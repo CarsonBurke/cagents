@@ -1827,18 +1827,22 @@ impl Runtime {
             Provider::Antigravity => "Antigravity",
             Provider::Muse => "Muse",
         };
-        let model = agent
+        // As the selected child's caption words it: an unreported model is
+        // left out rather than said to be missing.
+        let mut identity = format!(
+            "{} · {} · {provider} subagent",
+            Self::short_description(label, 80),
+            Self::native_child_status(agent),
+        );
+        if let Some(model) = agent
             .model
             .as_deref()
             .map(str::trim)
             .filter(|model| !model.is_empty())
-            .unwrap_or("Model not reported");
-        let mut identity = format!(
-            "{} · {} · {provider} native subagent · {}",
-            Self::short_description(label, 80),
-            Self::native_child_status(agent),
-            Self::short_description(model, 80),
-        );
+        {
+            identity.push_str(" · ");
+            identity.push_str(&Self::short_description(model, 80));
+        }
         // A blocked or failed child's provider error keeps its raw diagnostic
         // for copying; the tab says what it means. A finished child's detail
         // is its own report, whose prose may merely mention such words.
@@ -1964,14 +1968,22 @@ impl Runtime {
         if working > 0 {
             agent_parts.push(format!(
                 "{working} {} working",
-                if working == 1 { "agent" } else { "agents" }
+                if working == 1 {
+                    "subagent"
+                } else {
+                    "subagents"
+                }
             ));
         }
         if waiting > 0 {
             agent_parts.push(if agent_parts.is_empty() {
                 format!(
                     "{waiting} {} waiting",
-                    if waiting == 1 { "agent" } else { "agents" }
+                    if waiting == 1 {
+                        "subagent"
+                    } else {
+                        "subagents"
+                    }
                 )
             } else {
                 format!("{waiting} waiting")
@@ -1982,9 +1994,9 @@ impl Runtime {
                 format!(
                     "{on_background_work} {} waiting on background work",
                     if on_background_work == 1 {
-                        "agent"
+                        "subagent"
                     } else {
-                        "agents"
+                        "subagents"
                     }
                 )
             } else {
@@ -2030,11 +2042,11 @@ impl Runtime {
         }
         let (name, on_press) = match failed.as_slice() {
             [agent] => (
-                format!("Open failed agent: {}", Self::agent_failure_task(agent)),
+                format!("Open failed subagent: {}", Self::agent_failure_task(agent)),
                 Action::SelectSubagent(self.target, Some(agent.id.clone())),
             ),
             _ => (
-                format!("Choose from {} failed agents", failed.len()),
+                format!("Choose from {} failed subagents", failed.len()),
                 Action::SubagentFailures(self.target),
             ),
         };
@@ -2826,7 +2838,7 @@ impl Runtime {
                 Provider::Muse => "Muse",
             };
             // A model the provider never reported is left out rather than
-            // announced; the tooltip says so for whoever asks.
+            // announced, here and in the tooltip.
             let model = agent
                 .model
                 .as_deref()

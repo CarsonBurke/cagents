@@ -2275,8 +2275,9 @@ fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() 
             "{mode:?}: {names:?}"
         );
         assert!(
+            // Said once, by the member it stops.
             names.iter().any(|name| name.contains("Limited channel")
-                && name.contains("1 stopped by a usage limit")),
+                && name.matches("stopped by a usage limit").count() == 1),
             "{mode:?}: the read channel still needs its Limited badge in the compact view: {names:?}"
         );
         assert!(

@@ -1507,9 +1507,9 @@ fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting
     Arc::make_mut(&mut runtime.snapshot).error = None;
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
     snapshot.subagents.push(native_child_fixture());
-    assert_eq!(runtime.conversation_status(false).1, "1 agent working");
+    assert_eq!(runtime.conversation_status(false).1, "1 subagent working");
     Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
-    assert_eq!(runtime.conversation_status(false).1, "1 agent waiting");
+    assert_eq!(runtime.conversation_status(false).1, "1 subagent waiting");
     Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Succeeded;
     assert_eq!(
         runtime.conversation_status(false).1,
@@ -1580,11 +1580,11 @@ fn agent_status_counts_only_active_states_and_identifies_the_current_failure() {
     }
     assert_eq!(
         runtime.conversation_status(false).1,
-        "1 agent working · 1 waiting · 1 waiting on background work · 1 failed: Check restart safety"
+        "1 subagent working · 1 waiting · 1 waiting on background work · 1 failed: Check restart safety"
     );
     assert_eq!(
         runtime.conversation_status_with_failures(false, false).1,
-        "1 agent working · 1 waiting · 1 waiting on background work"
+        "1 subagent working · 1 waiting · 1 waiting on background work"
     );
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
     snapshot
@@ -1626,7 +1626,7 @@ fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a
         .root()
         .iter()
         .chain(nodes.children())
-        .find(|node| node.node().label() == Some("Open failed agent: Check restart safety"))
+        .find(|node| node.node().label() == Some("Open failed subagent: Check restart safety"))
         .and_then(|node| node.node().bounds())
         .expect("an actionable named failure");
     let pointer = iced::Point::new(
@@ -1681,7 +1681,7 @@ fn long_activity_remains_one_line_in_a_narrow_pane() {
     let renderer = crate::app::tests::headless_renderer();
     let mut row = activity_row(
         Some(Icon::AgentWorking),
-        "7 agents working\n1 waiting on background work · ".repeat(20),
+        "7 subagents working\n1 waiting on background work · ".repeat(20),
         None,
     );
     let mut tree = Tree::new(row.as_widget());
@@ -1905,7 +1905,7 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
 
     // A closing line that says more than the row keeps its words.
     Arc::make_mut(&mut runtime.snapshot).subagents = vec![native_child_fixture()];
-    assert_eq!(closing(&runtime), (None, "1 agent working".to_owned()));
+    assert_eq!(closing(&runtime), (None, "1 subagent working".to_owned()));
     Arc::make_mut(&mut runtime.snapshot).subagents.clear();
 
     // The command left running in the background while the agent goes
@@ -2102,21 +2102,21 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         activity(&runtime),
         Some((
             Icon::AgentWorking,
-            "Reviewing changes · 2 agents working".into()
+            "Reviewing changes · 2 subagents working".into()
         ))
     );
     assert_eq!(runtime.snapshot.items.len(), items);
     Arc::make_mut(&mut runtime.snapshot).busy = false;
     assert_eq!(
         activity(&runtime),
-        Some((Icon::AgentWorking, "2 agents working".into()))
+        Some((Icon::AgentWorking, "2 subagents working".into()))
     );
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
     snapshot.subagents[0].waiting = true;
     snapshot.subagents[1].status = chat::ToolStatus::Succeeded;
     assert_eq!(
         activity(&runtime),
-        Some((Icon::AgentWaiting, "1 agent waiting".into()))
+        Some((Icon::AgentWaiting, "1 subagent waiting".into()))
     );
     Arc::make_mut(&mut runtime.snapshot).waiting = true;
     assert_eq!(
@@ -2241,7 +2241,7 @@ fn an_agent_on_its_background_work_is_reported_without_asking_for_the_user() {
     snapshot.finished_at = Some(42);
     let (glyph, label) = runtime.conversation_status(false);
     assert!(
-        label.contains("1 agent waiting on background work"),
+        label.contains("1 subagent waiting on background work"),
         "{label}"
     );
     assert!(!label.contains("Waiting for you"), "{label}");
@@ -2254,7 +2254,7 @@ fn an_agent_on_its_background_work_is_reported_without_asking_for_the_user() {
         runtime.timeline_activity(false, None),
         Some((
             Icon::AgentBackground,
-            "1 agent waiting on background work".into()
+            "1 subagent waiting on background work".into()
         ))
     );
     let child = runtime.snapshot.subagents[0].clone();
@@ -2270,8 +2270,9 @@ fn native_child_identity_uses_its_reported_model_and_waiting_state() {
     Arc::make_mut(&mut runtime.snapshot).selected_model = Some("parent-model".into());
     let mut child = native_child_fixture();
     let unknown = runtime.native_child_identity(&child);
-    assert!(unknown.contains("Claude native subagent"));
-    assert!(unknown.contains("Model not reported"));
+    // An unreported model is left out, not said to be missing.
+    assert!(unknown.contains(" · Claude subagent · Task: "), "{unknown}");
+    assert!(!unknown.contains("native"), "{unknown}");
     assert!(!unknown.contains("parent-model"));
     child.model = Some("child-model".into());
     child.waiting = true;
@@ -3528,11 +3529,9 @@ fn selected_native_child_renders_identity_and_bounded_selector() {
         .filter_map(|node| node.node().label().map(str::to_owned))
         .collect();
     assert!(
-        labels
-            .iter()
-            .any(|label| label.contains("Claude native subagent")
-                && label.contains("child-model")
-                && label.contains("Waiting for you")),
+        labels.iter().any(|label| label.contains("Claude subagent")
+            && label.contains("child-model")
+            && label.contains("Waiting for you")),
         "{labels:?}"
     );
     assert!(

@@ -457,13 +457,13 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     };
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::AgentWorking), "1 agent working".into())
+        (Some(Icon::AgentWorking), "1 subagent working".into())
     );
 
     snapshot.waiting = true;
     let parent_and_child = (
         Some(Icon::AgentWorking),
-        "Waiting for you · 1 agent working".to_owned(),
+        "Waiting for you · 1 subagent working".to_owned(),
     );
     assert_eq!(publish(&mut snapshot), parent_and_child);
     snapshot.detail = "Background command completed".into();
@@ -486,7 +486,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::AgentWorking),
-            "Account limit reached · 1 agent working".into(),
+            "Account limit reached · 1 subagent working".into(),
         )
     );
     snapshot.subagents[0].waiting = true;
@@ -494,7 +494,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::Warning),
-            "Account limit reached · 1 agent waiting".into(),
+            "Account limit reached · 1 subagent waiting".into(),
         )
     );
     snapshot.subagents[0].status = ToolStatus::Succeeded;
@@ -521,13 +521,13 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::AgentWaiting),
-            "Waiting for you · 1 agent waiting".into()
+            "Waiting for you · 1 subagent waiting".into()
         )
     );
     snapshot.requests.clear();
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::AgentWaiting), "1 agent waiting".into())
+        (Some(Icon::AgentWaiting), "1 subagent waiting".into())
     );
 }
 
@@ -548,7 +548,7 @@ fn mixed_blocked_waiting_and_working_children_do_not_hide_real_work_or_clear_par
     assert_eq!(icon, Some(Icon::AgentWorking));
     for text in [
         "Account limit reached",
-        "1 agent working",
+        "1 subagent working",
         "1 waiting",
         "1 failed:",
     ] {
@@ -594,7 +594,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
             runtime.conversation_status(false),
             (
                 Some(Icon::AgentWorking),
-                format!("{label} · 1 agent working")
+                format!("{label} · 1 subagent working")
             )
         );
         let details: Vec<_> = runtime
@@ -614,7 +614,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
             runtime.conversation_status(false),
             (
                 Some(Icon::AgentWorking),
-                "Provider at capacity · 1 agent working".into(),
+                "Provider at capacity · 1 subagent working".into(),
             )
         );
         assert!(runtime.failure_ui.incidents.iter().any(|incident| {
@@ -626,7 +626,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
             runtime.conversation_status(false),
             (
                 Some(Icon::AgentWorking),
-                format!("{label} · 1 agent working")
+                format!("{label} · 1 subagent working")
             )
         );
 
@@ -639,7 +639,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         runtime.refresh();
         assert_eq!(
             runtime.conversation_status(false),
-            (Some(Icon::AgentWorking), "1 agent working".into())
+            (Some(Icon::AgentWorking), "1 subagent working".into())
         );
         runtime.error = None;
         runtime.reconcile_failure_ui();
@@ -765,7 +765,7 @@ fn waiting_child_quota_detail_without_items_is_projected_and_does_not_hide_other
     assert!(runtime.snapshot.subagents[0].items.is_empty());
     let (icon, status) = runtime.conversation_status(false);
     assert_eq!(icon, Some(Icon::AgentWorking));
-    assert!(status.contains("1 agent working"), "{status}");
+    assert!(status.contains("1 subagent working"), "{status}");
     assert!(status.contains("1 waiting"), "{status}");
     assert!(runtime.error.is_none());
 }
