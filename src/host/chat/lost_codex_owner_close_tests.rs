@@ -474,9 +474,13 @@ impl Spawned {
         .expect("the spawned holder published its record")
     }
 
-    /// The owner as Close holds it once it has adopted the holder.
-    fn detach(&mut self) -> chat::native_holder::Detached {
-        self.holder.take().unwrap().preserve()
+    /// The owner as Close holds it once it has adopted the holder. The
+    /// holder Close adopts is durable and outlives its channel; this one's
+    /// provider is never confirmed, so it would end as soon as its channel
+    /// closed. The fixture keeps the channel, and the holder lives until the
+    /// test ends it.
+    fn owner(&self) -> chat::native_holder::Detached {
+        self.holder.as_ref().unwrap().owner()
     }
 
     fn new(source: &Session) -> Self {
@@ -531,9 +535,9 @@ fn kill(process: &registry::Process) {
 /// already settled, leaving only the confirmation to fail.
 fn pending_close_whose_owner_then_ended(root: &std::path::Path, released: bool) {
     let fixture = Fixture::new(root);
-    let mut spawned = Spawned::new(&fixture.source);
+    let spawned = Spawned::new(&fixture.source);
     let record = Spawned::record(&fixture.source);
-    let owner = spawned.detach();
+    let owner = spawned.owner();
     fixture.host.lock().unwrap().native_closing.insert(
         fixture.source.id,
         native_cleanup::NativeClose::adopted(fixture.source.clone(), owner, released),
@@ -556,7 +560,7 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
         return;
     };
     let fixture = Fixture::new(&root);
-    let mut spawned = Spawned::new(&fixture.source);
+    let spawned = Spawned::new(&fixture.source);
     struct Cleanup(chat::native_holder::Detached, Record);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -568,7 +572,7 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
         }
     }
     let record = Spawned::record(&fixture.source);
-    let owner = Cleanup(spawned.detach(), record.clone());
+    let owner = Cleanup(spawned.owner(), record.clone());
     let pane = crate::workspace_model::views::Pane {
         id: crate::model::CardId::new(),
         title: "Original chat".into(),
@@ -657,12 +661,12 @@ fn a_pending_close_whose_provider_outlived_its_holder_waits_for_it() {
         return;
     };
     let fixture = Fixture::new(&root);
-    let mut spawned = Spawned::new(&fixture.source);
+    let spawned = Spawned::new(&fixture.source);
     let record = Spawned::record(&fixture.source);
     // The holder dies while it still serves its provider.
     kill(&record.holder);
     assert!(record.root.is_current(), "the provider outlived its holder");
-    let owner = spawned.detach();
+    let owner = spawned.owner();
     fixture.host.lock().unwrap().native_closing.insert(
         fixture.source.id,
         native_cleanup::NativeClose::adopted(fixture.source.clone(), owner, false),

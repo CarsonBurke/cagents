@@ -314,6 +314,16 @@ impl Holder {
         }
     }
 
+    /// The owner a Close holds once it has adopted this holder, while this
+    /// handle keeps the holder's channel open. A holder whose provider was
+    /// never confirmed ends with its channel, so a test that cannot confirm a
+    /// provider keeps it here to stand in for the durable holder a Close
+    /// adopts.
+    #[cfg(test)]
+    pub(crate) fn owner(&self) -> super::Detached {
+        self.identity.clone()
+    }
+
     pub fn preserve(mut self) -> super::Detached {
         self.release_on_drop = false;
         self.control.take();
