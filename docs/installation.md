@@ -232,8 +232,15 @@ upgrades](daemon.md) for how the daemon, sessions, and upgrades interact.
 ### In-app updates
 
 Full self-managed (`install.sh`) installations, including packages built
-locally with a `+local` version, check authenticated GitHub releases at startup
-and every six hours. A newer stable version appears in a notice above the
+locally with a `+local` version, check for a newer release at startup and every
+six hours, and whenever you choose **Check for updates** in About. A check
+reads the latest release's signed `release-metadata.json` through github.com's
+public download links, so it needs `curl` but no GitHub sign-in, and spends no
+GitHub API quota. The update is offered only when that metadata carries a
+valid signature by a key the installed build trusts (see
+[Releasing](releasing.md#signing)). The metadata names the SHA-256 of every
+file the update downloads, including the installer, and the updater checks each
+download against it. A newer stable version appears in a notice above the
 workspace. Dismissing it with × retains the update in the notices popover.
 Build metadata identifies the installed binaries but does not make a published
 release with the same base version count as an upgrade.
@@ -250,8 +257,10 @@ from, the newer build's own updater performs the update, so its checks decide
 what continues. Supported source protocols are wire-proven for the updater's
 lifecycle operations. If the running daemon's protocol is not one of them, the
 update is refused before anything changes; follow the cold installation the
-refusal describes. Source trees and OS packages retain their own update
-method; browserless builds do not download full releases.
+refusal describes. Builds that cannot update themselves say why in About instead
+of offering an update: a package installed by the system package manager
+names it, a build from source asks you to install a release, and a build
+without `curl` asks for it. Browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
 downloaded bytes, and asks every open window to save. Dirty editors, unsent

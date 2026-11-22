@@ -194,14 +194,15 @@ mod tests {
         seal_file(&archive).unwrap();
         verify_digest(&mut archive, &digest).unwrap();
         let asset = Asset {
-            id: 1,
             name: "fixture".into(),
             size: 1,
+            sha256: digest,
         };
         let release = Release {
             version: "9.8.7".into(),
             url: String::new(),
-            id: 1,
+            notes: String::new(),
+            metadata: [1; 32],
             archive: asset.clone(),
             installer: asset.clone(),
             checksums: asset,

@@ -49,7 +49,6 @@ host = [
     "dep:jiff",
     "dep:ashpd",
     "dep:futures-util",
-    "dep:base64",
     "dep:hmac",
     "dep:image",
     "dep:ksni",
@@ -64,7 +63,6 @@ host = [
 ]
 ui = [
     "dep:accesskit_unix",
-    "dep:base64",
     "dep:ashpd",
     "dep:async-channel",
     "dep:croner",
@@ -169,12 +167,14 @@ unicode-segmentation = { version = "1.13.3", optional = true }
 arc-swap = "1.7"
 async-channel = { version = "2.5", optional = true }
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio"], optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 bitflags = { version = "2.9", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "=4.5.61"
 crossbeam-channel = "0.5"
 directories = "6.0"
+# Verifies the signature on a release's metadata before an update trusts it.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", optional = true }
 glob = "0.3.4"
 # Seals the messages the daemon delivers between sessions, so a conversation
