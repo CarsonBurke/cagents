@@ -178,6 +178,17 @@ pub(super) struct State {
 }
 
 impl State {
+    /// A healthy watch wakes the application from the filesystem event.
+    /// Keep a timer only until the watch can be retried, or while an
+    /// incomplete watch needs its coarse fallback scan.
+    pub(super) fn fallback_refresh_needed(&self) -> bool {
+        (self.watch.is_none() && !self.entries.is_empty())
+            || self
+                .entries
+                .values()
+                .any(|entry| entry.fallback.is_some() || entry.read_failure.is_some())
+    }
+
     pub(super) fn remember_archived(
         &mut self,
         project: ProjectId,

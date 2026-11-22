@@ -191,10 +191,61 @@ impl Cagents {
     }
 
     pub(super) fn refresh_subscription(&self) -> Subscription<Message> {
-        if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
+        if !self.refresh_ui.focused
+            || self.modal_is_open()
+            || self.update_prepared
+            || !self.refresh_tick_needed()
+        {
             return Subscription::none();
         }
         cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick))
+    }
+
+    /// Whether the periodic refresh can currently advance any visible or
+    /// background state. Chats and terminals receive daemon wakes directly,
+    /// so a settled workspace containing only those cards must not keep an
+    /// application-wide timer alive.
+    fn refresh_tick_needed(&self) -> bool {
+        if crate::device::is_remote() {
+            return self
+                .sidebar_model
+                .projects
+                .iter()
+                .any(|project| project.unreachable.is_none());
+        }
+
+        // Reopen a failed watch and retain its coarse fallback scan. A healthy
+        // inotify watch wakes the application itself when something changes.
+        if self.refresh_ui.git.fallback_refresh_needed() {
+            return true;
+        }
+
+        if self.cards.iter().any(|(&card, runtime)| {
+            self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+                && matches!(
+                    runtime,
+                    CardRuntime::Repository(_) | CardRuntime::PullRequests(_)
+                )
+        }) {
+            return true;
+        }
+
+        if self.workspace_view_shown().is_some()
+            && self.refresh_ui.source_cancel.is_none()
+            && self
+                .sidebar_model
+                .source_control
+                .as_ref()
+                .is_some_and(|source| !source.busy())
+        {
+            return true;
+        }
+
+        self.sidebar_model.projects.iter().any(|project| {
+            project.kind == ProjectKind::Git
+                && project.unreachable.is_none()
+                && self.github_project_polling_ready(project.id)
+        })
     }
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
@@ -435,6 +486,18 @@ mod tests {
         assert!(!crate::ui_controls::activity_animates());
         drop(app.update(Message::RefreshUi(Action::Focused(other, true))));
         assert!(!crate::ui_controls::activity_animates());
+    }
+
+    #[test]
+    fn settled_chat_and_terminal_workspaces_do_not_arm_a_refresh_timer() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
+
+        assert_eq!(
+            app.refresh_subscription().units(),
+            0,
+            "daemon wakes keep settled chats and terminals current without polling"
+        );
     }
 
     #[test]
