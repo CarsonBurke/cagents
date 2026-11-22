@@ -428,10 +428,11 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                     Some(at) => {
                         let turn = &mut turns[at];
                         turn.spans(item);
-                        thinking_in = Some(at);
                         // Thinking after the group's prose fell below its
-                        // strip, so the strip does not list it.
+                        // strip, so the strip neither lists it nor counts on
+                        // through it: the work it leads to opens below.
                         let lies = if turn.prose.is_empty() {
+                            thinking_in = Some(at);
                             Lies::Among(at)
                         } else {
                             Lies::Unlisted
@@ -1928,6 +1929,25 @@ mod tests {
         assert!(!turns[0].running);
         assert!(!turns[0].thinking);
         assert_eq!(pauses(&turns[0]), [(2, 3, 3_000)]);
+    }
+
+    #[test]
+    fn thinking_after_a_groups_narration_leaves_its_strip_finished() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(
+                text("progress", Role::Assistant, Phase::Commentary, false),
+                2_000,
+                3_000,
+            ),
+            thought("t", "", 3_000, 9_000),
+        ];
+        let turns = group(&items, &unasked(), Working);
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].running, "the thought fell below the strip");
+        assert!(!turns[0].thinking);
+        assert!(turns[0].pauses.is_empty());
     }
 
     #[test]
