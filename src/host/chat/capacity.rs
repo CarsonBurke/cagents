@@ -24,7 +24,11 @@ pub(super) fn holding(state: &HostState, id: &TerminalId) -> bool {
 
 /// Residents that hold a slot.
 fn holders(state: &HostState) -> usize {
-    state.chats.values().filter(|record| holds_slot(record)).count()
+    state
+        .chats
+        .values()
+        .filter(|record| holds_slot(record))
+        .count()
 }
 
 /// Distinct slots in use: residents that can hold provider work, plus each
