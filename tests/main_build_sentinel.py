@@ -590,6 +590,15 @@ if sys.argv[1:3] == ['issue', 'create']:
         checkout = self.repo / ".worktrees" / "main-build-sentinel"
         self.assertEqual(self.command("git", "-C", str(checkout), "rev-parse", "HEAD"), checked)
 
+    def test_a_kept_verdict_is_returned_while_a_tick_holds_the_locks(self):
+        self.tick()
+        tip = json.loads((self.state / "state.json").read_text())["tested"]
+        with ((self.repo / ".worktrees" / ".main-build-sentinel.lock").open("a") as checkout_lock,
+              (self.state / "lock").open("a") as lock):
+            fcntl.flock(checkout_lock, fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertTrue(sentinel.require_tests(self.repo, self.state, tip)["passed"])
+
     def with_evidence_tool(self):
         """Gives main a native-evidence that builds stand-in executables."""
         tool = self.origin / "scripts" / "native-evidence"

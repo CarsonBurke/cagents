@@ -495,6 +495,15 @@ def test_main(repository, directory, state):
 def require_tests(repository, directory, revision):
     """Blocks until no tick runs, then returns the commit's verdict, testing
     it first if it has none, and fetching main first if it is not known here."""
+    commit = f"{revision}^{{commit}}"
+    # A verdict, once written, never changes: one already kept needs no lock,
+    # and so does not wait for a tick testing another commit.
+    known = subprocess.run(["git", "-C", str(repository), "rev-parse", "--quiet", "--verify", commit],
+                           text=True, stdout=subprocess.PIPE)
+    if not known.returncode:
+        verdict = read_verdict(directory, known.stdout.strip())
+        if verdict is not None:
+            return verdict
     worktrees = repository / ".worktrees"
     worktrees.mkdir(exist_ok=True)
     directory.mkdir(parents=True, exist_ok=True)
@@ -502,7 +511,6 @@ def require_tests(repository, directory, revision):
           (directory / "lock").open("a") as lock):
         fcntl.flock(checkout_lock, fcntl.LOCK_EX)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        commit = f"{revision}^{{commit}}"
         if subprocess.run(["git", "-C", str(repository), "rev-parse", "--quiet", "--verify", commit],
                           stdout=subprocess.DEVNULL).returncode:
             git(repository, "fetch", "--no-tags", "origin", "main")

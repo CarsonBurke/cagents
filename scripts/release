@@ -144,11 +144,18 @@ tests=\$!
     "\$checkout/scripts/build-release-linux" --ref $(printf '%q' "$TAG") \
     --output $(printf '%q' "$remote_output") --notes /var/tmp/cagents-release/$VERSION-notes.md </dev/null
 verdict=/var/tmp/cagents-release/$VERSION-tests.json
-if ! wait "\$tests"; then
+status=0
+wait "\$tests" || status=\$?
+if ((status)); then
     cat "\$verdict" >&2 || :
     rm -rf -- $(printf '%q' "$remote_output") "\$verdict"
-    printf '%s\n' 'release: the commit has no passing test verdict from the main sentinel (above);' \
-        'release: its test logs are under ~/.local/state/cagents-main-sentinel/logs' >&2
+    case \$status in
+        1) reason='its tests fail' ;;
+        3) reason='a test lane stopped outside the code, as when the build host refused it; run the release again' ;;
+        *) reason='the sentinel could not give a verdict' ;;
+    esac
+    printf 'release: the commit has no passing test verdict from the main sentinel: %s (above).\n' "\$reason" >&2
+    printf '%s\n' 'release: its test logs are under ~/.local/state/cagents-main-sentinel/logs' >&2
     exit 1
 fi
 rm -f -- "\$verdict"
