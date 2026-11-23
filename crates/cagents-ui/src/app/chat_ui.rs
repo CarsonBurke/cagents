@@ -16377,10 +16377,12 @@ impl Cagents {
                         return self.handle_chat_ui(Action::SubagentPicker(target, false));
                     }
                     // An open chooser keeps what the reader searched for.
-                    let picker = runtime.child_picker.get_or_insert_with(|| {
-                        child_navigation::Picker::new(&runtime.snapshot.subagents)
-                    });
+                    let mut picker = runtime
+                        .child_picker
+                        .take()
+                        .unwrap_or_else(|| runtime.child_picker_for_now());
                     picker.opened_on = Some(section);
+                    runtime.child_picker = Some(picker);
                     let offset = runtime.child_section_offset(section).unwrap_or(0.0);
                     if let Some(picker) = runtime.child_picker.as_mut() {
                         picker.scroll = offset;
@@ -16404,8 +16406,7 @@ impl Cagents {
             }
             Action::SubagentPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.child_picker =
-                        open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
+                    runtime.child_picker = open.then(|| runtime.child_picker_for_now());
                     if open {
                         return widget::text_input::focus(card_control_id(
                             target.card,

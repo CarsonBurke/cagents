@@ -278,14 +278,35 @@ pub(super) fn child_label<'a>(
     }
 }
 
-/// When a child last did anything its transcript shows, in Unix
-/// milliseconds. A child whose transcript was trimmed away shows nothing.
-fn last_activity(child: &chat::Subagent) -> Option<u64> {
-    child
+/// Each child's latest report to the conversation, by the ID the child is
+/// listed under.
+type Reports<'a> = HashMap<&'a str, &'a chat::Item>;
+
+/// When a child last did anything its transcript or its report shows, in
+/// Unix milliseconds. A child whose transcript was trimmed away and that
+/// has not reported shows nothing.
+fn last_activity(child: &chat::Subagent, report: Option<&chat::Item>) -> Option<u64> {
+    let worked = child
         .items
         .iter()
         .rev()
-        .find_map(|item| item.at.or(item.started_at))
+        .find_map(|item| item.at.or(item.started_at));
+    worked.max(report.and_then(|report| report.at.or(report.started_at)))
+}
+
+/// A report's body, or its summary when it has none.
+fn report_text(report: &chat::Item) -> Option<&str> {
+    match &report.content {
+        ItemContent::Delivery { body, summary, .. } => Some(
+            if body.trim().is_empty() {
+                summary
+            } else {
+                body
+            }
+            .as_str(),
+        ),
+        _ => None,
+    }
 }
 
 /// When a child's transcript shows it starting, in Unix milliseconds.
@@ -309,10 +330,10 @@ fn span(millis: u64) -> String {
 
 /// A chooser row's time: how long a working child has been at it, and how
 /// long ago any other child last did something.
-fn row_time(child: &chat::Subagent, now: u64) -> Option<String> {
+fn row_time(child: &chat::Subagent, report: Option<&chat::Item>, now: u64) -> Option<String> {
     match Section::of(child) {
         Section::Working => first_activity(child).map(|start| span(now.saturating_sub(start))),
-        _ => last_activity(child).map(|last| {
+        _ => last_activity(child, report).map(|last| {
             cagents::account::format_ago(
                 i64::try_from(now.saturating_sub(last) / 1_000).unwrap_or(i64::MAX),
             )
@@ -381,9 +402,22 @@ impl Picker {
     /// row does not move out from under the pointer while children report;
     /// only a change of state moves a child to another section. Within a
     /// section the child that did something last leads.
+    #[cfg(test)]
     pub fn new(children: &[chat::Subagent]) -> Self {
+        Self::ordered(children, &Reports::new())
+    }
+
+    fn ordered(children: &[chat::Subagent], reports: &Reports<'_>) -> Self {
         let mut order: Vec<_> = children.iter().collect();
-        order.sort_by_key(|child| (Section::of(child), std::cmp::Reverse(last_activity(child))));
+        order.sort_by_key(|child| {
+            (
+                Section::of(child),
+                std::cmp::Reverse(last_activity(
+                    child,
+                    reports.get(child.id.as_str()).copied(),
+                )),
+            )
+        });
         Self {
             order: order.into_iter().map(|child| child.id.clone()).collect(),
             ..Self::default()
@@ -433,6 +467,34 @@ impl Picker {
 }
 
 impl Runtime {
+    /// A chooser opening on this conversation's children as they stand.
+    pub(super) fn child_picker_for_now(&self) -> Picker {
+        Picker::ordered(&self.snapshot.subagents, &self.child_reports())
+    }
+
+    /// Each child's latest report in the conversation, under the ID the
+    /// child is listed by: a report names its sender as the provider
+    /// addresses it.
+    fn child_reports(&self) -> Reports<'_> {
+        let mut reports = Reports::new();
+        for item in self.snapshot.items.iter().rev() {
+            if let ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                sender,
+                ..
+            } = &item.content
+                && !sender.is_empty()
+            {
+                let listed = self
+                    .agent_addresses
+                    .get(sender)
+                    .map_or(sender.as_str(), String::as_str);
+                reports.entry(listed).or_insert(item.as_ref());
+            }
+        }
+        reports
+    }
+
     /// What the conversation itself is doing, in the glyph and words its
     /// status line uses, for the pane's inspector. Its subagents are left to
     /// the strip of agent tabs above the composer.
@@ -652,9 +714,19 @@ impl Runtime {
     /// What a chooser row says a child is doing, or how it ended: its
     /// current step while it works, what it waits on, its error, or the
     /// first line of its report.
-    pub(super) fn child_activity(&self, child: &chat::Subagent) -> String {
+    pub(super) fn child_activity(
+        &self,
+        child: &chat::Subagent,
+        report: Option<&chat::Item>,
+    ) -> String {
         let status = self.native_child_status(child);
         let detail = child.detail.trim();
+        let reported = || {
+            report
+                .and_then(report_text)
+                .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+                .map(|line| Self::short_description(line, 160))
+        };
         let failure = || {
             chat::failure::Failure::parse(self.session.launch.provider, detail)
                 .map(|failure| failure.summary)
@@ -681,16 +753,18 @@ impl Runtime {
                 }
             }
             chat::ToolStatus::Waiting => status.to_owned(),
-            chat::ToolStatus::Failed | chat::ToolStatus::Denied => {
-                said(failure().or_else(|| detail.lines().next().map(str::to_owned)))
-            }
-            _ => said(
+            chat::ToolStatus::Failed | chat::ToolStatus::Denied => said(
+                failure()
+                    .or_else(reported)
+                    .or_else(|| detail.lines().next().map(str::to_owned)),
+            ),
+            _ => said(reported().or_else(|| {
                 detail
                     .lines()
                     .map(str::trim)
                     .find(|line| !line.is_empty())
-                    .map(|line| Self::short_description(line, 160)),
-            ),
+                    .map(|line| Self::short_description(line, 160))
+            })),
         }
     }
 
@@ -710,6 +784,7 @@ impl Runtime {
         );
         let first = rows.first().map(|child| child.id.clone());
         let listed = entries(&rows);
+        let reports = self.child_reports();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| {
@@ -759,7 +834,11 @@ impl Runtime {
                 ),
                 Entry::Child(child) => (
                     child_key(&child.id),
-                    crate::interaction::keyboard_list_row(self.child_choice(child, now)),
+                    crate::interaction::keyboard_list_row(self.child_choice(
+                        child,
+                        reports.get(child.id.as_str()).copied(),
+                        now,
+                    )),
                 ),
             });
         }
@@ -862,7 +941,12 @@ impl Runtime {
 
     /// One child's row in the chooser: its state's mark, its name over what
     /// it is doing or how it ended, and its time.
-    fn child_choice(&self, child: &chat::Subagent, now: u64) -> Element<'_, Message> {
+    fn child_choice(
+        &self,
+        child: &chat::Subagent,
+        report: Option<&chat::Item>,
+        now: u64,
+    ) -> Element<'_, Message> {
         let target = self.target;
         let chosen = self.selected_subagent.as_ref() == Some(&child.id);
         let label = self.child_label(child, 80);
@@ -890,7 +974,7 @@ impl Runtime {
                 .into(),
             widget::column::with_children(vec![
                 title.width(Length::Fill).into(),
-                line(self.child_activity(child), true)
+                line(self.child_activity(child, report), true)
                     .width(Length::Fill)
                     .into(),
             ])
@@ -898,7 +982,7 @@ impl Runtime {
             .spacing(space::XXS)
             .into(),
         ];
-        if let Some(time) = row_time(child, now) {
+        if let Some(time) = row_time(child, report, now) {
             parts.push(line(time, true).into());
         }
         widget::button::custom(
@@ -1607,9 +1691,13 @@ mod tests {
             ids(rows.iter().copied()),
             ["asking", "fresh-run", "long-run", "new-done", "old-done"]
         );
-        assert_eq!(row_time(&children[2], now).as_deref(), Some("1h 30m"));
-        assert_eq!(row_time(&children[1], now).as_deref(), Some("5m ago"));
-        assert_eq!(row_time(&children[4], now), None, "nothing to time it by");
+        assert_eq!(row_time(&children[2], None, now).as_deref(), Some("1h 30m"));
+        assert_eq!(row_time(&children[1], None, now).as_deref(), Some("5m ago"));
+        assert_eq!(
+            row_time(&children[4], None, now),
+            None,
+            "nothing to time it by"
+        );
         // Each section is headed by its count, and the list knows where each
         // starts without building a row.
         let listed = entries(&rows);
@@ -1634,5 +1722,53 @@ mod tests {
         );
         let none = entries(&rows[..1]);
         assert_eq!(section_offset(&none, Section::Finished), None);
+    }
+
+    /// A finished child whose transcript was trimmed away is timed, ordered
+    /// and summarized by the report it sent the conversation.
+    #[test]
+    fn a_finished_child_is_known_by_its_report() {
+        use chat::ToolStatus::*;
+        let minute = 60_000;
+        let now = 1_000 * minute;
+        let report = |sender: &str, body: &str, at: u64| chat::Item {
+            id: format!("report-{sender}"),
+            role: chat::Role::User,
+            content: ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                from: "general-purpose".into(),
+                sender: sender.into(),
+                summary: format!("Agent \"{sender}\" finished"),
+                body: body.into(),
+            },
+            started_at: None,
+            at: Some(at),
+        };
+        let children = vec![
+            child("early", Succeeded, false),
+            active(child("late", Succeeded, false), 0, now - 30 * minute),
+            child("quiet", Succeeded, false),
+        ];
+        let early = report(
+            "early",
+            "\nNo problem found.\nDetails follow.",
+            now - 2 * minute,
+        );
+        let late = report("late", "", now - 10 * minute);
+        let reports: Reports<'_> = [("early", &early), ("late", &late)].into_iter().collect();
+        let picker = Picker::ordered(&children, &reports);
+        assert_eq!(
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
+            ["early", "late", "quiet"]
+        );
+        assert_eq!(
+            row_time(&children[0], Some(&early), now).as_deref(),
+            Some("2m ago")
+        );
+        assert_eq!(
+            report_text(&early).map(str::trim_start),
+            Some("No problem found.\nDetails follow.")
+        );
+        assert_eq!(report_text(&late), Some("Agent \"late\" finished"));
     }
 }
