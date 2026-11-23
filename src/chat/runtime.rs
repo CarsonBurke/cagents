@@ -1142,8 +1142,10 @@ impl LocalHandle {
 
     /// As [`Self::try_close_if_idle`], with `detached` deciding what the
     /// provider leaves running. The decision precedes the claim, since
-    /// teardown may begin as soon as the actor grants it; a refusal restores
-    /// the earlier one, so a later close is decided as it would have been.
+    /// teardown may begin as soon as the actor grants it. Unless the actor
+    /// granted it, which is when it set `stop`, the earlier decision comes
+    /// back, so a later close is decided as it would have been: after a
+    /// changed generation, a busy actor's refusal or a lost acknowledgement.
     pub(crate) fn try_stop_if_idle(
         &self,
         generation: u64,
@@ -1151,7 +1153,7 @@ impl LocalHandle {
     ) -> Result<bool, String> {
         let previous = self.0.detached_work.replace(detached);
         let stopped = self.try_close_if_idle(generation);
-        if matches!(stopped, Ok(false)) {
+        if !self.0.stop.load(Ordering::Acquire) {
             self.0.detached_work.restore(previous);
         }
         stopped
@@ -1711,6 +1713,15 @@ impl LocalHandle {
             .filter(|agent| agent.background && agent.status.is_live())
             .map(|agent| agent.id.clone())
             .collect()
+    }
+
+    /// See [`super::Snapshot::background_tasks`].
+    pub(crate) fn background_tasks(&self) -> usize {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .background_tasks
     }
 
     pub(crate) fn interrupt_subagents(&self) -> Vec<String> {
@@ -4518,6 +4529,7 @@ fn apply_projected_event(
         }
         Event::RequestResolved { id } => state.requests.retain(|request| request.id != id),
         Event::Waiting(waiting) => state.waiting = waiting,
+        Event::BackgroundTasks(live) => state.background_tasks = live,
         Event::Status { busy, detail } => {
             if busy {
                 state.prompt_suggestion = None;
@@ -4588,6 +4600,7 @@ fn apply_projected_event(
             state.busy = false;
             state.ready = false;
             state.history_loading = false;
+            state.background_tasks = 0;
         }
         Event::ReadOnlyHistory { reason } => state.read_only_reason = Some(reason),
         Event::Ready(ready) => {

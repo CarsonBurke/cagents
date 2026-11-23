@@ -96,8 +96,9 @@ fn refusal(used: usize, starting: usize, limit: usize) -> String {
     format!(
         "No room for another chat: {running}{starting}, and the limit is {limit}.\n\n\
          Close a chat you have finished with, then try again; `cagents chat capacity` lists \
-         the open ones. A finished Claude chat that no window shows is stopped to make room, \
-         but none could be. Chats that only show saved history don't count.{more}"
+         the open ones. None of them could be stopped to make room: only a finished Claude \
+         chat that no window shows and that has nothing left running can be. Chats that only \
+         show saved history don't count.{more}"
     )
 }
 
@@ -125,7 +126,8 @@ fn spare(state: &HostState, id: TerminalId, record: &Record) -> Option<Spare> {
         && !handle.is_completed()
         && handle.is_idle()
         && handle.update_activity() == (false, true)
-        && handle.background_subagents().is_empty();
+        && handle.background_subagents().is_empty()
+        && handle.background_tasks() == Some(0);
     let unseen = !record.subscribers.values().any(|&visible| visible);
     let untouched = !record.returning_terminal
         && record.paired_terminal.is_none()

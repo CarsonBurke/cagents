@@ -15,15 +15,16 @@ its last turn longest ago among the Claude chats that:
 
 - no window is showing, preferring one no window has open in a tab;
 - have finished a turn and have nothing under way: no turn, request,
-  background subagent or queued message;
+  queued message, or background task such as a subagent, a shell command run
+  in the background or a monitor, since stopping Claude ends those;
 - the daemon owes nothing: no automation owns them, no message waits for
   them, and their agent has no run or launch unfinished;
 - no transition such as a start, close or return to the terminal holds.
 
 The conversation stays open where it was. Its pane says that Claude stopped
 and keeps your draft; Resume conversation continues it in place, so nothing is
-lost but the idle process. What the provider started and left running is kept
-or stopped as closing the chat would decide. The daemon does this only when a
+lost but the idle process. Anything else the provider left running, outside
+the tasks it reports, is kept or stopped as closing the chat would decide. The daemon does this only when a
 chat needs the slot, never on a timer, and never to a chat on screen.
 
 If no chat qualifies, the daemon refuses the new chat with "No room for another

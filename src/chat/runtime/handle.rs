@@ -738,6 +738,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().background_subagents.clone(),
         }
     }
+    /// How many background tasks the provider reports live, or `None` from
+    /// a helper that predates reporting them.
+    pub(crate) fn background_tasks(&self) -> Option<usize> {
+        match &self.0 {
+            Owner::Local(local) => Some(local.background_tasks()),
+            Owner::Remote(remote) => remote.state().background_tasks,
+        }
+    }
     pub(crate) fn interrupt_subagents(&self) -> Vec<String> {
         match &self.0 {
             Owner::Local(local) => local.interrupt_subagents(),

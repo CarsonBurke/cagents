@@ -2742,7 +2742,11 @@ impl Claude {
             .filter(|task| task["ambient"].as_bool() != Some(true))
             .filter_map(|task| task["parent_task_id"].as_str())
             .collect::<HashSet<_>>();
-        let Some(previous) = self.background_level.replace(live.clone()) else {
+        let previous = self.background_level.replace(live.clone());
+        if previous.as_ref().map(HashSet::len) != Some(live.len()) {
+            step.events.push(Event::BackgroundTasks(live.len()));
+        }
+        let Some(previous) = previous else {
             return;
         };
         let mut left = previous.difference(&live).cloned().collect::<Vec<_>>();

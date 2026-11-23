@@ -192,6 +192,10 @@ pub(crate) struct Resident {
     pub confirmed_session: Option<String>,
     pub background_subagents: Vec<String>,
     pub interrupt_subagents: Vec<String>,
+    /// See [`chat::Snapshot::background_tasks`]. A helper that predates it
+    /// reports none.
+    #[serde(default)]
+    pub background_tasks: Option<usize>,
     /// What holds the conversation, by name. A helper that predates it
     /// reports none; see [`Resident::work_hold`].
     #[serde(default)]
@@ -533,6 +537,7 @@ impl RemoteActor {
             confirmed_session: None,
             background_subagents: Vec::new(),
             interrupt_subagents: Vec::new(),
+            background_tasks: Some(0),
             work_hold: None,
             account_reports: Vec::new(),
             agent_addresses: Vec::new(),
@@ -2937,6 +2942,7 @@ impl Server {
         let active_model_revision = state.active_model_revision;
         let sampled_activity = state.activity();
         let work_hold = state.work_hold();
+        let background_tasks = state.background_tasks;
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -3026,6 +3032,7 @@ impl Server {
             confirmed_session,
             background_subagents,
             interrupt_subagents,
+            background_tasks: Some(background_tasks),
             work_hold: Some(work_hold),
             account_reports,
             agent_addresses: self.actor.agent_addresses(),

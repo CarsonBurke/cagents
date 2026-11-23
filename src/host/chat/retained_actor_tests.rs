@@ -1568,6 +1568,11 @@ for line in sys.stdin:
                         raise RuntimeError('private fixture third-frame gate timed out')
                     time.sleep(0.02)
             time.sleep(0.04)
+        level=root/'background-level'
+        if level.exists():
+            # Claude Code's live background tasks, which it reports when they change.
+            send({'type':'system','subtype':'background_tasks_changed','uuid':'level-'+received,'session_id':session,'tasks':json.loads(level.read_text())})
+            level.unlink()
         send({'type':'result','uuid':'final','subtype':'success','is_error':False,'session_id':session,'usage':{'input_tokens':7,'output_tokens':40}})
         (root/'provider-done').write_text('done')
 "#).unwrap();
@@ -5567,8 +5572,29 @@ fn a_full_daemon_stops_a_finished_hidden_chat_to_make_room() {
             .insert(9, visible);
     };
 
+    // A shell left running in the background keeps a hidden chat: stopping
+    // Claude would end it.
+    fs::write(
+        root.join("background-level"),
+        r#"[{"task_id":"bserve","task_type":"local_bash","description":"Serve"}]"#,
+    )
+    .unwrap();
     let first = start(0).unwrap();
     let first_handle = finish_turn(first, &mut cleanup);
+    wait_until(
+        || first_handle.background_tasks() == Some(1),
+        "the background shell was never reported",
+    );
+    let refused = start(1).unwrap_err();
+    assert_eq!(refused.code, ProtocolErrorCode::ChatCapacity, "{refused:?}");
+    assert!(!first_handle.is_completed());
+    // Once the shell ends, nothing keeps it.
+    fs::write(root.join("background-level"), "[]").unwrap();
+    finish_turn(first, &mut cleanup);
+    wait_until(
+        || first_handle.background_tasks() == Some(0),
+        "the background shell never ended",
+    );
     let conversation = first_handle.confirmed_session_id();
     assert!(conversation.is_some());
     // The card holds the descriptor the daemon publishes for its chat.
