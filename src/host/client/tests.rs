@@ -4071,7 +4071,17 @@ fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
         .reserve_spawn_writing(spawning, &opening)
         .unwrap();
     let inherited = directory.path().join(format!("{}.log", TerminalId::new()));
-    let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+    // The census does not depend on what the terminal runs. A login shell
+    // can exit on its own or leave session jobs (fish's first run starts a
+    // completion generator), and then teardown cannot confirm its cleanup.
+    // Run a root that waits for hangup and starts nothing else.
+    let recipe = crate::model::LaunchRecipe {
+        program: "/bin/sleep".into(),
+        arguments: vec!["600".into()],
+        working_directory: directory.path().to_owned(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
     let returned = crate::model::TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
@@ -4117,12 +4127,11 @@ fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
         .map(|terminal| terminal.session.id)
         .collect();
     assert_eq!(listed, [returned.id], "the inventory omits the spawn");
-    host.lock()
-        .unwrap()
-        .handle(1, returned.id)
-        .unwrap()
-        .shutdown()
-        .unwrap();
+    // shutdown() reports every failure as Closed, so accepting Closed would
+    // also hide a worker that never finished or a process it left running.
+    // The root above cannot end before this, so require confirmed cleanup.
+    let terminal = host.lock().unwrap().handle(1, returned.id).unwrap();
+    assert_eq!(terminal.shutdown(), Ok(()), "shutdown must confirm cleanup");
 }
 
 #[test]
