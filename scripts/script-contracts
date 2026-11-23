@@ -165,6 +165,9 @@ JOBS = (
         Suite("pull request landing", "tests/land_pr.py",
               sources=("scripts/land-pr", "scripts/check-older-clients")),
         Suite("output token counts", "tests/output_tokens.py", sources=("scripts/output-tokens",)),
+        # Reads the whole checkout's source text; compiles nothing.
+        Suite("provider credential guard", "tests/check_credential_guard.py",
+              sources=("scripts/check-credential-guard", "src/account.rs")),
     )),
     # The rehearsal's pure contracts: records, comparison, staging and retry.
     # The desktop, installed archives and a real update run only on fw16 (see
