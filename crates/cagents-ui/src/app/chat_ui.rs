@@ -84,6 +84,7 @@ mod changes;
 mod child_navigation;
 mod clipboard_image;
 mod close_refusal;
+mod draft_choice;
 mod draft_images;
 #[cfg(test)]
 pub(in crate::app) use close_refusal::{close_refusal_dismiss_id, close_refusal_end_id};
@@ -7684,6 +7685,7 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
             provider,
             recipe,
             session_id,
+            draft_model: None,
         },
         proof: None,
         terminal: Some(Box::new(session.clone())),
@@ -8708,6 +8710,9 @@ impl Cagents {
             runtime.session = session.clone();
             runtime.error = None;
         }
+        // The choice is the draft's, so every window showing it shows it.
+        draft_choice::set(&mut runtime.session, &(model.clone(), reasoning.clone()));
+        let session = runtime.session.clone();
         if changed {
             // The composer's note, such as an attachment refusal, answered
             // the previous model's rules.
@@ -8716,8 +8721,8 @@ impl Cagents {
             runtime.release_start_block();
         }
         self.remember_chat_model(provider, model, reasoning);
-        let skills = if let Some(session) = moved {
-            self.replace_chat_conversation(target.card, session);
+        self.replace_chat_conversation(target.card, session);
+        let skills = if moved.is_some() {
             self.load_draft_skills(target)
         } else {
             Task::none()
@@ -8815,6 +8820,8 @@ impl Cagents {
             .recipe
             .environment
             .remove(account::routing::AUTOMATIC_MARKER);
+        // Another account runs the same model and effort.
+        draft_choice::carry(&runtime.session, &mut session);
         if session == runtime.session {
             return Task::none();
         }
@@ -9389,6 +9396,20 @@ impl Cagents {
         } else if rehomed {
             Arc::make_mut(&mut runtime.snapshot).skills.clear();
         }
+        // The model and effort another window chose for the draft. A draft
+        // no window chose them for keeps following this window's preference.
+        if let Some((model, reasoning)) = draft_choice::get(session) {
+            if runtime.snapshot.selected_model != model || runtime.snapshot.reasoning != reasoning {
+                runtime.model_picker = None;
+                // The note and refusal answered the previous choice.
+                runtime.composer_note = None;
+                runtime.release_start_block();
+                let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                snapshot.selected_model = model;
+                snapshot.reasoning = reasoning;
+            }
+            runtime.draft_model_chosen = true;
+        }
         Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
             .draft_permission
             .get(&session.launch.recipe, provider);
@@ -9398,6 +9419,12 @@ impl Cagents {
             runtime.error = None;
             runtime.composer_note = None;
             runtime.completion.restart(true);
+        }
+        if !rehomed {
+            // The skills this window found still answer the draft's home
+            // and directory; another window's model or permission choice
+            // changes neither.
+            return Task::none();
         }
         let target = runtime.target;
         self.load_draft_skills(target)
@@ -10342,10 +10369,14 @@ impl Cagents {
             .draft_models
             .remove(&card)
             .filter(|saved| saved.applies_to(&session));
-        let model_chosen = saved_model.is_some();
-        if let Some(saved) = saved_model {
-            snapshot.selected_model = saved.model;
-            snapshot.reasoning = saved.reasoning;
+        // The draft's own record is the latest choice any window made; this
+        // window's saved one is for a draft saved before drafts kept theirs.
+        let chosen = draft_choice::get(&session)
+            .or_else(|| saved_model.map(|saved| (saved.model, saved.reasoning)));
+        let model_chosen = chosen.is_some();
+        if let Some((model, reasoning)) = chosen {
+            snapshot.selected_model = model;
+            snapshot.reasoning = reasoning;
         }
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
@@ -12125,6 +12156,9 @@ impl Cagents {
         // start was already returned to A behind its own write.
         let mut candidate = source.clone();
         candidate.id = TerminalId::new();
+        // The start names the chosen model and effort; the started chat's
+        // launch, which identity checks compare, keeps no draft choice.
+        candidate.launch.draft_model = None;
         let text = runtime.composer.text();
         let resolved_text = completion::invocations(
             completion::from_leading_skill(&text, &runtime.snapshot.skills),
@@ -12792,9 +12826,13 @@ impl Cagents {
         let Some(chosen) = runtime.queued.as_ref().map(|queued| queued.chosen.clone()) else {
             return Task::none();
         };
-        let Some(draft) = runtime.unqueue() else {
+        let Some(mut draft) = runtime.unqueue() else {
             return Task::none();
         };
+        if runtime.draft_model_chosen {
+            // What the message went out on, which a refused model is not.
+            draft_choice::set(&mut draft, &chosen);
+        }
         (snapshot.selected_model, snapshot.reasoning) = chosen;
         snapshot.permission_mode = runtime.draft_permission.get(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
@@ -13413,7 +13451,7 @@ impl Cagents {
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
-                    && runtime.session.launch == launch
+                    && draft_choice::same_launch(&runtime.session.launch, &launch)
                 {
                     Arc::make_mut(&mut runtime.snapshot).skills = skills;
                     runtime.completion.restart(true);
@@ -17225,7 +17263,13 @@ impl Cagents {
                     let snapshot = Arc::make_mut(&mut runtime.snapshot);
                     snapshot.selected_model = Some(model.clone());
                     snapshot.reasoning = reasoning.clone();
+                    draft_choice::set(
+                        &mut runtime.session,
+                        &(Some(model.clone()), reasoning.clone()),
+                    );
+                    let session = runtime.session.clone();
                     self.remember_chat_model(provider, Some(model), reasoning);
+                    self.replace_chat_conversation(target.card, session);
                     return self.save_snapshot_soon();
                 }
                 let command = Command::SetModel { model, reasoning };

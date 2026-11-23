@@ -268,6 +268,7 @@ pub(crate) fn terminal_started(source: &crate::model::TerminalSession) -> Option
         provider,
         recipe,
         session_id: Some(session_id),
+        draft_model: None,
     })
 }
 

@@ -230,6 +230,11 @@ struct Comparison<'a> {
     /// Fields of the named enum's variant that this side decodes the older
     /// client's request without, as (enum, variant, field).
     requests_decoded_without: Vec<(&'static str, &'static str, &'static str)>,
+    /// Fields of the named struct that no request between the two sides
+    /// carries, because the newer side reads an older client's requests, and
+    /// writes its own to an older daemon, in that side's protocol (see
+    /// `decoding_from` and `encoding_for`).
+    request_without: Vec<(&'static str, &'static str)>,
     /// When present, only these outer variants belong to the proven contract.
     /// Nested enums remain unrestricted and must agree in full.
     selected: Vec<(&'static str, Vec<&'static str>)>,
@@ -269,12 +274,15 @@ impl Comparison<'_> {
             }
             (Container::Struct(old), Container::Struct(new)) => {
                 // A field the daemon omits for this client is one it never
-                // receives. A request still has to carry every field.
+                // receives. A request has to carry every field its reader
+                // reads it with, in the older side's protocol.
                 let new: Vec<_> = new
                     .iter()
-                    .filter(|(name, _)| {
-                        direction == Direction::Request
-                            || !self.restated.contains(&(current, name.as_str()))
+                    .filter(|(name, _)| match direction {
+                        Direction::Request => {
+                            !self.request_without.contains(&(current, name.as_str()))
+                        }
+                        Direction::Reply => !self.restated.contains(&(current, name.as_str())),
                     })
                     .cloned()
                     .collect();
@@ -282,9 +290,11 @@ impl Comparison<'_> {
                 // decodes its message without (see `decoding_from`).
                 let old: Vec<_> = old
                     .iter()
-                    .filter(|(name, _)| {
-                        direction == Direction::Request
-                            || !self.decoded_without.contains(&(older, name.as_str()))
+                    .filter(|(name, _)| match direction {
+                        Direction::Request => {
+                            !self.request_without.contains(&(older, name.as_str()))
+                        }
+                        Direction::Reply => !self.decoded_without.contains(&(older, name.as_str())),
                     })
                     .cloned()
                     .collect();
@@ -446,6 +456,7 @@ fn differences(
     refused: Vec<(&'static str, &'static [&'static str])>,
     restated: Vec<(&'static str, &'static str)>,
     requests_decoded_without: Vec<(&'static str, &'static str, &'static str)>,
+    request_without: Vec<(&'static str, &'static str)>,
 ) -> Vec<String> {
     let mut comparison = Comparison {
         older,
@@ -455,6 +466,7 @@ fn differences(
         restated,
         decoded_without: Vec::new(),
         requests_decoded_without,
+        request_without,
         selected: Vec::new(),
         visited: BTreeSet::new(),
         differences: Vec::new(),
@@ -512,10 +524,12 @@ fn this_protocols_wire_format_is_recorded() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     changed.extend(differences(
         &current,
         &recorded,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -589,6 +603,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 .collect(),
             restated_for(client.protocol),
             requests_decoded_for(client.protocol),
+            decoded_for(client.protocol),
         );
         assert!(
             differences.is_empty(),
@@ -703,6 +718,9 @@ fn decoding_lifecycle_differences(
                 Vec::new()
             },
             requests_decoded_without: Vec::new(),
+            // This side writes its requests to the older daemon without the
+            // fields it restates for it.
+            request_without: restated.to_vec(),
             selected: selected.to_vec(),
             visited: BTreeSet::new(),
             differences: Vec::new(),

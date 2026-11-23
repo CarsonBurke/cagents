@@ -117,6 +117,7 @@ impl Fixture {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: None,
@@ -192,6 +193,7 @@ fn finished_actor(root: &std::path::Path) -> chat::runtime::Handle {
             .into(),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     let encoded: String = project
         .to_str()
@@ -1803,6 +1805,7 @@ fn a_close_that_finds_a_process_starting_asks_to_try_again() {
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
         proof: None,
         terminal: None,

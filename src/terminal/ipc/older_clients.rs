@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 201,
+    proven_at: 202,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -138,9 +138,16 @@ pub(crate) const CHANNEL_CHECKOUT: u16 = 200;
 /// source before it is read as compacting nowhere short of the whole window.
 pub(crate) const USAGE_COMPACT_LIMIT: u16 = 201;
 
+/// The first protocol whose chat launches carry the model and effort chosen
+/// for a draft. A client before it is sent launches without them, and its
+/// requests are read without them; a source before it chose none and is sent
+/// none.
+pub(crate) const DRAFT_MODEL_IN_LAUNCH: u16 = 202;
+
 /// Fields a later protocol added to a struct, which a client from before it is
-/// sent without: the struct's type name, the fields, and the protocol that
-/// added them. The wire format proof accepts exactly these.
+/// sent without, as is a request to a daemon from before it: the struct's type
+/// name, the fields, and the protocol that added them. The wire format proofs
+/// accept exactly these.
 #[cfg(test)]
 const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
     (
@@ -164,6 +171,11 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
         &["compact_limit"],
         USAGE_COMPACT_LIMIT,
     ),
+    (
+        "cagents::chat::Launch",
+        &["draft_model"],
+        DRAFT_MODEL_IN_LAUNCH,
+    ),
 ];
 
 /// Fields a later protocol added to a variant of a request's enum, which this
@@ -181,10 +193,10 @@ const REQUEST_FIELDS_DECODED_WITHOUT: &[(&str, &str, &[&str], u16)] = &[(
 )];
 
 /// Fields a later protocol added to a struct that this side reads a message
-/// from an update source before it without: the struct's type name, the
-/// fields, and the protocol that added them. Each is decoded in
-/// [`decoding_from`] scope as the source encoded it, so the frozen lifecycle
-/// proof accepts exactly these.
+/// from an update source, or a request from an older client, before it
+/// without: the struct's type name, the fields, and the protocol that added
+/// them. Each is decoded in [`decoding_from`] scope as that side encoded it,
+/// so the frozen lifecycle and older client proofs accept exactly these.
 #[cfg(test)]
 const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
     ("cagents::chat::FileChange", &["lines"], PATCH_LINE_ORIGIN),
@@ -197,6 +209,11 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
         "cagents::chat::Usage",
         &["compact_limit"],
         USAGE_COMPACT_LIMIT,
+    ),
+    (
+        "cagents::chat::Launch",
+        &["draft_model"],
+        DRAFT_MODEL_IN_LAUNCH,
     ),
 ];
 
@@ -1063,6 +1080,69 @@ mod tests {
             .unwrap(),
             (vec![patch(LineOrigin::Excerpt)], 7)
         );
+    }
+
+    /// A chat launch crosses the protocol that added its draft model both
+    /// ways: a request or reply for an older peer leaves the choice out, and
+    /// one read from an older peer has none. What follows it stays in place.
+    #[test]
+    fn launches_cross_the_draft_model_protocol_in_both_directions() {
+        use crate::{
+            agent::Provider,
+            chat::Launch,
+            model::{ChatDraftModel, LaunchRecipe, TerminalId},
+        };
+        let older = DRAFT_MODEL_IN_LAUNCH - 1;
+        let recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: vec!["--print".into()],
+            working_directory: "/work".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let launch = Launch {
+            provider: Provider::Claude,
+            recipe: recipe.clone(),
+            session_id: Some("resumed".into()),
+            draft_model: Some(Box::new(ChatDraftModel {
+                session: TerminalId::new(),
+                provider: Provider::Claude,
+                model: Some("sonnet".into()),
+                reasoning: Some("high".into()),
+            })),
+        };
+        let without = Launch {
+            draft_model: None,
+            ..launch.clone()
+        };
+        // As the older protocol has it: three fields, then the next value.
+        let before =
+            postcard::to_stdvec(&((Provider::Claude, &recipe, Some("resumed")), 7u8)).unwrap();
+        let message = (launch.clone(), 7u8);
+        assert_eq!(
+            encoding_for(older, || postcard::to_stdvec(&message).unwrap()),
+            before
+        );
+        let current = postcard::to_stdvec(&message).unwrap();
+        assert_ne!(current, before);
+        assert_eq!(
+            postcard::from_bytes::<(Launch, u8)>(&current).unwrap(),
+            message
+        );
+        assert_eq!(
+            decoding_from(older, || postcard::from_bytes::<(Launch, u8)>(&before)).unwrap(),
+            (without.clone(), 7)
+        );
+        // A saved launch from before the field has no choice either.
+        let mut json = serde_json::to_value(&launch).unwrap();
+        json.as_object_mut().unwrap().remove("draft_model");
+        assert_eq!(
+            serde_json::from_value::<Launch>(json.clone()).unwrap(),
+            without
+        );
+        // One saved without a choice is written as before the field, so a
+        // record an older release digested digests alike.
+        assert_eq!(serde_json::to_value(&without).unwrap(), json);
     }
 
     /// The decode scope belongs to the decode it was entered for: it ends

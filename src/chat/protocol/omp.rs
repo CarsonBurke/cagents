@@ -4076,6 +4076,7 @@ mod tests {
                 environment: Default::default(),
             },
             session_id: Some(CONVERSATION.into()),
+            draft_model: None,
         };
         let (spec, _) = create(&launch).expect("the persisted native recipe is resumable");
         assert_eq!(

@@ -2367,6 +2367,7 @@ mod tests {
                 provider: crate::agent::Provider::Omp,
                 recipe: source.launch.clone(),
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: Some(Box::new(source)),

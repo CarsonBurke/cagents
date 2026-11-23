@@ -212,6 +212,7 @@ fn a_saved_conversation_with_untyped_blocks_opens_and_pages() {
             )]),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     let (_, mut adapter) = create(&launch).unwrap();
     let opened = format!("{:?}", adapter.initialize().unwrap().events);
@@ -1955,6 +1956,7 @@ fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries()
             .into(),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     let mut adapter = Claude {
         session_id: Some(id.clone()),
@@ -10867,6 +10869,7 @@ fn a_conversation_launched_on_an_alias_shows_that_alias_and_its_context() {
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         };
         let (spec, mut adapter) = create(&launch).unwrap();
         let session = spec
@@ -12035,6 +12038,7 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
             )]),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     let (spec, mut adapter) = create(&launch).unwrap();
     assert!(matches!(
@@ -12168,6 +12172,7 @@ fn composer_fixture_persists_the_provider_history_used_after_restart() {
             )]),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     let (_, mut adapter) = create(&launch).unwrap();
     let step = adapter.initialize().unwrap();
@@ -12214,6 +12219,7 @@ fn launch_preserves_explicit_policy_without_replaying_or_implicitly_resuming() {
             working_directory: PathBuf::from("/tmp"),
             environment: Default::default(),
         },
+        draft_model: None,
     };
     let args = arguments(&launch).unwrap();
     assert!(!args.contains(&"old prompt".into()));
@@ -12266,6 +12272,7 @@ fn converted_chat_applies_configured_auto_before_its_first_prompt() {
             )]
             .into(),
         },
+        draft_model: None,
     };
     assert!(
         arguments(&launch)
@@ -12986,6 +12993,7 @@ fn an_unreadable_transcript_still_resumes_and_a_missing_one_refuses() {
             )]),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     // Nothing saved at all.
     assert!(matches!(
@@ -13091,6 +13099,7 @@ fn typed_start_and_read_only_history_keep_damaged_message_markers() {
             )]),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     for read_only in [false, true] {
         let (spec, mut adapter) = if read_only {

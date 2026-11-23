@@ -1815,6 +1815,7 @@ fn first_model_read_uses_moved_native_pane_instead_of_stale_managed_placement() 
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let agent = Agent {
@@ -2061,6 +2062,7 @@ fn model_read_publishes_new_managed_chat_before_initialized_view_projection() {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         let agent = Agent {
@@ -3511,6 +3513,7 @@ fn headless_execution_adopts_exact_target_without_stealing_focus_or_resurrecting
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let mut agent = Agent {
@@ -3715,6 +3718,7 @@ fn unloaded_chat_label_fixture() -> (
             provider: crate::agent::Provider::Claude,
             recipe: console.launch,
             session_id: None,
+            draft_model: None,
         },
         proof: Some(crate::model::HostSessionProof {
             host_session_id: "labels-host".into(),
@@ -7538,6 +7542,7 @@ fn window_holding_a_channel_name() -> (Cagents, ChannelId, ModelUpdate) {
                 environment: Default::default(),
             },
             session_id: None,
+            draft_model: None,
         },
         proof: None,
         terminal: None,

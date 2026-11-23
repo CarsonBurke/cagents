@@ -8861,6 +8861,7 @@ fn pane_clone_preserves_explicit_titles_across_later_process_reports() {
                     provider: crate::agent::Provider::Claude,
                     recipe,
                     session_id: None,
+                    draft_model: None,
                 },
                 proof: None,
                 terminal: None,
@@ -8959,6 +8960,7 @@ fn pane_clone_starts_a_new_chat_without_reusing_source_conversation() {
             provider: crate::agent::Provider::Claude,
             recipe,
             session_id: Some(conversation.into()),
+            draft_model: None,
         },
         proof: Some(HostSessionProof {
             host_session_id: "source-holder".into(),
@@ -9017,6 +9019,7 @@ fn pane_clone_releases_owned_and_legacy_codex_endpoints_before_changing_identity
                 provider: crate::agent::Provider::Codex,
                 recipe,
                 session_id: Some("source-conversation".into()),
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: None,

@@ -543,6 +543,7 @@ fn run(initialized: bool) {
                 ]
                 .into(),
             },
+            draft_model: None,
         },
     };
     let mut creator = crate::app::tests::context_inspector_test_app(false);

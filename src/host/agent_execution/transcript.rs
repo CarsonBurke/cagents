@@ -261,6 +261,7 @@ pub(super) fn source(
                 provider,
                 recipe,
                 session_id,
+                draft_model: None,
             }
         }
     };
@@ -521,6 +522,7 @@ mod tests {
                     .into(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         for tools in [true, false] {
@@ -594,6 +596,7 @@ mod tests {
                     .into(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         assert!(source.modified().is_some());

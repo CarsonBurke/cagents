@@ -52,6 +52,7 @@ impl Fixture {
                 )]),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         };
         Self {
             _root: root,

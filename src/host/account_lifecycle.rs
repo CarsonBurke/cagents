@@ -2221,6 +2221,7 @@ pub(crate) mod tests {
                     ]),
                     unset_environment: BTreeSet::from(["CLAUDE_CONFIG_DIR".into()]),
                 },
+                draft_model: None,
             },
         };
         let failure = super::super::client::process_request(
@@ -2340,6 +2341,7 @@ pub(crate) mod tests {
                 environment: environment.clone(),
                 unset_environment: BTreeSet::new(),
             },
+            draft_model: None,
         };
         // Private filesystem-only control: the actual constructor resolves
         // the empty selector to cwd, not the foreign HOME fallback. The

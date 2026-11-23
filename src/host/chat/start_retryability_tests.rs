@@ -124,6 +124,7 @@ fn session(root: &Path, provider: Provider, arguments: Vec<String>) -> Session {
                 ]),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     }
 }

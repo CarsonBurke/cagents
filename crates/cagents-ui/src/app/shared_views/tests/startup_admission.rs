@@ -438,6 +438,7 @@ fn cached_chat() -> (Cagents, ChannelId, ChannelId, Pane, uuid::Uuid) {
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
         proof: Some(HostSessionProof {
             host_session_id: "old-host".into(),

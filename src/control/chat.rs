@@ -263,6 +263,7 @@ mod tests {
                             environment: BTreeMap::new(),
                             unset_environment: BTreeSet::new(),
                         },
+                        draft_model: None,
                     },
                 },
                 execution_instance: uuid::Uuid::new_v4(),

@@ -139,15 +139,18 @@ impl Client {
             stream: &mut self.stream,
             deadline: self.deadline,
         };
-        ipc::write_frame(
-            &mut stream,
-            &ClientEnvelope {
-                version: self.protocol,
-                request_id,
-                proof: authenticated.then(|| self.proof.clone()),
-                request,
-            },
-        )
+        // The source reads the request as its own protocol wrote it.
+        ipc::encoding_for(self.protocol, || {
+            ipc::write_frame(
+                &mut stream,
+                &ClientEnvelope {
+                    version: self.protocol,
+                    request_id,
+                    proof: authenticated.then(|| self.proof.clone()),
+                    request,
+                },
+            )
+        })
         .map_err(|_| "Cannot send source inspection")?;
         // Legacy ChatStart installs its hidden subscriber before responding.
         // Activity can arrive first, including during Detach. Drain only that
@@ -792,7 +795,7 @@ mod tests {
             },
         };
         let mut bytes = Vec::new();
-        ipc::write_frame(&mut bytes, &connect).unwrap();
+        ipc::encoding_for(100, || ipc::write_frame(&mut bytes, &connect)).unwrap();
         assert_eq!(
             bytes.as_slice(),
             include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connect.bin")
@@ -801,7 +804,7 @@ mod tests {
             let mut request = connect.clone();
             request.version = protocol;
             let mut current = Vec::new();
-            ipc::write_frame(&mut current, &request).unwrap();
+            ipc::encoding_for(protocol, || ipc::write_frame(&mut current, &request)).unwrap();
             assert_eq!(current, source_frame_version(&bytes, protocol));
         }
         for (name, response) in [
@@ -836,7 +839,7 @@ mod tests {
                 message: ServerMessage::Response { response },
             };
             let mut bytes = Vec::new();
-            ipc::write_frame(&mut bytes, &envelope).unwrap();
+            ipc::encoding_for(100, || ipc::write_frame(&mut bytes, &envelope)).unwrap();
             let frozen: &[u8] = match name {
                 "CONNECTED" => {
                     include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connected.bin")
@@ -859,12 +862,20 @@ mod tests {
                 let mut expected = envelope.clone();
                 expected.version = protocol;
                 let mut current = Vec::new();
-                ipc::write_frame(&mut current, &expected).unwrap();
-                assert_eq!(current, historical);
-                assert_eq!(
-                    read_response(protocol, &mut historical.as_slice()).unwrap(),
-                    expected
-                );
+                ipc::encoding_for(protocol, || ipc::write_frame(&mut current, &expected)).unwrap();
+                if protocol < ipc::DRAFT_MODEL_IN_LAUNCH {
+                    assert_eq!(current, historical);
+                    assert_eq!(
+                        read_response(protocol, &mut historical.as_slice()).unwrap(),
+                        expected
+                    );
+                } else {
+                    // A later source's launches carry a draft model slot.
+                    assert_eq!(
+                        read_response(protocol, &mut current.as_slice()).unwrap(),
+                        expected
+                    );
+                }
             }
         }
     }
@@ -957,7 +968,7 @@ mod tests {
                     message: ServerMessage::Response { response },
                 };
                 let mut frame = Vec::new();
-                ipc::write_frame(&mut frame, &envelope).unwrap();
+                ipc::encoding_for(protocol, || ipc::write_frame(&mut frame, &envelope)).unwrap();
                 assert_eq!(
                     read_response(protocol, &mut frame.as_slice()).unwrap(),
                     envelope
@@ -981,7 +992,10 @@ mod tests {
         let expected = requested.clone();
         let worker = std::thread::spawn(move || {
             for step in 0..4 {
-                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                let request: ClientEnvelope =
+                    ipc::decoding_from(protocol, || ipc::read_frame(&mut peer))
+                        .unwrap()
+                        .unwrap();
                 assert_eq!(request.version, protocol);
                 assert_eq!(request.proof, Some(proof()));
                 let response = match (step, request.request) {
@@ -1224,7 +1238,11 @@ mod tests {
                 peer.set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 for step in 0..2 {
-                    let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                    // As a source of `protocol` reads and writes.
+                    let request: ClientEnvelope =
+                        ipc::decoding_from(protocol, || ipc::read_frame(&mut peer))
+                            .unwrap()
+                            .unwrap();
                     assert_eq!(request.version, protocol);
                     let response = if step == 0 {
                         assert!(request.proof.is_none());
@@ -1244,15 +1262,17 @@ mod tests {
                             session: expected_source.clone(),
                         }
                     };
-                    ipc::write_frame(
-                        &mut peer,
-                        &ServerEnvelope {
-                            version: protocol,
-                            request_id: Some(request.request_id),
-                            proof: expected.clone(),
-                            message: ServerMessage::Response { response },
-                        },
-                    )
+                    ipc::encoding_for(protocol, || {
+                        ipc::write_frame(
+                            &mut peer,
+                            &ServerEnvelope {
+                                version: protocol,
+                                request_id: Some(request.request_id),
+                                proof: expected.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                    })
                     .unwrap();
                 }
             });

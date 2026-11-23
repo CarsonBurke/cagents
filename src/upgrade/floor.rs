@@ -701,6 +701,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("recorded".into()),
+                draft_model: None,
             },
             proof: Some(source()),
             terminal: None,
@@ -1271,6 +1272,7 @@ mod compact_tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
+                draft_model: None,
             },
             proof: Some(HostSessionProof {
                 host_session_id: crate::model::HostSessionId::new("host"),
@@ -1364,6 +1366,7 @@ mod compact_tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("a".into()),
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: None,

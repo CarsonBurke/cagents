@@ -23,6 +23,7 @@ fn initial_chat() -> (Cagents, CardId, chat::Session) {
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());

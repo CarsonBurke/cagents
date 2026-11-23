@@ -2542,6 +2542,7 @@ mod tests {
                         provider: crate::agent::Provider::Omp,
                         recipe,
                         session_id: None,
+                        draft_model: None,
                     },
                     proof: None,
                     terminal: None,

@@ -1249,6 +1249,7 @@ fn a_replaced_chat_conversation_saves_with_its_snapshot_and_restores() {
                     ..terminal.launch.clone()
                 },
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: None,
@@ -1313,6 +1314,7 @@ fn adopted_and_replaced_conversations_save_with_their_one_snapshot() {
                     ..terminal.launch.clone()
                 },
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: None,
@@ -1407,6 +1409,7 @@ fn staged_chat(state: &WorkspaceState) -> crate::chat::Session {
             provider: crate::agent::Provider::Claude,
             recipe: terminal.launch,
             session_id: None,
+            draft_model: None,
         },
         proof: None,
         terminal: None,
@@ -1538,6 +1541,7 @@ fn conversion_checkpoints_preserve_discovered_identity_before_fast_cli_return() 
             provider: crate::agent::Provider::Omp,
             recipe: terminal.launch.clone(),
             session_id: None,
+            draft_model: None,
         },
         proof: None,
         terminal: None,
@@ -2376,6 +2380,7 @@ fn chat_recovery_io_failure_is_acknowledged_without_a_later_retry() {
                     environment: BTreeMap::from([("CODEX_HOME".into(), "/removed".into())]),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         let mut replacement = source.clone();
@@ -2440,6 +2445,7 @@ fn upgrade_recovery_translates_queued_source_snapshots_before_the_next_save() {
                 environment: BTreeMap::new(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let mut replacement = source.clone();
@@ -2534,6 +2540,7 @@ fn retained_copy_keeps_its_typed_payload_for_io_retry_but_not_content_refusal() 
                     environment: BTreeMap::new(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         state.cards[0].id = CardId::new();
@@ -2695,6 +2702,7 @@ fn retained_copy_explicit_retry_commits_real_bytes_after_its_initial_error() {
                 environment: BTreeMap::new(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let mut original = workspace();
@@ -2873,6 +2881,7 @@ fn retained_copy_writer_survives_refused_canonical_snapshots_and_explicit_close(
                     environment: BTreeMap::new(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         let mut original = workspace();
@@ -4308,6 +4317,7 @@ fn closing_a_chat_card_drops_its_refused_conversation() {
                 ..terminal.launch.clone()
             },
             session_id: session_id.map(str::to_owned),
+            draft_model: None,
         },
         proof: None,
         terminal: None,

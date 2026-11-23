@@ -294,6 +294,7 @@ fn run_pair(mode: &str) {
             provider: Provider::Codex,
             recipe: exact,
             session_id: Some(ID.into()),
+            draft_model: None,
         },
         proof: Some(proof.clone()),
         terminal: None,
@@ -939,6 +940,7 @@ fn restore_missing_native_with_carried_scope(
                 ..effective.clone()
             },
             session_id: None,
+            draft_model: None,
         },
         proof: Some(previous_proof.clone()),
         terminal: None,

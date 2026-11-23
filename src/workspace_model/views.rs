@@ -1325,6 +1325,7 @@ mod managed_display_tests {
                 provider: Provider::Claude,
                 session_id: Some("existing-conversation".into()),
                 recipe,
+                draft_model: None,
             },
             proof: Some(proof),
             terminal: None,

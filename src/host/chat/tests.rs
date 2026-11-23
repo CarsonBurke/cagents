@@ -153,6 +153,7 @@ fn direct_completion_actor(
             provider: Provider::Claude,
             recipe,
             session_id: None,
+            draft_model: None,
         },
     )
 }
@@ -375,6 +376,7 @@ IFS= read -r finish < finish
                 ]),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
@@ -532,6 +534,7 @@ fn chat_read_reports_remote_endpoint_failure_without_retiring_owned_chat() {
             provider: Provider::Claude,
             recipe: LaunchRecipe::shell("/".into()).unwrap(),
             session_id: Some(uuid::Uuid::new_v4().to_string()),
+            draft_model: None,
         },
         proof: Some(proof.clone()),
         terminal: None,
@@ -597,6 +600,7 @@ fn native_constructor_environment_is_private_once_and_preserves_precedence_and_r
                 .into(),
                 unset_environment: ["HTTPS_PROXY".into()].into(),
             },
+            draft_model: None,
         };
         let issued = launch.clone();
         let daemon = [
@@ -736,6 +740,7 @@ fn native_constructor_history_uses_effective_source_selected_and_unset_home_with
                 .into(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         };
         let source = [
             ("HOME".into(), actual_home.to_str().unwrap().into()),
@@ -866,6 +871,7 @@ fn upgrade_history_validation_keeps_recorded_home_after_live_working_directory_d
             environment: [("HOME".into(), home_a.to_str().unwrap().into())].into(),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     std::fs::create_dir(&launch.recipe.working_directory).unwrap();
     assert!(!launch.needs_read_only_history());
@@ -941,6 +947,7 @@ fn removed_claude_account_is_reported_before_missing_resume_history() {
                 unset_environment: Default::default(),
             },
             session_id: Some("3a888c9d-7e33-47ad-9c0f-d538f63b9099".into()),
+            draft_model: None,
         },
     };
     store
@@ -989,6 +996,7 @@ fn an_upgrade_restores_the_environment_a_chat_actually_started_with() {
             ]),
         },
         session_id: Some("01a0ab66-21d6-7065-9fe5-95f302b669e1".into()),
+        draft_model: None,
     };
     let daemon = BTreeMap::from([
         ("BUN_INSTALL_GLOBAL_STORE".into(), "/store".into()),
@@ -1037,6 +1045,7 @@ fn selected_account_removals_survive_daemon_environment_and_upgrade() {
                 .collect(),
         },
         session_id: None,
+        draft_model: None,
     };
     let daemon = BTreeMap::from([
         ("ANTHROPIC_API_KEY".into(), "daemon-fixture".into()),
@@ -1090,6 +1099,7 @@ fn a_system_claude_launch_does_not_take_the_daemon_home() {
         provider: Provider::Claude,
         recipe,
         session_id: None,
+        draft_model: None,
     };
     let daemon = BTreeMap::from([
         ("CLAUDE_CONFIG_DIR".into(), "/daemon/claude".into()),
@@ -1142,6 +1152,7 @@ fn paired_codex_upgrade_preserves_confirmed_fresh_or_switched_thread() {
         provider: Provider::Codex,
         recipe: expected.clone(),
         session_id: Some(SELECTED.into()),
+        draft_model: None,
     };
     for source in [recipe.clone(), bind_session(&recipe, ORIGINAL).unwrap()] {
         let process = AgentProcess {
@@ -1318,6 +1329,7 @@ fn a_candidate_listing_names_a_terminal_where_a_preview_names_a_conversation() {
                 environment: BTreeMap::new(),
             },
             session_id: None,
+            draft_model: None,
         },
         proof: Some(source.clone()),
         terminal: None,
@@ -1396,6 +1408,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         },
         session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+        draft_model: None,
     };
     let source = Session {
         native_continuity: Default::default(),
@@ -2442,6 +2455,7 @@ done
                 ]),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let mut process_recipe = source.launch.recipe.clone();
@@ -2801,6 +2815,7 @@ fn client_listener_evidence_cannot_claim_an_unrelated_root() {
                 environment: BTreeMap::new(),
             },
             session_id: None,
+            draft_model: None,
         },
         proof: Some(current.clone()),
         terminal: None,
@@ -2890,6 +2905,7 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
             provider: Provider::Codex,
             recipe: recipe.clone(),
             session_id: Some(identity.into()),
+            draft_model: None,
         },
     };
     session.launch.recipe.arguments = vec![
@@ -3241,6 +3257,7 @@ fn control_client_closes_chat(slow: bool, return_terminal: bool) {
                 recipe
             },
             session_id: None,
+            draft_model: None,
         },
         proof: Some(proof),
         terminal: None,
@@ -3401,6 +3418,7 @@ fn agent_addresses_reach_every_subscriber_and_each_new_one() {
                         provider: Provider::Claude,
                         recipe,
                         session_id: None,
+                        draft_model: None,
                     },
                     proof: Some(proof),
                     terminal: None,
@@ -3529,6 +3547,7 @@ fn acknowledgement_race(before_rearm: bool) {
                         provider: Provider::Claude,
                         recipe,
                         session_id: None,
+                        draft_model: None,
                     },
                     proof: Some(proof),
                     terminal: None,

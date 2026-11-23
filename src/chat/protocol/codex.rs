@@ -5251,6 +5251,7 @@ mod fresh_recipe_constructor_tests {
                     ]),
                     unset_environment: ["OPENAI_API_KEY".into()].into(),
                 },
+                draft_model: None,
             },
             proof: Some(crate::model::HostSessionProof {
                 host_session_id: "old-host".into(),

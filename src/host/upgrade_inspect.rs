@@ -2551,6 +2551,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                draft_model: None,
             },
             proof: Some(HostSessionProof {
                 host_session_id: HostSessionId::new("source"),
@@ -4958,6 +4959,7 @@ mod floor_capture_tests {
                     unset_environment: Default::default(),
                 },
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: None,

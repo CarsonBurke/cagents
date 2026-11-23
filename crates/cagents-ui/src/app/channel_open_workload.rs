@@ -93,6 +93,7 @@ fn chat(directory: &Path, index: usize) -> CardKind {
             provider: crate::agent::Provider::Claude,
             recipe: recipe(directory, chat_environment(index)),
             session_id: Some(uuid::Uuid::new_v4().to_string()),
+            draft_model: None,
         },
         proof: None,
         terminal: None,

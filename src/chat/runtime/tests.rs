@@ -2232,6 +2232,7 @@ fn codex_child_name_adapter(directory: &std::path::Path) -> Box<dyn Adapter> {
             )]),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     // Build an owned-listener spec without creating a process or socket.
     super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
@@ -4627,6 +4628,7 @@ fn claude_initialization_pipe(body: &str) -> (tempfile::TempDir, LocalHandle) {
             unset_environment: Default::default(),
         },
         session_id: None,
+        draft_model: None,
     };
     let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
     let mut initial = adapter.initialize().unwrap();
@@ -4762,6 +4764,7 @@ for line in sys.stdin:
             unset_environment: Default::default(),
         },
         session_id: None,
+        draft_model: None,
     };
     let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
     let mut initial = adapter.initialize().unwrap();
@@ -4814,6 +4817,7 @@ fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
             unset_environment: Default::default(),
         },
         session_id: None,
+        draft_model: None,
     };
     let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
     let mut initial = adapter.initialize().unwrap();
@@ -4895,6 +4899,7 @@ fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
             unset_environment: Default::default(),
         },
         session_id,
+        draft_model: None,
     };
     let start = |session_id| {
         let (spec, mut adapter) = super::super::protocol::acp::create(
@@ -5076,6 +5081,7 @@ fn only_providers_that_opt_in_tolerate_stdout_noise() {
         provider: crate::agent::Provider::Claude,
         recipe,
         session_id: None,
+        draft_model: None,
     };
     let (spec, _) = super::super::protocol::claude::create(&launch).unwrap();
     assert!(spec.stdout_noise.is_some());
@@ -5242,6 +5248,7 @@ fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
             unset_environment: Default::default(),
         },
         session_id: None,
+        draft_model: None,
     };
     let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
     let mut initial = adapter.initialize().unwrap();

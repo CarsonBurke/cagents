@@ -7567,6 +7567,9 @@ impl Cagents {
                 session.id = TerminalId::new();
                 session.launch.recipe = recipe;
                 session.launch.session_id = None;
+                // The source's draft model choice was its own; a clone
+                // follows the usual choice, as a new conversation does.
+                session.launch.draft_model = None;
                 session.proof = None;
                 session.terminal = None;
                 card.title = session.launch.provider.chat_title().into();

@@ -3332,6 +3332,7 @@ mod tests {
                 provider: crate::agent::Provider::Omp,
                 recipe: launch.clone(),
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: terminal.map(Box::new),

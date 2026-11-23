@@ -2864,7 +2864,8 @@ impl ControlClient {
             request,
         };
         if let Some(deadline) = deadline {
-            write_frame(
+            write_frame_for(
+                self.protocol,
                 &mut DeadlineWriter {
                     stream: &mut self.stream,
                     deadline,
@@ -2872,7 +2873,7 @@ impl ControlClient {
                 &envelope,
             )?;
         } else {
-            write_frame(&mut self.stream, &envelope)?;
+            write_frame_for(self.protocol, &mut self.stream, &envelope)?;
         }
 
         loop {
@@ -3040,6 +3041,16 @@ impl ControlClient {
             .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(ControlError::Configure)
     }
+}
+
+/// Writes a request as a daemon of `protocol` reads it, which is older than
+/// this one when it is an update source.
+fn write_frame_for<T: serde::Serialize>(
+    protocol: u16,
+    writer: &mut impl std::io::Write,
+    value: &T,
+) -> Result<(), crate::terminal_ipc::FrameError> {
+    crate::terminal_ipc::encoding_for(protocol, || write_frame(writer, value))
 }
 
 /// Reads a daemon's message as a daemon of `protocol` encoded it, which is
@@ -6438,6 +6449,43 @@ mod tests {
         write_frame(&mut garbage, &[0xffu8; 3]).unwrap();
         assert!(super::read_frame_from::<FileChange>(older, &mut garbage.as_slice()).is_err());
         assert!(!decoding_before(PATCH_LINE_ORIGIN));
+    }
+
+    /// A client writes its requests to an update source as that source reads
+    /// them, and to a current daemon in full.
+    #[test]
+    fn a_request_is_written_in_the_sources_protocol() {
+        use crate::chat::Launch;
+        use crate::terminal_ipc::{DRAFT_MODEL_IN_LAUNCH, PROTOCOL_VERSION, read_frame};
+        let launch = Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: "/work".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+            draft_model: Some(Box::new(crate::model::ChatDraftModel {
+                session: crate::model::TerminalId::new(),
+                provider: crate::agent::Provider::Codex,
+                model: Some("gpt".into()),
+                reasoning: None,
+            })),
+        };
+        let older = DRAFT_MODEL_IN_LAUNCH - 1;
+        let mut frame = Vec::new();
+        super::write_frame_for(older, &mut frame, &launch).unwrap();
+        let read: Launch = super::read_frame_from(older, &mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.draft_model, None);
+        assert_eq!(read.recipe, launch.recipe);
+        let mut frame = Vec::new();
+        super::write_frame_for(PROTOCOL_VERSION, &mut frame, &launch).unwrap();
+        let read: Launch = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(read, launch);
     }
 
     #[test]
@@ -10011,6 +10059,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("recorded".into()),
+                draft_model: None,
             },
             proof: Some(pinned.clone()),
             terminal: None,
@@ -10096,6 +10145,7 @@ mod tests {
                         unset_environment: Default::default(),
                     },
                     session_id: Some("reviewed".into()),
+                    draft_model: None,
                 },
                 proof: Some(pinned.clone()),
                 terminal: None,
@@ -10206,6 +10256,7 @@ mod tests {
                 provider: crate::agent::Provider::Codex,
                 recipe: recipe.clone(),
                 session_id: None,
+                draft_model: None,
             },
             proof: Some(pinned.clone()),
             terminal: None,
@@ -10808,6 +10859,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+                draft_model: None,
             },
             proof: Some(pinned.clone()),
             terminal: None,
@@ -11822,6 +11874,7 @@ mod tests {
                     provider: crate::agent::Provider::Claude,
                     recipe: credential_recipe("claude"),
                     session_id: None,
+                    draft_model: None,
                 },
                 proof: None,
                 terminal: Some(Box::new(terminal("claude"))),

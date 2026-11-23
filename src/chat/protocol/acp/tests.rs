@@ -81,6 +81,7 @@ fn launch(arguments: &[&str], session: Option<&str>) -> Launch {
             unset_environment: Default::default(),
         },
         session_id: session.map(str::to_owned),
+        draft_model: None,
     }
 }
 

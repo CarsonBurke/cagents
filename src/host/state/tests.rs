@@ -171,6 +171,7 @@ fn channel_title_admission_rejects_delayed_names_from_the_same_resident_actor() 
             provider: crate::agent::Provider::Claude,
             recipe,
             session_id: Some(SESSION.into()),
+            draft_model: None,
         },
     };
     state.chats.insert(
@@ -343,6 +344,7 @@ fn a_pane_that_has_not_recorded_its_conversation_takes_its_first_prompt_name() {
             provider: crate::agent::Provider::Claude,
             recipe,
             session_id: None,
+            draft_model: None,
         },
     };
     state
@@ -1233,6 +1235,7 @@ for line in sys.stdin:
                     ]),
                 },
                 session_id: Some(id.into()),
+                draft_model: None,
             },
             proof: Some(
                 host.lock()
@@ -1419,6 +1422,7 @@ for line in sys.stdin:
                 ]),
             },
             session_id: Some(A.into()),
+            draft_model: None,
         },
         proof: Some(
             host.lock()
@@ -1885,6 +1889,7 @@ pub(super) fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
             provider: Provider::Omp,
             recipe: recipe.clone(),
             session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+            draft_model: None,
         },
         proof: Some(
             host.lock()
@@ -2768,6 +2773,7 @@ fn a_stop_refused_for_native_work_names_confirmation_unless_emptiness_was_demand
                     provider: crate::agent::Provider::Claude,
                     recipe: recipe.clone(),
                     session_id: None,
+                    draft_model: None,
                 },
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
@@ -3524,6 +3530,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
                 working_directory: directory.path().into(),
                 environment: selected,
             },
+            draft_model: None,
         },
     };
     state.chats.insert(

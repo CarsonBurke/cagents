@@ -6697,6 +6697,7 @@ fn attention_chat_alias_proof_does_not_follow_another_native_thread_or_unknown_i
             provider: crate::agent::Provider::Codex,
             session_id: Some("original-thread".into()),
             recipe: source.launch.clone(),
+            draft_model: None,
         },
     };
     assert!(same_attention_update_source(
@@ -8160,6 +8161,7 @@ fn retained_chat_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
             provider: crate::agent::Provider::Claude,
             recipe: terminal.launch,
             session_id: Some("retained-close-fixture".into()),
+            draft_model: None,
         },
     };
     let kind = CardKind::Chat(session);

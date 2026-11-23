@@ -412,6 +412,7 @@ fn begin_history() -> (tempfile::TempDir, Cagents, Scope, Task<Message>) {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         },
     };

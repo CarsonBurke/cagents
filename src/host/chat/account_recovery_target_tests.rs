@@ -176,6 +176,7 @@ done
                 ]),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let mut recipe = source.launch.recipe.clone();

@@ -320,7 +320,13 @@ use crate::{
 /// auto-compacts the conversation, which the context meter measures against.
 /// An older client is sent usage without it; usage read from an older update
 /// source has none, which leaves the whole window as the budget.
-pub const PROTOCOL_VERSION: u16 = 201;
+///
+/// Version 202 adds `Launch::draft_model`, the model and effort chosen for an
+/// unstarted draft, so every window showing the draft shows and starts it on
+/// them. An older client is sent launches without it, and its requests are
+/// read without it; one read from an older update source has none, and a
+/// request to one is written without it.
+pub const PROTOCOL_VERSION: u16 = 202;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -348,12 +354,10 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
-#[cfg(test)]
-pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN,
-    PLAN_AND_RESET_READINGS, USAGE_COMPACT_LIMIT, WAIT_KINDS, WAITING_TOOL_STATUS, decoding_before,
-    decoding_from, encoding_before,
+    ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH, ENDED_TOOL_STATUS,
+    PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, USAGE_COMPACT_LIMIT, WAIT_KINDS,
+    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before, encoding_for,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

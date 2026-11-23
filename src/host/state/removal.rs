@@ -57,6 +57,7 @@ mod tests {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         let (handle, _) = crate::chat::runtime::Handle::fixture_remote_attachment_pair();

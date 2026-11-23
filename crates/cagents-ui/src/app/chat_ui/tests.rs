@@ -16808,6 +16808,8 @@ fn a_peer_provider_switch_clears_this_windows_model_pick() {
         unreachable!()
     };
     moved.launch.provider = Provider::Codex;
+    // A move starts the new provider's draft with no choice made for it.
+    moved.launch.draft_model = None;
     let moved = moved.clone();
     drop(app.adopt_shared_draft_session(card, &moved));
     let runtime = chat_runtime(&app, card);
@@ -16817,6 +16819,70 @@ fn a_peer_provider_switch_clears_this_windows_model_pick() {
         !app.persistent_workspace()
             .chat_draft_models
             .contains_key(&card)
+    );
+}
+
+/// Two windows show one draft: the model and effort either chooses is the
+/// draft's, so the other shows it. Starting on it is
+/// `a_model_another_window_chose_starts_the_draft_and_leaves_its_launch`.
+#[test]
+fn a_model_chosen_in_one_window_is_shown_in_the_other() {
+    let mut chooser = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut chooser, Provider::Claude);
+    let target = chat_runtime(&chooser, card).target;
+    drop(chooser.update(Message::ChatUi(Action::DraftModel(
+        target,
+        Provider::Claude,
+        Some("other-model".into()),
+    ))));
+    drop(chooser.update(Message::ChatUi(Action::Reasoning(
+        target,
+        "other-model".into(),
+        Some("low".into()),
+    ))));
+    // What the shared view carries to every window showing the pane.
+    let Some(CardKind::Chat(shared)) = chooser.card_state(card).map(|state| state.kind.clone())
+    else {
+        unreachable!()
+    };
+    assert_eq!(chat_runtime(&chooser, card).session, shared);
+    assert_eq!(
+        super::draft_choice::get(&shared),
+        Some((Some("other-model".into()), Some("low".into())))
+    );
+
+    // The other window shows the same draft on its own remembered choice.
+    let mut peer = crate::app::tests::context_inspector_test_app(false);
+    drop(peer.observe_listed_models(
+        Provider::Claude,
+        vec![
+            fixture_model("fixture-model", &["low", "high"]),
+            fixture_model("other-model", &["low", "high"]),
+        ],
+        None,
+    ));
+    let peer_card = draft_chat_for_provider(&mut peer, Provider::Claude);
+    // Before the choice reaches it, the peer shows the same draft unchosen.
+    let session = shared.clone();
+    let mut unchosen = session.clone();
+    unchosen.launch.draft_model = None;
+    let Some(CardRuntime::Chat(runtime)) = peer.cards.get_mut(&peer_card) else {
+        unreachable!()
+    };
+    runtime.session = unchosen;
+    drop(peer.adopt_shared_draft_session(peer_card, &session));
+    let runtime = chat_runtime(&peer, peer_card);
+    assert_eq!(runtime.session, session);
+    assert_eq!(
+        runtime.snapshot.selected_model.as_deref(),
+        Some("other-model")
+    );
+    assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
+    assert!(runtime.draft_model_chosen);
+    // The peer's own preference for new drafts is its own.
+    assert_ne!(
+        peer.chat_ui.last_models.get(&Provider::Claude),
+        Some(&("other-model".to_owned(), Some("low".to_owned())))
     );
 }
 

@@ -38,6 +38,7 @@ fn reopened(root: &Path) -> Session {
                 unset_environment: Default::default(),
             },
             session_id: Some(thread_id().into()),
+            draft_model: None,
         },
     }
 }

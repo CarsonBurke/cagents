@@ -1145,6 +1145,7 @@ fn refused_optimistic_channel_title_is_restored_by_equal_authoritative_read() {
                     environment: Default::default(),
                 },
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: None,

@@ -70,6 +70,7 @@ impl Fixture {
                     unset_environment: Default::default(),
                 },
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: None,
