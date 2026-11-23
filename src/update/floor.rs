@@ -34,9 +34,11 @@ pub(super) fn preview_stop_list(
         return Ok(None);
     };
     let mut client = source_client_for(daemon)?;
+    let terminals = client.list()?;
     let inventory = Inventory {
         chats: client.list_chats()?,
-        terminals: client.list()?,
+        processes: super::floor_display::TerminalProcesses::observe(&terminals),
+        terminals,
         chat_states: BTreeMap::new(),
     };
     let service = needs_service_stop(daemon)
@@ -61,6 +63,9 @@ struct Inventory {
     chats: Vec<crate::chat::Session>,
     chat_states: BTreeMap<TerminalId, String>,
     terminals: Vec<TerminalDescriptor>,
+    /// The terminals' processes, observed with them, so their foreground
+    /// commands can label the stop list.
+    processes: super::floor_display::TerminalProcesses,
 }
 
 fn stop_list(
@@ -72,7 +77,6 @@ fn stop_list(
         .daemon
         .as_ref()
         .ok_or_else(|| invalid("The source service is no longer running"))?;
-    let processes = super::floor_display::TerminalProcesses::observe();
     let mut items = Vec::new();
     for item in &daemon.sessions {
         let label = preview.labels.names.get(&item.id).unwrap_or(&item.title);
@@ -114,7 +118,7 @@ fn stop_list(
                     .continuity
                     .can_resume_live(&daemon.capability.proof)
                 {
-                    items.push(terminal_item(terminal, item, label, &processes));
+                    items.push(terminal_item(terminal, item, label, &inventory.processes));
                 }
             }
             _ => (),
@@ -167,7 +171,7 @@ fn stop_list(
                 .unwrap_or("Terminal");
             let item =
                 descriptor_impact(id, impact::SessionKind::Terminal, label, &terminal.session)?;
-            items.push(terminal_item(terminal, &item, label, &processes));
+            items.push(terminal_item(terminal, &item, label, &inventory.processes));
         }
     }
     items.sort_by_key(|item| (item.kind, item.id));
@@ -373,6 +377,7 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         Ok(Inventory {
             chats,
             chat_states,
+            processes: super::floor_display::TerminalProcesses::observe(&terminals),
             terminals,
         })
     }
