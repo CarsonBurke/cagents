@@ -1269,8 +1269,15 @@ fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings(
     assert!(adapter.background_agents.contains("live-child"));
     assert!(!adapter.tasks.iter().any(|task| task == "task-failed"));
     assert!(adapter.tasks.iter().any(|task| task == "task-live"));
+    // The live one is still counted; the count isn't what this settles.
+    let events = step
+        .events
+        .iter()
+        .filter(|event| !matches!(event, Event::BackgroundTasks(1)))
+        .cloned()
+        .collect::<Vec<_>>();
     assert!(
-        matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
+        matches!(events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
             if owner=="failed-child" && id=="failed-child" && detail==failure
             && item.id=="claude-result-error:child-result:0"
             && chat::failure::provider_error_text(Provider::Claude,item)==Some(failure)
@@ -14090,6 +14097,17 @@ fn a_background_shell_counts_before_any_level_is_reported() {
         json!({"type":"system","subtype":"task_notification","uuid":"n2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"watch",
         "status":"completed","summary":"Done"}),
     );
+    assert_eq!(lead.snapshot.background_tasks, 0);
+
+    // So does one whose end reaches the conversation only as the notice the
+    // model receives.
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"t2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"watch2",
+        "task_type":"monitor","description":"Watch the tests"}),
+    );
+    assert_eq!(lead.snapshot.background_tasks, 1);
+    lead.receive(json!({"type":"user","uuid":"delivered","origin":{"kind":"task-notification"},"message":{"role":"user",
+        "content":"<task-notification>\n<task-id>watch2</task-id>\n<status>completed</status>\n<summary>Done</summary>\n</task-notification>"}}));
     assert_eq!(lead.snapshot.background_tasks, 0);
 }
 

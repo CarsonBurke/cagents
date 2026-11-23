@@ -813,7 +813,8 @@ struct Claude {
     /// whether or not its own notification arrived.
     background_level: Option<HashSet<String>>,
     /// Every task seen to start and not yet to end, of any type, for the
-    /// count before Claude Code reports its level. Oldest first.
+    /// count before Claude Code reports its level. Oldest first. A
+    /// conversation reset keeps them: they belong to the process.
     started_tasks: VecDeque<String>,
     /// The live background task count last published; see
     /// [`Self::background_tasks`].
@@ -2802,6 +2803,7 @@ impl Claude {
                         self.settle_task_call(&call, TaskOutcome::new(ToolStatus::Ended, ""), step);
                     }
                     self.tasks.retain(|running| running != &task);
+                    self.task_ended(&task, ToolStatus::Ended);
                     self.foreground_tasks.retain(|known| known != &task);
                     let row = ScopedId::new(None, &format!("claude-task:{task}"));
                     if self.tools.get(&row).and_then(|item| item.content.status())
@@ -3040,6 +3042,7 @@ impl Claude {
         };
         if !started && ended.is_some() {
             self.tasks.retain(|running| running != task);
+            self.task_ended(task, status);
             if self.ended_agent(tool) != Some(ToolStatus::Stopped) {
                 self.ended_agents.retain(|(known, _)| known != tool);
                 self.ended_agents.push_back((tool.into(), status));
@@ -3155,6 +3158,7 @@ impl Claude {
                     // A Bash or workflow task has no Agent to settle, only its row.
                     if status != ToolStatus::Running {
                         self.tasks.retain(|running| running != &task);
+                        self.task_ended(&task, status);
                         self.settle_task_row(&task, status, step);
                     }
                     continue;
@@ -3193,6 +3197,7 @@ impl Claude {
             );
             if !running {
                 self.tasks.retain(|running| running != &task);
+                self.task_ended(&task, status);
             }
             let represented = self.agent_tool(&owner);
             if let Some(item) = self.tools.get_mut(&key)
@@ -4084,6 +4089,15 @@ impl Claude {
     /// still counts what it started. A task whose end went unseen keeps
     /// counting until a level says otherwise: an overcount only keeps a chat
     /// running.
+    /// Forgets `task` for [`Self::background_tasks`] once it ended as
+    /// `status`. A task waiting on its own background work is still alive,
+    /// so it keeps counting.
+    fn task_ended(&mut self, task: &str, status: ToolStatus) {
+        if status != ToolStatus::Waiting {
+            self.started_tasks.retain(|known| known != task);
+        }
+    }
+
     fn background_tasks(&self) -> usize {
         if let Some(live) = &self.background_level {
             return live.len();
@@ -4210,7 +4224,6 @@ impl Claude {
                 self.permissions = None;
                 self.tool_order.clear();
                 self.tasks.clear();
-                self.started_tasks.clear();
                 self.report_tasks.clear();
                 self.command_tasks.clear();
                 self.subagent_tasks.clear();
@@ -4540,16 +4553,26 @@ impl Claude {
                     {
                         *known = status;
                     }
-                    self.tasks.retain(|task| {
-                        !self
-                            .agent_task_calls
+                    let settled = |task: &String| {
+                        self.agent_task_calls
                             .iter()
                             .any(|(tool, known)| tool == parent && known == task)
-                            && !self
+                            || self
                                 .agent_calls
                                 .iter()
                                 .any(|(known, tool)| tool == parent && known == task)
-                    });
+                    };
+                    let settled = self
+                        .tasks
+                        .iter()
+                        .chain(&self.started_tasks)
+                        .filter(|task| settled(task))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for task in settled {
+                        self.tasks.retain(|running| running != &task);
+                        self.task_ended(&task, status);
+                    }
                     if let Some(stream) = self.streams.remove(parent) {
                         self.settle(Some(parent), &stream.message);
                     }
@@ -7621,9 +7644,9 @@ impl Claude {
                         status
                     }
                 });
-                if ended.is_some() {
+                if let Some(status) = ended {
                     self.tasks.retain(|running| running != task);
-                    self.started_tasks.retain(|running| running != task);
+                    self.task_ended(task, status);
                     self.foreground_tasks.retain(|known| known != task);
                 }
                 let resumed = ended.is_none() && waiting;
