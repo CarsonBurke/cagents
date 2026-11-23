@@ -851,10 +851,11 @@ The daemon's Work board keeps each open project's Git facts current. The Git
 watcher covers projects within a budget of 8192 directory watches, and each
 checkout's tracked directories count against it, so a repository with
 hundreds of worktrees is polled instead. Each worktree of a polled project
-comes due on its own. A worktree with a live agent session is read every 15 s,
-and any other every 120 s; reads due within the next 15 s share one scan. A
-recent edit still keeps its card in **Active**, but does not keep rerunning
-`git status` after its agent has stopped. Previously one recent edit anywhere
+comes due on its own. A worktree with a working agent session, or a file
+edited in the last four minutes, is read every 15 s, and any other every
+120 s; reads due within the next 15 s share one scan. An edit keeps its card
+in **Active** for three hours, but stops the 15 s `git status` reads minutes
+after the edits stop. Previously one recent edit anywhere
 made the whole project re-read every worktree every 15 s; later, each recently
 dirty worktree did so independently for the three-hour card-activity window.
 
@@ -889,7 +890,7 @@ A fixture checkout holds 40 files. A real checkout costs more per read: on a
 347-worktree repository with 8 active worktrees, the scanner's Git processes
 took at least half a core before this change.
 
-Rerun the fixture for the current session-only cadence; its per-thread I/O
+Rerun the fixture for the current cadence; its per-thread I/O
 output makes the daemon's `work-scan` reads comparable as well as the Git
 process count.
 

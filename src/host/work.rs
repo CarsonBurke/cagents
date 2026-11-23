@@ -56,6 +56,12 @@ const IDLE_POLL: Duration = Duration::from_secs(120);
 /// happens on another filesystem or while it re-registers.
 const WATCHED_POLL: Duration = Duration::from_secs(10 * 60);
 const SESSION_SAMPLE: Duration = Duration::from_secs(15);
+/// A session sampled within this long is still working; one late sample is
+/// tolerated.
+const LIVE_SESSION: Duration = Duration::from_secs(2 * SESSION_SAMPLE.as_secs());
+/// A worktree edited within this long polls at the active cadence. Two idle
+/// polls: an edit an idle poll found keeps the next one short too.
+const LIVE_EDIT: Duration = Duration::from_secs(2 * IDLE_POLL.as_secs());
 /// How often an agent's work in one worktree is written down.
 const SESSION_STAMP: Duration = Duration::from_secs(60);
 const MODEL_REFRESH: Duration = Duration::from_secs(30);
@@ -533,7 +539,7 @@ impl Shared {
     }
 
     fn worktree_due(&self, worktree: &scan::Worktree, last_scan: Instant) -> Instant {
-        let interval = if self.worktree_has_live_session(worktree) {
+        let interval = if self.worktree_live(worktree) {
             ACTIVE_POLL
         } else {
             IDLE_POLL
@@ -541,18 +547,24 @@ impl Shared {
         worktree.status_read_at.unwrap_or(last_scan) + interval
     }
 
-    /// Whether a running agent can be changing this checkout between native
-    /// filesystem events. A card remains Active for the longer product
-    /// activity window, but a completed edit must not keep an uncovered
-    /// worktree running `git status` every fifteen seconds for three hours.
-    fn worktree_has_live_session(&self, worktree: &scan::Worktree) -> bool {
+    /// Whether something may be changing this checkout between scans: a
+    /// working agent session sampled in it, or a file edited in the last few
+    /// minutes (an agent launched elsewhere can edit a worktree by path, and
+    /// each scan refreshes this while it keeps editing). A card stays Active
+    /// for the longer product window, but a finished edit must not keep an
+    /// uncovered worktree running `git status` every 15 seconds for hours.
+    fn worktree_live(&self, worktree: &scan::Worktree) -> bool {
+        let within = |at: u64, window: Duration| {
+            u128::from(now_unix_ms().saturating_sub(at)) <= window.as_millis()
+        };
         self.session_activity
             .get(&worktree.path)
-            .copied()
-            .is_some_and(|at| {
-                now_unix_ms().saturating_sub(at)
-                    <= u64::try_from(SESSION_SAMPLE.as_millis()).unwrap_or(u64::MAX) * 2
-            })
+            .is_some_and(|&at| within(at, LIVE_SESSION))
+            || worktree
+                .dirty
+                .as_ref()
+                .and_then(|dirty| dirty.newest_modified_at_unix_ms)
+                .is_some_and(|at| within(at, LIVE_EDIT))
     }
 
     fn track(&mut self, repository: &Path, name: &str) -> &mut Tracked {
@@ -2557,11 +2569,17 @@ mod tests {
         let mut shared = handle.shared();
         let start = Instant::now();
         let at = |seconds| start + Duration::from_secs(seconds);
-        // One checkout was edited recently, another still has a live session,
-        // and the rest of a large project sits untouched, most of it read
-        // more recently. Recent dirtiness affects card placement, but only a
-        // live session earns the short fallback polling cadence.
-        let edited = polled_worktree("/repo/.worktrees/edited", start, Some(now_unix_ms()));
+        // One checkout was edited an hour ago, one is being edited now,
+        // another has a live session, and the rest of a large project sits
+        // untouched, most of it read more recently. An hour-old edit still
+        // places the card in Active, but only a live session or a fresh edit
+        // earns the short fallback polling cadence.
+        let edited = polled_worktree(
+            "/repo/.worktrees/edited",
+            start,
+            Some(now_unix_ms() - 60 * 60 * 1000),
+        );
+        let editing = polled_worktree("/repo/.worktrees/editing", start, Some(now_unix_ms()));
         let session = polled_worktree("/repo/.worktrees/session", start, None);
         let nearly_due = polled_worktree("/repo/.worktrees/nearly-due", start, None);
         let quiet = (0..300)
@@ -2570,7 +2588,12 @@ mod tests {
         shared
             .session_activity
             .insert(session.path.clone(), now_unix_ms());
-        let worktrees = [edited.clone(), session.clone(), nearly_due.clone()]
+        let worktrees = [
+            edited.clone(),
+            editing.clone(),
+            session.clone(),
+            nearly_due.clone(),
+        ]
             .into_iter()
             .chain(quiet)
             .collect();
@@ -2585,12 +2608,17 @@ mod tests {
         assert_eq!(shared.due_polls(tracked, at(14)), None);
         assert_eq!(
             shared.due_polls(tracked, at(15)),
-            Some(BTreeSet::from([session.id])),
-            "a historical edit does not earn the short polling cadence"
+            Some(BTreeSet::from([editing.id, session.id])),
+            "an hour-old edit does not earn the short polling cadence"
         );
         assert_eq!(
             shared.due_polls(tracked, at(110)),
-            Some(BTreeSet::from([edited.id, session.id, nearly_due.id])),
+            Some(BTreeSet::from([
+                edited.id,
+                editing.id,
+                session.id,
+                nearly_due.id
+            ])),
             "idle worktrees due in the next active interval join one scan"
         );
         // The quiet worktrees still come due at the idle cadence.
@@ -2598,7 +2626,7 @@ mod tests {
             shared
                 .due_polls(tracked, at(94) + IDLE_POLL)
                 .map(|due| due.len()),
-            Some(303)
+            Some(304)
         );
     }
 
