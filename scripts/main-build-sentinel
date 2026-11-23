@@ -613,7 +613,7 @@ def main():
     parser.add_argument("--require-tests", metavar="SHA",
                         help="print SHA's test verdict, testing it first if it has none; exit 0 "
                              "if its tests passed, 1 if they failed, 3 if a lane stopped outside "
-                             "the code, as when the build host refused it")
+                             "the code, as when the build host refused it, 4 on any other error")
     args = parser.parse_args()
     if socket.gethostname().split(".")[0] != "fw16":
         parser.error("run this watcher on fw16; builds still go through scripts/cargo-gate")
@@ -621,7 +621,12 @@ def main():
     _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
     if args.require_tests:
-        verdict = require_tests(args.repository.resolve(), args.state.resolve(), args.require_tests)
+        try:
+            verdict = require_tests(args.repository.resolve(), args.state.resolve(), args.require_tests)
+        except Exception as error:
+            # Not a verdict: the caller must not read it as failing tests.
+            print(f"main-build-sentinel: no verdict for {args.require_tests}: {error!r}", file=sys.stderr)
+            sys.exit(4)
         print(json.dumps(verdict, indent=2))
         sys.exit(0 if verdict["passed"] else 3 if verdict.get("outside_code") else 1)
     tick(args.repository.resolve(), args.state.resolve(), args.github_repository)

@@ -903,8 +903,8 @@ the disk guard's refusal or a kill, says nothing about the code: it keeps no
 verdict, opens no issue, and the commit is tested again 30 minutes later.
 
 `scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
-commit's verdict and exits 0 if its tests passed, 1 if they failed and 3 if a
-lane stopped outside the code. A commit without a verdict, such as a version
+commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a
+lane stopped outside the code and 4 if it could not get a verdict at all. A commit without a verdict, such as a version
 bump that main moved past before it was tested, is tested first, after any
 running check finishes, fetching main first if fw16 does not have it yet.
 A failing verdict is not retested on its own: to test a commit again, such as
