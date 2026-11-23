@@ -1,8 +1,15 @@
 # Native chat capacity
 
-The daemon keeps a bounded number of resident native chat handles. Completed
-handles can still occupy this capacity. This limit is separate from account
+The daemon keeps a bounded number of resident native chat handles that can run
+a provider. A pane that only shows saved history, such as one an update paused,
+holds no slot, so a full daemon still opens saved conversations. Completed
+writers can still occupy this capacity. This limit is separate from account
 usage allowances and provider plan quotas.
+
+A full daemon refuses a new chat with "No room for another chat", how many are
+open, and the limit. The pane keeps the message you wrote and offers Retry;
+close a chat you have finished with, then retry. The refusal's details name
+the `cagents chat capacity set` command that allows more at once.
 
 Run `cagents chat capacity` to see used admission slots, resident handles, pending
 spawns and the configured limit. Its compact resident table includes completed

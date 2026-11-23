@@ -57,22 +57,44 @@ fn pending(state: &HostState) -> usize {
             .count()
 }
 
+/// How many slots the refusal suggests adding when it names the setting.
+const SUGGESTED_INCREASE: usize = 32;
+
 pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> {
     let used = usage(state);
     if used >= state.native_chat_capacity {
         return Err(ProtocolError::new(
             ProtocolErrorCode::ChatCapacity,
-            format!(
-                "Daemon native chat capacity reached: {} resident, {} starting, limit {} ({} distinct slots used). Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
-                holders(state),
-                pending(state),
-                state.native_chat_capacity,
-                used,
-            ),
+            refusal(used, pending(state), state.native_chat_capacity),
             true,
         ));
     }
     Ok(())
+}
+
+/// A headline the person can act on, then the detail a reader of Details or
+/// the CLI needs: what counts, and how to allow more.
+fn refusal(used: usize, starting: usize, limit: usize) -> String {
+    let running = match used {
+        1 => "1 chat is open".to_owned(),
+        n => format!("{n} chats are open"),
+    };
+    let starting = match starting {
+        0 => String::new(),
+        n => format!(" ({n} of them starting)"),
+    };
+    let maximum = crate::native_chat_capacity::MAX_LIMIT as usize;
+    let more = if limit < maximum {
+        let suggested = (used.max(limit) + SUGGESTED_INCREASE).min(maximum);
+        format!(" To allow more at once, run `cagents chat capacity set {suggested}`.")
+    } else {
+        String::new()
+    };
+    format!(
+        "No room for another chat: {running}{starting}, and the limit is {limit}.\n\n\
+         Close a chat you have finished with, then try again; `cagents chat capacity` lists \
+         the open ones. Chats that only show saved history don't count.{more}"
+    )
 }
 
 /// An exact descriptor is the reservation token. Other transitions cannot
@@ -337,7 +359,7 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
                 status: if state.chat_spawning.contains_key(&id) {
                     "starting".into()
                 } else if record.handle.is_read_only_history() {
-                    "read-only history".into()
+                    "saved history only (no slot)".into()
                 } else if record.handle.is_completed() {
                     "closed".into()
                 } else {
@@ -1078,7 +1100,9 @@ mod tests {
         rejected.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
         let failure = start(&host, 1, rejected, None, false, None, Default::default()).unwrap_err();
         assert_eq!(failure.code, ProtocolErrorCode::ChatCapacity);
-        assert!(failure.message.contains("0 resident, 1 starting, limit 1"));
+        assert!(failure.message.starts_with(
+            "No room for another chat: 1 chat is open (1 of them starting), and the limit is 1."
+        ));
         assert_eq!(host.lock().unwrap().chat_spawning.len(), 1);
     }
 
@@ -1369,6 +1393,25 @@ mod tests {
         drop(admission);
         assert!(host.lock().unwrap().chats.contains_key(&source.id));
     }
+    #[test]
+    fn refusal_leads_with_what_happened_and_names_the_next_step() {
+        let text = refusal(128, 0, 128);
+        let (headline, detail) = text.split_once("\n\n").unwrap();
+        assert_eq!(
+            headline,
+            "No room for another chat: 128 chats are open, and the limit is 128."
+        );
+        assert!(headline.chars().count() <= 160);
+        assert!(detail.starts_with("Close a chat you have finished with, then try again;"));
+        assert!(detail.contains("`cagents chat capacity` lists the open ones"));
+        assert!(detail.ends_with("run `cagents chat capacity set 160`."));
+        // A lowered limit suggests room above what already runs.
+        assert!(refusal(130, 2, 1).contains("(2 of them starting), and the limit is 1."));
+        assert!(refusal(130, 2, 1).contains("set 162`"));
+        let maximum = crate::native_chat_capacity::MAX_LIMIT as usize;
+        assert!(!refusal(maximum, 0, maximum).contains("capacity set"));
+    }
+
     #[test]
     fn history_readers_hold_no_slot() {
         let host = host();

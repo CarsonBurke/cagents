@@ -3347,7 +3347,11 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
     let rejected = start(&host, 0, other, None, false, None, Default::default()).unwrap_err();
     assert_eq!(rejected.code, ProtocolErrorCode::ChatCapacity);
     assert!(rejected.retryable);
-    assert!(rejected.message.contains("0 resident, 1 starting, limit 1"));
+    assert!(
+        rejected
+            .message
+            .contains("1 chat is open (1 of them starting), and the limit is 1")
+    );
     cleanup.fail.store(true, Ordering::SeqCst);
     assert!(
         retained_actor::reconcile_startup(&host, &source)

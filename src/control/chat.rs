@@ -152,7 +152,7 @@ fn execute_requests(
 
 fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) -> CommandOutput {
     let suffix = if capacity.used >= capacity.limit {
-        "\nNew admissions are blocked. Existing work is unchanged. Check eligibility with cagents chat release ID --dry-run. Release requires supported, verified saved history and no protected work."
+        "\nFull: new chats are refused until one closes. Open chats keep working, and saved history still opens. Close a chat you have finished with, or raise the limit with cagents chat capacity set N."
     } else {
         ""
     };
@@ -194,8 +194,8 @@ fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) 
         .saturating_sub(capacity.resident);
     let readers = match readers {
         0 => String::new(),
-        1 => "; 1 read-only history reader holds no slot".to_owned(),
-        n => format!("; {n} read-only history readers hold no slot"),
+        1 => "; 1 chat only shows saved history and doesn't count toward the limit".to_owned(),
+        n => format!("; {n} chats only show saved history and don't count toward the limit"),
     };
     let mut data = json!(capacity);
     data["persistence_warning"] = json!(persistence_warning);
@@ -477,7 +477,7 @@ mod tests {
             None,
         );
         assert!(output.human.starts_with(
-            "Native chats: 1 used / 128 limit (1 resident, 0 spawning; 2 read-only history readers hold no slot)"
+            "Native chats: 1 used / 128 limit (1 resident, 0 spawning; 2 chats only show saved history and don't count toward the limit)"
         ));
     }
 
@@ -539,6 +539,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.data["resident"], 128);
-        assert!(output.human.contains("Existing work is unchanged"));
+        assert!(output.human.contains("Open chats keep working"));
     }
 }
