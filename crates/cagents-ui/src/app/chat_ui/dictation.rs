@@ -269,9 +269,7 @@ impl Runtime {
         self.composer_note = None;
         self.dismiss_suggestion();
         self.completion.restart(true);
-        self.history_cursor = None;
-        self.history_stash = None;
-        self.history_attachment_stash = None;
+        self.end_history_walk();
     }
 
     /// Follows an edit of the draft other than dictation's own.
@@ -314,7 +312,7 @@ impl Runtime {
         if !start.valid || !end.valid || start.cursor.position == end.cursor.position {
             return;
         }
-        let before = self.composer.cursor();
+        let before = self.composer.selection_span();
         let inline = self.inline_references();
         attachment_draft::move_to(
             &mut self.composer,
@@ -323,7 +321,8 @@ impl Runtime {
                 selection: Some(start.cursor.position),
             },
         );
-        if let Some(change) = attachment_draft::edit(&mut self.composer, text_editor::Edit::Delete) {
+        if let Some(change) = attachment_draft::edit(&mut self.composer, text_editor::Edit::Delete)
+        {
             for bookmark in self.attachment_bookmarks.values_mut() {
                 bookmark.changed(&change);
             }
