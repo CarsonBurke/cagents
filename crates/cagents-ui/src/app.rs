@@ -1808,14 +1808,6 @@ struct ReplicaSnapshotDebt {
     writer: crate::session::WriterIdentity,
 }
 
-/// Whether a focus change reads the newly focused pane's update at once, or
-/// leaves that to the attention dwell once the pane has stayed visible.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FocusRead {
-    Now,
-    AfterDwell,
-}
-
 /// What an update changed in the durable workspace beside focus, which decides
 /// when [`Cagents::apply_viewport`] hands the workspace to the writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9142,10 +9134,14 @@ impl Cagents {
         })
     }
 
+    /// Whether the person is attending to `card`: the focused pane of the
+    /// focused window, chosen rather than only passed over by the pointer,
+    /// with nothing covering it. Its updates are read as they come.
     fn pane_is_active(&self, card: CardId) -> bool {
         self.exit.is_none()
             && self.refresh_ui.focused
             && self.workspace.focused() == Some(card)
+            && !self.hover_focused(card)
             && !self.modal_is_open()
             && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
@@ -10664,11 +10660,12 @@ impl Cagents {
     }
 
     /// Typing in the pane the pointer focused chooses it: from then on it is
-    /// where a new pane opens. A shortcut, or a modifier pressed on its way
-    /// to one, chooses nothing.
-    fn note_typing(&mut self, event: &keyboard::Event) {
+    /// where a new pane opens, and its update is read. A shortcut, or a
+    /// modifier pressed on its way to one, chooses nothing. Returns whether
+    /// this key chose the pane.
+    fn note_typing(&mut self, event: &keyboard::Event) -> bool {
         let keyboard::Event::KeyPressed { key, .. } = event else {
-            return;
+            return false;
         };
         if self.hover_focus.is_none()
             || self.workspace_inputs_blocked()
@@ -10691,13 +10688,15 @@ impl Cagents {
             )
             .is_some()
         {
-            return;
+            return false;
         }
-        if self.hover_focus.is_some_and(|hover| {
+        let chosen = self.hover_focus.is_some_and(|hover| {
             !hover.keyboard_outside && self.workspace.focused() == Some(hover.card)
-        }) {
+        });
+        if chosen {
             self.hover_focus = None;
         }
+        chosen
     }
 
     /// Records whether a pane event's focus was chosen. The pointer entering
@@ -10721,6 +10720,12 @@ impl Cagents {
             WorkspaceViewportEvent::PointerFocused { .. } => self.hover_focus = None,
             _ => {}
         }
+    }
+
+    /// Whether `card` holds the focus only because the pointer passed over
+    /// it. Such a pane is neither where a new pane opens nor read.
+    fn hover_focused(&self, card: CardId) -> bool {
+        self.hover_focus.is_some_and(|hover| hover.card == card)
     }
 
     /// The pane a new pane opens after when nothing more specific opened it:
@@ -10775,7 +10780,20 @@ impl Cagents {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.keyboard_modifiers = *modifiers;
         }
-        self.note_typing(&event);
+        if self.note_typing(&event) {
+            let read = self.acknowledge_active_pane();
+            let (task, _) = self.answer_key(event, captured);
+            return (Task::batch([read, task]), Projection::Full);
+        }
+        self.answer_key(event, captured)
+    }
+
+    /// Answers a key that no dialog took first; see [`Self::key_event`].
+    fn answer_key(
+        &mut self,
+        event: keyboard::Event,
+        captured: bool,
+    ) -> (Task<Message>, Projection) {
         // Letting go of a dictation shortcut held down ends push-to-talk,
         // whatever has the keyboard now.
         if let keyboard::Event::KeyReleased { physical_key, .. } = &event
@@ -11356,16 +11374,6 @@ impl Cagents {
         synchronize_scroll: bool,
         durable_change: DurableChange,
     ) -> Task<Message> {
-        self.apply_viewport_reading(update, synchronize_scroll, durable_change, FocusRead::Now)
-    }
-
-    fn apply_viewport_reading(
-        &mut self,
-        update: ViewportUpdate,
-        synchronize_scroll: bool,
-        durable_change: DurableChange,
-        read: FocusRead,
-    ) -> Task<Message> {
         // A pane resized too narrow for its inspector closes it before it is
         // drawn squeezed.
         self.sync_pane_inspectors();
@@ -11388,7 +11396,8 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).focused = focused;
         }
         let mut tasks = Vec::new();
-        if focus_changed && read == FocusRead::Now {
+        // A pane the pointer only passed over is not read.
+        if focus_changed {
             tasks.push(self.acknowledge_active_pane());
         }
         if self.chrome_ui.tabs_focus != focused {
@@ -12389,7 +12398,10 @@ impl Cagents {
         show_resize_splitter: bool,
     ) -> Element<'a, Message> {
         let card = self.card_state(id);
-        let attention = self.sidebar_state.has_card_update(id) && !focused;
+        // The chosen pane does not mark itself; one the pointer only passed
+        // over has not been read and keeps its mark.
+        let attention =
+            self.sidebar_state.has_card_update(id) && (!focused || self.hover_focused(id));
         let labels = self.card_labels(card.map(|card| &card.kind));
         // `sync_chrome` keeps an entry for every durable card the strip can
         // show; a miss can only be a card that is not durable, which renders
@@ -13188,26 +13200,14 @@ impl Cagents {
         } else {
             surface
         };
-        // The attention border goes around the whole pane, its inspector
+        // The attention frame goes around the whole pane, its inspector
         // included, and over both, so the inspector's surface cannot hide
-        // it. It is always mounted, so attention coming and going never
-        // remounts the pane.
+        // it. It stops short of the trailing rule layered over it, which
+        // would otherwise hide its right side. It is always mounted, so
+        // attention coming and going never remounts the pane.
         let surface = crate::interaction::layer(
             surface,
-            widget::container(iced::widget::Space::new())
-                .class(cosmic::theme::Container::custom(move |theme| {
-                    iced::widget::container::Style {
-                        border: iced::Border {
-                            color: design::warning_color(theme),
-                            width: if attention { design::BORDER_WIDTH } else { 0.0 },
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                }))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
+            design::attention_frame(attention, show_resize_splitter),
         );
         let edge: Element<'a, Message> = if card.is_some() {
             if show_resize_splitter {
@@ -18511,11 +18511,14 @@ impl Cagents {
                 // card, even if no view has observed its acknowledgment yet.
                 self.set_terminal_review_owner(None);
                 let task = self.focus_workspace_card(id);
-                // Only a pane that took the focus was chosen.
+                // Only a pane that took the focus was chosen. Choosing the
+                // pane the pointer had already focused reads it too.
                 if self.workspace.focused() == Some(id) {
                     self.hover_focus = None;
+                    Task::batch([task, self.acknowledge_active_pane()])
+                } else {
+                    task
                 }
-                task
             }
             Message::PaneWidgetFocused(id) => {
                 self.set_terminal_review_owner(None);
@@ -19144,16 +19147,14 @@ impl Cagents {
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
                 self.note_viewport_focus(event, previous_focus);
-                // The pointer passing over a pane on its way elsewhere focuses
-                // it, but has not read it: its update is read once it stays
-                // visible for the attention dwell, like any other pane.
-                let read = if matches!(event, WorkspaceViewportEvent::PointerEntered(_)) {
-                    FocusRead::AfterDwell
+                let task = self.apply_viewport(update, false, DurableChange::None);
+                // A press chooses the pane even where the pointer had already
+                // focused it, and reads it.
+                let read = if matches!(event, WorkspaceViewportEvent::PointerFocused { .. }) {
+                    self.acknowledge_active_pane()
                 } else {
-                    FocusRead::Now
+                    Task::none()
                 };
-                let task =
-                    self.apply_viewport_reading(update, false, DurableChange::None, read);
                 let keyboard = match event {
                     WorkspaceViewportEvent::PointerEntered(card)
                         if self.workspace.focused() == Some(card) =>
@@ -19171,7 +19172,7 @@ impl Cagents {
                     }
                     _ => Task::none(),
                 };
-                let task = Task::batch([task, keyboard]);
+                let task = Task::batch([task, read, keyboard]);
                 // Both native Scrolled feedback and Resized can measure the
                 // narrower strip first. Reveal its active tab independently
                 // of focus activation and attention acknowledgement.

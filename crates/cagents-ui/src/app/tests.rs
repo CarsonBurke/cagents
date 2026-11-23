@@ -12324,7 +12324,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
 }
 
 #[test]
-fn pane_attention_tracks_semantic_events_and_a_hover_reads_only_the_pane_it_stays_on() {
+fn pane_attention_tracks_semantic_events_and_a_hover_never_reads_a_pane() {
     use crate::agent::{Activity, ActivityState, Provider};
     let mut app = context_inspector_test_app(true);
     let window = window::Id::RESERVED;
@@ -12364,43 +12364,85 @@ fn pane_attention_tracks_semantic_events_and_a_hover_reads_only_the_pane_it_stay
     });
     assert_eq!(app.workspace.focused(), Some(second_id));
     assert_eq!(app.workspace.camera().offset(), offset);
-    // Hover focus is immediate, but passing over a pane does not read it.
+    // Hover focus is immediate, but the pointer resting on a pane, however
+    // long, does not read it: no dwell starts, and a timer from before reads
+    // nothing.
     assert!(app.sidebar_state.has_card_update(second_id));
-    // The pointer moves on to the third pane before the attention dwell
-    // ends, and that dwell's timer, stale now, reads neither.
-    let stale = app.attention_focus_epoch;
-    let _ = app.update(Message::Viewport {
-        generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerEntered(third_id),
-    });
-    assert_eq!(app.workspace.focused(), Some(third_id));
-    drop(app.update(Message::AcknowledgeVisiblePane {
-        card: second_id,
-        epoch: stale,
-    }));
-    assert!(app.sidebar_state.has_card_update(second_id));
-    assert!(app.sidebar_state.has_card_update(third_id));
-    // Back on the second pane, and it stays there for the dwell.
-    let _ = app.update(Message::Viewport {
-        generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerEntered(second_id),
-    });
+    drop(app.sync_visible_attention());
     drop(app.update(Message::AcknowledgeVisiblePane {
         card: second_id,
         epoch: app.attention_focus_epoch,
     }));
-    // Only the pane the pointer stayed on is read.
-    assert!(!app.sidebar_state.has_card_update(second_id));
-    assert!(app.sidebar_state.has_card_update(third_id));
-    app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
-    assert!(!app.sidebar_state.has_card_update(second_id));
+    assert!(app.sidebar_state.has_card_update(second_id));
+    // News for a pane the pointer only rests on is news.
+    app.observe_agent_activity_for_card(first, activity(ActivityState::Working));
+    let _ = app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::PointerEntered(first),
+    });
+    app.observe_agent_activity_for_card(first, activity(ActivityState::Idle));
+    assert!(app.sidebar_state.has_card_update(first));
     app.settings.focus_follows_mouse = false;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
         event: WorkspaceViewportEvent::PointerEntered(third_id),
     });
-    assert_eq!(app.workspace.focused(), Some(second_id));
+    assert_eq!(app.workspace.focused(), Some(first));
     assert!(app.sidebar_state.has_card_update(third_id));
+}
+
+/// Focusing a pane is enough to read it, by any choice: a press, typing in
+/// it, its tab or a row, or moving focus to it. The pane the pointer had
+/// already focused is read when chosen, at once rather than after a dwell.
+#[test]
+fn choosing_a_pane_reads_its_update_at_once() {
+    let (mut app, ids) = four_terminals();
+    let window = window::Id::RESERVED;
+    app.core.set_main_window_id(Some(window));
+    drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+        window, true,
+    ))));
+    app.settings.focus_follows_mouse = true;
+    for &card in &ids[1..] {
+        app.observe_agent_update_for_card(card);
+        assert!(app.sidebar_state.has_card_update(card));
+    }
+    let hovered_then = |app: &mut Cagents, card, choose: &dyn Fn(&mut Cagents)| {
+        viewport(app, WorkspaceViewportEvent::PointerEntered(card));
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "hover reads nothing"
+        );
+        choose(app);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(!app.sidebar_state.has_card_update(card), "choosing reads");
+    };
+    hovered_then(&mut app, ids[1], &|app| {
+        viewport(
+            app,
+            WorkspaceViewportEvent::PointerFocused {
+                card: ids[1],
+                primary: true,
+            },
+        );
+    });
+    hovered_then(&mut app, ids[2], &|app| {
+        type_key(
+            app,
+            keyboard::Key::Character("a".into()),
+            keyboard::Modifiers::empty(),
+        );
+    });
+    hovered_then(&mut app, ids[3], &|app| {
+        drop(app.update(Message::FocusCard(ids[3])));
+    });
+
+    // Focus moved to a pane by anything but the pointer reads it too.
+    app.observe_agent_update_for_card(ids[1]);
+    assert!(app.sidebar_state.has_card_update(ids[1]));
+    drop(app.update(Message::FocusCard(ids[1])));
+    assert!(!app.sidebar_state.has_card_update(ids[1]));
 }
 
 /// Moving focus alone is saved once per burst rather than once per move,
