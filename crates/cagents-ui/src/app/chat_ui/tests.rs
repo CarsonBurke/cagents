@@ -10451,12 +10451,28 @@ fn a_declined_send_is_a_notice_unless_the_conversation_cannot_go_on() {
         drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
         settle(&mut app, card, Err(outcome.into()));
         let runtime = chat_runtime(&app, card);
-        assert!(
+        // A message that may have arrived stays where it went, as not
+        // confirmed, rather than in the composer to be sent twice; its row
+        // says so, unless the conversation itself is done.
+        let unknown = chat::failure::DeliveryOutcome::parse(outcome)
+            .unwrap()
+            .unknown;
+        assert_eq!(
             runtime.failures.iter().any(|note| note.text == outcome),
+            !unknown || conversation_error,
             "{outcome}: {:?}",
             runtime.failures
         );
-        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert_eq!(
+            runtime.composer.text().trim(),
+            if unknown { "" } else { "Keep this message" },
+            "{outcome}"
+        );
+        assert_eq!(
+            runtime.commands.unconfirmed().len(),
+            usize::from(unknown),
+            "{outcome}"
+        );
         assert_eq!(
             runtime.reported_errors().next().is_some(),
             conversation_error,
@@ -10488,7 +10504,7 @@ fn an_exit_after_a_declined_send_replaces_only_a_send_notice() {
     use chat::failure::delivery;
     for (outcome, kept) in [
         (delivery::CROWDED_INPUT, false),
-        (delivery::UNACKNOWLEDGED_INPUT, false),
+        (delivery::UNCONFIRMED_INPUT, false),
         (delivery::UNAVAILABLE_INPUT, true),
     ] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
