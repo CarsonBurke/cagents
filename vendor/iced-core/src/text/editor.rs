@@ -20,6 +20,18 @@ pub trait Editor: Sized + Default {
     /// Returns the current [`Cursor`] of the [`Editor`].
     fn cursor(&self) -> Cursor;
 
+    /// Returns the span the current selection covers, as a [`Cursor`] whose
+    /// `selection` is the end the reader is not moving, or the caret alone
+    /// when nothing is selected.
+    ///
+    /// A word or line selection's [`Editor::cursor`] reports the points the
+    /// reader clicked and dragged to, not the words or lines it covers; this
+    /// reports the text an edit replaces. The default suits an editor whose
+    /// selections are always plain ranges.
+    fn selection_span(&self) -> Cursor {
+        self.cursor()
+    }
+
     /// Returns the current [`Selection`] of the [`Editor`].
     fn selection(&self) -> Selection;
 
