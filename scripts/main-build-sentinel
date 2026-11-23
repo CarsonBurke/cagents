@@ -42,6 +42,13 @@ LANES = {
     "editor": ["-p", "ceditor"],
 }
 APPLICATION_LANES = {"app", "browser"}
+# Not a compile: the commit's own scripts/check-lane-isolation resolves every
+# lane's dependency graph and fails when one pulls in another lane's, such as
+# Ghostty into the UI. It counts as a lane, bisected like the others, but a
+# commit that fails only it still compiled, so it is built and tested.
+ISOLATION = "isolation"
+ISOLATION_SCRIPT = "scripts/check-lane-isolation"
+CHECKS = [*LANES, ISOLATION]
 # Lanes whose package an older commit may not have, and the manifest that
 # says it does.
 LANE_MANIFESTS = {lane: "crates/cagents-ui/Cargo.toml" for lane in APPLICATION_LANES}
@@ -149,6 +156,20 @@ def check_lane(command, checkout, environment, log_path, warnings_path, packages
     return status, len(warnings.own)
 
 
+def check_isolation(checkout, environment, log_path):
+    """Runs the commit's lane-isolation check, which never fetches, after
+    fetching this host's dependencies, which a commit checked only in this
+    lane while bisecting may not have had built here; returns its status."""
+    with log_path.open("w") as log:
+        fetched = subprocess.run(["cargo", "fetch", "--locked", "--target", "host-tuple"], cwd=checkout,
+                                 env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        if fetched.returncode:
+            return fetched.returncode
+        log.flush()
+        return subprocess.run([str(checkout / ISOLATION_SCRIPT)], cwd=checkout, env=environment,
+                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT).returncode
+
+
 def github(directory, state, *args):
     result = subprocess.run(["gh", *args, "--repo", state["github_repository"]], text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -190,17 +211,25 @@ def check_commit(repository, directory, sha, lanes):
     statuses = {}
     warnings = {}
     packages = workspace_packages(checkout)
+    # No priority bypass, held lease, or local compilation override.
+    environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
     for lane in lanes:
+        log = directory / "logs" / f"{sha}-{lane}.log"
+        warnings_log = directory / "logs" / f"{sha}-{lane}-warnings.log"
+        if lane == ISOLATION:
+            # A commit from before the check has nothing to run.
+            if not (checkout / ISOLATION_SCRIPT).exists():
+                continue
+            print(f"main-build-sentinel: {sha} {lane}", flush=True)
+            statuses[lane], warnings[lane] = check_isolation(checkout, environment, log), 0
+            warnings_log.write_text("")
+            continue
         if lane in LANE_MANIFESTS and not (checkout / LANE_MANIFESTS[lane]).exists():
             continue
         command = [str(checkout / "scripts/cargo-gate"), "clippy", "--locked",
                    "--no-default-features", "--all-targets", *present(LANES[lane], packages)]
         print(f"main-build-sentinel: {sha} {lane}", flush=True)
-        # No priority bypass, held lease, or local compilation override.
-        environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
-        statuses[lane], warnings[lane] = check_lane(
-            command, checkout, environment, directory / "logs" / f"{sha}-{lane}.log",
-            directory / "logs" / f"{sha}-{lane}-warnings.log", packages)
+        statuses[lane], warnings[lane] = check_lane(command, checkout, environment, log, warnings_log, packages)
     return statuses, warnings
 
 
@@ -266,15 +295,15 @@ def report(repository, directory, state):
     sha = pending["sha"]
     details = git(repository, "show", "-s", "--format=%H%n%P%n%s", sha)
     body = (f"Main fails its Rust build check at `{sha}` on fw16: a lane does not compile, "
-            "or the workspace's own crates print compiler or Clippy warnings. Vendored "
-            "dependencies' warnings "
-            "do not count.\n\n"
+            "the workspace's own crates print compiler or Clippy warnings, or a lane resolves "
+            "another lane's dependency graph. Vendored dependencies' warnings do not count.\n\n"
             f"Last passing commit: `{state.get('last_good', 'none recorded')}`.\n\n"
             f"Commit, parents and subject:\n```text\n{details}\n```\n\n"
             "Checks use `scripts/cargo-gate clippy --locked --no-default-features --all-targets` "
             "in separate CLI, host, shared UI (`--features ui`), application "
             "(`-p cagents-ui`), integrated browser and dictation helper "
-            "(`-p cagents-dictate --features engine`) lanes.\n\n")
+            "(`-p cagents-dictate --features engine`) lanes, as well as `-p ceditor`. The "
+            "isolation lane is `scripts/check-lane-isolation`, which compiles nothing.\n\n")
     for lane, status in pending["lanes"].items():
         count = warnings.get(lane, 0)
         body += f"- {lane}: exit {status}" + (f", {count} warning{'s' * (count != 1)}" if count else "") + "\n"
@@ -623,7 +652,7 @@ def tick_locked(repository, directory, github_repository):
                     state["queue"] = state["queue"][-1:]
                     save(path, state)
                 sha = state["queue"][0]
-                statuses, warnings = check_commit(repository, directory, sha, LANES)
+                statuses, warnings = check_commit(repository, directory, sha, CHECKS)
                 state["pending"] = {"sha": sha, "lanes": statuses, "warnings": warnings}
                 save(path, state)
             state["retry_after"] = time.time() + 120
@@ -638,10 +667,11 @@ def tick_locked(repository, directory, github_repository):
                 state["bisect"] = {"after": state["checked"], "commits": [*between, pending["sha"]],
                                    "lanes": {lane: {"good": -1, "bad": len(between)} for lane in failed}}
             state["checked"] = pending["sha"]
-            if not any(pending["lanes"].values()):
+            if not any(status for lane, status in pending["lanes"].items() if lane != ISOLATION):
                 state["compiled"] = pending["sha"]
-                if not any(pending.get("warnings", {}).values()):
-                    state["last_good"] = pending["sha"]
+            # A passing commit passes every check, isolation too.
+            if not failed:
+                state["last_good"] = pending["sha"]
             state["queue"].pop(0)
             save(path, state)
         # Before bisecting moves the checkout off the commit it builds.

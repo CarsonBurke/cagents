@@ -188,8 +188,9 @@ class Structure(unittest.TestCase):
                                          {lane})
 
     def test_aggregates_cover_exactly_the_three_isolated_lanes(self):
-        groups = [entry["tasks"] for entry in self.tasks["check"]["run"] if isinstance(entry, dict)]
-        self.assertEqual(groups, [["check:cli", "check:host", "check:ui"]])
+        groups = [entry for entry in self.tasks["check"]["run"] if isinstance(entry, dict)]
+        # Isolation first: it compiles nothing.
+        self.assertEqual(groups, [{"task": "check:isolation"}, {"tasks": ["check:cli", "check:host", "check:ui"]}])
         self.assertEqual([entry["task"] for entry in self.tasks["test"]["run"] if isinstance(entry, dict)],
                          ["test:cli", "test:host", "test:ui"])
 
@@ -354,11 +355,17 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("test", status=3).returncode, 3)
         self.assertEqual(len(self.calls()), 1)
 
-    def test_the_check_aggregate_checks_every_lane_once(self):
+    def test_the_check_aggregate_checks_isolation_then_every_lane_once(self):
         self.assertEqual(self.mise_run("check").returncode, 0)
-        lanes = sorted(tuple(features(call)) for call in self.calls())
+        isolation, *builds = self.calls()
+        self.assertEqual(isolation, ["check-lane-isolation"])
+        lanes = sorted(tuple(features(call)) for call in builds)
         self.assertEqual(lanes, [(), ("host",), ("ui",)])
-        self.assertTrue(all(call[-1] == "--all-targets" for call in self.calls()))
+        self.assertTrue(all(call[-1] == "--all-targets" for call in builds))
+        self.log.unlink()
+        # A leaked graph stops it before any build.
+        self.assertEqual(self.mise_run("check", status=1).returncode, 1)
+        self.assertEqual(self.calls(), [["check-lane-isolation"]])
 
     def test_runner_arguments_are_forwarded_after_the_lane(self):
         self.assertEqual(self.mise_run("dev", "--", "--debug", "--", "--ui-arg").returncode, 0)
