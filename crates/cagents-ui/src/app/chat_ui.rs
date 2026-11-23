@@ -15367,11 +15367,19 @@ impl Cagents {
                 let mut followups_sent = false;
                 let mut due = Task::none();
                 // A message whose outcome is unknown, with what the
-                // provider said of it.
+                // provider said of it, where it said anything. One sent
+                // again stays unknown whatever went wrong this time: its
+                // first sending may still arrive.
                 let unconfirmed = match &result {
-                    Err(error) => chat::failure::DeliveryOutcome::parse(error)
-                        .filter(|outcome| outcome.unknown)
-                        .and_then(|outcome| Some((outcome, pending.take_message()?))),
+                    Err(error) => {
+                        let outcome = chat::failure::DeliveryOutcome::parse(error)
+                            .filter(|outcome| outcome.unknown);
+                        if outcome.is_some() || pending.sent_again() {
+                            pending.take_message().map(|message| (outcome, message))
+                        } else {
+                            None
+                        }
+                    }
                     Ok(()) => None,
                 };
                 let first_prompt = match (result, unconfirmed) {
@@ -15431,7 +15439,16 @@ impl Cagents {
                         }
                         pending.first_prompt
                     }
-                    (Err(error), Some((outcome, (outgoing, command)))) => {
+                    (Err(error), Some((None, (outgoing, command)))) => {
+                        // Sent again and failed for a reason that says
+                        // nothing of its first sending: it goes back to
+                        // being not confirmed, as it was.
+                        runtime.commands.return_unconfirmed(outgoing, command);
+                        runtime.prepare_local_prompt();
+                        runtime.note(error);
+                        None
+                    }
+                    (Err(error), Some((Some(outcome), (outgoing, command)))) => {
                         // The provider may have the message, so it does not
                         // go back to the composer, where sending it again
                         // could deliver it twice. It stays where it was

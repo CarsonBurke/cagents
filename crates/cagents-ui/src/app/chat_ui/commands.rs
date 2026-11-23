@@ -156,6 +156,14 @@ impl PendingCommand {
         Some((outgoing, command))
     }
 
+    /// Whether the message this command carries is one sent again from
+    /// not confirmed, as [`Outgoing::again`] says.
+    pub(super) fn sent_again(&self) -> bool {
+        self.outgoing
+            .as_ref()
+            .is_some_and(|outgoing| outgoing.again.is_some())
+    }
+
     /// The key the message this command carries is sent under, which stays
     /// the same each time it is sent.
     fn delivery(&self) -> Option<chat::DeliveryKey> {
@@ -724,7 +732,7 @@ impl Commands {
 
     /// Puts `outgoing`, sent again by `command`, back among the messages
     /// not confirmed, as it was before it was sent again.
-    fn return_unconfirmed(&mut self, mut outgoing: Outgoing, command: Command) {
+    pub(super) fn return_unconfirmed(&mut self, mut outgoing: Outgoing, command: Command) {
         let again = outgoing.again.take();
         self.unconfirmed.push(Unconfirmed {
             outgoing,
@@ -1712,6 +1720,26 @@ mod tests {
             Err(chat::failure::delivery::UNACKNOWLEDGED_INPUT.into()),
         );
         assert_eq!(chat_runtime(&app, card).commands.unconfirmed().len(), 1);
+
+        // Sent again and failed for a reason that says nothing of the first
+        // sending, it is still not confirmed, not back in the composer.
+        drop(app.update(Message::ChatUi(Action::RetryUnconfirmed(target, key))));
+        assert!(chat_runtime(&app, card).commands.in_flight().is_some());
+        settle(
+            &mut app,
+            card,
+            Err("Chat request acknowledgement timed out; do not retry blindly".into()),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.composer.text().trim().is_empty());
+        let [unconfirmed] = runtime.commands.unconfirmed() else {
+            panic!("still not confirmed");
+        };
+        assert_eq!(unconfirmed.outgoing.delivery, key);
+        assert!(
+            runtime.can_retry(unconfirmed),
+            "the same connection can ask again"
+        );
 
         let mut published = (*chat_runtime(&app, card).snapshot).clone();
         published.generation += 1;
