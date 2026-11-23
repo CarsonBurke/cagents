@@ -282,15 +282,28 @@ impl State {
             .collect::<BTreeSet<_>>();
         let before = std::mem::replace(&mut self.work, work);
         // Moving between on screen and out of sight changes only the order
-        // the budget goes in, which matters only while it falls short: a
-        // project re-plans when a checkout gains or loses file watches, or
-        // when one that wants them goes without.
+        // the budget goes in, which matters only while it falls short of a
+        // checkout that wants file watches, in any project, since the budget
+        // is shared. Otherwise a project re-plans only when one of its
+        // checkouts gains or loses file watches.
+        let short = self.entries.iter().any(|(project, entry)| {
+            !entry.unwatched.is_empty()
+                && entry
+                    .interest(*project, &before)
+                    .iter()
+                    .any(|(worktree, interest)| {
+                        interest.watches_files() && entry.unwatched.contains(worktree)
+                    })
+        });
         let replan = moved
             .into_iter()
             .filter(|project| {
                 let Some(entry) = self.entries.get(project) else {
                     return false;
                 };
+                if short {
+                    return true;
+                }
                 let was = entry.interest(*project, &before);
                 let now = entry.interest(*project, &self.work);
                 now.iter().any(|(worktree, interest)| {
@@ -2279,6 +2292,16 @@ mod tests {
         );
         state.entries.get_mut(&project).unwrap().unwatched.clear();
         assert!(replans(&mut state, &[]), "both lose their watches");
+
+        // The budget is shared: another project's own checkout going without
+        // makes this project's order matter too.
+        assert!(replans(&mut state, &[(worked, Active)]));
+        let elsewhere = fixture(&directory.path().join("elsewhere"));
+        let own = elsewhere.worktrees[0].0.id;
+        let mut entry = Entry::new(elsewhere, 1, None);
+        entry.unwatched = BTreeSet::from([own]);
+        state.entries.insert(ProjectId::new(), entry);
+        assert!(replans(&mut state, &[(worked, Shown)]));
     }
 
     #[test]
