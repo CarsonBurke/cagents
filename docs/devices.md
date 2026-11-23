@@ -158,8 +158,9 @@ children: they belong to the session that started them, not to the device's own
 sessions. It is held to the permission ceiling it has here, as of its
 connection's latest proof: the agents it starts on the device with
 `agent spawn` get no more than it could give them here, and it may approve
-their tool requests there only if it could here. A terminal it starts with `terminal spawn` runs any command on
-the device as you, and, as on this computer, the permission ceiling does not
+their tool requests there only if it could here. A terminal it starts with
+`terminal spawn` runs any command on the device as you, and, as on this
+computer, the permission ceiling does not
 cover a provider CLI it starts that way. Allowing agents on a device therefore
 lets sessions here run commands there as you. An agent it starts on the device
 is a session of that device, so it may use the device's own links to further
@@ -189,11 +190,14 @@ lineage and its permission ceiling, so nothing relaying it can raise either.
 The key guards against relaying, not against a process running as you, which
 can read it. The device then issues a capability for that connection, which
 lapses after 30 seconds unless the connection proves itself again; `cagents`
-does so every 15 seconds while a command runs, such as `agent wait`. Each
-time, this computer's daemon vouches for the session as it is then, so denying
-agents, unlinking, ending the session or changing its mode reaches a connection
-that is already open within 30 seconds: the device closes it, or holds it to the
-session's new permission ceiling. When `unlink` reaches the device, the device
+does so before its next request once 15 seconds have passed, so a command that
+polls, such as `agent wait`, keeps its connection. Each time, this computer's
+daemon vouches for the session as it is then, so denying agents, unlinking,
+ending the session or changing its mode reaches a connection that is already
+open within 30 seconds: the device closes it, or holds it to the session's new
+permission ceiling. A request the device already accepted still finishes, and
+agents the session started there keep running with the ceiling they started
+with. When `unlink` reaches the device, the device
 closes that computer's connections at once, as it does when a device is linked
 again with a new key. Unlinking deletes the key here at once, so no connection
 can be proved again even when the device cannot be reached to forget it.

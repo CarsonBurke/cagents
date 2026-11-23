@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agent_execution::{Authority, Lineage, Origin, permission::Ceiling},
     device_trust::{CAPABILITY_LIFETIME, Claim, LinkKey, LinkStatus, Reply, Request, SECRET_BYTES},
-    host::state::{ClientId, HostLock, HostState, SharedHost},
+    host::{
+        delivery::DeliveryQueue,
+        state::{ClientId, HostLock, HostState, SharedHost},
+    },
     terminal_ipc::{ProtocolError, ProtocolErrorCode},
 };
 
@@ -183,22 +186,22 @@ impl Peers {
     }
 }
 
-/// Closes connections whose device capability ended, discarding what was
-/// queued for them. A closed connection's state is cleared as it leaves.
-fn close(state: &HostState, clients: &[ClientId]) {
-    for client in clients {
-        if let Some(delivery) = state.clients.get(client) {
-            delivery.abort("its device capability ended");
-        }
-    }
+/// The delivery queues of connections whose device capability ended.
+fn queues(state: &HostState, clients: &[ClientId]) -> Vec<Arc<DeliveryQueue>> {
+    clients
+        .iter()
+        .filter_map(|client| state.clients.get(client).cloned())
+        .collect()
 }
 
-/// Ends `peer`'s capabilities and closes their connections, because the peer
-/// was forgotten or re-keyed.
-fn revoke(host: &SharedHost, peer: uuid::Uuid) {
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let clients = state.peers.revoke(peer);
-    close(&state, &clients);
+/// Closes those connections, discarding what was queued for them. Called
+/// without the host lock, since a backlog can hold whole terminal frames. A
+/// closed connection's state is cleared as it leaves; until then it is
+/// refused everything.
+fn close(queues: Vec<Arc<DeliveryQueue>>) {
+    for delivery in queues {
+        delivery.abort("its device capability ended");
+    }
 }
 
 /// Starts the thread that closes connections as their capabilities lapse,
@@ -227,16 +230,20 @@ fn reap(host: &Weak<HostLock>) {
         let next = {
             let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
             let (lapsed, next) = state.peers.lapse(Instant::now());
-            close(&state, &lapsed);
-            let Some(next) = next else {
+            let lapsed = queues(&state, &lapsed);
+            if next.is_none() {
                 // Decided under the lock, so a capability issued after this
                 // starts a new watcher.
                 state.peers.reaper = None;
-                return;
-            };
+            }
+            drop(state);
+            close(lapsed);
             next
         };
         drop(shared);
+        let Some(next) = next else {
+            return;
+        };
         std::thread::park_timeout(next.saturating_duration_since(Instant::now()));
     }
 }
@@ -553,11 +560,17 @@ pub(in crate::host) fn process_with(
         Request::RegisterPeer { peer, .. } | Request::ForgetPeer { peer } => Some(*peer),
         _ => None,
     };
-    let _store = STORE.lock().unwrap_or_else(|p| p.into_inner());
-    let reply = apply_at(path, request)?;
-    if let Some(peer) = ended {
-        revoke(host, peer);
-    }
+    let (reply, revoked) = {
+        let _store = STORE.lock().unwrap_or_else(|p| p.into_inner());
+        let reply = apply_at(path, request)?;
+        let revoked = ended.map(|peer| {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let clients = state.peers.revoke(peer);
+            queues(&state, &clients)
+        });
+        (reply, revoked)
+    };
+    close(revoked.unwrap_or_default());
     Ok(reply)
 }
 
@@ -647,6 +660,11 @@ pub(in crate::host) fn authenticate_at(
     // it also authenticates with the capability, so it is admitted only to
     // what a session may do.
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    // A connection whose capability ended while this proof was on its way is
+    // closing; a proof must not revive it.
+    if state.peers.ended(client) {
+        return Err(denied(ended()));
+    }
     match state.agent_clients.get(&client) {
         Some(bound) if *bound != lineage => {
             return Err(denied(

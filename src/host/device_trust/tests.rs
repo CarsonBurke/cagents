@@ -468,6 +468,25 @@ fn an_open_connection_proves_itself_again_or_loses_its_capability_and_closes() {
     assert!(
         super::super::agent_execution::terminals::authenticate(&host, client, &lowered).is_err()
     );
+    // Nor does a proof already on its way when it lapsed revive it.
+    host.lock().unwrap().peers.disconnect(client);
+    let delivery = host.lock().unwrap().register_client(client);
+    let nonce = challenge(&host, client).unwrap();
+    let late = crate::device_trust::proof(&key(5), &nonce, peer, &claim(session));
+    host.lock()
+        .unwrap()
+        .agent_clients
+        .insert(client, crate::device_trust::peer_lineage(peer, session));
+    host.lock().unwrap().peers.issue(
+        client,
+        peer,
+        crate::device_trust::peer_lineage(peer, session),
+        Ceiling::from_stated(&claim(session).ceiling).unwrap(),
+    );
+    host.lock().unwrap().peers.lapse_now(client);
+    let error = authenticate_at(&path, &host, client, peer, &claim(session), &late).unwrap_err();
+    assert!(error.message.contains("capability has ended"), "{error:?}");
+    assert!(host.lock().unwrap().peers.ended(client));
     // Still bound to the session until it closes, never a person's connection.
     assert!(host.lock().unwrap().agent_clients.contains_key(&client));
     assert!(closes(&delivery), "the lapsed connection must be closed");

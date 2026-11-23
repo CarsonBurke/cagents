@@ -5148,6 +5148,18 @@ fn a_linked_computers_session_owns_the_agents_it_starts_on_the_device() {
     let nonce = device_trust::challenge(&host, client).unwrap();
     let error = device_trust::sign_at(&trust, &host, &local, "devx", &nonce).unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    // Unlinking here deletes the key, so no renewal can be signed even when
+    // the device cannot be reached to forget this computer.
+    device_trust::process_at(
+        &trust,
+        Request::RemoveLink {
+            device: "devx".into(),
+        },
+    )
+    .unwrap();
+    let error = device_trust::sign_at(&trust, &host, &local, "devx", &nonce).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    assert_eq!(error.message, crate::device_trust::unlinked("devx"));
     host.lock().unwrap().peers.lapse_now(client);
     for refused in [
         ClientRequest::Agent {
