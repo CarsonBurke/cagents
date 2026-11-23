@@ -2013,15 +2013,18 @@ impl Claude {
                 }));
             }
         } else if let Some(content) = message["content"].as_str() {
-            step.events.push(Event::Item(if context {
-                context_item(format!("{id}:0"), content.into())
-            } else if let Some(output) = (role == Role::User)
+            let local = (!context && role == Role::User)
                 .then(|| local_command_output(content))
-                .flatten()
-            {
-                text_item(format!("{id}:0"), Role::System, output, false)
+                .flatten();
+            // A command that printed nothing, such as `/clear`, leaves no note.
+            let item = if local.as_deref() == Some("") {
+                None
+            } else if context {
+                Some(context_item(format!("{id}:0"), content.into()))
+            } else if let Some(output) = local {
+                Some(text_item(format!("{id}:0"), Role::System, output, false))
             } else {
-                text_item(
+                Some(text_item(
                     format!("{id}:0"),
                     role,
                     if role == Role::User {
@@ -2030,8 +2033,9 @@ impl Claude {
                         content.into()
                     },
                     false,
-                )
-            }));
+                ))
+            };
+            step.events.extend(item.map(Event::Item));
         } else if let Some(content) = message["content"].as_array() {
             let message_key = ScopedId::new(child, id);
             let base = frame["_cagents_block_base"]
@@ -2147,12 +2151,15 @@ impl Claude {
                         if !context && !thinking && role == Role::User && model_only_note(text) {
                             continue;
                         }
+                        let local = (!context && !thinking && role == Role::User)
+                            .then(|| local_command_output(text))
+                            .flatten();
+                        if local.as_deref() == Some("") {
+                            continue;
+                        }
                         step.events.push(Event::Item(if context {
                             context_item(format!("{id}:{index}"), text.into())
-                        } else if let Some(output) = (role == Role::User && !thinking)
-                            .then(|| local_command_output(text))
-                            .flatten()
-                        {
+                        } else if let Some(output) = local {
                             text_item(format!("{id}:{index}"), Role::System, output, false)
                         } else {
                             text_item(format!("{id}:{index}"), role, text.into(), thinking)
@@ -6753,6 +6760,7 @@ fn apply_result(
         | ItemContent::Delivery { .. } => {}
     }
 }
+
 /// A web search's result with its `Links: [...]` line, a JSON array of the
 /// pages found, as one page to a line pair: its title, then its address.
 fn search_links(text: String) -> String {
@@ -6808,12 +6816,7 @@ fn harness_framing(text: String) -> String {
     const BREAKS: &[char] = &['\n', '\r'];
     let mut body = text.as_str();
     let mut framed = false;
-    if let Some((inner, "")) = element(body.trim(), "persisted-output") {
-        (body, framed) = (inner.trim_start_matches(BREAKS), true);
-    }
-    if let Some((_, rest)) = element(body.trim_start(), "tools-used-before-summary") {
-        (body, framed) = (rest.trim_start_matches(BREAKS), true);
-    }
+    // Reminders follow everything else, persisted output included.
     loop {
         let trimmed = body.trim_end();
         let Some(open) = ["usage", "system-reminder"].into_iter().find_map(|name| {
@@ -6827,6 +6830,12 @@ fn harness_framing(text: String) -> String {
             break;
         };
         (body, framed) = (&trimmed[..open], true);
+    }
+    if let Some((inner, "")) = element(body.trim(), "persisted-output") {
+        (body, framed) = (inner.trim_start_matches(BREAKS), true);
+    }
+    if let Some((_, rest)) = element(body.trim_start(), "tools-used-before-summary") {
+        (body, framed) = (rest.trim_start_matches(BREAKS), true);
     }
     if framed {
         body.trim_end().to_owned()

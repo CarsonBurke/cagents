@@ -45,7 +45,10 @@ pub(super) fn tool_input(input: &str) -> (Cow<'_, str>, Language) {
 /// one whole JSON value, such as an excerpt of a long one, is shown as it
 /// came.
 pub(super) fn tool_output(output: &str) -> (Cow<'_, str>, Language) {
-    readable(output)
+    match chat::readable::result(output) {
+        Some(readable) => (Cow::Owned(readable), Language::Plain),
+        None => (Cow::Borrowed(output), Language::structured(output)),
+    }
 }
 
 fn readable(input: &str) -> (Cow<'_, str>, Language) {

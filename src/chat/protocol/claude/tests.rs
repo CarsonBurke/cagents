@@ -15121,6 +15121,13 @@ fn tool_results_drop_the_harness_framing_around_them() {
         harness_framing(persisted.into()),
         "Output too large (30.9KB). Full output saved to: /tmp/out.txt\n\nPreview (first 2KB):\nline one"
     );
+    assert_eq!(
+        harness_framing(format!(
+            "{persisted}\n<system-reminder>\nCheck the file.\n</system-reminder>"
+        )),
+        "Output too large (30.9KB). Full output saved to: /tmp/out.txt\n\nPreview (first 2KB):\nline one",
+        "a reminder after persisted output goes with its tags"
+    );
     let report = "  <tools-used-before-summary>Agent, Monitor</tools-used-before-summary>\nThe build passes.\nagentId: a3c (use SendMessage with to: 'a3c')\n<usage>subagent_tokens: 9</usage>";
     assert_eq!(
         harness_framing(report.into()),
@@ -15190,4 +15197,6 @@ fn user_frames_hide_model_notes_and_unwrap_local_command_output() {
     assert!(
         matches!(&item.content, ItemContent::Text { text, .. } if text == "Set model to Opus 5.5")
     );
+    let silent = adapter.receive(json!({"type":"user","uuid":"clear","message":{"role":"user","content":"<local-command-stdout></local-command-stdout>"}})).unwrap();
+    assert!(items(&silent).is_empty(), "{:?}", items(&silent));
 }
