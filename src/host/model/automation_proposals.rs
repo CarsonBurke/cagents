@@ -363,6 +363,7 @@ mod tests {
                 repository: repository.clone(),
                 title: "User standup channel".into(),
                 title_source: ChannelTitleSource::Manual,
+                checkout: None,
             })
             .unwrap();
         let definition = Definition {

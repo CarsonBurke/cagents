@@ -2555,6 +2555,7 @@ mod tests {
                 repository: accepted.agent.spec.target.repository.clone(),
                 title: "moved".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         let mut current = registry.agent(accepted.agent.id).unwrap();
@@ -3436,6 +3437,7 @@ mod tests {
                         repository: directory.path().into(),
                         title: "User channel".into(),
                         title_source: Default::default(),
+                        checkout: None,
                     })
                     .unwrap();
                 Placement::Channel(id)

@@ -227,6 +227,9 @@ struct Comparison<'a> {
     /// Fields of the named struct in `older` that the other side decodes a
     /// message without, because it decodes in that side's protocol.
     decoded_without: Vec<(&'static str, &'static str)>,
+    /// Fields of the named enum's variant that this side decodes the older
+    /// client's request without, as (enum, variant, field).
+    requests_decoded_without: Vec<(&'static str, &'static str, &'static str)>,
     /// When present, only these outer variants belong to the proven contract.
     /// Nested enums remain unrestricted and must agree in full.
     selected: Vec<(&'static str, Vec<&'static str>)>,
@@ -337,6 +340,25 @@ impl Comparison<'_> {
                         continue;
                     }
                     match (fields, next_fields) {
+                        (Some(old), Some(Fields::Struct(new)))
+                            if direction == Direction::Request =>
+                        {
+                            // A field this side decodes the older client's
+                            // request without is one that client never sends.
+                            let new = Fields::Struct(
+                                new.iter()
+                                    .filter(|(field, _)| {
+                                        !self.requests_decoded_without.contains(&(
+                                            current,
+                                            name.as_str(),
+                                            field.as_str(),
+                                        ))
+                                    })
+                                    .cloned()
+                                    .collect(),
+                            );
+                            self.fields(direction, old, &new, &path);
+                        }
                         (Some(old), Some(new)) => self.fields(direction, old, new, &path),
                         _ => self.differ(&path, "variant was not traced".into()),
                     }
@@ -423,6 +445,7 @@ fn differences(
     gated: Vec<(&'static str, usize)>,
     refused: Vec<(&'static str, &'static [&'static str])>,
     restated: Vec<(&'static str, &'static str)>,
+    requests_decoded_without: Vec<(&'static str, &'static str, &'static str)>,
 ) -> Vec<String> {
     let mut comparison = Comparison {
         older,
@@ -431,6 +454,7 @@ fn differences(
         refused,
         restated,
         decoded_without: Vec::new(),
+        requests_decoded_without,
         selected: Vec::new(),
         visited: BTreeSet::new(),
         differences: Vec::new(),
@@ -481,10 +505,18 @@ fn this_protocols_wire_format_is_recorded() {
         return;
     }
     let recorded = recorded(PROTOCOL_VERSION);
-    let mut changed = differences(&recorded, &current, Vec::new(), Vec::new(), Vec::new());
+    let mut changed = differences(
+        &recorded,
+        &current,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
     changed.extend(differences(
         &current,
         &recorded,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -556,6 +588,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 .flatten()
                 .collect(),
             restated_for(client.protocol),
+            requests_decoded_for(client.protocol),
         );
         assert!(
             differences.is_empty(),
@@ -584,6 +617,20 @@ fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
                     fields.iter().map(move |field| (*container, *field))
                 }),
         )
+        .collect()
+}
+
+/// Fields of request variants this daemon decodes a client of `protocol`
+/// without, as (enum, variant, field).
+fn requests_decoded_for(protocol: u16) -> Vec<(&'static str, &'static str, &'static str)> {
+    REQUEST_FIELDS_DECODED_WITHOUT
+        .iter()
+        .filter(|(.., since)| protocol < *since)
+        .flat_map(|(container, variant, fields, _)| {
+            fields
+                .iter()
+                .map(move |field| (*container, *variant, *field))
+        })
         .collect()
 }
 
@@ -655,6 +702,7 @@ fn decoding_lifecycle_differences(
             } else {
                 Vec::new()
             },
+            requests_decoded_without: Vec::new(),
             selected: selected.to_vec(),
             visited: BTreeSet::new(),
             differences: Vec::new(),

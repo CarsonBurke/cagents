@@ -800,6 +800,11 @@ mod tests {
             ] {
                 assert_eq!(after.remove(table).unwrap(), Vec::<Vec<_>>::new());
             }
+            // Schema 30 adds each channel's checkout, which a channel made
+            // before it lacks: it works in the main checkout.
+            for channel in after.get_mut("channels").unwrap() {
+                assert_eq!(channel.pop(), Some(rusqlite::types::Value::Null));
+            }
             assert_eq!(
                 after, before,
                 "every original table value, including audit/outbox/view receipts, must remain exact"

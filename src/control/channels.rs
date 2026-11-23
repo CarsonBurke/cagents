@@ -315,6 +315,7 @@ mod tests {
                     title: "channel".into(),
                     title_source: Default::default(),
                     ordinal: 1,
+                    checkout: None,
                 })
                 .collect(),
             views: vec![View {
@@ -658,6 +659,7 @@ mod tests {
             title: "Auth refactor".into(),
             title_source: Default::default(),
             ordinal: 3,
+            checkout: None,
         });
         let served = model.clone();
         let expected = pane.clone();

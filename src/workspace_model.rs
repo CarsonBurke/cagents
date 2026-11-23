@@ -67,7 +67,13 @@ pub struct ModelProject {
 
 /// Shared channel metadata. Ordered pane descriptors live in [`views::View`];
 /// the active channel and focused pane remain local to each client.
+///
+/// A client from before [`CHANNEL_CHECKOUT`] is sent a channel without its
+/// checkout: see the [`Serialize`] implementation below.
+///
+/// [`CHANNEL_CHECKOUT`]: crate::terminal_ipc::CHANNEL_CHECKOUT
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelChannel {
     pub id: ChannelId,
     pub repository: PathBuf,
@@ -81,6 +87,62 @@ pub struct ModelChannel {
     /// channel at the same moment cannot mint the same rank. The sidebar renders
     /// a project's channels by descending rank, so the newest sits on top.
     pub ordinal: u32,
+    /// The linked worktree the channel works in, where its new panes start.
+    /// `None` is the project's main checkout, which is what every channel
+    /// created before channels had a checkout works in.
+    ///
+    /// Fixed when the channel is created, and checked then to be a worktree of
+    /// [`Self::repository`] (see [`ModelEdit::canonicalized`]).
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+}
+
+/// As derived, except that a client from before channels had a checkout is
+/// sent the fields it decodes, in its positional order.
+impl Serialize for ModelChannel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !crate::terminal_ipc::encoding_before(crate::terminal_ipc::CHANNEL_CHECKOUT) {
+            return Self::serialize(self, serializer);
+        }
+        #[derive(Serialize)]
+        #[serde(rename = "ModelChannel")]
+        struct Before<'a> {
+            id: ChannelId,
+            repository: &'a Path,
+            title: &'a str,
+            title_source: crate::model::ChannelTitleSource,
+            ordinal: u32,
+        }
+        Before {
+            id: self.id,
+            repository: &self.repository,
+            title: &self.title,
+            title_source: self.title_source,
+            ordinal: self.ordinal,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelChannel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::deserialize(deserializer)
+    }
+}
+
+/// Reads a created channel's checkout, which a CLI from before
+/// [`CHANNEL_CHECKOUT`] never sends: its channel works in the main checkout.
+/// Nothing is read for such a client, so the rest of its frame keeps its
+/// positions (see `terminal_ipc::decoding_from`).
+///
+/// [`CHANNEL_CHECKOUT`]: crate::terminal_ipc::CHANNEL_CHECKOUT
+fn created_checkout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PathBuf>, D::Error> {
+    if crate::terminal_ipc::decoding_before(crate::terminal_ipc::CHANNEL_CHECKOUT) {
+        return Ok(None);
+    }
+    Option::deserialize(deserializer)
 }
 
 /// Where a `MovePane` request puts a pane: always a channel of the pane's
@@ -298,6 +360,7 @@ impl WorkspaceModel {
                 repository,
                 title,
                 title_source,
+                checkout,
             } => {
                 if self.channel(*id).is_none() {
                     self.channels.push(ModelChannel {
@@ -306,6 +369,7 @@ impl WorkspaceModel {
                         repository: repository.clone(),
                         title: title.clone(),
                         ordinal: PENDING_ORDINAL,
+                        checkout: checkout.clone(),
                     });
                 }
             }
@@ -417,6 +481,9 @@ pub enum ModelEdit {
         title: String,
         #[serde(default)]
         title_source: crate::model::ChannelTitleSource,
+        /// The channel's [`ModelChannel::checkout`].
+        #[serde(default, deserialize_with = "created_checkout")]
+        checkout: Option<PathBuf>,
     },
     /// Return this project to automatic sidebar ordering.
     ResetNavigation { repository: PathBuf },
@@ -540,12 +607,21 @@ impl ModelEdit {
                 repository,
                 title,
                 title_source,
-            } => Self::CreateChannel {
-                id,
-                repository: canonical_repository(&repository)?,
-                title,
-                title_source,
-            },
+                checkout,
+            } => {
+                let repository = canonical_repository(&repository)?;
+                let checkout = match checkout {
+                    Some(checkout) => canonical_checkout(&repository, &checkout)?,
+                    None => None,
+                };
+                Self::CreateChannel {
+                    id,
+                    repository,
+                    title,
+                    title_source,
+                    checkout,
+                }
+            }
             Self::SeedView {
                 scope,
                 panes,
@@ -618,6 +694,87 @@ pub fn canonical_repository(path: &Path) -> Result<PathBuf, String> {
     Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
+/// Resolves a channel's checkout against its canonical repository key: `None`
+/// for the repository's main checkout, the canonical path of one of its linked
+/// worktrees, and an error for anything else.
+///
+/// Git records a linked worktree twice, each record naming the other: the
+/// checkout's `.git` file names an administrative directory under the common
+/// directory's `worktrees/`, which is the repository key, and that
+/// directory's `gitdir` file names the checkout's `.git` back. These are the
+/// files `git worktree list` itself reads. Reading them here keeps the check
+/// to a few small reads at the boundary, before the registry takes its
+/// writer, instead of a `git` process per edit, and it cannot accept a copied
+/// `.git` file or a worktree of another repository.
+pub fn canonical_checkout(repository: &Path, checkout: &Path) -> Result<Option<PathBuf>, String> {
+    if !checkout.is_absolute() {
+        return Err(format!(
+            "a channel's checkout must be absolute, but `{}` is relative",
+            checkout.display()
+        ));
+    }
+    // As with the repository key, a remote device's daemon checks its own
+    // files when the edit reaches it.
+    if crate::device::is_remote() {
+        return Ok((checkout != repository).then(|| checkout.to_path_buf()));
+    }
+    let checkout = std::fs::canonicalize(checkout).map_err(|error| {
+        format!(
+            "the checkout `{}` cannot be used for a channel: {error}",
+            checkout.display()
+        )
+    })?;
+    let dot_git = checkout.join(".git");
+    // A folder project is its own checkout, and a Git project's main checkout
+    // holds the common directory itself or, as a submodule or a checkout made
+    // with `--separate-git-dir` does, a `.git` file naming it.
+    let names_repository = |git: Option<PathBuf>| {
+        git.and_then(|git| std::fs::canonicalize(git).ok())
+            .is_some_and(|git| git == repository)
+    };
+    if checkout == repository
+        || names_repository(Some(dot_git.clone()))
+        || names_repository(gitdir_line(&dot_git))
+    {
+        return Ok(None);
+    }
+    let linked = || -> Option<()> {
+        let administrative = std::fs::canonicalize(gitdir_line(&dot_git)?).ok()?;
+        let worktrees = std::fs::canonicalize(repository.join("worktrees")).ok()?;
+        let named_back =
+            std::fs::canonicalize(gitdir_line(&administrative.join("gitdir"))?).ok()?;
+        (administrative.parent() == Some(worktrees.as_path())
+            && std::fs::canonicalize(&dot_git).is_ok_and(|git| git == named_back))
+        .then_some(())
+    };
+    match linked() {
+        Some(()) => Ok(Some(checkout)),
+        None => Err(format!(
+            "`{}` is not a worktree of the repository `{}`",
+            checkout.display(),
+            repository.display()
+        )),
+    }
+}
+
+/// The path a small Git pointer file names: a checkout's `.git` file
+/// (`gitdir: PATH`) or a worktree's administrative `gitdir` file (`PATH`).
+/// A relative path is relative to the checkout or administrative directory
+/// holding it, which joining it to that directory resolves.
+fn gitdir_line(file: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut text = String::new();
+    // Both files hold one line; a larger one is not a pointer file.
+    std::fs::File::open(file)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    let line = text.lines().next()?.trim_end();
+    let path = line.strip_prefix("gitdir: ").unwrap_or(line);
+    (!path.is_empty()).then(|| file.parent().unwrap_or(file).join(path))
+}
+
 /// The name a repository key presents when no window has supplied one.
 ///
 /// The key and the name deliberately come from different places. The key is the
@@ -646,10 +803,193 @@ pub fn repository_display_name(repository: &Path) -> String {
         .unwrap_or_else(|| repository.display().to_string())
 }
 
+/// A Git repository with one linked worktree, for tests of checkouts.
+#[cfg(test)]
+pub(crate) struct CheckoutFixture {
+    pub directory: tempfile::TempDir,
+    /// The repository key: the common Git directory, canonical.
+    pub repository: PathBuf,
+    pub main: PathBuf,
+    pub linked: PathBuf,
+}
+
+#[cfg(test)]
+impl CheckoutFixture {
+    pub(crate) fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("repo");
+        std::fs::create_dir(&main).unwrap();
+        let git = |arguments: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&main)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Cagents")
+                .env("GIT_AUTHOR_EMAIL", "cagents@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Cagents")
+                .env("GIT_COMMITTER_EMAIL", "cagents@example.invalid")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {arguments:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "start"]);
+        git(&["worktree", "add", "--quiet", "-b", "feature", "../feature"]);
+        let main = std::fs::canonicalize(&main).unwrap();
+        Self {
+            repository: main.join(".git"),
+            linked: std::fs::canonicalize(directory.path().join("feature")).unwrap(),
+            main,
+            directory,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    /// A channel's checkout is its repository's main checkout (`None`) or one
+    /// of its linked worktrees, whatever spelling names it; anything else is
+    /// refused before it reaches the registry.
+    #[test]
+    fn a_channel_checkout_is_the_main_checkout_or_a_worktree_of_its_repository() {
+        let fixture = CheckoutFixture::new();
+        let repository = &fixture.repository;
+        assert_eq!(canonical_checkout(repository, &fixture.main), Ok(None));
+        assert_eq!(
+            canonical_checkout(repository, &fixture.linked),
+            Ok(Some(fixture.linked.clone()))
+        );
+        // Another spelling of the same worktree resolves to the same key.
+        let spelled = fixture.main.join("..").join("feature").join(".");
+        assert_eq!(
+            canonical_checkout(repository, &spelled),
+            Ok(Some(fixture.linked.clone()))
+        );
+        assert!(canonical_checkout(repository, Path::new("feature")).is_err());
+        // A directory that is not a checkout, a missing one, and one inside
+        // the worktree that is not its root.
+        let plain = fixture.directory.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(canonical_checkout(repository, &plain).is_err());
+        assert!(canonical_checkout(repository, &fixture.directory.path().join("gone")).is_err());
+        let nested = fixture.linked.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert!(canonical_checkout(repository, &nested).is_err());
+        // A copied `.git` file names the worktree's administrative directory,
+        // which names the real worktree back, not the copy.
+        let copy = fixture.directory.path().join("copy");
+        std::fs::create_dir(&copy).unwrap();
+        std::fs::copy(fixture.linked.join(".git"), copy.join(".git")).unwrap();
+        assert!(canonical_checkout(repository, &copy).is_err());
+        // A main checkout whose `.git` file names the repository, as a
+        // submodule's or one made with `--separate-git-dir` does.
+        let separate = fixture.directory.path().join("separate");
+        std::fs::create_dir(&separate).unwrap();
+        std::fs::write(
+            separate.join(".git"),
+            format!("gitdir: {}\n", repository.display()),
+        )
+        .unwrap();
+        assert_eq!(canonical_checkout(repository, &separate), Ok(None));
+        // A worktree of another repository is not one of this repository's.
+        let other = CheckoutFixture::new();
+        assert!(canonical_checkout(repository, &other.linked).is_err());
+        // A folder project is its own and only checkout.
+        let folder = std::fs::canonicalize(&plain).unwrap();
+        assert_eq!(canonical_checkout(&folder, &folder), Ok(None));
+        assert!(canonical_checkout(&folder, &fixture.linked).is_err());
+    }
+
+    /// Postcard is positional: a carried older CLI's channel creation has no
+    /// checkout, and is read in its own protocol's scope as one in the main
+    /// checkout, while a current one round trips. An older CLI is sent
+    /// channels without the field.
+    #[test]
+    fn older_clients_create_and_read_channels_without_a_checkout() {
+        use crate::terminal_ipc::{CHANNEL_CHECKOUT, decoding_from, encoding_for};
+        #[derive(Serialize)]
+        enum OlderEdit {
+            _OpenProject,
+            _ReopenProject,
+            _CloseProject,
+            CreateChannel {
+                id: ChannelId,
+                repository: PathBuf,
+                title: String,
+                title_source: ChannelTitleSource,
+            },
+        }
+        let id = ChannelId::new();
+        let older = postcard::to_allocvec(&OlderEdit::CreateChannel {
+            id,
+            repository: "/repo/.git".into(),
+            title: "Older".into(),
+            title_source: ChannelTitleSource::Manual,
+        })
+        .unwrap();
+        let created = ModelEdit::CreateChannel {
+            id,
+            repository: "/repo/.git".into(),
+            title: "Older".into(),
+            title_source: ChannelTitleSource::Manual,
+            checkout: None,
+        };
+        assert_eq!(
+            decoding_from(CHANNEL_CHECKOUT - 1, || postcard::from_bytes::<ModelEdit>(
+                &older
+            ))
+            .unwrap(),
+            created
+        );
+        let current = ModelEdit::CreateChannel {
+            id,
+            repository: "/repo/.git".into(),
+            title: "Feature".into(),
+            title_source: ChannelTitleSource::Manual,
+            checkout: Some("/repo/worktrees/feature".into()),
+        };
+        let bytes = postcard::to_allocvec(&current).unwrap();
+        assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), current);
+
+        let channel = ModelChannel {
+            id,
+            repository: "/repo/.git".into(),
+            title: "Feature".into(),
+            title_source: ChannelTitleSource::Manual,
+            ordinal: 3,
+            checkout: Some("/repo/worktrees/feature".into()),
+        };
+        #[derive(Deserialize)]
+        struct OlderChannel {
+            id: ChannelId,
+            repository: PathBuf,
+            title: String,
+            _title_source: ChannelTitleSource,
+            ordinal: u32,
+        }
+        let sent = encoding_for(CHANNEL_CHECKOUT - 1, || postcard::to_allocvec(&channel)).unwrap();
+        let (read, rest) = postcard::take_from_bytes::<OlderChannel>(&sent).unwrap();
+        assert!(
+            rest.is_empty(),
+            "nothing follows the fields an older client knows"
+        );
+        assert_eq!(
+            (read.id, read.repository, read.title, read.ordinal),
+            (id, channel.repository.clone(), channel.title.clone(), 3)
+        );
+        let bytes = postcard::to_allocvec(&channel).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ModelChannel>(&bytes).unwrap(),
+            channel
+        );
+    }
 
     #[test]
     fn navigation_folding_keeps_missing_channels_above_the_saved_mixed_order() {
@@ -934,6 +1274,7 @@ mod tests {
                 repository: "/repo".into(),
                 title: String::new(),
                 title_source: Default::default(),
+                checkout: None,
             },
         );
         model.fold(

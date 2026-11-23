@@ -229,6 +229,7 @@ impl Fixture {
                     title: format!("channel {ordinal}"),
                     title_source: Default::default(),
                     ordinal: ordinal as u32,
+                    checkout: None,
                 })
                 .collect(),
             views: vec![
@@ -405,6 +406,7 @@ fn public_user_open_and_spawn_preserve_folder_identity_order_and_readiness_polic
                                 repository: actual,
                                 title,
                                 title_source,
+                                checkout: None,
                             },
                     } = &created.request
                     else {
@@ -420,6 +422,7 @@ fn public_user_open_and_spawn_preserve_folder_identity_order_and_readiness_polic
                         title: title.clone(),
                         title_source: *title_source,
                         ordinal: 9,
+                        checkout: None,
                     });
                     model_reply(peer, &created, result);
                 }
@@ -640,6 +643,7 @@ fn public_lists_remain_global_unauthenticated_reads_with_explicit_folder_filter_
                 title: "other channel".into(),
                 title_source: Default::default(),
                 ordinal: 99,
+                checkout: None,
             });
             let peer = Peer::new(connected(), move |peer| {
                 if mode == "filtered" {

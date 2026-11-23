@@ -311,7 +311,11 @@ use crate::{
 /// Version 199 appends `Approval` and `Question` to `ActivityState`: what an
 /// agent waiting on the user waits for, where its provider says. An older
 /// client is sent `Waiting` for either.
-pub const PROTOCOL_VERSION: u16 = 199;
+///
+/// Version 200 adds `checkout` to `ModelChannel` and `ModelEdit::CreateChannel`:
+/// the linked worktree a channel works in. An older client is sent channels
+/// without it, and its channel creation is read as one in the main checkout.
+pub const PROTOCOL_VERSION: u16 = 200;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -342,8 +346,9 @@ mod older_clients;
 #[cfg(test)]
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS,
-    WAIT_KINDS, WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
+    ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN,
+    PLAN_AND_RESET_READINGS, WAIT_KINDS, WAITING_TOOL_STATUS, decoding_before, decoding_from,
+    encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

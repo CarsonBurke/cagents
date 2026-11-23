@@ -208,6 +208,7 @@ fn channel_title_admission_rejects_delayed_names_from_the_same_resident_actor() 
                 repository: directory.path().into(),
                 title: String::new(),
                 title_source: Default::default(),
+                checkout: None,
             },
         )
         .unwrap();
@@ -393,6 +394,7 @@ fn a_pane_that_has_not_recorded_its_conversation_takes_its_first_prompt_name() {
                         repository: directory.path().into(),
                         title: String::new(),
                         title_source: Default::default(),
+                        checkout: None,
                     },
                 )
                 .unwrap();
@@ -3733,5 +3735,69 @@ fn visibility_is_aggregated_and_empty_terminals_stay_hidden() {
     assert_eq!(
         subscriptions.visibility(terminal_id),
         TerminalVisibility::Hidden
+    );
+}
+
+/// The daemon creates a channel in a worktree of its own repository and
+/// reports that checkout back; it refuses one that is not a worktree of the
+/// repository, changing nothing, and keeps a main-checkout channel's absent.
+#[test]
+fn the_daemon_validates_and_reports_a_channels_checkout() {
+    let fixture = crate::workspace_model::CheckoutFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = test_host();
+    state.install_model(
+        super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+    );
+    state
+        .edit_model(
+            1,
+            ModelEdit::OpenProject {
+                repository: fixture.repository.clone(),
+                name: "repo".into(),
+                kind: Default::default(),
+            },
+        )
+        .unwrap();
+    let create = |checkout: &std::path::Path| ModelEdit::CreateChannel {
+        id: crate::model::ChannelId::new(),
+        repository: fixture.repository.clone(),
+        title: "Feature".into(),
+        title_source: Default::default(),
+        checkout: Some(checkout.to_path_buf()),
+    };
+    let elsewhere = tempfile::tempdir().unwrap();
+    let refused = state.edit_model(1, create(elsewhere.path())).unwrap_err();
+    assert_eq!(refused.code, ProtocolErrorCode::InvalidRequest);
+    assert!(
+        refused.message.contains("is not a worktree of"),
+        "{}",
+        refused.message
+    );
+    assert!(
+        state
+            .registry()
+            .unwrap()
+            .model()
+            .unwrap()
+            .channels
+            .is_empty()
+    );
+    let relative = state
+        .edit_model(1, create(std::path::Path::new("feature")))
+        .unwrap_err();
+    assert_eq!(relative.code, ProtocolErrorCode::InvalidRequest);
+
+    let model = state.edit_model(1, create(&fixture.linked)).unwrap();
+    assert_eq!(model.channels[0].checkout, Some(fixture.linked.clone()));
+    let model = state.edit_model(1, create(&fixture.main)).unwrap();
+    assert_eq!(
+        model
+            .channels
+            .iter()
+            .map(|channel| channel.checkout.clone())
+            .collect::<Vec<_>>(),
+        [Some(fixture.linked.clone()), None],
+        "the main checkout is recorded as no checkout"
     );
 }

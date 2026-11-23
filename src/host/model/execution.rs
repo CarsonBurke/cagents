@@ -3104,6 +3104,7 @@ mod tests {
                 repository: directory.path().into(),
                 title: "Other connection".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         let (sequence, effects) = execution.execution_delta().unwrap();
@@ -3192,6 +3193,7 @@ mod tests {
                 repository: directory.path().into(),
                 title: "Delayed window seed".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
 

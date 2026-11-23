@@ -690,6 +690,11 @@ pub enum ChannelCommand {
         /// conversation's first title, exactly as one created in a window does.
         #[arg(long, default_value = "")]
         title: String,
+        /// Worktree of the project the channel works in, where its new panes
+        /// start (defaults to the main checkout). The project defaults to
+        /// this worktree's.
+        #[arg(long)]
+        checkout: Option<PathBuf>,
     },
     /// List shared channels, newest first.
     List {
@@ -5898,7 +5903,13 @@ fn execute_channel_with(
     // A listing may name a project whose checkout is gone, which only the
     // registry can recognize, so it is only checked for shape here.
     let selected = match &command {
-        ChannelCommand::Spawn { repository, .. } => Some(project_directory(repository.clone())?),
+        ChannelCommand::Spawn {
+            repository,
+            checkout,
+            ..
+        } => Some(project_directory(
+            repository.clone().or_else(|| checkout.clone()),
+        )?),
         ChannelCommand::List {
             repository: Some(path),
         } => Some(registered_project_path(Some(path.clone()))?),
@@ -5926,6 +5937,7 @@ enum ResolvedChannel {
         repository: PathBuf,
         title: String,
         kind: crate::model::ProjectKind,
+        checkout: Option<PathBuf>,
     },
     List {
         repository: Option<PathBuf>,
@@ -5962,12 +5974,24 @@ impl ChannelCommand {
                     }
                 },
             },
-            Self::Spawn { repository, title } => {
-                let location = resolve_project_location(repository, model)?;
+            Self::Spawn {
+                repository,
+                title,
+                checkout,
+            } => {
+                // The daemon checks that the checkout is a worktree of the
+                // project; here it only becomes the absolute directory the
+                // caller meant, which the daemon cannot know.
+                let checkout = checkout
+                    .map(|checkout| project_directory(Some(checkout)))
+                    .transpose()?;
+                let location =
+                    resolve_project_location(repository.or_else(|| checkout.clone()), model)?;
                 ResolvedChannel::Spawn {
                     repository: location.key,
                     kind: location.kind,
                     title,
+                    checkout,
                 }
             }
             // Only an explicit filter is resolved: no `--repository` means every
@@ -5993,6 +6017,7 @@ fn channel_output(
             repository,
             title,
             kind,
+            checkout,
         } => {
             // The project comes first: a channel in a repository no project owns
             // is reachable from no window's sidebar. `OpenProject` is an upsert,
@@ -6014,6 +6039,7 @@ fn channel_output(
                     repository,
                     title,
                     title_source: Default::default(),
+                    checkout,
                 })
                 .map_err(protocol_error)?;
             let channel = model.channel(id).cloned().ok_or_else(|| {
@@ -6065,8 +6091,10 @@ fn channel_output(
 }
 
 fn channel_list_human(channels: &[&ModelChannel]) -> String {
-    format::table(
-        ["CHANNEL", "REPOSITORY", "TITLE"],
+    // Most channels work in the main checkout, so the column appears only when
+    // one does not.
+    format::sparse_table(
+        ["CHANNEL", "REPOSITORY", "TITLE", "CHECKOUT"],
         channels
             .iter()
             .map(|channel| {
@@ -6074,6 +6102,11 @@ fn channel_list_human(channels: &[&ModelChannel]) -> String {
                     channel.id.to_string(),
                     channel.repository.display().to_string(),
                     channel.title.clone(),
+                    channel
+                        .checkout
+                        .as_ref()
+                        .map(|checkout| checkout.display().to_string())
+                        .unwrap_or_default(),
                 ]
             })
             .collect(),
@@ -7478,6 +7511,7 @@ mod tests {
             title: "Build\nlogs".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         };
         let human = channel_list_human(&[&channel]);
         assert_eq!(human.lines().count(), 2);
@@ -7494,6 +7528,21 @@ mod tests {
         assert!(human.contains(&channel.id.to_string()));
         // Channel repository identity is retained; it is not asserted to be a checkout path.
         assert!(human.contains("/repo/.git"));
+        let linked = ModelChannel {
+            checkout: Some("/repo/worktrees/feature".into()),
+            ..channel.clone()
+        };
+        let human = channel_list_human(&[&channel, &linked]);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["CHANNEL", "REPOSITORY", "TITLE", "CHECKOUT"]
+        );
+        assert!(human.ends_with("/repo/worktrees/feature"));
     }
 
     #[test]
@@ -8095,6 +8144,7 @@ mod tests {
                     repository: server_repository,
                     title,
                     ordinal: 4,
+                    checkout: None,
                 }],
                 closed_projects: Vec::new(),
                 views: Vec::new(),
@@ -8113,6 +8163,7 @@ mod tests {
         let resolved = ChannelCommand::Spawn {
             repository: Some(repository),
             title: "probe".into(),
+            checkout: None,
         }
         .resolved()
         .unwrap();
@@ -8256,6 +8307,7 @@ mod tests {
         let ResolvedChannel::Spawn { repository, .. } = (ChannelCommand::Spawn {
             repository: Some(root.clone()),
             title: "Work".into(),
+            checkout: None,
         })
         .resolved_with_model(Some(&model))
         .unwrap() else {
@@ -8876,6 +8928,7 @@ mod tests {
                     repository: repository.to_path_buf(),
                     title: (*title).to_owned(),
                     ordinal: *ordinal,
+                    checkout: None,
                 })
                 .collect(),
             closed_projects: Vec::new(),

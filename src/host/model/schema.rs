@@ -238,6 +238,12 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            30 => {
+                // An older daemon has no checkout to read; every channel it
+                // shows works in its project's main checkout.
+                tx.execute_batch("ALTER TABLE channels DROP COLUMN checkout;")
+                    .map_err(|error| error.to_string())?;
+            }
             29 => {
                 // Older daemons deduplicate creates against live rows only.
                 tx.execute_batch("DROP TABLE deleted_channels;")
@@ -395,6 +401,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_SEVEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_EIGHT: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_NINE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -414,6 +421,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         27 => &TWENTY_SEVEN,
         28 => &TWENTY_EIGHT,
         29 => &TWENTY_NINE,
+        30 => &THIRTY,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -913,6 +921,7 @@ mod tests {
             (28, "DROP TABLE pane_chat_starts;"),
             (28, "DROP TABLE pane_chat_allocations;"),
             (29, "DROP TABLE deleted_channels;"),
+            (30, "ALTER TABLE channels DROP COLUMN checkout;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
             (22, "DROP INDEX automation_firing_successors;"),
@@ -1353,8 +1362,9 @@ mod tests {
             // This current opener also applies retention20, run-attention21,
             // history22, the empty console recovery ledger24, session
             // channel history25 and source bindings26, schema 27 drops
-            // channel work, schema 28 adds private pane chat ownership, and
-            // schema 29 retains explicitly deleted channel identities.
+            // channel work, schema 28 adds private pane chat ownership,
+            // schema 29 retains explicitly deleted channel identities, and
+            // schema 30 records each channel's checkout.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1416,9 +1426,21 @@ mod tests {
                 .position(|tokens| tokens == column)
                 .unwrap();
             firing.3.drain(start..start + column.len());
+            // Schema 30 likewise adds only the channel's checkout column.
+            let channels = inventory
+                .iter_mut()
+                .find(|object| object.1 == "channels")
+                .unwrap();
+            let column = tokens(", checkout TEXT").unwrap();
+            let start = channels
+                .3
+                .windows(column.len())
+                .position(|tokens| tokens == column)
+                .unwrap();
+            channels.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects, source bindings, the console ledger, pane chat ownership, deleted channel identities and the exact history column may be added, and only channel work removed"
+                "only lifecycle/run outboxes, retention objects, source bindings, the console ledger, pane chat ownership, deleted channel identities and the exact history and checkout columns may be added, and only channel work removed"
             );
             assert!(
                 registry
@@ -1750,7 +1772,7 @@ mod tests {
         let _clear = Clear;
         for step in [
             1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26, 27, 28, 29,
+            26, 27, 28, 29, 30,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
@@ -2076,6 +2098,7 @@ mod tests {
                     repository: "/kept".into(),
                     title: "New channel".into(),
                     title_source: ChannelTitleSource::Manual,
+                    checkout: None,
                 },
             ];
             let changed = registry.db.total_changes();

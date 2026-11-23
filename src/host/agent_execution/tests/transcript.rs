@@ -228,6 +228,7 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
                 repository: project.clone(),
                 title: "Login".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         model
@@ -236,6 +237,7 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
                 repository: project.clone(),
                 title: "Other".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         model
@@ -377,6 +379,7 @@ fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
                 repository: project.clone(),
                 title: "Login".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         // The pane saved the conversation its provider confirmed.

@@ -68,7 +68,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 29;
+const SCHEMA_VERSION: u32 = 30;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -558,6 +558,7 @@ impl Registry {
                 repository,
                 title,
                 title_source,
+                checkout,
             } => {
                 let key = repository_key(repository)?;
                 let exists: bool = transaction
@@ -587,9 +588,16 @@ impl Registry {
                     let ordinal = take_ordinal(&transaction, "next_channel_ordinal")?;
                     transaction
                         .execute(
-                            "INSERT INTO channels(id, repository, title, ordinal, title_source) \
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![id.to_string(), key, title, ordinal, *title_source as i64],
+                            "INSERT INTO channels(id, repository, title, ordinal, title_source, checkout) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                id.to_string(),
+                                key,
+                                title,
+                                ordinal,
+                                *title_source as i64,
+                                checkout.as_deref().map(checkout_key).transpose()?,
+                            ],
                         )
                         .map_err(|error| error.to_string())?;
                     true
@@ -876,7 +884,7 @@ fn record_channel(
     Ok(())
 }
 
-const CHANNEL_COLUMNS: &str = "id, repository, title, ordinal, title_source";
+const CHANNEL_COLUMNS: &str = "id, repository, title, ordinal, title_source, checkout";
 
 /// A `channels` row as [`CHANNEL_COLUMNS`] selects it.
 struct ChannelColumns {
@@ -885,6 +893,7 @@ struct ChannelColumns {
     title: String,
     ordinal: i64,
     title_source: i64,
+    checkout: Option<String>,
 }
 
 fn channel_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelColumns> {
@@ -894,6 +903,7 @@ fn channel_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelColumns> 
         title: row.get(2)?,
         ordinal: row.get(3)?,
         title_source: row.get(4)?,
+        checkout: row.get(5)?,
     })
 }
 
@@ -910,6 +920,7 @@ impl ChannelColumns {
             repository: PathBuf::from(self.repository),
             title: self.title,
             ordinal: self.ordinal as u32,
+            checkout: self.checkout.map(PathBuf::from),
         })
     }
 }
@@ -964,6 +975,12 @@ fn repository_key(repository: &Path) -> Result<&str, String> {
             repository.display()
         )
     })
+}
+
+fn checkout_key(checkout: &Path) -> Result<&str, String> {
+    checkout
+        .to_str()
+        .ok_or_else(|| format!("checkout path `{}` is not valid UTF-8", checkout.display()))
 }
 
 fn parse_channel_id(value: &str) -> Result<ChannelId, String> {
@@ -1157,6 +1174,13 @@ fn migrate_through(
         tx.execute_batch("CREATE TABLE deleted_channels(id TEXT PRIMARY KEY) STRICT;")
             .map_err(|error| error.to_string())?;
         schema::migration_checkpoint(29)?;
+    }
+    // Every channel before this works in its project's main checkout, which
+    // is what an absent checkout means.
+    if version < 30 && target >= 30 {
+        tx.execute_batch("ALTER TABLE channels ADD COLUMN checkout TEXT;")
+            .map_err(|error| error.to_string())?;
+        schema::migration_checkpoint(30)?;
     }
     Ok(())
 }
@@ -1457,6 +1481,7 @@ mod tests {
                 repository: "/project".into(),
                 title: String::new(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         let suggest = |title: &str, source| ModelEdit::SuggestChannelTitle {
@@ -1528,6 +1553,7 @@ mod tests {
                 repository: "/project".into(),
                 title: String::new(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         let chat = || Pane {
@@ -1690,6 +1716,7 @@ mod tests {
                 repository: "/project".into(),
                 title: "My channel".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         // Build the legacy store with no live Registry connection: its TEMP
@@ -1699,7 +1726,8 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE deleted_channels;
+                "ALTER TABLE channels DROP COLUMN checkout;
+                 DROP TABLE deleted_channels;
                  DROP TABLE pane_chat_allocations;
                  DROP TABLE pane_chat_starts;
                  DROP TABLE terminal_pane_bindings;
@@ -1745,6 +1773,48 @@ mod tests {
         );
     }
 
+    /// Schema 30 adds the channel's checkout. Channels a schema 29 store holds
+    /// work in their project's main checkout, and a checkout recorded from
+    /// then on survives reopening the store, in the model and in the effects
+    /// a watcher is sent.
+    #[test]
+    fn schema_thirty_keeps_existing_channels_in_the_main_checkout_and_persists_checkouts() {
+        let (mut registry, directory) = registry();
+        registry.apply(&open("/project/.git")).unwrap();
+        let existing = ChannelId::new();
+        registry
+            .apply(&create(existing, "/project/.git", "Existing"))
+            .unwrap();
+        drop(registry);
+        let path = directory.path().join("model.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE channels DROP COLUMN checkout; PRAGMA user_version = 29;")
+            .unwrap();
+        let mut upgraded = Registry::at(&path).unwrap();
+        assert_eq!(schema::stored_version(&path).unwrap(), Some(SCHEMA_VERSION));
+        assert_eq!(upgraded.model().unwrap().channels[0].checkout, None);
+        let linked = ChannelId::new();
+        let checkout = PathBuf::from("/project/worktrees/feature");
+        let applied = upgraded
+            .apply_delta(&ModelEdit::CreateChannel {
+                id: linked,
+                repository: "/project/.git".into(),
+                title: "Feature".into(),
+                title_source: Default::default(),
+                checkout: Some(checkout.clone()),
+            })
+            .unwrap();
+        assert_eq!(
+            applied.receipt.effects.channels[0].checkout.as_ref(),
+            Some(&checkout)
+        );
+        drop(upgraded);
+        let reopened = Registry::at(&path).unwrap().model().unwrap();
+        assert_eq!(reopened.channel(existing).unwrap().checkout, None);
+        assert_eq!(reopened.channel(linked).unwrap().checkout, Some(checkout));
+    }
+
     fn registry() -> (Registry, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
@@ -1765,6 +1835,7 @@ mod tests {
             repository: PathBuf::from(repository),
             title: title.to_owned(),
             title_source: Default::default(),
+            checkout: None,
         }
     }
 

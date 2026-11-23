@@ -433,6 +433,7 @@ fn main() -> Result<()> {
         }
         .into(),
         title_source: cagents::model::ChannelTitleSource::Manual,
+        checkout: None,
     })?;
     let scope = Scope::Channel(channel);
     let anchor = Pane {

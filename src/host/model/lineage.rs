@@ -722,6 +722,7 @@ mod tests {
                     repository: repository.clone(),
                     title: "Fixture channel".into(),
                     title_source: Default::default(),
+                    checkout: None,
                 })
                 .unwrap();
         }
@@ -805,6 +806,7 @@ mod tests {
                 repository: directory.path().to_path_buf(),
                 title: "Fixture channel".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         let session = TerminalId::new();

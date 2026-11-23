@@ -310,7 +310,7 @@ mod tests {
         db.execute("INSERT INTO projects VALUES('/work','Work',1,'git')", [])
             .unwrap();
         db.execute(
-            "INSERT INTO channels VALUES(?1,'/work','Channel',1,2)",
+            "INSERT INTO channels VALUES(?1,'/work','Channel',1,2,NULL)",
             [channel.to_string()],
         )
         .unwrap();

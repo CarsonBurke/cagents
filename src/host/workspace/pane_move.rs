@@ -245,6 +245,7 @@ fn make_channel(
         repository: repository.to_path_buf(),
         title,
         title_source: crate::model::ChannelTitleSource::Manual,
+        checkout: None,
     };
     let (_, made) = edit_then(host, origin, edit, |registry| {
         let model = registry.model().map_err(unavailable)?;

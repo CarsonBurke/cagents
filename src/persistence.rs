@@ -9392,6 +9392,7 @@ mod tests {
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         SaveLane::default().save(&store, &workspace).unwrap();
         let original = std::fs::read(&path).unwrap();
@@ -10110,6 +10111,7 @@ mod tests {
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
@@ -10205,6 +10207,7 @@ mod tests {
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         workspace.active_channel = Some(id);
         workspace.active_worktree = Some("/tmp".into());
@@ -10239,6 +10242,7 @@ mod tests {
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         workspace.active_channel = None;
         assert!(matches!(
@@ -12613,6 +12617,7 @@ mod tests {
             shared: false,
             cards: vec![workspace.cards[0].id],
             focused: workspace.focused,
+            checkout: None,
         });
         workspace.active_channel = Some(channel_id);
         SaveLane::default().save(&store, &workspace).unwrap();

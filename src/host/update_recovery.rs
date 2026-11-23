@@ -582,6 +582,7 @@ mod tests {
                 repository: directory.to_owned(),
                 title: "Paused Codex".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         let db = rusqlite::Connection::open(registry_path).unwrap();

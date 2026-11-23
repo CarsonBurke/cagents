@@ -6853,6 +6853,7 @@ fn spawn_burst(baseline: &WorkspaceModel, repository: &Path) -> (ChannelId, Vec<
                 repository: repository.to_path_buf(),
                 title: created.title.clone(),
                 title_source: Default::default(),
+                checkout: None,
             },
             changes: EdgeChanges {
                 identity: Some(baseline.identity),
@@ -7016,6 +7017,7 @@ fn a_run_applies_its_edges_in_the_order_they_were_sent() {
                     repository: repository.to_path_buf(),
                     title: created.title.clone(),
                     title_source: Default::default(),
+                    checkout: None,
                 },
                 changes: EdgeChanges {
                     identity: Some(baseline.identity),

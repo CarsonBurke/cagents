@@ -305,6 +305,17 @@ mod tests {
         );
     }
 
+    /// The rows of `db` as a schema before 30 holds them. Schema 30 adds
+    /// each channel's checkout, which a channel made before it lacks: it
+    /// works in the main checkout.
+    fn rows_without_checkouts(db: &Connection) -> BTreeMap<String, Vec<Vec<Value>>> {
+        let mut rows = rows(db);
+        for channel in rows.get_mut("channels").unwrap() {
+            assert_eq!(channel.pop(), Some(Value::Null));
+        }
+        rows
+    }
+
     fn sorted(mut views: Vec<View>) -> Vec<View> {
         views.sort_by_cached_key(|view| serde_json::to_string(&view.scope).unwrap());
         views
@@ -319,7 +330,11 @@ mod tests {
             let before = rows(&Connection::open(&path).unwrap());
             let mut registry = Registry::at(&path).unwrap();
             schema::require_current(&registry.db).unwrap();
-            assert_eq!(rows(&registry.db), before, "only channel work is removed");
+            assert_eq!(
+                rows_without_checkouts(&registry.db),
+                before,
+                "only channel work is removed"
+            );
             assert_eq!(
                 registry
                     .db
@@ -364,7 +379,7 @@ mod tests {
                 "old history must not retain an empty channel"
             );
             registry.db.execute("UPDATE native_actor_retirements SET receipt='receipt written after upgrade' WHERE actor='actor'",[]).unwrap();
-            let current = rows(&registry.db);
+            let current = rows_without_checkouts(&registry.db);
             let views = views::all(&registry.db).unwrap();
             let mut model = registry.model().unwrap();
             model.views = sorted(model.views);

@@ -97,6 +97,7 @@ fn seeded_scopes(host: &SharedHost, root: &std::path::Path) -> (Scope, Scope) {
                 repository: root.to_owned(),
                 title: title.into(),
                 title_source: Default::default(),
+                checkout: None,
             },
         );
         let scope = Scope::Channel(id);

@@ -786,6 +786,7 @@ for line in sys.stdin:
                 repository: fixture._directory.path().into(),
                 title: "Destination".into(),
                 title_source: Default::default(),
+                checkout: None,
             },
         )
         .unwrap();

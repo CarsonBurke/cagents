@@ -290,6 +290,7 @@ fn pending_completion_refuses_changes_to_the_reserved_pane() {
                         repository: fixture.directory.path().into(),
                         title: "destination".into(),
                         title_source: Default::default(),
+                        checkout: None,
                     })
                     .unwrap();
                 Change::Transfer {

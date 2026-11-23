@@ -24,6 +24,7 @@ fn fixture() -> (Registry, tempfile::TempDir, ChannelIncarnation, PathBuf) {
             repository: repository.clone(),
             title: "Original".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     let model = registry.model().unwrap();
@@ -52,6 +53,7 @@ fn retirement_rejects_a_reused_channel_identity_and_another_registry() {
             repository,
             title: "Replacement".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     let current = registry.model().unwrap();
