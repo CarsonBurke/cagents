@@ -584,8 +584,8 @@ fn an_idle_board_runs_no_git_and_an_event_reads_only_its_worktree() {
     }
     rescan(&mut scanner);
     let in_use = worktree(&local(&handle), &linked[3]).id;
-    // The worktree with a staged change has its files watched too, within
-    // the budget: an agent elsewhere may be editing it by path.
+    // The worktree just edited has its files watched too, within the
+    // budget: an agent elsewhere may be editing it by path.
     let changed = worktree(&local(&handle), &linked[7]).id;
     drained(&mut scanner, &|tracked| {
         tracked

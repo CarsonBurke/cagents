@@ -904,7 +904,7 @@ running Git while nothing happens. The Git watcher sees Git's bookkeeping in
 every worktree (its `HEAD`, index, refs, and the worktree list), a few
 directories each. Within a budget of 8192 directory watches it also watches
 the files of the worktrees a session runs in and of the primary checkout,
-then those with uncommitted changes or work in the last three hours. A scan
+then those created, committed to or edited in the last three hours. A scan
 follows an event and reads only what it moved: the worktree list after a
 topology change, the refs after a ref or configuration change, and the
 status of each worktree the event named or whose branch moved. A worktree

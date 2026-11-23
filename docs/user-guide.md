@@ -631,10 +631,10 @@ finishes. Agents may read plans, but only you can remove a worktree.
 The daemon watches the Git metadata of every worktree, so staging, committing,
 switching branches and adding or removing worktrees arrive as events. Within
 its watch budget it also watches the tracked directories of each project's own
-checkout and of every worktree a session runs in, then of worktrees with
-uncommitted changes or work in the last three hours. An edit in any other
-worktree that is neither staged nor committed shows at that worktree's next Git event, on
-**Refresh**, or when the pane opens with that worktree's status read more than
+checkout and of every worktree a session runs in, then of worktrees created,
+committed to or edited in the last three hours. An edit in any other worktree
+that is neither staged nor committed shows at that worktree's next Git event,
+on **Refresh**, or when the pane opens with that worktree's status read more than
 15 minutes before. A worktree whose files are not watched is read every 15
 seconds only while an agent works in it or its files changed in the last four
 minutes. A project whose metadata cannot be watched, such as one on a network

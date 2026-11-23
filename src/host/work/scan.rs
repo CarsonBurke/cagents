@@ -515,25 +515,26 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
     });
     let retry_plan = previous.is_some_and(|previous| previous.plan_error.is_some());
     // Files are watched first in the worktrees someone works in and the
-    // primary checkout, then, within the budget, in those with uncommitted
-    // changes or recent work, where an agent elsewhere may be editing by
-    // path. Git's bookkeeping is watched in every one.
+    // primary checkout, then, within the budget, in those created, committed
+    // to or edited recently, where an agent elsewhere may be editing by
+    // path. Old uncommitted changes do not count, so worktrees left behind
+    // do not take the budget from new ones. Git's bookkeeping is watched in
+    // every one.
     let recent = |worktree: &Worktree| {
-        worktree.dirty.as_ref().is_some_and(|dirty| dirty.paths > 0)
-            || [
-                worktree.created_at_unix_ms,
-                worktree
-                    .head
-                    .as_ref()
-                    .and_then(|head| head.committed_at_unix_ms),
-                worktree
-                    .dirty
-                    .as_ref()
-                    .and_then(|dirty| dirty.newest_modified_at_unix_ms),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|at| now_unix_ms.saturating_sub(at) <= crate::work::ACTIVE_WINDOW_MS)
+        [
+            worktree.created_at_unix_ms,
+            worktree
+                .head
+                .as_ref()
+                .and_then(|head| head.committed_at_unix_ms),
+            worktree
+                .dirty
+                .as_ref()
+                .and_then(|dirty| dirty.newest_modified_at_unix_ms),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|at| now_unix_ms.saturating_sub(at) <= crate::work::ACTIVE_WINDOW_MS)
     };
     let interests = worktrees
         .iter()

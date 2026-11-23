@@ -647,7 +647,7 @@ impl Shared {
     /// each read refreshes this while it keeps editing). A card stays Active
     /// for the longer product window, but a finished edit must not keep an
     /// uncovered worktree running `git status` every 15 seconds for hours.
-    /// A worktree with uncommitted changes or recent work has its files
+    /// A worktree created, committed to or edited recently has its files
     /// watched within the budget instead, so this polls only past it.
     fn worktree_live(&self, worktree: &scan::Worktree) -> bool {
         let within = |at: u64, window: Duration| {
