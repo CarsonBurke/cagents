@@ -171,14 +171,15 @@ steps, each through `mise run release` (`scripts/release --help`):
      release;
    - it opens two windows and seeds chats, agents, a channel and terminals
      with a long-lived child;
-   - it updates to the cut's bundle, the bytes the cut checked, through
+   - it updates to the cut's archive, copied from the cut bundle, through
      `cagents daemon upgrade`;
    - it requires every pane, chat, agent and terminal to survive and the
      windows to reopen.
 
    The update must end `Complete`, with no refusal, so the reopened windows
    report no "Update failed". A rehearsal that does not pass leaves its report,
-   records and screenshots in `/var/tmp/cr/release-VERSION` on the host.
+   records and screenshots in `/var/tmp/cr/release-VERSION` on the host, until
+   the next rehearsal of that version replaces them.
    The in-app path through a file feed (below) needs builds that read one.
 3. `mise run release -- publish VERSION` asks you to type the version, then
    runs `scripts/publish-release --push-tag`. It checks the signature against
