@@ -12443,6 +12443,19 @@ fn the_panel_mounts_for_the_active_worktree_and_rebinds_rather_than_leaking_the_
     );
     assert_eq!(state.active_worktree(), Some(&fix_key()));
 
+    // A pane whose channel's worktree was removed runs in another checkout:
+    // the panel unbinds rather than keep, or fall back to, any other.
+    assert!(state.sync_active_worktree(&model, &SidebarFocus::Removed));
+    assert_eq!(state.active_worktree(), None);
+    assert!(bound_source_control(&model, &state).is_none());
+    assert!(!state.sync_active_worktree(&model, &SidebarFocus::None));
+    assert_eq!(
+        state.active_worktree(),
+        None,
+        "focus naming nothing after it does not restore the worktree it left"
+    );
+    assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+
     // A worktree the project list no longer holds cannot stay bound.
     let emptied = SidebarModel::ready(SidebarMode::Expanded, Vec::new());
     assert!(emptied.source_control.is_none());

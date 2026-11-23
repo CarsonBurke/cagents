@@ -5,7 +5,7 @@
 //! into a channel when the daemon started, the channel keeps its panes and
 //! their conversations, and they start in the project's main checkout. The
 //! window says so while the channel is shown, and offers the two ways out:
-//! make the worktree again where it was, or close the channel.
+//! make the worktree again where it was, or delete the channel.
 use super::*;
 use crate::app::worktree_dialog::WorktreeDraft;
 use crate::app::worktree_ui::listed_worktree;
@@ -14,7 +14,7 @@ use crate::app::worktree_ui::listed_worktree;
 pub enum Action {
     /// Opens the new-worktree dialog on the channel's branch and folder.
     Recreate(ChannelId),
-    /// Closes the channel and its panes.
+    /// Deletes the channel, closing its panes, once confirmed.
     Close(ChannelId),
 }
 
@@ -29,18 +29,26 @@ pub(in crate::app) struct Missing {
     /// The branch the worktree was last seen on, when this window listed it.
     /// A channel's name is no guide: it may be the folder's, or the user's.
     pub(in crate::app) branch: Option<String>,
+    label: String,
 }
 
 impl Missing {
-    /// The branch, else the folder's name.
-    fn name(&self) -> String {
-        self.branch.clone().unwrap_or_else(|| {
-            self.path.file_name().map_or_else(
-                || self.path.display().to_string(),
+    /// What the worktree is called: its branch, else its folder's name.
+    pub(in crate::app) fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+fn label(branch: Option<&str>, path: &Path) -> String {
+    branch.map_or_else(
+        || {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
             )
-        })
-    }
+        },
+        str::to_owned,
+    )
 }
 
 impl Cagents {
@@ -79,14 +87,26 @@ impl Cagents {
         {
             return None;
         }
+        let branch = self.channel_ui.known_branches.get(path).cloned();
         Some(Missing {
             channel: id,
             project_id: project.id,
             project: project.name.clone(),
             repository: project.repository.clone(),
             path: path.to_path_buf(),
-            branch: self.channel_ui.known_branches.get(path).cloned(),
+            label: label(branch.as_deref(), path),
+            branch,
         })
+    }
+
+    /// [`Self::missing_checkout`] for the channel holding `card`.
+    pub(in crate::app) fn card_missing_checkout(&self, card: CardId) -> Option<Missing> {
+        self.durable
+            .channels
+            .iter()
+            .filter(|channel| channel.checkout.is_some())
+            .find(|channel| channel.cards.contains(&card))
+            .and_then(|channel| self.missing_checkout(channel.id))
     }
 
     pub(in crate::app) fn update_missing_checkout(&mut self, action: Action) -> Task<Message> {
@@ -107,6 +127,7 @@ impl Cagents {
                     WorktreeDraft {
                         branch: branch.unwrap_or_default(),
                         destination: missing.path.display().to_string(),
+                        recreates: Some(missing.label),
                         ..WorktreeDraft::default()
                     },
                     None,
@@ -132,7 +153,7 @@ impl Cagents {
         let enabled = !self.modal_is_open();
         let text = format!(
             "The worktree {} was removed. New terminals open in {}'s main checkout.",
-            missing.name(),
+            missing.label(),
             missing.project
         );
         let actions = vec![
@@ -147,9 +168,9 @@ impl Cagents {
                     ),
                 missing.path.display().to_string(),
             ),
-            widget::button::text("Close channel")
+            widget::button::text("Delete channel")
                 .id(widget::Id::new("missing-checkout.close"))
-                .name("Close this channel and its panes")
+                .name("Delete this channel and close its panes")
                 .class(notice_surface_button(severity))
                 .on_press_maybe(
                     enabled.then_some(Message::MissingCheckout(Action::Close(missing.channel))),
@@ -165,7 +186,9 @@ impl Cagents {
                     .align_y(Alignment::Center)
                     .into(),
             ),
-            true,
+            // Its own padding rather than the bars' fixed row: beside the
+            // panes it may be narrow enough to wrap.
+            false,
         )
     }
 }

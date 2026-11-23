@@ -639,6 +639,7 @@ impl Cagents {
                     ..
                 } => self.elsewhere_body(repository, number, url),
                 pull_request_ui::WorkScope::Unlisted { label } => self.unlisted_body(label),
+                pull_request_ui::WorkScope::Removed(missing) => self.removed_body(&missing),
                 _ if !owner => self.elsewhere_pane_body(card, view),
                 _ => self.workspace_body(view, width),
             }),
@@ -742,6 +743,41 @@ impl Cagents {
             })
             .map(sidebar::worktree_indicators)
             .unwrap_or_default()
+    }
+
+    /// The channel's worktree is gone. Its panes run in the main checkout,
+    /// whose changes are not this channel's, so nothing is offered to commit
+    /// until the worktree is back.
+    fn removed_body(
+        &self,
+        missing: &super::channel_ui::missing_checkout::Missing,
+    ) -> Element<'_, Message> {
+        widget::container(
+            widget::column::with_children(vec![
+                design::heading(format!("{} was removed", missing.label()))
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)
+                    .into(),
+                design::caption(
+                    "Its changes and files show here again once the worktree is recreated.",
+                )
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into(),
+                crate::ui_controls::button::secondary("Recreate worktree")
+                    .id(widget::Id::new("inspector.missing-checkout.recreate"))
+                    .name(format!("Recreate {}", missing.label()))
+                    .on_press_maybe((!self.modal_is_open()).then_some(Message::MissingCheckout(
+                        super::channel_ui::missing_checkout::Action::Recreate(missing.channel),
+                    )))
+                    .into(),
+            ])
+            .spacing(space::S)
+            .width(Length::Fill),
+        )
+        .padding(space::L)
+        .width(Length::Fill)
+        .into()
     }
 
     /// A worktree Projects does not list: this window reads only those, so

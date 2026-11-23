@@ -795,6 +795,11 @@ mod tests {
         let dialog = fixture.app.worktree_dialog.as_ref().expect("the dialog");
         assert_eq!(dialog.draft.branch, "", "an unknown branch is asked for");
         assert_eq!(dialog.draft.destination, gone.display().to_string());
+        assert_eq!(
+            dialog.draft.recreates.as_deref(),
+            Some("feature-two"),
+            "named by its folder while its branch is unknown"
+        );
         fixture.app.worktree_dialog = None;
 
         fixture
@@ -807,6 +812,57 @@ mod tests {
         )));
         let dialog = fixture.app.worktree_dialog.as_ref().expect("the dialog");
         assert_eq!(dialog.draft.branch, "feat/two");
+        assert_eq!(dialog.draft.recreates.as_deref(), Some("feat/two"));
+    }
+
+    /// A pane in a channel whose worktree is gone runs in the main checkout.
+    /// Its inspector must not offer that checkout's changes to commit, nor
+    /// keep showing whichever worktree was shown before; it offers to
+    /// recreate the worktree instead.
+    #[test]
+    fn a_removed_worktrees_pane_binds_no_other_checkouts_source_control() {
+        let mut fixture = fixture();
+        let main = fixture.main.path().to_path_buf();
+        let gone = std::path::PathBuf::from("/nonexistent/feature-two");
+        let missing = fixture.channel(1, Some(&gone));
+        let pane = strip_pane(&main);
+        Arc::make_mut(&mut fixture.app.durable).cards = vec![pane.clone()].into();
+        {
+            let channel = Arc::make_mut(&mut fixture.app.durable)
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == missing)
+                .unwrap();
+            channel.cards = vec![pane.id];
+            channel.focused = Some(pane.id);
+        }
+        fixture.app.refresh_sidebar_channels();
+        // The main checkout is shown first, as it was before the channel.
+        let main_focus = crate::sidebar::SidebarFocus::Repository {
+            worktree: main.clone(),
+        };
+        fixture
+            .app
+            .sidebar_state
+            .sync_active_worktree(&fixture.app.sidebar_model, &main_focus);
+        assert!(fixture.app.sidebar_state.active_worktree().is_some());
+
+        drop(fixture.app.select_channel(missing));
+
+        assert_eq!(fixture.app.workspace.focused(), Some(pane.id));
+        assert_eq!(
+            fixture.app.sidebar_focus(),
+            crate::sidebar::SidebarFocus::Removed
+        );
+        drop(fixture.app.rebind_source_control());
+        assert_eq!(fixture.app.sidebar_state.active_worktree(), None);
+        assert!(fixture.app.sidebar_model.source_control.is_none());
+        assert!(matches!(
+            fixture.app.work_summary(pane.id).scope,
+            super::super::super::pull_request_ui::WorkScope::Removed(ref removed)
+                if removed.channel == missing && removed.path == gone
+        ));
+        assert_eq!(fixture.app.inspector_panel_pin(), None);
     }
 
     /// A listing records each worktree's branch, so it outlives the worktree.

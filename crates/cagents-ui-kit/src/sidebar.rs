@@ -1643,13 +1643,17 @@ pub enum SidebarFocus {
     Repository { worktree: PathBuf },
     /// A terminal card, identified by its working directory.
     Terminal { working_directory: PathBuf },
+    /// A card in a channel whose worktree was removed. Its panes run in
+    /// another checkout, so the panel shows no worktree rather than that one
+    /// or the one shown before.
+    Removed,
 }
 
 impl SidebarFocus {
     /// The directory this focus names, if any.
     fn path(&self) -> Option<&Path> {
         match self {
-            Self::None => None,
+            Self::None | Self::Removed => None,
             Self::Repository { worktree } => Some(worktree),
             Self::Terminal { working_directory } => Some(working_directory),
         }
@@ -4684,6 +4688,7 @@ impl SidebarState {
     pub fn sync_active_worktree(&mut self, model: &SidebarModel, focus: &SidebarFocus) -> bool {
         let followed = match focus.path().and_then(|path| model.worktree_at(path)) {
             Some(key) => Some(key),
+            None if *focus == SidebarFocus::Removed => None,
             None => self
                 .followed_worktree
                 .clone()

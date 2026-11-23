@@ -639,6 +639,37 @@ impl Consent {
         self.conversations
     }
 
+    /// The conversations and terminals deleting closes, as the confirmation
+    /// names them: "its conversation and 2 terminals".
+    fn closes(&self) -> Option<String> {
+        let count = |wanted: fn(&PaneSource) -> bool| {
+            self.panes
+                .iter()
+                .filter(|(_, source)| wanted(source))
+                .count()
+        };
+        let chats = count(|source| matches!(source, PaneSource::Chat(_)));
+        let terminals = count(|source| matches!(source, PaneSource::Terminal(_)));
+        let phrase = |count: usize, noun: &str| match count {
+            1 => noun.to_owned(),
+            count => format!("{count} {noun}s"),
+        };
+        match (chats, terminals) {
+            (0, 0) => None,
+            (chats, 0) => Some(format!("its {}", phrase(chats, "conversation"))),
+            (0, terminals) => Some(format!("its {}", phrase(terminals, "terminal"))),
+            (chats, 1) => Some(format!(
+                "its {} and a terminal",
+                phrase(chats, "conversation")
+            )),
+            (chats, terminals) => Some(format!(
+                "its {} and {}",
+                phrase(chats, "conversation"),
+                phrase(terminals, "terminal")
+            )),
+        }
+    }
+
     /// Whether deleting the channel as it is now loses nothing beyond what
     /// this consent named: the same panes showing the same sources, and no
     /// unsaved editor it did not list.
@@ -664,6 +695,8 @@ struct Deletion {
     /// Why the last deletion of this channel failed, when the dialog is
     /// opened again after it. Confirming retries it.
     failure: Option<String>,
+    /// What deleting leaves alone, for a channel working in a worktree.
+    kept: Option<String>,
 }
 
 impl State {
@@ -1819,12 +1852,24 @@ impl Cagents {
         };
         let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
             .into_owned();
+        // Deleting a channel never touches Git; one working in a worktree
+        // says so, since its name is the branch's.
+        let kept = channel.checkout.as_ref().map(|_| {
+            self.missing_checkout(id).map_or_else(
+                || "Its worktree and branch stay as they are.".to_owned(),
+                |missing| match &missing.branch {
+                    Some(branch) => format!("The branch {branch} stays in the repository."),
+                    None => "Its branch stays in the repository.".to_owned(),
+                },
+            )
+        });
         self.channel_ui.dialog = Some(Deletion {
             channel: id,
             title,
             consent,
             changed,
             failure: self.channel_ui.failed.get(&id).cloned(),
+            kept,
         });
         iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
     }
@@ -2038,14 +2083,14 @@ impl Cagents {
         if started.is_empty() {
             return Task::none();
         }
-        self.refresh_sidebar_channels();
         // Settling spawns and closing sessions take a round trip each, and the
         // rows report them meanwhile. The workspace leaves the channel now, so
         // nothing the user does in the meantime lands in a channel whose
         // sessions are being closed. Every channel going is already marked
         // deleting, so it lands on one that stays rather than passing through
-        // each of the others on the way.
-        let leaving = self
+        // each of the others on the way. Its neighbours are read while the
+        // sidebar still draws its row.
+        let successor = self
             .durable
             .active_channel
             .filter(|active| started.iter().any(|(id, _)| id == active))
@@ -2054,12 +2099,11 @@ impl Cagents {
                     .channels
                     .iter()
                     .position(|channel| channel.id == active)
-            });
-        let leave = match leaving {
-            Some(index) => {
-                let (project_id, successor) = self.channel_successor(index);
-                self.land_after_channel(project_id, successor)
-            }
+            })
+            .map(|index| self.channel_successor(index));
+        self.refresh_sidebar_channels();
+        let leave = match successor {
+            Some((project_id, successor)) => self.land_after_channel(project_id, successor),
             None => Task::none(),
         };
         let mut tasks = Vec::with_capacity(started.len() + 2);
@@ -2414,18 +2458,50 @@ impl Cagents {
     }
 
     /// The project of the channel at `index`, and the channel the workspace
-    /// moves to once it is gone: the one below it in the sidebar, or the one
-    /// above it when the project's oldest channel is the one going away. Below
-    /// means the next lower rank, because the sidebar renders newest first.
+    /// moves to once it is gone: the project's channel the sidebar draws next
+    /// below it, else the one above, so the selection stays in view under a
+    /// search or filter. When the sidebar draws neither, the one below it in
+    /// rank, or above it when the project's oldest channel is the one going
+    /// away. Below means the next lower rank, because the sidebar renders
+    /// newest first.
     fn channel_successor(&self, index: usize) -> (ProjectId, Option<ChannelId>) {
         let leaving = &self.durable.channels[index];
-        let mut below = None::<&ProjectChannel>;
-        let mut above = None::<&ProjectChannel>;
-        for channel in self.durable.channels.iter().filter(|channel| {
+        let stays = |channel: &ProjectChannel| {
             channel.id != leaving.id
                 && channel.project_id == leaving.project_id
                 && !self.channel_ui.is_deleting(channel.id)
-        }) {
+        };
+        let rows = self.visible_sidebar_rows();
+        let shown = || {
+            rows.iter().enumerate().filter_map(|(at, row)| match row {
+                crate::sidebar::SelectionRow::Channel(id) => self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == *id && stays(channel))
+                    .then_some((at, *id)),
+                _ => None,
+            })
+        };
+        let neighbour = rows
+            .iter()
+            .position(|row| *row == crate::sidebar::SelectionRow::Channel(leaving.id))
+            .and_then(|leaving_at| {
+                shown()
+                    .find(|(at, _)| *at > leaving_at)
+                    .or_else(|| shown().filter(|(at, _)| *at < leaving_at).last())
+            });
+        if let Some((_, id)) = neighbour {
+            return (leaving.project_id, Some(id));
+        }
+        let mut below = None::<&ProjectChannel>;
+        let mut above = None::<&ProjectChannel>;
+        for channel in self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| stays(channel))
+        {
             if channel.ordinal <= leaving.ordinal {
                 if below.is_none_or(|best| channel.ordinal > best.ordinal) {
                     below = Some(channel);
@@ -2470,15 +2546,14 @@ impl Cagents {
         let dialog = self.channel_ui.dialog.as_ref()?;
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title("Delete channel?").into(),
-            super::notice_body(match dialog.consent.conversations {
-                0 => format!("Delete \"{}\" from this workspace?", dialog.title),
-                1 => format!("Delete \"{}\" and close its conversation?", dialog.title),
-                chats => format!(
-                    "Delete \"{}\" and close its {chats} conversations?",
-                    dialog.title
-                ),
+            super::notice_body(match dialog.consent.closes() {
+                None => format!("Delete \"{}\" from this workspace?", dialog.title),
+                Some(closes) => format!("Delete \"{}\" and close {closes}?", dialog.title),
             }),
         ];
+        if let Some(kept) = &dialog.kept {
+            rows.push(design::caption(kept.as_str()).into());
+        }
         if let Some(unsaved) = unsaved_editors_notice(&dialog.consent.unsaved) {
             rows.push(
                 widget::text::body(unsaved)
@@ -4452,6 +4527,79 @@ pub(in crate::app) mod tests {
         assert_eq!(
             app.durable.active_worktree, app.active_workspace,
             "the deletion persisted the workspace it left behind"
+        );
+    }
+
+    /// Under a search, the workspace lands on the neighbour the sidebar
+    /// still draws, rather than on a sibling the search hides, which would
+    /// leave nothing in the list marked as shown.
+    #[test]
+    fn deleting_the_active_channel_under_a_search_lands_on_a_drawn_neighbour() {
+        for (query, drawn_lands) in [("", false), ("investigation", true)] {
+            let (mut app, doomed, survivor, _) = channel_with_a_conversation();
+            let project = app.sidebar_model.projects.last().unwrap().id;
+            let drawn = ChannelId::new();
+            {
+                let durable = Arc::make_mut(&mut app.durable);
+                for channel in &mut durable.channels {
+                    channel.ordinal = if channel.id == doomed { 2 } else { 1 };
+                }
+                durable.channels.push(ProjectChannel {
+                    title_source: Default::default(),
+                    id: drawn,
+                    project_id: project,
+                    title: "Investigation notes".into(),
+                    ordinal: 3,
+                    shared: false,
+                    cards: Vec::new(),
+                    focused: None,
+                    checkout: None,
+                });
+            }
+            app.refresh_sidebar_channels();
+            drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(query.into()))));
+
+            let _ = app.handle_channel_ui(Action::Delete(doomed));
+            let _ = app.handle_channel_ui(Action::ConfirmDelete);
+            assert_eq!(
+                app.durable.active_channel,
+                Some(if drawn_lands { drawn } else { survivor }),
+                "searching {query:?}"
+            );
+        }
+    }
+
+    /// The confirmation names what deleting closes by what it is.
+    #[test]
+    fn a_deletion_names_the_conversations_and_terminals_it_closes() {
+        let consent = |chats: usize, terminals: usize| Consent {
+            panes: (0..chats)
+                .map(|_| {
+                    (
+                        CardId::new(),
+                        PaneSource::Chat(crate::model::TerminalId::new()),
+                    )
+                })
+                .chain((0..terminals).map(|_| {
+                    (
+                        CardId::new(),
+                        PaneSource::Terminal(crate::model::TerminalId::new()),
+                    )
+                }))
+                .collect(),
+            conversations: chats + terminals,
+            unsaved: Vec::new(),
+        };
+        assert_eq!(consent(0, 0).closes(), None);
+        assert_eq!(consent(1, 0).closes().as_deref(), Some("its conversation"));
+        assert_eq!(consent(0, 2).closes().as_deref(), Some("its 2 terminals"));
+        assert_eq!(
+            consent(1, 2).closes().as_deref(),
+            Some("its conversation and 2 terminals")
+        );
+        assert_eq!(
+            consent(3, 1).closes().as_deref(),
+            Some("its 3 conversations and a terminal")
         );
     }
 
