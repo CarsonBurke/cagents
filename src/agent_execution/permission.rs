@@ -614,9 +614,120 @@ fn launched_options(provider: Provider, arguments: &[String]) -> Option<Vec<(&st
     Some(options)
 }
 
+/// A session's ceiling as its own daemon states it to a linked device, which
+/// then holds the session's capability there to it. The names are the ones
+/// [`Mode`] reads, so the device ranks the same mode the session runs in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StatedCeiling {
+    pub provider: Option<Provider>,
+    pub mode: Option<String>,
+}
+
+impl StatedCeiling {
+    /// The bytes a device proof signs for this ceiling, so that no one
+    /// relaying the proof can raise it.
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(2 + self.mode.as_ref().map_or(0, String::len));
+        bytes.push(self.provider.map_or(0, |provider| provider as u8 + 1));
+        match &self.mode {
+            Some(mode) => {
+                bytes.push(1);
+                bytes.extend_from_slice(mode.as_bytes());
+            }
+            None => bytes.push(0),
+        }
+        bytes
+    }
+}
+
+impl Ceiling {
+    /// This ceiling as a linked device is told it.
+    pub fn stated(&self) -> StatedCeiling {
+        StatedCeiling {
+            provider: self.provider,
+            mode: self.mode.map(Mode::name),
+        }
+    }
+
+    /// The ceiling another daemon stated. A mode this one cannot read is
+    /// refused rather than counted as asking, which could be more than the
+    /// session has.
+    pub fn from_stated(stated: &StatedCeiling) -> Result<Self, String> {
+        let unreadable = || "The device could not read this session's permission mode".to_owned();
+        let mode = match (&stated.mode, stated.provider) {
+            (None, _) => None,
+            (Some(_), None) => return Err(unreadable()),
+            (Some(name), Some(provider)) => Some(match provider {
+                // Named by meaning only, so an agent's own alias of one
+                // meaning cannot be read as another.
+                Provider::Antigravity | Provider::Muse => {
+                    let meaning = *provider
+                        .permission_modes()
+                        .iter()
+                        .find(|meaning| **meaning == name)
+                        .ok_or_else(unreadable)?;
+                    Mode::Acp(Claude::parse(meaning).ok_or_else(unreadable)?, meaning)
+                }
+                _ => Mode::parse(provider, name).ok_or_else(unreadable)?,
+            }),
+        };
+        Ok(Self {
+            provider: stated.provider,
+            mode,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stated_ceiling_reads_back_as_the_same_ceiling() {
+        let providers = [
+            Provider::Omp,
+            Provider::Claude,
+            Provider::Codex,
+            Provider::Antigravity,
+            Provider::Muse,
+        ];
+        let mut ceilings = vec![Ceiling::unknown()];
+        for provider in providers {
+            ceilings.push(Ceiling {
+                provider: Some(provider),
+                mode: None,
+            });
+            for mode in Mode::strictest(provider) {
+                ceilings.push(Ceiling {
+                    provider: Some(provider),
+                    mode: Some(mode),
+                });
+            }
+        }
+        for ceiling in ceilings {
+            assert_eq!(
+                Ceiling::from_stated(&ceiling.stated()).as_ref(),
+                Ok(&ceiling),
+                "{ceiling:?}"
+            );
+        }
+        for unreadable in [
+            StatedCeiling {
+                provider: Some(Provider::Codex),
+                mode: Some("never".into()),
+            },
+            StatedCeiling {
+                provider: None,
+                mode: Some("bypassPermissions".into()),
+            },
+            StatedCeiling {
+                provider: Some(Provider::Claude),
+                mode: Some("yolo".into()),
+            },
+        ] {
+            assert!(Ceiling::from_stated(&unreadable).is_err(), "{unreadable:?}");
+        }
+    }
 
     #[test]
     fn every_rankable_mode_reaches_its_tier() {

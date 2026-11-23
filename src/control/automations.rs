@@ -209,7 +209,6 @@ pub(super) fn execute_with_context(
     command: AutomationCommand,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
-    context.admit_remote()?;
     let authority = &context.authority;
     let wait = match &command {
         AutomationCommand::Propose {

@@ -303,7 +303,11 @@ use crate::{
 /// Version 197 appends `MovePane` and its `PaneMoved` reply, which move a
 /// pane into an existing or new channel of its project, and let an agent
 /// session move its own pane. An older client never sends it.
-pub const PROTOCOL_VERSION: u16 = 197;
+///
+/// Version 198 appends device links: `DeviceTrust`, the peer challenge and
+/// authentication through which a linked computer's session acts on this
+/// daemon, and `SignDeviceChallenge`, with their replies.
+pub const PROTOCOL_VERSION: u16 = 198;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -368,6 +372,11 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
     if let Some(path) = crate::device::socket_path()? {
         return Ok(path);
     }
+    local_daemon_socket_path()
+}
+
+/// This computer's daemon socket, even while another device is selected.
+pub fn local_daemon_socket_path() -> io::Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -807,6 +816,29 @@ pub enum ClientRequest {
         pane: Option<crate::model::CardId>,
         destination: crate::workspace_model::PaneDestination,
         operation: uuid::Uuid,
+    },
+    /// A person's request about this daemon's device links and linked
+    /// peers. Refused to a connection that acts for an agent session.
+    DeviceTrust {
+        request: crate::device_trust::Request,
+    },
+    /// Asks for the nonce a linked computer signs to act for one of its
+    /// sessions on this connection. A new challenge replaces the last.
+    PeerChallenge,
+    /// Presents the linked computer's proof for the last challenge. It is
+    /// answered with a capability for that peer lineage, which lasts while
+    /// this connection stays open.
+    PeerAuthenticate {
+        peer: uuid::Uuid,
+        claim: crate::device_trust::Claim,
+        proof: [u8; crate::device_trust::SECRET_BYTES],
+    },
+    /// Signs another device's nonce for the session `authority` was issued
+    /// to, when a person allowed sessions here to use `device`.
+    SignDeviceChallenge {
+        authority: crate::agent_execution::Authority,
+        device: String,
+        nonce: [u8; crate::device_trust::SECRET_BYTES],
     },
 }
 
@@ -1283,6 +1315,21 @@ pub enum ServerResponse {
     },
     /// The reply to `MovePane`.
     PaneMoved(crate::workspace_model::PaneMove),
+    DeviceTrust(crate::device_trust::Reply),
+    PeerChallenge {
+        nonce: [u8; crate::device_trust::SECRET_BYTES],
+    },
+    /// The capability a peer's session uses on this connection.
+    PeerAuthenticated {
+        authority: crate::agent_execution::Authority,
+    },
+    /// This computer's signature of a device's nonce for the caller's
+    /// lineage and permission ceiling.
+    DeviceProof {
+        peer: uuid::Uuid,
+        claim: crate::device_trust::Claim,
+        proof: [u8; crate::device_trust::SECRET_BYTES],
+    },
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

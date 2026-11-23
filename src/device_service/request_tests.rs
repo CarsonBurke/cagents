@@ -157,79 +157,48 @@ fn successful_user(peer: &mut UnixStream) {
 
 #[test]
 fn user_request_keeps_readiness_and_authenticates_before_one_device_operation() {
-    for remote in [false, true] {
-        let (_directory, socket, worker) = server(successful_user);
-        let starts = Cell::new(0);
-        assert_eq!(
-            request_as(
-                Operation::Home,
-                Authority::default(),
-                false,
-                remote,
-                || panic!("ordinary User retains the existing readiness/start path"),
-                // Readiness hands over the connection its handshake proved;
-                // `finished` shows the request needed no other (#3127).
-                || {
-                    starts.set(starts.get() + 1);
-                    crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())
-                },
-            )
-            .unwrap(),
-            home()
-        );
-        assert_eq!(starts.get(), 1);
-        finished(worker);
-    }
+    let (_directory, socket, worker) = server(successful_user);
+    let starts = Cell::new(0);
+    assert_eq!(
+        request_as(
+            Operation::Home,
+            Authority::default(),
+            false,
+            || panic!("ordinary User retains the existing readiness/start path"),
+            // Readiness hands over the connection its handshake proved;
+            // `finished` shows the request needed no other (#3127).
+            || {
+                starts.set(starts.get() + 1);
+                crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())
+            },
+        )
+        .unwrap(),
+        home()
+    );
+    assert_eq!(starts.get(), 1);
+    finished(worker);
 }
 
 #[test]
 fn explicit_no_start_user_request_uses_the_selected_socket_without_readiness() {
-    for remote in [false, true] {
-        let (_directory, socket, worker) = server(successful_user);
-        let selections = Cell::new(0);
-        assert_eq!(
-            request_as(
-                Operation::Home,
-                Authority::default(),
-                true,
-                remote,
-                || {
-                    selections.set(selections.get() + 1);
-                    Ok(socket)
-                },
-                || panic!("explicit no-start must never enter daemon readiness"),
-            )
-            .unwrap(),
-            home()
-        );
-        assert_eq!(selections.get(), 1);
-        finished(worker);
-    }
-}
-
-#[test]
-fn remote_present_authority_is_refused_before_socket_resolution_or_startup() {
-    for authority in [
-        Authority::session("fixture-remote-device-capability".into()),
-        Authority::session(String::new()),
-    ] {
-        for no_start in [false, true] {
-            let error = request_as(
-                Operation::Home,
-                authority.clone(),
-                no_start,
-                true,
-                || panic!("scoped remote selection must not launch an SSH bridge"),
-                || panic!("scoped remote requests must not enter daemon readiness"),
-            )
-            .unwrap_err();
-            assert!(error.contains("require a user terminal on the remote device"));
-            if let Some(token) = authority.token().filter(|token| !token.is_empty()) {
-                assert!(!error.contains(token));
-            }
-        }
-    }
+    let (_directory, socket, worker) = server(successful_user);
+    let selections = Cell::new(0);
+    assert_eq!(
+        request_as(
+            Operation::Home,
+            Authority::default(),
+            true,
+            || {
+                selections.set(selections.get() + 1);
+                Ok(socket)
+            },
+            || panic!("explicit no-start must never enter daemon readiness"),
+        )
+        .unwrap(),
+        home()
+    );
+    assert_eq!(selections.get(), 1);
+    finished(worker);
 }
 
 #[test]
@@ -257,7 +226,6 @@ fn scoped_request_keeps_captured_authority_through_selection_and_device_refusal(
         Operation::Home,
         captured,
         false,
-        false,
         || {
             *later_sample.borrow_mut() = Authority::default();
             Ok(socket)
@@ -282,7 +250,6 @@ fn a_refusal_shown_to_its_reader_is_the_daemons_own_wording() {
         Operation::Home,
         Authority::default(),
         true,
-        false,
         || Ok(socket),
         || panic!("no daemon is started"),
         super::reader_message,
@@ -323,7 +290,6 @@ fn only_the_daemons_busy_refusal_reads_as_busy() {
             Operation::Home,
             Authority::default(),
             true,
-            false,
             || Ok(socket),
             || panic!("no daemon is started"),
             crate::control::RequestError::from,
@@ -351,7 +317,6 @@ fn refused_present_authority_never_dispatches_or_falls_back_to_user() {
             Operation::Home,
             authority.clone(),
             false,
-            false,
             || Ok(socket),
             || panic!("even invalid presence must not become User startup"),
         )
@@ -377,7 +342,6 @@ fn scoped_and_no_start_requests_preserve_selected_socket_errors_without_startup(
             Operation::Home,
             authority,
             no_start,
-            false,
             || {
                 selections.set(selections.get() + 1);
                 Err("selected device unavailable".into())
@@ -392,7 +356,6 @@ fn scoped_and_no_start_requests_preserve_selected_socket_errors_without_startup(
         request_as(
             Operation::Home,
             Authority::default(),
-            false,
             false,
             || panic!("ordinary User uses readiness, not a selected-only fallback"),
             || {
@@ -434,7 +397,6 @@ fn handshake_refusal_and_proof_mismatch_never_authenticate_dispatch_or_retry() {
             Operation::Home,
             authority,
             no_start,
-            false,
             || {
                 selections.set(selections.get() + 1);
                 Ok(socket)
@@ -461,7 +423,6 @@ fn missing_selected_socket_never_starts_or_retries_as_user() {
             Operation::Home,
             authority,
             no_start,
-            false,
             || {
                 selections.set(selections.get() + 1);
                 Ok(directory.path().join("missing.sock"))

@@ -70,6 +70,15 @@ fn access(request: &ClientRequest) -> Access<'_> {
             | crate::work::Request::Snapshots { .. },
         )
         | R::WatchWork
+        // A linked computer's session resolves paths on this device as it
+        // starts agents; nothing else of a device's files is open to it.
+        | R::DeviceOperation {
+            operation:
+                crate::device_service::Operation::Home
+                | crate::device_service::Operation::Discover { .. },
+        }
+        | R::PeerChallenge
+        | R::PeerAuthenticate { .. }
         // Admitted only so its handler can explain that it was removed.
         | R::RetiredChannelWork => Access::Open,
         R::Input { terminal_id, .. }
@@ -91,6 +100,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
+        | R::DeviceTrust { .. }
+        | R::SignDeviceChallenge { .. }
         | R::Agent { .. }
         | R::Automation { .. }
         | R::Shutdown
@@ -151,6 +162,18 @@ pub(in crate::host) fn authenticate(
     if authority.token().is_none() {
         return Ok(());
     }
+    // A peer capability acts only on the connection whose proof it answered.
+    if super::super::device_trust::is_peer_capability(authority)
+        && !host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peers
+            .issued_to(authority.token().unwrap_or_default(), client_id)
+    {
+        return Err(denied(
+            "This device capability was issued to another connection",
+        ));
+    }
     let lineage = match super::origin(host, authority).map_err(denied)? {
         Origin::Child { parent } => parent,
         Origin::User | Origin::Automation { .. } => {
@@ -180,11 +203,17 @@ pub(in crate::host) fn admit(
     client_id: ClientId,
     request: &ClientRequest,
 ) -> Result<(), ProtocolError> {
+    if carries_foreign_peer_capability(host, client_id, request) {
+        return Err(denied(
+            "A device capability acts only on the connection that proved it",
+        ));
+    }
     let Some(lineage) = acting_for(host, client_id) else {
         return Ok(());
     };
     match access(request) {
         Access::Open => Ok(()),
+        Access::Refused if own_peer_request(host, client_id, request) => Ok(()),
         Access::Refused => Err(denied(
             "An agent session's connection may only read terminals and change its own",
         )),
@@ -352,6 +381,41 @@ pub(in crate::host) fn authorize_move(
         "Pane {} belongs to another session. An agent moves only its own pane and those of the terminals and agents it started; message that session with `cagents send`, or ask the person to move it",
         pane.id
     )))
+}
+
+/// A linked computer's session sends its agent and automation requests on the
+/// connection it proved, carrying the capability that proof issued; each is
+/// then held to that capability's scope as it is handled. Any other authority
+/// on that connection is refused, as on a local session's.
+fn own_peer_request(host: &SharedHost, client_id: ClientId, request: &ClientRequest) -> bool {
+    let (ClientRequest::Agent { authority, .. } | ClientRequest::Automation { authority, .. }) =
+        request
+    else {
+        return false;
+    };
+    authority.token().is_some_and(|token| {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peers
+            .issued_to(token, client_id)
+    })
+}
+
+/// Whether `request` presents a peer capability issued to another
+/// connection. Only the connection a proof was answered on may act with the
+/// capability it earned, whether or not this one has authenticated.
+fn carries_foreign_peer_capability(
+    host: &SharedHost,
+    client_id: ClientId,
+    request: &ClientRequest,
+) -> bool {
+    let (ClientRequest::Agent { authority, .. } | ClientRequest::Automation { authority, .. }) =
+        request
+    else {
+        return false;
+    };
+    super::super::device_trust::is_peer_capability(authority)
+        && !own_peer_request(host, client_id, request)
 }
 
 fn acting_for(host: &SharedHost, client_id: ClientId) -> Option<Lineage> {

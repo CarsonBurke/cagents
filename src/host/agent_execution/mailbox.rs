@@ -365,7 +365,7 @@ fn leave(
     outgoing: Outgoing,
 ) -> Result<Delivery, AcceptanceError> {
     outgoing.validate()?;
-    let (_, session) = caller(host, authority)?;
+    let (origin, session) = caller(host, authority)?;
     // Read first, as the listing takes the registry lock itself.
     let listing = directory::list(
         host,
@@ -413,7 +413,7 @@ fn leave(
                 .filter(|title| !title.is_empty())
         };
         let from = Party {
-            lineage: session.map(lineage_of),
+            lineage: session.map(lineage_of).or(linked(&origin, session)),
             session,
             title: session.and_then(title_of),
         };
@@ -537,7 +537,7 @@ pub(in crate::host) fn inbox(
     authority: &Authority,
     query: Inbox,
 ) -> Result<Vec<Message>, AcceptanceError> {
-    let (_, session) = caller(host, authority)?;
+    let (origin, session) = caller(host, authority)?;
     let registry = registry(host)?;
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
     let lineage = session
@@ -546,7 +546,8 @@ pub(in crate::host) fn inbox(
                 .session_lineage(session)
                 .map(|lineage| lineage.unwrap_or(Lineage(session)))
         })
-        .transpose()?;
+        .transpose()?
+        .or(linked(&origin, session));
     let result = registry.read_messages(lineage, session, &query, super::now());
     drop(registry);
     if result.is_ok() {
@@ -560,7 +561,7 @@ pub(in crate::host) fn peek(
     authority: &Authority,
     query: Inbox,
 ) -> Result<Vec<Message>, AcceptanceError> {
-    let (_, session) = caller(host, authority)?;
+    let (origin, session) = caller(host, authority)?;
     let registry = registry(host)?;
     let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
     let lineage = session
@@ -569,7 +570,8 @@ pub(in crate::host) fn peek(
                 .session_lineage(session)
                 .map(|lineage| lineage.unwrap_or(Lineage(session)))
         })
-        .transpose()?;
+        .transpose()?
+        .or(linked(&origin, session));
     let mut messages = registry.peek_messages(lineage, &query)?;
     for message in &mut messages {
         if message.state == State::Pending {
@@ -587,7 +589,7 @@ pub(in crate::host) fn acknowledge(
     receipt: Receipt,
 ) -> Result<(), AcceptanceError> {
     receipt.validate()?;
-    let (_, session) = caller(host, authority)?;
+    let (origin, session) = caller(host, authority)?;
     let registry = registry(host)?;
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
     let lineage = session
@@ -596,7 +598,8 @@ pub(in crate::host) fn acknowledge(
                 .session_lineage(session)
                 .map(|lineage| lineage.unwrap_or(Lineage(session)))
         })
-        .transpose()?;
+        .transpose()?
+        .or(linked(&origin, session));
     let result = registry.acknowledge_messages(lineage, session, &receipt, super::now());
     drop(registry);
     if result.is_ok() {
@@ -701,6 +704,16 @@ fn resolve(
     }
 }
 
+/// The lineage a session from a linked computer reads and sends mail as. It
+/// has no session here, only the lineage its connection proved, and without
+/// one it would read the person's own inbox.
+fn linked(origin: &Origin, session: Option<TerminalId>) -> Option<Lineage> {
+    match (origin, session) {
+        (Origin::Child { parent }, None) => Some(*parent),
+        _ => None,
+    }
+}
+
 /// Where the caller's parent receives messages: the session whose agent it
 /// is, or the user when the user's own CLI started it.
 fn parent(
@@ -709,7 +722,11 @@ fn parent(
     lineage: Option<Lineage>,
 ) -> Result<Option<Lineage>, String> {
     let Some(session) = session else {
-        return Err("Only a session has a parent; this caller is the user's own CLI".into());
+        return Err(match lineage {
+            // A linked computer's session, which has no record here.
+            Some(_) => "A session from another computer has no parent on this device; message it from that computer".into(),
+            None => "Only a session has a parent; this caller is the user's own CLI".into(),
+        });
     };
     // A relaunched agent keeps its record under the session first bound to it.
     let agent = match registry.agent_for_session(session)? {

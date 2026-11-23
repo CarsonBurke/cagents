@@ -334,6 +334,8 @@ pub(crate) struct HostState {
     /// The capability each of those connections authenticated with last,
     /// from which its own permission ceiling is read.
     pub(super) agent_client_authorities: BTreeMap<ClientId, crate::agent_execution::Authority>,
+    /// What linked computers' sessions hold on their connections.
+    pub(super) peers: super::device_trust::Peers,
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
@@ -523,6 +525,7 @@ impl HostState {
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             agent_client_authorities: BTreeMap::new(),
+            peers: Default::default(),
             automations: None,
             work: None,
             mailbox: None,
@@ -624,6 +627,7 @@ impl HostState {
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
         self.agent_client_authorities.remove(&client_id);
+        self.peers.disconnect(client_id);
     }
 
     /// Installs the durable shared sidebar model.
@@ -1123,6 +1127,7 @@ impl HostState {
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
         self.agent_client_authorities.remove(&client_id);
+        self.peers.disconnect(client_id);
         handles
     }
 

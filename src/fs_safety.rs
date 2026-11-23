@@ -1434,7 +1434,7 @@ fn temporary_name() -> io::Result<OsString> {
 }
 
 /// Fills `buffer` from the kernel's random pool.
-fn fill_random(buffer: &mut [u8]) -> io::Result<()> {
+pub(crate) fn fill_random(buffer: &mut [u8]) -> io::Result<()> {
     let mut filled = 0;
     while filled < buffer.len() {
         let remaining = &mut buffer[filled..];

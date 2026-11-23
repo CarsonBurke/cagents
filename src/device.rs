@@ -204,12 +204,12 @@ fn list_from_path(path: &Path) -> io::Result<Vec<Device>> {
         Err(error) => Err(error),
     }
 }
-fn validate(device: &Device) -> io::Result<()> {
-    if device.name == "local"
-        || device.name.is_empty()
-        || device.name.len() > 16
-        || !device
-            .name
+/// Whether `name` can name a saved device.
+pub(crate) fn validate_name(name: &str) -> io::Result<()> {
+    if name == "local"
+        || name.is_empty()
+        || name.len() > 16
+        || !name
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
     {
@@ -217,6 +217,10 @@ fn validate(device: &Device) -> io::Result<()> {
             "device names must be 1–16 ASCII letters, digits, hyphens or underscores; local is reserved",
         ));
     }
+    Ok(())
+}
+fn validate(device: &Device) -> io::Result<()> {
+    validate_name(&device.name)?;
     if device.host.is_empty()
         || device.host.starts_with('-')
         || device
@@ -402,6 +406,9 @@ fn quote(value: &str) -> String {
 /// window or finishing a command leaves no usable transport behind.
 fn ssh(control: Option<&str>) -> Command {
     let mut command = Command::new("ssh");
+    // A session's capability is this computer's alone; on the device it
+    // proves itself through a link instead. A `SendEnv` must not carry it.
+    command.env_remove(crate::agent_execution::AUTHORITY_ENV);
     command.args([
         "-T",
         "-o",
@@ -1277,7 +1284,7 @@ pub fn prepare() -> io::Result<()> {
     if !is_remote() {
         return Ok(());
     }
-    match crate::device_service::request(crate::device_service::Operation::Home) {
+    match crate::device_service::request_refusable(crate::device_service::Operation::Home) {
         Ok(crate::device_service::Reply::Home {
             path,
             shell,
@@ -1295,7 +1302,12 @@ pub fn prepare() -> io::Result<()> {
             io::ErrorKind::NotConnected,
             DaemonNotRunning,
         )),
-        Err(error) => Err(io::Error::other(
+        // The device answered: SSH and the daemon are fine, and the reason
+        // is the answer.
+        Err(crate::device_service::Failure::Refused(message)) => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+        }
+        Err(crate::device_service::Failure::Failed(error)) => Err(io::Error::other(
             format!(
                 "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start` and install matching cagents executables",
                 selected().unwrap().name,

@@ -1,7 +1,7 @@
 //! Public terminal entry over private framed peers. Synthetic authentication
 //! proves client custody and startup order, never actual Host permissions.
-//! Remote cases concern early permission guidance on the current guarded
-//! device-service path; they do not claim an old SSH execution vulnerability.
+//! Remote cases show a hosted session reaches the device without SSH
+//! carrying its capability.
 use super::*;
 use crate::{
     model::{BootId, HostIncarnation, HostSessionId},
@@ -416,7 +416,6 @@ fn remote() {
     assert!(crate::device::is_remote());
     assert_eq!(crate::device::selected().unwrap().name, "fixture");
     assert_eq!(proxies(), before);
-    assert!(!Path::new(&std::env::var_os(MARKER).unwrap()).exists());
     // Exactly one public invocation per child: Cleanup closes device selection
     // at return, so a second command would exercise a closed fixture instead.
 }
@@ -440,7 +439,7 @@ fn child(selector: &str, role: &str, remote_verb: Option<Business>) {
     let ssh = base.join("bin/ssh");
     fs::write(
         &ssh,
-        b"#!/bin/sh\nprintf 'unexpected ssh\\n' >> \"$CAGENTS_TEST_TERMINAL_START_SSH\"\nexit 1\n",
+        b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; export -p; } >> \"$CAGENTS_TEST_TERMINAL_START_SSH\"\nexit 1\n",
     )
     .unwrap();
     fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
@@ -510,20 +509,25 @@ fn child(selector: &str, role: &str, remote_verb: Option<Business>) {
         "{role} {remote_verb:?}: {stdout}\n{stderr}"
     );
     assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
-    assert!(!marker.exists());
     let errors = outputs(&stderr);
     if remote_verb.is_some() {
+        // The session reaches the device, which this fixture's SSH cannot:
+        // a connection failure, and SSH never carries its capability.
+        let ssh = fs::read_to_string(&marker).expect("a hosted session reaches the device");
+        assert!(
+            // `export -p` is the shell's own, so it lists the environment
+            // even though PATH holds only this fixture's ssh.
+            ssh.contains("XDG_STATE_HOME")
+                && !ssh.contains(TOKEN)
+                && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
+            "SSH must never carry the session's capability: {ssh}"
+        );
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0]["ok"], false);
-        assert_eq!(errors[0]["error"]["kind"], "permission_denied");
-        let message = errors[0]["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("own terminal"),
-            "remote refusal must explain the recovery action"
-        );
-        assert!(!message.contains("daemon start"));
+        assert_eq!(errors[0]["error"]["kind"], "device", "{}", errors[0]);
         assert!(outputs(&stdout).is_empty());
     } else {
+        assert!(!marker.exists());
         let scoped = !role.starts_with("user");
         // A scoped mutation must not recover/start before authentication.
         let routes = Business::ALL.map(|business| {

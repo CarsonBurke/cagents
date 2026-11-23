@@ -127,3 +127,69 @@ and exact terminal/chat sessions. Creating, moving or closing a pane updates the
 other clients live. Focus, scrolling and unsent drafts belong to each window.
 When another client removes a pane with local unsaved work, that work stays
 available here until it is saved or discarded.
+
+## Agents on a device
+
+An agent running in cagents on this computer can start and drive agents on a
+saved device, once you allow it. Link the device and allow agents from a system
+terminal outside cagents:
+
+```console
+cagents device link build-host --allow-agents
+```
+
+Then a session on this computer uses the device as you would:
+
+```console
+cagents --device build-host agent spawn --provider codex --project /home/user/projects/example 'Run the tests'
+cagents --device build-host agent wait AGENT
+cagents --device build-host agent send AGENT 'Fix the failure too'
+cagents --device build-host agent close AGENT
+```
+
+On the device, the session has a session's scope: it may start, message, wait
+for and close its own agents and terminals there, and message other sessions.
+Like a session on the device, it can also read every terminal's screen and
+every conversation there, including your own, so allow agents only on a device
+whose contents you would show them. Through cagents it may not change accounts,
+the daemon, installations or device links, and, as on this computer, it may
+only use a project already open on the device. Its agents there are its
+children: they belong to the session that started them, not to the device's own
+sessions. It keeps the permission ceiling it had here when its connection was
+proved: the agents it starts on the device with `agent spawn` get no more than
+it could give them here, and it may approve their tool requests there only if
+it could here. A terminal it starts with `terminal spawn` runs any command on
+the device as you, and, as on this computer, the permission ceiling does not
+cover a provider CLI it starts that way. Allowing agents on a device therefore
+lets sessions here run commands there as you. An agent it starts on the device
+is a session of that device, so it may use the device's own links to further
+devices if a person there allowed them.
+
+| Command | What it does |
+| --- | --- |
+| `cagents device list` | Saved devices, whether each is linked, and whether agents here may use it. |
+| `cagents device link NAME [--allow-agents]` | Links a saved device. Linking again replaces its key; the agents sessions here started on the device stay theirs. |
+| `cagents device allow-agents NAME` | Lets sessions on this computer use a linked device. |
+| `cagents device deny-agents NAME` | Stops them. Agents they already started there keep running. |
+| `cagents device unlink NAME` | Forgets the link here and on the device. |
+
+Only a person may link, allow, deny or unlink: the CLI refuses these commands
+in a cagents session, so an agent cannot grant itself a device through cagents.
+Like every session scope, this is cagents' own interface, not an
+operating-system sandbox: an agent with a shell and your SSH keys can already
+act as you on the device. A session that tries a device it may not use is told
+so, with the command a person can run, rather than a connection error.
+
+Linking stores a random key in `device-trust.json`, readable only by you, in
+each daemon's data directory. A session's own capability never leaves this
+computer, and SSH never carries it. For each connection, the device asks for a
+fresh challenge to be signed; this computer's daemon signs it only for a live
+session and only while agents are allowed. The signature covers the session's
+lineage and its permission ceiling, so nothing relaying it can raise either.
+The key guards against relaying, not against a process running as you, which
+can read it. The device then issues a capability that ends with that
+connection. Denying agents, unlinking, ending the session or changing its mode
+applies to the connections proved afterwards; a connection already proved, such
+as one waiting on an agent, keeps its capability until it closes. Unlinking
+deletes the key here at once, so no new connection can be proved even when the
+device cannot be reached to forget it.

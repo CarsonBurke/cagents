@@ -349,106 +349,103 @@ fn first_edit(peer: &mut UnixStream, verb: &str, model: &WorkspaceModel) -> Clie
 fn public_user_open_and_spawn_preserve_folder_identity_order_and_readiness_policy() {
     for verb in ["open", "spawn"] {
         for no_start in [false, true] {
-            for remote in [false, true] {
-                let fixture = Fixture::new();
-                let initial = fixture.model.clone();
-                let repository = fixture.repository.clone();
-                let peer = Peer::new(connected(), move |peer| {
-                    read_model(peer, &initial);
-                    let request = next(peer);
-                    let expected = if verb == "open" {
-                        ModelEdit::ReopenProject {
-                            repository: repository.clone(),
-                            kind: ProjectKind::Folder,
-                            name: repository_display_name(&repository),
-                        }
-                    } else {
-                        ModelEdit::OpenProject {
-                            repository: repository.clone(),
-                            kind: ProjectKind::Folder,
-                            name: repository_display_name(&repository),
-                        }
-                    };
-                    assert_eq!(
-                        request.request,
-                        ClientRequest::EditWorkspaceModel { edit: expected }
-                    );
-                    model_reply(peer, &request, initial.clone());
-                    if verb == "spawn" {
-                        let created = next(peer);
-                        let ClientRequest::EditWorkspaceModel {
-                            edit:
-                                ModelEdit::CreateChannel {
-                                    id,
-                                    repository: actual,
-                                    title,
-                                    title_source,
-                                },
-                        } = &created.request
-                        else {
-                            panic!("expected minted channel creation");
-                        };
-                        assert_eq!(actual, &repository);
-                        assert_eq!(title, "original title");
-                        assert_eq!(*title_source, Default::default());
-                        let mut result = initial;
-                        result.channels.push(ModelChannel {
-                            id: *id,
-                            repository,
-                            title: title.clone(),
-                            title_source: *title_source,
-                            ordinal: 9,
-                        });
-                        model_reply(peer, &created, result);
+            let fixture = Fixture::new();
+            let initial = fixture.model.clone();
+            let repository = fixture.repository.clone();
+            let peer = Peer::new(connected(), move |peer| {
+                read_model(peer, &initial);
+                let request = next(peer);
+                let expected = if verb == "open" {
+                    ModelEdit::ReopenProject {
+                        repository: repository.clone(),
+                        kind: ProjectKind::Folder,
+                        name: repository_display_name(&repository),
                     }
-                });
-                let mut args = fixture.argv(verb);
-                if no_start {
-                    args.insert(0, "--no-start".into());
-                }
-                let cli = parse(&args);
-                let context = ProjectChannelContext {
-                    authority: Authority::default(),
-                    remote,
-                    no_start: cli.global.no_start,
-                };
-                let existing = Cell::new(0);
-                let ready = Cell::new(0);
-                let output = dispatch(cli, |mutation| {
-                    assert!(mutation);
-                    context.connect_with(
-                        mutation,
-                        || {
-                            existing.set(existing.get() + 1);
-                            Ok(peer.socket.clone())
-                        },
-                        || {
-                            ready.set(ready.get() + 1);
-                            ControlClient::connect(&peer.socket)
-                                .map_err(|error| AppError::new("daemon_connection", error))
-                        },
-                        ControlClient::connect,
-                    )
-                })
-                .unwrap();
-                assert_eq!(
-                    output.command,
-                    if verb == "open" {
-                        "project.open"
-                    } else {
-                        "channel.spawn"
-                    }
-                );
-                assert_eq!(existing.get(), usize::from(no_start));
-                assert_eq!(ready.get(), usize::from(!no_start));
-                let row = if verb == "open" {
-                    &output.data["project"]
                 } else {
-                    &output.data["channel"]
+                    ModelEdit::OpenProject {
+                        repository: repository.clone(),
+                        kind: ProjectKind::Folder,
+                        name: repository_display_name(&repository),
+                    }
                 };
-                assert_eq!(row["repository"], json!(fixture.repository));
-                peer.finished();
+                assert_eq!(
+                    request.request,
+                    ClientRequest::EditWorkspaceModel { edit: expected }
+                );
+                model_reply(peer, &request, initial.clone());
+                if verb == "spawn" {
+                    let created = next(peer);
+                    let ClientRequest::EditWorkspaceModel {
+                        edit:
+                            ModelEdit::CreateChannel {
+                                id,
+                                repository: actual,
+                                title,
+                                title_source,
+                            },
+                    } = &created.request
+                    else {
+                        panic!("expected minted channel creation");
+                    };
+                    assert_eq!(actual, &repository);
+                    assert_eq!(title, "original title");
+                    assert_eq!(*title_source, Default::default());
+                    let mut result = initial;
+                    result.channels.push(ModelChannel {
+                        id: *id,
+                        repository,
+                        title: title.clone(),
+                        title_source: *title_source,
+                        ordinal: 9,
+                    });
+                    model_reply(peer, &created, result);
+                }
+            });
+            let mut args = fixture.argv(verb);
+            if no_start {
+                args.insert(0, "--no-start".into());
             }
+            let cli = parse(&args);
+            let context = ProjectChannelContext {
+                authority: Authority::default(),
+                no_start: cli.global.no_start,
+            };
+            let existing = Cell::new(0);
+            let ready = Cell::new(0);
+            let output = dispatch(cli, |mutation| {
+                assert!(mutation);
+                context.connect_with(
+                    mutation,
+                    || {
+                        existing.set(existing.get() + 1);
+                        Ok(peer.socket.clone())
+                    },
+                    || {
+                        ready.set(ready.get() + 1);
+                        ControlClient::connect(&peer.socket)
+                            .map_err(|error| AppError::new("daemon_connection", error))
+                    },
+                    ControlClient::connect,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                output.command,
+                if verb == "open" {
+                    "project.open"
+                } else {
+                    "channel.spawn"
+                }
+            );
+            assert_eq!(existing.get(), usize::from(no_start));
+            assert_eq!(ready.get(), usize::from(!no_start));
+            let row = if verb == "open" {
+                &output.data["project"]
+            } else {
+                &output.data["channel"]
+            };
+            assert_eq!(row["repository"], json!(fixture.repository));
+            peer.finished();
         }
     }
 }
@@ -510,7 +507,6 @@ fn public_user_close_and_move_preserve_exact_destructive_intent_and_receipts() {
         });
         let context = ProjectChannelContext {
             authority: Authority::default(),
-            remote: false,
             no_start: true,
         };
         let output = dispatch(parse(&fixture.argv(verb)), |mutation| {
@@ -549,7 +545,6 @@ fn every_scoped_legacy_mutation_authenticates_captured_authority_before_reads_an
         let later_sample = RefCell::new(authority.clone());
         let context = ProjectChannelContext {
             authority: later_sample.borrow().clone(),
-            remote: false,
             no_start: false,
         };
         let resolves = Cell::new(0);
@@ -587,7 +582,6 @@ fn invalid_and_empty_inherited_tokens_cannot_read_or_edit_after_authentication_r
             let peer = Peer::new(connected(), move |peer| auth(peer, &expected, false));
             let context = ProjectChannelContext {
                 authority: authority.clone(),
-                remote: false,
                 no_start: false,
             };
             let error = dispatch(parse(&fixture.argv(verb)), |mutation| {
@@ -643,7 +637,6 @@ fn public_lists_remain_global_unauthenticated_reads_with_explicit_folder_filter_
             };
             let context = ProjectChannelContext {
                 authority: authority.clone(),
-                remote: false,
                 no_start: true,
             };
             let output = dispatch(parse(&args), |mutation| {
@@ -677,60 +670,6 @@ fn public_lists_remain_global_unauthenticated_reads_with_explicit_folder_filter_
                 })
             );
             peer.finished();
-        }
-    }
-}
-
-#[test]
-fn scoped_remote_refusal_precedes_resolvers_connect_and_public_path_discovery() {
-    for authority in [
-        Authority::session("fixture-remote-cli-scope".into()),
-        Authority::session(String::new()),
-    ] {
-        for no_start in [false, true] {
-            let context = ProjectChannelContext {
-                authority: authority.clone(),
-                remote: true,
-                no_start,
-            };
-            for mutation in [false, true] {
-                let error = context
-                    .connect_with(
-                        mutation,
-                        || panic!("selected socket/SSH must not resolve"),
-                        || panic!("readiness must not run"),
-                        |_| panic!("must not connect"),
-                    )
-                    .err()
-                    .unwrap();
-                assert_eq!(error.kind, "permission_denied");
-            }
-            // The actual *_as wrappers must refuse before even validating this
-            // definitely absent private path, rather than reaching discovery.
-            let private = tempfile::tempdir().unwrap();
-            let missing = private.path().join("missing");
-            for args in [
-                vec![
-                    "project".into(),
-                    "open".into(),
-                    missing.to_str().unwrap().into(),
-                ],
-                vec![
-                    "channel".into(),
-                    "spawn".into(),
-                    "--repository".into(),
-                    missing.to_str().unwrap().into(),
-                ],
-            ] {
-                let error = match parse(&args).command {
-                    TopCommand::Project { command } => execute_project_as(command, &context),
-                    TopCommand::Channel { command } => execute_channel_as(command, &context),
-                    _ => unreachable!(),
-                }
-                .err()
-                .unwrap();
-                assert_eq!(error.kind, "permission_denied");
-            }
         }
     }
 }
@@ -780,7 +719,6 @@ fn public_path_validation_and_project_confirmation_remain_effective() {
         let peer = Peer::new(connected(), move |peer| read_model(peer, &model));
         let context = ProjectChannelContext {
             authority: Authority::default(),
-            remote: false,
             no_start: true,
         };
         let error = dispatch(parse(&args), |mutation| {
@@ -817,7 +755,6 @@ fn public_path_validation_and_project_confirmation_remain_effective() {
         });
         let context = ProjectChannelContext {
             authority: Authority::default(),
-            remote: false,
             no_start: true,
         };
         let args = vec![
@@ -858,7 +795,6 @@ fn handshake_refusal_and_mismatched_proof_never_authenticate_or_fall_back() {
         let peer = Peer::new(handshake, |_| {});
         let context = ProjectChannelContext {
             authority: Authority::session("fixture-handshake-scope".into()),
-            remote: false,
             no_start: false,
         };
         let attempts = Cell::new(0);
@@ -891,7 +827,6 @@ fn selected_readiness_and_connection_failures_keep_original_error_and_never_retr
                 } else {
                     Authority::default()
                 },
-                remote: false,
                 no_start,
             };
             let existing = Cell::new(0);
@@ -927,7 +862,6 @@ fn selected_readiness_and_connection_failures_keep_original_error_and_never_retr
     let missing = directory.path().join("absent.sock");
     let context = ProjectChannelContext {
         authority: Authority::session("fixture-no-fallback".into()),
-        remote: false,
         no_start: false,
     };
     let attempts = Cell::new(0);
@@ -961,7 +895,6 @@ fn public_move_refuses_cross_project_before_editing() {
     let peer = Peer::new(connected(), move |peer| read_model(peer, &model));
     let context = ProjectChannelContext {
         authority: Authority::default(),
-        remote: false,
         no_start: true,
     };
     let error = dispatch(parse(&fixture.argv("move")), |mutation| {
@@ -982,17 +915,14 @@ fn public_classification_and_staged_routing_preserve_reads_and_users() {
     let fixture = Fixture::new();
     let scoped = ProjectChannelContext {
         authority: Authority::session("fixture-staged-scope".into()),
-        remote: false,
         no_start: false,
     };
     let empty = ProjectChannelContext {
         authority: Authority::session(String::new()),
-        remote: false,
         no_start: false,
     };
     let user = ProjectChannelContext {
         authority: Authority::default(),
-        remote: false,
         no_start: false,
     };
     for verb in ["open", "project-close", "spawn", "channel-close", "move"] {
