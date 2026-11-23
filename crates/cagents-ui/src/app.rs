@@ -18466,11 +18466,15 @@ impl Cagents {
                 if due { self.acknowledge_visible_pane() } else { Task::none() }
             }
             Message::FocusCard(id) => {
-                self.hover_focus = None;
                 // Explicit activation also cancels a pending entry on this same
                 // card, even if no view has observed its acknowledgment yet.
                 self.set_terminal_review_owner(None);
-                self.focus_workspace_card(id)
+                let task = self.focus_workspace_card(id);
+                // Only a pane that took the focus was chosen.
+                if self.workspace.focused() == Some(id) {
+                    self.hover_focus = None;
+                }
+                task
             }
             Message::PaneWidgetFocused(id) => {
                 self.set_terminal_review_owner(None);
