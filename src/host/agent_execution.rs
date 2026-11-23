@@ -504,21 +504,24 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
 /// Starts each agent's next waiting prompt that its agent can now take.
 /// Called by the mailbox courier whenever a conversation or a run changes,
 /// outside any client request, so it takes the upgrade barrier itself, one
-/// prompt at a time.
-pub(super) fn start_queued(host: &SharedHost) -> Result<(), String> {
+/// prompt at a time. Returns whether one failed to start, so the courier
+/// tries again later rather than waiting for the next edge.
+pub(super) fn start_queued(host: &SharedHost) -> Result<bool, String> {
     let queued = registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .queued_agent_runs()?;
+    let mut failed = false;
     for accepted in queued {
         let Some(started) = mailbox::with_control(host, || start(host, &accepted)) else {
             break;
         };
         if let Err(error) = started {
             tracing::warn!(%error, run = %accepted.run.id, "cannot start a queued agent prompt");
+            failed = true;
         }
     }
-    Ok(())
+    Ok(failed)
 }
 
 /// Reopens the conversation of an agent whose process ended, as its pane's

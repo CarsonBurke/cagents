@@ -35,8 +35,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// A failed delivery pass retries at this rate. Normal delivery edges wake the
-/// courier directly, so an empty healthy courier has no periodic timeout.
+/// The longest the courier sleeps while it has a deadline (a held reply, a
+/// usage limit reset) or something to retry (a failed pass, or a message or
+/// queued run that failed to start). Activity edges wake it sooner. The cap
+/// keeps a far deadline honest across a suspend, which the monotonic wait
+/// does not count. A courier with none of these waits for an edge alone,
+/// apart from the hourly prune.
 const FALLBACK: Duration = Duration::from_secs(15);
 /// How often the courier forgets messages past their retention.
 const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -899,7 +903,7 @@ impl Handle {
                 match crate::host::service::attempt("message delivery", || deliver(&host)) {
                     Ok(Some(released)) => Some(
                         Duration::from_millis(released.saturating_sub(super::now()))
-                            .max(Duration::from_millis(50)),
+                            .clamp(Duration::from_millis(50), FALLBACK),
                     ),
                     Ok(None) => None,
                     Err(error) => {
@@ -1041,7 +1045,8 @@ impl Handle {
 
     /// Gives each lineage with a live, idle conversation its oldest waiting
     /// message. Returns when the courier must look again: when the next held
-    /// reply is released or a known usage limit resets.
+    /// reply is released or a known usage limit resets, or soon to retry a
+    /// message or queued run that failed; `None` when nothing is due.
     fn deliver(&self, host: &SharedHost) -> Result<Option<u64>, String> {
         let limits = self.publish_limits(host, super::now());
         let reset = limits
@@ -1050,26 +1055,29 @@ impl Handle {
             .filter(|at| *at >= 0)
             .map(|at| (at as u64).saturating_mul(1000))
             .min();
-        self.start_queued(host);
-        let released = self.deliver_messages(host, &limits)?;
-        Ok(match (released, reset) {
-            (Some(released), Some(reset)) => Some(released.min(reset)),
-            (released, reset) => released.or(reset),
-        })
+        let queued_failed = self.start_queued(host);
+        let (released, message_failed) = self.deliver_messages(host, &limits)?;
+        let retry = (queued_failed || message_failed)
+            .then(|| super::now().saturating_add(FALLBACK.as_millis() as u64));
+        Ok([released, reset, retry].into_iter().flatten().min())
     }
 
     /// Starts the prompts agents hold behind work that has since ended.
-    fn start_queued(&self, host: &SharedHost) {
-        if let Err(error) = super::start_queued(host) {
+    /// Returns whether one failed to start, or the queue could not be read.
+    fn start_queued(&self, host: &SharedHost) -> bool {
+        super::start_queued(host).unwrap_or_else(|error| {
             tracing::warn!(%error, "cannot start queued agent prompts");
-        }
+            true
+        })
     }
 
+    /// Returns when the next held reply is released, and whether handing a
+    /// message to its agent failed in a way only logged, to be retried.
     fn deliver_messages(
         &self,
         host: &SharedHost,
         limits: &BTreeMap<TerminalId, UsageLimit>,
-    ) -> Result<Option<u64>, String> {
+    ) -> Result<(Option<u64>, bool), String> {
         let live = directory::live_sessions(host);
         let (pending, released, heads, pending_lineages, lineages) = {
             let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -1096,7 +1104,7 @@ impl Handle {
             notifications.reconcile_inboxes(pending_lineages, events);
         }
         if pending.is_empty() {
-            return Ok(released);
+            return Ok((released, false));
         }
         let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1113,6 +1121,7 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .session_lineages(chats.iter().map(|(id, _, _)| *id))?;
+        let mut failed = false;
         for message in pending {
             let Some(recipient) = message.to.lineage else {
                 continue;
@@ -1127,11 +1136,11 @@ impl Handle {
                     host, &message, recipient, limited, &chats, &lineages, limits,
                 )
             }) else {
-                return Ok(released);
+                return Ok((released, failed));
             };
-            delivered?;
+            failed |= delivered?;
         }
-        Ok(released)
+        Ok((released, failed))
     }
 
     /// Gives one pending message to its recipient: as a run of the agent
@@ -1146,7 +1155,7 @@ impl Handle {
         chats: &[(TerminalId, crate::agent::Provider, chat::runtime::Handle)],
         lineages: &BTreeMap<TerminalId, crate::agent_execution::Lineage>,
         limits: &BTreeMap<TerminalId, UsageLimit>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         {
             match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
                 // Its run has it, or it waits its turn to become one.
@@ -1155,15 +1164,15 @@ impl Handle {
                     | Handoff::Waiting { .. }
                     | Handoff::Behind { .. }
                     | Handoff::NoSlot { .. },
-                )) => return Ok(()),
+                )) => return Ok(false),
                 Ok(Some(Handoff::Ended { reason, run, .. })) => {
                     tracing::info!(%reason, %run, message = %message.id, "a message's run ended");
-                    return Ok(());
+                    return Ok(false);
                 }
                 // Its run has it, perhaps already with the provider.
                 Ok(Some(Handoff::Unknown { reason, run, .. })) => {
                     tracing::warn!(%reason, %run, message = %message.id, "a message's run ended without proof of delivery");
-                    return Ok(());
+                    return Ok(false);
                 }
                 // Not as a run, but as a message, as a person's conversation
                 // takes one.
@@ -1173,16 +1182,16 @@ impl Handle {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, message = %message.id, "cannot hand a message to its agent");
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
         let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
             lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
         }) else {
-            return Ok(());
+            return Ok(false);
         };
-        self.hand_over(message, *session, handle)
+        self.hand_over(message, *session, handle).map(|()| false)
     }
 
     /// Claims the message for `session` before prompting, so that an inbox
