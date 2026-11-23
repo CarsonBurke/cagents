@@ -299,7 +299,11 @@ use crate::{
 /// Version 196 appends `ChatDeliver`, a chat command sent under a key, so that
 /// sending a message again after an unknown outcome waits on the first send
 /// instead of delivering it twice. An older client cannot send it.
-pub const PROTOCOL_VERSION: u16 = 196;
+///
+/// Version 197 appends `MovePane` and its `PaneMoved` reply, which move a
+/// pane into an existing or new channel of its project, and let an agent
+/// session move its own pane. An older client never sends it.
+pub const PROTOCOL_VERSION: u16 = 197;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -793,6 +797,17 @@ pub enum ClientRequest {
         command: crate::chat::Command,
         delivery: crate::chat::DeliveryKey,
     },
+    /// Moves a pane into a channel of its own project, or into a new channel
+    /// made there for it, and answers with where it now is. `pane: None` is
+    /// the caller's own pane: the one showing the live session its agent
+    /// authority was issued to. A connection acting for an agent moves only
+    /// a session pane its lineage controls, so this is also the only way an
+    /// agent creates a channel. `operation` makes a resent request one move.
+    MovePane {
+        pane: Option<crate::model::CardId>,
+        destination: crate::workspace_model::PaneDestination,
+        operation: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1266,6 +1281,8 @@ pub enum ServerResponse {
         terminals: Vec<TerminalId>,
         transcripts: Vec<PathBuf>,
     },
+    /// The reply to `MovePane`.
+    PaneMoved(crate::workspace_model::PaneMove),
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

@@ -1,6 +1,7 @@
 mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
+mod pane_move;
 #[cfg(target_os = "linux")]
 mod retained_automation;
 mod transcript;

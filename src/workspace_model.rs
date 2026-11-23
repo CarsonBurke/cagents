@@ -83,6 +83,35 @@ pub struct ModelChannel {
     pub ordinal: u32,
 }
 
+/// Where a `MovePane` request puts a pane: always a channel of the pane's
+/// own project.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneDestination {
+    Channel(ChannelId),
+    /// A channel made in the pane's project for this move, titled by the
+    /// caller. The id is minted by the client, as `CreateChannel`'s is, so a
+    /// resent request names the same channel.
+    NewChannel {
+        id: ChannelId,
+        title: String,
+    },
+}
+
+/// What a `MovePane` request did.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaneMove {
+    /// The pane as it now is, in `channel`.
+    pub pane: views::Pane,
+    /// Where the pane was before; `channel`'s own scope when it was already
+    /// there and nothing moved.
+    pub from: views::Scope,
+    pub channel: ModelChannel,
+    /// The request made `channel`.
+    pub created: bool,
+    /// The model sequence that includes the move.
+    pub sequence: u64,
+}
+
 mod conversation_titles;
 pub use conversation_titles::{channel_title, channel_title_from_prompt};
 

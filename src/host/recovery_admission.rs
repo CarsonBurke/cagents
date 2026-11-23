@@ -106,6 +106,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         // the person chose and the daemon proves are that conversation's.
         | R::ChatLostProcesses { .. } => Access::Open,
         R::ApplyWorkspaceEdit { edit } | R::EditWorkspaceModel { edit } => model_access(edit),
+        // A channel creation and a view change, both open as edits; when the
+        // move fails it retires its own channel as `RetireEmptyChannel` does.
+        R::MovePane { .. } => Access::Open,
         // Closing an original the reader is still attached to, as when the
         // hold is raised while it runs, is the Close the refusal offers.
         R::ChatClose { chat_id } => Access::Close(Some(*chat_id)),

@@ -652,13 +652,21 @@ pub enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ChannelCommand {
-    /// Move a live pane, hosted session or agent into another channel.
+    /// Move a live pane, hosted session or agent into another channel of its
+    /// project, or into a new channel made for it. From an agent session,
+    /// with no pane named, this moves the session's own pane.
+    #[command(group(clap::ArgGroup::new("destination").required(true).args(["to", "new"])))]
     Move {
-        /// Full pane/session ID, agent ID or unique prefix, or unique agent name.
-        target: String,
-        /// Destination channel in the same project.
+        /// Full pane/session ID, agent ID or unique prefix, or unique agent
+        /// name. An agent session leaves it out to move its own pane.
+        target: Option<String>,
+        /// Destination channel in the same project (`channel list` shows them).
         #[arg(long)]
-        to: ChannelId,
+        to: Option<ChannelId>,
+        /// Make a channel with this title in the pane's project and move the
+        /// pane into it.
+        #[arg(long, value_name = "TITLE")]
+        new: Option<String>,
     },
     /// Create a channel in a project, with or without a window running.
     Spawn {
@@ -1541,6 +1549,23 @@ impl ControlClient {
         match self.request_strict(ClientRequest::ReadWorkspaceView { scope })? {
             ServerResponse::WorkspaceView { view, sequence } => Ok((view, sequence)),
             response => Err(unexpected_response("a workspace view", &response)),
+        }
+    }
+
+    /// Moves a pane into a channel of its project, or into a new one made for
+    /// it; `pane: None` is the authenticated agent session's own pane.
+    pub fn move_pane(
+        &mut self,
+        pane: Option<crate::model::CardId>,
+        destination: crate::workspace_model::PaneDestination,
+    ) -> Result<crate::workspace_model::PaneMove, ControlError> {
+        match self.request_strict(ClientRequest::MovePane {
+            pane,
+            destination,
+            operation: uuid::Uuid::new_v4(),
+        })? {
+            ServerResponse::PaneMoved(moved) => Ok(moved),
+            response => Err(unexpected_response("a moved pane", &response)),
         }
     }
 
@@ -3059,6 +3084,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::Listed { .. } => "listed",
         ServerResponse::ListedPage { .. } => "listed_page",
         ServerResponse::ResidentTerminals { .. } => "resident_terminals",
+        ServerResponse::PaneMoved(_) => "pane_moved",
         ServerResponse::Spawned { .. } => "spawned",
         ServerResponse::Attached { .. } => "attached",
         ServerResponse::Detached => "detached",
@@ -5697,8 +5723,8 @@ fn execute_channel_with(
 /// changes an open folder's identity.
 enum ResolvedChannel {
     Move {
-        target: String,
-        to: ChannelId,
+        target: Option<String>,
+        to: crate::workspace_model::PaneDestination,
     },
     Spawn {
         repository: PathBuf,
@@ -5724,7 +5750,22 @@ impl ChannelCommand {
         model: Option<&WorkspaceModel>,
     ) -> Result<ResolvedChannel, AppError> {
         Ok(match self {
-            Self::Move { target, to } => ResolvedChannel::Move { target, to },
+            Self::Move { target, to, new } => ResolvedChannel::Move {
+                target,
+                to: match (to, new) {
+                    (Some(channel), _) => crate::workspace_model::PaneDestination::Channel(channel),
+                    (None, Some(title)) => crate::workspace_model::PaneDestination::NewChannel {
+                        id: ChannelId::new(),
+                        title,
+                    },
+                    (None, None) => {
+                        return Err(AppError::new(
+                            "invalid_target",
+                            "Choose where the pane goes: `--to CHANNEL` or `--new TITLE`",
+                        ));
+                    }
+                },
+            },
             Self::Spawn { repository, title } => {
                 let location = resolve_project_location(repository, model)?;
                 ResolvedChannel::Spawn {
@@ -5751,7 +5792,7 @@ fn channel_output(
     command: ResolvedChannel,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedChannel::Move { target, to } => channels::move_pane(client, &target, to),
+        ResolvedChannel::Move { target, to } => channels::move_pane(client, target.as_deref(), to),
         ResolvedChannel::Spawn {
             repository,
             title,
