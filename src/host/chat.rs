@@ -1222,11 +1222,31 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
 ///
 /// An open agent that still runs as this conversation ends with it, as it
 /// would have with a receipt: a person closing the pane closes the agent.
+///
+/// The evidence proves an absence only if nothing Cagents runs can launch a
+/// writer of this conversation while it is read; the process scan judges
+/// only processes that exist when it reads them. The owner itself is gone
+/// ([`what_holds`] reads its holder record). The caller's claim on the
+/// conversation, its `chat_spawning` entry, refuses everything else that
+/// could launch one:
+/// - a Start or Resume of this pane, or of any pane naming the same
+///   conversation, and the retained actor startup it makes: refused at
+///   admission ([`capacity::Reservation`]) and again as it installs (see
+///   `start_publishing`);
+/// - another pane of the same conversation returning to a terminal, which
+///   runs a CLI naming the conversation (`ChatReturnTerminal`).
+///
+/// Those admitted before the claim and still under way hold the Close in
+/// [`what_holds`]. A program started outside Cagents is no launch of it,
+/// and no fence can hold one back.
 fn settle_lost_execution(
     host: &SharedHost,
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<(), String> {
+    if !claimed_for_close(&host.lock().unwrap_or_else(|p| p.into_inner()), session) {
+        return Err("This conversation's Close lost its claim; it was not closed".into());
+    }
     refuse_scheduled_agent(host, session)?;
     if let Some(holds) = what_holds(host, session, proof)? {
         return Err(lost_execution_refusal(session, holds));
@@ -1255,6 +1275,20 @@ fn settle_lost_execution(
             )?;
     }
     Ok(())
+}
+
+/// Whether `session`'s pane is claimed, so that no Start, Resume or startup
+/// of it can be admitted (see [`settle_lost_execution`]). A Codex claim must
+/// also name its conversation: admission compares conversations by the
+/// claim, and the process scan counts any process naming it as a writer. A
+/// retained Claude actor's claim is its issued descriptor, which may predate
+/// the conversation its resident confirmed; its evidence is its own roster.
+fn claimed_for_close(state: &HostState, session: &Session) -> bool {
+    state.chat_spawning.get(&session.id).is_some_and(|claim| {
+        session.launch.provider != Provider::Codex
+            || same_conversation(&claim.launch, &session.launch)
+            || session.launch.session_id.is_none()
+    })
 }
 
 /// A scheduled agent is its automation's to end, as when a changed boot
@@ -1570,10 +1604,25 @@ fn what_holds(
     // below does.
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        // Another pane starting this same conversation launches a writer of
+        // it. One admitted before the caller's claim may still be launching;
+        // the claim refuses any admitted after it (see
+        // [`settle_lost_execution`]).
+        let launching = |other: &Session| {
+            other.id != session.id && same_conversation(&other.launch, &session.launch)
+        };
         if codex_terminal_owner(&state, session).is_some()
             || state.chat_handoffs.contains_key(&session.id)
+            || state
+                .chat_handoffs
+                .values()
+                .any(|handoff| launching(&handoff.source))
+            || state.chat_spawning.values().any(launching)
             || state.native_actor_startups.values().any(|startup| {
-                startup.source.id == session.id || startup.requested.id == session.id
+                startup.source.id == session.id
+                    || startup.requested.id == session.id
+                    || launching(&startup.source)
+                    || launching(&startup.requested)
             })
         {
             return Ok(Some(Holds::InProgress));
@@ -4494,8 +4543,20 @@ fn process_inner(
                         "Too many unacknowledged terminal handoffs; save existing replacements before converting another chat",
                     ));
                 }
-                let owners =
-                    paired_close::Owners::capture(&state, attached(&state, client, chat_id)?)?;
+                let record = attached(&state, client, chat_id)?;
+                // The terminal runs a CLI naming the conversation: a writer
+                // that another pane's Close, proving none can start, refuses
+                // (see `settle_lost_execution`).
+                let mut launch = record.session.launch.clone();
+                launch.session_id = record.handle.session_id();
+                if state.chat_spawning.iter().any(|(id, pending)| {
+                    *id != chat_id && same_conversation(&pending.launch, &launch)
+                }) {
+                    return Err(retryable_unavailable(
+                        "This conversation is starting or closing in another pane; return it to the terminal once that finishes",
+                    ));
+                }
+                let owners = paired_close::Owners::capture(&state, record)?;
                 let closing =
                     capacity::Reservation::closing(host, &mut state, &owners.target.source)?;
                 (owners, closing)

@@ -399,6 +399,61 @@ fn a_start_holding_the_allocation_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
 }
 
+/// Another pane starting the same conversation launches a writer of it,
+/// which the process scan cannot see before it exists. One admitted before
+/// this Close claimed the conversation holds the Close until it finishes;
+/// the claim refuses any admitted after (see `settle_lost_execution`).
+#[test]
+fn another_pane_starting_the_conversation_keeps_the_refusal() {
+    let Some(root) = isolated("another_pane_starting_the_conversation_keeps_the_refusal") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let other = Session {
+        id: TerminalId::new(),
+        owned_codex_listener: None,
+        ..fixture.source.clone()
+    };
+    let starting = {
+        let mut state = fixture.host.lock().unwrap();
+        capacity::Reservation::closing(&fixture.host, &mut state, &other).unwrap()
+    };
+    let refusal = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(refusal.contains("elsewhere in Cagents"), "{refusal}");
+    assert!(fixture.socket().parent().unwrap().exists());
+    // While this Close holds its claim, the other pane's start is refused.
+    {
+        let mut state = fixture.host.lock().unwrap();
+        let closing =
+            capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap();
+        drop(state);
+        drop(starting);
+        assert!(capacity::Reservation::new(&fixture.host, &other).is_err());
+        drop(closing);
+    }
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+}
+
+/// The evidence proves nothing of a Close that does not hold its claim on
+/// the conversation: a start could launch a writer while it is read.
+#[test]
+fn a_lost_execution_settles_only_under_its_close_claim() {
+    let Some(root) = isolated("a_lost_execution_settles_only_under_its_close_claim") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let proof = fixture.host.lock().unwrap().proof().clone();
+    let refusal = settle_lost_execution(&fixture.host, &fixture.source, &proof).unwrap_err();
+    assert!(refusal.contains("lost its claim"), "{refusal}");
+    let closing = {
+        let mut state = fixture.host.lock().unwrap();
+        capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap()
+    };
+    settle_lost_execution(&fixture.host, &fixture.source, &proof).unwrap();
+    drop(closing);
+}
+
 /// The state the report left: the same daemon, no record, no receipt, and the
 /// allocation itself already given back.
 #[test]

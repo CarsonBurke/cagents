@@ -1201,6 +1201,12 @@ pub(super) fn execution_end(
 /// still shows none is read again for up to `settle`; a published executable
 /// keeps it unproved, while no executable or argv excludes a kernel thread.
 ///
+/// Like any read of `/proc`, this judges the processes that exist as it
+/// reads them, so it proves an absence only while nothing can launch a
+/// writer. A Close holds that while it reads (see
+/// [`crate::host::chat`]'s `settle_lost_execution`); a Start or Resume is
+/// itself the one launch its admission lets through.
+///
 /// Processes still unproved after the whole table has been read are looked
 /// at again, alone, for up to `patience`. One that has exited, or whose ID
 /// now names a later process, is settled: it could write nothing. The table
