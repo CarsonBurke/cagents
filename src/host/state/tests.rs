@@ -1302,6 +1302,7 @@ for line in sys.stdin:
             .ready()
     );
 
+    let owners = crate::upgrade::recovery::checkpointed_owners(&impact);
     let store = Store::open(&cwd.join("checkpoint")).unwrap();
     prepare_upgrade_with(&host, impact.capability, || Ok(store)).unwrap();
     finish_upgrade(&host).unwrap();
@@ -1312,6 +1313,32 @@ for line in sys.stdin:
     // window reopens the ended one from its saved descriptor.
     assert_eq!(saved.chats.len(), 1);
     assert_eq!(saved.chats[0].source, idle);
+    // The update worker refuses a checkpoint that omits an owner it
+    // requires. The ended conversation is reviewed but not carried, so the
+    // worker must require only what this checkpoint names.
+    use crate::update::impact::SessionKind;
+    let named: BTreeSet<_> = (saved
+        .chats
+        .iter()
+        .map(|chat| (SessionKind::NativeChat, chat.source.id)))
+    .chain(
+        saved
+            .terminals
+            .iter()
+            .map(|terminal| (SessionKind::Terminal, terminal.source.id)),
+    )
+    .chain(
+        saved
+            .carried
+            .iter()
+            .map(|terminal| (SessionKind::Terminal, terminal.source.id)),
+    )
+    .collect();
+    assert!(
+        owners.iter().all(|owner| named.contains(owner)),
+        "the worker requires {owners:?}, but the checkpoint names only {named:?}"
+    );
+    assert!(!owners.iter().any(|(_, id)| *id == ended.id));
     let empty_proc = cwd.join("proc");
     fs::create_dir(&empty_proc).unwrap();
     let replacement = Arc::new(crate::host::state::HostLock::new(

@@ -288,7 +288,7 @@ impl HostState {
             } else if self.provider_ended(id, record) {
                 (
                     Disposition::Resumes,
-                    "Its provider already stopped. The saved conversation will reopen with a new provider process.".into(),
+                    crate::update::impact::PROVIDER_ENDED.into(),
                 )
             } else if record.handle.is_completed() {
                 (
