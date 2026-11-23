@@ -308,18 +308,20 @@ fn state(status: &Value) -> ProbeResult<ActivityState> {
         Some("idle") => Ok(ActivityState::Idle),
         Some("active") => {
             let flags = status["activeFlags"].as_array().ok_or(())?;
-            let mut waiting = false;
+            let mut state = ActivityState::Working;
             for flag in flags {
                 match flag.as_str() {
-                    Some("waitingOnApproval" | "waitingOnUserInput") => waiting = true,
+                    // A permission holds the turn up mid-action, so it
+                    // outranks a question.
+                    Some("waitingOnApproval") => state = ActivityState::Approval,
+                    Some("waitingOnUserInput") if state != ActivityState::Approval => {
+                        state = ActivityState::Question;
+                    }
+                    Some("waitingOnUserInput") => {}
                     _ => return Err(()),
                 }
             }
-            Ok(if waiting {
-                ActivityState::Waiting
-            } else {
-                ActivityState::Working
-            })
+            Ok(state)
         }
         Some("systemError") => Ok(ActivityState::Unknown),
         // A loaded ID became unloaded while reading; no complete live census.
@@ -339,11 +341,17 @@ mod tests {
         );
         assert_eq!(
             state(&json!({"type":"active","activeFlags":["waitingOnApproval"]})),
-            Ok(ActivityState::Waiting)
+            Ok(ActivityState::Approval)
         );
         assert_eq!(
             state(&json!({"type":"active","activeFlags":["waitingOnUserInput"]})),
-            Ok(ActivityState::Waiting)
+            Ok(ActivityState::Question)
+        );
+        assert_eq!(
+            state(&json!({
+                "type":"active","activeFlags":["waitingOnUserInput","waitingOnApproval"]
+            })),
+            Ok(ActivityState::Approval)
         );
         assert_eq!(
             state(&json!({"type":"systemError"})),

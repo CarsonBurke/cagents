@@ -96,27 +96,9 @@ fn child_icon(child: &chat::Subagent) -> Icon {
 
 /// The small mark beside a child's name. Work in progress moves, the way the
 /// Conversation tab's own mark does; every other state is a still glyph, in
-/// the warning or error color when it asks something of the reader.
+/// its attention tone when it is a failure or asks something of the reader.
 pub(super) fn status_mark<'a>(child: &chat::Subagent) -> Element<'a, Message> {
-    let toned = |icon: Icon, color: fn(&cosmic::Theme) -> iced::Color| -> Element<'a, Message> {
-        widget::container(widget::icon(icon.into()).size(design::COMPACT_ICON_SIZE))
-            .class(cosmic::theme::Container::custom(move |theme| {
-                widget::container::Style {
-                    icon_color: Some(color(theme)),
-                    ..Default::default()
-                }
-            }))
-            .into()
-    };
-    match child_icon(child) {
-        Icon::AgentWorking => crate::ui_controls::activity_spinner(
-            f32::from(design::COMPACT_ICON_SIZE),
-            design::accent_color,
-        ),
-        icon @ Icon::Error => toned(icon, design::destructive_color),
-        icon @ (Icon::AgentWaiting | Icon::Unavailable) => toned(icon, design::warning_color),
-        icon => crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
-    }
+    crate::sidebar::status_glyph(child_icon(child), design::COMPACT_ICON_SIZE)
 }
 
 /// Keep metadata scanning cheap and mounted controls bounded. The chooser is
@@ -539,10 +521,14 @@ impl Runtime {
         let (glyph, label) = self.conversation_status_base(false);
         match glyph? {
             Icon::AgentWorking if self.snapshot.busy => Some((Icon::AgentWorking, label)),
-            Icon::AgentWaiting if self.snapshot.waiting || !self.snapshot.requests.is_empty() => {
-                Some((Icon::AgentWaiting, label))
+            glyph
+                if (self.snapshot.waiting || !self.snapshot.requests.is_empty())
+                    && crate::sidebar::AttentionState::of_glyph(glyph)
+                        .is_some_and(crate::sidebar::AttentionState::waits_on_user) =>
+            {
+                Some((glyph, label))
             }
-            Icon::Warning => Some((Icon::Warning, label)),
+            glyph @ (Icon::Warning | Icon::Error) => Some((glyph, label)),
             _ => None,
         }
     }
@@ -690,15 +676,10 @@ impl Runtime {
         let parent = selected
             .and_then(|_| self.parent_tab_state())
             .map(|(glyph, label)| {
-                let mark = if glyph == Icon::AgentWorking {
-                    crate::ui_controls::activity_spinner(
-                        f32::from(design::COMPACT_ICON_SIZE),
-                        design::accent_color,
-                    )
-                } else {
-                    crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
-                };
-                (mark, label)
+                (
+                    crate::sidebar::status_glyph(glyph, design::COMPACT_ICON_SIZE),
+                    label,
+                )
             });
         let (mark, description) = match parent {
             Some((mark, label)) => (Some(mark), format!("Main conversation: {label}").into()),

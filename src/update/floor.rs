@@ -357,7 +357,7 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
                     .map(|activity| activity.state);
                 let state = match activity {
                     Some(crate::agent::ActivityState::Working) => "working",
-                    Some(crate::agent::ActivityState::Waiting) => "waiting",
+                    Some(state) if state.waits_on_user() => "waiting",
                     Some(crate::agent::ActivityState::Idle) => "idle",
                     _ if daemon.sessions.iter().any(|item| {
                         item.id == chat.id && item.disposition == impact::Disposition::WaitsForIdle

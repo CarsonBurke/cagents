@@ -124,6 +124,10 @@ pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
 /// is read as an excerpt, whose numbers place nothing.
 pub(crate) const PATCH_LINE_ORIGIN: u16 = 195;
 
+/// The first protocol whose agent activity says what a waiting agent waits
+/// for. An older client is told it waits, as it was before.
+pub(crate) const WAIT_KINDS: u16 = 198;
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
 /// added them. The wire format proof accepts exactly these.
@@ -164,6 +168,8 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
 const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
     ("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS),
     ("cagents::chat::ToolStatus", "Ended", ENDED_TOOL_STATUS),
+    ("cagents::agent::ActivityState", "Approval", WAIT_KINDS),
+    ("cagents::agent::ActivityState", "Question", WAIT_KINDS),
     (
         "cagents::terminal::ipc::ProtocolErrorCode",
         "store_busy",

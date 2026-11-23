@@ -3219,7 +3219,7 @@ pub fn browser_row<'a>(
     // The checks keep their tone on their words, now the glyph has the state.
     let checks: Option<(&str, fn(&cosmic::Theme) -> iced::widget::text::Style)> = match checks {
         CheckStatus::Passing => Some(("Checks passing", design::success_text)),
-        CheckStatus::Pending => Some(("Checks pending", design::warning_text)),
+        CheckStatus::Pending => Some(("Checks pending", design::muted_text)),
         CheckStatus::Failing => Some(("Checks failing", design::destructive_text)),
         CheckStatus::Unknown => None,
     };

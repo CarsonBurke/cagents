@@ -130,8 +130,8 @@ impl TerminalOutcome {
     fn tone(self) -> design::Tone {
         design::Tone::Themed(match self {
             Self::Clean => design::success_color,
-            Self::Failed => design::warning_color,
-            Self::Stopped => design::destructive_color,
+            // Both are failures, not something waiting on the reader.
+            Self::Failed | Self::Stopped => design::destructive_color,
             Self::Unknown => design::muted_color,
         })
     }

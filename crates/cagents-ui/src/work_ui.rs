@@ -946,7 +946,7 @@ impl State {
                 && item.worktree.is_some()
             {
                 facts.push(crate::interaction::tooltip(
-                    badge("Unpushed", Tone::Themed(design::warning_color)),
+                    badge("Unpushed", Tone::Themed(design::muted_icon_color)),
                     "The worktree has commits the pull request does not",
                 ));
             }
@@ -991,7 +991,7 @@ impl State {
                 facts.push(crate::interaction::tooltip(
                     badge(
                         format!("{} changed", dirty.paths),
-                        Tone::Themed(design::warning_color),
+                        Tone::Themed(design::muted_icon_color),
                     ),
                     "Uncommitted changes in the worktree",
                 ));
@@ -1014,7 +1014,7 @@ impl State {
             .map(|session| {
                 let working = matches!(session.state, ActivityState::Working);
                 let glyph: Element<'a, Action> = if working {
-                    crate::ui_controls::activity_spinner(12.0, design::accent_color)
+                    crate::sidebar::attention_mark(crate::sidebar::AttentionState::Working, 12)
                 } else {
                     match session.provider {
                         Some(provider) => widget::icon(crate::ui_controls::provider_icon(provider))
@@ -1032,9 +1032,9 @@ impl State {
                     )
                 });
                 let state = match session.state {
-                    ActivityState::Working => "working",
+                    ActivityState::Idle | ActivityState::Unknown => "idle",
                     ActivityState::Waiting => "waiting for you",
-                    _ => "idle",
+                    state => state.label(),
                 };
                 crate::interaction::tooltip(
                     widget::button::custom(glyph)
@@ -1235,7 +1235,7 @@ fn column_index(column: Column) -> usize {
 fn column_tone(column: Column) -> Toned {
     match column {
         Column::Active => design::success_color,
-        Column::InProgress => design::warning_color,
+        Column::InProgress => design::muted_icon_color,
         Column::InReview => design::accent_color,
         Column::Landed => merged_color,
         Column::Stale => design::muted_color,
@@ -1282,7 +1282,8 @@ fn status_glyph_is_pull_request(item: &Item) -> bool {
 /// agent waiting, else the pull request's state, else a branch.
 enum Leading<'a> {
     Working,
-    Waiting,
+    /// The most urgent wait among the card's agents.
+    Waiting(crate::sidebar::AttentionState),
     PullRequest(&'a crate::work::PullRequest),
     Branch,
 }
@@ -1292,8 +1293,14 @@ impl<'a> Leading<'a> {
         let any = |state| item.sessions.iter().any(|session| session.state == state);
         if any(ActivityState::Working) {
             Self::Working
-        } else if any(ActivityState::Waiting) {
-            Self::Waiting
+        } else if let Some(wait) = item
+            .sessions
+            .iter()
+            .filter_map(|session| crate::sidebar::AttentionState::of_activity(session.state))
+            .filter(|state| state.waits_on_user())
+            .max()
+        {
+            Self::Waiting(wait)
         } else if let Some(pull_request) = &item.pull_request {
             Self::PullRequest(pull_request)
         } else {
@@ -1304,13 +1311,13 @@ impl<'a> Leading<'a> {
 
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
     match Leading::of(item) {
-        Leading::Working => widget::container(crate::ui_controls::activity_spinner(
-            12.0,
-            design::accent_color,
+        Leading::Working => widget::container(crate::sidebar::attention_mark(
+            crate::sidebar::AttentionState::Working,
+            12,
         ))
         .center(Length::Fixed(f32::from(design::ROW_ICON_SIZE)))
         .into(),
-        Leading::Waiting => glyph(Icon::AgentWaiting, design::warning_color),
+        Leading::Waiting(state) => crate::sidebar::attention_mark(state, design::ROW_ICON_SIZE),
         Leading::PullRequest(pull_request) => pull_request_glyph(pull_request),
         // A checked-out branch is a worktree, drawn as the sidebar draws it.
         Leading::Branch if item.worktree.is_some() => glyph(Icon::Worktree, design::muted_color),

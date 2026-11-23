@@ -231,12 +231,7 @@ impl Member {
         } else if self.limit.is_some() {
             "limited"
         } else {
-            match self.session.state {
-                ActivityState::Unknown => "unknown",
-                ActivityState::Idle => "idle",
-                ActivityState::Working => "working",
-                ActivityState::Waiting => "waiting",
-            }
+            self.session.state.label()
         }
     }
 
@@ -361,12 +356,7 @@ impl Entry {
         let provider = self
             .provider
             .map_or("shell", |provider| provider.executable());
-        let state = match self.state {
-            ActivityState::Unknown => "unknown",
-            ActivityState::Idle => "idle",
-            ActivityState::Working => "working",
-            ActivityState::Waiting => "waiting",
-        };
+        let state = self.state.label();
         let relation = match (self.relation, self.delegation.as_ref().map(|d| &d.owner)) {
             (Relation::Myself, _) => " (me)",
             (Relation::Parent, _) => " (my parent)",

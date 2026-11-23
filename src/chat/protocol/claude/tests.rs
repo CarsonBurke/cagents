@@ -10516,7 +10516,7 @@ fn notification_old_interrupt_ack_preserves_the_new_question_and_topic() {
         assert_eq!(state.requests.len(), 1);
         assert_eq!(state.requests[0].id, "question-b");
         assert!(state.error.is_none());
-        assert_eq!(state.activity(), crate::agent::ActivityState::Waiting);
+        assert_eq!(state.activity(), crate::agent::ActivityState::Question);
     }
 }
 

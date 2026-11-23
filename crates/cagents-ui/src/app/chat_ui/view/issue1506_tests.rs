@@ -479,7 +479,13 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         fields: Vec::new(),
         actions: Vec::new(),
     });
-    assert_eq!(publish(&mut snapshot), parent_and_child);
+    assert_eq!(
+        publish(&mut snapshot),
+        (
+            Some(Icon::AgentWorking),
+            "Waiting for your answer · 1 subagent working".to_owned(),
+        )
+    );
 
     snapshot.error = Some(quota("1:30pm", "single-child-parent"));
     assert_eq!(
@@ -493,7 +499,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     assert_eq!(
         publish(&mut snapshot),
         (
-            Some(Icon::Warning),
+            Some(Icon::UsageLimit),
             "Account limit reached · 1 subagent waiting".into(),
         )
     );
@@ -501,7 +507,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     snapshot.subagents[0].waiting = false;
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::Warning), "Account limit reached".into())
+        (Some(Icon::UsageLimit), "Account limit reached".into())
     );
     snapshot.error = None;
     for status in [
@@ -512,7 +518,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         snapshot.subagents[0].status = status;
         assert_eq!(
             publish(&mut snapshot),
-            (Some(Icon::AgentWaiting), "Waiting for you".into())
+            (Some(Icon::Question), "Waiting for your answer".into())
         );
     }
     snapshot.subagents[0].status = ToolStatus::Running;
@@ -520,8 +526,8 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     assert_eq!(
         publish(&mut snapshot),
         (
-            Some(Icon::AgentWaiting),
-            "Waiting for you · 1 subagent waiting".into()
+            Some(Icon::Question),
+            "Waiting for your answer · 1 subagent waiting".into()
         )
     );
     snapshot.requests.clear();

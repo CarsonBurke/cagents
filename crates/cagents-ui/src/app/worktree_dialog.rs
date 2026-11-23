@@ -605,7 +605,7 @@ impl Cagents {
                         .size(design::TEXT_BODY)
                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                         .width(Length::Fill)
-                        .class(cosmic::theme::Text::Custom(design::warning_text)),
+                        .class(cosmic::theme::Text::Custom(design::destructive_text)),
                 )
                 .id(widget::Id::new("dialog.worktree.error"))
                 .into(),
@@ -671,7 +671,7 @@ fn error_note(message: &str) -> Element<'_, Message> {
     widget::text::caption(message)
         .size(design::TEXT_CAPTION)
         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-        .class(cosmic::theme::Text::Custom(design::warning_text))
+        .class(cosmic::theme::Text::Custom(design::destructive_text))
         .into()
 }
 

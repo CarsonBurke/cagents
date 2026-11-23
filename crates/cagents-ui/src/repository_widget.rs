@@ -11160,7 +11160,7 @@ fn diff_review_controls(
                 {
                     crate::ui_controls::activity_spinner(
                         f32::from(crate::design::ROW_ICON_SIZE),
-                        crate::design::warning_color,
+                        crate::design::muted_icon_color,
                     )
                 } else {
                     iced::widget::Space::new().into()

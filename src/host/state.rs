@@ -684,7 +684,9 @@ impl HostState {
             .fold(crate::tray::AgentTally::default(), |mut tally, state| {
                 match state {
                     ActivityState::Working => tally.working += 1,
-                    ActivityState::Waiting => tally.waiting += 1,
+                    ActivityState::Waiting | ActivityState::Approval | ActivityState::Question => {
+                        tally.waiting += 1;
+                    }
                     ActivityState::Idle | ActivityState::Unknown => {}
                 }
                 tally

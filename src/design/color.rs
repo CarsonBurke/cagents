@@ -230,7 +230,18 @@ pub fn accent_color(theme: &Theme) -> Color {
     theme.cosmic().accent.base.into()
 }
 
-/// The shell's "working" tone: something is in flight and may still fail.
+/// Work in flight that the user started, such as an agent's turn: the accent,
+/// so a busy sidebar reads as calm progress rather than trouble. Work the
+/// application does for itself (loading, refreshing, deleting) recedes
+/// further, in [`muted_icon_color`].
+pub fn activity_color(theme: &Theme) -> Color {
+    accent_color(theme)
+}
+
+/// Something needs the user before it can go on: an agent waiting for input,
+/// a usage limit, a failure to act on. Never routine progress or a durable
+/// fact such as uncommitted changes; on many themes this is close enough to
+/// [`destructive_color`] that a row full of it reads as an alarm.
 pub fn warning_color(theme: &Theme) -> Color {
     theme.cosmic().warning.base.into()
 }

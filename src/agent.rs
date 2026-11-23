@@ -110,13 +110,63 @@ where
         .serialize(serializer)
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub enum ActivityState {
     #[default]
     Unknown,
     Idle,
     Working,
+    /// Waiting on the user for something its provider does not name, such as
+    /// a terminal agent whose status says only that it waits.
     Waiting,
+    /// Waiting for the user to allow or refuse an action.
+    Approval,
+    /// Waiting for the user to answer a question.
+    Question,
+}
+
+impl ActivityState {
+    /// Whether the agent is held up until the user does something, whatever
+    /// the provider says it waits for.
+    pub const fn waits_on_user(self) -> bool {
+        matches!(self, Self::Waiting | Self::Approval | Self::Question)
+    }
+
+    /// The state in a sentence's words, as the CLI lists it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Approval => "waiting for approval",
+            Self::Question => "waiting for an answer",
+        }
+    }
+}
+
+/// As derived, except that a client from before the kinds of wait were named
+/// is sent `Waiting`, which is what it was told before.
+impl Serialize for ActivityState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let state = match self {
+            Self::Approval | Self::Question
+                if crate::terminal_ipc::encoding_before(crate::terminal_ipc::WAIT_KINDS) =>
+            {
+                Self::Waiting
+            }
+            state => *state,
+        };
+        let name = match state {
+            Self::Unknown => "Unknown",
+            Self::Idle => "Idle",
+            Self::Working => "Working",
+            Self::Waiting => "Waiting",
+            Self::Approval => "Approval",
+            Self::Question => "Question",
+        };
+        serializer.serialize_unit_variant("ActivityState", state as u32, name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

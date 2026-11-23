@@ -307,7 +307,11 @@ use crate::{
 /// Version 198 appends device links: `DeviceTrust`, the peer challenge and
 /// authentication through which a linked computer's session acts on this
 /// daemon, and `SignDeviceChallenge`, with their replies.
-pub const PROTOCOL_VERSION: u16 = 198;
+///
+/// Version 199 appends `Approval` and `Question` to `ActivityState`: what an
+/// agent waiting on the user waits for, where its provider says. An older
+/// client is sent `Waiting` for either.
+pub const PROTOCOL_VERSION: u16 = 199;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -339,7 +343,7 @@ mod older_clients;
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
     ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS,
-    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
+    WAIT_KINDS, WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

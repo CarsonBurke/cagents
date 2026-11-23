@@ -180,7 +180,7 @@ impl Runtime {
         if let Some(error) = self.reported_errors().next() {
             content.push(
                 design::caption(error)
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .class(cosmic::theme::Text::Custom(design::destructive_text))
                     .into(),
             );
         }

@@ -1936,8 +1936,13 @@ impl Snapshot {
     pub fn activity(&self) -> ActivityState {
         if self.exited {
             ActivityState::Unknown
+        } else if let Some(state) = self.requests.iter().map(Request::wait).max_by_key(|state| {
+            // A permission holds the agent up mid-action, so it outranks a
+            // question asked between them.
+            matches!(state, ActivityState::Approval)
+        }) {
+            state
         } else if self.waiting
-            || !self.requests.is_empty()
             || self
                 .subagents
                 .iter()
@@ -3019,6 +3024,16 @@ pub enum RequestKind {
     Consent,
 }
 
+impl Request {
+    /// What the agent waits on the user for while this request is open.
+    pub fn wait(&self) -> ActivityState {
+        match self.kind {
+            RequestKind::Approval | RequestKind::Consent => ActivityState::Approval,
+            RequestKind::Question => ActivityState::Question,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     /// Old JSON snapshots remain conservative; postcard peers use a matched version.
@@ -3814,6 +3829,42 @@ mod tests {
         assert!(snapshot.subagents[0].stopped_by_interrupt(&capabilities));
         snapshot.exited = true;
         assert_eq!(snapshot.activity(), crate::agent::ActivityState::Unknown);
+    }
+
+    /// A waiting conversation says what it waits for, from the kind of the
+    /// request its provider raised; a permission outranks a question, and a
+    /// wait no request explains stays plain waiting.
+    #[test]
+    fn a_waiting_conversation_is_classified_by_its_requests() {
+        use crate::agent::ActivityState;
+        let request = |kind| super::Request {
+            kind,
+            id: format!("{kind:?}"),
+            title: String::new(),
+            description: String::new(),
+            fields: Vec::new(),
+            actions: Vec::new(),
+        };
+        let mut snapshot = super::Snapshot::default();
+        for (kinds, expected) in [
+            (vec![RequestKind::Question], ActivityState::Question),
+            (vec![RequestKind::Approval], ActivityState::Approval),
+            (vec![RequestKind::Consent], ActivityState::Approval),
+            (
+                vec![RequestKind::Question, RequestKind::Approval],
+                ActivityState::Approval,
+            ),
+            (
+                vec![RequestKind::Approval, RequestKind::Question],
+                ActivityState::Approval,
+            ),
+        ] {
+            snapshot.requests = kinds.into_iter().map(request).collect();
+            assert_eq!(snapshot.activity(), expected);
+        }
+        snapshot.requests.clear();
+        snapshot.waiting = true;
+        assert_eq!(snapshot.activity(), ActivityState::Waiting);
     }
 
     #[test]

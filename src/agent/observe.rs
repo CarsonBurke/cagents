@@ -276,12 +276,12 @@ impl Observer {
                 }
             }
             let old = waiting.insert(key, (state, Instant::now()));
-            (state == ActivityState::Waiting && old.is_some_and(|(old, _)| old != state)).then(
-                || crate::notifications::Evidence {
+            (state.waits_on_user() && old.is_some_and(|(old, _)| old != state)).then(|| {
+                crate::notifications::Evidence {
                     key: format!("waiting:{}", uuid::Uuid::new_v4()),
                     kind: crate::notifications::Kind::Waiting,
-                },
-            )
+                }
+            })
         })();
         Ok(Observation {
             activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
@@ -355,7 +355,7 @@ fn add(census: &mut Census, cwd: &str, state: ActivityState) -> ProbeResult<()> 
     // Unknown poisons a worktree rather than hiding an unsupported live status.
     let rank = |state| match state {
         ActivityState::Idle => 0,
-        ActivityState::Waiting => 1,
+        ActivityState::Waiting | ActivityState::Approval | ActivityState::Question => 1,
         ActivityState::Working => 2,
         ActivityState::Unknown => 3,
     };

@@ -471,12 +471,9 @@ impl Item {
     }
 
     pub fn has_live_agent(&self) -> bool {
-        self.sessions.iter().any(|session| {
-            matches!(
-                session.state,
-                ActivityState::Working | ActivityState::Waiting
-            )
-        })
+        self.sessions
+            .iter()
+            .any(|session| session.state == ActivityState::Working || session.state.waits_on_user())
     }
 }
 

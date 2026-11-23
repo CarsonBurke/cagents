@@ -65,7 +65,9 @@ impl MemberState {
         }
         match activity {
             ActivityState::Working => Self::Working,
-            ActivityState::Waiting => Self::Waiting,
+            ActivityState::Waiting | ActivityState::Approval | ActivityState::Question => {
+                Self::Waiting
+            }
             ActivityState::Idle => Self::Idle,
             ActivityState::Unknown => Self::Running,
         }

@@ -21,7 +21,7 @@ use cosmic::{
     widget::{self, button},
 };
 
-use super::{AttentionSummary, COMPACT_WIDTH, Icon, SidebarAction};
+use super::{AttentionState, AttentionSummary, COMPACT_WIDTH, Icon, SidebarAction};
 use crate::design;
 
 /// One rail cell: the rail less an equal gutter each side. The right gutter is
@@ -58,15 +58,13 @@ pub(super) enum News {
     /// Unread updates: an accent pill with their count, or a dot when there
     /// is none to give.
     Unread(Option<usize>),
-    /// Something needs the user before it can go on: an agent waiting for
-    /// input, a deletion that failed, a project that cannot be reached. The
-    /// expanded sidebar's warning triangle.
+    /// A problem with the row itself that needs the user: a deletion that
+    /// failed, a project that cannot be reached. The expanded sidebar's
+    /// warning triangle.
     Warning,
-    /// An agent's update failed. The expanded sidebar's error mark.
-    Failed,
-    /// A provider usage limit stops an agent until it resets. The expanded
-    /// sidebar's alarm.
-    Limited,
+    /// An agent's state that needs the user: waiting on them, a failed
+    /// update, a usage limit. The expanded sidebar's mark for the state.
+    Agent(AttentionState),
     /// How many rows a folded section holds: a neutral pill, since counting
     /// them is not news the user has to act on.
     Count(usize),
@@ -75,7 +73,8 @@ pub(super) enum News {
 /// Who is doing the work a bottom-right spinner shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Activity {
-    /// An agent, in the expanded sidebar's working colour.
+    /// An agent, in the expanded sidebar's working colour: the accent, since
+    /// progress is not news the user has to act on.
     Agent,
     /// The application itself: a deletion, or a worktree being created.
     App,
@@ -95,16 +94,11 @@ impl Badges {
     /// then a failed update, then the unread count. The tooltip and the
     /// accessible name still give the whole summary.
     pub fn attention(summary: AttentionSummary) -> Self {
-        let news = if summary.waiting != 0 {
-            Some(News::Warning)
-        } else if summary.failed != 0 {
-            Some(News::Failed)
-        } else if summary.limited != 0 {
-            Some(News::Limited)
-        } else if summary.unread != 0 {
-            Some(News::Unread(Some(summary.unread)))
-        } else {
-            None
+        let news = match summary.state() {
+            Some(AttentionState::Unread | AttentionState::Working) | None => {
+                (summary.unread != 0).then_some(News::Unread(Some(summary.unread)))
+            }
+            Some(state) => Some(News::Agent(state)),
         };
         Self {
             news,
@@ -221,13 +215,9 @@ fn news_badge<'a>(news: News) -> Element<'a, SidebarAction> {
                 .into(),
             design::warning_color,
         ),
-        News::Failed => status_disc(
-            widget::icon(Icon::Error.handle()).size(STATUS_GLYPH).into(),
-            design::destructive_color,
-        ),
-        News::Limited => status_disc(
-            widget::icon(Icon::Alarm.handle()).size(STATUS_GLYPH).into(),
-            design::warning_color,
+        News::Agent(state) => status_disc(
+            super::attention_mark(state, STATUS_GLYPH),
+            state.look().tone.color(),
         ),
     }
 }
@@ -298,7 +288,7 @@ fn status_disc<'a>(
 
 fn activity_badge<'a>(activity: Activity) -> Element<'a, SidebarAction> {
     let ink: fn(&cosmic::Theme) -> Color = match activity {
-        Activity::Agent => design::warning_color,
+        Activity::Agent => design::activity_color,
         Activity::App => design::muted_icon_color,
     };
     status_disc(crate::ui_controls::activity_spinner(SPINNER, ink), ink)
@@ -436,7 +426,7 @@ mod tests {
             working: 1,
             failed: 0,
             waiting: 0,
-            limited: 0,
+            ..AttentionSummary::default()
         });
         assert_eq!(badges.news, Some(News::Unread(Some(3))));
         assert_eq!(badges.activity, Some(Activity::Agent));
@@ -454,14 +444,14 @@ mod tests {
             unread: 4,
             ..AttentionSummary::default()
         });
-        assert_eq!(waiting.news, Some(News::Warning));
+        assert_eq!(waiting.news, Some(News::Agent(AttentionState::Waiting)));
         assert_eq!(waiting.activity, None);
         let failed = Badges::attention(AttentionSummary {
             unread: 2,
             failed: 1,
             ..AttentionSummary::default()
         });
-        assert_eq!(failed.news, Some(News::Failed));
+        assert_eq!(failed.news, Some(News::Agent(AttentionState::Failed)));
         let limited = AttentionSummary {
             unread: 2,
             working: 1,
@@ -469,7 +459,7 @@ mod tests {
         }
         .limited(true);
         let limited = Badges::attention(limited);
-        assert_eq!(limited.news, Some(News::Limited));
+        assert_eq!(limited.news, Some(News::Agent(AttentionState::Limited)));
         // A limited agent is not working, whatever it last reported.
         assert_eq!(limited.activity, None);
         assert_eq!(

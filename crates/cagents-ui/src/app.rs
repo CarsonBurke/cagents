@@ -9178,7 +9178,7 @@ impl Cagents {
         let next = activity.map(|activity| activity.state);
         // Only an agent that carries on was answered. One that disconnects,
         // fails, or closes while waiting reports no state at all.
-        if previous == Some(crate::agent::ActivityState::Waiting)
+        if previous.is_some_and(crate::agent::ActivityState::waits_on_user)
             && matches!(
                 next,
                 Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle)
@@ -9188,7 +9188,7 @@ impl Cagents {
             let placement = self.attention_placement(card, &listed);
             self.sidebar_state.settle_waiting_agent(card, &placement);
         }
-        if (next == Some(crate::agent::ActivityState::Waiting) && previous != next)
+        if (next.is_some_and(crate::agent::ActivityState::waits_on_user) && previous != next)
             || (previous == Some(crate::agent::ActivityState::Working)
                 && next == Some(crate::agent::ActivityState::Idle))
         {
@@ -9197,10 +9197,9 @@ impl Cagents {
         // A turn that ends has often pushed a branch or opened a pull request;
         // one that stops to ask for permission has not finished anything.
         let finished = previous == Some(crate::agent::ActivityState::Working)
-            && !matches!(
-                next,
-                Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting)
-            );
+            && !next.is_some_and(|next| {
+                next == crate::agent::ActivityState::Working || next.waits_on_user()
+            });
         // Every terminal wake lands here, so a plain shell resolves nothing.
         let worktree = (finished || activity.is_some())
             .then(|| self.agent_worktree(card))

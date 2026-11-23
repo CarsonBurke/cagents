@@ -33,7 +33,7 @@ impl Tracker {
     pub fn activity(&mut self, state: crate::agent::ActivityState) -> Option<(RunId, Update)> {
         let run = self.active?;
         let capture = self.runs.get_mut(&run)?;
-        let waiting = state == crate::agent::ActivityState::Waiting;
+        let waiting = state.waits_on_user();
         if capture.waiting == waiting {
             return None;
         }

@@ -1874,10 +1874,7 @@ impl Scanner {
                 continue;
             };
             in_use.insert(worktree.clone());
-            if !matches!(
-                session.state,
-                ActivityState::Working | ActivityState::Waiting
-            ) {
+            if session.state != ActivityState::Working && !session.state.waits_on_user() {
                 continue;
             }
             working = true;

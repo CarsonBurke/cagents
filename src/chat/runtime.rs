@@ -2605,10 +2605,8 @@ impl TurnAttention {
     }
 
     fn finish(&self, state: &mut Snapshot, at: Option<u64>) -> bool {
-        if matches!(
-            state.activity(),
-            ActivityState::Working | ActivityState::Waiting
-        ) {
+        let activity = state.activity();
+        if activity == ActivityState::Working || activity.waits_on_user() {
             // Providers can announce a background task in a later frame than
             // the parent's settlement. Its eventual finish must replace the
             // earlier idle time, rather than merely reveal it again.
@@ -3935,7 +3933,7 @@ impl Actor {
         }
         let activity = state.activity();
         let generation = state.generation;
-        let waiting_fingerprint = if activity == ActivityState::Waiting {
+        let waiting_fingerprint = if activity.waits_on_user() {
             state.waiting_fingerprint()
         } else {
             None
@@ -3956,8 +3954,7 @@ impl Actor {
                 (self.notify)(Update::Execution { run, update });
             }
         }
-        if activity == ActivityState::Waiting && baselined && (activity_changed || waiting_changed)
-        {
+        if activity.waits_on_user() && baselined && (activity_changed || waiting_changed) {
             self.publish_current_attention(crate::notifications::Evidence {
                 key: format!("{}:waiting:{generation}", self.attention.key),
                 kind: crate::notifications::Kind::Waiting,

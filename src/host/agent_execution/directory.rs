@@ -456,7 +456,7 @@ pub(super) fn list(
                 Relation::Myself | Relation::Peer => 2,
             },
             match entry.state {
-                ActivityState::Waiting => 0,
+                ActivityState::Waiting | ActivityState::Approval | ActivityState::Question => 0,
                 ActivityState::Working => 1,
                 ActivityState::Idle => 2,
                 ActivityState::Unknown => 3,

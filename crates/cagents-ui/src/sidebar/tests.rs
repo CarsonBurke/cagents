@@ -7398,7 +7398,7 @@ fn draws_work_spinner(element: &Element<'_, SidebarAction>) -> bool {
     }
     let spinner = crate::ui_controls::activity_spinner::<SidebarAction>(
         f32::from(ROW_ICON_SIZE),
-        design::warning_color,
+        design::activity_color,
     );
     contains(&Tree::new(element), spinner.as_widget().tag())
 }
@@ -10766,8 +10766,7 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
             unread: 2,
             working: 1,
             waiting: 1,
-            failed: 0,
-            limited: 0,
+            ..AttentionSummary::default()
         }
     );
     let plain = format!("Open project {}", folder.name);
