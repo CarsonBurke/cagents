@@ -7,28 +7,27 @@
 | <img src="../../packaging/dev.cagents.Cagents.svg" width="128" alt="cagents icon"> | <img src="../../packaging/io.github.cagents.ceditor.svg" width="128" alt="ceditor icon"> |
 
 Both icons are obsidian panes in the GNOME Circle style: physical objects with
-a 2.5D bottom edge, a soft drop shadow and a neutral title bar, rather than
-glyphs on a tile. The title bars stay grey so that the robot and the code carry
-the colour.
+a 2.5D bottom edge, a soft drop shadow and a short coloured title bar, rather
+than glyphs on a tile. The title bars stay thin so that the robot and the code
+remain the focus.
 
-- **cagents** is an active session pane carrying an agent robot, centred
-  below its title bar, with a second session pane behind it, offset up and to
-  the right.
+- **cagents** is an active session pane, titled in coral, carrying an agent
+  robot centred below its title bar, with a teal-titled session pane behind it,
+  offset up and to the right.
   It reads as an agent at work with more sessions running alongside.
-- **ceditor** is a fan of obsidian code pages. The front page shows a gutter,
-  syntax-coloured lines and a highlighted active line ending in a coral I-beam
-  caret; two more pages fan out behind it.
+- **ceditor** is a fan of obsidian code pages. The teal-titled front page shows
+  a gutter, syntax-coloured lines and a highlighted active line ending in a
+  coral I-beam caret; slate- and coral-titled pages fan out behind it.
 
 From 24 px up the marks stay distinct: a coral robot in a square pane against
 a fanned stack of lined pages. At 16 px they reduce to an orange mark on a dark
-pane against a dark page flecked with coral and teal.
+pane against a dark page with a teal top.
 
 ## Construction
 
 - Panes and pages: obsidian face (`#3B4660` → `#2A3245` → `#222939`, back pane
   `#303A50` → `#1C2230`) over a 4-5 px darker edge (`#11151F`), with a white rim
-  light and a glossy slate title bar (`#5A6680` → `#4A556E`) over a dark
-  hairline. Panes and pages share one title bar and corner radius as rendered
+  light and a glossy title bar in a flat palette colour over a dark hairline. Panes and pages share one title bar and corner radius as rendered
   at 128 px, about 11 px tall with an 8 px radius, so the two icons read as a
   set.
   Everything casts a soft shadow; the cagents front pane casts it to the right
