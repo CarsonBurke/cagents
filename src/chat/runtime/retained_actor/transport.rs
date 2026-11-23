@@ -192,6 +192,10 @@ pub(crate) struct Resident {
     pub confirmed_session: Option<String>,
     pub background_subagents: Vec<String>,
     pub interrupt_subagents: Vec<String>,
+    /// See [`chat::Snapshot::background_tasks`]. A helper that predates it
+    /// reports none.
+    #[serde(default)]
+    pub background_tasks: Option<usize>,
     /// What holds the conversation, by name. A helper that predates it
     /// reports none; see [`Resident::work_hold`].
     #[serde(default)]
@@ -533,6 +537,7 @@ impl RemoteActor {
             confirmed_session: None,
             background_subagents: Vec::new(),
             interrupt_subagents: Vec::new(),
+            background_tasks: Some(0),
             work_hold: None,
             account_reports: Vec::new(),
             agent_addresses: Vec::new(),
@@ -2398,7 +2403,20 @@ impl RemoteActor {
         self.publish_close_result(self.call(method, args))
     }
     pub fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
-        let publication = match self.call("try_close_if_idle", json!([generation])) {
+        self.try_close_if_idle_with(json!([generation]))
+    }
+    /// As [`Self::try_close_if_idle`], with `detached` deciding what the
+    /// provider leaves running. A helper from before this refuses, closing
+    /// nothing.
+    pub fn try_stop_if_idle(
+        &self,
+        generation: u64,
+        detached: DetachedWork,
+    ) -> Result<bool, String> {
+        self.try_close_if_idle_with(json!([generation, detached == DetachedWork::Spare]))
+    }
+    fn try_close_if_idle_with(&self, args: Value) -> Result<bool, String> {
+        let publication = match self.call("try_close_if_idle", args) {
             Ok(ConditionalClosePublication::Changed) => return Ok(false),
             Ok(ConditionalClosePublication::Closed(publication)) => Ok(*publication),
             Err(error) => Err(error),
@@ -2924,6 +2942,7 @@ impl Server {
         let active_model_revision = state.active_model_revision;
         let sampled_activity = state.activity();
         let work_hold = state.work_hold();
+        let background_tasks = state.background_tasks;
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -3013,6 +3032,7 @@ impl Server {
             confirmed_session,
             background_subagents,
             interrupt_subagents,
+            background_tasks: Some(background_tasks),
             work_hold: Some(work_hold),
             account_reports,
             agent_addresses: self.actor.agent_addresses(),
@@ -3723,7 +3743,7 @@ impl Server {
             }
             "close_if_idle" => {
                 let (generation,) = decode!((u64,));
-                match self.try_close_if_idle(generation)? {
+                match self.try_close_if_idle(generation, None)? {
                     ConditionalClosePublication::Changed => {
                         Err("Provider state changed before conditional idle close".into())
                     }
@@ -3731,8 +3751,25 @@ impl Server {
                 }
             }
             "try_close_if_idle" => {
-                let (generation,) = decode!((u64,));
-                value!(self.try_close_if_idle(generation)?)
+                // `[generation, spare]` decides what the provider leaves
+                // running, as `close` does. A daemon that sends only the
+                // generation stops everything, as before; a helper from
+                // before this refuses the second argument, closing nothing.
+                let (generation, detached) = match request.args.as_array().map(Vec::as_slice) {
+                    Some([generation]) => (generation.as_u64(), None),
+                    Some([generation, Value::Bool(spare)]) => (
+                        generation.as_u64(),
+                        Some(if *spare {
+                            DetachedWork::Spare
+                        } else {
+                            DetachedWork::Stop
+                        }),
+                    ),
+                    _ => (None, None),
+                };
+                let generation = generation
+                    .ok_or("try_close_if_idle takes a generation and an optional spare")?;
+                value!(self.try_close_if_idle(generation, detached)?)
             }
             "close" => {
                 // `[true]` leaves what the provider leaves running when it
@@ -3837,13 +3874,29 @@ impl Server {
         }
         Ok(())
     }
+    /// `detached` decides what the provider leaves running, as `close`
+    /// does; without one, everything it started stops.
     fn try_close_if_idle(
         &mut self,
         generation: u64,
+        detached: Option<DetachedWork>,
     ) -> Result<ConditionalClosePublication, String> {
         if self.closed_snapshot.is_none() {
-            if !self.actor.try_close_if_idle(generation)? {
+            let closed = match detached {
+                Some(detached) => self.actor.try_stop_if_idle(generation, detached)?,
+                None => self.actor.try_close_if_idle(generation)?,
+            };
+            if !closed {
                 return Ok(ConditionalClosePublication::Changed);
+            }
+            if let Some(detached) = detached {
+                // As in `close`: what a killed provider left would hold the
+                // memory it needed.
+                self.detached = if self.actor.provider_was_force_stopped() {
+                    DetachedWork::Stop
+                } else {
+                    detached
+                };
             }
             reap_orphans(self.detached)?;
             self.finish_inputs();

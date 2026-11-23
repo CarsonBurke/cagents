@@ -13,9 +13,12 @@ pub(in crate::host) struct CloseRemoval {
 /// Whether a resident can hold provider work, and so a capacity slot. A
 /// read-only history reader pages saved data with no provider process and
 /// never owns work; counting it would let paused or saved panes, which cost
-/// a transcript page, refuse a chat that would run.
+/// a transcript page, refuse a chat that would run. Nor does a writer whose
+/// provider has ended and left nothing unsettled: its pane resumes through
+/// an ordinary admission.
 fn holds_slot(record: &Record) -> bool {
     !record.handle.is_read_only_history()
+        && (record.handle.owns_work() || !record.handle.is_completed())
 }
 
 pub(super) fn holding(state: &HostState, id: &TerminalId) -> bool {
@@ -93,8 +96,191 @@ fn refusal(used: usize, starting: usize, limit: usize) -> String {
     format!(
         "No room for another chat: {running}{starting}, and the limit is {limit}.\n\n\
          Close a chat you have finished with, then try again; `cagents chat capacity` lists \
-         the open ones. Chats that only show saved history don't count.{more}"
+         the open ones. None of them could be stopped to make room: only a finished Claude \
+         chat that no window shows and that has nothing left running can be. Chats that only \
+         show saved history don't count.{more}"
     )
+}
+
+/// A chat whose provider [`make_room`] may stop: a retained Claude actor,
+/// which resumes in place, that has finished a turn and has nothing under
+/// way, which no window shows, and which no transition holds.
+struct Spare {
+    id: TerminalId,
+    handle: Handle,
+    /// A window keeps it in a background tab.
+    open: bool,
+    finished_at: u64,
+    /// Its agent, whose starts [`stop_spare`] excludes while it stops.
+    agent: Option<crate::model::AgentId>,
+}
+
+fn spare(state: &HostState, id: TerminalId, record: &Record) -> Option<Spare> {
+    let handle = &record.handle;
+    let settled = matches!(
+        handle.native_continuity(),
+        chat::NativeContinuity::RetainedClaudeActor { .. }
+    ) && handle.actor_identity().is_some()
+        && !handle.is_close_only()
+        && holds_slot(record)
+        && !handle.is_completed()
+        && handle.is_idle()
+        && handle.update_activity() == (false, true)
+        && handle.background_subagents().is_empty()
+        && handle.background_tasks() == Some(0);
+    let unseen = !record.subscribers.values().any(|&visible| visible);
+    let untouched = !record.returning_terminal
+        && record.paired_terminal.is_none()
+        && record.session.terminal.is_none()
+        && !state.chat_spawning.contains_key(&id)
+        && !state.native_actor_startups.contains_key(&id)
+        && !state.native_closing.contains_key(&id)
+        && !state.chat_handoffs.contains_key(&id)
+        && !state.chat_close_reservations.contains_key(&id);
+    if !(settled && unseen && untouched) {
+        return None;
+    }
+    Some(Spare {
+        id,
+        handle: handle.clone(),
+        open: !record.subscribers.is_empty(),
+        finished_at: handle.finished_at()?,
+        agent: None,
+    })
+}
+
+/// `id`'s agent, if any, when stopping it holds up nothing the daemon owes
+/// it; `Err` when it is an automation's, its agent has a run or launch
+/// unfinished, a message waits for it, or the registry can't say.
+fn owes_nothing(
+    registry: &super::super::model::Registry,
+    id: TerminalId,
+    waiting: &std::collections::BTreeSet<crate::agent_execution::Lineage>,
+) -> Result<Option<crate::model::AgentId>, ()> {
+    let owed = |error: String| {
+        tracing::debug!(chat = %id, %error, "kept a chat that may owe work");
+    };
+    let lineage = registry
+        .session_lineage(id)
+        .map_err(owed)?
+        .unwrap_or(crate::agent_execution::Lineage(id));
+    if waiting.contains(&lineage) {
+        return Err(());
+    }
+    let Some(agent) = registry.agent_for_session(id).map_err(owed)? else {
+        return Ok(None);
+    };
+    let busy = matches!(
+        agent.origin,
+        crate::agent_execution::Origin::Automation { .. }
+    ) || !registry
+        .unfinished_agent_runs(agent.id)
+        .map_err(owed)?
+        .is_empty()
+        || registry
+            .pending_agent_launch(agent.id)
+            .map_err(owed)?
+            .is_some();
+    if busy { Err(()) } else { Ok(Some(agent.id)) }
+}
+
+/// Frees one slot of a full daemon for a chat that needs it, and only then:
+/// never on a timer. It stops the provider of the chat that finished longest
+/// ago among those nobody is looking at and that have nothing under way,
+/// preferring one no window has open. The conversation stays resident and
+/// its pane resumes it in place, so only a process ends; what that process
+/// leaves running is decided as closing the chat would. Chats the daemon
+/// owes work, such as an automation's or one with a message waiting, are
+/// left alone. Returns whether a slot was freed.
+fn make_room(host: &SharedHost) -> bool {
+    let (mut spares, registry) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down || usage(&state) < state.native_chat_capacity {
+            return false;
+        }
+        let spares: Vec<_> = state
+            .chats
+            .iter()
+            .filter_map(|(&id, record)| spare(&state, id, record))
+            .collect();
+        (spares, state.execution_registry.clone())
+    };
+    if spares.is_empty() {
+        return false;
+    }
+    if let Some(registry) = registry {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(waiting) = registry.pending_message_lineages() else {
+            return false;
+        };
+        spares.retain_mut(|spare| match owes_nothing(&registry, spare.id, &waiting) {
+            Ok(agent) => {
+                spare.agent = agent;
+                true
+            }
+            Err(()) => false,
+        });
+    }
+    spares.sort_by_key(|spare| (spare.open, spare.finished_at));
+    spares.into_iter().any(|spare| stop_spare(host, spare))
+}
+
+/// Stops one candidate under a teardown fence, after checking again that it
+/// is the same attachment, still qualifies and still owes nothing. Its
+/// agent's start gate keeps a prompt from being sent to it meanwhile; one
+/// already starting is left alone rather than waited for, since its start
+/// may itself be making room. The actor refuses unless it is idle at the
+/// generation read here.
+fn stop_spare(host: &SharedHost, candidate: Spare) -> bool {
+    let gate = candidate
+        .agent
+        .map(|agent| super::super::agent_execution::start_gate(host, agent));
+    let _starts = match &gate {
+        Some(gate) => match gate.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    let generation = candidate.handle.resident_generation();
+    let (_fence, registry) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&candidate.id) else {
+            return false;
+        };
+        if !record.handle.same_attachment(&candidate.handle)
+            || spare(&state, candidate.id, record).is_none()
+        {
+            return false;
+        }
+        let source = record.session.clone();
+        let registry = state.execution_registry.clone();
+        match Reservation::closing(host, &mut state, &source) {
+            Ok(fence) => (fence, registry),
+            Err(_) => return false,
+        }
+    };
+    if let Some(registry) = registry {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(waiting) = registry.pending_message_lineages() else {
+            return false;
+        };
+        if owes_nothing(&registry, candidate.id, &waiting) != Ok(candidate.agent) {
+            return false;
+        }
+    }
+    let detached = super::super::agent_execution::detached_work_on_close(host, candidate.id);
+    match candidate.handle.try_stop_if_idle(generation, detached) {
+        Ok(true) => {
+            tracing::info!(chat = %candidate.id, "stopped an idle chat's provider to make room");
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            tracing::debug!(chat = %candidate.id, %error, "could not stop an idle chat to make room");
+            false
+        }
+    }
 }
 
 /// An exact descriptor is the reservation token. Other transitions cannot
@@ -154,12 +340,19 @@ impl Reservation {
         Self::new_with_source(host, source, None)
     }
 
+    /// A full daemon first makes room by stopping a finished chat nobody is
+    /// looking at (see [`make_room`]), then admits again under every fence.
     pub(super) fn new_with_source(
         host: &SharedHost,
         source: &Session,
         terminal_proof: Option<&HostSessionProof>,
     ) -> Result<Option<Self>, ProtocolError> {
-        Self::admit(host, source, terminal_proof, true)
+        match Self::admit(host, source, terminal_proof, true) {
+            Err(refused) if refused.code == ProtocolErrorCode::ChatCapacity && make_room(host) => {
+                Self::admit(host, source, terminal_proof, true)
+            }
+            admitted => admitted,
+        }
     }
 
     /// Admits a read-only history reader, which holds no slot once
@@ -360,6 +553,8 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
                     "starting".into()
                 } else if record.handle.is_read_only_history() {
                     "saved history only (no slot)".into()
+                } else if !holds_slot(record) {
+                    "stopped (no slot)".into()
                 } else if record.handle.is_completed() {
                     "closed".into()
                 } else {
@@ -1753,6 +1948,30 @@ exit 0
         );
         process_inner(host, 73, ClientRequest::ChatDetach { chat_id: source.id }).unwrap();
         (directory, source, handle)
+    }
+
+    #[test]
+    fn a_stopped_writer_holds_no_slot_and_resumes_through_admission() {
+        let host = host();
+        let (_directory, source, _handle) = completed_writer(&host);
+        {
+            let mut state = host.lock().unwrap();
+            state.native_chat_capacity = 1;
+            assert!(!holding(&state, &source.id));
+            assert_eq!(usage(&state), 0);
+            let status = status_from_state(&state);
+            assert_eq!((status.used, status.resident), (0, 0));
+            assert_eq!(status.residents[0].status, "stopped (no slot)");
+            let occupied = session();
+            state.chat_spawning.insert(occupied.id, occupied);
+        }
+        // Nothing here can be stopped to make room, so a full daemon refuses.
+        assert_eq!(
+            Reservation::new(&host, &source).err().unwrap().code,
+            ProtocolErrorCode::ChatCapacity
+        );
+        host.lock().unwrap().chat_spawning.clear();
+        assert!(Reservation::new(&host, &source).unwrap().is_some());
     }
 
     #[test]

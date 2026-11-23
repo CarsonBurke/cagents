@@ -2,14 +2,38 @@
 
 The daemon keeps a bounded number of resident native chat handles that can run
 a provider. A pane that only shows saved history, such as one an update paused,
-holds no slot, so a full daemon still opens saved conversations. Completed
-writers can still occupy this capacity. This limit is separate from account
-usage allowances and provider plan quotas.
+holds no slot, so a full daemon still opens saved conversations. Nor does a
+chat whose provider stopped with nothing unsettled; resuming it takes a slot
+again. This limit is separate from account usage allowances and provider plan
+quotas.
 
-A full daemon refuses a new chat with "No room for another chat", how many are
-open, and the limit. The pane keeps the message you wrote and offers Retry;
-close a chat you have finished with, then retry. The refusal's details name
-the `cagents chat capacity set` command that allows more at once.
+## Making room
+
+When a new or resumed chat needs a slot and none is free, the daemon first
+stops the provider of one chat to make room. It picks the chat that finished
+its last turn longest ago among the Claude chats that:
+
+- no window is showing, preferring one no window has open in a tab;
+- have finished a turn and have nothing under way: no turn, request,
+  queued message, or background task such as a subagent, a shell command run
+  in the background or a monitor, since stopping Claude ends those. A task
+  whose end Claude doesn't report keeps its chat until it does;
+- the daemon owes nothing: no automation owns them, no message waits for
+  them, and their agent has no run or launch unfinished;
+- no transition such as a start, close or return to the terminal holds.
+
+The conversation stays open where it was. Its pane says that Claude stopped
+and keeps your draft; Resume conversation continues it in place, so nothing is
+lost but the idle process. Anything else the provider left running, outside
+the tasks it reports, is kept or stopped as closing the chat would decide. The
+daemon does this only when a chat needs the slot, never on a timer, and never to
+a chat on screen.
+
+If no chat qualifies, the daemon refuses the new chat with "No room for another
+chat", how many are open, and the limit. The pane keeps the message you wrote
+and offers Retry; close a chat you have finished with, then retry. The
+refusal's details name the `cagents chat capacity set` command that allows more
+at once.
 
 Run `cagents chat capacity` to see used admission slots, resident handles, pending
 spawns and the configured limit. Its compact resident table includes completed
@@ -24,7 +48,7 @@ memory and process use.
 
 Lowering the limit leaves existing residents and their work untouched. New
 admissions wait until usage falls below the limit; exact recovery of an existing
-resident does not allocate another slot. The daemon saves this setting in
+resident that holds a slot does not allocate another. The daemon saves this setting in
 `native-chat-capacity.toml` beside its window settings, with a private atomic
 replacement. Window settings saves cannot overwrite it. A malformed or unsafe
 capacity file causes daemon startup to report an error rather than silently
@@ -105,6 +129,9 @@ If inspection confirms eligibility, `cagents chat release FULL-CHAT-ID --yes`
 explicitly requests release. The CLI obtains a fresh identity proof and the
 daemon checks it again before changing anything. A changed daemon, successor
 actor or snapshot generation invalidates the proof. Release drops a resident
-handle; it does not delete saved conversations. There is no bulk cleanup or
-automatic eviction. After capacity becomes available, retry the blocked pane's
-normal start or reconnect action.
+handle and its cached transcript; it does not delete saved conversations. A
+completed writer holds no slot, so releasing one frees memory rather than
+capacity. There is no bulk cleanup, and
+nothing is released automatically; [making room](#making-room) only stops a
+provider. After capacity becomes available, retry the blocked pane's normal
+start or reconnect action.

@@ -1269,8 +1269,15 @@ fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings(
     assert!(adapter.background_agents.contains("live-child"));
     assert!(!adapter.tasks.iter().any(|task| task == "task-failed"));
     assert!(adapter.tasks.iter().any(|task| task == "task-live"));
+    // The live one is still counted; the count isn't what this settles.
+    let events = step
+        .events
+        .iter()
+        .filter(|event| !matches!(event, Event::BackgroundTasks(1)))
+        .cloned()
+        .collect::<Vec<_>>();
     assert!(
-        matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
+        matches!(events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
             if owner=="failed-child" && id=="failed-child" && detail==failure
             && item.id=="claude-result-error:child-result:0"
             && chat::failure::provider_error_text(Provider::Claude,item)==Some(failure)
@@ -14024,6 +14031,82 @@ fn work_that_leaves_the_background_level_without_a_notice_stops_running() {
     let agent = &lead.snapshot.subagents[0];
     assert_eq!(agent.status, ToolStatus::Succeeded);
     assert_eq!(agent.detail, "");
+}
+
+/// A background shell outlives the turn that started it without holding the
+/// conversation, so the snapshot says it is live for whatever would stop the
+/// provider and end it.
+#[test]
+fn a_background_shell_that_outlives_its_turn_counts_as_a_live_task() {
+    let mut lead = Lead::default();
+    let level = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","uuid":"l","session_id":"00000000-0000-4000-8000-000000000001","tasks":tasks});
+    lead.receive(
+        json!({"type":"assistant","uuid":"a","message":{"id":"m","role":"assistant","content":[
+        {"type":"tool_use","id":"cmd","name":"Bash","input":{"command":"npm run dev","description":"Serve","run_in_background":true}}]}}),
+    );
+    lead.receive(level(
+        json!([{"task_id":"bcmd","task_type":"local_bash","description":"Serve"}]),
+    ));
+    lead.receive(json!({"type":"result","subtype":"success","is_error":false,"uuid":"turn"}));
+    assert!(!lead.snapshot.holds_work());
+    assert_eq!(lead.snapshot.background_tasks, 1);
+
+    // A watcher counts too: stopping the provider would end it as well.
+    lead.receive(level(json!([
+        {"task_id":"bcmd","task_type":"local_bash","description":"Serve"},
+        {"task_id":"watch","task_type":"monitor","description":"Watch","ambient":true}
+    ])));
+    assert_eq!(lead.snapshot.background_tasks, 2);
+
+    lead.receive(level(json!([])));
+    assert_eq!(lead.snapshot.background_tasks, 0);
+}
+
+/// Until Claude Code reports its level, the commands seen to start in the
+/// background and not yet to end are what is live.
+#[test]
+fn a_background_shell_counts_before_any_level_is_reported() {
+    let mut lead = Lead::default();
+    lead.receive(
+        json!({"type":"assistant","uuid":"a","message":{"id":"m","role":"assistant","content":[
+        {"type":"tool_use","id":"cmd","name":"Bash","input":{"command":"npm run dev","description":"Serve","run_in_background":true}}]}}),
+    );
+    lead.receive(
+        json!({"type":"user","uuid":"r1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"cmd",
+        "content":"Command running in background with ID: bcmd."}]},"tool_use_result":{"backgroundTaskId":"bcmd"}}),
+    );
+    lead.receive(json!({"type":"result","subtype":"success","is_error":false,"uuid":"turn"}));
+    assert_eq!(lead.snapshot.background_tasks, 1);
+
+    lead.receive(
+        json!({"type":"system","subtype":"task_notification","uuid":"n","session_id":"00000000-0000-4000-8000-000000000001","task_id":"bcmd",
+        "tool_use_id":"cmd","status":"completed","output_file":"/tmp/o",
+        "summary":"Background command \"Serve\" completed (exit code 0)"}),
+    );
+    assert_eq!(lead.snapshot.background_tasks, 0);
+
+    // A task of another type, such as a monitor, counts from its start.
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"t","session_id":"00000000-0000-4000-8000-000000000001","task_id":"watch",
+        "task_type":"monitor","description":"Watch the build"}),
+    );
+    assert_eq!(lead.snapshot.background_tasks, 1);
+    lead.receive(
+        json!({"type":"system","subtype":"task_notification","uuid":"n2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"watch",
+        "status":"completed","summary":"Done"}),
+    );
+    assert_eq!(lead.snapshot.background_tasks, 0);
+
+    // So does one whose end reaches the conversation only as the notice the
+    // model receives.
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"t2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"watch2",
+        "task_type":"monitor","description":"Watch the tests"}),
+    );
+    assert_eq!(lead.snapshot.background_tasks, 1);
+    lead.receive(json!({"type":"user","uuid":"delivered","origin":{"kind":"task-notification"},"message":{"role":"user",
+        "content":"<task-notification>\n<task-id>watch2</task-id>\n<status>completed</status>\n<summary>Done</summary>\n</task-notification>"}}));
+    assert_eq!(lead.snapshot.background_tasks, 0);
 }
 
 #[test]

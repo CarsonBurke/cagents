@@ -501,6 +501,19 @@ impl Handle {
             Owner::Remote(remote) => remote.try_close_if_idle(generation),
         }
     }
+    /// Ends an idle conversation's provider when `generation` is still
+    /// current, with `detached` deciding what it leaves running, as a close
+    /// does. False means the conversation changed and nothing stopped.
+    pub(crate) fn try_stop_if_idle(
+        &self,
+        generation: u64,
+        detached: crate::daemon::owned_children::DetachedWork,
+    ) -> Result<bool, String> {
+        match &self.0 {
+            Owner::Local(local) => local.try_stop_if_idle(generation, detached),
+            Owner::Remote(remote) => remote.try_stop_if_idle(generation, detached),
+        }
+    }
     pub(crate) fn usage(&self) -> chat::Usage {
         match &self.0 {
             Owner::Local(local) => local.usage(),
@@ -723,6 +736,14 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.background_subagents(),
             Owner::Remote(remote) => remote.state().background_subagents.clone(),
+        }
+    }
+    /// How many background tasks the provider reports live, or `None` from
+    /// a helper that predates reporting them.
+    pub(crate) fn background_tasks(&self) -> Option<usize> {
+        match &self.0 {
+            Owner::Local(local) => Some(local.background_tasks()),
+            Owner::Remote(remote) => remote.state().background_tasks,
         }
     }
     pub(crate) fn interrupt_subagents(&self) -> Vec<String> {

@@ -1760,8 +1760,9 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<Option<Undelivered>>>
     )
 }
 
-/// Serializes starting an agent's waiting prompts; see `start`.
-fn start_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
+/// Serializes starting an agent's waiting prompts; see `start`. Making room
+/// holds it while it stops the agent's provider, so no start sends to it.
+pub(super) fn start_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
     shared_gate(
         &mut host
             .lock()

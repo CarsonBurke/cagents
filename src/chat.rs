@@ -1670,6 +1670,12 @@ pub struct Snapshot {
     /// Child conversations associated with this exact parent conversation.
     #[serde(default)]
     pub subagents: Vec<Subagent>,
+    /// How many background tasks the provider last reported live, of every
+    /// kind: shells, monitors and the agents above. They run in its process
+    /// group, so stopping the provider ends them, and with them whatever
+    /// they would have reported to the conversation.
+    #[serde(default)]
+    pub background_tasks: usize,
     /// Whether the provider takes commands, so that what waits to be sent
     /// can wait for it rather than for a refusal.
     pub ready: bool,
@@ -3468,6 +3474,9 @@ pub enum Event {
     },
     /// Authoritative provider attention independent of request presentation.
     Waiting(bool),
+    /// How many background tasks the provider now reports live; see
+    /// [`Snapshot::background_tasks`].
+    BackgroundTasks(usize),
     /// The plan the provider is now working to, replacing any earlier one.
     ///
     /// A plan is republished whole on every revision, so the newest event is
