@@ -238,17 +238,27 @@ mod tests {
     #[test]
     fn lease_handoff_rejects_same_inode_on_another_device() {
         let root = tempfile::tempdir().unwrap();
-        // These Linux filesystem roots share inode 1 on distinct devices.
-        // No mounts or changes to either filesystem are needed for the fixture.
+        // Pseudo-filesystem roots usually share inode 1 on distinct devices,
+        // so no mounts or changes to either filesystem are needed for the
+        // fixture. A sandbox may bind-mount some of them instead, as the
+        // release builder does /sys, so take the first that still qualifies.
         let expected = fs::metadata("/proc").unwrap();
-        let unrelated = fs::metadata("/sys").unwrap();
+        let Some((unrelated_path, unrelated)) =
+            ["/sys", "/dev/pts", "/dev/mqueue", "/sys/fs/cgroup"]
+                .into_iter()
+                .filter_map(|path| Some((path, fs::metadata(path).ok()?)))
+                .find(|(_, other)| other.ino() == expected.ino() && other.dev() != expected.dev())
+        else {
+            eprintln!("skipped: no filesystem root here shares /proc's inode on another device");
+            return;
+        };
         assert_eq!(expected.ino(), unrelated.ino());
         assert_ne!(expected.dev(), unrelated.dev());
         let record = lock_record(&expected);
         let process = fake_process(root.path(), &record);
         // The flock record matches the indexed inode, but fd stat proves it
         // belongs to another device. An unlocked target fd cannot supply proof.
-        symlink("/sys", process.join("fd/7")).unwrap();
+        symlink(unrelated_path, process.join("fd/7")).unwrap();
         fs::write(process.join("fdinfo/7"), format!("lock: {record}")).unwrap();
         symlink("/proc", process.join("fd/8")).unwrap();
         fs::write(process.join("fdinfo/8"), "pos: 0\n").unwrap();
