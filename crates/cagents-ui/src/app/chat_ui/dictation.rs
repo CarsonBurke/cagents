@@ -748,10 +748,14 @@ impl Cagents {
                 };
                 // Where the camera is going, so that passing over the chat
                 // on the way elsewhere does not flash the strip away.
-                let start = workspace.camera().target();
-                let end = start + workspace.viewport_width();
-                let shown = geometry.end.min(end) - geometry.start.max(start);
-                shown < geometry.width() / 2.0
+                let viewport = workspace.viewport_width();
+                let start = workspace
+                    .camera()
+                    .target()
+                    .clamp(0.0, workspace.geometry().max_offset(viewport));
+                let shown = geometry.end.min(start + viewport) - geometry.start.max(start);
+                // A chat wider than the window counts as seen when it fills it.
+                shown < geometry.width().min(viewport) / 2.0
             })
     }
 
