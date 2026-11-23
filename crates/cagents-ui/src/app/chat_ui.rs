@@ -12156,6 +12156,9 @@ impl Cagents {
         // start was already returned to A behind its own write.
         let mut candidate = source.clone();
         candidate.id = TerminalId::new();
+        // The start names the chosen model and effort; the started chat's
+        // launch, which identity checks compare, keeps no draft choice.
+        candidate.launch.draft_model = None;
         let text = runtime.composer.text();
         let resolved_text = completion::invocations(
             completion::from_leading_skill(&text, &runtime.snapshot.skills),

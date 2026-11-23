@@ -336,9 +336,9 @@ pub struct Launch {
     /// applies only to the draft it was chosen in (see
     /// [`ChatDraftModel::applies_to`]) and never reaches the provider's
     /// process. Absent from an older record or peer, which kept the choice
-    /// with the window.
+    /// with the window, and from a started chat's launch. Boxed because it is
+    /// rarely present and every launch carries the slot.
     #[serde(default)]
-    /// Boxed because it is rarely present and every launch carries the slot.
     pub draft_model: Option<Box<crate::model::ChatDraftModel>>,
 }
 

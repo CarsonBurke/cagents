@@ -1805,6 +1805,7 @@ fn a_close_that_finds_a_process_starting_asks_to_try_again() {
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
         proof: None,
         terminal: None,

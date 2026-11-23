@@ -7542,6 +7542,7 @@ fn window_holding_a_channel_name() -> (Cagents, ChannelId, ModelUpdate) {
                 environment: Default::default(),
             },
             session_id: None,
+            draft_model: None,
         },
         proof: None,
         terminal: None,

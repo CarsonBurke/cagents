@@ -857,6 +857,51 @@ fn options_another_window_chose_during_the_first_save_leave_the_draft_sendable()
     assert_ne!(attempted.id, chosen.id);
 }
 
+/// A model and effort another window chose for the draft are what its first
+/// message starts on here, and the started chat carries no draft choice: it
+/// names its model in the start, and a launch's identity outlives the draft.
+#[test]
+fn a_model_another_window_chose_starts_the_draft_and_leaves_its_launch() {
+    let (mut app, _directory, card, target) = fixture();
+    let CardKind::Chat(chosen) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    chosen.launch.draft_model = Some(Box::new(crate::model::ChatDraftModel {
+        session: chosen.id,
+        provider: chosen.launch.provider,
+        model: Some("chosen-elsewhere".into()),
+        reasoning: Some("high".into()),
+    }));
+    let chosen = chosen.clone();
+    drop(app.adopt_shared_draft_session(card, &chosen));
+    assert_eq!(runtime(&app, card).session, chosen);
+
+    let task = app.start_chat_draft(target);
+    let pending = &app.chat_ui.draft_checkpoints[&card];
+    assert_eq!(
+        pending.model,
+        Some(("chosen-elsewhere".into(), Some("high".into())))
+    );
+    assert_eq!(pending.candidate.launch.draft_model, None);
+    let (target, attempt, result) = checkpoint(task);
+    assert!(result.is_ok());
+    drop(app.draft_start_checkpointed(target, attempt, result));
+    let attempted = app
+        .chat_ui
+        .attempt(card)
+        .expect("the draft starts")
+        .session
+        .clone();
+    assert_eq!(attempted.launch.draft_model, None);
+    assert_eq!(
+        chat::Launch {
+            draft_model: None,
+            ..chosen.launch.clone()
+        },
+        attempted.launch
+    );
+}
+
 #[test]
 fn edited_message_requires_a_new_save_before_starting() {
     let (mut app, _directory, card, target) = fixture();

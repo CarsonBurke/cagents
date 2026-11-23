@@ -16823,9 +16823,10 @@ fn a_peer_provider_switch_clears_this_windows_model_pick() {
 }
 
 /// Two windows show one draft: the model and effort either chooses is the
-/// draft's, so the other shows it and its first message would start on it.
+/// draft's, so the other shows it. Starting on it is
+/// `a_model_another_window_chose_starts_the_draft_and_leaves_its_launch`.
 #[test]
-fn a_model_chosen_in_one_window_is_shown_and_started_in_the_other() {
+fn a_model_chosen_in_one_window_is_shown_in_the_other() {
     let mut chooser = crate::app::tests::context_inspector_test_app(false);
     let card = reasoning_action_draft(&mut chooser, Provider::Claude);
     let target = chat_runtime(&chooser, card).target;
