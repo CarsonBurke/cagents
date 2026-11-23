@@ -1343,7 +1343,7 @@ impl Cagents {
 
     /// A manual name survives its conversation leaving, so only an automatic
     /// one needs giving back.
-    fn remember_channel_name(
+    pub(super) fn remember_channel_name(
         &mut self,
         id: ChannelId,
         title: String,

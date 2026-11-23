@@ -7368,6 +7368,25 @@ fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
             .find(|view| view.scope == scope),
         Some(&inserted)
     );
+    // An edge whose kind settles a lifecycle intent still reconciles when it
+    // is older than the snapshot and carries no row.
+    for (sequence, edit) in [
+        (21, ModelEdit::DeleteChannel { id: other }),
+        (
+            22,
+            ModelEdit::CloseProject {
+                repository: repository.join("elsewhere"),
+            },
+        ),
+    ] {
+        assert!(
+            reconciles(
+                &mut app,
+                changed_edge(identity, sequence, edit, EditEffects::default(), vec![]),
+            ),
+            "a stale lifecycle edge reconciles"
+        );
+    }
     // A newer view still reconciles.
     let removed = View {
         scope: scope.clone(),
@@ -7393,4 +7412,132 @@ fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
             vec![removed],
         ),
     ));
+}
+
+/// A window holding a name for `channel` until its pane arrives, which has
+/// reconciled the edge that brought the pane, and that edge to deliver again.
+fn window_holding_a_channel_name() -> (Cagents, ChannelId, ModelUpdate) {
+    use crate::workspace_model::{
+        delta::ViewRevision,
+        views::{Change, Pane, Scope, View},
+    };
+    let (mut app, project, repository) = app_with_project();
+    let channel = ChannelId::new();
+    let mut row = local(channel, project, "", 1);
+    row.shared = true;
+    row.cards = vec![app.durable.cards[0].id];
+    row.focused = row.cards.first().copied();
+    Arc::make_mut(&mut app.durable).channels.push(row);
+    Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+    app.workspace_model = registry(vec![shared(channel, &repository, "", 1)]);
+    app.workspace_model.views.push(View::empty(channel));
+    let identity = app.workspace_model.identity;
+    let scope = Scope::Channel(channel);
+    // The window's chat, whose pane header and window title take the
+    // channel's name.
+    let session = crate::chat::Session {
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        id: crate::model::TerminalId::new(),
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Omp,
+            recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: "/bin/sh".into(),
+                arguments: Vec::new(),
+                working_directory: PathBuf::from("/tmp"),
+                environment: Default::default(),
+            },
+            session_id: None,
+        },
+        proof: None,
+        terminal: None,
+    };
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards[0].title = session.launch.provider.chat_title().into();
+    durable.cards[0].kind = crate::model::CardKind::Chat(session);
+    let card = &durable.cards[0];
+    // Already shared, as the pane the edge carries.
+    app.shared_views.attached.insert(card.id);
+    let pane = Pane {
+        id: card.id,
+        title: card.title.clone(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        scope: None,
+        kind: card.kind.clone(),
+    };
+    let insert = changed_edge(
+        identity,
+        10,
+        ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: 0,
+            operation: uuid::Uuid::nil(),
+            change: Change::Insert {
+                pane: pane.clone(),
+                before: None,
+            },
+        },
+        EditEffects {
+            views: vec![ViewRevision {
+                scope: scope.clone(),
+                before: Some(0),
+                after: Some(5),
+            }],
+            ..Default::default()
+        },
+        vec![View {
+            scope,
+            revision: 5,
+            panes: vec![pane],
+            retired: vec![],
+        }],
+    );
+    assert!(reconciles(&mut app, insert.clone()));
+    app.remember_channel_name(
+        channel,
+        "Parser cache".into(),
+        crate::model::ChannelTitleSource::Provider,
+    );
+    (app, channel, insert)
+}
+
+fn channel_title(app: &Cagents, channel: ChannelId) -> Option<&str> {
+    app.durable
+        .channels
+        .iter()
+        .find(|held| held.id == channel)
+        .map(|held| held.title.as_str())
+}
+
+/// The naming stage a complete reconciliation ends with also runs for an edge
+/// that skips it: a name held until its channel's pane arrived is applied, and
+/// the edge declares the chrome projection the new name needs. Declaring none
+/// would leave the derived state stale, which the projection oracle reports.
+#[test]
+fn a_skipped_edge_applies_a_held_channel_name_and_projects_its_chrome() {
+    let (mut app, channel, echo) = window_holding_a_channel_name();
+    // Derived state current before the edge, so only what it leaves shows.
+    drop(app.project_workspace(false));
+    let before = complete_reconciliations();
+    let (_, projection) = app.apply_workspace_model_updates(vec![echo]);
+    assert_eq!(complete_reconciliations(), before, "the echo skips");
+    assert_eq!(channel_title(&app, channel), Some("Parser cache"));
+    assert_eq!(projection, Projection::Chrome);
+    let skipped = super::projection_oracle::Snapshot::capture(&app);
+    drop(app.project_workspace(false));
+    let projected = super::projection_oracle::Snapshot::capture(&app);
+    assert!(
+        !skipped.differences(&projected).is_empty(),
+        "the new name is stale until projected"
+    );
+    // Through an update, the projection oracle checks the chrome projection
+    // the edge declares.
+    let (mut app, channel, echo) = window_holding_a_channel_name();
+    let before = complete_reconciliations();
+    drop(app.update(Message::WorkspaceModelObserved(echo)));
+    assert_eq!(complete_reconciliations(), before, "the echo skips");
+    assert_eq!(channel_title(&app, channel), Some("Parser cache"));
 }

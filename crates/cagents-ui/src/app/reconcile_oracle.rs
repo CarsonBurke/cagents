@@ -3,12 +3,13 @@
 //!
 //! [`Cagents::apply_changed_edge`] skips
 //! [`Cagents::reconcile_workspace_model`], and the projection after it, for
-//! an edge that changed nothing it reads. That claims the window is already what the reconciliation makes it.
-//! In unit tests built with debug assertions, each such skip captures what the
-//! reconciliation writes, runs it, and fails on any difference, including any
-//! edit it would publish or task it would start. The reconciliation's result
-//! stays, as the projection oracle's does, so a test goes on from the state a
-//! correct skip leaves.
+//! an edge that changed nothing it reads. That claims the window is already
+//! what the reconciliation makes it. In unit tests built with debug
+//! assertions, each such skip captures what the reconciliation writes, runs
+//! it, and fails on any difference, including any edit it would publish or
+//! task it would start. The reconciliation's result stays, so a test goes on
+//! from the state a correct skip leaves. The projection the skip declares is
+//! the projection oracle's to check.
 
 use super::*;
 use crate::workspace_model::WorkspaceModel;
@@ -20,7 +21,8 @@ thread_local! {
 }
 
 /// Whether the check's own reconciliation is running, which the count of
-/// complete reconciliations leaves out.
+/// complete reconciliations leaves out, and which leaves out the naming stage
+/// that the skipped edge runs itself.
 pub(super) fn verifying() -> bool {
     VERIFYING.get()
 }
@@ -63,22 +65,19 @@ impl Snapshot {
     }
 }
 
-/// Fails unless a complete reconciliation and the projection after it change
-/// nothing that the skipped edge, `kind`, and its update's projection leave.
+/// Fails unless a complete reconciliation, apart from its naming stage,
+/// changes nothing that the skipped edge, `kind`, leaves. Neither capture projects: whether the projection the
+/// skip declares leaves the derived state current is the projection oracle's
+/// check when the update ends, which projecting here would repair first.
 pub(super) fn check_skipped(app: &mut Cagents, kind: &str) {
     if !super::projection_oracle::enabled() {
         return;
     }
-    // Settle what earlier updates in the same message owe the projection,
-    // so only the reconciliation's own work shows. That the skip itself owes
-    // none is the projection oracle's check.
     VERIFYING.set(true);
-    drop(app.project_workspace(false));
     let skipped = Snapshot::capture(app);
     // Work the reconciliation would start without changing state, such as
     // loading a repository, shows only as its task.
     let started = app.reconcile_workspace_model().units();
-    drop(app.project_workspace(false));
     VERIFYING.set(false);
     let reconciled = Snapshot::capture(app);
     if skipped != reconciled || started != 0 {

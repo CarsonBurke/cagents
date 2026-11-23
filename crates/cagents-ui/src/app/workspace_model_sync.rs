@@ -1378,6 +1378,14 @@ impl Cagents {
                 tracing::trace!(target: "cagents::workspace_projection", selected = false, reason, "Projecting shared model")
             }
         }
+        if let ModelUpdate::Changed {
+            sequence,
+            edit,
+            changes,
+        } = update
+        {
+            return self.apply_changed_edge(sequence, &edit, changes);
+        }
         let (task, changed) = self.apply_workspace_model_update_full_effect(update);
         (
             task,
@@ -1681,14 +1689,6 @@ impl Cagents {
         // The observer repeats this on every reconnection attempt.
         if matches!(update, ModelUpdate::Unavailable(_)) && self.shared_views.registry_unavailable {
             return (Task::none(), false);
-        }
-        if let ModelUpdate::Changed {
-            sequence,
-            edit,
-            changes,
-        } = update
-        {
-            return self.apply_changed_edge(sequence, &edit, changes);
         }
         (self.apply_workspace_model_update_inner(update), true)
     }
@@ -1997,11 +1997,9 @@ impl Cagents {
                 self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => self.apply_model_edge(sequence, edit),
-            ModelUpdate::Changed {
-                sequence,
-                edit,
-                changes,
-            } => self.apply_changed_edge(sequence, &edit, changes).0,
+            ModelUpdate::Changed { .. } => {
+                unreachable!("a changed edge is applied with its own projection")
+            }
             ModelUpdate::Ranked { channel, model } => {
                 // The publisher and observer use separate connections. Keep the
                 // complete response: a rank alone cannot fence an older observer
@@ -2158,16 +2156,16 @@ impl Cagents {
     /// uses the same installation before acknowledging its pending operation,
     /// then performs its one projection after that overlay has been removed.
     ///
-    /// Also returns whether anything is left to project: an edge that changed
-    /// nothing leaves the window as the last reconciliation and projection
-    /// made it, so it skips both, unless the window holds work only a
-    /// complete reconciliation finishes.
+    /// Also returns what is left to project: an edge that changed nothing
+    /// leaves the window as the last reconciliation and projection made it,
+    /// so it skips both, unless the window holds work only a complete
+    /// reconciliation finishes.
     fn apply_changed_edge(
         &mut self,
         sequence: u64,
         edit: &ModelEdit,
         changes: EdgeChanges,
-    ) -> (Task<Message>, bool) {
+    ) -> (Task<Message>, Projection) {
         let title = channel_title_only(edit, &changes.effects, &changes.views);
         let mut phase = WorkspaceProjectionTiming::new(true);
         let Some(Installed {
@@ -2175,7 +2173,7 @@ impl Cagents {
             changed,
         }) = self.install_edge(sequence, edit, changes)
         else {
-            return (Task::none(), false);
+            return (Task::none(), Projection::Unchanged);
         };
         phase.mark("edge_install");
         if !changed {
@@ -2188,30 +2186,47 @@ impl Cagents {
                 }
                 None => {
                     tracing::trace!(target: "cagents::workspace_projection", selected = true, "Skipped an edge that changed nothing");
-                    // A runtime attached since the last reconciliation can
-                    // make a channel name suggestion, which that
-                    // reconciliation's naming stage would have sampled.
-                    let naming = self.refresh_channel_naming();
                     // In a run that already owes a reconciliation, the window
-                    // is not yet reconciled to compare against.
+                    // is not yet reconciled to compare against. The check
+                    // leaves out the naming stage, which runs next either way.
                     #[cfg(test)]
                     if !self.observed_run.is_some_and(|owed| owed.reconcile) {
                         super::reconcile_oracle::check_skipped(self, edit_kind(edit));
                     }
-                    return (Task::batch([installed, naming]), false);
+                    // A runtime attached since the last reconciliation can
+                    // make a channel name suggestion, which that
+                    // reconciliation's naming stage would have sampled. A
+                    // name it writes reaches the pane headers and the window
+                    // title, as a presentation edge's does.
+                    let naming_source = Arc::downgrade(&self.durable);
+                    let naming = self.refresh_channel_naming();
+                    let projection = if naming_source.as_ptr() == Arc::as_ptr(&self.durable) {
+                        Projection::Unchanged
+                    } else {
+                        Projection::Chrome
+                    };
+                    return (Task::batch([installed, naming]), projection);
                 }
             }
         }
         if let Some(id) = title
             && let Some(title) = self.absorb_channel_title(id)
         {
-            return (Task::batch([installed, title]), true);
+            return (Task::batch([installed, title]), Projection::Full);
         }
-        (Task::batch([installed, self.reconcile_after_edge()]), true)
+        (
+            Task::batch([installed, self.reconcile_after_edge()]),
+            Projection::Full,
+        )
     }
 
     /// Work this window holds that only a complete reconciliation finishes,
     /// so an edge must not skip it even when the edge changed nothing.
+    ///
+    /// Some of it can stay held for a long time, such as a deletion whose
+    /// registry request failed or a local conversation still waiting to
+    /// publish; every edge until it settles then reconciles, as before edges
+    /// could skip, and the trace gives the reason.
     fn reconciliation_owed(&self) -> Option<&'static str> {
         if !self.pending_repository_reconciliation.is_empty() {
             Some("a repository reconciliation is deferred")
@@ -2703,11 +2718,6 @@ impl Cagents {
         if self.workspace_model.identity == NO_REGISTRY {
             return Task::none();
         }
-        if repositories.is_none() {
-            // Which worktree a card belongs to reads these roots, so a
-            // change to them owes the next edge a reconciliation.
-            self.shared_views.reconciled_roots = self.worktree_roots_digest();
-        }
         // Only a complete pass is timed: it is the one every structural edge
         // pays, and its stages split the reconciliation's own walks from the
         // shared views' projection.
@@ -2885,8 +2895,22 @@ impl Cagents {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
         }
-        tasks.push(self.refresh_channel_naming());
+        // The reconcile oracle compares everything before this stage, which a
+        // skipped edge runs as well.
+        #[cfg(test)]
+        let naming = !super::reconcile_oracle::verifying();
+        #[cfg(not(test))]
+        let naming = true;
+        if naming {
+            tasks.push(self.refresh_channel_naming());
+        }
         phase.mark("reconcile_naming");
+        if repositories.is_none() {
+            // Which worktree a card belongs to reads these roots, so a change
+            // to them owes the next edge a reconciliation. Read after the
+            // pass, which can adopt projects and their worktrees.
+            self.shared_views.reconciled_roots = self.worktree_roots_digest();
+        }
         Task::batch(tasks)
     }
 
