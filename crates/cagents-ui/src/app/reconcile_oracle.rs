@@ -66,9 +66,10 @@ impl Snapshot {
 }
 
 /// Fails unless a complete reconciliation, apart from its naming stage,
-/// changes nothing that the skipped edge, `kind`, leaves. Neither capture projects: whether the projection the
-/// skip declares leaves the derived state current is the projection oracle's
-/// check when the update ends, which projecting here would repair first.
+/// changes nothing that the skipped edge, `kind`, leaves. Neither capture
+/// projects: whether the projection the skip declares leaves the derived state
+/// current is the projection oracle's check when the update ends, which
+/// projecting here would repair first.
 pub(super) fn check_skipped(app: &mut Cagents, kind: &str) {
     if !super::projection_oracle::enabled() {
         return;
