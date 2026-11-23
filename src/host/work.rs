@@ -2594,9 +2594,9 @@ mod tests {
             session.clone(),
             nearly_due.clone(),
         ]
-            .into_iter()
-            .chain(quiet)
-            .collect();
+        .into_iter()
+        .chain(quiet)
+        .collect();
         track_polled(&mut shared, worktrees, at(94));
         let tracked = &shared.projects[Path::new("/repo")];
 
