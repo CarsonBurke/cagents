@@ -35,12 +35,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The longest the courier sleeps while it has a deadline (a held reply, a
-/// usage limit reset) or something to retry (a failed pass, or a message or
-/// queued run that failed to start). Activity edges wake it sooner. The cap
-/// keeps a far deadline honest across a suspend, which the monotonic wait
-/// does not count. A courier with none of these waits for an edge alone,
-/// apart from the hourly prune.
+/// The longest the courier sleeps while anything is outstanding: a pending
+/// message, a usage limit, a queued run that failed to start, or a failed
+/// pass. Edges wake it sooner; this covers the changes no edge reports (a
+/// terminal's provider detected, a limit lifted by another process's usage
+/// reading, a handoff failure only logged) and keeps a far deadline honest
+/// across a suspend, which the monotonic wait does not count. With nothing
+/// outstanding the courier sleeps until an edge or the hourly prune.
 const FALLBACK: Duration = Duration::from_secs(15);
 /// How often the courier forgets messages past their retention.
 const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -871,6 +872,21 @@ impl Drop for Courier {
     }
 }
 
+/// How long the courier sleeps after a pass: until the deadline the pass
+/// reported, clamped to keep it off a spin and honest across a suspend, or
+/// the fallback after a failed pass; at most until the next prune.
+fn courier_wait(pass: &Result<Option<u64>, String>, now_ms: u64, prune_in: Duration) -> Duration {
+    let delivery = match pass {
+        Ok(Some(due_ms)) => Some(
+            Duration::from_millis(due_ms.saturating_sub(now_ms))
+                .clamp(Duration::from_millis(50), FALLBACK),
+        ),
+        Ok(None) => None,
+        Err(_) => Some(FALLBACK),
+    };
+    delivery.map_or(prune_in, |delay| delay.min(prune_in))
+}
+
 impl Handle {
     fn run(&self) {
         self.run_with(|| self.prune(), |host| self.deliver(host));
@@ -899,21 +915,14 @@ impl Handle {
             let Some(host) = self.0.host.upgrade() else {
                 return;
             };
-            let delivery_delay =
-                match crate::host::service::attempt("message delivery", || deliver(&host)) {
-                    Ok(Some(released)) => Some(
-                        Duration::from_millis(released.saturating_sub(super::now()))
-                            .clamp(Duration::from_millis(50), FALLBACK),
-                    ),
-                    Ok(None) => None,
-                    Err(error) => {
-                        tracing::warn!(%error, "cannot deliver messages");
-                        Some(FALLBACK)
-                    }
-                };
-            let prune_delay =
-                pruned_at.map(|at| (at + PRUNE_EVERY).saturating_duration_since(Instant::now()));
-            let delay = [delivery_delay, prune_delay].into_iter().flatten().min();
+            let pass = crate::host::service::attempt("message delivery", || deliver(&host));
+            if let Err(error) = &pass {
+                tracing::warn!(%error, "cannot deliver messages");
+            }
+            let prune_in = pruned_at.map_or(PRUNE_EVERY, |at| {
+                (at + PRUNE_EVERY).saturating_duration_since(Instant::now())
+            });
+            let delay = courier_wait(&pass, super::now(), prune_in);
             drop(host);
             #[cfg(test)]
             {
@@ -925,24 +934,13 @@ impl Handle {
                 self.0.scanned.notify_all();
             }
             let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-            let state = match delay {
-                Some(delay) => {
-                    self.0
-                        .changed
-                        .wait_timeout_while(state, delay, |state| {
-                            !state.stopped && state.generation == observed
-                        })
-                        .unwrap_or_else(|p| p.into_inner())
-                        .0
-                }
-                None => self
-                    .0
-                    .changed
-                    .wait_while(state, |state| {
-                        !state.stopped && state.generation == observed
-                    })
-                    .unwrap_or_else(|p| p.into_inner()),
-            };
+            let (state, _) = self
+                .0
+                .changed
+                .wait_timeout_while(state, delay, |state| {
+                    !state.stopped && state.generation == observed
+                })
+                .unwrap_or_else(|p| p.into_inner());
             if state.stopped {
                 return;
             }
@@ -1045,8 +1043,9 @@ impl Handle {
 
     /// Gives each lineage with a live, idle conversation its oldest waiting
     /// message. Returns when the courier must look again: when the next held
-    /// reply is released or a known usage limit resets, or soon to retry a
-    /// message or queued run that failed; `None` when nothing is due.
+    /// reply is released or a known usage limit resets, and soon while a
+    /// message is pending, a conversation is limited or a queued run failed
+    /// to start; `None` when nothing is outstanding.
     fn deliver(&self, host: &SharedHost) -> Result<Option<u64>, String> {
         let limits = self.publish_limits(host, super::now());
         let reset = limits
@@ -1056,10 +1055,10 @@ impl Handle {
             .map(|at| (at as u64).saturating_mul(1000))
             .min();
         let queued_failed = self.start_queued(host);
-        let (released, message_failed) = self.deliver_messages(host, &limits)?;
-        let retry = (queued_failed || message_failed)
+        let (released, pending) = self.deliver_messages(host, &limits)?;
+        let outstanding = (queued_failed || pending || !limits.is_empty())
             .then(|| super::now().saturating_add(FALLBACK.as_millis() as u64));
-        Ok([released, reset, retry].into_iter().flatten().min())
+        Ok([released, reset, outstanding].into_iter().flatten().min())
     }
 
     /// Starts the prompts agents hold behind work that has since ended.
@@ -1071,8 +1070,8 @@ impl Handle {
         })
     }
 
-    /// Returns when the next held reply is released, and whether handing a
-    /// message to its agent failed in a way only logged, to be retried.
+    /// Returns when the next held reply is released, and whether any message
+    /// is still pending for a recipient.
     fn deliver_messages(
         &self,
         host: &SharedHost,
@@ -1087,6 +1086,7 @@ impl Handle {
             let lineages = registry.session_lineages(live.iter().map(|entry| entry.id))?;
             (pending, released, heads, pending_lineages, lineages)
         };
+        let outstanding = !pending_lineages.is_empty();
         let notifications = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1104,7 +1104,7 @@ impl Handle {
             notifications.reconcile_inboxes(pending_lineages, events);
         }
         if pending.is_empty() {
-            return Ok((released, false));
+            return Ok((released, outstanding));
         }
         let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1121,7 +1121,6 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .session_lineages(chats.iter().map(|(id, _, _)| *id))?;
-        let mut failed = false;
         for message in pending {
             let Some(recipient) = message.to.lineage else {
                 continue;
@@ -1136,11 +1135,11 @@ impl Handle {
                     host, &message, recipient, limited, &chats, &lineages, limits,
                 )
             }) else {
-                return Ok((released, failed));
+                return Ok((released, outstanding));
             };
-            failed |= delivered?;
+            delivered?;
         }
-        Ok((released, failed))
+        Ok((released, outstanding))
     }
 
     /// Gives one pending message to its recipient: as a run of the agent
@@ -1155,7 +1154,7 @@ impl Handle {
         chats: &[(TerminalId, crate::agent::Provider, chat::runtime::Handle)],
         lineages: &BTreeMap<TerminalId, crate::agent_execution::Lineage>,
         limits: &BTreeMap<TerminalId, UsageLimit>,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         {
             match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
                 // Its run has it, or it waits its turn to become one.
@@ -1164,15 +1163,15 @@ impl Handle {
                     | Handoff::Waiting { .. }
                     | Handoff::Behind { .. }
                     | Handoff::NoSlot { .. },
-                )) => return Ok(false),
+                )) => return Ok(()),
                 Ok(Some(Handoff::Ended { reason, run, .. })) => {
                     tracing::info!(%reason, %run, message = %message.id, "a message's run ended");
-                    return Ok(false);
+                    return Ok(());
                 }
                 // Its run has it, perhaps already with the provider.
                 Ok(Some(Handoff::Unknown { reason, run, .. })) => {
                     tracing::warn!(%reason, %run, message = %message.id, "a message's run ended without proof of delivery");
-                    return Ok(false);
+                    return Ok(());
                 }
                 // Not as a run, but as a message, as a person's conversation
                 // takes one.
@@ -1182,16 +1181,16 @@ impl Handle {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, message = %message.id, "cannot hand a message to its agent");
-                    return Ok(true);
+                    return Ok(());
                 }
             }
         }
         let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
             lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
         }) else {
-            return Ok(false);
+            return Ok(());
         };
-        self.hand_over(message, *session, handle).map(|()| false)
+        self.hand_over(message, *session, handle)
     }
 
     /// Claims the message for `session` before prompting, so that an inbox
@@ -1586,6 +1585,32 @@ mod tests {
         });
         assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn an_idle_courier_sleeps_until_the_prune_and_a_busy_one_rechecks_soon() {
+        let prune_in = Duration::from_secs(1800);
+        let now = 1_000_000;
+        assert_eq!(courier_wait(&Ok(None), now, prune_in), prune_in);
+        assert_eq!(courier_wait(&Err("no".into()), now, prune_in), FALLBACK);
+        assert_eq!(
+            courier_wait(&Ok(Some(now - 5)), now, prune_in),
+            Duration::from_millis(50),
+            "a past deadline must not spin"
+        );
+        assert_eq!(
+            courier_wait(&Ok(Some(now + 3_000)), now, prune_in),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            courier_wait(&Ok(Some(now + 3_600_000)), now, prune_in),
+            FALLBACK,
+            "a far deadline is rechecked, as a suspend stops the monotonic wait"
+        );
+        assert_eq!(
+            courier_wait(&Ok(None), now, Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
