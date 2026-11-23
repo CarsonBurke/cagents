@@ -8675,6 +8675,12 @@ fn a_kept_closed_pane_does_not_keep_its_conversation_from_reopening() {
             "{case:?}: the closed pane goes"
         );
         assert!(
+            !app.recently_closed
+                .iter()
+                .any(|(closed, _)| closed.id == pane.id),
+            "{case:?}: nor is it listed to reopen while its conversation is open"
+        );
+        assert!(
             app.card_state(reopened)
                 .is_some_and(|state| state.existence.is_open())
         );
@@ -8990,16 +8996,10 @@ fn a_kept_closed_pane_its_view_fences_goes_when_its_stop_is_refused() {
                 Err("the provider did not exit".into()),
             ))),
         );
-        if app
-            .card_state(pane.id)
-            .is_some_and(|state| state.existence.is_open())
-        {
-            drop(app.update(Message::CommitClose(pane.id)));
-        }
         assert!(
             !app.card_state(pane.id)
                 .is_some_and(|state| state.existence.is_open()),
-            "reopen={reopen}: the fenced pane goes"
+            "reopen={reopen}: the fenced pane goes at once, with nothing left to commit"
         );
         assert!(
             app.shared_views.fenced_closes.contains(&pane.id),

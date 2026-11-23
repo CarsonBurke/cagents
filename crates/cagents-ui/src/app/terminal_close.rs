@@ -955,10 +955,15 @@ impl Cagents {
         };
         // Nothing of a terminal proven gone is left to bring back. Reopening
         // could only run its saved command again, unasked. Nor of a pane
-        // that gave way to another holding its conversation.
-        if let Some(card) = closed_descriptor
-            .filter(|_| !self.proven_gone_cards.remove(&id) && !self.reopen_superseded(id))
-        {
+        // that gave way to another holding its conversation, or that goes
+        // while another holds it, as a closed pane a shared view put back
+        // does once its conversation has reopened.
+        if let Some(card) = closed_descriptor.filter(|card| {
+            !self.proven_gone_cards.remove(&id)
+                && !self.reopen_superseded(id)
+                && !matches!(&card.kind, CardKind::Chat(session)
+                    if self.existing_conversation_card(session, Some(id)).is_some())
+        }) {
             // A pane closed again holding the same conversation, as one a
             // shared view put back is, is listed once, where it closed last.
             let again = |closed: &CardState| {
