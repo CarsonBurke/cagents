@@ -2662,11 +2662,18 @@ impl State {
                                 selected.definition.agent.target.directory.display()
                             )))
                             .push(
-                                crate::ui_controls::button::quiet(if open {
-                                    "Hide instructions and launch settings"
-                                } else {
-                                    "Show instructions and launch settings"
-                                })
+                                crate::ui_controls::button::quiet(
+                                    "Show instructions and launch settings",
+                                )
+                                .instead("Hide instructions and launch settings", open)
+                                .icon(
+                                    if open {
+                                        crate::ui_controls::Icon::ChevronDown
+                                    } else {
+                                        crate::ui_controls::Icon::ChevronRight
+                                    }
+                                    .handle(),
+                                )
                                 .on_press(Action::ToggleLaunchSettings),
                             );
                         if open {
