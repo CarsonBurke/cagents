@@ -29,6 +29,7 @@ use crate::{
 struct WakeState {
     generation: u64,
     stopped: bool,
+    history_retry: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -43,12 +44,20 @@ impl Wake {
         state.generation = state.generation.wrapping_add(1);
         self.changed.notify_all();
     }
-    fn wait(&self, observed: u64, timeout: Duration) -> bool {
+    fn wait(&self, observed: u64, timeout: Option<Duration>) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let (state, _) = self
-            .changed
-            .wait_timeout_while(state, timeout, |s| !s.stopped && s.generation == observed)
-            .unwrap_or_else(|p| p.into_inner());
+        let state = match timeout {
+            Some(timeout) => {
+                self.changed
+                    .wait_timeout_while(state, timeout, |s| !s.stopped && s.generation == observed)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            }
+            None => self
+                .changed
+                .wait_while(state, |s| !s.stopped && s.generation == observed)
+                .unwrap_or_else(|p| p.into_inner()),
+        };
         !state.stopped
     }
 }
@@ -94,6 +103,10 @@ pub(in crate::host) struct Broker {
     handle: Handle,
     thread: Option<JoinHandle<()>>,
 }
+
+/// How often the scheduler rechecks while it holds an active firing or a
+/// precheck worker, whose retries no other event announces.
+const OWNED_WORK_RECHECK: Duration = Duration::from_secs(60);
 
 fn warn_history_maintenance(error: &str) {
     let diagnostic: String = error
@@ -408,54 +421,10 @@ impl Handle {
     }
 
     fn run(&self) {
-        let mut maintained = Instant::now();
-        self.run_with(|host| self.tick_with_history_maintenance(host, &mut maintained));
+        self.run_with(|host| self.tick(host));
     }
 
-    fn tick_with_history_maintenance(
-        &self,
-        host: &SharedHost,
-        maintained: &mut Instant,
-    ) -> Result<Duration, String> {
-        if maintained.elapsed() >= Duration::from_secs(60) {
-            match self.maintain_history_under_control(host) {
-                Ok(false) => {} // No attempt while the control writer owns admission.
-                result => {
-                    // Failure is an attempted pass too. Preserve the finite
-                    // retry interval instead of warning on every fast tick.
-                    *maintained = Instant::now();
-                    if let Err(error) = result {
-                        warn_history_maintenance(&error);
-                    }
-                }
-            }
-        }
-        // Optional maintenance cannot gate either transfer or actual work.
-        // Errors from those real-work paths retain their existing handling.
-        self.tick(host)
-    }
-
-    fn maintain_history_under_control(&self, host: &SharedHost) -> Result<bool, String> {
-        let control = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .control_gate
-            .clone();
-        let Some(_control) = control.try_shared() else {
-            return Ok(false);
-        };
-        if crate::host::client::ensure_control_open(host).is_err() {
-            return Ok(false);
-        }
-        self.0
-            .registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .maintain_removed_automation_history(service::now()?)?;
-        Ok(true)
-    }
-
-    fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Duration, String>) {
+    fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Option<Duration>, String>) {
         loop {
             let observed = {
                 let state = self.0.wake.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -472,7 +441,7 @@ impl Handle {
                 Ok(delay) => delay,
                 Err(error) => {
                     tracing::warn!(%error, "automation scheduling is temporarily unavailable");
-                    Duration::from_secs(5)
+                    Some(Duration::from_secs(5))
                 }
             };
             drop(host);
@@ -505,26 +474,47 @@ impl Handle {
         }
     }
 
-    fn tick(&self, host: &SharedHost) -> Result<Duration, String> {
+    fn history_retry_remaining(&self) -> Option<Duration> {
+        let mut state = self.0.wake.state.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let retry = state.history_retry?;
+        if retry <= now {
+            state.history_retry = None;
+            None
+        } else {
+            Some(retry.duration_since(now))
+        }
+    }
+
+    fn defer_history_maintenance(&self) {
+        self.0
+            .wake
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .history_retry = Some(Instant::now() + Duration::from_secs(60));
+    }
+
+    fn tick(&self, host: &SharedHost) -> Result<Option<Duration>, String> {
         let attention_delay = self.transfer_attention(host);
         // Receipt polling must remain possible while shutdown owns control.
         // Neither the HostState guard nor the control gate reaches advance().
         let notification_delay = self.advance_notifications(host);
-        self.tick_under_control(host).map(|delay| {
-            let delay = delay.min(notification_delay);
-            attention_delay.map_or(delay, |attention| delay.min(attention))
+        self.tick_under_control(host).map(|scheduler_delay| {
+            [attention_delay, notification_delay, scheduler_delay]
+                .into_iter()
+                .flatten()
+                .min()
         })
     }
 
-    fn advance_notifications(&self, host: &SharedHost) -> Duration {
+    fn advance_notifications(&self, host: &SharedHost) -> Option<Duration> {
         let notifications = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .notifications
             .clone();
-        let Some(notifications) = notifications else {
-            return notifications::RETRY;
-        };
+        let notifications = notifications?;
         match self
             .0
             .notifications
@@ -535,12 +525,12 @@ impl Handle {
             Ok(delay) => delay,
             Err(error) => {
                 tracing::warn!(%error, "automation attention transfer is temporarily unavailable");
-                notifications::RETRY
+                Some(notifications::RETRY)
             }
         }
     }
 
-    fn tick_under_control(&self, host: &SharedHost) -> Result<Duration, String> {
+    fn tick_under_control(&self, host: &SharedHost) -> Result<Option<Duration>, String> {
         let control = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -550,12 +540,30 @@ impl Handle {
         // not just the eventual process spawn. Never wait behind shutdown's
         // writer: it may be joining this coordinator while dropping Broker.
         let Some(_control) = control.try_shared() else {
-            return Ok(Duration::from_millis(250));
+            return Ok(Some(Duration::from_millis(250)));
         };
         if crate::host::client::ensure_control_open(host).is_err() {
-            return Ok(Duration::from_millis(250));
+            return Ok(Some(Duration::from_millis(250)));
         }
         let now = service::now()?;
+        // Optional history maintenance never gates the real work below: a
+        // failure is logged and retried after a finite backoff.
+        if self.history_retry_remaining().is_none() {
+            let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            let maintained = registry
+                .next_removed_automation_history_deadline()
+                .and_then(|deadline| match deadline {
+                    Some(deadline) if deadline <= now => {
+                        registry.maintain_removed_automation_history(now)
+                    }
+                    _ => Ok(()),
+                });
+            drop(registry);
+            if let Err(error) = maintained {
+                self.defer_history_maintenance();
+                warn_history_maintenance(&error);
+            }
+        }
         let active = self
             .0
             .registry
@@ -563,6 +571,11 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .active_automation_firings()?;
         let owners: std::collections::BTreeSet<_> = active.iter().map(|firing| firing.id).collect();
+        // Broker-owned work retries some steps on the ordinary cadence, such
+        // as releasing a run whose provider is still busy or retiring a
+        // precheck whose child has not been reaped, and nothing else wakes
+        // the scheduler for those. While any is held, keep that cadence.
+        let mut owns_work = !active.is_empty();
         let mut checking = false;
         let candidates = self
             .0
@@ -669,27 +682,60 @@ impl Handle {
                     )?;
             }
         }
-        let next = self
+        let (automation_deadline, history_deadline) = {
+            let registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                registry.next_automation_deadline()?,
+                registry.next_removed_automation_history_deadline(),
+            )
+        };
+        // A real calendar schedule is rechecked at least once a minute, so a
+        // wall-clock change or a suspend is noticed. With nothing scheduled
+        // there is no clock wake at all.
+        let automation_delay = automation_deadline.map(|due| {
+            Duration::from_millis(due.saturating_sub(now).max(50)).min(Duration::from_secs(60))
+        });
+        let history_delay = match history_deadline {
+            Ok(None) => None,
+            Ok(Some(deadline)) if deadline > now => {
+                Some(Duration::from_millis((deadline - now).max(50)))
+            }
+            // Due: wait out a failed attempt's backoff, or continue a
+            // bounded batch that left eligible history behind.
+            Ok(Some(_)) => Some(
+                self.history_retry_remaining()
+                    .unwrap_or(Duration::from_millis(50)),
+            ),
+            // A failure already backing off was reported when it began.
+            Err(error) => self.history_retry_remaining().or_else(|| {
+                self.defer_history_maintenance();
+                warn_history_maintenance(&error);
+                self.history_retry_remaining()
+            }),
+        };
+        owns_work |= !self
             .0
-            .registry
+            .workers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .next_automation_deadline()?;
-        let delay = next.map_or(Duration::from_secs(60), |due| {
-            Duration::from_millis(due.saturating_sub(now).max(50))
-        });
-        // Wall-clock changes are noticed at least once a minute. Precheck
-        // observation and outstanding journal receipts shorten the next wake.
-        let delay = delay.min(if checking {
-            Duration::from_millis(250)
+            .is_empty();
+        let owned_delay = owns_work.then_some(OWNED_WORK_RECHECK);
+        let delay = [automation_delay, history_delay, owned_delay]
+            .into_iter()
+            .flatten()
+            .min();
+        let delay = if checking {
+            Some(delay.map_or(Duration::from_millis(250), |delay| {
+                delay.min(Duration::from_millis(250))
+            }))
         } else {
-            Duration::from_secs(60)
-        });
+            delay
+        };
         drop(_control);
         // Reconciliation above may have committed a new source edge. Transfer
         // it before sleeping, outside the execution-admission guard as well.
         let attention_delay = self.transfer_attention(host);
-        Ok(attention_delay.map_or(delay, |attention| delay.min(attention)))
+        Ok([attention_delay, delay].into_iter().flatten().min())
     }
 
     fn release_run(&self, host: &SharedHost, firing: &Firing, now: u64) -> Result<bool, String> {
@@ -1980,11 +2026,80 @@ mod tests {
                 let _guard = host.lock().unwrap();
                 handle.0.wake.state.lock().unwrap().stopped = true;
                 reported.send(ticks).unwrap();
-                Ok(Duration::ZERO)
+                Ok(Some(Duration::ZERO))
             });
         });
         assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn empty_scheduler_waits_for_an_event_instead_of_a_fixed_tick() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = crate::host::service::test_host();
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            )),
+            root: directory.path().into(),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            launching: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        let wake = handle.clone();
+        let (reported, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut ticks = 0;
+            handle.run_with(|_| {
+                ticks += 1;
+                reported.send(ticks).unwrap();
+                if ticks == 2 {
+                    handle.0.wake.state.lock().unwrap().stopped = true;
+                }
+                Ok(None)
+            });
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        assert!(
+            received.recv_timeout(Duration::from_millis(100)).is_err(),
+            "an empty scheduler must not create a periodic wake"
+        );
+        wake.wake();
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_tick_with_nothing_scheduled_or_owned_sets_no_deadline() {
+        use crate::{
+            host::model::Registry,
+            model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("test"),
+                boot_id: BootId::new("test"),
+                host_incarnation: HostIncarnation::new("test"),
+            },
+        )));
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(registry)),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            launching: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        assert_eq!(handle.tick(&host).unwrap(), None);
     }
 
     #[test]
@@ -2053,7 +2168,10 @@ mod tests {
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.exclusive();
-        assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
+        assert_eq!(
+            handle.tick(&host).unwrap(),
+            Some(Duration::from_millis(250))
+        );
         assert_eq!(
             registry
                 .lock()
@@ -2274,9 +2392,12 @@ mod tests {
         }));
         let control = host.lock().unwrap().control_gate.clone();
         let exclusive = control.exclusive();
-        assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
+        assert_eq!(
+            handle.tick(&host).unwrap(),
+            Some(Duration::from_millis(250))
+        );
         drop(exclusive);
-        let delay = handle.tick(&host).unwrap();
+        let delay = handle.tick(&host).unwrap().unwrap();
         assert!(delay > Duration::ZERO && delay <= notifications::RETRY);
         assert_eq!(
             registry

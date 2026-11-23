@@ -46,6 +46,10 @@ fn precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_o
     registry
         .remove_automation(automation.id, automation.revision, 5)
         .unwrap();
+    assert_eq!(
+        registry.next_removed_automation_history_deadline().unwrap(),
+        Some(5 + history::REMOVED_TTL_MS)
+    );
     registry
         .maintain_removed_automation_history(6 + history::REMOVED_TTL_MS)
         .unwrap();

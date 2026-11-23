@@ -587,12 +587,9 @@ fn history_delete_failure_rolls_back_but_startup_and_tick_keep_both_outboxes_liv
             attention: Mutex::default(),
             notifications: Mutex::default(),
         }));
-        let mut maintained = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
-        handle
-            .tick_with_history_maintenance(&host, &mut maintained)
-            .unwrap();
+        handle.tick(&host).unwrap();
         assert!(
-            maintained.elapsed() < Duration::from_secs(60),
+            handle.history_retry_remaining().is_some(),
             "failed attempt retains finite backoff"
         );
         assert_eq!(fences(), 0);
@@ -657,11 +654,8 @@ fn history_delete_failure_rolls_back_but_startup_and_tick_keep_both_outboxes_liv
             .set_automation_history_prune_failure_for_test(None)
             .unwrap();
         // Removing the fault does not bypass the maintenance retry interval.
-        let attempted = maintained;
-        handle
-            .tick_with_history_maintenance(&host, &mut maintained)
-            .unwrap();
-        assert_eq!(maintained, attempted);
+        handle.tick(&host).unwrap();
+        assert!(handle.history_retry_remaining().is_some());
         assert_eq!(fences(), 0);
         for _ in 0..4 {
             for _ in 0..8 {
@@ -674,9 +668,7 @@ fn history_delete_failure_rolls_back_but_startup_and_tick_keep_both_outboxes_liv
                 journal.pending_events().is_empty(),
                 "bounded fixture journal drain"
             );
-            handle
-                .tick_with_history_maintenance(&host, &mut maintained)
-                .unwrap();
+            handle.tick(&host).unwrap();
         }
         assert!(pending_run().is_empty());
         assert!(
