@@ -61,13 +61,18 @@ fn handshake_through_trickle(
 
 #[test]
 fn default_handshake_deadline_bounds_a_progressing_partial_connected_frame() {
-    // This parent exercises the real local default, without changing device
-    // selection or the production five-second budget.
+    // This exercises the real local default path, without changing device
+    // selection. The ordinary budget is lowered so that waiting it out is
+    // cheap; each byte still arrives well within it.
     assert!(!crate::device::is_remote());
-    match handshake_through_trickle(Duration::from_secs(3), ControlClient::from_stream) {
-        Err(ControlError::ReplyTimeout { timeout, .. }) => assert!(timeout <= IO_TIMEOUT),
+    let budget = ordinary_budget::QUICK;
+    match handshake_through_trickle(budget * 3 / 5, move |stream| {
+        let _budget = ordinary_budget::scope(budget);
+        ControlClient::from_stream(stream)
+    }) {
+        Err(ControlError::ReplyTimeout { timeout, .. }) => assert!(timeout <= budget),
         Ok(()) => panic!(
-            "default handshake must reject a progressing Connected frame after its original five-second budget"
+            "default handshake must reject a progressing Connected frame after its original budget"
         ),
         Err(error) => panic!("expected the default handshake deadline, got {error}"),
     }

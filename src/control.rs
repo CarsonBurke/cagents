@@ -93,7 +93,54 @@ use crate::{
     },
 };
 
+/// The ordinary budget for one control exchange: a connect, a handshake, a
+/// write, or the wait for a reply. Read it through [`io_timeout`].
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The ordinary budget in force on this thread. A test that has to wait one
+/// out lowers it for its own threads with [`ordinary_budget::scope`]; nothing
+/// else can change it.
+fn io_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        ordinary_budget::current()
+    }
+    #[cfg(not(test))]
+    {
+        IO_TIMEOUT
+    }
+}
+
+#[cfg(test)]
+mod ordinary_budget {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    /// Short enough that waiting one out costs little, and still long beside
+    /// an in-process exchange.
+    pub(super) const QUICK: Duration = Duration::from_secs(1);
+
+    thread_local! {
+        static BUDGET: Cell<Duration> = const { Cell::new(super::IO_TIMEOUT) };
+    }
+
+    pub(super) fn current() -> Duration {
+        BUDGET.get()
+    }
+
+    /// Lower the ordinary budget on this thread until the guard drops. A
+    /// client must be created and used on a thread holding the scope.
+    #[must_use]
+    pub(super) fn scope(budget: Duration) -> impl Drop {
+        struct Restore(Duration);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BUDGET.set(self.0);
+            }
+        }
+        Restore(BUDGET.replace(budget))
+    }
+}
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 // A live close may outlast a slow commit or shared request at the daemon's fence
 // before its own teardown. Timing out earlier would call that wait unresponsive.
@@ -1079,10 +1126,14 @@ impl ControlClient {
         let result = (|| {
             let stream = connect_control_socket(
                 socket_path,
-                IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+                io_timeout().min(deadline.saturating_duration_since(Instant::now())),
             )
             .map_err(ControlError::Connect)?;
-            Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
+            Self::from_stream_inner(
+                stream,
+                deadline,
+                deadline.min(Instant::now() + io_timeout()),
+            )
         })();
         #[cfg(feature = "ui")]
         crate::daemon_health::connection(socket_path, &result, health_request);
@@ -1091,14 +1142,18 @@ impl ControlClient {
 
     pub fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         let deadline = Instant::now() + Self::handshake_timeout();
-        Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
+        Self::from_stream_inner(
+            stream,
+            deadline,
+            deadline.min(Instant::now() + io_timeout()),
+        )
     }
 
     fn handshake_timeout() -> Duration {
         if crate::device::is_remote() {
             Duration::from_secs(30)
         } else {
-            IO_TIMEOUT
+            io_timeout()
         }
     }
 
@@ -1110,7 +1165,7 @@ impl ControlClient {
         deadline: Instant,
     ) -> Result<Self, ControlError> {
         let deadline = deadline.max(Instant::now() + Self::handshake_timeout());
-        Self::from_stream_inner(stream, deadline, Instant::now() + IO_TIMEOUT)
+        Self::from_stream_inner(stream, deadline, Instant::now() + io_timeout())
     }
 
     pub(crate) fn from_stream_with_deadline(
@@ -1152,7 +1207,7 @@ impl ControlClient {
             .set_read_timeout(Some(Self::handshake_timeout()))
             .map_err(ControlError::Configure)?;
         stream
-            .set_write_timeout(Some(IO_TIMEOUT))
+            .set_write_timeout(Some(io_timeout()))
             .map_err(ControlError::Configure)?;
         let mut client = HandshakeClient {
             stream,
@@ -1162,11 +1217,11 @@ impl ControlClient {
         let proof = client.handshake(deadline, write_deadline)?;
         client
             .stream
-            .set_read_timeout(Some(IO_TIMEOUT))
+            .set_read_timeout(Some(io_timeout()))
             .map_err(ControlError::Configure)?;
         client
             .stream
-            .set_write_timeout(Some(IO_TIMEOUT))
+            .set_write_timeout(Some(io_timeout()))
             .map_err(ControlError::Configure)?;
         Ok(Self {
             stream: client.stream,
@@ -1477,7 +1532,7 @@ impl ControlClient {
         request: ClientRequest,
     ) -> Result<crate::notifications::Snapshot, ControlError> {
         self.stream
-            .set_read_timeout(Some(IO_TIMEOUT))
+            .set_read_timeout(Some(io_timeout()))
             .map_err(ControlError::Configure)?;
         match self.request_strict(request)? {
             ServerResponse::Notifications { snapshot } => Ok(snapshot),
@@ -1526,7 +1581,7 @@ impl ControlClient {
     ) -> Result<crate::notifications::TestOutcome, ControlError> {
         match self.request_with_deadline(
             ClientRequest::SendTestNotification,
-            Instant::now() + crate::notifications::TEST_TIMEOUT + IO_TIMEOUT,
+            Instant::now() + crate::notifications::TEST_TIMEOUT + io_timeout(),
         )? {
             ServerResponse::NotificationTest { outcome } => Ok(outcome),
             response => Err(unexpected_response(
@@ -1588,7 +1643,7 @@ impl ControlClient {
         scope: crate::workspace_model::views::Scope,
     ) -> Result<(Option<crate::workspace_model::views::View>, u64), ControlError> {
         self.stream
-            .set_read_timeout(Some(IO_TIMEOUT))
+            .set_read_timeout(Some(io_timeout()))
             .map_err(ControlError::Configure)?;
         match self.request_strict(ClientRequest::ReadWorkspaceView { scope })? {
             ServerResponse::WorkspaceView { view, sequence } => Ok((view, sequence)),
@@ -1687,7 +1742,7 @@ impl ControlClient {
         &mut self,
         session: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, ControlError> {
-        self.observe_update_chat_until(session, Instant::now() + IO_TIMEOUT)
+        self.observe_update_chat_until(session, Instant::now() + io_timeout())
     }
 
     pub(crate) fn observe_update_chat_until(
@@ -1726,7 +1781,7 @@ impl ControlClient {
         chat_id: TerminalId,
         generation: u64,
     ) -> Result<Option<crate::chat::Snapshot>, ControlError> {
-        self.read_update_chat_until(chat_id, generation, Instant::now() + IO_TIMEOUT)
+        self.read_update_chat_until(chat_id, generation, Instant::now() + io_timeout())
     }
 
     pub(crate) fn read_update_chat_until(
@@ -2222,7 +2277,7 @@ impl ControlClient {
             terminal_id,
         );
         let result = match visible {
-            Ok(()) => self.snapshot_until(terminal_id, Instant::now() + IO_TIMEOUT),
+            Ok(()) => self.snapshot_until(terminal_id, Instant::now() + io_timeout()),
             Err(error) => Err(error),
         };
         self.finish_visible_attachment(terminal_id, result)
@@ -2328,7 +2383,7 @@ impl ControlClient {
 
     /// Answered during startup recovery, when other requests are refused.
     pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
-        self.startup_state_with_deadline(Instant::now() + IO_TIMEOUT)
+        self.startup_state_with_deadline(Instant::now() + io_timeout())
     }
 
     pub(crate) fn startup_state_with_deadline(
@@ -2822,7 +2877,7 @@ impl ControlClient {
         let read_restored = self.restore_read_timeout();
         let write_restored = self
             .stream
-            .set_write_timeout(Some(IO_TIMEOUT))
+            .set_write_timeout(Some(io_timeout()))
             .map_err(ControlError::Configure);
         // Restore both directions even when the request or either restoration fails.
         result.and_then(|response| read_restored.and(write_restored).map(|()| response))
@@ -2851,7 +2906,7 @@ impl ControlClient {
     ) -> Result<ServerResponse, ControlError> {
         let reply_timeout = deadline
             .map(|end| end.saturating_duration_since(Instant::now()))
-            .unwrap_or(IO_TIMEOUT);
+            .unwrap_or(io_timeout());
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         if self.next_request_id == 0 {
@@ -3031,14 +3086,14 @@ impl ControlClient {
         let remaining = deadline.saturating_duration_since(Instant::now());
         self.stream
             .set_read_timeout(Some(
-                remaining.max(Duration::from_millis(1)).min(IO_TIMEOUT),
+                remaining.max(Duration::from_millis(1)).min(io_timeout()),
             ))
             .map_err(ControlError::Configure)
     }
 
     fn restore_read_timeout(&self) -> Result<(), ControlError> {
         self.stream
-            .set_read_timeout(Some(IO_TIMEOUT))
+            .set_read_timeout(Some(io_timeout()))
             .map_err(ControlError::Configure)
     }
 }
@@ -10474,6 +10529,8 @@ mod tests {
         source_checked: bool,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         use terminal::ipc::TerminalCloseResult;
+        // "late-closed" answers after the ordinary budget; keep that short.
+        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
         fn reply(
             stream: &mut UnixStream,
             pinned: &HostSessionProof,
@@ -10619,7 +10676,7 @@ mod tests {
                 return;
             }
             if peer_case == "late-closed" {
-                thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+                thread::sleep(ordinary_budget::QUICK + Duration::from_millis(500));
             }
             let message = match peer_case.as_str() {
                 "remote-error" => ServerMessage::Error(ProtocolError::new(
@@ -10754,6 +10811,7 @@ mod tests {
 
     #[test]
     fn window_claims_outlast_the_ordinary_reply_timeout() {
+        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("presence-owner", "boot", "incarnation");
         let server = thread::spawn(move || {
@@ -10768,7 +10826,7 @@ mod tests {
                 claim.request,
                 ClientRequest::NotificationPresence { .. }
             ));
-            thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+            thread::sleep(ordinary_budget::QUICK + Duration::from_millis(500));
             write_frame(
                 &mut server_stream,
                 &ServerEnvelope {
@@ -11017,6 +11075,8 @@ mod tests {
         outcome: &'static str,
         ending: &'static str,
     ) -> (Result<(), ControlError>, bool) {
+        // The "timeout" ending waits out the ordinary budget; keep it short.
+        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         server_stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -11140,8 +11200,9 @@ mod tests {
                 return;
             }
             if ending == "timeout" {
-                // A close's own deadline restores IO_TIMEOUT before this Detach.
-                wait.recv_timeout(IO_TIMEOUT + Duration::from_secs(3))
+                // A close's own deadline restores the ordinary budget before
+                // this Detach.
+                wait.recv_timeout(ordinary_budget::QUICK + Duration::from_secs(3))
                     .unwrap();
                 return;
             }
@@ -11357,6 +11418,7 @@ mod tests {
 
     #[test]
     fn upgrade_impact_accepts_slow_preview_without_changing_normal_rpc_timeout() {
+        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let expected = preview_impact(pinned.clone());
@@ -11376,8 +11438,8 @@ mod tests {
                 }
             );
             assert_eq!(request.proof, Some(pinned.clone()));
-            // This is deliberately beyond the generic RPC's five-second budget.
-            thread::sleep(IO_TIMEOUT + Duration::from_millis(100));
+            // This is deliberately beyond the ordinary RPC budget.
+            thread::sleep(ordinary_budget::QUICK + Duration::from_millis(100));
             write_frame(
                 &mut server_stream,
                 &ServerEnvelope {
@@ -11404,8 +11466,14 @@ mod tests {
                 .unwrap(),
             expected
         );
-        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
-        assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+        assert_eq!(
+            client.stream.read_timeout().unwrap(),
+            Some(ordinary_budget::QUICK)
+        );
+        assert_eq!(
+            client.stream.write_timeout().unwrap(),
+            Some(ordinary_budget::QUICK)
+        );
         drop(client);
         server.join().unwrap();
     }
@@ -11502,6 +11570,9 @@ mod tests {
 
     #[test]
     fn a_long_reply_deadline_reports_the_actual_budget() {
+        // The deadline outlasts one ordinary budget but not two.
+        const BUDGET: Duration = ordinary_budget::QUICK;
+        const DEADLINE: Duration = Duration::from_millis(2100);
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let server = thread::spawn(move || {
@@ -11521,24 +11592,25 @@ mod tests {
         });
         let client = ControlClient::from_stream(client_stream).unwrap();
         // The reported budget tells the full deadline apart from a single
-        // read's IO_TIMEOUT; a client that enforced neither never returns.
+        // read's ordinary budget; a client that enforced neither never returns.
         let error = crate::test_timing::returns("a request with a long deadline", move || {
+            let _budget = ordinary_budget::scope(BUDGET);
             let mut client = client;
             client
                 .request_with_deadline(
                     ClientRequest::ListPage { after: None },
-                    Instant::now() + Duration::from_millis(6100),
+                    Instant::now() + DEADLINE,
                 )
                 .unwrap_err()
         });
         assert!(
-            matches!(&error, ControlError::ReplyTimeout { timeout, .. } if *timeout > IO_TIMEOUT && *timeout <= Duration::from_millis(6100)),
+            matches!(&error, ControlError::ReplyTimeout { timeout, .. } if *timeout > BUDGET && *timeout <= DEADLINE),
             "{error}"
         );
         assert!(
             error
                 .to_string()
-                .contains("the daemon did not answer within 6 s"),
+                .contains("the daemon did not answer within 2 s"),
             "{error}"
         );
         server.join().unwrap();

@@ -741,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             mailbox.client.stream.read_timeout().unwrap(),
-            Some(IO_TIMEOUT)
+            Some(io_timeout())
         );
     }
 
