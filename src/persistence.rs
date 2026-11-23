@@ -40,7 +40,7 @@ mod update_resume;
 #[cfg(test)]
 mod history_scale;
 pub(crate) use refusal::invalid_state;
-pub use refusal::{RefusedCheck, Violation};
+pub use refusal::{CARD_RESURRECTION, RefusedCheck, Violation};
 #[cfg(feature = "ui")]
 pub use update_resume::{Taken, UpdateResumeStore};
 
@@ -4947,9 +4947,10 @@ fn save_card(
         if stored.existence == StoredExistence::Closed
             && !matches!(card.existence, Existence::Closed { .. })
         {
-            return Err(invalid_state!(
-                "tombstoned card {card_id} cannot be resurrected"
-            ));
+            return Err(StoreError::InvalidState(Violation::new(
+                CARD_RESURRECTION,
+                format!("tombstoned card {card_id} cannot be resurrected"),
+            )));
         }
         if expected != stored.generation {
             return Err(StoreError::StaleGeneration {

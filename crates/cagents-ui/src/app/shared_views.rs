@@ -385,6 +385,11 @@ pub(super) struct State {
     /// Its removal is sent again at most once per view revision, and only a
     /// few times per connection, so a refusal never becomes a loop.
     pub(super) outstanding_closes: HashMap<CardId, OutstandingClose>,
+    /// Each copy of a pane this window had published or seen accepted when
+    /// it closed the pane. A registry still holding one of them holds this
+    /// window's pane, however far behind the card it is; any other copy was
+    /// changed by another client.
+    pub(super) closed_sources: HashMap<CardId, Vec<Pane>>,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -618,6 +623,7 @@ impl State {
             metadata_revisions,
             closed,
             outstanding_closes,
+            closed_sources,
             local_projection_count: _,
             topology_build_count: _,
             view_projection_count: _,
@@ -674,6 +680,7 @@ impl State {
             metadata_revisions: metadata_revisions.clone(),
             closed: closed.clone(),
             outstanding_closes: outstanding_closes.clone(),
+            closed_sources: closed_sources.clone(),
             registry_unavailable: *registry_unavailable,
             unintroduced_projects: *unintroduced_projects,
             baseline: baseline.clone(),
@@ -4754,13 +4761,21 @@ impl Cagents {
             scope: pane.scope.clone(),
         };
         // A conversation's pane also changes as its provider confirms what
-        // it already is, as when its session is named after the close. And a
-        // draft nobody has started holds no work: one whose options differ
-        // only lost an edit of this window's to the same trouble as its close.
+        // it already is, as when its session is named after the close.
         let confirms = matches!((&closed.kind, &pane.kind), (CardKind::Chat(closed), CardKind::Chat(current))
-                if super::chat_ui::background_close::only_confirms(closed, current)
-                    || (closed.is_unstarted() && current.is_unstarted()));
-        if !confirms && !views::same_removal_source(&closed, pane) {
+                if super::chat_ui::background_close::only_confirms(closed, current));
+        // The registry may also be behind the card, holding a copy this
+        // window published before an edit lost to the same trouble.
+        let published = self
+            .shared_views
+            .closed_sources
+            .get(&pane.id)
+            .is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| views::same_removal_source(source, pane))
+            });
+        if !confirms && !published && !views::same_removal_source(&closed, pane) {
             return None;
         }
         self.removal_source_change(scope, pane, None)
@@ -4771,6 +4786,26 @@ impl Cagents {
     /// and at most [`OUTSTANDING_CLOSE_SENDS`] times per connection, so a
     /// refusal waits for the view to change or a reconnect, never looping.
     fn publish_outstanding_closes(&mut self) {
+        // What a close saw is owed nothing once the registry retired the pane.
+        if !self.shared_views.closed_sources.is_empty() {
+            let owed_nothing: Vec<CardId> = self
+                .shared_views
+                .closed_sources
+                .keys()
+                .copied()
+                .filter(|id| {
+                    self.card_state(*id).is_none()
+                        || self
+                            .workspace_model
+                            .views
+                            .iter()
+                            .any(|view| view.retired.contains(id))
+                })
+                .collect();
+            for id in owed_nothing {
+                self.shared_views.closed_sources.remove(&id);
+            }
+        }
         if self.shared_views.outstanding_closes.is_empty() {
             return;
         }

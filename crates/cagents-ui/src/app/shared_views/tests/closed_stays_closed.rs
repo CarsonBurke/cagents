@@ -14,22 +14,39 @@ const WAIT: Duration = Duration::from_secs(5);
 /// message is saved and started. Before, the view reopened the closed card,
 /// storage refused it, and every first message failed on that refusal.
 ///
-/// The registry may also hold an older copy of the draft, when a change to
-/// its options was lost to the same trouble. That is still this window's
-/// draft, not another client's: it is removed again without a notice.
+/// The registry may also hold an older copy of the draft that this window
+/// published, when a later change to its options was lost to the same
+/// trouble: still this window's draft, removed again without a notice. A copy
+/// this window never published was changed by another client, which keeps
+/// it: this window says so and sends nothing.
 #[test]
 fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
-    for (refusal, older) in [
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Held {
+        AsClosed,
+        OlderPublished,
+        ChangedElsewhere,
+    }
+    for (refusal, held_copy) in [
         (
             crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT,
-            false,
+            Held::AsClosed,
         ),
         (
             "The pane change waited too long for the daemon to be resent",
-            false,
+            Held::AsClosed,
         ),
-        (crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT, true),
+        (
+            crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT,
+            Held::OlderPublished,
+        ),
+        (
+            crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT,
+            Held::ChangedElsewhere,
+        ),
     ] {
+        let refusal = format!("{refusal} ({held_copy:?})");
+        let refusal = refusal.as_str();
         let (mut app, channel, card, target, receiver) = unpublished_default_chat();
         let scope = Scope::Channel(channel);
         let storage = tempfile::tempdir().unwrap();
@@ -51,6 +68,25 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
                 _ => None,
             })
             .expect("the composed draft is published");
+
+        if held_copy == Held::OlderPublished {
+            // An options change after the Insert, which the registry never saw.
+            let durable = Arc::make_mut(&mut app.durable);
+            let local = durable
+                .cards
+                .iter_mut()
+                .find(|state| state.id == card)
+                .unwrap();
+            let CardKind::Chat(session) = &mut local.kind else {
+                panic!("a chat card")
+            };
+            session
+                .launch
+                .recipe
+                .arguments
+                .push("--option-the-registry-never-saw".into());
+            app.publish_view_changes();
+        }
 
         // Closed while its Insert is unanswered.
         drop(app.begin_chat_close(card));
@@ -79,7 +115,7 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
         let mut accepted = View::empty(channel);
         accepted.revision = 1;
         let mut held = pane.clone();
-        if older {
+        if held_copy == Held::ChangedElsewhere {
             let CardKind::Chat(session) = &mut held.kind else {
                 panic!("a chat pane")
             };
@@ -87,7 +123,7 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
                 .launch
                 .recipe
                 .arguments
-                .push("--option-before-the-lost-edit".into());
+                .push("--option-another-window-chose".into());
         }
         accepted.panes.push(held);
         app.workspace_model.views = vec![accepted];
@@ -112,18 +148,32 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
             .chain(app.notices.recent().map(|entry| &entry.notice))
             .map(|notice| notice.message.to_string())
             .collect();
-        assert!(
-            told.is_empty(),
-            "{refusal}: nothing to tell when the removal is sent again: {told:?}"
-        );
-        assert!(
-            app.shared_views.pending.iter().any(|(operation, _, change)| {
+        let resent = app
+            .shared_views
+            .pending
+            .iter()
+            .any(|(operation, _, change)| {
                 *operation != close
                     && matches!(change, Change::RemoveSource { before, .. } if before.id == card)
-            }),
-            "{refusal}: the removal is sent again: {:?}",
-            app.shared_views.pending
-        );
+            });
+        if held_copy == Held::ChangedElsewhere {
+            assert!(!resent, "{refusal}: another window's pane is not removed");
+            assert_eq!(
+                told,
+                vec![super::super::PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()],
+                "{refusal}"
+            );
+        } else {
+            assert!(
+                told.is_empty(),
+                "{refusal}: nothing to tell when the removal is sent again: {told:?}"
+            );
+            assert!(
+                resent,
+                "{refusal}: the removal is sent again: {:?}",
+                app.shared_views.pending
+            );
+        }
         app.persist();
         app.session
             .as_ref()
@@ -152,12 +202,14 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
     }
 }
 
-/// One pane storage refuses - the closed card brought back, as the view did
-/// before this fix - fails nothing but its own saves. A new chat's first
-/// message still saves and starts, and a draft that does fail says why,
-/// naming the pane storage refused rather than pointing at a notice.
+/// A closed card back open in memory - as the view brought it back before
+/// this fix - blocks nothing: storage keeps it closed, as the person left it,
+/// so the save an update makes of every window before restarting them
+/// passes, and a new chat's first message saves and starts. A draft whose
+/// first save does fail says why, naming the pane storage refused rather
+/// than pointing at a notice.
 #[test]
-fn a_pane_storage_refuses_does_not_stop_another_chat_starting() {
+fn a_closed_card_back_in_memory_blocks_neither_an_update_nor_a_new_chat() {
     let (mut app, channel, card, target, _receiver) = unpublished_default_chat();
     let storage = tempfile::tempdir().unwrap();
     let (writer, _) = crate::session::SessionRuntime::open(
@@ -184,11 +236,25 @@ fn a_pane_storage_refuses_does_not_stop_another_chat_starting() {
     stuck.existence = Existence::Open;
     stuck.title = "Stuck draft".into();
     app.persist();
+    // The window barrier an update's Prepare waits on, through
+    // `capture_workspace_save`, before it restarts every window.
     app.session
         .as_ref()
         .unwrap()
         .flush(WAIT)
-        .expect_err("storage refuses the closed card");
+        .expect("the update's save does not fail over a pane the person closed");
+    let stored = app
+        .session
+        .as_ref()
+        .unwrap()
+        .operation_store()
+        .load_card(card, None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !stored.existence.is_open(),
+        "storage keeps the closed card closed"
+    );
 
     drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
     let fresh = app

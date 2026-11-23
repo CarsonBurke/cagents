@@ -3382,10 +3382,30 @@ fn a_refused_autosave_stays_reported_until_a_later_one_lands() {
     assert_eq!(writes.quarantine.window_state(), None);
 }
 
-/// A pane's barrier vouches only for that pane. One pane storage refuses -
-/// a closed card brought back, as #2444's stuck draft was - fails the window
-/// barrier, but not the barrier of another pane, which saved around it; its
-/// own barrier names it and the rule it broke.
+/// Stores `state` with its first pane as an unstarted chat, and returns a
+/// copy of that chat storage refuses by rule: its source names a terminal
+/// other than the chat's own.
+fn stored_chat_and_refused_copy(
+    runtime: &SessionRuntime,
+    state: &mut WorkspaceState,
+) -> crate::chat::Session {
+    let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+        unreachable!()
+    };
+    let chat = staged_chat(state);
+    state.cards[0].kind = CardKind::Chat(chat.clone());
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime.flush(Duration::from_secs(5)).unwrap();
+    let mut refused = chat;
+    let mut source = terminal;
+    source.id = TerminalId::new();
+    refused.terminal = Some(Box::new(source));
+    refused
+}
+
+/// A pane's barrier vouches only for that pane. One pane storage refuses
+/// fails the window barrier, but not the barrier of another pane, which
+/// saved around it; its own barrier names it and the rule it broke (#2444).
 #[test]
 fn a_pane_barrier_is_not_failed_by_another_panes_refusal() {
     let directory = tempdir().unwrap();
@@ -3400,11 +3420,7 @@ fn a_pane_barrier_is_not_failed_by_another_panes_refusal() {
         session.id = TerminalId::new();
     }
     state.cards.push(other.clone());
-    runtime.snapshot(Arc::new(state.clone()));
-    runtime.flush(timeout).unwrap();
-    let card = state.cards.remove(0);
-    runtime.snapshot(Arc::new(state.clone()));
-    runtime.flush(timeout).unwrap();
+    let refused = stored_chat_and_refused_copy(&runtime, &mut state);
     let pane_flush = |card: CardId| {
         runtime
             .request_pane_flush(card)
@@ -3414,8 +3430,8 @@ fn a_pane_barrier_is_not_failed_by_another_panes_refusal() {
     };
     assert_eq!(pane_flush(other.id), Ok(()));
 
-    let resurrected = card.id;
-    state.cards.insert(0, card);
+    let stuck = state.cards[0].id;
+    state.cards[0].kind = CardKind::Chat(refused);
     state.cards[1].title = "draft, renamed".into();
     runtime.snapshot(Arc::new(state.clone()));
     runtime
@@ -3432,16 +3448,89 @@ fn a_pane_barrier_is_not_failed_by_another_panes_refusal() {
         .unwrap()
         .unwrap();
     assert_eq!(saved.title, "draft, renamed");
-    let refusal = pane_flush(resurrected).expect_err("its own refusal fails its barrier");
+    let refusal = pane_flush(stuck).expect_err("its own refusal fails its barrier");
     let PaneSaveRefusal::Refused { pane, rule, .. } = &refusal else {
         panic!("a refusal by rule, not a storage failure: {refusal:?}")
     };
-    assert_eq!(*pane, Some(resurrected));
-    assert!(rule.as_str().contains("cannot be resurrected"), "{refusal}");
+    assert_eq!(*pane, Some(stuck));
     assert!(
-        refusal.to_string().contains(&resurrected.to_string()),
+        rule.as_str().contains("changed source identity"),
         "{refusal}"
     );
+    assert!(
+        refusal.to_string().contains(&stuck.to_string()),
+        "{refusal}"
+    );
+}
+
+/// A pane the person closed and the window then offered open again - a
+/// shared view bringing a closed card back, as #2093 and #2444's stuck draft
+/// were - is kept closed by storage, which is what the person left it. That
+/// fails no barrier: not another pane's, not its own, and not the window's,
+/// which an update waits on before it restarts every window.
+#[test]
+fn a_closed_pane_offered_open_again_stays_closed_and_fails_no_barrier() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("closed-offered-open.sqlite3");
+    let boot = BootId::new("boot-closed-offered-open");
+    let timeout = Duration::from_secs(5);
+    let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+    let health = runtime.health_receiver();
+    let mut state = workspace();
+    let mut other = state.cards[0].clone();
+    other.id = CardId::new();
+    if let CardKind::Terminal(session) = &mut other.kind {
+        session.id = TerminalId::new();
+    }
+    state.cards.push(other.clone());
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime.flush(timeout).unwrap();
+    let closed_card = state.cards.remove(0);
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime.flush(timeout).unwrap();
+
+    let resurrected = closed_card.id;
+    state.cards.insert(0, closed_card);
+    state.cards[1].title = "renamed beside it".into();
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime
+        .flush(timeout)
+        .expect("the window barrier an update waits on passes");
+    for card in [resurrected, other.id] {
+        assert_eq!(
+            runtime
+                .request_pane_flush(card)
+                .unwrap()
+                .recv_timeout(timeout)
+                .unwrap(),
+            Ok(())
+        );
+    }
+    assert!(latest_health(&health).quarantined.is_empty());
+    let saved = runtime
+        .operation_store()
+        .load_workspace(state.id, None)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        saved
+            .cards
+            .iter()
+            .find(|card| card.id == resurrected)
+            .map(|card| &card.existence),
+        Some(Existence::Closed { .. })
+    ));
+    assert_eq!(
+        saved
+            .cards
+            .iter()
+            .find(|card| card.id == other.id)
+            .map(|card| card.title.as_str()),
+        Some("renamed beside it")
+    );
+    runtime.shutdown();
+    let store = StateStore::open(&path, boot).unwrap();
+    assert!(!store.recovery_report().dirty_shutdown);
 }
 
 #[test]
@@ -3453,18 +3542,15 @@ fn a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown() {
     let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
     let health = runtime.health_receiver();
     let mut state = workspace();
-    runtime.snapshot(Arc::new(state.clone()));
-    runtime.flush(timeout).unwrap();
-    let card = state.cards.remove(0);
-    runtime.snapshot(Arc::new(state.clone()));
-    runtime.flush(timeout).unwrap();
+    let refused_chat = stored_chat_and_refused_copy(&runtime, &mut state);
+    let CardKind::Chat(stored_chat) = state.cards[0].kind.clone() else {
+        unreachable!()
+    };
 
-    // Bringing a closed card back is refused by construction. Storage
-    // keeps its tombstone, and the rest of the window saves around it,
-    // without focusing a closed card.
-    let resurrected = card.id;
-    state.cards.push(card);
-    state.focused = Some(resurrected);
+    // A pane whose content breaks a rule is refused by construction. Storage
+    // keeps its earlier content, and the rest of the window saves around it.
+    let resurrected = state.cards[0].id;
+    state.cards[0].kind = CardKind::Chat(refused_chat);
     state.chat_drafts.insert(resurrected, "first draft".into());
     runtime.snapshot(Arc::new(state.clone()));
     let refusal = runtime
@@ -3473,8 +3559,8 @@ fn a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown() {
     assert!(refusal.contains("refused part of the window"), "{refusal}");
     assert!(
         refusal.contains(&format!(
-            "the latest changes to pane {resurrected} (refused by rule: tombstoned card … \
-                 cannot be resurrected)."
+            "the latest changes to pane {resurrected} (refused by rule: chat card … \
+                 changed source identity)."
         )),
         "a refused barrier names what the reader has to change, and the rule it broke: \
              {refusal}"
@@ -3496,19 +3582,18 @@ fn a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown() {
         .load_workspace(state.id, None)
         .unwrap()
         .unwrap();
-    assert_eq!(saved.focused, None);
     assert_eq!(
         saved.chat_drafts.get(&resurrected).map(String::as_str),
         Some("first draft")
     );
-    assert!(matches!(
+    assert_eq!(
         saved
             .cards
             .iter()
             .find(|card| card.id == resurrected)
-            .map(|card| &card.existence),
-        Some(Existence::Closed { .. })
-    ));
+            .map(|card| &card.kind),
+        Some(&CardKind::Chat(stored_chat))
+    );
 
     // Later edits to the window keep saving while the pane stays refused,
     // and an explicit retry offers the pane again without clearing it.
@@ -3959,12 +4044,8 @@ fn a_later_snapshot_supersedes_a_refused_one() {
     let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
     let health = runtime.health_receiver();
     let mut state = workspace();
-    runtime.snapshot(Arc::new(state.clone()));
-    runtime.flush(timeout).unwrap();
-    let card = state.cards.remove(0);
-    runtime.snapshot(Arc::new(state.clone()));
-    runtime.flush(timeout).unwrap();
-    state.cards.push(card);
+    let refused = stored_chat_and_refused_copy(&runtime, &mut state);
+    state.cards[0].kind = CardKind::Chat(refused);
     runtime.snapshot(Arc::new(state.clone()));
     runtime.flush(timeout).unwrap_err();
 

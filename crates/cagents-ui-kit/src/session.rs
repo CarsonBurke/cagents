@@ -1751,6 +1751,14 @@ impl Quarantine {
         let panes = refused
             .iter()
             .filter_map(|error| match error {
+                // Storage kept a pane closed that the window offered open: a
+                // card the person closed, brought back in memory. Closed is
+                // what they left it, so nothing of theirs went unsaved, and a
+                // checkpoint - a first message, an update - does not wait on it.
+                StoreError::Card { card, .. } if error.resurrects_closed_card() => {
+                    tracing::info!(%card, "storage keeps a closed pane closed that the window offered open");
+                    None
+                }
                 StoreError::Card { card, .. } => Some((
                     *card,
                     record_refusal(

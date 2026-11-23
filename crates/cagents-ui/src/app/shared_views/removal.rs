@@ -308,12 +308,50 @@ impl Cagents {
         self.status = Some(TransientNotice::warning(PANE_KEPT));
     }
 
+    /// Keeps each copy of `card` this window had published, or the registry
+    /// had accepted, as it closes: the copies a later removal of the pane may
+    /// find in the registry without another client having changed it.
+    fn record_closed_sources(&mut self, card: CardId) {
+        let accepted = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| view.panes.iter());
+        let published = self
+            .shared_views
+            .pending
+            .iter()
+            .flat_map(|(_, _, change)| match change {
+                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => vec![pane],
+                Change::Update { before, pane }
+                | Change::UpdateTerminalSource { before, pane, .. } => {
+                    vec![before, pane]
+                }
+                _ => Vec::new(),
+            });
+        let copies: Vec<Pane> = accepted
+            .chain(published)
+            .filter(|pane| pane.id == card)
+            .cloned()
+            .collect();
+        if copies.is_empty() {
+            return;
+        }
+        let sources = self.shared_views.closed_sources.entry(card).or_default();
+        for copy in copies {
+            if !sources.contains(&copy) {
+                sources.push(copy);
+            }
+        }
+    }
+
     pub(in crate::app) fn prepare_shared_removal(&mut self, card: CardId) -> bool {
         // A fenced pane's saved source is unconfirmed, so its close captures
         // none: publication removes the closed pane from its view by identity.
         if self.shared_views.quarantined.contains(&card) {
             return true;
         }
+        self.record_closed_sources(card);
         if !self.shared_views.removals.contains_key(&card) && !self.capture_shared_removal(card) {
             return false;
         }
