@@ -1336,8 +1336,14 @@ if command == "lease":
         pending = SLOT_DISK * sum(1 for index in existing if growing(index))
         if not existing or len(existing) < slots and free() - floor - pending >= SLOT_DISK:
             indices.append(max(existing, default=-1) + 1)
-        return sorted(indices, key=lambda index: (owner(index) != key, not built(index),
-                                                  leased_at(index), index)), None
+        def order(index):
+            own, made = owner(index) == key, built(index)
+            # This checkout's own slots, the one it used last first; another
+            # checkout's, the one leased least lately first; empty ones, and
+            # then a new one, in turn.
+            recency = -leased_at(index) if own else leased_at(index) if made else 0
+            return (not own, not made, recency, index)
+        return sorted(indices, key=order), None
     while True:
         order, why = candidates()
         if why != "same" and queue.closed:
