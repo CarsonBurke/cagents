@@ -1058,6 +1058,38 @@ impl Cagents {
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, Projection) {
+        // Another client's move of a pane out of the channel this window
+        // shows, read before the move empties it here.
+        let departure = match &update {
+            ModelUpdate::Changed { edit, changes, .. }
+                if changes
+                    .identity
+                    .is_none_or(|identity| identity == self.workspace_model.identity) =>
+            {
+                self.pane_departure(edit)
+            }
+            _ => None,
+        };
+        let (task, projection) = self.project_workspace_model_update(update);
+        let Some(departure) = departure else {
+            return (task, projection);
+        };
+        let active = self.durable.active_channel;
+        let followed = self.pane_departed(departure);
+        // Following changes which channel the window shows, which only the
+        // full projection carries through to the sidebar and chrome.
+        let projection = if self.durable.active_channel == active {
+            projection
+        } else {
+            Projection::Full
+        };
+        (Task::batch([task, followed]), projection)
+    }
+
+    fn project_workspace_model_update(
+        &mut self,
+        update: ModelUpdate,
+    ) -> (Task<Message>, Projection) {
         // A registry receipt can arrive after this scope began another seed.
         // Fence it before installing rows or capturing any projection source.
         let update = match update {

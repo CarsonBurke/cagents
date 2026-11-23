@@ -369,3 +369,142 @@ fn an_agent_moves_only_the_panes_it_controls_and_makes_a_channel_only_by_moving_
     }
     crate::host::workspace::before_transfer(None);
 }
+
+/// A conversation in a chat pane moves that pane and the panes of the agents
+/// it delegated to, while its delegate moves only its own.
+#[test]
+fn a_chat_agent_moves_its_own_pane_and_its_delegates_but_a_delegate_not_its_parent() {
+    if isolated("host::agent_execution::tests::pane_move::a_chat_agent_moves_its_own_pane_and_its_delegates_but_a_delegate_not_its_parent").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let project = path.parent().unwrap().join("project");
+    const USER: u64 = 1;
+    const PARENT: u64 = 2;
+    const CHILD: u64 = 3;
+    for client in [USER, PARENT, CHILD] {
+        host.lock().unwrap().register_client(client);
+    }
+    let request_as = |client: u64, request: ClientRequest| {
+        process_request(&host, client, request).map(|(response, _, _)| response)
+    };
+    let chat = |agent: AgentId| {
+        let session = registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(agent)
+            .unwrap()
+            .session
+            .unwrap();
+        let crate::agent_execution::HostedSession::Chat(chat) = session else {
+            panic!("the fixture runs a native chat")
+        };
+        chat
+    };
+    let authority = |session: TerminalId| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_authority(session)
+            .unwrap()
+    };
+    let model = || -> WorkspaceModel {
+        match request_as(USER, ClientRequest::ReadWorkspaceModel).unwrap() {
+            ServerResponse::WorkspaceModel { model } => model,
+            response => panic!("unexpected read reply {response:?}"),
+        }
+    };
+    let placed = |pane: CardId| {
+        model()
+            .views
+            .into_iter()
+            .find(|view| view.panes.iter().any(|candidate| candidate.id == pane))
+            .map(|view| view.scope)
+    };
+    let move_as = |client: u64, pane: Option<CardId>, destination: ChannelId| {
+        request_as(
+            client,
+            ClientRequest::MovePane {
+                pane,
+                destination: PaneDestination::Channel(destination),
+                operation: uuid::Uuid::new_v4(),
+            },
+        )
+        .map(|response| match response {
+            ServerResponse::PaneMoved(moved) => moved,
+            response => panic!("unexpected move reply {response:?}"),
+        })
+    };
+
+    // A conversation the person started, and one it delegated to.
+    let parent = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let parent_chat = chat(parent.agent.id);
+    let mut delegated = request;
+    delegated.idempotency_key = "delegated".into();
+    let child = submit(&host, &authority(parent_chat.id), delegated).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let child_chat = chat(child.agent.id);
+    for (client, session) in [(PARENT, parent_chat.id), (CHILD, child_chat.id)] {
+        request_as(
+            client,
+            ClientRequest::Authenticate {
+                authority: authority(session),
+            },
+        )
+        .unwrap();
+    }
+
+    let (home, other) = (ChannelId::new(), ChannelId::new());
+    for (id, title) in [(home, "Home"), (other, "Other")] {
+        request_as(
+            USER,
+            ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::CreateChannel {
+                    id,
+                    repository: project.clone(),
+                    title: title.into(),
+                    title_source: Default::default(),
+                },
+            },
+        )
+        .unwrap();
+    }
+    let parents = pane(CardKind::Chat(parent_chat));
+    let childs = pane(CardKind::Chat(child_chat));
+    request_as(
+        USER,
+        ClientRequest::EditWorkspaceModel {
+            edit: ModelEdit::SeedView {
+                scope: Scope::Channel(home),
+                panes: vec![parents.clone(), childs.clone()],
+                closed: vec![],
+            },
+        },
+    )
+    .unwrap();
+
+    // The delegate moves its own chat pane, found by its session.
+    let moved = move_as(CHILD, None, other).unwrap();
+    assert_eq!(moved.pane.id, childs.id);
+    assert_eq!(moved.from, Scope::Channel(home));
+    assert_eq!(placed(childs.id), Some(Scope::Channel(other)));
+    // But never its parent's.
+    let error = move_as(CHILD, Some(parents.id), other).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    assert!(
+        error.message.contains("belongs to another session"),
+        "{}",
+        error.message
+    );
+    assert_eq!(placed(parents.id), Some(Scope::Channel(home)));
+
+    // The parent moves its delegate's pane back, and its own after it.
+    move_as(PARENT, Some(childs.id), home).unwrap();
+    assert_eq!(placed(childs.id), Some(Scope::Channel(home)));
+    let moved = move_as(PARENT, None, other).unwrap();
+    assert_eq!(moved.pane.id, parents.id);
+    assert_eq!(placed(parents.id), Some(Scope::Channel(other)));
+}
