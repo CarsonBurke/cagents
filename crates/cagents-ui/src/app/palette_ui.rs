@@ -2176,6 +2176,7 @@ mod tests {
                     shared: false,
                     cards: vec![card.id],
                     focused: Some(card.id),
+                    checkout: None,
                 });
         } else {
             app.worktree_owners.insert(card.id, path.clone());

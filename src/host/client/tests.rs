@@ -3593,6 +3593,7 @@ fn transfer_requests_refuse_invalid_membership_without_acknowledging_or_mutating
             repository,
             title: "channel".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     }
@@ -3724,6 +3725,7 @@ fn stale_pane_source_updates_return_retryable_conflict_without_partial_success()
         repository,
         title: "channel".into(),
         title_source: Default::default(),
+        checkout: None,
     })
     .unwrap();
     let original = Pane {
@@ -3964,6 +3966,7 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
         id: channel,
         repository,
         title: "shared".into(),
+        checkout: None,
     };
     let created = editor.apply(create.clone());
     assert_eq!(created.identity, identity.unwrap());

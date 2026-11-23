@@ -78,6 +78,7 @@ fn fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
             shared: true,
             cards: vec![],
             focused: None,
+            checkout: None,
         });
     }
     app.workspace_model.identity = uuid::Uuid::new_v4();
@@ -95,6 +96,7 @@ fn fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
             title: "view".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         })
         .collect();
     app.shared_views
@@ -223,6 +225,7 @@ fn channel_move_fixture_with_kind(kind: Option<CardKind>) -> (Cagents, ChannelId
             title: "Channel".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         })
         .collect();
     let mut source_view = View::empty(source);
@@ -1933,6 +1936,7 @@ fn desktop_inventory_fixture() -> (Cagents, crate::workspace_model::WorkspaceMod
             shared: true,
             cards: vec![],
             focused: None,
+            checkout: None,
         });
         model.channels.push(crate::workspace_model::ModelChannel {
             id,
@@ -1940,6 +1944,7 @@ fn desktop_inventory_fixture() -> (Cagents, crate::workspace_model::WorkspaceMod
             title: format!("Channel {index}"),
             title_source: Default::default(),
             ordinal: index,
+            checkout: None,
         });
         let scope = Scope::Channel(id);
         model.views.push(View::empty(scope.clone()));
@@ -2488,6 +2493,7 @@ fn a_rename_of_a_channel_this_window_lacks_reconciles_in_full() {
         title: "Elsewhere".into(),
         title_source: Default::default(),
         ordinal: 30,
+        checkout: None,
     });
     drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
     Arc::make_mut(&mut app.durable)
@@ -5296,6 +5302,7 @@ fn shared_terminal_reconcile_does_not_block_native_input_on_autosave_contention(
                 shared: true,
                 cards: vec![source_id],
                 focused: Some(source_id),
+                checkout: None,
             });
         let mut view = View::empty(Scope::Channel(channel));
         view.panes.push(Pane::from_card(&card, None).unwrap());
@@ -9706,6 +9713,7 @@ fn unsent_text_survives_replaced_identity_and_transfer() {
                 title: "view".into(),
                 title_source: Default::default(),
                 ordinal: 1,
+                checkout: None,
             })
             .collect();
         model.views[0].panes.push(pane.clone());

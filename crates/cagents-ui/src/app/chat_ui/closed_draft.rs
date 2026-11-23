@@ -215,6 +215,7 @@ mod tests {
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         // Keep this scope inactive so the projection does not add placeholders.
         let mut view = View::empty(channel);

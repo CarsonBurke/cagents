@@ -333,6 +333,7 @@ fn compact_attention_projection_counts_open_logical_conversations_once_and_reuse
         shared: false,
         cards: vec![first.id, alias.id, closed.id],
         focused: None,
+        checkout: None,
     };
     let mut durable = Arc::new(crate::model::WorkspaceState {
         cards: vec![first.clone(), alias.clone(), closed.clone()].into(),
@@ -501,6 +502,7 @@ fn channel_pane_attention_stays_off_the_worktree_it_runs_in() {
         shared: false,
         cards: vec![scoped.id, remembered.id],
         focused: None,
+        checkout: None,
     };
     let channel_only = Arc::new(crate::model::WorkspaceState {
         cards: vec![scoped.clone(), remembered.clone()].into(),
@@ -10167,6 +10169,7 @@ fn folder_root_panes_list_as_pane_rows_in_attention() {
         shared: true,
         cards: vec![child.id],
         focused: None,
+        checkout: None,
     };
     let channel_row = |state, unread| {
         SidebarChannel::new(
@@ -10598,6 +10601,7 @@ fn compact_folder_root_badge_survives_a_visible_channel() {
         shared: true,
         cards: Vec::new(),
         focused: None,
+        checkout: None,
     };
     folder.channels.push(SidebarChannel::new(
         channel.id,
@@ -10712,6 +10716,7 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
         shared: true,
         cards: vec![child.id],
         focused: None,
+        checkout: None,
     };
     folder.channels.push(
         SidebarChannel::new(

@@ -444,6 +444,7 @@ mod tests {
                 shared: false,
                 cards: vec![card],
                 focused: Some(card),
+                checkout: None,
             });
             app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
             channels.push(channel);
@@ -694,6 +695,7 @@ mod tests {
                     shared: false,
                     cards: vec![card],
                     focused: Some(card),
+                    checkout: None,
                 });
                 app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
                 channels.push((channel, card));

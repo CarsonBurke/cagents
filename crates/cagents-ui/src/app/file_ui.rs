@@ -817,6 +817,7 @@ mod tests {
             shared: false,
             cards: vec![terminal],
             focused: Some(terminal),
+            checkout: None,
         });
         durable.active_channel = Some(channel);
         let task = app.open_document_link(

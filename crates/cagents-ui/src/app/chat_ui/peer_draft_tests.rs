@@ -89,6 +89,7 @@ fn peer() -> Peer {
             shared: true,
             cards: vec![],
             focused: None,
+            checkout: None,
         });
     Arc::make_mut(&mut app.durable).active_channel = Some(channel);
     app.workspace_model.identity = uuid::Uuid::new_v4();
@@ -111,6 +112,7 @@ fn peer() -> Peer {
             title: String::new(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         });
     app.workspace_model.views.push(View {
         revision: 1,

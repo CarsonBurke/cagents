@@ -1248,6 +1248,7 @@ mod tests {
                 title: format!("Channel {ordinal}"),
                 title_source: Default::default(),
                 ordinal: ordinal as u32,
+                checkout: None,
             });
         }
         let home = |id| {

@@ -209,6 +209,7 @@ impl Listing {
                         title: "Fixture channel".into(),
                         title_source: Default::default(),
                         ordinal: 1,
+                        checkout: None,
                     }]
                 } else {
                     vec![]
@@ -681,6 +682,7 @@ fn accepted_wait_output(
                                         title: "Fixture accepted agents".into(),
                                         title_source: Default::default(),
                                         ordinal: 0,
+                                        checkout: None,
                                     }],
                                     ..Default::default()
                                 },

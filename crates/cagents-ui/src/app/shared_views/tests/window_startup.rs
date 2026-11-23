@@ -110,6 +110,7 @@ fn joining_the_first_registry_keeps_the_selected_scope_default_intent() {
                 title: channel.title.clone(),
                 title_source: channel.title_source,
                 ordinal: channel.ordinal,
+                checkout: None,
             })
             .collect(),
         views: vec![View::empty(channel)],

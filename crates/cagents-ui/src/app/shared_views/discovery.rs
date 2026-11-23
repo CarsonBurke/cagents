@@ -1806,18 +1806,18 @@ mod tests {
         );
     }
 
-    /// Opening a worktree that holds no card puts a card in a scope the
-    /// sidebar row already discovers, and the saves around it discover
-    /// nothing again.
+    /// Opening a worktree that holds no card makes its channel and puts a
+    /// card there, and the saves around it discover nothing again.
     #[test]
     fn opening_a_worktree_without_a_card_discovers_nothing_again() {
         let (mut app, _, _directory) = large_workspace(&SMALL);
-        let (action, scope) = worktree_without_a_card(&mut app);
+        let (action, _) = worktree_without_a_card(&mut app);
         let reused = reset_discovery_counts(&app);
         drop(app.update(Message::Sidebar(action)));
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         app.persist();
-        assert_followed(&app, reused, &scope);
+        let channel = app.durable.active_channel.expect("the worktree's channel");
+        assert_followed(&app, reused, &Scope::Channel(channel));
     }
 
     /// A card in a worktree nothing else discovers, no root nor listed view,

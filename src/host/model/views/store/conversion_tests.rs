@@ -833,6 +833,7 @@ fn fresh() -> (Registry, tempfile::TempDir, Scope) {
             repository: "/repo".into(),
             title: "view".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     (registry, directory, Scope::Channel(channel))

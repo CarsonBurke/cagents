@@ -254,6 +254,7 @@ fn a_new_primary_conversation_carries_the_channel_title_it_reset() {
         repository: "/repo".into(),
         title: "Initial inferred title".into(),
         title_source: crate::model::ChannelTitleSource::Prompt,
+        checkout: None,
     })
     .unwrap();
     let mut original = live_source_pane();

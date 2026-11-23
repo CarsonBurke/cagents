@@ -190,6 +190,7 @@ fn an_agent_moves_only_the_panes_it_controls_and_makes_a_channel_only_by_moving_
             repository: repository.clone(),
             title: title.into(),
             title_source: Default::default(),
+            checkout: None,
         });
     }
     let own = pane(CardKind::Terminal(agent.clone()));
@@ -289,6 +290,7 @@ fn an_agent_moves_only_the_panes_it_controls_and_makes_a_channel_only_by_moving_
                     repository: project.clone(),
                     title: "Direct".into(),
                     title_source: Default::default(),
+                    checkout: None,
                 },
             },
         )
@@ -467,6 +469,7 @@ fn a_chat_agent_moves_its_own_pane_and_its_delegates_but_a_delegate_not_its_pare
                     repository: project.clone(),
                     title: title.into(),
                     title_source: Default::default(),
+                    checkout: None,
                 },
             },
         )
@@ -618,6 +621,7 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
             repository: repository.clone(),
             title: "Channel".into(),
             title_source: Default::default(),
+            checkout: None,
         });
     }
 

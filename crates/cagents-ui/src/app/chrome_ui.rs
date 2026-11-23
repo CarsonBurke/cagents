@@ -712,6 +712,7 @@ mod tests {
                 shared: false,
                 cards: vec![card],
                 focused: Some(card),
+                checkout: None,
             });
         let renderer = super::super::tests::headless_renderer();
         let mut tree = Tree::new(rename_fixture_view(&app).as_widget());
@@ -784,6 +785,7 @@ mod tests {
                 shared: true,
                 cards: Vec::new(),
                 focused: None,
+                checkout: None,
             }];
             app.note_channel_named(id);
             drop(app.update_chrome(Action::RenameChannel(id)));

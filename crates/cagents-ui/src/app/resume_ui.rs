@@ -2117,7 +2117,8 @@ impl Cagents {
     /// Enters the place a resumed conversation belongs: the channel it was
     /// closed in, brought back if it retired with its last card; else the
     /// channel `/resume` was asked from, when the conversation runs in that
-    /// channel's directory; else the conversation's own worktree.
+    /// channel's directory; else the channel of the conversation's own
+    /// checkout.
     fn enter_resumed_conversation_home(
         &mut self,
         home: Option<channel_ui::ClosedCardHome>,
@@ -2138,7 +2139,8 @@ impl Cagents {
                 .enter_closed_card_home(channel_ui::ClosedCardHome::Channel(channel))
                 .unwrap_or_else(Task::none);
         }
-        self.select_worktree(directory.clone(), false)
+        self.open_checkout(directory.clone(), false, DurableChange::Content)
+            .1
     }
 
     /// Closes the picker and stops indexing. Focus is left to whatever the
@@ -3508,6 +3510,7 @@ mod tests {
             shared: false,
             cards: vec![existing],
             focused: Some(existing),
+            checkout: None,
         });
         app.refresh_sidebar_channels();
 

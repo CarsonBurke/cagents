@@ -13181,6 +13181,7 @@ mod app_tests {
                 shared: true,
                 cards: Vec::new(),
                 focused: None,
+                checkout: None,
             });
         Arc::make_mut(&mut app.durable).active_channel = Some(channel);
         app.active_workspace = Some(PathBuf::from("/unrelated"));

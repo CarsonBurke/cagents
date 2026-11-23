@@ -117,6 +117,7 @@ impl RestoredWorkspace {
             title: "Unrelated".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         });
         let mut view = View::empty(unrelated_channel);
         view.revision = 1;
@@ -158,6 +159,7 @@ impl RestoredWorkspace {
                 title: format!("Channel {index}"),
                 title_source: Default::default(),
                 ordinal: index as u32 + 2,
+                checkout: None,
             });
             let mut channel = View::empty(project.channel);
             channel.revision = 3;
@@ -205,6 +207,7 @@ impl RestoredWorkspace {
                 shared: false,
                 cards: vec![],
                 focused: None,
+                checkout: None,
             });
         }
         app.workspace_model.sequence = 2;

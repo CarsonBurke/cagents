@@ -194,6 +194,7 @@ fn selected_worktree_and_channel_restore_their_focused_pane_from_stores() {
                 shared: false,
                 cards: vec![first.id, second.id],
                 focused: Some(second.id),
+                checkout: None,
             });
         }
         drop(app.restore_worktree_scope());
@@ -276,6 +277,7 @@ fn stale_channel_selection_does_not_enter_a_retained_panes_worktree() {
         shared: false,
         cards: vec![retained.id],
         focused: Some(retained.id),
+        checkout: None,
     });
     let workspace = durable.id;
     let boot = BootId::new("stale-channel-fixture");

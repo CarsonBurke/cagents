@@ -748,7 +748,7 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
     },
     ReleasedSource {
         protocol: 198,
-        // The signed releases 0.2.0 and 0.2.1 both serve it.
+        // The signed releases 0.2.0 to 0.2.3 all serve it.
         release: "0.2.1",
     },
 ];
@@ -822,6 +822,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (
         197,
         "intermediate #3708 protocol; superseded by 198 without a qualified installed update source",
+    ),
+    (
+        199,
+        "intermediate #3777 protocol; superseded by 200 without a qualified installed update source",
     ),
 ];
 

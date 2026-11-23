@@ -198,6 +198,7 @@ fn title_suggestion_sqlite_contention_keeps_the_host_lock_available() {
                 repository: directory.path().to_owned(),
                 title: String::new(),
                 title_source: Default::default(),
+                checkout: None,
             },
         },
     )
@@ -563,6 +564,7 @@ fn a_confirmed_project_close_cannot_take_a_channel_created_after_confirmation() 
                 repository: repository.clone(),
                 title: "created by another window".into(),
                 title_source: Default::default(),
+                checkout: None,
             },
         },
     )

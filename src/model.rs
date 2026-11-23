@@ -1250,6 +1250,12 @@ pub struct ProjectChannel {
     /// in the order they were created in.
     #[serde(default)]
     pub ordinal: u32,
+    /// The linked worktree the channel works in, mirrored from the shared
+    /// registry's `ModelChannel::checkout`. `None` is the project's main
+    /// checkout, as it is for every channel saved before channels had one,
+    /// and is left out of the saved record so those records stay as they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<PathBuf>,
     /// Whether the registry this window last reconciled against is known to
     /// hold this channel.
     ///
@@ -2087,6 +2093,7 @@ mod tests {
                 shared: false,
                 cards: vec![first, first, missing],
                 focused: Some(missing),
+                checkout: None,
             },
             ProjectChannel {
                 title_source: Default::default(),
@@ -2097,6 +2104,7 @@ mod tests {
                 shared: false,
                 cards: vec![first, second],
                 focused: Some(first),
+                checkout: None,
             },
         ];
         let mut active = Some(b);

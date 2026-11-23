@@ -6,6 +6,7 @@ fn create(id: ChannelId) -> ModelEdit {
         repository: "/repo".into(),
         title: "Channel".into(),
         title_source: Default::default(),
+        checkout: None,
     }
 }
 

@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 199,
+    proven_at: 200,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -128,6 +128,11 @@ pub(crate) const PATCH_LINE_ORIGIN: u16 = 195;
 /// for. An older client is told it waits, as it was before.
 pub(crate) const WAIT_KINDS: u16 = 199;
 
+/// The first protocol whose channels name the checkout they work in. A client
+/// before it is sent channels without one, and a channel it creates works in
+/// the main checkout.
+pub(crate) const CHANNEL_CHECKOUT: u16 = 200;
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
 /// added them. The wire format proof accepts exactly these.
@@ -144,7 +149,26 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
         &["lines"],
         PATCH_LINE_ORIGIN,
     ),
+    (
+        "cagents::workspace_model::ModelChannel",
+        &["checkout"],
+        CHANNEL_CHECKOUT,
+    ),
 ];
+
+/// Fields a later protocol added to a variant of a request's enum, which this
+/// daemon decodes an older client's request without: the enum's type name, the
+/// variant, its fields, and the protocol that added them. The connection reads
+/// such a client's requests in [`decoding_from`] scope, where each field's
+/// decoder reads nothing and takes its default. The wire format proof accepts
+/// exactly these.
+#[cfg(test)]
+const REQUEST_FIELDS_DECODED_WITHOUT: &[(&str, &str, &[&str], u16)] = &[(
+    "cagents::workspace_model::ModelEdit",
+    "CreateChannel",
+    &["checkout"],
+    CHANNEL_CHECKOUT,
+)];
 
 /// Fields a later protocol added to a struct that this side reads a message
 /// from an update source before it without: the struct's type name, the
@@ -240,10 +264,11 @@ thread_local! {
     static DECODING_FROM: Cell<Option<u16>> = const { Cell::new(None) };
 }
 
-/// Runs `decode` with this thread decoding a message from a daemon of
-/// `protocol`, such as an update source, so that values a later protocol
-/// added a field to decode as that daemon encoded them. The decode scope ends
-/// with `decode`, however it returns or unwinds.
+/// Runs `decode` with this thread decoding a message from a peer of
+/// `protocol`, such as an update source's daemon or an older CLI this daemon
+/// serves, so that values a later protocol added a field to decode as that
+/// peer encoded them. The decode scope ends with `decode`, however it returns
+/// or unwinds.
 pub(crate) fn decoding_from<R>(protocol: u16, decode: impl FnOnce() -> R) -> R {
     struct Restore(Option<u16>);
     impl Drop for Restore {
@@ -256,7 +281,7 @@ pub(crate) fn decoding_from<R>(protocol: u16, decode: impl FnOnce() -> R) -> R {
     decode()
 }
 
-/// Whether the value being decoded comes from a daemon before `protocol`.
+/// Whether the value being decoded comes from a peer before `protocol`.
 pub(crate) fn decoding_before(protocol: u16) -> bool {
     DECODING_FROM.get().is_some_and(|older| older < protocol)
 }

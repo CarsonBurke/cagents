@@ -580,6 +580,7 @@ mod tests {
             title: "Fixture".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         });
         // An existing target is never an overwrite capability.
         assert!(
@@ -617,6 +618,7 @@ mod tests {
             title: "Fixture".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         });
         model.views[0].scope = Scope::Channel(Default::default());
         model.views[0].panes[0].id = CardId::new();
@@ -654,6 +656,7 @@ mod tests {
             title: "Fixture".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         });
         assert_eq!(publish_revision(&model, &target, &repository).unwrap(), 0);
         assert!(publish_revision(&model, &target, &project).is_err());

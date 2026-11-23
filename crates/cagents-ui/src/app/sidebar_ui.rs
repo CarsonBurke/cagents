@@ -187,9 +187,11 @@ impl Cagents {
                 repository,
             } => {
                 let directory = self.project_entry_directory(project_id, &repository);
-                self.navigate_to_worktree(directory, true)
+                self.open_checkout(directory, true, DurableChange::Navigation).1
             }
-            SidebarAction::OpenWorktree { path, .. } => self.navigate_to_worktree(path, true),
+            SidebarAction::OpenWorktree { path, .. } => {
+                self.open_checkout(path, true, DurableChange::Navigation).1
+            }
             SidebarAction::BrowsePullRequests { project_id } => self.browse_pull_requests(project_id),
             SidebarAction::OpenPullRequest {
                 project_id,

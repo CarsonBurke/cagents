@@ -134,7 +134,7 @@ impl Cagents {
                     self.sync_worktree_operation_rows();
                     self.sidebar_model.data_state = SidebarDataState::Ready;
                     if open_cards && !self.refuse_in_deleting_worktree(&worktree) {
-                        task = self.select_worktree(worktree, true);
+                        task = self.open_checkout(worktree, true, DurableChange::Content).1;
                     }
                     // Publishing the reopened project below reads the
                     // rows before the projection after this update,
@@ -301,7 +301,7 @@ impl Cagents {
                 ]);
                 if open_cards {
                     if !self.refuse_in_deleting_worktree(&worktree) {
-                        task = self.select_worktree(worktree, true);
+                        task = self.open_checkout(worktree, true, DurableChange::Content).1;
                     }
                 } else if let Some(active) = self.active_workspace.clone()
                     && self.project_owns_active_scope(project_id, &active)

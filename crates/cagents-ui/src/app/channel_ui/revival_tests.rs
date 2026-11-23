@@ -90,6 +90,7 @@ fn fixture_with(unsent: bool) -> Fixture {
         shared: true,
         cards: std::iter::once(card).chain(unsent).collect(),
         focused: Some(card),
+        checkout: None,
     });
     app.sidebar_model.projects.push(SidebarProject::new(
         project,
@@ -120,6 +121,7 @@ fn fixture_with(unsent: bool) -> Fixture {
         title: "Investigation".into(),
         title_source: crate::model::ChannelTitleSource::Manual,
         ordinal: home.creation_ordinal,
+        checkout: None,
     });
     app.workspace_model.views.push(View {
         scope: Scope::Channel(channel),
@@ -324,6 +326,21 @@ impl Fixture {
             open: false,
             updated_at_unix_ms: 1,
         }
+    }
+
+    /// The channel a conversation resumed without a channel of its own opened
+    /// in: the main checkout's, made for it when there was none, which is
+    /// never the channel it was closed in.
+    fn resumed_in_checkout_channel(&self) -> &ProjectChannel {
+        let channel = self.active_channel();
+        assert_ne!(channel.id, self.channel);
+        assert_eq!(channel.checkout, None);
+        assert!(channel.cards.contains(&self.resumed().id));
+        assert_eq!(
+            self.app.active_workspace.as_deref(),
+            Some(self.directory.path())
+        );
+        channel
     }
 
     /// The card on screen, which must be the conversation resumed again.
@@ -572,7 +589,8 @@ fn resuming_from_the_picker_returns_to_the_revived_channel() {
 }
 
 /// A channel the user deleted stays deleted: reopening a card that was closed
-/// in it opens nothing, and resuming it from the picker uses its worktree.
+/// in it opens nothing, and resuming it from the picker opens it in its
+/// checkout's channel, made for it under the branch's name.
 #[test]
 fn a_deleted_channel_is_not_revived() {
     let mut fixture = fixture();
@@ -599,25 +617,23 @@ fn a_deleted_channel_is_not_revived() {
     assert_eq!(fixture.app.durable.cards.len(), cards);
 
     drop(fixture.app.resume_saved_conversation(saved));
-    assert_eq!(fixture.app.durable.channels.len(), channels);
-    assert_eq!(fixture.app.durable.active_channel, None);
-    assert_eq!(
-        fixture.app.active_workspace.as_deref(),
-        Some(fixture.directory.path())
-    );
+    assert_eq!(fixture.app.durable.channels.len(), channels + 1);
+    assert_eq!(fixture.resumed_in_checkout_channel().title, "main");
     assert_eq!(fixture.resumed().title, TITLE);
 }
 
 /// A local deletion's close can tombstone its open pane before the receipt
-/// removes the channel. Even after the registry forgets its retired view,
-/// the saved picker must not place that conversation in another channel.
+/// removes the channel. Once the registry forgets its retired view, the
+/// conversation has no channel of its own to return to, so the saved picker
+/// opens it where its checkout opens: the main checkout's channel the user
+/// was last in.
 #[test]
-fn a_conversation_deleted_while_open_resumes_in_its_worktree() {
+fn a_conversation_deleted_while_open_resumes_in_its_checkouts_channel() {
     let mut fixture = fixture();
     let saved = fixture.saved();
     let boundary = fixture
         .app
-        .create_channel(fixture.project, "Boundary".into(), Default::default())
+        .create_channel(fixture.project, "Boundary".into(), Default::default(), None)
         .unwrap();
     drop(
         fixture
@@ -700,13 +716,16 @@ fn a_conversation_deleted_while_open_resumes_in_its_worktree() {
     assert_eq!(fixture.app.durable.cards.len(), cards);
     assert_eq!(fixture.active_channel(), &other);
     drop(fixture.app.resume_saved_conversation(saved));
-    assert_eq!(fixture.app.durable.active_channel, None);
+    assert_eq!(fixture.app.durable.active_channel, Some(boundary));
     assert_eq!(
         fixture.app.active_workspace.as_deref(),
         Some(fixture.directory.path())
     );
-    assert_eq!(fixture.app.durable.channels, vec![other]);
-    assert_eq!(fixture.resumed().title, TITLE);
+    assert_eq!(fixture.app.durable.channels.len(), 1, "no channel is made");
+    let resumed = fixture.resumed().clone();
+    assert_eq!(resumed.title, TITLE);
+    assert!(fixture.active_channel().cards.contains(&resumed.id));
+    assert_eq!(fixture.active_channel().title, other.title);
     assert!(fixture.app.recently_closed.is_empty());
 }
 
@@ -1015,21 +1034,27 @@ fn an_explicit_peer_deletion_during_retirement_is_final() {
         ));
         let cards = fixture.app.durable.cards.len();
         fixture.reopen_pane();
-        assert!(fixture.app.durable.channels.is_empty());
         assert!(fixture.app.channel_ui.emptied.is_empty());
-        if picker {
+        let survivors = if picker {
             assert_eq!(fixture.resumed().title, TITLE);
-            assert_eq!(fixture.app.durable.active_channel, None);
-            assert_eq!(
-                fixture.app.active_workspace.as_deref(),
-                Some(fixture.directory.path())
-            );
+            vec![fixture.resumed_in_checkout_channel().id]
         } else {
             assert_eq!(fixture.app.durable.cards.len(), cards);
-        }
+            Vec::new()
+        };
+        let channels = |fixture: &Fixture| {
+            fixture
+                .app
+                .durable
+                .channels
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(channels(&fixture), survivors);
         // A late answer cannot restore privilege revoked by the deletion.
         fixture.answer_retirement(true);
-        assert!(fixture.app.durable.channels.is_empty());
+        assert_eq!(channels(&fixture), survivors);
     }
 }
 
@@ -1059,8 +1084,8 @@ fn an_explicit_peer_deletion_overtaken_by_its_snapshot_stays_final() {
     fixture.reopen_pane();
     assert!(fixture.app.durable.channels.is_empty());
     drop(fixture.app.resume_saved_conversation(saved));
-    assert!(fixture.app.durable.channels.is_empty());
-    assert_eq!(fixture.app.durable.active_channel, None);
+    assert_eq!(fixture.app.durable.channels.len(), 1);
+    fixture.resumed_in_checkout_channel();
     assert_eq!(fixture.resumed().title, TITLE);
 }
 
@@ -1100,11 +1125,32 @@ fn an_explicit_peer_deletion_severs_a_revival_created_before_its_edge() {
             },
         },
     ));
+    // Another channel in the same checkout is where the user is, so the
+    // conversation opens there unless the severed revival still claims it.
+    let boundary = fixture
+        .app
+        .create_channel(fixture.project, "Boundary".into(), Default::default(), None)
+        .unwrap();
+    drop(fixture.app.select_channel(boundary));
     drop(fixture.app.resume_saved_conversation(another));
 
-    assert_eq!(fixture.app.durable.channels.len(), 1);
-    assert_eq!(fixture.app.durable.channels[0].cards, revived.cards);
-    assert_eq!(fixture.app.durable.active_channel, None);
+    assert_eq!(fixture.app.durable.channels.len(), 2);
+    let kept = |id| {
+        fixture
+            .app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .unwrap()
+    };
+    assert_eq!(kept(revived.id).cards, revived.cards);
+    assert_eq!(fixture.app.durable.active_channel, Some(boundary));
+    assert!(
+        kept(boundary)
+            .cards
+            .contains(&fixture.app.durable.focused.unwrap())
+    );
     assert!(
         !fixture
             .app
@@ -1134,8 +1180,8 @@ fn a_shared_view_names_the_channel_a_card_was_removed_from() {
     assert_eq!(fixture.app.durable.active_channel, Some(fixture.channel));
 
     // A pane that moved between views was removed from each it left, which
-    // names no single one; even from another channel in the same project,
-    // the conversation then opens in its worktree.
+    // names no single one; the conversation then opens where its checkout
+    // opens, here the main checkout's channel the user is in.
     let mut fixture = self::fixture();
     let saved = SavedConversation {
         card: fixture.card,
@@ -1157,7 +1203,7 @@ fn a_shared_view_names_the_channel_a_card_was_removed_from() {
     });
     let boundary = fixture
         .app
-        .create_channel(fixture.project, "Boundary".into(), Default::default())
+        .create_channel(fixture.project, "Boundary".into(), Default::default(), None)
         .unwrap();
     drop(fixture.app.select_channel(boundary));
     let other = fixture.active_channel().clone();
@@ -1166,19 +1212,8 @@ fn a_shared_view_names_the_channel_a_card_was_removed_from() {
         Some(ClosedCardHome::Strip)
     );
     drop(fixture.app.resume_saved_conversation(saved));
-    assert_eq!(fixture.app.durable.active_channel, None);
-    assert_eq!(
-        fixture.app.active_workspace.as_deref(),
-        Some(fixture.directory.path())
-    );
-    assert!(
-        fixture
-            .app
-            .durable
-            .channels
-            .iter()
-            .any(|channel| channel == &other)
-    );
+    assert_eq!(fixture.app.durable.active_channel, Some(other.id));
+    assert_eq!(fixture.resumed_in_checkout_channel().title, other.title);
 }
 
 /// A conversation this window never saw close, resumed from a channel in its
@@ -1256,11 +1291,8 @@ fn a_channel_deleted_elsewhere_is_not_revived() {
     assert_eq!(fixture.app.durable.cards.len(), cards);
 
     drop(fixture.app.resume_saved_conversation(saved));
-    assert!(fixture.app.durable.channels.is_empty());
-    assert_eq!(
-        fixture.app.active_workspace.as_deref(),
-        Some(fixture.directory.path())
-    );
+    assert_eq!(fixture.app.durable.channels.len(), 1);
+    fixture.resumed_in_checkout_channel();
     assert_eq!(fixture.resumed().title, TITLE);
 }
 
@@ -1286,7 +1318,7 @@ fn reopening_in_another_project_leaves_a_retired_channel_alone() {
     drop(fixture.app.select_worktree(path, false));
     let other = fixture
         .app
-        .create_channel(fixture.project, "Other".into(), Default::default())
+        .create_channel(fixture.project, "Other".into(), Default::default(), None)
         .unwrap();
     drop(fixture.app.select_channel(other));
     assert_eq!(fixture.app.durable.active_channel, Some(other));
@@ -1413,6 +1445,7 @@ fn a_channel_named_from_its_conversation_gets_the_name_back() {
         title: String::new(),
         title_source: source,
         ordinal: 9,
+        checkout: None,
     });
     model.views.push(View {
         scope: Scope::Channel(revived),

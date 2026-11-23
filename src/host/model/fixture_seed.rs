@@ -87,6 +87,7 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
                 repository: plan.project(channel.project)?.repository.clone(),
                 title: channel.title.clone(),
                 title_source: channel.title_source,
+                checkout: None,
             },
         )?;
     }

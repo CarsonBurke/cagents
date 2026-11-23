@@ -29,6 +29,7 @@ fn shared_channel_app() -> (Cagents, Scope, tempfile::TempDir) {
         shared: true,
         cards: vec![],
         focused: None,
+        checkout: None,
     });
     durable.active_channel = Some(channel);
     app.workspace_model.identity = uuid::Uuid::new_v4();

@@ -22,6 +22,7 @@ fn setup() -> (Registry, tempfile::TempDir, ChannelId) {
             repository: "/repo".into(),
             title: "channel".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     (registry, dir, channel)
@@ -57,6 +58,7 @@ fn no_op_receipts_supply_canonical_metadata_without_advancing_the_clock() {
             repository: "/repo".into(),
             title: "stale optimistic name".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     assert!(!receipt.changed);
@@ -95,6 +97,7 @@ fn a_delta_commit_and_scope_read_do_not_parse_an_unrelated_scope() {
             repository: "/repo".into(),
             title: "other".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     let broken = pane();
@@ -200,6 +203,7 @@ fn subscriber_snapshot_excludes_transfer_tombstones_from_closed_identities() {
             repository: "/repo".into(),
             title: "other".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
     let moved = pane();

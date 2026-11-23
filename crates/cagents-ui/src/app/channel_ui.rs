@@ -4,6 +4,8 @@ use crate::sidebar::SidebarChannel;
 use crate::workspace_model::ModelEdit;
 use std::collections::BTreeMap;
 
+mod checkout;
+
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
 /// daemon itself reports rather than the saved descriptors, together with the
 /// source terminal a converted chat keeps running.
@@ -523,6 +525,7 @@ struct EmptiedChannel {
     project_id: ProjectId,
     title: String,
     title_source: crate::model::ChannelTitleSource,
+    checkout: Option<PathBuf>,
 }
 
 /// As many emptied channels as there are recently closed cards to reopen.
@@ -725,7 +728,18 @@ impl Cagents {
     /// workspace saves it. Only a channel this window just `created` is known
     /// to be empty before its shared view loads.
     fn open_channel_with_default(&mut self, id: ChannelId, created: bool) -> Task<Message> {
-        let scope = self.navigate_to_channel(id);
+        self.show_channel_with_default(id, created, DurableChange::Navigation)
+    }
+
+    /// Shows channel `id` with a default pane when it holds none, recording
+    /// the switch as `change`.
+    fn show_channel_with_default(
+        &mut self,
+        id: ChannelId,
+        created: bool,
+        change: DurableChange,
+    ) -> Task<Message> {
+        let scope = self.show_channel(id, change);
         if self.durable.active_channel != Some(id) {
             return scope;
         }
@@ -890,7 +904,8 @@ impl Cagents {
                 self.delete_channel(id)
             }
             Action::Create(project_id) => {
-                let Some(id) = self.create_channel(project_id, String::new(), Default::default())
+                let Some(id) =
+                    self.create_channel(project_id, String::new(), Default::default(), None)
                 else {
                     return Task::none();
                 };
@@ -939,11 +954,14 @@ impl Cagents {
     ///
     /// An empty `title` means the channel awaits its first accepted prompt; a
     /// nonempty one, including a user's, is never replaced by that prompt.
-    fn create_channel(
+    /// `checkout` names the linked worktree the channel works in, and `None`
+    /// keeps it in the project's main checkout.
+    pub(super) fn create_channel(
         &mut self,
         project_id: ProjectId,
         title: String,
         title_source: crate::model::ChannelTitleSource,
+        checkout: Option<PathBuf>,
     ) -> Option<ChannelId> {
         let project = self
             .sidebar_model
@@ -956,7 +974,12 @@ impl Cagents {
             self.status = Some(TransientNotice::warning("That project is being removed."));
             return None;
         }
-        let directory = self.project_primary_worktree(project_id)?;
+        // Its new panes start in this directory, so it must not be removed
+        // while the channel is being made.
+        let directory = match &checkout {
+            Some(checkout) => checkout.clone(),
+            None => self.project_primary_worktree(project_id)?,
+        };
         if let Err(error) = self.worktree_protections.protect_next(&directory) {
             self.status = Some(TransientNotice::warning(format!(
                 "Cannot open this worktree yet: {error}"
@@ -984,6 +1007,7 @@ impl Cagents {
                 shared: false,
                 cards: Vec::new(),
                 focused: None,
+                checkout,
             });
         self.publish_channel_creation(id, project_id);
         self.sidebar_state.reveal_project(project_id);
@@ -1288,6 +1312,7 @@ impl Cagents {
             project_id: channel.project_id,
             title: channel.title.clone(),
             title_source: channel.title_source,
+            checkout: channel.checkout.clone(),
         };
         self.channel_ui.revived.remove(&retired);
         self.remember_emptied(snapshot);
@@ -1323,10 +1348,25 @@ impl Cagents {
             .iter()
             .position(|emptied| emptied.id == id)?;
         let emptied = self.channel_ui.emptied[index].clone();
+        // A worktree removed since the channel emptied can no longer hold it,
+        // so the channel comes back in the main checkout instead.
+        let checkout = emptied.checkout.clone().filter(|checkout| {
+            self.sidebar_model
+                .project(emptied.project_id)
+                .and_then(|project| {
+                    super::worktree_ui::listed_worktree(
+                        project,
+                        &self.known_worktree_roots,
+                        checkout,
+                    )
+                })
+                .is_some()
+        });
         let revived = self.create_channel(
             emptied.project_id,
             emptied.title.clone(),
             emptied.title_source,
+            checkout,
         )?;
         self.channel_ui.emptied.remove(index);
         self.channel_ui.revived.insert(id, revived);
@@ -1572,6 +1612,7 @@ impl Cagents {
                 project_id: channel.project_id,
                 title: channel.title.clone(),
                 title_source: channel.title_source,
+                checkout: channel.checkout.clone(),
             };
             self.remember_emptied(snapshot);
         }
@@ -2405,26 +2446,9 @@ impl Cagents {
 
     /// Where a project's workspace falls back to when no channel is selected.
     fn project_primary_worktree(&self, project_id: ProjectId) -> Option<PathBuf> {
-        let project = self.sidebar_model.project(project_id)?;
-        Some(
-            project
-                .worktrees
-                .iter()
-                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
-                .map_or_else(
-                    || {
-                        project
-                            .repository
-                            .parent()
-                            .filter(|parent| {
-                                sidebar::is_primary_worktree(&project.repository, parent)
-                            })
-                            .unwrap_or(&project.repository)
-                            .to_path_buf()
-                    },
-                    |worktree| worktree.path.clone(),
-                ),
-        )
+        self.sidebar_model
+            .project(project_id)
+            .map(super::worktree_ui::project_main_checkout)
     }
 
     pub(super) fn channel_dialog_view(&self) -> Option<Element<'_, Message>> {
@@ -2855,6 +2879,7 @@ pub(in crate::app) mod tests {
                 title: "Work".into(),
                 title_source: Default::default(),
                 ordinal: home.creation_ordinal,
+                checkout: None,
             }],
             views: vec![View {
                 scope: Scope::Channel(home.channel),
@@ -2931,6 +2956,7 @@ pub(in crate::app) mod tests {
                     shared: true,
                     cards: vec![card],
                     focused: Some(card),
+                    checkout: None,
                 });
             drop(app.close_emptied_channels(&[card]));
             assert_eq!(
@@ -3019,6 +3045,7 @@ pub(in crate::app) mod tests {
             shared: false,
             cards: vec![],
             focused: None,
+            checkout: None,
         };
         Arc::make_mut(&mut app.durable)
             .channels
@@ -3168,6 +3195,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: vec![card],
                 focused: Some(card),
+                checkout: None,
             });
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -3226,6 +3254,7 @@ pub(in crate::app) mod tests {
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -3306,6 +3335,7 @@ pub(in crate::app) mod tests {
             shared: true,
             cards: vec![utility, a.id, b.id],
             focused: Some(a.id),
+            checkout: None,
         });
         app.workspace_model.views.push(View {
             scope: Scope::Channel(id),
@@ -3407,6 +3437,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 focused: cards.first().copied(),
                 cards,
+                checkout: None,
             });
         }
         let live = app.durable.channels[7].id;
@@ -3470,6 +3501,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: vec![card],
                 focused: Some(card),
+                checkout: None,
             });
         }
         drop(app.sync_chrome());
@@ -3536,6 +3568,7 @@ pub(in crate::app) mod tests {
             shared: false,
             cards: vec![terminal, first, second],
             focused: Some(first),
+            checkout: None,
         });
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -3583,6 +3616,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: vec![shell],
                 focused: Some(shell),
+                checkout: None,
             });
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -3631,6 +3665,7 @@ pub(in crate::app) mod tests {
             shared: false,
             cards: vec![shell, idle, working, unstarted],
             focused: Some(idle),
+            checkout: None,
         });
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -3751,6 +3786,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards,
                 focused: None,
+                checkout: None,
             });
             let _ = app.handle_channel_ui(Action::Delete(id));
             assert!(!app.durable.channels.iter().any(|channel| channel.id == id));
@@ -3775,6 +3811,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: vec![card],
                 focused: Some(card),
+                checkout: None,
             });
         let _ = app.handle_channel_ui(Action::Delete(id));
         assert_eq!(
@@ -4069,6 +4106,7 @@ pub(in crate::app) mod tests {
             shared: false,
             cards: vec![conversation],
             focused: Some(conversation),
+            checkout: None,
         });
         durable.channels.push(ProjectChannel {
             title_source: Default::default(),
@@ -4079,6 +4117,7 @@ pub(in crate::app) mod tests {
             shared: false,
             cards: Vec::new(),
             focused: None,
+            checkout: None,
         });
         durable.active_channel = Some(doomed);
         app.sidebar_model.projects.push(SidebarProject::new(
@@ -4117,6 +4156,7 @@ pub(in crate::app) mod tests {
                     shared: false,
                     cards: Vec::new(),
                     focused: None,
+                    checkout: None,
                 });
             channels.push(id);
         }
@@ -4498,6 +4538,7 @@ pub(in crate::app) mod tests {
             shared: true,
             cards: vec![conversation, settings],
             focused: Some(settings),
+            checkout: None,
         });
         app.cards.insert(settings, CardRuntime::Settings);
 

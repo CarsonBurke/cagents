@@ -1350,22 +1350,28 @@ impl Cagents {
                     }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;
-                        let select = self.select_worktree(target.path.clone(), false);
-                        let terminal = self.add_terminal(target.path);
-                        return Task::batch([select, terminal]);
+                        let (opened, scope) =
+                            self.open_checkout(target.path, false, DurableChange::Content);
+                        if !opened {
+                            return scope;
+                        }
+                        // The checkout's channel, or its strip, is now the
+                        // scope, and it names the directory the pane starts in.
+                        let directory = self.active_workspace.clone().expect("opened checkout");
+                        let terminal = self.add_terminal(directory);
+                        return Task::batch([scope, terminal]);
                     }
                     ProjectCommand::NewChannel => {
                         self.project_ui.dialog = None;
                         if target.worktree.is_some() {
-                            let (selected, scope) =
-                                self.select_worktree_checked(target.path, false);
-                            if !selected {
+                            let (opened, scope) =
+                                self.open_checkout(target.path, false, DurableChange::Content);
+                            if !opened {
                                 return scope;
                             }
-                            // Selection commits synchronously, including aliases;
+                            // Opening commits synchronously, including aliases;
                             // do not reconstruct the target from a later callback.
-                            let directory =
-                                self.active_workspace.clone().expect("selected worktree");
+                            let directory = self.active_workspace.clone().expect("opened checkout");
                             let thread = self.new_native_thread_at(directory);
                             return Task::batch([scope, thread]);
                         }
@@ -3846,7 +3852,7 @@ pub(in crate::app) mod tests {
     }
 
     #[test]
-    fn worktree_row_thread_uses_successful_selected_scope_and_refuses_before_draft() {
+    fn worktree_row_thread_opens_in_the_worktrees_channel_and_refuses_before_draft() {
         for blocked in [true, false] {
             let repository = tempfile::tempdir().unwrap();
             let linked_directory = tempfile::tempdir().unwrap();
@@ -3891,6 +3897,7 @@ pub(in crate::app) mod tests {
                     "refused physical protection cannot expose a draft"
                 );
                 assert_eq!(app.durable.card_scopes, old_scopes);
+                assert!(app.durable.channels.is_empty());
                 assert!(
                     app.status
                         .as_ref()
@@ -3903,11 +3910,12 @@ pub(in crate::app) mod tests {
                     app.active_workspace.as_deref(),
                     Some(linked_directory.path())
                 );
-                assert!(app.durable.active_channel.is_none());
-                assert!(
-                    app.durable.channels.is_empty(),
-                    "worktree row opens a thread, not a project channel"
-                );
+                let [channel] = &app.durable.channels[..] else {
+                    panic!("the worktree's own channel holds the thread");
+                };
+                assert_eq!(app.durable.active_channel, Some(channel.id));
+                assert_eq!(channel.checkout.as_deref(), Some(linked_directory.path()));
+                assert_eq!(channel.title, "feature/login");
                 let added = app
                     .durable
                     .cards
@@ -4457,6 +4465,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: Vec::new(),
                 focused: None,
+                checkout: None,
             });
         let _ = app.select_channel(channel);
         let target = app.project_ui.deletions[&id].target.clone();
@@ -4510,6 +4519,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: vec![child_card],
                 focused: Some(child_card),
+                checkout: None,
             });
         Arc::make_mut(&mut app.durable).active_channel = Some(channel);
         let CardKind::Terminal(session) = &mut app.card_state_mut(child_card).unwrap().kind else {

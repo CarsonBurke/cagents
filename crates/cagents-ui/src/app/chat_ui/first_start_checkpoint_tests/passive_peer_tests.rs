@@ -568,6 +568,7 @@ fn run(initialized: bool) {
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
     Arc::make_mut(&mut creator.durable).active_channel = Some(channel);
     let scope = Scope::Channel(channel);

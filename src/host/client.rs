@@ -256,7 +256,11 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
     let mut older = None;
     loop {
         let frame = if connected {
-            codec.read::<ClientEnvelope>(&mut reader)
+            // An older CLI's requests are read as it encoded them; see
+            // `REQUEST_FIELDS_DECODED_WITHOUT`.
+            crate::terminal_ipc::decoding_from(protocol.unwrap_or(PROTOCOL_VERSION), || {
+                codec.read::<ClientEnvelope>(&mut reader)
+            })
         } else {
             read_handshake_frame(&mut reader, handshake_deadline)
         };

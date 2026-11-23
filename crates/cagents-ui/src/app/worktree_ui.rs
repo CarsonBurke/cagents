@@ -158,6 +158,15 @@ impl KnownWorktreeRoots {
         self.roots.contains(root)
     }
 
+    /// Whether `root` is known to be the directory whose canonical form is
+    /// `form`, as resolved by the last [`Cagents::refresh_worktree_owners`].
+    pub(super) fn is_alias(&self, form: &Path, root: &Path) -> bool {
+        self.canonical
+            .roots
+            .get(form)
+            .is_some_and(|aliases| aliases.iter().any(|alias| alias == root))
+    }
+
     pub(super) fn iter(&self) -> std::collections::hash_set::Iter<'_, PathBuf> {
         self.roots.iter()
     }
@@ -498,6 +507,54 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
     }
 }
 
+/// A project's main checkout: its primary worktree, or the folder itself.
+///
+/// A submodule's or a `--separate-git-dir` checkout's repository is a Git
+/// directory kept elsewhere, which names none of its rows. `git worktree
+/// list` names the main checkout first, so the first row is that checkout;
+/// the Git directory itself is never a place to work.
+pub(super) fn project_main_checkout(project: &SidebarProject) -> PathBuf {
+    let separate = project.kind != ProjectKind::Folder
+        && project
+            .repository
+            .file_name()
+            .is_some_and(|name| name != ".git");
+    project
+        .worktrees
+        .iter()
+        .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+        .or_else(|| separate.then(|| project.worktrees.first()).flatten())
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or_else(|| {
+            project
+                .repository
+                .parent()
+                .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                .unwrap_or(&project.repository)
+                .to_path_buf()
+        })
+}
+
+/// Whether `path` is still one of `project`'s worktrees. A channel's checkout
+/// can be removed outside this window, and a channel never works in a
+/// directory that no longer exists.
+///
+/// The registry records a checkout in its canonical form, which need not be
+/// the spelling `git worktree list` gave the row, so a known alias of the row
+/// matches too. The answer is the row's own spelling, the one panes and
+/// strips are filed under.
+pub(super) fn listed_worktree<'a>(
+    project: &'a SidebarProject,
+    known: &KnownWorktreeRoots,
+    checkout: &Path,
+) -> Option<&'a Path> {
+    project
+        .worktrees
+        .iter()
+        .map(|worktree| worktree.path.as_path())
+        .find(|path| *path == checkout || known.is_alias(checkout, path))
+}
+
 pub(super) fn belongs_to_scope(
     card: &CardState,
     scope: &Path,
@@ -743,7 +800,10 @@ impl Cagents {
         }
     }
 
-    /// The exact directory a channel enters, also used by navigation admission.
+    /// The exact directory a channel enters, where its new panes start, also
+    /// used by navigation admission: the channel's checkout while it is still
+    /// one of its project's worktrees, and otherwise the project's main
+    /// checkout, so a channel whose worktree was removed still opens.
     pub(super) fn channel_directory(&self, id: ChannelId) -> Option<PathBuf> {
         let channel = self
             .durable
@@ -752,19 +812,11 @@ impl Cagents {
             .find(|channel| channel.id == id)?;
         let project = self.sidebar_model.project(channel.project_id)?;
         Some(
-            project
-                .worktrees
-                .iter()
-                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
-                .map(|worktree| worktree.path.clone())
-                .unwrap_or_else(|| {
-                    project
-                        .repository
-                        .parent()
-                        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
-                        .unwrap_or(&project.repository)
-                        .to_path_buf()
-                }),
+            channel
+                .checkout
+                .as_deref()
+                .and_then(|checkout| listed_worktree(project, &self.known_worktree_roots, checkout))
+                .map_or_else(|| project_main_checkout(project), Path::to_path_buf),
         )
     }
 
@@ -781,7 +833,7 @@ impl Cagents {
         self.show_channel(id, DurableChange::Navigation)
     }
 
-    fn show_channel(&mut self, id: ChannelId, change: DurableChange) -> Task<Message> {
+    pub(super) fn show_channel(&mut self, id: ChannelId, change: DurableChange) -> Task<Message> {
         let Some(path) = self.channel_directory(id) else {
             return Task::none();
         };
@@ -844,7 +896,7 @@ impl Cagents {
     /// The known roots keep their canonical forms between calls, so this
     /// resolves only the directories of open panes and `selected`, not every
     /// worktree the window has known.
-    fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
+    pub(super) fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
         // Deleted worktree rows disappear from navigation, not from ownership.
         // Otherwise a surviving nested session would fall into its parent repo.
         self.known_worktree_roots
@@ -1103,17 +1155,12 @@ impl Cagents {
         }
     }
 
-    /// A project opens in its first worktree, or its repository without one.
+    /// A project opens in its main checkout, where its channels work by
+    /// default.
     pub(super) fn project_entry_directory(&self, project: ProjectId, repository: &Path) -> PathBuf {
         self.sidebar_model
-            .projects
-            .iter()
-            .find(|row| row.id == project)
-            .and_then(|row| row.worktrees.first())
-            .map_or_else(
-                || repository.to_path_buf(),
-                |worktree| worktree.path.clone(),
-            )
+            .project(project)
+            .map_or_else(|| repository.to_path_buf(), project_main_checkout)
     }
 
     pub(super) fn select_worktree(
@@ -1158,7 +1205,24 @@ impl Cagents {
         self.show_worktree(path, create_if_empty, DurableChange::Navigation)
     }
 
-    fn show_worktree(
+    /// Whether the legacy strip of the checkout at `root` still holds an open
+    /// pane outside every channel. Opening that checkout keeps showing the
+    /// strip until such panes are moved into channels, so none of them
+    /// becomes unreachable. Utility panes appear in every strip and count for
+    /// none. `root` and the panes' owners come from the last
+    /// [`Self::refresh_worktree_owners`].
+    pub(super) fn legacy_strip_holds_panes(&self, root: &Path) -> bool {
+        let channeled = channeled_cards(&self.durable);
+        let roots = &self.worktree_paths;
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && !card.kind.is_utility()
+                && !channeled.contains(&card.id)
+                && self.unchanneled_card_worktree_indexed(card, &roots) == Some(root)
+        })
+    }
+
+    pub(super) fn show_worktree(
         &mut self,
         path: PathBuf,
         create_if_empty: bool,
@@ -1372,8 +1436,15 @@ impl Cagents {
         {
             return Some(path.clone());
         }
-        if let Some(path) = &self.active_workspace {
-            return Some(path.clone());
+        // A channel's directory rather than the strip it installed: the
+        // channel's checkout may have been listed, or removed, since.
+        if let Some(path) = self
+            .durable
+            .active_channel
+            .and_then(|channel| self.channel_directory(channel))
+            .or_else(|| self.active_workspace.clone())
+        {
+            return Some(path);
         }
         let card = self
             .workspace
@@ -1593,6 +1664,32 @@ mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectChannel};
 
+    /// A submodule keeps its Git directory inside the superproject's, which
+    /// is never where its panes should start: its main checkout is the row
+    /// `git worktree list` names first. A Git directory named `.git` still
+    /// finds its checkout beside it, wherever that row is listed.
+    #[test]
+    fn a_main_checkout_is_never_a_git_directory_kept_elsewhere() {
+        let row = |path: &str| SidebarWorktree::from_durable(WorktreeId::new(), path.into(), None);
+        let project = |repository: &str, rows: Vec<SidebarWorktree>| {
+            SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "repo".into(),
+                repository.into(),
+                rows,
+                Vec::new(),
+            )
+        };
+        let submodule = project(
+            "/super/.git/modules/sub",
+            vec![row("/super/sub"), row("/super/sub-feature")],
+        );
+        assert_eq!(project_main_checkout(&submodule), Path::new("/super/sub"));
+        let ordinary = project("/repo/.git", vec![row("/repo-feature"), row("/repo")]);
+        assert_eq!(project_main_checkout(&ordinary), Path::new("/repo"));
+    }
+
     thread_local! {
         /// How many cards this thread has searched every channel for.
         pub(super) static CHANNEL_SEARCHES: std::cell::Cell<usize> =
@@ -1628,6 +1725,7 @@ mod tests {
                 shared: false,
                 cards: chunk[..4].iter().map(|card| card.id).collect(),
                 focused: None,
+                checkout: None,
             })
             .collect::<Vec<_>>();
         let card_count = cards.len();
@@ -1686,6 +1784,7 @@ mod tests {
                 shared: false,
                 cards: vec![channeled.id],
                 focused: Some(channeled.id),
+                checkout: None,
             }],
             ..WorkspaceState::default()
         });
@@ -1738,6 +1837,7 @@ mod tests {
                     shared: false,
                     cards: vec![first.id, focused.id],
                     focused: Some(focused.id),
+                    checkout: None,
                 },
                 ProjectChannel {
                     title_source: Default::default(),
@@ -1748,6 +1848,7 @@ mod tests {
                     shared: false,
                     cards: vec![second.id],
                     focused: Some(second.id),
+                    checkout: None,
                 },
             ],
             ..WorkspaceState::default()
@@ -1799,6 +1900,7 @@ mod tests {
                 shared: false,
                 cards: vec![closed.id],
                 focused: Some(closed.id),
+                checkout: None,
             }],
             ..WorkspaceState::default()
         });
@@ -1906,6 +2008,7 @@ mod tests {
                 shared: false,
                 cards: vec![channeled.id],
                 focused: Some(channeled.id),
+                checkout: None,
             }],
             ..WorkspaceState::default()
         });
@@ -1990,6 +2093,7 @@ mod tests {
                 shared: false,
                 cards: vec![channeled.id],
                 focused: Some(channeled.id),
+                checkout: None,
             }],
             ..WorkspaceState::default()
         });
@@ -2053,6 +2157,7 @@ mod tests {
                 shared: true,
                 cards: Vec::new(),
                 focused: None,
+                checkout: None,
             });
         let _ = app.select_channel(empty);
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
@@ -3461,7 +3566,7 @@ mod tests {
     }
 
     #[test]
-    fn a_created_nested_worktree_gets_its_own_terminal_and_git_context() {
+    fn a_created_nested_worktree_opens_in_its_own_channel_with_a_terminal_there() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("worktrees/topic");
         let project = ProjectId::new();
@@ -3472,7 +3577,7 @@ mod tests {
         app.workspace_model_tx = tx;
         // These selection checks run after the shared registry has hydrated.
         app.workspace_model.identity = uuid::Uuid::new_v4();
-        app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
+        app.settings.default_channel_pane = settings::DefaultPane::Terminal;
         let parent_terminal = terminal(root.path().to_str().unwrap());
         app.durable = Arc::new(WorkspaceState {
             cards: vec![parent_terminal.clone()].into(),
@@ -3515,13 +3620,17 @@ mod tests {
                 warnings: Vec::new(),
             }),
         });
-        assert!(app.workspace.cards().is_empty());
-        acknowledge_empty_default_scope(&mut app);
+        // The parent's strip keeps its own pane, which is not the new
+        // worktree's: the new worktree gets a channel of its own, which this
+        // window made and so knows to be empty without waiting for the
+        // registry.
+        let [channel] = &app.durable.channels[..] else {
+            panic!("the new worktree's channel");
+        };
+        assert_eq!(app.durable.active_channel, Some(channel.id));
+        assert_eq!(channel.checkout.as_deref(), Some(nested.as_path()));
+        assert_eq!(channel.title, "topic");
         assert_eq!(app.terminal_directory(), Some(nested.clone()));
-        assert_eq!(
-            app.sidebar_state.active_worktree().unwrap().canonical_path,
-            nested
-        );
         assert_eq!(app.durable.cards.len(), 2);
         assert!(app.workspace.card(parent_terminal.id).is_none());
         let terminal = app.card_state(app.workspace.focused().unwrap()).unwrap();

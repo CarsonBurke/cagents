@@ -489,6 +489,7 @@ fn model(
                 title: "view".into(),
                 title_source: Default::default(),
                 ordinal: 1,
+                checkout: None,
             })
             .collect(),
         views: vec![View::empty(active), view],

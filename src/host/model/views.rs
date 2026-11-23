@@ -406,6 +406,7 @@ impl EmptiedView {
                 repository,
                 title: "emptied".into(),
                 title_source: Default::default(),
+                checkout: None,
             })
             .unwrap();
         let scope = Scope::Channel(channel);
@@ -1335,6 +1336,7 @@ mod tests {
                     repository: "/repo".into(),
                     title: "view".into(),
                     title_source: Default::default(),
+                    checkout: None,
                 })
                 .unwrap();
         }
@@ -1830,6 +1832,7 @@ mod tests {
                     repository: "/repo".into(),
                     title: "Review the accepted task".into(),
                     title_source: source,
+                    checkout: None,
                 })
                 .unwrap();
             let original = live_chat_pane(None);
@@ -1903,6 +1906,7 @@ mod tests {
                         repository: "/repo".into(),
                         title: "Accepted task".into(),
                         title_source: Prompt,
+                        checkout: None,
                     })
                     .unwrap();
                 let original = live_chat_pane(Some("first-thread"));
@@ -1998,6 +2002,7 @@ mod tests {
                             repository: "/repo".into(),
                             title: "Accepted task".into(),
                             title_source: Prompt,
+                            checkout: None,
                         })
                         .unwrap();
                     let mut original = live_chat_pane(Some("first-thread"));
@@ -2087,6 +2092,7 @@ mod tests {
                     repository: "/repo".into(),
                     title: "Accepted task".into(),
                     title_source: crate::model::ChannelTitleSource::Prompt,
+                    checkout: None,
                 })
                 .unwrap();
             let mut original = live_chat_pane(None);
@@ -2166,6 +2172,7 @@ mod tests {
                     repository: "/repo".into(),
                     title: "Initial inferred title".into(),
                     title_source: crate::model::ChannelTitleSource::Prompt,
+                    checkout: None,
                 })
                 .unwrap();
             let original = live_chat_pane(Some("first-thread"));
@@ -2695,6 +2702,7 @@ mod tests {
             repository: "/other".into(),
             title: "foreign".into(),
             title_source: Default::default(),
+            checkout: None,
         })
         .unwrap();
         for (source, id, destination) in [
