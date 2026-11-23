@@ -526,6 +526,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                     panes = adopted.panes,
                     channels = adopted.created_channels,
                     kept = adopted.kept,
+                    failed = adopted.failed,
                     "moved worktree strips into their checkouts' channels"
                 ),
                 Ok(_) => {}

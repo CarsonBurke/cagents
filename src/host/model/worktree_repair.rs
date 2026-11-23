@@ -61,6 +61,18 @@ pub(crate) struct Adopted {
     /// Panes the transfer refused, such as an agent pane whose process changed
     /// since it was saved. They stay in their strip, which still opens.
     pub(crate) kept: usize,
+    /// Strips whose move failed and was undone; they still open as strips.
+    pub(crate) failed: usize,
+}
+
+impl Adopted {
+    fn add(&mut self, strip: Self) {
+        self.strips += strip.strips;
+        self.panes += strip.panes;
+        self.created_channels += strip.created_channels;
+        self.kept += strip.kept;
+        self.failed += strip.failed;
+    }
 }
 
 impl Registry {
@@ -87,7 +99,30 @@ impl Registry {
         super::schema::require_current(&transaction)?;
         let mut adopted = Adopted::default();
         for (scope, home) in &homes {
-            adopt(&transaction, scope, home, &mut adopted)?;
+            // Each strip moves whole or not at all, and one that cannot move
+            // leaves the others to move. A strip none of whose panes or agents
+            // can move leaves no channel behind, or each start would make
+            // another.
+            transaction
+                .execute_batch("SAVEPOINT adopt_strip")
+                .map_err(|error| error.to_string())?;
+            let outcome = adopt(&transaction, scope, home);
+            let keep = matches!(&outcome, Ok(strip) if strip.strips > 0);
+            transaction
+                .execute_batch(if keep {
+                    "RELEASE adopt_strip"
+                } else {
+                    "ROLLBACK TO adopt_strip; RELEASE adopt_strip"
+                })
+                .map_err(|error| error.to_string())?;
+            match outcome {
+                // A strip that moved nothing still counts the panes it kept.
+                Ok(strip) => adopted.add(strip),
+                Err(error) => {
+                    tracing::warn!(?scope, %error, "a worktree strip was left in place");
+                    adopted.failed += 1;
+                }
+            }
         }
         if adopted.strips > 0 {
             transaction
@@ -129,21 +164,17 @@ fn strips(db: &rusqlite::Connection) -> Result<Vec<(PathBuf, PathBuf)>, String> 
         .map_err(|error| error.to_string())
 }
 
-fn adopt(
-    transaction: &Transaction<'_>,
-    scope: &Scope,
-    home: &Home,
-    adopted: &mut Adopted,
-) -> Result<(), String> {
+fn adopt(transaction: &Transaction<'_>, scope: &Scope, home: &Home) -> Result<Adopted, String> {
+    let mut adopted = Adopted::default();
     let Scope::Worktree { repository, path } = scope else {
-        return Ok(());
+        return Ok(adopted);
     };
-    // A strip none of whose panes or agents can move leaves no channel
-    // behind, or each start would make another.
-    transaction
-        .execute_batch("SAVEPOINT adopt_strip")
-        .map_err(|error| error.to_string())?;
-    let (channel, created) = home_channel(transaction, repository, home)?;
+    let (channel, created) = checkout_channel(
+        transaction,
+        repository,
+        home.checkout.as_deref(),
+        &home.title,
+    )?;
     let destination = Scope::Channel(channel);
     let mut recorder = views::Recorder::default();
     let strip = views::read(transaction, scope)?;
@@ -175,43 +206,51 @@ fn adopt(
         .collect();
     let placed = place_agents(transaction, scope, &destination, &left)?;
     if moved == 0 && placed == 0 {
-        transaction
-            .execute_batch("ROLLBACK TO adopt_strip; RELEASE adopt_strip")
-            .map_err(|error| error.to_string())?;
-        return Ok(());
+        return Ok(adopted);
     }
     place_in_navigation(transaction, repository, path, channel)?;
-    transaction
-        .execute_batch("RELEASE adopt_strip")
-        .map_err(|error| error.to_string())?;
-    adopted.strips += 1;
-    adopted.panes += moved;
-    adopted.created_channels += usize::from(created);
-    Ok(())
+    adopted.strips = 1;
+    adopted.panes = moved;
+    adopted.created_channels = usize::from(created);
+    Ok(adopted)
 }
 
-/// The worktree's oldest channel, or a new one named after its branch. A main
-/// checkout's strip gets a channel of its own rather than joining whichever
-/// conversation happens to be oldest.
-fn home_channel(
+/// The channel work in a checkout goes to, and whether it was made now.
+///
+/// A linked worktree's is its oldest channel recording that checkout. The
+/// main checkout's is its oldest channel named after it, `title`, that no
+/// checkout or prompt named: it gets a channel of its own rather than joining
+/// whichever conversation happens to be oldest. Without one, a channel named
+/// `title` is made. Windows adopting panes only they held choose the same way
+/// (`Cagents::adopt_strip_cards`), so the repair and they never split one
+/// checkout's panes across two channels.
+pub(super) fn checkout_channel(
     transaction: &Transaction<'_>,
     repository: &Path,
-    home: &Home,
+    checkout: Option<&Path>,
+    title: &str,
 ) -> Result<(ChannelId, bool), String> {
     let key = repository_key(repository)?;
-    if let Some(checkout) = &home.checkout {
-        let existing: Option<String> = transaction
-            .query_row(
-                "SELECT id FROM channels WHERE repository = ?1 AND checkout = ?2
-                 ORDER BY ordinal, id LIMIT 1",
-                params![key, checkout_key(checkout)?],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(id) = existing {
-            return Ok((super::parse_channel_id(&id)?, false));
-        }
+    let title = crate::workspace_model::channel_title(title).unwrap_or_else(|| title.to_owned());
+    let existing: Option<String> = match checkout {
+        Some(checkout) => transaction.query_row(
+            "SELECT id FROM channels WHERE repository = ?1 AND checkout = ?2
+             ORDER BY ordinal, id LIMIT 1",
+            params![key, checkout_key(checkout)?],
+            |row| row.get(0),
+        ),
+        None => transaction.query_row(
+            "SELECT id FROM channels
+              WHERE repository = ?1 AND checkout IS NULL AND title = ?2 AND title_source = ?3
+             ORDER BY ordinal, id LIMIT 1",
+            params![key, title, ChannelTitleSource::Manual as i64],
+            |row| row.get(0),
+        ),
+    }
+    .optional()
+    .map_err(|error| error.to_string())?;
+    if let Some(id) = existing {
+        return Ok((super::parse_channel_id(&id)?, false));
     }
     let id = ChannelId::new();
     let ordinal = take_ordinal(transaction, "next_channel_ordinal")?;
@@ -222,10 +261,10 @@ fn home_channel(
             params![
                 id.to_string(),
                 key,
-                home.title,
+                title,
                 ordinal,
                 ChannelTitleSource::Manual as i64,
-                home.checkout.as_deref().map(checkout_key).transpose()?,
+                checkout.map(checkout_key).transpose()?,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -423,7 +462,8 @@ mod tests {
                 strips: 1,
                 panes: 2,
                 created_channels: 1,
-                kept: 0
+                kept: 0,
+                failed: 0,
             }
         );
         let channel = store
@@ -498,8 +538,8 @@ mod tests {
         assert_eq!(store.view(&Scope::Channel(channel.id)), panes);
     }
 
-    /// The main checkout's strip becomes a channel of its own in the main
-    /// checkout rather than joining an unrelated conversation.
+    /// The main checkout's strip becomes a channel of its own, named after
+    /// it, rather than joining an unrelated conversation.
     #[test]
     fn the_main_checkouts_strip_becomes_its_own_channel() {
         let mut store = Store::new();
@@ -526,8 +566,222 @@ mod tests {
             .find(|channel| channel.id != existing)
             .expect("the main checkout's channel");
         assert_eq!(channel.checkout, None);
+        assert_eq!(channel.title_source, ChannelTitleSource::Manual);
         assert_eq!(store.view(&Scope::Channel(channel.id)), panes);
         assert!(store.view(&Scope::Channel(existing)).is_empty());
+
+        // Panes found in the strip later join that channel, not a second one
+        // of the same name, as a window's adoption of its own panes does.
+        let later = pane(1.0, &main);
+        store.seed(&strip, vec![later.clone()]);
+        let adopted = store.registry.adopt_worktree_views().unwrap();
+        assert_eq!((adopted.strips, adopted.created_channels), (1, 0));
+        assert_eq!(store.channels().len(), 2);
+        assert_eq!(
+            store.view(&Scope::Channel(channel.id)),
+            [panes, vec![later]].concat()
+        );
+    }
+
+    impl Store {
+        /// An open agent, made in a channel of its own and then placed in
+        /// `strip`, as a daemon before channels had a checkout left it.
+        fn agent_in(&mut self, strip: &Scope) -> crate::agent_execution::Agent {
+            use crate::agent_execution::{Destination, Origin, Spec, Submit, Surface, Target};
+            let accepted = self
+                .registry
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::New(Spec {
+                            provider: crate::agent::Provider::Claude,
+                            account: None,
+                            target: Target {
+                                repository: self.checkout.repository.clone(),
+                                directory: self.checkout.main.clone(),
+                                placement: None,
+                            },
+                            surface: Surface::Terminal,
+                            model: None,
+                            permission_mode: None,
+                            reasoning_effort: None,
+                        }),
+                        prompt: "Work".into(),
+                        idempotency_key: uuid::Uuid::new_v4().to_string(),
+                    },
+                    1,
+                )
+                .unwrap();
+            self.place(&accepted.agent.id.to_string(), strip);
+            self.registry.agent(accepted.agent.id).unwrap()
+        }
+
+        fn place(&self, agent: &str, scope: &Scope) {
+            self.registry
+                .db
+                .execute(
+                    "UPDATE agents SET record = json_set(record, '$.placement', json(?2))
+                     WHERE id = ?1",
+                    params![agent, serde_json::to_string(scope).unwrap()],
+                )
+                .unwrap();
+        }
+    }
+
+    /// A strip that holds no pane but has an open agent placed in it moves,
+    /// and the agent with it.
+    #[test]
+    fn an_agent_placed_in_a_strip_without_panes_moves_to_the_channel() {
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let strip = store.strip(&linked);
+        let agent = store.agent_in(&strip);
+        assert_eq!(agent.placement, strip);
+
+        let adopted = store.registry.adopt_worktree_views().unwrap();
+        assert_eq!((adopted.strips, adopted.panes), (1, 0));
+        let channel = store
+            .channels()
+            .into_iter()
+            .find(|channel| channel.checkout.as_deref() == Some(linked.as_path()))
+            .expect("the worktree's channel");
+        let agent = store.registry.agent(agent.id).unwrap();
+        assert_eq!(agent.placement, Scope::Channel(channel.id));
+        assert!(agent.session.is_none() && !agent.closed);
+    }
+
+    /// A follow-up to an agent still placed in a strip that no longer shows
+    /// its pane moves it to its checkout's channel, where its pane reopens,
+    /// since the strip takes no new pane. One whose pane is there stays.
+    #[test]
+    fn a_follow_up_moves_an_agent_out_of_a_strip_without_its_pane() {
+        use crate::agent_execution::{Destination, Origin, Submit};
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let strip = store.strip(&linked);
+        let (kept, moved) = (store.agent_in(&strip), store.agent_in(&strip));
+        let held = Pane {
+            id: CardId::from_uuid(kept.id.as_uuid()),
+            ..pane(1.0, &linked)
+        };
+        store.seed(&strip, vec![held]);
+        let follow_up = |agent: crate::model::AgentId, key: &str| Submit {
+            name: None,
+            destination: Destination::Existing(agent),
+            prompt: "More".into(),
+            idempotency_key: key.into(),
+        };
+        for (agent, key) in [(kept.id, "kept"), (moved.id, "moved")] {
+            store
+                .registry
+                .submit_agent(&Origin::User, &follow_up(agent, key), 2)
+                .unwrap();
+        }
+        assert_eq!(store.registry.agent(kept.id).unwrap().placement, strip);
+        let channel = store
+            .channels()
+            .into_iter()
+            .find(|channel| channel.checkout.as_deref() == Some(linked.as_path()))
+            .expect("the worktree's channel");
+        assert_eq!(
+            store.registry.agent(moved.id).unwrap().placement,
+            Scope::Channel(channel.id)
+        );
+    }
+
+    /// A pane the transfer refuses stays in its strip, and so does the agent
+    /// it shows; the strip's other panes still move.
+    #[test]
+    fn a_refused_pane_and_its_agent_stay_in_the_strip() {
+        use crate::agent_execution::HostedSession;
+        use crate::model::{
+            BootId, HostIncarnation, HostSessionId, TerminalContinuity, TerminalSession,
+        };
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let strip = store.strip(&linked);
+        let agent = store.agent_in(&strip);
+        // A live session with no proof of its process: moving its pane is
+        // refused until a window refreshes it.
+        let terminal = TerminalSession {
+            id: crate::model::TerminalId::new(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: crate::model::LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: vec![],
+                working_directory: linked.clone(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::Live {
+                host_session_id: HostSessionId::new(""),
+                boot_id: BootId::new(""),
+                host_incarnation: HostIncarnation::new(""),
+            },
+        };
+        let refused = Pane {
+            id: CardId::from_uuid(agent.id.as_uuid()),
+            kind: CardKind::Terminal(terminal.clone()),
+            ..pane(0.5, &linked)
+        };
+        let moved = pane(0.5, &linked);
+        store.seed(&strip, vec![refused.clone(), moved.clone()]);
+        store
+            .registry
+            .bind_agent(agent.id, None, HostedSession::Terminal(terminal))
+            .unwrap();
+
+        let adopted = store.registry.adopt_worktree_views().unwrap();
+        assert_eq!((adopted.strips, adopted.panes, adopted.kept), (1, 1, 1));
+        let channel = store
+            .channels()
+            .into_iter()
+            .find(|channel| channel.checkout.as_deref() == Some(linked.as_path()))
+            .expect("the worktree's channel");
+        assert_eq!(store.view(&Scope::Channel(channel.id)), vec![moved]);
+        assert_eq!(store.view(&strip), vec![refused]);
+        assert_eq!(store.registry.agent(agent.id).unwrap().placement, strip);
+    }
+
+    /// A strip whose move fails is undone alone, leaving no channel, and the
+    /// project's other strips still move.
+    #[test]
+    fn a_strip_that_cannot_move_is_undone_alone() {
+        let mut store = Store::new();
+        let (linked, main) = (store.checkout.linked.clone(), store.checkout.main.clone());
+        let (broken, healthy) = (store.strip(&linked), store.strip(&main));
+        let stuck = pane(1.0, &linked);
+        store.seed(&broken, vec![stuck.clone()]);
+        let moved = pane(1.0, &main);
+        store.seed(&healthy, vec![moved.clone()]);
+        // An agent record the repair cannot read fails the strip it names.
+        store
+            .registry
+            .db
+            .execute(
+                "INSERT INTO agents(id, origin, record, closed) VALUES ('unreadable', '\"User\"', '{}', 0)",
+                [],
+            )
+            .unwrap();
+        store.place("unreadable", &broken);
+
+        let adopted = store.registry.adopt_worktree_views().unwrap();
+        assert_eq!((adopted.strips, adopted.failed), (1, 1));
+        store
+            .registry
+            .db
+            .execute("DELETE FROM agents WHERE id = 'unreadable'", [])
+            .unwrap();
+        let channels = store.channels();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].checkout, None);
+        assert_eq!(store.view(&Scope::Channel(channels[0].id)), vec![moved]);
+        assert_eq!(store.view(&broken), vec![stuck]);
     }
 
     /// A project arranged by hand lists the new channel where its worktree is.
