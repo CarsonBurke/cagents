@@ -13440,3 +13440,96 @@ fn a_spend_below_one_cent_never_reads_as_free() {
     assert_eq!(dollars(10_000), "$0.01");
     assert_eq!(dollars(1_234_567), "$1.23");
 }
+
+#[test]
+fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
+    let mut runtime = Runtime::draft(
+        Target {
+            card: CardId::new(),
+            generation: 0,
+        },
+        chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::ReconnectOnly,
+        },
+        Snapshot::default(),
+        true,
+        crate::settings::EditorSyntaxTheme::default(),
+    );
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.queue_remove = true;
+    snapshot.queued_messages = vec![
+        chat::QueuedMessage::new("a".into(), "First".into()),
+        chat::QueuedMessage::new("b".into(), "Second".into()),
+    ];
+    snapshot.busy = true;
+    // Without the provider's say-so the queue waits for the turn.
+    assert_eq!(runtime.send_now_count(), 0);
+    assert!(!runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .send_queued_now = true;
+    assert_eq!(runtime.send_now_count(), 2);
+    assert!(runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+
+    // A message on its way back to the composer does not go early.
+    runtime.taken_back.push("b".into());
+    assert_eq!(runtime.send_now_count(), 1);
+    runtime.taken_back.clear();
+
+    // One request at a time, and the heading says it is on its way.
+    for state in [chat::SendNow::Requested, chat::SendNow::Delivering] {
+        Arc::make_mut(&mut runtime.snapshot).send_now = Some(state);
+        assert!(!runtime.can_send_now());
+        assert_eq!(runtime.queue_title(2), "Queued · 2 · sending now…");
+    }
+    Arc::make_mut(&mut runtime.snapshot).send_now = Some(chat::SendNow::Stopped);
+    assert!(!runtime.can_send_now());
+    assert_eq!(
+        runtime.queue_title(2),
+        "Queued · 2 · reply stopped, sending now…"
+    );
+    // Declined leaves the queue to the turn, not to be asked again until
+    // the queue changes.
+    Arc::make_mut(&mut runtime.snapshot).send_now = Some(chat::SendNow::Declined);
+    assert!(!runtime.can_send_now());
+    assert_eq!(
+        runtime.queue_title(2),
+        "Queued · 2 · they go when the turn reaches them"
+    );
+
+    // Between turns the queue starts on its own; nothing to send early.
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.send_now = None;
+    snapshot.busy = false;
+    assert_eq!(runtime.send_now_count(), 0);
+    assert!(!runtime.can_send_now());
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    runtime.disconnected = true;
+    assert!(!runtime.can_send_now());
+    runtime.disconnected = false;
+
+    // The control fits beside the heading at narrow and wide widths.
+    let renderer = crate::app::tests::headless_renderer();
+    for width in [320.0, 960.0] {
+        let mut element = runtime.queue_view().unwrap();
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0)),
+        );
+        assert_eq!(node.size().width, width);
+    }
+}

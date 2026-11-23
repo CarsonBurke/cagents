@@ -2544,6 +2544,92 @@ impl Runtime {
                 .any(|outgoing| !outgoing.in_transcript())
     }
 
+    /// How many waiting messages Send now would hand to the running turn:
+    /// those the provider holds, where it can take them early, and not on
+    /// their way back to the composer. Messages this app still holds, such
+    /// as follow-ups for a provider without a queue, cannot go early.
+    pub(super) fn send_now_count(&self) -> usize {
+        if !self.snapshot.capabilities.send_queued_now || !self.snapshot.busy {
+            return 0;
+        }
+        self.snapshot
+            .queued_messages
+            .iter()
+            .filter(|queued| {
+                !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
+            })
+            .count()
+    }
+
+    /// Whether Send now can be asked for this moment: one already on its way
+    /// is not asked for twice, and one Claude declined is not asked again
+    /// until the queue changes.
+    pub(super) fn can_send_now(&self) -> bool {
+        self.send_now_count() > 0
+            && self.snapshot.send_now.is_none()
+            && !self.disconnected
+            && !self.snapshot.exited
+            && self.snapshot.read_only_reason.is_none()
+    }
+
+    /// The queue's heading: how many wait, and how a Send now stands.
+    fn queue_title(&self, count: usize) -> String {
+        let send_now = self.send_now_count();
+        match self.snapshot.send_now {
+            Some(chat::SendNow::Requested | chat::SendNow::Delivering) if send_now > 0 => {
+                format!("Queued · {count} · sending now…")
+            }
+            Some(chat::SendNow::Stopped) if send_now > 0 => {
+                format!("Queued · {count} · reply stopped, sending now…")
+            }
+            Some(chat::SendNow::Declined) if send_now > 0 => {
+                let goes = if send_now == 1 {
+                    "it goes when the turn reaches it"
+                } else {
+                    "they go when the turn reaches them"
+                };
+                format!("Queued · {count} · {goes}")
+            }
+            _ => format!("Queued · {count}"),
+        }
+    }
+
+    /// Send now, beside the queue's heading while the turn could take what
+    /// the provider holds. It names how many go, since it sends them all.
+    fn send_now_control(&self) -> Option<Element<'_, Message>> {
+        let count = self.send_now_count();
+        if count == 0 {
+            return None;
+        }
+        let (label, name): (Cow<'_, str>, Cow<'_, str>) = if count == 1 {
+            ("Send now".into(), "Send the queued message now".into())
+        } else {
+            (
+                format!("Send {count} now").into(),
+                format!("Send the {count} queued messages now").into(),
+            )
+        };
+        let tooltip = if count == 1 {
+            "Claude reads it now, without waiting for this step to finish. Subagents and \
+             background work keep running. A reply being written may be cut short."
+        } else {
+            "Claude reads them now, without waiting for this step to finish. Subagents and \
+             background work keep running. A reply being written may be cut short."
+        };
+        Some(crate::interaction::tooltip(
+            crate::ui_controls::button::secondary(label)
+                .icon(Icon::Send)
+                .id(card_control_id(self.target.card, "chat-send-now"))
+                .name(name)
+                .description(tooltip)
+                .on_press_maybe(
+                    self.can_send_now()
+                        .then(|| action(Action::SendQueuedNow(self.target))),
+                ),
+            tooltip,
+        ))
+    }
+
     /// Whether the conversation's status reads "Sending": a message is on
     /// its way, and the queue is not already saying so above a working agent.
     fn says_sending(&self) -> bool {
@@ -6903,7 +6989,7 @@ impl Runtime {
             rows.push(design::caption("Showing the first 128 queued messages").into());
         }
         let mut header: Vec<Element<'_, Message>> = vec![
-            design::caption(format!("Queued · {count}"))
+            design::caption(self.queue_title(count))
                 .width(Length::Fill)
                 .into(),
         ];
@@ -6925,10 +7011,12 @@ impl Runtime {
                 },
             ));
         }
+        header.extend(self.send_now_control());
         Some(
             widget::container(
                 widget::column::with_children(vec![
                     widget::row::with_children(header)
+                        .align_y(Alignment::Center)
                         .spacing(step::GAP_S)
                         .padding([0.0, step::GAP_XS])
                         .into(),
