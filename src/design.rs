@@ -313,3 +313,13 @@ pub fn horizontal_rule<'a, Message: 'a>() -> cosmic::Element<'a, Message> {
 pub fn vertical_rule<'a, Message: 'a>() -> cosmic::Element<'a, Message> {
     crate::separator::vertical()
 }
+
+/// The mark of a pane that needs the person: a translucent stroke in the
+/// attention tone fading inward, kept clear of the pane's trailing rule
+/// when `trailing_rule` says it has one.
+pub fn attention_frame<'a, Message: 'a>(
+    active: bool,
+    trailing_rule: bool,
+) -> cosmic::Element<'a, Message> {
+    crate::separator::attention_frame(active, trailing_rule, warning_color)
+}

@@ -183,7 +183,7 @@ impl Cagents {
             sidebar::SelectionIntent::Navigate,
         );
         let scope = self.navigate_to_channel(channel);
-        let focus = self.focus_workspace_card(card);
+        let focus = self.choose_workspace_card(card);
         Task::batch([scope, focus])
     }
 

@@ -148,8 +148,8 @@ determine which models and permission modes are available.
 - **Focus follows mouse** is on by default: moving the pointer into a pane
   focuses it at once, without scrolling, and puts the keyboard in its message
   input, terminal or editor. An open chat menu or picker, dialog or palette
-  suppresses it. A pane you only pass over is not marked read; that happens
-  once it stays focused for a moment, as for any other pane.
+  suppresses it. A pane the pointer only rests on keeps its alert; it is read
+  when you click it, type in it or go to it by tab, sidebar or palette.
   Turn it off in **Settings > General > Workspace** to focus panes only by
   clicking them or with pane navigation.
 - Focusing a chat pane in any way, by clicking it, navigating to it, switching
@@ -869,8 +869,9 @@ arbitrary external directories are preserved. Missing, unreadable, or newer
 account registries prevent this orphan cleanup.
 
 **Notifications** controls background agent completion, failure or cancellation,
-and requests for attention. Alerts are suppressed while their pane is focused
-unless **Notify while focused** is enabled. By default, they name the provider and
+and requests for attention. Alerts are suppressed while their pane is focused,
+unless **Notify while focused** is enabled; a pane the pointer only rests on
+does not count as focused. By default, they name the provider and
 folder without copying prompts or output. **Show message previews** optionally
 adds bounded message context. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its

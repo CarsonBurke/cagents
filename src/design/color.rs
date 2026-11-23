@@ -12,7 +12,9 @@ use cosmic::{
 pub const SCRIM_ALPHA: f32 = 0.48;
 /// [`modal_scrim`]'s strength on a dark theme.
 const DARK_MODAL_SCRIM_ALPHA: f32 = 0.72;
-pub const ATTENTION_BORDER_ALPHA: f32 = 0.35;
+/// The attention frame's stroke, as a share of the attention tone: enough to
+/// find the pane at a glance, short of a hard line.
+pub const ATTENTION_BORDER_ALPHA: f32 = 0.6;
 pub const DIFF_GUTTER_ALPHA: f32 = 0.48;
 pub const DIFF_DIVIDER_ALPHA: f32 = 0.16;
 

@@ -115,6 +115,170 @@ impl<Message> Widget<Message, Theme, Renderer> for Separator {
     }
 }
 
+/// How far the attention frame's inner glow reaches into the pane.
+const ATTENTION_GLOW: f32 = 5.0;
+/// The attention frame's stroke, as a share of its tone.
+const ATTENTION_STROKE_ALPHA: f32 = crate::design::ATTENTION_BORDER_ALPHA;
+/// The glow's strength where it meets the stroke, as a share of its tone. A
+/// warm tone over a dark surface reads as a heavier band than over a light
+/// one, so the dark theme takes less of it.
+const ATTENTION_GLOW_ALPHA_DARK: f32 = 0.14;
+const ATTENTION_GLOW_ALPHA_LIGHT: f32 = 0.28;
+
+/// The mark of a pane that needs the person: a translucent stroke in `tone`
+/// on the pane's edge, fading inward over a few pixels, so the pane reads
+/// at a glance without a hard line around it. Every side lies inside the
+/// pane on the physical pixel grid. A pane with its own trailing rule
+/// (`trailing_rule`) keeps that column for the rule, so the frame's
+/// trailing side runs beside it rather than under it. Drawing nothing while
+/// `active` is false, it can stay mounted as attention comes and goes.
+pub(crate) fn attention_frame<'a, Message: 'a>(
+    active: bool,
+    trailing_rule: bool,
+    tone: fn(&Theme) -> iced::Color,
+) -> Element<'a, Message> {
+    Element::new(AttentionFrame {
+        active,
+        trailing_rule,
+        tone,
+    })
+}
+
+struct AttentionFrame {
+    active: bool,
+    trailing_rule: bool,
+    tone: fn(&Theme) -> iced::Color,
+}
+
+impl AttentionFrame {
+    /// The frame's outer edge: the pane's bounds snapped inward to whole
+    /// physical pixels, short of the trailing rule's column when it has one.
+    fn outer(&self, bounds: Rectangle, offset: Vector, scale: f32) -> Rectangle {
+        let thickness = (crate::design::BORDER_WIDTH * scale).round().max(1.0) / scale;
+        let start = |value: f32, shift: f32| ((value - shift) * scale).ceil() / scale + shift;
+        let end = |value: f32, shift: f32| ((value - shift) * scale).floor() / scale + shift;
+        let x = start(bounds.x, offset.x);
+        let y = start(bounds.y, offset.y);
+        let mut right = end(bounds.x + bounds.width, offset.x);
+        if self.trailing_rule {
+            right -= thickness;
+        }
+        let bottom = end(bounds.y + bounds.height, offset.y);
+        Rectangle {
+            x,
+            y,
+            width: (right - x).max(0.0),
+            height: (bottom - y).max(0.0),
+        }
+    }
+}
+
+/// Paints the `width`-wide band just inside `outer`'s edge, as four quads
+/// that do not overlap, so a translucent color is laid down once everywhere.
+fn paint_ring(renderer: &mut Renderer, outer: Rectangle, width: f32, color: iced::Color) {
+    if outer.width <= 2.0 * width || outer.height <= 2.0 * width {
+        return;
+    }
+    let sides = [
+        Rectangle {
+            height: width,
+            ..outer
+        },
+        Rectangle {
+            y: outer.y + outer.height - width,
+            height: width,
+            ..outer
+        },
+        Rectangle {
+            y: outer.y + width,
+            width,
+            height: outer.height - 2.0 * width,
+            ..outer
+        },
+        Rectangle {
+            x: outer.x + outer.width - width,
+            y: outer.y + width,
+            width,
+            height: outer.height - 2.0 * width,
+        },
+    ];
+    for bounds in sides {
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                snap: false,
+                ..Default::default()
+            },
+            color,
+        );
+    }
+}
+
+fn shrink(rectangle: Rectangle, by: f32) -> Rectangle {
+    Rectangle {
+        x: rectangle.x + by,
+        y: rectangle.y + by,
+        width: rectangle.width - 2.0 * by,
+        height: rectangle.height - 2.0 * by,
+    }
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for AttentionFrame {
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fill)
+    }
+
+    fn draw(
+        &self,
+        _: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        _: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        if !self.active || !layout.bounds().intersects(viewport) {
+            return;
+        }
+        let scale = style.scale_factor as f32;
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let tone = (self.tone)(theme);
+        let glow = if theme.cosmic().is_dark {
+            ATTENTION_GLOW_ALPHA_DARK
+        } else {
+            ATTENTION_GLOW_ALPHA_LIGHT
+        };
+        let mut ring = self.outer(layout.bounds(), layout.virtual_offset(), scale);
+        let stroke = (crate::design::BORDER_WIDTH * scale).round().max(1.0) / scale;
+        paint_ring(
+            renderer,
+            ring,
+            stroke,
+            tone.scale_alpha(ATTENTION_STROKE_ALPHA),
+        );
+        ring = shrink(ring, stroke);
+        // One ring per physical pixel, fading quadratically, so the glow is as
+        // smooth at any scale and never ends in a visible step.
+        let steps = (ATTENTION_GLOW * scale).round().max(1.0);
+        let pixel = 1.0 / scale;
+        for step in 0..steps as usize {
+            let remaining = 1.0 - (step as f32 + 0.5) / steps;
+            let alpha = glow * remaining * remaining;
+            paint_ring(renderer, ring, pixel, tone.scale_alpha(alpha));
+            ring = shrink(ring, pixel);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +447,110 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The attention frame's sides all show, alike, at any scale and
+    /// scroll phase: its trailing side runs just inside the pane's trailing
+    /// rule instead of under it.
+    #[test]
+    fn the_attention_frame_shows_every_side_beside_the_trailing_rule() {
+        let mut renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(<Renderer as Headless>::new(
+                Font::DEFAULT,
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let theme = Theme::default();
+        let background = Color::from_rgb(1.0, 0.0, 1.0);
+        let tone: fn(&Theme) -> Color = |_| Color::from_rgb(0.0, 1.0, 0.0);
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for phase in [0.0, 0.125, 0.5] {
+                let shift = Vector::new(phase, phase);
+                let pane = Rectangle::new(iced::Point::ORIGIN, Size::new(120.5, 80.0));
+                let extent = Size::new(130.0, 90.0);
+                renderer.reset(Rectangle::with_size(extent));
+                let mut parts: Vec<(Element<'_, ()>, Rectangle)> = vec![
+                    (attention_frame(true, true, tone), pane),
+                    (
+                        Splitter::new(
+                            iced::id::Id::new("frame.test"),
+                            "Test frame",
+                            100.0,
+                            50.0,
+                            150.0,
+                            Edge::Trailing,
+                            false,
+                            |_| (),
+                            || (),
+                        )
+                        .into(),
+                        Rectangle {
+                            x: pane.width - crate::splitter::WIDTH,
+                            width: crate::splitter::WIDTH,
+                            ..pane
+                        },
+                    ),
+                ];
+                for (part, bounds) in &mut parts {
+                    let mut tree = Tree::new(part.as_widget());
+                    let node = part
+                        .as_widget_mut()
+                        .layout(
+                            &mut tree,
+                            &renderer,
+                            &layout::Limits::new(Size::ZERO, bounds.size()),
+                        )
+                        .move_to(bounds.position());
+                    renderer.with_layer(pane, |renderer| {
+                        renderer.with_translation(-shift, |renderer| {
+                            part.as_widget().draw(
+                                &tree,
+                                renderer,
+                                &theme,
+                                &renderer::Style {
+                                    scale_factor: scale as f64,
+                                    ..Default::default()
+                                },
+                                Layout::new(&node).with_virtual_offset(shift),
+                                mouse::Cursor::Unavailable,
+                                &Rectangle::with_size(extent),
+                            );
+                        });
+                    });
+                }
+                let size = Size::new(
+                    (extent.width * scale).ceil() as u32,
+                    (extent.height * scale).ceil() as u32,
+                );
+                let pixels = renderer.screenshot(size, scale, background);
+                let rgb = |x: u32, y: u32| {
+                    let index = ((y * size.width + x) * 4) as usize;
+                    [pixels[index], pixels[index + 1], pixels[index + 2]]
+                };
+                let middle = (40.0 * scale) as u32;
+                let painted: Vec<u32> = (0..size.width)
+                    .filter(|&x| rgb(x, middle) != [255, 0, 255])
+                    .collect();
+                let context = format!("scale={scale}, phase={phase}");
+                let (first, last) = (painted[0], *painted.last().unwrap());
+                let rule = rgb(last, middle);
+                let stroke = rgb(first, middle);
+                assert_ne!(stroke, rule, "{context}");
+                assert_eq!(
+                    rgb(last - scale.round() as u32, middle),
+                    stroke,
+                    "the trailing side shows beside the rule: {context}"
+                );
+                let top = (0..size.height)
+                    .find(|&y| rgb((60.0 * scale) as u32, y) != [255, 0, 255])
+                    .unwrap();
+                assert_eq!(rgb((60.0 * scale) as u32, top), stroke, "{context}");
             }
         }
     }
