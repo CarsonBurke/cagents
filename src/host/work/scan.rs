@@ -1,7 +1,9 @@
-//! One project's local facts, read from Git alone. A scan costs one worktree
-//! listing, one ref census and one status per worktree that changed; ahead and
-//! behind counts are cached by commit pair, and ignored trees such as
-//! `node_modules` are never read.
+//! One project's local facts, read from Git alone. A scan reads only what its
+//! change can have moved: the worktree list after a topology change, the ref
+//! census after a ref change, and the status of each worktree that changed or
+//! whose head moved. Ahead and behind counts are cached by commit pair, and
+//! ignored trees such as `node_modules` are never read. A scan woken by an
+//! edit in one worktree runs one `git status`.
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
@@ -15,7 +17,10 @@ use crate::{
     git_watch,
     linear::context::LinkedIssue,
     model::{ProjectId, WorktreeId},
-    repository::{CancellationToken, Divergence, HeadState, RepositoryService, StatusSnapshot},
+    repository::{
+        CancellationToken, Divergence, HeadState, RefTip, RepositoryService, StatusSnapshot,
+        WorktreeRecord,
+    },
     work::{Comparison, Dirty, Head, branch_identity, branch_name},
 };
 
@@ -86,14 +91,30 @@ pub(super) struct Local {
     /// them again while reusing every other retained census.
     plan_retry: BTreeSet<WorktreeId>,
     divergence: HashMap<(String, String), Divergence>,
+    /// The worktree list and ref census as last read, reused until a
+    /// topology or ref change says they moved.
+    records: Arc<[WorktreeRecord]>,
+    base_ref: Option<String>,
+    tips: Arc<[RefTip]>,
+    /// When the worktree list was last read; a project the watcher cannot
+    /// see re-reads it on a timer.
+    pub listed_at: Option<Instant>,
 }
 
 pub(super) struct Input<'a> {
     pub id: ProjectId,
     pub repository: &'a Path,
     pub previous: Option<&'a Local>,
-    /// Which worktrees to re-read; everything on a first scan or topology change.
+    /// What changed since `previous`: which worktrees to re-read, and
+    /// whether the worktree list or the refs moved.
     pub change: &'a git_watch::Change,
+    /// Re-read every worktree's status whatever changed, as a first scan
+    /// or a request for a fresh board does.
+    pub full: bool,
+    /// Worktrees someone works in now: a live session runs in them. Their
+    /// files are watched first; the rest are watched for Git's bookkeeping
+    /// alone, apart from the primary checkout.
+    pub in_use: &'a BTreeSet<PathBuf>,
     pub hints: &'a ForgeHints,
     pub now_unix_ms: u64,
     pub cancellation: &'a CancellationToken,
@@ -110,34 +131,62 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         repository,
         previous,
         change,
+        full,
+        in_use,
         hints,
         now_unix_ms,
         cancellation,
     } = input;
-    let full = previous.is_none() || change.topology;
+    let full = full || previous.is_none();
 
-    // Cheap enough to repeat every scan, and it catches worktrees added while
-    // the watcher was over its budget.
-    let records = git
-        .list_worktrees(repository, cancellation)
-        .map_err(text)?
-        .into_iter()
-        .filter(|record| record.prunable_reason.is_none())
-        .collect::<Vec<_>>();
+    // The worktree list moves only with Git's worktree bookkeeping, which
+    // the watcher reports as a topology change, as it does when it cannot
+    // see the bookkeeping at all.
+    let listed = match previous {
+        Some(previous) if !full && !change.topology => None,
+        _ => Some(
+            git.list_worktrees(repository, cancellation)
+                .map_err(text)?
+                .into_iter()
+                .filter(|record| record.prunable_reason.is_none())
+                .collect::<Arc<[_]>>(),
+        ),
+    };
+    let listed_at = match &listed {
+        Some(_) => Some(Instant::now()),
+        None => previous.and_then(|previous| previous.listed_at),
+    };
+    let records = match (&listed, previous) {
+        (Some(records), _) => records.clone(),
+        (None, Some(previous)) => previous.records.clone(),
+        (None, None) => unreachable!("a first scan lists its worktrees"),
+    };
+    let listed = listed.is_some();
     let primary_path = records
         .first()
         .filter(|record| !record.bare)
         .map(|record| record.path.clone());
-    let base_ref = git
-        .default_branch_ref(repository, cancellation)
-        .map_err(text)?;
-    let mut patterns = vec!["refs/heads"];
-    if let Some(base) = &base_ref {
-        patterns.push(base);
-    }
-    let tips = git
-        .ref_tips(repository, &patterns, cancellation)
-        .map_err(text)?;
+    // The default branch and the branch tips move only with the refs, and
+    // with the configuration that names a remote's default branch.
+    let (base_ref, tips) = match previous {
+        Some(previous) if !listed && !change.references && !change.configuration => {
+            (previous.base_ref.clone(), previous.tips.clone())
+        }
+        _ => {
+            let base_ref = git
+                .default_branch_ref(repository, cancellation)
+                .map_err(text)?;
+            let mut patterns = vec!["refs/heads"];
+            if let Some(base) = &base_ref {
+                patterns.push(base);
+            }
+            let tips = git
+                .ref_tips(repository, &patterns, cancellation)
+                .map_err(text)?
+                .into();
+            (base_ref, tips)
+        }
+    };
     let base = base_ref.as_ref().and_then(|refname| {
         tips.iter()
             .find(|tip| tip.refname.as_os_str() == OsStr::new(refname))
@@ -174,13 +223,32 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
     for record in records.iter().filter(|record| !record.bare) {
         let old = retained.get(&record.id).copied();
         // A shared ref change names no worktree; a commit, reset or branch
-        // switch moves the head `git worktree list` reports.
+        // switch moves the head `git worktree list` reports, or the tip of
+        // the branch checked out. A detached head moves only with the
+        // worktree's own `HEAD`, which names it.
+        let moved = |old: &Worktree| {
+            let head = old.head.as_ref().map(|head| &head.oid);
+            if listed {
+                head != record.head_oid.as_ref()
+            } else {
+                old.branch
+                    .as_deref()
+                    .is_some_and(|branch| local_tips.get(branch).map(|tip| &tip.oid) != head)
+            }
+        };
         let reread = full
             || change.worktrees.contains(&record.id)
-            || old.is_none_or(|old| {
-                old.error.is_some()
-                    || old.head.as_ref().map(|head| &head.oid) != record.head_oid.as_ref()
-            });
+            || old.is_none_or(|old| old.error.is_some() || moved(old));
+        if !reread
+            && !listed
+            && let Some(old) = old
+        {
+            // Nothing this scan read can have moved it.
+            let mut worktree = old.clone();
+            worktree.comparison = None;
+            worktrees.push(worktree);
+            continue;
+        }
         let mut worktree = Worktree {
             id: record.id,
             path: record.path.clone(),
@@ -205,6 +273,12 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             error: None,
             status_read_at: None,
         };
+        if !listed && let Some(old) = old {
+            // The list was not read again: the head and branch last read
+            // stand until this worktree's status replaces them.
+            worktree.branch = old.branch.clone();
+            worktree.head = old.head.clone();
+        }
         if reread {
             match git.activity_status(&record.path, cancellation) {
                 Ok(status) => {
@@ -239,15 +313,20 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 }
             }
         }
-        worktree.link = planned
-            .get(&record.id)
-            .map(|git_dir| git_dir.to_path_buf())
-            .or_else(|| {
-                crate::project_location::git_directories(&record.path)
-                    .map(|directories| directories.private)
-            })
-            .and_then(|git_dir| crate::linear::context::linked_in_git_dir(&git_dir).ok())
-            .flatten();
+        // The link lives in the worktree's Git directory, whose writes name
+        // the worktree, so an unread worktree keeps the one it had.
+        worktree.link = match old {
+            Some(old) if !reread => old.link.clone(),
+            _ => planned
+                .get(&record.id)
+                .map(|git_dir| git_dir.to_path_buf())
+                .or_else(|| {
+                    crate::project_location::git_directories(&record.path)
+                        .map(|directories| directories.private)
+                })
+                .and_then(|git_dir| crate::linear::context::linked_in_git_dir(&git_dir).ok())
+                .flatten(),
+        };
         worktrees.push(worktree);
     }
 
@@ -435,45 +514,76 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 .any(|worktree| roots.get(&worktree.id).copied() != Some(&worktree.root))
     });
     let retry_plan = previous.is_some_and(|previous| previous.plan_error.is_some());
+    // Files are watched in the worktrees someone works in, and in the
+    // primary checkout; Git's bookkeeping is watched in every one.
+    let interests = worktrees
+        .iter()
+        .map(|worktree| {
+            let interest = if in_use.contains(&worktree.path) {
+                git_watch::Interest::Active
+            } else if worktree.primary {
+                git_watch::Interest::Shown
+            } else {
+                git_watch::Interest::Metadata
+            };
+            (worktree.id, interest)
+        })
+        .collect::<HashMap<_, _>>();
+    let interest = |id: WorktreeId| {
+        interests
+            .get(&id)
+            .copied()
+            .unwrap_or(git_watch::Interest::Metadata)
+    };
+    let interest_changed = previous_plan.as_ref().is_some_and(|plan| {
+        plan.worktrees
+            .iter()
+            .any(|worktree| worktree.interest() != interest(worktree.id))
+    });
     let mut plan_retry = BTreeSet::new();
-    let (plan, plan_error) =
-        if membership_changed || change.membership || change.topology || retry_plan {
-            let listed = records
-                .iter()
-                .filter(|record| roots.contains_key(&record.id))
-                .cloned()
-                .collect::<Vec<_>>();
-            // A failed read may have been the only one told which checkouts
-            // changed. Carry those IDs until a read succeeds, so a retry
-            // refreshes them without discarding every other census.
-            let changed = previous
-                .map(|previous| &previous.plan_retry)
-                .into_iter()
-                .flatten()
-                .chain(&change.worktrees)
-                .copied()
-                .collect::<BTreeSet<_>>();
-            match git_watch::Project::read_changed(
-                id,
-                repository.to_path_buf(),
-                &listed,
-                cancellation,
-                previous_plan.as_deref(),
-                &changed,
-            ) {
-                Ok(plan) => (Some(Arc::new(plan)), None),
-                // Without a plan the project is polled; its cards still stand.
-                Err(error) => {
-                    plan_retry = changed;
-                    (previous_plan, Some(error))
-                }
+    let (plan, plan_error) = if membership_changed
+        || change.membership
+        || change.topology
+        || retry_plan
+        || interest_changed
+    {
+        let checkouts = records
+            .iter()
+            .filter(|record| roots.contains_key(&record.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        // A failed read may have been the only one told which checkouts
+        // changed. Carry those IDs until a read succeeds, so a retry
+        // refreshes them without discarding every other census.
+        let changed = previous
+            .map(|previous| &previous.plan_retry)
+            .into_iter()
+            .flatten()
+            .chain(&change.worktrees)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        match git_watch::Project::read_changed_with_interest(
+            id,
+            repository.to_path_buf(),
+            &checkouts,
+            cancellation,
+            previous_plan.as_deref(),
+            &changed,
+            &interest,
+        ) {
+            Ok(plan) => (Some(Arc::new(plan)), None),
+            // Without a plan the project is polled; its cards still stand.
+            Err(error) => {
+                plan_retry = changed;
+                (previous_plan, Some(error))
             }
-        } else {
-            (
-                previous_plan,
-                previous.and_then(|previous| previous.plan_error.clone()),
-            )
-        };
+        }
+    } else {
+        (
+            previous_plan,
+            previous.and_then(|previous| previous.plan_error.clone()),
+        )
+    };
 
     Ok(Local {
         scanned_at_unix_ms: now_unix_ms,
@@ -487,6 +597,10 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         plan_error,
         plan_retry,
         divergence,
+        records,
+        base_ref,
+        tips,
+        listed_at,
     })
 }
 
@@ -655,12 +769,28 @@ mod tests {
     }
 
     fn run(fixture: &Fixture, previous: Option<&Local>, change: &git_watch::Change) -> Local {
+        run_with(fixture, previous, change, false, &BTreeSet::new())
+    }
+
+    fn run_with(
+        fixture: &Fixture,
+        previous: Option<&Local>,
+        change: &git_watch::Change,
+        full: bool,
+        in_use: &BTreeSet<PathBuf>,
+    ) -> Local {
         let repository = fixture.root.join(".git");
+        // A project keeps its ID across scans, as the board's does.
+        let id = previous
+            .and_then(|previous| previous.plan.as_ref())
+            .map_or_else(ProjectId::new, |plan| plan.id);
         scan(Input {
-            id: ProjectId::new(),
+            id,
             repository: &repository,
             previous,
             change,
+            full,
+            in_use,
             hints: &ForgeHints {
                 branches: BTreeSet::from(["mine".to_owned()]),
                 merged: BTreeMap::from([(
@@ -808,6 +938,10 @@ mod tests {
         };
         assert_eq!(dirty(&second, &fixture.root), 1);
         assert_eq!(dirty(&second, &fixture.linked), 1, "not re-read");
+        // Nothing moved the worktree list or the refs, so neither is read.
+        assert_eq!(second.listed_at, first.listed_at);
+        assert!(Arc::ptr_eq(&second.records, &first.records));
+        assert!(Arc::ptr_eq(&second.tips, &first.tips));
         // Each worktree remembers when its status was last read, which the
         // board's polls are scheduled from.
         let read_at = |local: &Local, path: &Path| {
@@ -825,13 +959,29 @@ mod tests {
             read_at(&first, &fixture.linked),
             "carried forward with the status it dates"
         );
-        let third = run(
+        // A topology change lists the worktrees again, but re-reads only one
+        // that is new or whose head moved.
+        let listed = run(
             &fixture,
             Some(&second),
             &git_watch::Change {
                 topology: true,
                 ..git_watch::Change::default()
             },
+        );
+        assert!(listed.listed_at > second.listed_at);
+        assert_eq!(dirty(&listed, &fixture.linked), 1, "nothing moved it");
+        assert_eq!(
+            read_at(&listed, &fixture.linked),
+            read_at(&second, &fixture.linked)
+        );
+        // A fresh board re-reads every worktree.
+        let third = run_with(
+            &fixture,
+            Some(&listed),
+            &git_watch::Change::default(),
+            true,
+            &BTreeSet::new(),
         );
         assert_eq!(dirty(&third, &fixture.linked), 0);
         assert!(read_at(&third, &fixture.linked) > read_at(&second, &fixture.linked));
@@ -849,6 +999,68 @@ mod tests {
         let fourth = run(&fixture, Some(&third), &references);
         assert_eq!(dirty(&fourth, &fixture.root), 1, "its head moved");
         assert_eq!(dirty(&fourth, &fixture.linked), 0, "its head did not");
+        assert_eq!(
+            fourth.listed_at, third.listed_at,
+            "refs alone move no worktree"
+        );
+        assert!(!Arc::ptr_eq(&fourth.tips, &third.tips));
+    }
+
+    #[test]
+    fn files_are_watched_where_a_session_runs_and_in_the_primary_checkout() {
+        let fixture = fixture();
+        let interests = |local: &Local| {
+            local
+                .plan
+                .as_ref()
+                .unwrap()
+                .worktrees
+                .iter()
+                .map(|worktree| (worktree.root.clone(), worktree.interest()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let first = run(&fixture, None, &git_watch::Change::default());
+        assert_eq!(
+            interests(&first),
+            BTreeMap::from([
+                (fixture.root.clone(), git_watch::Interest::Shown),
+                (fixture.linked.clone(), git_watch::Interest::Metadata),
+            ]),
+            "an idle linked worktree is watched for Git's bookkeeping alone"
+        );
+
+        // A session starting there re-plans it, with nothing else to read.
+        let in_use = BTreeSet::from([fixture.linked.clone()]);
+        let working = run_with(
+            &fixture,
+            Some(&first),
+            &git_watch::Change::default(),
+            false,
+            &in_use,
+        );
+        assert_eq!(
+            interests(&working)[&fixture.linked],
+            git_watch::Interest::Active
+        );
+        assert_eq!(working.listed_at, first.listed_at);
+        let again = run_with(
+            &fixture,
+            Some(&working),
+            &git_watch::Change::default(),
+            false,
+            &in_use,
+        );
+        assert!(Arc::ptr_eq(
+            working.plan.as_ref().unwrap(),
+            again.plan.as_ref().unwrap()
+        ));
+
+        // Once it ends, the worktree goes back to its bookkeeping alone.
+        let ended = run(&fixture, Some(&again), &git_watch::Change::default());
+        assert_eq!(
+            interests(&ended)[&fixture.linked],
+            git_watch::Interest::Metadata
+        );
     }
 
     #[test]
@@ -884,10 +1096,11 @@ mod tests {
                 added.to_str().unwrap(),
             ],
         );
-        // A periodic rescan names only worktrees known before the scan. It
-        // cannot manufacture the missing topology notification for this one.
+        // A project whose bookkeeping the watcher cannot see polls its
+        // worktree list, which names a worktree no event announced.
         let poll = git_watch::Change {
             worktrees: first.worktrees.iter().map(|worktree| worktree.id).collect(),
+            topology: true,
             ..git_watch::Change::default()
         };
         let second = run(&fixture, Some(&first), &poll);
@@ -902,10 +1115,10 @@ mod tests {
         assert!(plan.worktrees.iter().any(|worktree| worktree.root == added));
         assert!(!Arc::ptr_eq(first.plan.as_ref().unwrap(), plan));
 
-        // Ordinary scans must not repeatedly reconfigure the monitor once
-        // all discovered checkouts belong to the plan.
+        // Ordinary scans must not change the plan once all discovered
+        // checkouts belong to it, so the monitor is not reconfigured.
         let third = run(&fixture, Some(&second), &poll);
-        assert!(Arc::ptr_eq(plan, third.plan.as_ref().unwrap()));
+        assert_eq!(plan, third.plan.as_ref().unwrap());
     }
 
     #[test]
@@ -922,7 +1135,14 @@ mod tests {
                 moved.to_str().unwrap(),
             ],
         );
-        let second = run(&fixture, Some(&first), &git_watch::Change::default());
+        let second = run(
+            &fixture,
+            Some(&first),
+            &git_watch::Change {
+                topology: true,
+                ..git_watch::Change::default()
+            },
+        );
         let plan = second.plan.as_ref().unwrap();
         let moved = moved.canonicalize().unwrap();
         assert!(plan.worktrees.iter().any(|worktree| worktree.root == moved));
@@ -956,7 +1176,14 @@ mod tests {
         let marker = added.join(".git");
         let original = std::fs::read(&marker).unwrap();
         std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
-        let failed = run(&fixture, Some(&first), &git_watch::Change::default());
+        let failed = run(
+            &fixture,
+            Some(&first),
+            &git_watch::Change {
+                topology: true,
+                ..git_watch::Change::default()
+            },
+        );
         assert!(failed.plan_error.is_some());
         assert!(Arc::ptr_eq(
             first.plan.as_ref().unwrap(),
@@ -988,7 +1215,12 @@ mod tests {
     #[test]
     fn polling_retries_failed_plan_when_checkout_membership_is_unchanged() {
         let fixture = fixture();
-        let first = run(&fixture, None, &git_watch::Change::default());
+        // A session in the linked worktree has its tracked files watched.
+        let in_use = BTreeSet::from([fixture.linked.clone()]);
+        let run = |previous: Option<&Local>, change: &git_watch::Change| {
+            run_with(&fixture, previous, change, false, &in_use)
+        };
+        let first = run(None, &git_watch::Change::default());
         let added = fixture.linked.join("new-directory/added.rs");
         std::fs::create_dir_all(added.parent().unwrap()).unwrap();
         std::fs::write(&added, "new tracked file\n").unwrap();
@@ -997,7 +1229,6 @@ mod tests {
         let original = std::fs::read(&marker).unwrap();
         std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
         let failed = run(
-            &fixture,
             Some(&first),
             &git_watch::Change {
                 membership: true,
@@ -1026,7 +1257,6 @@ mod tests {
         // Shared refs can wake the next scan without checkout IDs. The lost
         // membership edge still needs a fresh census before its error clears.
         let recovered = run(
-            &fixture,
             Some(&failed),
             &git_watch::Change {
                 references: true,
@@ -1042,17 +1272,25 @@ mod tests {
         let records = RepositoryService::system("git")
             .list_worktrees(&repository, &cancellation)
             .unwrap();
-        let fresh = git_watch::Project::read_changed(
+        let interest = |id| {
+            plan.worktrees
+                .iter()
+                .find(|worktree| worktree.id == id)
+                .unwrap()
+                .interest()
+        };
+        let fresh = git_watch::Project::read_changed_with_interest(
             plan.id,
             repository,
             &records,
             &cancellation,
             None,
             &BTreeSet::new(),
+            &interest,
         )
         .unwrap();
         assert_eq!(plan.worktrees, fresh.worktrees);
-        let unchanged = run(&fixture, Some(&recovered), &git_watch::Change::default());
+        let unchanged = run(Some(&recovered), &git_watch::Change::default());
         assert!(unchanged.plan_error.is_none());
         assert!(
             Arc::ptr_eq(plan, unchanged.plan.as_ref().unwrap()),

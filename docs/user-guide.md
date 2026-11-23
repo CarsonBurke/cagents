@@ -487,8 +487,8 @@ command line.
 The pane shows one column per state below, or every card in one list newest
 first. The scope menu narrows it to one project, and search matches branches,
 projects, worktree paths, pull request titles and numbers, and Linear tickets.
-The daemon pushes each changed board to open panes, so a commit, an edited file
-or a merged pull request moves its card without a refresh. Refresh rescans
+The daemon pushes each changed board to open panes, so a commit, an edit where
+a session runs or a merged pull request moves its card without a refresh. Refresh rescans
 every project and polls GitHub at once. Clicking a card opens its worktree, or
 its pull request when it has no worktree. Its menu, also on right-click, opens
 either one or its Linear issue, copies the branch, and pins or unpins the card.
@@ -628,11 +628,19 @@ containers are not seen; stop them first. Sessions in other worktrees keep
 running, and the daemon refuses to upgrade or shut down until the removal
 finishes. Agents may read plans, but only you can remove a worktree.
 
-The daemon watches each project's Git metadata and, within its watch budget,
-the tracked directories of its worktrees. Projects beyond the budget are
-polled, every 15 seconds after recent activity and every two minutes
-otherwise; ignored trees such as `node_modules` are never walked. A commit or
-fetch re-reads only the worktrees whose head it moved.
+The daemon watches the Git metadata of every worktree, so staging, committing,
+switching branches and adding or removing worktrees arrive as events. Within
+its watch budget it also watches the tracked directories of each project's own
+checkout and of every worktree a session runs in. An edit elsewhere that is
+neither staged nor committed shows at that worktree's next Git event, on
+**Refresh**, or when the pane opens with that worktree's status read more than
+15 minutes before. A worktree whose files are not watched is read every 15
+seconds only while an agent works in it or its files changed in the last four
+minutes. A project whose metadata cannot be watched, such as one on a network
+filesystem, is polled: every 15 seconds after recent activity and every two
+minutes otherwise. Ignored trees such as `node_modules` are never walked. A
+commit or fetch re-reads only the worktrees whose head it moved, and an idle
+daemon runs no Git.
 
 GitHub is read with `gh`: two `gh pr list` calls per repository, plus a cached
 lookup for a checked-out branch whose pull request someone else opened. While

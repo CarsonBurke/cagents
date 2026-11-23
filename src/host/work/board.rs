@@ -17,7 +17,7 @@ use crate::{
 };
 
 /// A live session and the directory it runs in, canonicalized by the caller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LiveSession {
     pub id: TerminalId,
     pub provider: Option<Provider>,

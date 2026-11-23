@@ -885,6 +885,27 @@ pub fn derive_column(item: &Item, now_unix_ms: u64, stale_after_days: u16) -> Co
     Column::InProgress
 }
 
+/// When, after `now_unix_ms`, the clock alone may next move `item` to
+/// another column: once its last activity leaves [`ACTIVE_WINDOW_MS`], and
+/// once it is older than `stale_after_days`. `None` when time can no longer
+/// move it. A board need not be assembled again before the earliest of these
+/// across its cards unless its facts change.
+pub fn column_changes_at(item: &Item, now_unix_ms: u64, stale_after_days: u16) -> Option<u64> {
+    let activity = item.last_activity?;
+    let active_until = (activity.source != ActivitySource::PullRequest)
+        .then(|| activity.at_unix_ms.saturating_add(ACTIVE_WINDOW_MS));
+    let stale_from = activity
+        .at_unix_ms
+        .saturating_add(u64::from(stale_after_days.max(1)) * DAY_MS);
+    // The thresholds are inclusive, so the column changes a millisecond on.
+    [active_until, Some(stale_from)]
+        .into_iter()
+        .flatten()
+        .map(|at| at.saturating_add(1))
+        .filter(|&at| at > now_unix_ms)
+        .min()
+}
+
 /// Sets `derived` from the facts and `column` from the pin, if any.
 pub fn place(item: &mut Item, pin: Option<Column>, now_unix_ms: u64, stale_after_days: u16) {
     item.derived = derive_column(item, now_unix_ms, stale_after_days);

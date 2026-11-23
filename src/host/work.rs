@@ -2,9 +2,13 @@
 //! user is working on, shared by the CLI and the windows.
 //!
 //! A coordinator thread decides which projects to scan and a few workers
-//! scan them, so one large checkout delays only itself. The watcher wakes the
-//! coordinator for the projects within the watch budget; the rest are polled,
-//! sooner while something happens in them. A separate forge thread polls
+//! scan them, so one large checkout delays only itself. The watcher sees Git's
+//! bookkeeping in every worktree, and the files of those someone works in, so
+//! an idle daemon runs no Git: a scan follows a Git event and reads only what
+//! it moved. A worktree whose files are not watched is polled only while
+//! something may be changing it, and read once when a window starts watching
+//! the board with its status long unread. A project whose bookkeeping cannot
+//! be watched at all is polled. A separate forge thread polls
 //! GitHub with bounded `gh` calls, so a slow forge delays no local scan.
 //! Requests assemble a board from the latest facts without spawning a
 //! process unless they ask for a fresh one. A publisher thread sends windows
@@ -48,14 +52,18 @@ const SCAN_SPACING: Duration = Duration::from_secs(2);
 /// A failed scan is retried this long after, or as soon as someone reads the
 /// board; its changes wait for the retry.
 const SCAN_RETRY: Duration = Duration::from_secs(30);
-/// Polling for projects beyond the watch budget: soon after recent activity,
-/// rarely otherwise.
+/// Polling a worktree whose files are not watched while something may be
+/// changing it, and, in a project whose Git bookkeeping cannot be watched,
+/// every other worktree and the worktree list.
 const ACTIVE_POLL: Duration = Duration::from_secs(15);
 const IDLE_POLL: Duration = Duration::from_secs(120);
-/// A watched project is still re-read now and then; a watcher can miss what
-/// happens on another filesystem or while it re-registers.
-const WATCHED_POLL: Duration = Duration::from_secs(10 * 60);
+/// A window that starts watching the board has every worktree whose files
+/// are not watched read again once its status is this old.
+const SHOWN_STALE: Duration = Duration::from_secs(15 * 60);
 const SESSION_SAMPLE: Duration = Duration::from_secs(15);
+/// While a window watches the board, sessions are sampled this often, so a
+/// card's session state follows within it.
+const WATCHED_SAMPLE: Duration = Duration::from_secs(5);
 /// A session sampled within this long is still working; one late sample is
 /// tolerated.
 const LIVE_SESSION: Duration = Duration::from_secs(2 * SESSION_SAMPLE.as_secs());
@@ -79,10 +87,11 @@ const TICK_FLOOR: Duration = Duration::from_millis(250);
 /// Changes arriving together, such as several workers finishing at once, are
 /// sent to watchers as one board.
 const PUBLISH_FLOOR: Duration = Duration::from_millis(150);
-/// How often a watched board is reassembled without a change to wake it:
-/// session states and the clock move cards without a scan.
-const REPUBLISH: Duration = Duration::from_secs(5);
-/// Unwatched, the publisher waits for a watcher's notification.
+/// A watched board whose open projects could not be read tries again after
+/// this long.
+const REPUBLISH_RETRY: Duration = Duration::from_secs(5);
+/// The longest the publisher sleeps: unwatched, it waits for a watcher's
+/// notification, and watched, for a change or the clock to move a card.
 const UNWATCHED: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Default)]
@@ -132,6 +141,8 @@ struct Job {
     id: ProjectId,
     previous: Option<Arc<scan::Local>>,
     change: git_watch::Change,
+    full: bool,
+    in_use: Arc<BTreeSet<PathBuf>>,
     hints: Arc<scan::ForgeHints>,
     sequence: u64,
 }
@@ -194,11 +205,18 @@ struct Tracked {
     scanning: bool,
     /// What changed since the last scan; `Some` while a scan is wanted.
     pending: Option<git_watch::Change>,
+    /// The pending scan re-reads every worktree's status, for a request
+    /// that wants a fresh board.
+    full: bool,
     /// A request asked for this scan and waits on it.
     urgent: bool,
     last_scan: Option<Instant>,
-    /// Whether the watcher covers every worktree, so polling can rest.
+    /// Whether the watcher covers everything this project asked it to.
     covered: bool,
+    /// With Git's bookkeeping watched, the worktrees whose own files are
+    /// not: an edit there shows only at their next read. `None` while the
+    /// bookkeeping is not known to be watched, so the project is polled.
+    unwatched: Option<BTreeSet<WorktreeId>>,
     /// Uncovered only because native registration failed, so registering
     /// the same plan again may restore coverage.
     watch_recoverable: bool,
@@ -234,9 +252,11 @@ impl Tracked {
             scans: 0,
             scanning: false,
             pending: Some(full_change()),
+            full: true,
             urgent: false,
             last_scan: None,
             covered: false,
+            unwatched: None,
             watch_recoverable: false,
             hints: Arc::default(),
             forge: Forge::Pending,
@@ -370,6 +390,8 @@ struct Shared {
     listings: forge::Listings,
     pins: BTreeMap<(PathBuf, String), Column>,
     session_activity: HashMap<PathBuf, u64>,
+    /// Worktrees a live session runs in now, whose files are watched first.
+    in_use: Arc<BTreeSet<PathBuf>>,
     /// Resolved Linear tickets by reference: a linked issue's id or a branch
     /// name's identifier.
     tickets: BTreeMap<String, store::Ticket>,
@@ -461,39 +483,106 @@ impl Shared {
     }
 
     /// When `tracked` next needs a re-read that no watcher event asked for.
-    /// A watched project is re-read whole now and then. An unwatched one
-    /// polls each worktree on its own: a worktree with recent work soon, the
-    /// rest rarely, so a project with hundreds of checkouts and a few agents
-    /// does not re-read every checkout at the agents' cadence. Its worktree
-    /// list is still read at least every [`IDLE_POLL`].
+    ///
+    /// With Git's bookkeeping watched, only a worktree whose files are not
+    /// is polled, and only while something may be changing it
+    /// ([`worktree_live`](Self::worktree_live)): an idle project runs no Git.
+    /// Otherwise each worktree polls on its own, one with recent work soon
+    /// and the rest rarely, so a project with hundreds of checkouts and a few
+    /// agents does not re-read every checkout at the agents' cadence, and its
+    /// worktree list is read every [`IDLE_POLL`].
     fn next_poll(&self, tracked: &Tracked) -> Option<Instant> {
         let last = tracked.last_scan?;
-        if tracked.covered {
-            return Some(last + WATCHED_POLL);
-        }
         let worktrees = tracked.local.iter().flat_map(|local| &local.worktrees);
-        std::iter::once(last + IDLE_POLL)
-            .chain(worktrees.map(|worktree| self.worktree_due(worktree, last)))
-            .min()
+        match &tracked.unwatched {
+            Some(unwatched) => worktrees
+                .filter(|worktree| unwatched.contains(&worktree.id) && self.worktree_live(worktree))
+                .map(|worktree| worktree.status_read_at.unwrap_or(last) + ACTIVE_POLL)
+                .min(),
+            None => std::iter::once(Self::list_due(tracked, last))
+                .chain(worktrees.map(|worktree| self.worktree_due(worktree, last)))
+                .min(),
+        }
     }
 
-    /// The worktrees a poll of `tracked` re-reads, if one is due. Worktrees
-    /// that would come due before the next active poll join it, so their
-    /// reads share one scan.
-    fn due_polls(&self, tracked: &Tracked, now: Instant) -> Option<BTreeSet<WorktreeId>> {
+    /// When a project whose bookkeeping is not watched reads its worktree
+    /// list again.
+    fn list_due(tracked: &Tracked, last_scan: Instant) -> Instant {
+        tracked
+            .local
+            .as_ref()
+            .and_then(|local| local.listed_at)
+            .unwrap_or(last_scan)
+            + IDLE_POLL
+    }
+
+    /// What a poll of `tracked` re-reads, if one is due. Reads that would
+    /// come due before the next active poll join it, so they share one scan.
+    fn due_polls(&self, tracked: &Tracked, now: Instant) -> Option<git_watch::Change> {
         if self.next_poll(tracked)? > now {
             return None;
         }
         let last = tracked.last_scan?;
+        let soon = now + ACTIVE_POLL;
         let worktrees = tracked.local.iter().flat_map(|local| &local.worktrees);
-        Some(
-            worktrees
+        Some(match &tracked.unwatched {
+            Some(unwatched) => git_watch::Change {
+                worktrees: worktrees
+                    .filter(|worktree| {
+                        unwatched.contains(&worktree.id)
+                            && self.worktree_live(worktree)
+                            && worktree.status_read_at.unwrap_or(last) + ACTIVE_POLL <= soon
+                    })
+                    .map(|worktree| worktree.id)
+                    .collect(),
+                ..git_watch::Change::default()
+            },
+            None => git_watch::Change {
+                worktrees: worktrees
+                    .filter(|worktree| self.worktree_due(worktree, last) <= soon)
+                    .map(|worktree| worktree.id)
+                    .collect(),
+                topology: Self::list_due(tracked, last) <= soon,
+                ..git_watch::Change::default()
+            },
+        })
+    }
+
+    /// Asks for a read of each worktree whose files are not watched and
+    /// whose status is [`SHOWN_STALE`], as a window starts watching the
+    /// board: its cards come into view. Cards that stay in view are not
+    /// read again on a timer; a project whose bookkeeping is not watched is
+    /// polled anyway.
+    fn read_stale(&mut self, now: Instant) -> bool {
+        let mut asked = false;
+        for tracked in self.projects.values_mut() {
+            let (Some(unwatched), Some(local), Some(last)) =
+                (&tracked.unwatched, &tracked.local, tracked.last_scan)
+            else {
+                continue;
+            };
+            let stale = local
+                .worktrees
+                .iter()
                 .filter(|worktree| {
-                    tracked.covered || self.worktree_due(worktree, last) <= now + ACTIVE_POLL
+                    unwatched.contains(&worktree.id)
+                        && now.saturating_duration_since(worktree.status_read_at.unwrap_or(last))
+                            >= SHOWN_STALE
                 })
                 .map(|worktree| worktree.id)
-                .collect(),
-        )
+                .collect::<BTreeSet<_>>();
+            if !stale.is_empty() {
+                tracked
+                    .pending
+                    .get_or_insert_with(Default::default)
+                    .merge(git_watch::Change {
+                        worktrees: stale,
+                        ..git_watch::Change::default()
+                    });
+                asked = true;
+            }
+        }
+        asked
     }
 
     /// Adds each due poll to its project's pending change. A project still
@@ -508,15 +597,12 @@ impl Shared {
                 Some((repository.clone(), self.due_polls(tracked, now)?))
             })
             .collect::<Vec<_>>();
-        for (repository, worktrees) in polls {
+        for (repository, change) in polls {
             let tracked = self.projects.get_mut(&repository).expect("listed above");
             tracked
                 .pending
                 .get_or_insert_with(Default::default)
-                .merge(git_watch::Change {
-                    worktrees,
-                    ..git_watch::Change::default()
-                });
+                .merge(change);
         }
     }
 
@@ -683,6 +769,7 @@ impl Service {
             listings: forge::Listings::default(),
             pins: BTreeMap::new(),
             session_activity: HashMap::new(),
+            in_use: Arc::default(),
             tickets: BTreeMap::new(),
             linear_unavailable: None,
             stale_after_days: stale_after_days(),
@@ -781,6 +868,7 @@ impl Handle {
                 listings: forge::Listings::default(),
                 pins: BTreeMap::new(),
                 session_activity: HashMap::new(),
+                in_use: Arc::default(),
                 tickets: BTreeMap::new(),
                 linear_unavailable: None,
                 stale_after_days: 7,
@@ -966,6 +1054,7 @@ impl Handle {
                             .pending
                             .get_or_insert_with(Default::default)
                             .merge(full_change());
+                        tracked.full |= rescan;
                     }
                     tracked.urgent = true;
                     // A first scan answers whenever it completes.
@@ -1090,7 +1179,14 @@ impl Handle {
         self.settle(&selected, false);
         let mut publication = self.publication();
         publication.watchers.insert(client, delivery);
-        self.shared().set_watching(true);
+        let stale = {
+            let mut shared = self.shared();
+            shared.set_watching(true);
+            shared.read_stale(Instant::now())
+        };
+        if stale {
+            self.0.scanner.notify();
+        }
         // Assembled while subscribed, so no later change can miss this
         // client; the others are sent the same board if it is new to them.
         let board = self.assemble(host, &selected);
@@ -1128,24 +1224,24 @@ impl Handle {
                 break;
             };
             let started = Instant::now();
-            let watched =
+            let wait =
                 super::service::attempt("Work board publishing", || Ok(self.republish(&host)))
                     .unwrap_or_else(|error| {
                         tracing::warn!(%error, "Work board publishing is temporarily unavailable");
-                        true
+                        REPUBLISH_RETRY
                     });
             drop(host);
-            // Unwatched, only a new watcher's notification wakes this thread.
-            self.0
-                .publisher
-                .wait(observed, if watched { REPUBLISH } else { UNWATCHED });
+            // Only a change, a new watcher or the clock moving a card wakes
+            // this thread.
+            self.0.publisher.wait(observed, wait);
             std::thread::sleep(PUBLISH_FLOOR.saturating_sub(started.elapsed()));
         }
     }
 
-    /// Sends watchers the board when it changed, and reports whether anyone
-    /// is watching.
-    fn republish(&self, host: &SharedHost) -> bool {
+    /// Sends watchers the board when it changed, and says how long it may
+    /// wait for the next change: until the clock moves a card, or, with
+    /// nobody watching, until a watcher arrives.
+    fn republish(&self, host: &SharedHost) -> Duration {
         let mut publication = self.publication();
         publication
             .watchers
@@ -1153,13 +1249,13 @@ impl Handle {
         self.shared().set_watching(!publication.watchers.is_empty());
         if publication.watchers.is_empty() {
             publication.sent = None;
-            return false;
+            return UNWATCHED;
         }
         let selected = match self.resolve(host, &Scope::All) {
             Ok(selected) => selected,
             Err(error) => {
                 tracing::debug!(%error, "the Work board could not read the open projects");
-                return true;
+                return REPUBLISH_RETRY;
             }
         };
         let untracked = {
@@ -1181,7 +1277,18 @@ impl Handle {
         publication.offer(host, &board, None);
         let watched = !publication.watchers.is_empty();
         self.shared().set_watching(watched);
-        watched
+        if !watched {
+            return UNWATCHED;
+        }
+        let now = now_unix_ms();
+        board
+            .items
+            .iter()
+            .filter_map(|item| crate::work::column_changes_at(item, now, board.stale_after_days))
+            .min()
+            .map_or(UNWATCHED, |at| {
+                Duration::from_millis(at.saturating_sub(now)).min(UNWATCHED)
+            })
     }
 
     /// The one card on `board` named by `name`: its branch, its storage key or
@@ -1278,6 +1385,8 @@ impl Handle {
                     repository: &job.repository,
                     previous: job.previous.as_deref(),
                     change: &job.change,
+                    full: job.full,
+                    in_use: &job.in_use,
                     hints: &job.hints,
                     now_unix_ms: now_unix_ms(),
                     cancellation: &self.0.cancellation,
@@ -1321,6 +1430,7 @@ impl Handle {
                     .pending
                     .get_or_insert_with(Default::default)
                     .merge(job.change);
+                tracked.full |= job.full;
             }
         }
         let settled = tracked.scan_error.is_none()
@@ -1370,6 +1480,7 @@ impl Handle {
             monitor,
             configured: BTreeMap::new(),
             stamped: HashMap::new(),
+            sessions: Vec::new(),
             sampled: None,
             refreshed: None,
         };
@@ -1621,6 +1732,8 @@ struct Scanner {
     configured: BTreeMap<ProjectId, ConfiguredWatch>,
     /// When each worktree's agent activity was last written down.
     stamped: HashMap<PathBuf, Instant>,
+    /// The live sessions as last sampled.
+    sessions: Vec<board::LiveSession>,
     sampled: Option<Instant>,
     refreshed: Option<Instant>,
 }
@@ -1644,7 +1757,7 @@ impl Scanner {
         self.drain(handle);
         if self
             .sampled
-            .is_none_or(|sampled| sampled.elapsed() >= SESSION_SAMPLE)
+            .is_none_or(|sampled| sampled.elapsed() >= Self::sample_interval(handle))
         {
             self.sampled = Some(now);
             self.sample(handle, host);
@@ -1702,6 +1815,7 @@ impl Scanner {
             if let Some(covered) = change.coverage {
                 tracked.covered = covered;
                 tracked.watch_recoverable = change.recoverable;
+                tracked.unwatched.clone_from(&change.unwatched);
             }
             if let Some(error) = &change.error {
                 tracing::debug!(%error, project = %tracked.name, "the Work board polls this project");
@@ -1722,8 +1836,11 @@ impl Scanner {
         }
     }
 
-    /// Notes which worktrees agents are working in now. The stamp outlives
-    /// the session, so a card keeps its place after the agent finishes.
+    /// Notes which worktrees live sessions run in, whose files are then
+    /// watched first, and which of them agents are working in now. The
+    /// working stamp outlives the session, so a card keeps its place after
+    /// the agent finishes. Wakes the publisher when what the board shows of
+    /// the sessions changed.
     fn sample(&mut self, handle: &Handle, host: &SharedHost) {
         let sessions = live_sessions(host);
         let now = now_unix_ms();
@@ -1735,12 +1852,9 @@ impl Scanner {
             .flat_map(|local| local.worktrees.iter().map(|worktree| worktree.path.clone()))
             .collect::<Vec<_>>();
         let mut stamps = Vec::new();
-        for session in sessions.iter().filter(|session| {
-            matches!(
-                session.state,
-                ActivityState::Working | ActivityState::Waiting
-            )
-        }) {
+        let mut in_use = BTreeSet::new();
+        let mut working = false;
+        for session in &sessions {
             let Some(worktree) = worktrees
                 .iter()
                 .filter(|worktree| session.directory.starts_with(worktree))
@@ -1748,6 +1862,14 @@ impl Scanner {
             else {
                 continue;
             };
+            in_use.insert(worktree.clone());
+            if !matches!(
+                session.state,
+                ActivityState::Working | ActivityState::Waiting
+            ) {
+                continue;
+            }
+            working = true;
             shared.session_activity.insert(worktree.clone(), now);
             if self
                 .stamped
@@ -1758,10 +1880,33 @@ impl Scanner {
                 stamps.push((worktree.clone(), now));
             }
         }
+        // A worktree a session started or ended in is planned again, so its
+        // files are watched while it is in use.
+        if in_use != *shared.in_use {
+            let moved = in_use
+                .symmetric_difference(&shared.in_use)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for tracked in shared.projects.values_mut() {
+                if tracked
+                    .local
+                    .iter()
+                    .flat_map(|local| &local.worktrees)
+                    .any(|worktree| moved.contains(&worktree.path))
+                {
+                    tracked.pending.get_or_insert_with(Default::default);
+                }
+            }
+            shared.in_use = Arc::new(in_use);
+        }
         let horizon =
             now.saturating_sub(u64::from(crate::work::MAX_STALE_AFTER_DAYS) * crate::work::DAY_MS);
         shared.session_activity.retain(|_, at| *at >= horizon);
         drop(shared);
+        if working || sessions != self.sessions {
+            handle.0.publisher.notify();
+        }
+        self.sessions = sessions;
         self.stamped
             .retain(|_, stamped| stamped.elapsed() < SESSION_STAMP);
         if !stamps.is_empty() {
@@ -1775,6 +1920,7 @@ impl Scanner {
         let jobs = {
             let mut shared = handle.shared();
             shared.queue_polls(Instant::now());
+            let in_use = shared.in_use.clone();
             shared
                 .projects
                 .iter_mut()
@@ -1795,6 +1941,8 @@ impl Scanner {
                         id: tracked.id,
                         previous: tracked.local.clone(),
                         change: tracked.pending.take().unwrap_or_default(),
+                        full: std::mem::take(&mut tracked.full),
+                        in_use: in_use.clone(),
                         hints: tracked.hints.clone(),
                         sequence: tracked.scans_started,
                     }
@@ -1827,10 +1975,12 @@ impl Scanner {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
+        // A plan read again the same asks for the same watches: the index
+        // identity it also carries only saves its next census read.
         let unchanged = plans.len() == self.configured.len()
             && plans.iter().all(|(id, (plan, scan, retry))| {
                 self.configured.get(id).is_some_and(|configured| {
-                    Arc::ptr_eq(&configured.plan, plan)
+                    (Arc::ptr_eq(&configured.plan, plan) || configured.plan == *plan)
                         && (!retry
                             || *scan == configured.scan
                             || configured.attempted.elapsed() < ACTIVE_POLL)
@@ -1860,10 +2010,20 @@ impl Scanner {
         }
     }
 
+    /// How often sessions are sampled: sooner while a window shows them.
+    fn sample_interval(handle: &Handle) -> Duration {
+        if handle.shared().watching {
+            WATCHED_SAMPLE
+        } else {
+            SESSION_SAMPLE
+        }
+    }
+
     /// How long the scanner may sleep before something is due.
     fn next(&self, handle: &Handle) -> Duration {
+        let sample = Self::sample_interval(handle);
         let shared = handle.shared();
-        let mut next = SESSION_SAMPLE.saturating_sub(
+        let mut next = sample.saturating_sub(
             self.sampled
                 .map_or(Duration::ZERO, |sampled| sampled.elapsed()),
         );
@@ -2020,6 +2180,8 @@ mod tests {
                     id: tracked.id,
                     previous: tracked.local.clone(),
                     change: full_change(),
+                    full: true,
+                    in_use: Arc::default(),
                     hints: tracked.hints.clone(),
                     sequence: tracked.scans_started,
                 }
@@ -2029,6 +2191,8 @@ mod tests {
                 repository: &job.repository,
                 previous: job.previous.as_deref(),
                 change: &job.change,
+                full: job.full,
+                in_use: &job.in_use,
                 hints: &job.hints,
                 now_unix_ms: now_unix_ms(),
                 cancellation: &handle.0.cancellation,
@@ -2568,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unwatched_project_polls_only_its_due_worktrees() {
+    fn a_project_whose_bookkeeping_is_not_watched_polls_only_its_due_worktrees() {
         let handle = polling_handle();
         let mut shared = handle.shared();
         let start = Instant::now();
@@ -2609,14 +2773,19 @@ mod tests {
             Some(at(15)),
             "the next poll is the earliest worktree's"
         );
-        assert_eq!(shared.due_polls(tracked, at(14)), None);
+        let due = |now| {
+            shared
+                .due_polls(tracked, now)
+                .map(|change| change.worktrees)
+        };
+        assert_eq!(due(at(14)), None);
         assert_eq!(
-            shared.due_polls(tracked, at(15)),
+            due(at(15)),
             Some(BTreeSet::from([editing.id, session.id])),
             "an hour-old edit does not earn the short polling cadence"
         );
         assert_eq!(
-            shared.due_polls(tracked, at(110)),
+            due(at(110)),
             Some(BTreeSet::from([
                 edited.id,
                 editing.id,
@@ -2625,12 +2794,85 @@ mod tests {
             ])),
             "idle worktrees due in the next active interval join one scan"
         );
-        // The quiet worktrees still come due at the idle cadence.
+        assert!(!shared.due_polls(tracked, at(110)).unwrap().topology);
+        // The quiet worktrees still come due at the idle cadence, with the
+        // worktree list.
+        let idle = shared.due_polls(tracked, at(94) + IDLE_POLL).unwrap();
+        assert_eq!(idle.worktrees.len(), 304);
+        assert!(idle.topology);
+    }
+
+    #[test]
+    fn a_project_whose_bookkeeping_is_watched_polls_nothing_while_idle() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let start = Instant::now();
+        // Hundreds of worktrees, every one watched for Git's bookkeeping
+        // alone, some dirty from edits long finished.
+        let worktrees = (0..800)
+            .map(|index| {
+                let modified = (index % 10 == 0).then(|| now_unix_ms() - 24 * 60 * 60 * 1000);
+                polled_worktree(&format!("/repo/.worktrees/w{index}"), start, modified)
+            })
+            .collect::<Vec<_>>();
+        let unwatched = worktrees.iter().map(|worktree| worktree.id).collect();
+        track_polled(&mut shared, worktrees, start).unwatched = Some(unwatched);
+        let tracked = &shared.projects[Path::new("/repo")];
+        assert_eq!(shared.next_poll(tracked), None, "no Git on a timer");
+        assert_eq!(shared.until_scan(start), None);
+        shared.queue_polls(start + Duration::from_secs(24 * 60 * 60));
+        assert!(shared.projects[Path::new("/repo")].pending.is_none());
+    }
+
+    #[test]
+    fn an_unwatched_worktree_polls_only_while_something_may_change_it() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let start = Instant::now();
+        let session = polled_worktree("/repo/session", start, None);
+        let editing = polled_worktree("/repo/editing", start, Some(now_unix_ms()));
+        // Its files are watched, so its edits arrive as events.
+        let watched = polled_worktree("/repo/watched", start, Some(now_unix_ms()));
+        let quiet = polled_worktree("/repo/quiet", start, None);
+        shared
+            .session_activity
+            .insert(session.path.clone(), now_unix_ms());
+        let unwatched = BTreeSet::from([session.id, editing.id, quiet.id]);
+        track_polled(
+            &mut shared,
+            vec![session.clone(), editing.clone(), watched, quiet],
+            start,
+        )
+        .unwatched = Some(unwatched);
+        let tracked = &shared.projects[Path::new("/repo")];
+        assert_eq!(shared.next_poll(tracked), Some(start + ACTIVE_POLL));
+        let due = shared.due_polls(tracked, start + ACTIVE_POLL).unwrap();
+        assert_eq!(due.worktrees, BTreeSet::from([session.id, editing.id]));
+        assert!(!due.topology, "the watcher reports the worktree list");
+    }
+
+    #[test]
+    fn a_window_watching_the_board_reads_long_unread_worktrees_once() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let start = Instant::now();
+        let long_unread = polled_worktree("/repo/long-unread", start, None);
+        let recent = polled_worktree("/repo/recent", start + SHOWN_STALE, None);
+        let watched = polled_worktree("/repo/watched", start, None);
+        let unwatched = BTreeSet::from([long_unread.id, recent.id]);
+        track_polled(
+            &mut shared,
+            vec![long_unread.clone(), recent, watched],
+            start + SHOWN_STALE,
+        )
+        .unwatched = Some(unwatched);
+        assert!(shared.read_stale(start + SHOWN_STALE));
         assert_eq!(
-            shared
-                .due_polls(tracked, at(94) + IDLE_POLL)
-                .map(|due| due.len()),
-            Some(304)
+            shared.projects[Path::new("/repo")]
+                .pending
+                .as_ref()
+                .map(|change| change.worktrees.clone()),
+            Some(BTreeSet::from([long_unread.id]))
         );
     }
 
@@ -2661,31 +2903,12 @@ mod tests {
                 shared
                     .due_polls(tracked, start + IDLE_POLL)
                     .unwrap()
+                    .worktrees
                     .contains(&unwatched.id),
                 "selective publish {k} must retain the unwatched worktree's deadline"
             );
             assert!(shared.next_poll(tracked) <= Some(start + IDLE_POLL));
         }
-    }
-
-    #[test]
-    fn a_watched_project_polls_every_worktree_rarely() {
-        let handle = polling_handle();
-        let mut shared = handle.shared();
-        let now = Instant::now();
-        let worktrees = (0..3)
-            .map(|index| polled_worktree(&format!("/repo/{index}"), now, Some(now_unix_ms())))
-            .collect();
-        track_polled(&mut shared, worktrees, now).covered = true;
-        let tracked = &shared.projects[Path::new("/repo")];
-        assert_eq!(shared.next_poll(tracked), Some(now + WATCHED_POLL));
-        assert_eq!(shared.due_polls(tracked, now + ACTIVE_POLL), None);
-        assert_eq!(
-            shared
-                .due_polls(tracked, now + WATCHED_POLL)
-                .map(|due| due.len()),
-            Some(3)
-        );
     }
 
     #[test]

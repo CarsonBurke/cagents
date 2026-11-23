@@ -219,6 +219,11 @@ impl PartialEq for Worktree {
 impl Eq for Worktree {}
 
 impl Worktree {
+    /// How much its owner asked for this worktree's files to be watched.
+    pub fn interest(&self) -> Interest {
+        self.interest
+    }
+
     /// Whether the owner must read this worktree once it is registered in
     /// place of `before`: it is new or moved, or its files are watched by a
     /// census that changed, so an edit made before the new watches existed

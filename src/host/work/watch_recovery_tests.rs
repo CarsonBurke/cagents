@@ -62,6 +62,7 @@ fn fixture_handle() -> Handle {
             listings: forge::Listings::default(),
             pins: BTreeMap::new(),
             session_activity: HashMap::new(),
+            in_use: Arc::default(),
             tickets: BTreeMap::new(),
             linear_unavailable: None,
             stale_after_days: crate::work::DEFAULT_STALE_AFTER_DAYS,
@@ -101,6 +102,8 @@ fn complete_scan(scanner: &mut Scanner, handle: &Handle) {
         repository: &job.repository,
         previous: job.previous.as_deref(),
         change: &job.change,
+        full: job.full,
+        in_use: &job.in_use,
         hints: &job.hints,
         now_unix_ms: now_unix_ms(),
         cancellation: &handle.0.cancellation,
@@ -174,6 +177,7 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
         monitor: Some(monitor),
         configured: BTreeMap::new(),
         stamped: HashMap::new(),
+        sessions: Vec::new(),
         sampled: None,
         refreshed: None,
     };
@@ -218,17 +222,19 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
 
     // Advance only the existing scheduler's timestamps, avoiding a real
     // two-minute sleep. dispatch generates the real fallback poll, the worker
-    // runs Git, and publish retains the exact unchanged watch-plan Arc.
+    // runs Git, and publish keeps an unchanged watch plan.
     let poll = |scanner: &mut Scanner| {
-        handle
-            .shared()
-            .projects
-            .get_mut(&repository)
-            .unwrap()
-            .last_scan = Some(Instant::now() - IDLE_POLL);
+        {
+            let mut shared = handle.shared();
+            let tracked = shared.projects.get_mut(&repository).unwrap();
+            tracked.last_scan = Some(Instant::now() - IDLE_POLL);
+            let mut local = (**tracked.local.as_ref().unwrap()).clone();
+            local.listed_at = Some(Instant::now() - IDLE_POLL);
+            tracked.local = Some(Arc::new(local));
+        }
         scanner.configured.get_mut(&id).unwrap().attempted = Instant::now() - ACTIVE_POLL;
         complete_scan(scanner, &handle);
-        assert!(Arc::ptr_eq(
+        assert_eq!(
             &original,
             handle.shared().projects[&repository]
                 .local
@@ -237,7 +243,7 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
                 .plan
                 .as_ref()
                 .unwrap()
-        ));
+        );
         scanner.configure(&handle);
     };
     poll(&mut scanner);
@@ -326,6 +332,7 @@ fn an_unwatched_change_is_read_while_a_watched_worktree_keeps_changing() {
         monitor: None,
         configured: BTreeMap::new(),
         stamped: HashMap::new(),
+        sessions: Vec::new(),
         sampled: None,
         refreshed: None,
     };
@@ -404,4 +411,194 @@ fn an_unwatched_change_is_read_while_a_watched_worktree_keeps_changing() {
         .find(|worktree| worktree.id == unwatched.id)
         .unwrap();
     assert_eq!(linked.dirty.as_ref().unwrap().paths, 1);
+}
+
+/// The regression test for an idle daemon: with Git's bookkeeping watched,
+/// nothing is due however long it waits, and a Git event in one idle
+/// worktree reads that worktree's status alone, without listing the
+/// worktrees or reading the refs again.
+#[test]
+fn an_idle_board_runs_no_git_and_an_event_reads_only_its_worktree() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("repository");
+    std::fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.name", "Watch fixture"]);
+    git(&root, &["config", "user.email", "watch@example.invalid"]);
+    std::fs::write(root.join("README"), "tracked\n").unwrap();
+    git(&root, &["add", "README"]);
+    git(&root, &["commit", "-qm", "fixture"]);
+    let linked = (0..12)
+        .map(|index| {
+            let path = directory.path().join(format!("w{index}"));
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("w{index}"),
+                    path.to_str().unwrap(),
+                ],
+            );
+            path.canonicalize().unwrap()
+        })
+        .collect::<Vec<_>>();
+    let repository = root.canonicalize().unwrap().join(".git");
+    let handle = fixture_handle();
+    let id = handle.shared().track(&repository, "fixture").id;
+    let monitor = {
+        let signal = Arc::downgrade(&handle.0);
+        git_watch::Monitor::start(move || {
+            if let Some(inner) = signal.upgrade() {
+                inner.scanner.notify();
+            }
+        })
+        .unwrap()
+    };
+    let mut scanner = Scanner {
+        monitor: Some(monitor),
+        configured: BTreeMap::new(),
+        stamped: HashMap::new(),
+        sessions: Vec::new(),
+        sampled: None,
+        refreshed: None,
+    };
+    let local = |handle: &Handle| handle.shared().projects[&repository].local.clone().unwrap();
+    let worktree = |local: &scan::Local, path: &Path| {
+        local
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == path)
+            .unwrap()
+            .clone()
+    };
+    let rescan = |scanner: &mut Scanner| {
+        handle
+            .shared()
+            .projects
+            .get_mut(&repository)
+            .unwrap()
+            .last_scan = Some(Instant::now() - SCAN_SPACING);
+        complete_scan(scanner, &handle);
+        scanner.configure(&handle);
+    };
+    // Waits for the watcher to report something for the project, and takes
+    // it.
+    let drained = |scanner: &mut Scanner, until: &dyn Fn(&Tracked) -> bool| {
+        wait_until(|| {
+            scanner.drain(&handle);
+            until(&handle.shared().projects[&repository])
+        });
+    };
+
+    complete_scan(&mut scanner, &handle);
+    scanner.configure(&handle);
+    coverage(&mut scanner, &handle, id, true);
+    // The registration asks for one read of what it now watches.
+    if handle.shared().projects[&repository].pending.is_some() {
+        rescan(&mut scanner);
+    }
+    {
+        let shared = handle.shared();
+        let tracked = &shared.projects[&repository];
+        let unwatched = tracked.unwatched.as_ref().expect("bookkeeping is watched");
+        let local = tracked.local.as_ref().unwrap();
+        for path in &linked {
+            assert!(
+                unwatched.contains(&worktree(local, path).id),
+                "an idle linked worktree's files are not watched"
+            );
+        }
+        assert!(
+            !unwatched.contains(&local.worktrees[0].id),
+            "the primary's are"
+        );
+    }
+
+    // Idle: the daemon's own status reads take no optional locks, so they
+    // wake nothing, and no poll comes due however long it waits.
+    std::thread::sleep(Duration::from_millis(300));
+    scanner.drain(&handle);
+    let mut shared = handle.shared();
+    assert!(shared.projects[&repository].pending.is_none());
+    assert_eq!(shared.until_scan(Instant::now()), None);
+    shared.queue_polls(Instant::now() + Duration::from_secs(7 * 24 * 60 * 60));
+    assert!(shared.projects[&repository].pending.is_none());
+    drop(shared);
+
+    // Staging in an idle worktree is a Git event for it alone. Its scan reads
+    // that worktree, and not the worktree list or the refs.
+    let before = local(&handle);
+    std::fs::write(linked[7].join("README"), "staged\n").unwrap();
+    git(&linked[7], &["add", "README"]);
+    drained(&mut scanner, &|tracked| {
+        tracked
+            .pending
+            .as_ref()
+            .is_some_and(|change| !change.worktrees.is_empty())
+    });
+    {
+        let shared = handle.shared();
+        let change = shared.projects[&repository].pending.clone().unwrap();
+        assert_eq!(
+            change.worktrees,
+            BTreeSet::from([worktree(&before, &linked[7]).id])
+        );
+        assert!(!change.topology && !change.references);
+    }
+    rescan(&mut scanner);
+    let after = local(&handle);
+    assert_eq!(after.listed_at, before.listed_at, "the list was not read");
+    for path in &linked {
+        let (was, now) = (worktree(&before, path), worktree(&after, path));
+        if *path == linked[7] {
+            assert_eq!(now.dirty.as_ref().unwrap().paths, 1);
+            assert!(now.status_read_at > was.status_read_at);
+        } else {
+            assert_eq!(now.status_read_at, was.status_read_at, "{path:?} was read");
+        }
+    }
+
+    // A session in a worktree has its files watched, so an edit there with
+    // nothing staged arrives as an event.
+    {
+        let mut shared = handle.shared();
+        shared.in_use = Arc::new(BTreeSet::from([linked[3].clone()]));
+        shared
+            .projects
+            .get_mut(&repository)
+            .unwrap()
+            .pending
+            .get_or_insert_with(Default::default);
+    }
+    rescan(&mut scanner);
+    let in_use = worktree(&local(&handle), &linked[3]).id;
+    drained(&mut scanner, &|tracked| {
+        tracked
+            .unwatched
+            .as_ref()
+            .is_some_and(|unwatched| !unwatched.contains(&in_use))
+    });
+    // Gaining file watches asks for one read.
+    if handle.shared().projects[&repository].pending.is_some() {
+        rescan(&mut scanner);
+    }
+    std::fs::write(linked[3].join("README"), "edited\n").unwrap();
+    drained(&mut scanner, &|tracked| {
+        tracked
+            .pending
+            .as_ref()
+            .is_some_and(|change| change.worktrees.contains(&in_use))
+    });
+    rescan(&mut scanner);
+    assert_eq!(
+        worktree(&local(&handle), &linked[3])
+            .dirty
+            .as_ref()
+            .unwrap()
+            .paths,
+        1
+    );
 }
