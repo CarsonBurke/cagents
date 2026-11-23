@@ -154,35 +154,106 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     } else {
         Scope::Containing(current_directory()?)
     };
-    let directory = read(scope)?;
+    let mut client = control_daemon_client()?;
+    let directory = read_with(&mut client, scope)?;
+    let unshown = unshown(&mut client, &directory);
+    let mut data = listing_json(
+        json!({ "scope": fields::word(&directory.scope) }),
+        directory.caller.iter().chain(&directory.sessions),
+        None,
+        &arguments.fields.fields,
+        now_ms(),
+    );
+    // Only when no fields were chosen: a selection returns just those.
+    if arguments.fields.fields.is_empty() {
+        mark_unshown(&mut data, &unshown);
+    }
     Ok(CommandOutput {
         command: "sessions",
-        human: sessions_human(&directory, &super::format::program(), now_ms()),
-        data: listing_json(
-            json!({ "scope": fields::word(&directory.scope) }),
-            directory.caller.iter().chain(&directory.sessions),
-            None,
-            &arguments.fields.fields,
-            now_ms(),
-        ),
+        human: sessions_human(&directory, &unshown, &super::format::program(), now_ms()),
+        data,
     })
 }
 
-/// The caller and every session in scope, then what to run next.
-/// `program` names this CLI in those commands.
-fn sessions_human(directory: &Sessions, program: &str, now: u64) -> String {
+/// Marks each listed row no saved pane shows with `"no_pane": true`.
+fn mark_unshown(data: &mut Value, unshown: &BTreeSet<TerminalId>) {
+    let Some(rows) = data.get_mut("sessions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for row in rows {
+        let listed = row
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<TerminalId>().ok());
+        if listed.is_some_and(|id| unshown.contains(&id)) {
+            row["no_pane"] = json!(true);
+        }
+    }
+}
+
+/// The live conversations in `directory` that no saved pane shows, which
+/// `channel move` gives one. The model is read only when a listed
+/// conversation is in no single view, and an unreadable model marks none.
+fn unshown(client: &mut ControlClient, directory: &Sessions) -> BTreeSet<TerminalId> {
+    let candidates: BTreeSet<TerminalId> = directory
+        .caller
+        .iter()
+        .chain(&directory.sessions)
+        .map(|member| &member.session)
+        .filter(|entry| {
+            entry.surface == Surface::Chat
+                && entry.view_scope.is_none()
+                && entry.delegation.is_none()
+        })
+        .map(|entry| entry.id)
+        .collect();
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let Ok(model) = client.read_workspace_model() else {
+        return BTreeSet::new();
+    };
+    let shown: BTreeSet<TerminalId> = model
+        .views
+        .iter()
+        .flat_map(|view| &view.panes)
+        .filter_map(|pane| match &pane.kind {
+            crate::model::CardKind::Chat(session) => Some(session.id),
+            _ => None,
+        })
+        .collect();
+    &candidates - &shown
+}
+
+/// The caller and every session in scope, then what to run next. `unshown`
+/// are those no pane shows. `program` names this CLI in those commands.
+fn sessions_human(
+    directory: &Sessions,
+    unshown: &BTreeSet<TerminalId>,
+    program: &str,
+    now: u64,
+) -> String {
     let channel = directory.caller.as_ref().and_then(|me| me.session.channel);
     let human = list_human(
         directory
             .caller
             .iter()
             .chain(directory.sessions.iter())
-            .map(Row::from),
+            .map(|member| Row {
+                unshown: unshown.contains(&member.session.id),
+                ..Row::from(member)
+            }),
         channel,
         None,
         now,
     );
     let mut steps = conversing(program, directory.sessions.iter());
+    if !unshown.is_empty() {
+        steps.push((
+            format!("{program} channel move SESSION --to CHANNEL"),
+            "shows one with no pane in a channel",
+        ));
+    }
     if matches!(directory.scope, Scope::Project(_)) {
         steps.push((format!("{program} ls --all"), "lists every project"));
     }
@@ -590,6 +661,8 @@ pub(super) struct Row<'a> {
     limit: Option<&'a UsageLimit>,
     account: Option<&'a SessionAccount>,
     member: &'a Member,
+    /// A live conversation no saved pane shows.
+    unshown: bool,
 }
 
 impl<'a> From<&'a Member> for Row<'a> {
@@ -602,6 +675,7 @@ impl<'a> From<&'a Member> for Row<'a> {
             limit: member.limit.as_ref(),
             account: member.account.as_ref(),
             member,
+            unshown: false,
         }
     }
 }
@@ -782,6 +856,9 @@ fn context(
     {
         context.push(format!("view {}", super::format::location(path, root)));
     }
+    if row.unshown {
+        context.push("no pane".into());
+    }
     if entry.relation != Relation::Myself && channel.is_some() && entry.channel == channel {
         context.push("my channel".into());
     }
@@ -912,16 +989,27 @@ fn current_directory() -> Result<PathBuf, AppError> {
 }
 
 fn read(scope: Scope) -> Result<Sessions, AppError> {
-    request(
-        Operation::Context {
-            scope,
-            standing: true,
-        },
-        |reply| match reply {
-            Reply::Context(context) => Some(context.into_sessions()),
-            _ => None,
-        },
-    )
+    read_with(&mut control_daemon_client()?, scope)
+}
+
+/// The sessions in `scope`, read over a connection the caller already has.
+pub(super) fn read_with(client: &mut ControlClient, scope: Scope) -> Result<Sessions, AppError> {
+    let reply = client
+        .agent(
+            Authority::from_environment(),
+            Operation::Context {
+                scope,
+                standing: true,
+            },
+        )
+        .map_err(protocol_error)?;
+    match reply {
+        Reply::Context(context) => Ok(context.into_sessions()),
+        _ => Err(AppError::new(
+            "sessions",
+            "Unexpected reply from the daemon",
+        )),
+    }
 }
 
 fn request<T>(
@@ -936,7 +1024,7 @@ fn request<T>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::agent::ActivityState;
     use crate::agent_execution::{
@@ -944,7 +1032,7 @@ mod tests {
         directory::{Delegation, Owner, Surface},
     };
 
-    fn entry() -> Entry {
+    pub(in crate::control) fn entry() -> Entry {
         let id = "00000000-0000-4000-8000-000000000001".parse().unwrap();
         Entry {
             id,
@@ -972,6 +1060,38 @@ mod tests {
             relation: Relation::Child,
             lineage: Lineage("00000000-0000-4000-8000-000000000003".parse().unwrap()),
         }
+    }
+
+    /// #2073: a conversation no pane shows says so in both listings.
+    #[test]
+    fn a_session_no_pane_shows_says_so_and_how_to_show_it() {
+        let mut entry = entry();
+        entry.delegation = None;
+        entry.view_scope = None;
+        entry.relation = Relation::Peer;
+        let id = entry.id;
+        let directory = Sessions {
+            caller: None,
+            scope: Scope::All,
+            sessions: vec![live(entry)],
+        };
+        let unshown = BTreeSet::from([id]);
+        let listed = sessions_human(&directory, &unshown, "cagents", 0);
+        assert!(listed.contains("no pane"), "{listed}");
+        assert!(
+            listed.contains(
+                "`cagents channel move SESSION --to CHANNEL` shows one with no pane in a channel"
+            ),
+            "{listed}"
+        );
+        assert!(!sessions_human(&directory, &BTreeSet::new(), "cagents", 0).contains("no pane"));
+
+        let mut data = listing_json(json!({}), &directory.sessions, None, &[], 0);
+        mark_unshown(&mut data, &unshown);
+        assert_eq!(data["sessions"][0]["no_pane"], json!(true));
+        let mut data = listing_json(json!({}), &directory.sessions, None, &[], 0);
+        mark_unshown(&mut data, &BTreeSet::new());
+        assert!(data["sessions"][0].get("no_pane").is_none());
     }
 
     #[test]
@@ -1026,7 +1146,7 @@ mod tests {
         );
     }
 
-    fn live(session: Entry) -> Member {
+    pub(in crate::control) fn live(session: Entry) -> Member {
         Member {
             session,
             exited: false,
@@ -1505,7 +1625,7 @@ mod tests {
             scope: Scope::Project("/fixture/.git".into()),
             sessions: vec![peer],
         };
-        let listed = sessions_human(&directory, "cagents", 0);
+        let listed = sessions_human(&directory, &BTreeSet::new(), "cagents", 0);
         assert!(
             listed.ends_with(
                 "\nhint: `cagents transcript SESSION` reads one; \
@@ -1537,7 +1657,7 @@ mod tests {
             caller: None,
             scope: Scope::All,
         };
-        assert!(!sessions_human(&shells, "cagents", 0).contains("hint:"));
+        assert!(!sessions_human(&shells, &BTreeSet::new(), "cagents", 0).contains("hint:"));
 
         let outside = Sessions {
             caller: None,
@@ -1549,13 +1669,16 @@ mod tests {
             whoami_human(&outside, &[], "cagents", 0),
             "Not running inside a cagents session"
         );
-        assert_eq!(sessions_human(&outside, "cagents", 0), "No live sessions");
+        assert_eq!(
+            sessions_human(&outside, &BTreeSet::new(), "cagents", 0),
+            "No live sessions"
+        );
         let alone = Sessions {
             scope: Scope::Project("/fixture/.git".into()),
             ..outside
         };
         assert_eq!(
-            sessions_human(&alone, "cagents", 0),
+            sessions_human(&alone, &BTreeSet::new(), "cagents", 0),
             "No live sessions\nhint: `cagents ls --all` lists every project"
         );
     }

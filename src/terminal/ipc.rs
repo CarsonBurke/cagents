@@ -812,6 +812,9 @@ pub enum ClientRequest {
     /// authority was issued to. A connection acting for an agent moves only
     /// a session pane its lineage controls, so this is also the only way an
     /// agent creates a channel. `operation` makes a resent request one move.
+    /// `pane` may instead hold a session's ID: that session's one saved
+    /// pane moves, or a live conversation no saved pane shows gets a new
+    /// pane in the destination, keeping its provider running.
     MovePane {
         pane: Option<crate::model::CardId>,
         destination: crate::workspace_model::PaneDestination,

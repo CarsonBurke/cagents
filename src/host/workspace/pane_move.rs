@@ -5,17 +5,22 @@
 //! terminal and unsent draft. So this commits the same `Transfer` a window's
 //! own move sends, after the authority checks an agent's connection needs,
 //! and makes the destination channel first when the caller names a new one.
+//!
+//! A live conversation can outlive every pane that showed it, as when its
+//! channel is deleted or a window's stop is refused. Naming its session
+//! gives it a new pane in the destination instead: the same conversation,
+//! with no provider started or replayed.
 use super::{super::agent_execution::terminals, edit_delta, edit_then, snapshot, unavailable};
 use crate::{
     host::state::{ClientId, SharedHost},
-    model::{CardId, CardKind, ChannelId},
+    model::{CardId, CardKind, ChannelId, TerminalId},
     terminal_ipc::{ProtocolError, ProtocolErrorCode},
     workspace_model::{
         ChannelIncarnation, ModelChannel, ModelEdit, PaneDestination, PaneMove, WorkspaceModel,
         views::{Change, Pane, Scope, View},
     },
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Conflicting edits a move re-reads and re-authorizes before it gives up.
 const ATTEMPTS: usize = 3;
@@ -91,12 +96,15 @@ fn attempt(
     let mut conflicts = 0;
     loop {
         let model = snapshot(host, None)?;
-        let (view, found) = locate(&model, mover, pane)?;
+        let found = locate(host, &model, mover, pane)?;
         // Authorized against this revision: a pane whose session changes
         // before the transfer commits changes the revision and is read again.
-        terminals::authorize_move(host, mover, found)?;
-        let repository = project(&model, &view.scope)
-            .ok_or_else(|| refused("The pane's project is no longer open, so it can't move"))?;
+        terminals::authorize_move(host, mover, found.pane())?;
+        let repository = match &found {
+            Found::Saved(view, _) => project(&model, &view.scope)
+                .ok_or_else(|| refused("The pane's project is no longer open, so it can't move"))?,
+            Found::Unshown { repository, .. } => repository.as_path(),
+        };
         let (target, suggest_new) = match destination {
             PaneDestination::Channel(id) => (*id, true),
             PaneDestination::NewChannel { id, .. } => (*id, false),
@@ -122,26 +130,48 @@ fn attempt(
         };
         same_project(channel, repository, suggest_new)?;
         let to = Scope::Channel(target);
-        if view.scope == to {
-            return Ok(PaneMove {
-                pane: found.clone(),
-                from: to,
-                channel: channel.clone(),
-                created: false,
-                sequence: model.sequence,
-            });
-        }
-        let id = found.id;
-        let from = view.scope.clone();
-        let edit = ModelEdit::ChangeView {
-            scope: from.clone(),
-            expected_revision: view.revision,
-            operation,
-            change: Change::Transfer {
-                id,
-                destination: to.clone(),
-                before: None,
-            },
+        let opened = matches!(found, Found::Unshown { .. });
+        let (id, from, edit) = match found {
+            Found::Saved(view, found) if view.scope == to => {
+                return Ok(PaneMove {
+                    pane: found.clone(),
+                    from: to,
+                    channel: channel.clone(),
+                    created: false,
+                    sequence: model.sequence,
+                });
+            }
+            Found::Saved(view, found) => (
+                found.id,
+                view.scope.clone(),
+                ModelEdit::ChangeView {
+                    scope: view.scope.clone(),
+                    expected_revision: view.revision,
+                    operation,
+                    change: Change::Transfer {
+                        id: found.id,
+                        destination: to.clone(),
+                        before: None,
+                    },
+                },
+            ),
+            Found::Unshown { pane, home, .. } => (
+                pane.id,
+                home,
+                ModelEdit::ChangeView {
+                    scope: to.clone(),
+                    expected_revision: model
+                        .views
+                        .iter()
+                        .find(|view| view.scope == to)
+                        .map_or(0, |view| view.revision),
+                    operation,
+                    change: Change::Insert {
+                        pane: *pane,
+                        before: None,
+                    },
+                },
+            ),
         };
         #[cfg(test)]
         {
@@ -166,11 +196,26 @@ fn attempt(
             result => result?,
         };
         let after = after.as_ref();
-        let pane = after
+        let placed = after
             .and_then(|model| model.views.iter().find(|view| view.scope == to))
-            .and_then(|view| view.panes.iter().find(|pane| pane.id == id))
-            .unwrap_or(found)
-            .clone();
+            .and_then(|view| view.panes.iter().find(|pane| pane.id == id));
+        let pane = match placed {
+            Some(pane) => pane.clone(),
+            // The registry adds no second pane for a conversation a saved
+            // pane already shows, so a window saved its own pane for this one
+            // meanwhile. The edit's operation is spent, so moving that pane
+            // takes a new request.
+            None if opened => {
+                return Err(refused(
+                    "A window showed this session in a pane meanwhile; run the move again to move that pane",
+                ));
+            }
+            None => {
+                return Err(refused(
+                    "The pane changed while it moved; run the move again",
+                ));
+            }
+        };
         let channel = after
             .and_then(|model| model.channel(target))
             .unwrap_or(channel)
@@ -220,43 +265,156 @@ fn make_channel(
     made.ok_or_else(|| refused("That channel was closed; run the move again"))
 }
 
-/// The pane to move and the view holding it: the named pane, or the pane
-/// showing the agent's own live session.
+/// What a move places.
+enum Found<'a> {
+    /// A saved pane, in the view holding it.
+    Saved(&'a View, &'a Pane),
+    /// A live conversation no saved pane shows, with the pane it would get,
+    /// the checkout it works in and that checkout's open project.
+    Unshown {
+        pane: Box<Pane>,
+        home: Scope,
+        repository: PathBuf,
+    },
+}
+
+impl Found<'_> {
+    fn pane(&self) -> &Pane {
+        match self {
+            Self::Saved(_, pane) => pane,
+            Self::Unshown { pane, .. } => pane.as_ref(),
+        }
+    }
+}
+
+/// The pane to move: the named pane, the one pane showing the named
+/// session, a new pane for a live conversation no saved pane shows, or
+/// the pane showing the agent's own live session.
 fn locate<'a>(
+    host: &SharedHost,
     model: &'a WorkspaceModel,
     mover: &terminals::Mover,
     pane: Option<CardId>,
-) -> Result<(&'a View, &'a Pane), ProtocolError> {
+) -> Result<Found<'a>, ProtocolError> {
     let panes = || {
         model
             .views
             .iter()
             .flat_map(|view| view.panes.iter().map(move |pane| (view, pane)))
     };
+    let only = |session: TerminalId, many: &str| {
+        let mut showing = panes().filter(|(_, pane)| shows(pane, session));
+        let found = showing.next();
+        match showing.next() {
+            Some(_) => Err(refused(many)),
+            None => Ok(found),
+        }
+    };
     match (pane, mover) {
-        (Some(id), _) => panes().find(|(_, pane)| pane.id == id).ok_or_else(|| {
-            refused(format!(
-                "No saved pane {id}. A pane that only one window shows yet can be moved from that window"
-            ))
-        }),
+        (Some(id), _) => {
+            if let Some((view, pane)) = panes().find(|(_, pane)| pane.id == id) {
+                return Ok(Found::Saved(view, pane));
+            }
+            // Not a pane: perhaps a session, saved in one pane or in none.
+            let session = TerminalId::from_uuid(id.as_uuid());
+            if let Some((view, pane)) = only(
+                session,
+                "That session shows in more than one pane; name the pane to move by its ID",
+            )? {
+                return Ok(Found::Saved(view, pane));
+            }
+            unshown(host, model, session)?.ok_or_else(|| {
+                refused(format!(
+                    "No saved pane or live session {id}. A pane that only one window shows yet can be moved from that window"
+                ))
+            })
+        }
         (None, terminals::Mover::Person) => Err(refused(
             "Name the pane to move: `cagents channel move PANE --to CHANNEL`",
         )),
-        (None, terminals::Mover::Agent { session, .. }) => {
-            let mut own = panes().filter(|(_, pane)| shows(pane, *session));
-            let found = own.next().ok_or_else(|| {
-                refused(
-                    "Your session has no saved pane in a channel yet, so it can't move. Ask the person to move it from the window",
-                )
-            })?;
-            if own.next().is_some() {
-                return Err(refused(
-                    "Your session shows in more than one pane; name the pane to move by its ID",
-                ));
-            }
-            Ok(found)
-        }
+        (None, terminals::Mover::Agent { session, .. }) => only(
+            *session,
+            "Your session shows in more than one pane; name the pane to move by its ID",
+        )?
+        .map(|(view, pane)| Found::Saved(view, pane))
+        .ok_or_else(|| {
+            refused(
+                "Your session has no saved pane in a channel yet, so it can't move. Ask the person to move it from the window",
+            )
+        }),
     }
+}
+
+/// A new pane for `session`, a live conversation no saved pane shows, or
+/// `None` when the daemon hosts no such conversation. Refused while a
+/// window still shows it in a pane that window has not saved, which that
+/// window moves itself, and for an agent's conversation, whose pane a
+/// window opens in the agent's channel.
+fn unshown(
+    host: &SharedHost,
+    model: &WorkspaceModel,
+    session: TerminalId,
+) -> Result<Option<Found<'static>>, ProtocolError> {
+    if let Some(agent) = model.agents.iter().find(|agent| {
+        !agent.closed
+            && agent
+                .session
+                .as_ref()
+                .is_some_and(|hosted| hosted.id() == session)
+    }) {
+        let name = agent.name.clone().unwrap_or_else(|| agent.id.to_string());
+        return Err(refused(format!(
+            "Session {session} is agent {name}'s, and a window opens its pane in the agent's channel; move that pane once it shows"
+        )));
+    }
+    let (source, title) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&session) else {
+            return Ok(None);
+        };
+        if record.handle.is_completed() {
+            return Err(refused(format!(
+                "Session {session} has ended; resume its conversation from a window instead"
+            )));
+        }
+        if !record.subscribers.is_empty() {
+            return Err(refused(format!(
+                "Another client is showing session {session} right now, such as a window in a pane it has not saved or the phone app. Move it from that window, or close it there and run the move again"
+            )));
+        }
+        (record.current_session(), record.handle.title())
+    };
+    let directory = &source.launch.recipe.working_directory;
+    let placement = crate::project_location::place(directory, model);
+    let Some(repository) = placement.project else {
+        return Err(refused(format!(
+            "Session {session} works in {}, which no open project contains. Open its project with `cagents project open PATH` first",
+            directory.display()
+        )));
+    };
+    let checkout = placement.worktree.unwrap_or_else(|| repository.clone());
+    let pane = Box::new(Pane {
+        id: CardId::new(),
+        // The conversation's own title where it has one, as its old tab had.
+        title: title
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| source.launch.provider.chat_title().into()),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: crate::settings::DEFAULT_NATIVE_PANE_FRACTION,
+        // The checkout the conversation works in, as an agent's pane names
+        // the directory it was started in.
+        scope: Some(checkout.clone()),
+        kind: CardKind::Chat(source),
+    });
+    Ok(Some(Found::Unshown {
+        pane,
+        home: Scope::Worktree {
+            repository: repository.clone(),
+            path: checkout,
+        },
+        repository,
+    }))
 }
 
 fn shows(pane: &Pane, session: crate::model::TerminalId) -> bool {

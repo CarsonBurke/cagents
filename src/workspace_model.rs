@@ -103,7 +103,8 @@ pub struct PaneMove {
     /// The pane as it now is, in `channel`.
     pub pane: views::Pane,
     /// Where the pane was before; `channel`'s own scope when it was already
-    /// there and nothing moved.
+    /// there and nothing moved, and the checkout it works in when the move
+    /// gave a live conversation no saved pane showed a new one.
     pub from: views::Scope,
     pub channel: ModelChannel,
     /// The request made `channel`.
