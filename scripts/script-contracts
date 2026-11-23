@@ -208,7 +208,6 @@ UNSCHEDULED = (
     "tests/redraw_latency.py",
     "tests/release_artifact_smoke.py",
     "tests/release_editor_archive.py",
-    "tests/release_host_helper.py",
     "tests/release_package_dependencies.py",
     "tests/terminal_escape_fixture.py",
 )

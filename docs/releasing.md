@@ -15,20 +15,22 @@ Pushing a tag does not start a hosted build.
 `scripts/build-release-linux` builds an exact Git tag in a private, rootless
 Ubuntu 22.04 environment with Rust 1.93, Zig 0.15.2, and Git 2.55. This
 keeps the glibc 2.35 baseline instead of inheriting a newer workstation's libc.
-The builder runs locked tests for the isolated CLI, host, browserless UI,
-integrated UI, dictation helper, and editor boundaries with the `release-test` profile: release
-semantics (optimized, production identity, no debug assertions) without the
-link-time optimization and single codegen unit of shipped binaries. It then
-packages the shipped binaries with `release` and checks them and the desktop
-metadata. Both cagents packages ship the dictation helper `cagents-dictate`,
+It runs no tests itself: every lane's tests (CLI, host, browserless UI,
+integrated UI, dictation helper and editor) gate a release earlier, when main's
+build sentinel on fw16 runs them on each commit it checks, in the ordinary test
+profile ([Watching main after merges](development.md#watching-main-after-merges)).
+`mise run release -- build` requires the tagged commit's passing verdict. The
+builder packages the shipped binaries with `release` and checks them and the
+desktop metadata. Both cagents packages ship the dictation helper `cagents-dictate`,
 linked against the sherpa-onnx libraries `scripts/sherpa-onnx-libs` verifies,
 with its third-party notices; the builder and the publisher refuse a package
 from a source with the helper that lacks either.
 
 Before exposing the bundle, the builder installs and removes each Debian
 package and extracts each portable archive in a disposable Ubuntu 24.04 runtime
-image. This runtime checks actual package dependencies, shipped commands,
-matched daemon startup and safe shutdown, live-daemon removal guards, and
+image, all five at once. This runtime checks actual package dependencies, shipped commands,
+matched daemon startup as the production instance (so with release semantics:
+no debug assertions, production identity) and safe shutdown, live-daemon removal guards, and
 preservation of unrelated files and saved app data. The compiler environment
 remains Ubuntu 22.04; runtime smoke does not replace the glibc baseline checks.
 The runtime image is prepared once with network access by
@@ -47,7 +49,7 @@ mise run release:build -- --ref v0.1.2 --output /var/tmp/cagents-v0.1.2
 `release:build` runs `scripts/build-release-linux`; its `--help` gives the cache
 location and other details. `CARGO_BUILD_JOBS` defaults to one job per CPU,
 limited to one per 2 GiB of available memory; set it lower on a shared host.
-Tests run two at a time. Download and build temporary files stay in its private
+Download and build temporary files stay in its private
 disk cache rather than a RAM-backed `/tmp`. The cache also keeps one checkout of
 the source, and each build rewrites only the files that changed, so Cargo
 recompiles only the crates they belong to.
@@ -146,6 +148,11 @@ A release goes out in five steps, each through `mise run release`
    or `--build-host HOST`) with `scripts/build-release-linux` from the tag's own
    checkout, admitted through `scripts/cargo-gate` beside other builds, and
    brings the verified bundle back to `~/.local/state/cagents-release/0.2.0`.
+   It refuses the bundle unless main's sentinel there has a passing test
+   verdict for the tagged commit; a commit without one, such as a version bump
+   main moved past before its tests ran, is tested while the bundle builds
+   (`scripts/main-build-sentinel --require-tests`). The build host must
+   therefore be the sentinel's, fw16.
    The bundle's `release-metadata.json` carries the release notes an installed
    cagents shows before it updates: by default the `feat`, `fix` and `perf`
    commit subjects since the previous tag, or a file passed with

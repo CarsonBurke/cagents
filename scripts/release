@@ -25,8 +25,10 @@ Usage: scripts/release COMMAND VERSION [OPTIONS]
                    commit: git tag -a vVERSION -m vVERSION COMMIT
   build VERSION [--notes FILE] [--build-host HOST]
                    Build tag vVERSION on HOST (default: CAGENTS_RELEASE_BUILD_HOST
-                   or fw16) in the glibc-baseline environment, run its tests
-                   and smoke checks, and bring the bundle back to
+                   or fw16) in the glibc-baseline environment, require its
+                   passing test verdict from main's sentinel there (testing
+                   the commit first if it has none), run the smoke checks,
+                   and bring the bundle back to
                    $CAGENTS_RELEASE_BUNDLES/VERSION (default under
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
@@ -130,10 +132,26 @@ else
     git worktree add --quiet --detach "\$checkout" $(printf '%q' "$commit")
 fi
 rm -rf -- $(printf '%q' "$remote_output")
-# The gate admits the build beside other agents' and holds its shares.
-CARGO_BUILD_JOBS=\${CARGO_BUILD_JOBS:-8} "\$checkout/scripts/cargo-gate" exec \
+# Every lane's tests gate the release through main's sentinel, which runs them
+# per commit in the ordinary test profile; the release build runs none itself.
+# A commit main moved past before its tests ran is tested now, beside the build.
+"\$checkout/scripts/main-build-sentinel" --repository "\$PWD" \
+    --require-tests $(printf '%q' "$commit") > /var/tmp/cagents-release/$VERSION-tests.json 2>&1 </dev/null &
+tests=\$!
+# The gate admits the build beside other agents' and holds its shares. The
+# builder sizes its own Cargo jobs from the host's CPUs and available memory.
+"\$checkout/scripts/cargo-gate" exec \
     "\$checkout/scripts/build-release-linux" --ref $(printf '%q' "$TAG") \
     --output $(printf '%q' "$remote_output") --notes /var/tmp/cagents-release/$VERSION-notes.md </dev/null
+verdict=/var/tmp/cagents-release/$VERSION-tests.json
+if ! wait "\$tests"; then
+    cat "\$verdict" >&2 || :
+    rm -rf -- $(printf '%q' "$remote_output") "\$verdict"
+    printf '%s\n' 'release: the commit has no passing test verdict from the main sentinel (above);' \
+        'release: its test logs are under ~/.local/state/cagents-main-sentinel/logs' >&2
+    exit 1
+fi
+rm -f -- "\$verdict"
 EOF
     mkdir -p -- "$BUNDLES"
     rm -rf -- "$bundle.partial"
