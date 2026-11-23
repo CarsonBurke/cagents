@@ -1272,8 +1272,11 @@ mod tests {
                 } else {
                     preview(false)
                 };
+                // One list: each fixture mints new IDs, which would renew
+                // the nonce on every poll and race the decision below.
+                let list = stop_list();
                 wait_stop(&path, &mut job, true, || {
-                    Ok((reviewed.clone(), stop_list()))
+                    Ok((reviewed.clone(), list.clone()))
                 })
             });
             let current = published(directory.path(), None);
