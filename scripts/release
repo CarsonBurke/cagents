@@ -94,6 +94,7 @@ while (($#)); do
 done
 [[ $COMMAND == cut || ( -z $COMMIT && -z $KEY && $WAIT == false ) ]] \
     || fail '--commit, --key and --wait are for cut'
+[[ -z $COMMIT || $WAIT == false ]] || fail "--wait releases main's tip; --commit releases another bundle"
 
 repository_git() (
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
@@ -382,18 +383,22 @@ cut() {
     [[ $version =~ $VERSION_PATTERN ]] || fail "$sha does not declare a stable version"
     VERSION=$version
     TAG=v$VERSION
-    ! jq -e --arg v "$VERSION" 'index($v)' <<< "$released" >/dev/null \
-        || fail "$TAG is already on origin; main needs its version bump first"
+    if jq -e --arg v "$VERSION" 'index($v)' <<< "$released" >/dev/null; then
+        # publish pushes the tag just before it publishes; a failure between
+        # the two leaves the tag on origin with nothing published.
+        [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) == false ]] \
+            || fail "$TAG is on origin but not published; finish it with scripts/release publish $VERSION"
+        fail "$TAG is already released; main needs its version bump first"
+    fi
     bundle=$BUNDLES/$VERSION
     # Not on origin, so an earlier cut of this version was never published:
-    # this one replaces it.
-    if [[ -e $bundle ]] || { repository_git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null \
-            && [[ $(repository_git rev-parse "refs/tags/$TAG^{commit}") != "$sha" ]]; }; then
-        printf 'Replacing the unpublished cut of %s.\n' "$TAG"
-        rm -rf -- "$bundle"
-        if [[ $(repository_git rev-parse --quiet --verify "refs/tags/$TAG^{commit}") != "$sha" ]]; then
-            repository_git tag -d "$TAG" >/dev/null 2>&1 || :
-        fi
+    # this one replaces it once it is copied and checked.
+    if [[ -e $bundle/release-metadata.json.sig ]]; then
+        printf 'An unpublished cut of %s is signed already, from %s.\n' "$TAG" \
+            "$(jq -r .source_commit "$bundle/release-metadata.json" 2>/dev/null || echo 'an unknown commit')"
+        [[ -t 0 ]] || fail "remove $bundle to replace it"
+        read -r -p "Replace it with the bundle of ${sha:0:12}? [y/N] " answer
+        [[ $answer == [yY] ]] || fail 'nothing released'
     fi
     mkdir -p -- "$BUNDLES"
     rm -rf -- "$bundle.partial"
@@ -417,6 +422,13 @@ cut() {
     rm -- "$bundle.partial/release-metadata.json"
     "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$sha" --protocol "$protocol" --notes "$NOTES" >/dev/null
+    if [[ -e $bundle ]]; then
+        printf 'Replacing the unpublished cut of %s.\n' "$TAG"
+        rm -rf -- "$bundle"
+    fi
+    if [[ $(repository_git rev-parse --quiet --verify "refs/tags/$TAG^{commit}") != "$sha" ]]; then
+        repository_git tag -d "$TAG" >/dev/null 2>&1 || :
+    fi
     mv -- "$bundle.partial" "$bundle"
     repository_git tag -a "$TAG" -m "$TAG" "$sha" 2>/dev/null \
         || [[ $(repository_git rev-parse "refs/tags/$TAG^{commit}") == "$sha" ]] || fail "cannot tag $sha as $TAG"
@@ -438,8 +450,28 @@ cut() {
 # The pull request that starts the next patch version on main, as `release
 # publish` opens and lands it after each release. Running it again resumes:
 # it lands the pull request already open, or opens it afresh.
+# Rebuilds BRANCH in WORKTREE as main plus the bump to NEXT, and pushes it,
+# which also updates its open pull request. The bump is mechanical, so
+# regenerating it is always right.
+bump_branch() {
+    local next=$1 branch=$2 worktree=$3
+    [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
+    repository_git worktree prune
+    repository_git fetch --quiet origin main
+    repository_git worktree add --quiet -B "$branch" "$worktree" origin/main \
+        || fail "cannot create $worktree"
+    # bump runs cargo, which mise provides only in a trusted checkout.
+    if command -v mise >/dev/null && [[ -f $worktree/mise.toml ]]; then
+        mise trust --quiet "$worktree" || fail "cannot trust $worktree for mise"
+    fi
+    "$worktree/scripts/release" bump "$next" >/dev/null || fail "the version bump to $next failed in $worktree"
+    repository_git -C "$worktree" commit --quiet -am "chore(release): start $next after $TAG" \
+        || fail "cannot commit the version bump in $worktree"
+    repository_git -C "$worktree" push --quiet --force -u origin "$branch" || fail "cannot push $branch"
+}
+
 start_next_version() {
-    local next branch worktree number body
+    local next branch worktree number body status=0
     next=${VERSION%.*}.$((${VERSION##*.} + 1))
     repository_git fetch --quiet origin main
     if [[ $(repository_git show origin/main:Cargo.toml | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}') \
@@ -455,18 +487,7 @@ start_next_version() {
         printf 'Landing #%s, which starts %s.\n' "$number" "$next"
     else
         # Anything left of an earlier attempt that opened nothing is rebuilt.
-        [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
-        repository_git worktree prune
-        repository_git worktree add --quiet -B "$branch" "$worktree" origin/main \
-            || fail "cannot create $worktree"
-        # bump runs cargo, which mise provides only in a trusted checkout.
-        if command -v mise >/dev/null && [[ -f $worktree/mise.toml ]]; then
-            mise trust --quiet "$worktree" || fail "cannot trust $worktree for mise"
-        fi
-        "$worktree/scripts/release" bump "$next" >/dev/null || fail "the version bump to $next failed in $worktree"
-        repository_git -C "$worktree" commit --quiet -am "chore(release): start $next after $TAG" \
-            || fail "cannot commit the version bump in $worktree"
-        repository_git -C "$worktree" push --quiet --force -u origin "$branch" || fail "cannot push $branch"
+        bump_branch "$next" "$branch" "$worktree"
         body=$(printf '%s\n' \
             "$TAG is published, so main now declares the next patch version, $next. Release bundles are prebuilt from main commits with the version those commits declare, so until this lands every main commit declares the already-tagged $VERSION and gets no usable bundle." \
             "" \
@@ -477,7 +498,15 @@ start_next_version() {
         [[ -n $number ]] || fail "cannot open the pull request from $branch"
         printf 'Opened #%s to start %s; landing it once its checks pass.\n' "$number" "$next"
     fi
-    "$ROOT_DIR/scripts/land-pr" "$number" -R "$GITHUB_REPOSITORY" \
+    "$ROOT_DIR/scripts/land-pr" "$number" -R "$GITHUB_REPOSITORY" || status=$?
+    if ((status == 3)); then
+        # land-pr's status for a conflict with main.
+        printf '#%s conflicts with main; making the bump again on main.\n' "$number"
+        bump_branch "$next" "$branch" "$worktree"
+        status=0
+        "$ROOT_DIR/scripts/land-pr" "$number" -R "$GITHUB_REPOSITORY" || status=$?
+    fi
+    ((status == 0)) \
         || fail "#$number, which starts $next, did not land; run scripts/release publish $VERSION again once it can"
     [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
 }

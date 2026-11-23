@@ -177,7 +177,9 @@ steps, each through `mise run release` (`scripts/release --help`):
    already published and lands a bump pull request already open.
 
 A cut that is never published can be replaced: `cut` again replaces the local
-bundle and tag of an unpublished version.
+bundle and tag of an unpublished version once the new copy checks out, and
+asks first if the earlier one is signed. A bump pull request that conflicts
+with main is made again on main and landed.
 
 To build a tag without a prebuild, as before, bump and tag it yourself, then
 run `mise run release -- build VERSION`. This builds the tag on the build host

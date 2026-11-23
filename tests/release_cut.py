@@ -82,9 +82,14 @@ status=$(cat "$FIXTURE/publish-status" 2>/dev/null || echo 0)
 exit 0
 """
 
+# Exits with each line of land-statuses in turn, then 0.
 LAND = r"""#!/bin/bash
 echo "land-pr $*" >> "$FIXTURE/calls.log"
-exit "$(cat "$FIXTURE/land-status" 2>/dev/null || echo 0)"
+statuses=$FIXTURE/land-statuses
+[[ -s $statuses ]] || exit 0
+status=$(head -n1 "$statuses")
+sed -i 1d "$statuses"
+exit "$status"
 """
 
 RECORD = r"""#!/bin/bash
@@ -277,6 +282,7 @@ class ReleaseCut(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no bundle of main", result.stderr)
         # ...and the tip, which declares it too, needs main's bump.
+        (self.root / "release-draft").write_text("false\n")
         result = self.release("cut", "--wait")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("version bump first", result.stderr)
@@ -360,12 +366,11 @@ class ReleaseCut(unittest.TestCase):
 
     def test_publish_resumes_past_a_publication_and_a_pull_request_already_open(self):
         self.cut_signed()
-        (self.root / "land-status").write_text("1")
+        (self.root / "land-statuses").write_text("1\n")
         result = self.release("publish", "0.2.4", stdin="0.2.4\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("#77, which starts 0.2.5, did not land", result.stderr)
         # Run again: published already, and the bump's pull request is open.
-        (self.root / "land-status").unlink()
         (self.root / "release-draft").write_text("false\n")
         (self.root / "open-pr").write_text("77\n")
         result = self.release("publish", "0.2.4")
@@ -377,6 +382,57 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual([line for line in self.log("calls.log") if line.startswith("land-pr")],
                          ["land-pr 77 -R CarsonBurke/cagents"] * 2)
         self.assertFalse((self.repo / ".worktrees/release-bump-0.2.5").exists())
+
+    def test_a_bump_that_conflicts_with_main_is_made_again(self):
+        self.cut_signed()
+        self.git("push", "-q", "origin", "main")
+        (self.root / "release-draft").write_text("false\n")
+        (self.root / "open-pr").write_text("77\n")
+        (self.root / "land-statuses").write_text("3\n")
+        # The open pull request's branch, from before main moved on.
+        self.git("push", "-q", "origin", f"{self.feature}:refs/heads/release/bump-0.2.5")
+        later = self.commit("fix(deps): a change beside the version lines")
+        self.git("push", "-q", "origin", "main")
+        result = self.release("publish", "0.2.4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("conflicts with main; making the bump again", result.stdout)
+        self.assertEqual([line for line in self.log("calls.log") if line.startswith("land-pr")],
+                         ["land-pr 77 -R CarsonBurke/cagents"] * 2)
+        self.assertEqual(self.git("rev-parse", "release/bump-0.2.5^", cwd=self.origin), later)
+        self.assertFalse(any(line.startswith("pr create") for line in self.log("gh.log")))
+
+    def test_a_tag_on_origin_that_was_never_published_says_to_publish(self):
+        self.bundle(self.fix)
+        self.git("tag", "-a", "v0.2.4", "-m", "v0.2.4", self.fix)
+        self.git("push", "-q", "origin", "v0.2.4")
+        result = self.release("cut", "--commit", self.fix)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("finish it with scripts/release publish 0.2.4", result.stderr)
+
+    def test_commit_and_wait_together_are_refused(self):
+        result = self.release("cut", "--wait", "--commit", self.fix)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--wait releases main's tip", result.stderr)
+
+    def test_a_failed_recut_keeps_the_earlier_cut(self):
+        self.bundle(self.feature)
+        dist = self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--commit", self.feature).returncode, 0)
+        (dist / "install.sh").write_text("#!/bin/sh\nchanged\n")
+        result = self.release("cut")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), self.feature)
+        self.assertEqual(json.loads((self.root / "bundles/0.2.4/release-metadata.json").read_text())
+                         ["source_commit"], self.feature)
+
+    def test_a_signed_cut_is_not_replaced_without_asking(self):
+        self.bundle(self.feature)
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--commit", self.feature, "--key", str(self.root / "key")).returncode, 0)
+        result = self.release("cut")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("signed already", result.stdout)
+        self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), self.feature)
 
     def test_a_bump_attempt_that_opened_nothing_is_rebuilt(self):
         self.cut_signed()
