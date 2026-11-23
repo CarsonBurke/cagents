@@ -272,7 +272,7 @@ fn readiness_registration_coalesces_and_replacing_it_hangs_up_the_old_reader() {
 
 #[test]
 fn binary_presentation_requires_the_current_epoch_and_wire_version() {
-    let (mut server, _root) = tests::resident_server(Some("answer λ".into()));
+    let (server, _root) = tests::resident_server(Some("answer λ".into()));
     let invoke = |epoch, version| Invocation {
         proof: server.proof.clone(),
         epoch: Some(epoch),

@@ -272,9 +272,9 @@ fn reads_follow_the_attachment_the_serve_loop_publishes() {
             method: method.into(),
             args,
         }) {
-            Ok(connections::Answer::Value(answer)) => Some(answer),
-            Ok(_) => panic!("{method} answered other than as a value"),
-            Err(_) => None,
+            Some(connections::Answer::Value(answer)) => Some(answer),
+            Some(_) => panic!("{method} answered other than as a value"),
+            None => None,
         }
     };
     let files = json!([Command::LoadFileChanges {
@@ -284,8 +284,9 @@ fn reads_follow_the_attachment_the_serve_loop_publishes() {
     let transcript = json!([server.source.id, null]);
     let first = server.epoch;
     assert!(ask(&reads, "file_query", first, files.clone()).unwrap().is_ok());
+    assert!(reads::is_read("presentation_binary") && reads::is_read("text_copy"));
     assert!(
-        ask(&reads, "state", first, json!([0])).is_none(),
+        !reads::is_read("state") && !reads::is_read("input"),
         "the serve loop answers everything but reads"
     );
 
@@ -307,7 +308,7 @@ fn reads_follow_the_attachment_the_serve_loop_publishes() {
     let presentation = ask(&reads, "presentation", server.epoch, transcript.clone()).unwrap();
     assert!(presentation.unwrap().is_object());
 
-    // Once the loop stops, a read goes back to it, unanswered.
+    // Once the loop stops, a read goes unanswered, as the loop would leave it.
     drop(serving);
     assert!(ask(&reads, "presentation", server.epoch, transcript).is_none());
     server.actor.close().unwrap();

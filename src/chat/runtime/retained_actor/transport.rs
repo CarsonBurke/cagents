@@ -2954,13 +2954,6 @@ impl Server {
             detached: DetachedWork::Stop,
         })
     }
-    fn presentation_response(
-        &self,
-        id: crate::model::TerminalId,
-        after: Option<u64>,
-    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
-        self.publisher().presentation(id, after)
-    }
     #[cfg(test)]
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
         let outcomes = self.journal.clone();

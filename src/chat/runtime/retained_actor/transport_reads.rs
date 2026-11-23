@@ -55,23 +55,14 @@ impl Reads {
             journal: server.journal.clone(),
         });
     }
-    /// Answer `request` on this thread if it is a read, or give it back for
-    /// the serve loop. Once the loop has stopped every request goes back,
-    /// to be dropped unanswered as the loop would have dropped it.
-    pub(super) fn answer(&self, request: Invocation) -> Result<Answer, Invocation> {
-        if !matches!(
-            request.method.as_str(),
-            "presentation_codec" | "presentation" | "presentation_binary" | "text_copy" | "file_query"
-        ) {
-            return Err(request);
-        }
+    /// Answer a read ([`is_read`]) on this thread, or `None` once the serve
+    /// loop has stopped, which would not have answered it either.
+    pub(super) fn answer(&self, request: Invocation) -> Option<Answer> {
         let view = self.0.read().unwrap_or_else(|p| p.into_inner());
-        let Some(view) = view.as_ref() else {
-            return Err(request);
-        };
+        let view = view.as_ref()?;
         let admitted = admit(&request, view.epoch, &view.proof, view.close_only);
         let publisher = view.publisher();
-        Ok(if request.method == "presentation_binary" {
+        Some(if request.method == "presentation_binary" {
             Answer::Binary(
                 admitted
                     .and_then(|()| binary(&publisher, request.args))
@@ -81,6 +72,15 @@ impl Reads {
             Answer::Value(admitted.and_then(|()| value(&publisher, request)))
         })
     }
+}
+
+/// Whether `method` changes nothing the serve loop orders, so the worker
+/// that received it answers it ([`Reads::answer`]).
+pub(super) fn is_read(method: &str) -> bool {
+    matches!(
+        method,
+        "presentation_codec" | "presentation" | "presentation_binary" | "text_copy" | "file_query"
+    )
 }
 
 impl View {

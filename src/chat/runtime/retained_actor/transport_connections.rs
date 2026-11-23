@@ -253,20 +253,19 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream, re
             return;
         }
     };
-    let started = Instant::now();
-    let method = request.method.clone();
-    let request = match reads.answer(request) {
-        Ok(answer) => {
-            // A read waits in no queue; it is timed as a call that didn't.
-            let _timing = Timing {
-                method,
-                queued: started,
-                started,
-            };
-            return deliver(&control, answer);
+    if super::reads::is_read(&request.method) {
+        // A read waits in no queue; it is timed as a call that didn't.
+        let started = Instant::now();
+        let _timing = Timing {
+            method: request.method.clone(),
+            queued: started,
+            started,
+        };
+        if let Some(answer) = reads.answer(request) {
+            deliver(&control, answer);
         }
-        Err(request) => request,
-    };
+        return;
+    }
     let (answer, answered) = crossbeam_channel::bounded(1);
     // Held until this thread returns, so the serve loop can wait for a
     // retirement reply to reach the client before the helper exits.
