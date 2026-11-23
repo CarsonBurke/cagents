@@ -43,6 +43,7 @@ struct Serving {
     socket: std::path::PathBuf,
     startup: UnixStream,
     serving: thread::JoinHandle<Result<(), String>>,
+    journal: Arc<Mutex<Journal>>,
     _lease: crate::daemon::HostLease,
     _root: tempfile::TempDir,
 }
@@ -59,6 +60,7 @@ impl Serving {
             args: json!([0]),
         };
         let socket = server.socket.clone();
+        let journal = server.journal.clone();
         let (control, startup) = UnixStream::pair().unwrap();
         let serving = thread::spawn(move || server.serve(control, None));
         let _: Attached = receive::<Result<Attached, String>>(&startup, TIMEOUT)
@@ -69,6 +71,7 @@ impl Serving {
             socket,
             startup,
             serving,
+            journal,
             _lease: lease,
             _root: root,
         }
@@ -82,6 +85,22 @@ impl Serving {
             .unwrap()
             .unwrap();
         assert!(state.is_object(), "{state}");
+    }
+    /// Send `method` with `args` under the attachment's epoch, or `epoch`.
+    fn ask(&self, method: &str, args: Value, epoch: Option<uuid::Uuid>) -> UnixStream {
+        let client = UnixStream::connect(&self.socket).unwrap();
+        let request = Invocation {
+            proof: self.request.proof.clone(),
+            epoch: epoch.or(self.request.epoch),
+            method: method.into(),
+            args,
+        };
+        deadline_io::send_until(&client, &request, Instant::now() + TIMEOUT).unwrap();
+        client
+    }
+    fn answer(client: &UnixStream, budget: Duration) -> Result<Value, String> {
+        deadline_io::receive_until::<Result<Value, String>>(client, Instant::now() + budget)
+            .unwrap()
     }
     /// A client that sends half a frame header and then stops.
     fn stall(&self) -> UnixStream {
@@ -160,7 +179,7 @@ fn a_half_closed_client_gets_its_reply_and_frees_its_worker() {
     isolated("CAGENTS_RETAINED_HALF_CLOSED_CALL_TEST", || {
         let mut proof = RemoteActor::fixture().0.proof.clone();
         let _lease = leased_proof(&mut proof);
-        let connections = connections::Connections::new().unwrap();
+        let connections = connections::Connections::new(Default::default()).unwrap();
         let request = Invocation {
             proof,
             epoch: None,
@@ -208,4 +227,88 @@ fn a_half_closed_client_gets_its_reply_and_frees_its_worker() {
         drop(client);
         assert_eq!(next().method(), "state");
     });
+}
+
+#[test]
+fn a_read_is_answered_while_the_serve_loop_is_busy() {
+    isolated("CAGENTS_RETAINED_READ_BESIDE_LOOP_TEST", || {
+        let serving = Serving::start();
+        let files = json!([Command::LoadFileChanges {
+            request_id: 1,
+            after: None
+        }]);
+        // The loop waits for the journal to answer for the state, as it
+        // waits for a busy journal or store on a loaded computer.
+        let journal = serving.journal.lock().unwrap();
+        let state = serving.ask("state", json!([0]), None);
+        thread::sleep(Duration::from_millis(200));
+        // Before, the query waited in the loop's queue behind the state.
+        let query = serving.ask("file_query", files.clone(), None);
+        let answered = Serving::answer(&query, TIMEOUT / 2).unwrap();
+        assert!(answered.is_object(), "{answered}");
+        // A superseded attachment is still refused beside the loop.
+        let stale = serving.ask("file_query", files, Some(uuid::Uuid::new_v4()));
+        assert!(
+            Serving::answer(&stale, TIMEOUT / 2)
+                .unwrap_err()
+                .contains("superseded")
+        );
+        drop(journal);
+        assert!(Serving::answer(&state, TIMEOUT).unwrap().is_object());
+        serving.stop();
+    });
+}
+
+#[test]
+fn reads_follow_the_attachment_the_serve_loop_publishes() {
+    let (mut server, _root) = tests::resident_server(Some("A retained answer".into()));
+    let reads = Arc::new(reads::Reads::default());
+    let serving = reads::Serving(reads.clone());
+    reads.publish(&server);
+    let ask = |reads: &reads::Reads, method: &str, epoch, args| {
+        match reads.answer(Invocation {
+            proof: server.proof.clone(),
+            epoch: Some(epoch),
+            method: method.into(),
+            args,
+        }) {
+            Ok(connections::Answer::Value(answer)) => Some(answer),
+            Ok(_) => panic!("{method} answered other than as a value"),
+            Err(_) => None,
+        }
+    };
+    let files = json!([Command::LoadFileChanges {
+        request_id: 1,
+        after: None
+    }]);
+    let transcript = json!([server.source.id, null]);
+    let first = server.epoch;
+    assert!(ask(&reads, "file_query", first, files.clone()).unwrap().is_ok());
+    assert!(
+        ask(&reads, "state", first, json!([0])).is_none(),
+        "the serve loop answers everything but reads"
+    );
+
+    // An attachment that supersedes the first, close-only: the first is
+    // refused, and the new one may read the transcript but not query files.
+    server.epoch = uuid::Uuid::new_v4();
+    server.close_only = true;
+    reads.publish(&server);
+    assert!(
+        ask(&reads, "presentation", first, transcript.clone())
+            .unwrap()
+            .unwrap_err()
+            .contains("superseded")
+    );
+    assert_eq!(
+        ask(&reads, "file_query", server.epoch, files.clone()).unwrap(),
+        Err(close_only_refusal())
+    );
+    let presentation = ask(&reads, "presentation", server.epoch, transcript.clone()).unwrap();
+    assert!(presentation.unwrap().is_object());
+
+    // Once the loop stops, a read goes back to it, unanswered.
+    drop(serving);
+    assert!(ask(&reads, "presentation", server.epoch, transcript).is_none());
+    server.actor.close().unwrap();
 }

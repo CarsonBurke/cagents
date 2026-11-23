@@ -2521,6 +2521,24 @@ fn acknowledge_late(
     });
     receiver
 }
+/// Refuse `request` unless it belongs to the current attachment, and a
+/// close-only attachment only to what closing needs.
+fn admit(
+    request: &Invocation,
+    epoch: uuid::Uuid,
+    proof: &HostSessionProof,
+    close_only: bool,
+) -> Result<(), String> {
+    if request.epoch != Some(epoch) || &request.proof != proof {
+        return Err(
+            "Retained actor attachment was superseded; stale input and ACKs are refused".into(),
+        );
+    }
+    if close_only && !close_only_method(&request.method) {
+        return Err(close_only_refusal());
+    }
+    Ok(())
+}
 fn close_only_refusal() -> String {
     "This retained actor attachment is close-only; provider input and ownership preservation are refused".into()
 }
@@ -2612,6 +2630,113 @@ fn validate_pair(
         return Err("Paired view changed issued console or native conversation ownership".into());
     }
     Ok(())
+}
+
+/// What a public, identity-bearing response is remembered under: the issued
+/// source, the aliases it has published, and the journal that keeps them.
+/// Borrowed from the serve loop's [`Server`], or from the copy it publishes
+/// for the connection workers that answer reads ([`reads`]).
+struct Publisher<'a> {
+    source: &'a chat::Session,
+    lineage: &'a [chat::Session],
+    installed: bool,
+    journal: &'a Mutex<Journal>,
+    actor: &'a LocalHandle,
+}
+impl Publisher<'_> {
+    fn published_sources(&self) -> Vec<chat::Session> {
+        let confirmed = self.actor.confirmed_session_id();
+        let continuity = if self.installed {
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        } else {
+            chat::NativeContinuity::ReconnectOnly
+        };
+        let mut sources = self.lineage.to_vec();
+        for source in self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .published_sources()
+        {
+            if !sources.contains(source) {
+                sources.push(source.clone());
+            }
+        }
+        for source in self.lineage.iter().chain(std::iter::once(self.source)) {
+            let projected = published_source(source, confirmed.as_deref(), &continuity);
+            if &projected != self.source && !sources.contains(&projected) {
+                sources.push(projected);
+            }
+        }
+        sources
+    }
+    /// Journal commit precedes every public identity-bearing response. The
+    /// journal skips exact duplicates, so ordinary observation does not write.
+    fn remember_publication(
+        &self,
+        confirmed: Option<&str>,
+        continuity: &chat::NativeContinuity,
+    ) -> Result<chat::Session, String> {
+        let source = published_source(self.source, confirmed, continuity);
+        self.remember_descriptor(&source)?;
+        Ok(source)
+    }
+    fn remember_descriptor(&self, source: &chat::Session) -> Result<(), String> {
+        if self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .published_sources()
+            .contains(source)
+        {
+            return Ok(());
+        }
+        let mut lineage = self.published_sources();
+        if !lineage.contains(source) {
+            lineage.push(source.clone());
+        }
+        validate_source_lineage(&lineage)?;
+        self.journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remember_published_source(source)
+    }
+    /// The transcript as a reader asked for it, after `after` if given.
+    fn presentation(
+        &self,
+        id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
+        if id != self.source.id {
+            return Err("Retained presentation names another chat".into());
+        }
+        // Loss is outside the reducer's transcript generation. Refuse
+        // even an unchanged-generation read instead of hiding it as
+        // an empty publication or inventing a transcript revision.
+        if let Some(loss) = self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .continuity_loss()?
+        {
+            return Err(loss.reason);
+        }
+        let response = self.actor.presentation(id, after);
+        let snapshot = match &response {
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            }) => Some(snapshot),
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
+                Some(&update.metadata)
+            }
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
+            self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
+        }
+        Ok(response)
+    }
 }
 
 struct Server {
@@ -2830,39 +2955,11 @@ impl Server {
         })
     }
     fn presentation_response(
-        &mut self,
+        &self,
         id: crate::model::TerminalId,
         after: Option<u64>,
     ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
-        if id != self.source.id {
-            return Err("Retained presentation names another chat".into());
-        }
-        // Loss is outside the reducer's transcript generation. Refuse
-        // even an unchanged-generation read instead of hiding it as
-        // an empty publication or inventing a transcript revision.
-        if let Some(loss) = self
-            .journal
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .continuity_loss()?
-        {
-            return Err(loss.reason);
-        }
-        let response = self.actor.presentation(id, after);
-        let snapshot = match &response {
-            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
-                snapshot: Some(snapshot),
-                ..
-            }) => Some(snapshot),
-            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
-                Some(&update.metadata)
-            }
-            _ => None,
-        };
-        if let Some(snapshot) = snapshot {
-            self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
-        }
-        Ok(response)
+        self.publisher().presentation(id, after)
     }
     #[cfg(test)]
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
@@ -3029,31 +3126,20 @@ impl Server {
         })
     }
 
+    /// The issued identity this helper's public responses are remembered
+    /// under. Connection workers answering reads use the same rules through
+    /// the copy the serve loop publishes for them; see [`reads`].
+    fn publisher(&self) -> Publisher<'_> {
+        Publisher {
+            source: &self.source,
+            lineage: &self.lineage,
+            installed: self.installed,
+            journal: &self.journal,
+            actor: &self.actor,
+        }
+    }
     fn published_sources(&self) -> Vec<chat::Session> {
-        let confirmed = self.actor.confirmed_session_id();
-        let continuity = if self.installed {
-            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
-        } else {
-            chat::NativeContinuity::ReconnectOnly
-        };
-        let mut sources = self.lineage.clone();
-        for source in self
-            .journal
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .published_sources()
-        {
-            if !sources.contains(source) {
-                sources.push(source.clone());
-            }
-        }
-        for source in self.lineage.iter().chain(std::iter::once(&self.source)) {
-            let projected = published_source(source, confirmed.as_deref(), &continuity);
-            if projected != self.source && !sources.contains(&projected) {
-                sources.push(projected);
-            }
-        }
-        sources
+        self.publisher().published_sources()
     }
     /// Whether `source` projects an issued alias onto one of the `followed`
     /// conversations, as [`Self::published_sources`] projects the current one.
@@ -3068,36 +3154,16 @@ impl Server {
                     .any(|issued| &published_source(issued, Some(session), &continuity) == source)
         })
     }
-    /// Journal commit precedes every public identity-bearing response. The
-    /// journal skips exact duplicates, so ordinary observation does not write.
+    /// See [`Publisher::remember_publication`].
     fn remember_publication(
         &self,
         confirmed: Option<&str>,
         continuity: &chat::NativeContinuity,
     ) -> Result<chat::Session, String> {
-        let source = published_source(&self.source, confirmed, continuity);
-        self.remember_descriptor(&source)?;
-        Ok(source)
+        self.publisher().remember_publication(confirmed, continuity)
     }
     fn remember_descriptor(&self, source: &chat::Session) -> Result<(), String> {
-        if self
-            .journal
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .published_sources()
-            .contains(source)
-        {
-            return Ok(());
-        }
-        let mut lineage = self.published_sources();
-        if !lineage.contains(source) {
-            lineage.push(source.clone());
-        }
-        validate_source_lineage(&lineage)?;
-        self.journal
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remember_published_source(source)
+        self.publisher().remember_descriptor(source)
     }
     fn retained_sources_for_publication(&self) -> Result<Vec<chat::Session>, String> {
         // The reducer can advance between sampling fields of one response.
@@ -3241,14 +3307,7 @@ impl Server {
             }
             return serde_json::to_value(self.attached()?).map_err(|error| error.to_string());
         }
-        if request.epoch != Some(self.epoch) || request.proof != self.proof {
-            return Err(
-                "Retained actor attachment was superseded; stale input and ACKs are refused".into(),
-            );
-        }
-        if self.close_only && !close_only_method(&request.method) {
-            return Err(close_only_refusal());
-        }
+        admit(&request, self.epoch, &self.proof, self.close_only)?;
         macro_rules! decode {
             ($type:ty) => {
                 serde_json::from_value::<$type>(request.args).map_err(|error| error.to_string())?
@@ -3277,9 +3336,10 @@ impl Server {
         }
         match request.method.as_str() {
             "watch" => Ok(Value::Null),
-            "presentation_codec" => {
-                let (version,) = decode!((u16,));
-                value!(version == crate::terminal_ipc::PROTOCOL_VERSION)
+            // Connection workers answer these themselves while the loop
+            // serves; see `reads`.
+            "presentation_codec" | "presentation" | "text_copy" | "file_query" => {
+                reads::value(&self.publisher(), request)
             }
             "account_switch_generation"
             | "completed_account_options"
@@ -3604,19 +3664,6 @@ impl Server {
                 }
                 value!(snapshot)
             }
-            "presentation" => {
-                let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
-                let response = self.presentation_response(id, after)?;
-                value!(response)
-            }
-            "text_copy" => {
-                let (source, offset) = decode!((chat::TextCopySource, u64));
-                value!(self.actor.text_copy(&source, offset)?)
-            }
-            "file_query" => {
-                let (command,) = decode!((Command,));
-                value!(self.actor.file_query(&command)?)
-            }
             "visible" => {
                 let (visible,) = decode!((bool,));
                 self.actor.set_visible(visible);
@@ -3901,7 +3948,11 @@ impl Server {
         self.listener
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
-        let connections = connections::Connections::new()?;
+        let reads = Arc::new(reads::Reads::default());
+        reads.publish(self);
+        // Workers stop answering reads once the loop stops, however it stops.
+        let _reads = reads::Serving(reads.clone());
+        let connections = connections::Connections::new(reads.clone())?;
         let mut orphans = OrphanSweep::new(children);
         let mut child_exited = false;
         'serve: loop {
@@ -4002,6 +4053,9 @@ impl Server {
                 }
                 let revision = self.revision();
                 let response = self.invoke(request);
+                // Before the reply, so a read sent after it, such as one from
+                // the attachment it made, is admitted by what it changed.
+                reads.publish(self);
                 if self.revision() != revision {
                     self.watcher.notify();
                 }
@@ -4439,3 +4493,6 @@ mod push;
 
 #[path = "transport_binary.rs"]
 mod binary;
+
+#[path = "transport_reads.rs"]
+mod reads;

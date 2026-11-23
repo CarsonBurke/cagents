@@ -2,12 +2,13 @@
 //!
 //! Each accepted client is read, authorized and answered on its own thread
 //! within its own deadline, so a client that is slow to send its request or
-//! to read its reply holds up only itself. The serve loop still runs requests
-//! one at a time, in the order they finish arriving: every protocol fence
-//! (epoch, proof, installation, retirement) keeps its single-writer ordering.
+//! to read its reply holds up only itself. A read is answered on that thread
+//! too (see [`super::reads`]). The serve loop runs every other request one at
+//! a time, in the order they finish arriving: every protocol fence (epoch,
+//! proof, installation, retirement) keeps its single-writer ordering.
 //! A request that arrived in full runs even if its client has since hung up:
 //! an input's sender stops waiting for the reply, not for the input's receipt.
-use super::{Invocation, MAX_FRAME, TIMEOUT, authorize, receive, send};
+use super::{Invocation, MAX_FRAME, TIMEOUT, authorize, reads::Reads, receive, send};
 use crate::agent_execution::DirectoryIdentity;
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::Value;
@@ -116,7 +117,7 @@ pub(super) struct Connections {
     pool: Arc<Pool>,
 }
 impl Connections {
-    pub(super) fn new() -> Result<Self, String> {
+    pub(super) fn new(reads: Arc<Reads>) -> Result<Self, String> {
         let (wake, woken) = UnixStream::pair().map_err(|error| error.to_string())?;
         for end in [&wake, &woken] {
             end.set_nonblocking(true)
@@ -133,6 +134,7 @@ impl Connections {
                 accepted,
                 calls: sender,
                 wake,
+                reads,
             }),
         })
     }
@@ -194,6 +196,7 @@ struct Pool {
     accepted: Receiver<UnixStream>,
     calls: Sender<Call>,
     wake: UnixStream,
+    reads: Arc<Reads>,
 }
 struct Workers {
     idle: usize,
@@ -210,7 +213,7 @@ impl Pool {
     }
     fn work(&self, mut control: UnixStream) {
         loop {
-            connection(control, &self.calls, &self.wake);
+            connection(control, &self.calls, &self.wake, &self.reads);
             {
                 let mut workers = self.lock();
                 // Only a full helper stopped watching its listener.
@@ -237,7 +240,7 @@ impl Pool {
     }
 }
 
-fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
+fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream, reads: &Reads) {
     let request = receive::<Invocation>(&control, TIMEOUT).and_then(|request| {
         authorize(&control, &request.proof)?;
         Ok(request)
@@ -249,6 +252,20 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
             let _ = send(&control, &Err::<Value, _>(error), TIMEOUT);
             return;
         }
+    };
+    let started = Instant::now();
+    let method = request.method.clone();
+    let request = match reads.answer(request) {
+        Ok(answer) => {
+            // A read waits in no queue; it is timed as a call that didn't.
+            let _timing = Timing {
+                method,
+                queued: started,
+                started,
+            };
+            return deliver(&control, answer);
+        }
+        Err(request) => request,
     };
     let (answer, answered) = crossbeam_channel::bounded(1);
     // Held until this thread returns, so the serve loop can wait for a
@@ -264,18 +281,24 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
     }
     wake(wakeup);
     // A dropped reply means the helper stopped serving or the client left.
-    match answered.recv() {
-        Ok(Answer::Value(response)) => {
-            let _ = send(&control, &response, TIMEOUT);
+    if let Ok(answer) = answered.recv() {
+        deliver(&control, answer);
+    }
+}
+
+fn deliver(control: &UnixStream, answer: Answer) {
+    match answer {
+        Answer::Value(response) => {
+            let _ = send(control, &response, TIMEOUT);
         }
-        Ok(Answer::Binary(response)) => {
+        Answer::Binary(response) => {
             let _ = super::deadline_io::send_binary_until(
-                &control,
+                control,
                 &response,
                 Instant::now() + TIMEOUT,
             );
         }
-        Ok(Answer::Watch(watch)) => {
+        Answer::Watch(watch) => {
             let response = watch.as_ref().map(|_| ()).map_err(Clone::clone);
             let fds: Vec<_> = watch
                 .as_ref()
@@ -283,7 +306,7 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
                 .map(|watch| vec![watch.as_fd()])
                 .unwrap_or_default();
             let _ = crate::descriptor_frame::send_json_with_fds_until(
-                &control,
+                control,
                 &response,
                 &fds,
                 Instant::now() + TIMEOUT,
@@ -292,7 +315,7 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
                 crate::descriptor_frame::FrameByteOrder::LittleEndian,
             );
         }
-        Ok(Answer::Directory(pin)) => {
+        Answer::Directory(pin) => {
             let response = pin
                 .as_ref()
                 .map(|(identity, _)| *identity)
@@ -303,7 +326,7 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
                 .map(|(_, file)| vec![file.as_fd()])
                 .unwrap_or_default();
             let _ = crate::descriptor_frame::send_json_with_fds_until(
-                &control,
+                control,
                 &response,
                 &descriptors,
                 Instant::now() + TIMEOUT,
@@ -312,6 +335,5 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
                 crate::descriptor_frame::FrameByteOrder::LittleEndian,
             );
         }
-        Err(_) => {}
     }
 }

@@ -560,3 +560,94 @@ fn semantic_metadata_wakes_after_confirmation_without_hidden_body_ticks() {
     assert!(received.try_recv().is_err());
     handle.close().unwrap();
 }
+
+/// How long the helper takes to answer a changed files query, a transcript
+/// read and a command while it is publishing and other readers are reading
+/// a long transcript: the workload #3602 measures before and after reads
+/// leave the serve loop. Run on fw16 with
+/// `mise run test:lib -- host --prefix chat::runtime::retained_actor::transport::push_tests::retained_reads_while_busy -- --include-ignored --nocapture`.
+#[test]
+#[ignore = "fw16 retained read latency measurement"]
+fn retained_reads_while_busy() {
+    isolated("CAGENTS_RETAINED_READS_WHILE_BUSY", || {
+        use std::sync::atomic::AtomicBool;
+        let mut proof = RemoteActor::fixture().0.proof.clone();
+        let _lease = leased_proof(&mut proof);
+        // About 1.1 MB, a long conversation's transcript window.
+        let body = "Paragraph λ with **formatting** and `code`.\n\n".repeat(25_000);
+        let proxy = Proxy::start_with_body(&proof, Some(body), |_| {});
+        settled(&proxy);
+        let id = proxy.actor.0.source.id;
+        let done = AtomicBool::new(false);
+        let summary = |name: &str, mut samples: Vec<Duration>| {
+            samples.sort();
+            let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize].as_micros();
+            eprintln!(
+                "{name}: n={} p50_us={} p95_us={} p99_us={} max_us={}",
+                samples.len(),
+                at(0.5),
+                at(0.95),
+                at(0.99),
+                at(1.0)
+            );
+        };
+        thread::scope(|scope| {
+            // A streaming turn: ten publications a second, each observed by
+            // the proxy through the serve loop (state, outbox).
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    (proxy.updates)(Update::Presentation);
+                    thread::sleep(Duration::from_millis(100));
+                }
+            });
+            // Two windows reading the whole transcript, as on showing or
+            // paging it.
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !done.load(Ordering::Acquire) {
+                        proxy.actor.presentation_wire(id, None).unwrap();
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                });
+            }
+            let commands = scope.spawn(|| {
+                let mut samples = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    let started = Instant::now();
+                    proxy.actor.call::<()>("observe", json!([])).unwrap();
+                    samples.push(started.elapsed());
+                    thread::sleep(Duration::from_millis(50));
+                }
+                samples
+            });
+            let mut files = Vec::new();
+            let mut transcripts = Vec::new();
+            let until = Instant::now() + Duration::from_secs(20);
+            let mut request_id = 0;
+            while Instant::now() < until {
+                request_id += 1;
+                let started = Instant::now();
+                proxy
+                    .actor
+                    .file_query(&Command::LoadFileChanges {
+                        request_id,
+                        after: None,
+                    })
+                    .unwrap();
+                files.push(started.elapsed());
+                thread::sleep(Duration::from_millis(25));
+                // The read a reader makes when told of a publication: what
+                // changed after the generation it already shows.
+                let shown = proxy.local.0.state.lock().unwrap().generation;
+                let started = Instant::now();
+                proxy.actor.presentation_wire(id, Some(shown)).unwrap();
+                transcripts.push(started.elapsed());
+                thread::sleep(Duration::from_millis(25));
+            }
+            done.store(true, Ordering::Release);
+            summary("file_query", files);
+            summary("presentation", transcripts);
+            summary("command", commands.join().unwrap());
+        });
+    });
+}
