@@ -162,17 +162,22 @@ steps, each through `mise run release` (`scripts/release --help`):
      security key when it asks. Without a key, it prints the signing command
      (see [Signing](#signing)).
 2. Rehearse the update from the previous release through a file feed (below).
-3. `mise run release -- publish VERSION` asks you to type the version, pushes
-   the tag, then runs `scripts/publish-release`. It checks the signature
-   against the keys the tag lists, the metadata against every asset, the
-   checksums, the archive layouts and an offline smoke install before
-   uploading anything. It uploads to a draft it owns, downloads and compares
-   the served bytes, then publishes. It never moves tags or overwrites a
-   published release. Authentication stays in the local `gh` configuration,
-   outside the build environment. Publishing makes the release the update
-   every installed cagents offers within six hours. Finally, it opens the
-   pull request that sets main to the next patch version
-   (`scripts/release bump`) and lands it with `scripts/land-pr`.
+3. `mise run release -- publish VERSION` asks you to type the version, then
+   runs `scripts/publish-release --push-tag`. It checks the signature against
+   the keys the tag lists, the metadata against every asset, the checksums,
+   the archive layouts and an offline smoke install. Only then does it push
+   the tag, so a refused bundle leaves nothing on origin. It uploads to a draft
+   it owns, downloads and compares the served bytes, then publishes. It never
+   moves tags or overwrites a published release. Authentication stays in the
+   local `gh` configuration, outside the build environment. Publishing makes
+   the release the update every installed cagents offers within six hours.
+   Finally, it opens the pull request that sets main to the next patch version
+   (`scripts/release bump`) and lands it with `scripts/land-pr`. If any step
+   fails, fix the cause and run the same command again: it skips a release
+   already published and lands a bump pull request already open.
+
+A cut that is never published can be replaced: `cut` again replaces the local
+bundle and tag of an unpublished version.
 
 To build a tag without a prebuild, as before, bump and tag it yourself, then
 run `mise run release -- build VERSION`. This builds the tag on the build host

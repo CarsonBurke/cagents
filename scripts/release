@@ -31,7 +31,9 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    by default the features, fixes and speedups since the
                    previous tag), tags the commit vVERSION here, and signs
                    with KEY (default CAGENTS_RELEASE_SIGNING_KEY), or says how.
-                   VERSION is the one the commit declares.
+                   VERSION is the one the commit declares; an unpublished
+                   earlier cut of it is replaced. Without a terminal, a
+                   bundle behind main needs --wait or --commit.
   bump VERSION     Set every product manifest and Cargo.lock to VERSION.
                    Commit it through a pull request, then tag the merged
                    commit: git tag -a vVERSION -m vVERSION COMMIT
@@ -48,10 +50,10 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
   feed VERSION --feed DIR
                    Add the signed bundle to a file feed, for rehearsing the
                    update before publishing (docs/releasing.md#rehearsing).
-  publish VERSION  Verify the signed bundle and publish it on GitHub, after
-                   you confirm by typing the version, pushing its tag first.
-                   Then open and land the pull request that starts the next
-                   patch version on main.
+  publish VERSION  Verify the signed bundle, then push its tag and publish it
+                   on GitHub, after you confirm by typing the version. Then
+                   open and land the pull request that starts the next patch
+                   version on main. Run again after a failure, it resumes.
 
 Sign between cut or build and feed or publish, with your own key:
   ssh-keygen -Y sign -n cagents-release -f KEY BUNDLE/release-metadata.json
@@ -115,7 +117,14 @@ bump() {
         sed -i "/^\[package\]/,/^\[/{s/^version = \"$current\"$/version = \"$VERSION\"/;}" "$ROOT_DIR/$manifest"
     done
     # Updates the workspace's own entries in Cargo.lock; compiles nothing.
-    (cd "$ROOT_DIR" && cargo update --workspace --offline --quiet)
+    (cd "$ROOT_DIR" && cargo update --workspace --offline --quiet) || fail 'cargo could not update Cargo.lock'
+    local name locked
+    for manifest in "${MANIFESTS[@]}"; do
+        name=$(sed -n '/^\[package\]/,/^\[/{s/^name = "\([^"]*\)"$/\1/p;}' "$ROOT_DIR/$manifest")
+        locked=$(awk -v entry="name = \"$name\"" '$0 == entry { getline; gsub(/"/, "", $3); print $3; exit }' \
+            "$ROOT_DIR/Cargo.lock")
+        [[ $locked == "$VERSION" ]] || fail "Cargo.lock has $name at ${locked:-no version}, not $VERSION"
+    done
     printf 'Set %s to %s. Commit it through a pull request, then tag the merged commit:\n' \
         "${MANIFESTS[*]}" "$VERSION"
     printf '  git tag -a %s -m %s COMMIT && git push origin %s\n' "$TAG" "$TAG" "$TAG"
@@ -248,6 +257,8 @@ def verdict(sha):
         return json.loads((verdicts / f"{sha}.json").read_text()).get("passed")
     except (OSError, ValueError):
         return None
+# An unreadable bundle.json reads as null; such a bundle is no candidate.
+status["bundles"] = [bundle for bundle in status["bundles"] if bundle]
 for bundle in status["bundles"]:
     bundle["passed"] = verdict(bundle["sha"])
 print(json.dumps(status))
@@ -279,10 +290,15 @@ esac
 HOST
 }
 
-# The newest bundle main contains whose tests passed, as "SHA BEHIND", where
-# BEHIND counts the main commits after it.
+# The versions tagged on origin, as a JSON array.
+released_versions() {
+    repository_git ls-remote --tags --refs origin 'v*' | sed -n 's#.*refs/tags/v##p' | jq -R . | jq -sc .
+}
+
+# The newest bundle main contains whose tests passed and whose version is not
+# released yet, as "SHA BEHIND", where BEHIND counts the main commits after it.
 newest_bundle() {
-    local status=$1 sha behind best= fewest=
+    local status=$1 released=$2 sha behind best= fewest=
     while read -r sha; do
         repository_git merge-base --is-ancestor "$sha" "$MAIN" 2>/dev/null || continue
         behind=$(repository_git rev-list --count --first-parent "$sha..$MAIN")
@@ -290,35 +306,53 @@ newest_bundle() {
             best=$sha
             fewest=$behind
         fi
-    done < <(jq -r '.bundles[] | select(.passed == true) | .sha' <<< "$status")
+    done < <(jq -r --argjson released "$released" \
+        '.bundles[] | select(.passed == true and (.version as $v | $released | index($v) | not)) | .sha' \
+        <<< "$status")
     [[ -n $best ]] && printf '%s %s\n' "$best" "$fewest"
 }
 
+# A pinned bundle is kept from eviction while it is chosen and copied.
 CUT_SHA=
-NOTES_FILE=
-cut_cleanup() {
-    [[ -z $NOTES_FILE ]] || rm -f -- "$NOTES_FILE"
+pin_bundle() {
+    on_host "$1" <<'HOST' || fail "cannot keep the bundle of $1 on $BUILD_HOST; it may have been evicted, so run the release again"
+cd ~/"$1" && scripts/prebuild-release --repository "$PWD" pin "$2"
+HOST
+    CUT_SHA=$1
+}
+unpin_bundle() {
     [[ -z $CUT_SHA ]] || on_host "$CUT_SHA" <<'HOST' || :
 cd ~/"$1" && scripts/prebuild-release --repository "$PWD" unpin "$2"
 HOST
+    CUT_SHA=
+}
+
+NOTES_FILE=
+cut_cleanup() {
+    [[ -z $NOTES_FILE ]] || rm -f -- "$NOTES_FILE"
+    unpin_bundle
 }
 
 cut() {
-    local status selected sha behind tip answer version bundle protocol previous key building
+    local status released selected sha behind tip answer version bundle protocol previous key building
+    trap cut_cleanup EXIT
     repository_git fetch --quiet origin main
     MAIN=$(repository_git rev-parse --verify origin/main)
     tip=$MAIN
     status=$(prebuilt) || fail "cannot read the prebuilt bundles on $BUILD_HOST"
+    released=$(released_versions) || fail 'cannot read the tags on origin'
     if [[ -n $COMMIT ]]; then
         sha=$(repository_git rev-parse --verify "$COMMIT^{commit}") || fail "unknown commit: $COMMIT"
+        repository_git merge-base --is-ancestor "$sha" "$MAIN" || fail "$sha is not on main"
         jq -e --arg sha "$sha" '.bundles[] | select(.sha == $sha and .passed == true)' <<< "$status" >/dev/null \
             || fail "$sha has no prebuilt bundle with passing tests on $BUILD_HOST"
         behind=$(repository_git rev-list --count --first-parent "$sha..$MAIN")
-    elif selected=$(newest_bundle "$status"); then
+    elif selected=$(newest_bundle "$status" "$released"); then
         read -r sha behind <<< "$selected"
     else
         sha=
     fi
+    [[ -z $sha ]] || pin_bundle "$sha"
     if [[ $WAIT == false && -n $sha && $behind -gt 0 ]]; then
         printf 'The newest bundle with passing tests, %s, is %s commit(s) behind main (%s):\n' \
             "${sha:0:12}" "$behind" "${tip:0:12}"
@@ -329,6 +363,8 @@ cut() {
         if [[ -t 0 ]]; then
             read -r -p 'Release it, or wait for a prebuild of the tip? [r/w] ' answer
             case $answer in w|W) WAIT=true ;; r|R) ;; *) fail 'nothing released' ;; esac
+        elif [[ -z $COMMIT ]]; then
+            fail "run with --wait to release main's tip, or --commit $sha to release this bundle"
         fi
     fi
     if [[ $WAIT == true || -z $sha ]]; then
@@ -337,29 +373,30 @@ cut() {
             read -r -p "$BUILD_HOST has no bundle of main with passing tests. Wait for a prebuild of the tip? [y/N] " answer
             [[ $answer == [yY] ]] || fail 'nothing released'
         fi
+        unpin_bundle
         prebuild_tip "$tip" || fail "no bundle of $tip"
         sha=$tip
+        pin_bundle "$sha"
     fi
     version=$(repository_git show "$sha:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}')
     [[ $version =~ $VERSION_PATTERN ]] || fail "$sha does not declare a stable version"
     VERSION=$version
     TAG=v$VERSION
-    if repository_git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null; then
-        [[ $(repository_git rev-parse "refs/tags/$TAG^{commit}") == "$sha" ]] \
-            || fail "$TAG already exists at another commit; main needs its version bump first"
-    fi
-    [[ -z $(repository_git ls-remote --tags origin "refs/tags/$TAG") ]] \
+    ! jq -e --arg v "$VERSION" 'index($v)' <<< "$released" >/dev/null \
         || fail "$TAG is already on origin; main needs its version bump first"
     bundle=$BUNDLES/$VERSION
-    [[ ! -e $bundle ]] || fail "$bundle exists; remove it to cut $VERSION again"
+    # Not on origin, so an earlier cut of this version was never published:
+    # this one replaces it.
+    if [[ -e $bundle ]] || { repository_git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null \
+            && [[ $(repository_git rev-parse "refs/tags/$TAG^{commit}") != "$sha" ]]; }; then
+        printf 'Replacing the unpublished cut of %s.\n' "$TAG"
+        rm -rf -- "$bundle"
+        if [[ $(repository_git rev-parse --quiet --verify "refs/tags/$TAG^{commit}") != "$sha" ]]; then
+            repository_git tag -d "$TAG" >/dev/null 2>&1 || :
+        fi
+    fi
     mkdir -p -- "$BUNDLES"
     rm -rf -- "$bundle.partial"
-    # Pinned, eviction keeps it while it is copied.
-    on_host "$sha" <<'HOST' || fail "cannot pin the bundle of $sha"
-cd ~/"$1" && scripts/prebuild-release --repository "$PWD" pin "$2"
-HOST
-    CUT_SHA=$sha
-    trap cut_cleanup EXIT
     printf 'Copying the bundle of %s (%s) from %s.\n' "$sha" "$VERSION" "$BUILD_HOST"
     scp -q -r -- "$BUILD_HOST:.local/state/cagents-prebuilt/bundles/$sha/dist" "$bundle.partial"
     # Every file matches the size and digest the prebuild recorded for this
@@ -388,7 +425,8 @@ HOST
     key=${KEY:-${CAGENTS_RELEASE_SIGNING_KEY:-}}
     if [[ -n $key ]]; then
         printf '\nSigning with %s; touch the key if it asks.\n' "$key"
-        ssh-keygen -Y sign -n cagents-release -f "$key" "$bundle/release-metadata.json"
+        ssh-keygen -Y sign -n cagents-release -f "$key" "$bundle/release-metadata.json" \
+            || fail "$TAG is cut but not signed; sign it, then publish: ssh-keygen -Y sign -n cagents-release -f $(printf %q "$key") $(printf %q "$bundle/release-metadata.json")"
         printf 'Rehearse it if you like (docs/releasing.md#rehearsing), then publish:\n  scripts/release publish %s\n' \
             "$VERSION"
     else
@@ -398,9 +436,10 @@ HOST
 }
 
 # The pull request that starts the next patch version on main, as `release
-# publish` opens and lands it after each release.
+# publish` opens and lands it after each release. Running it again resumes:
+# it lands the pull request already open, or opens it afresh.
 start_next_version() {
-    local next worktree branch body
+    local next branch worktree number body
     next=${VERSION%.*}.$((${VERSION##*.} + 1))
     repository_git fetch --quiet origin main
     if [[ $(repository_git show origin/main:Cargo.toml | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}') \
@@ -410,23 +449,37 @@ start_next_version() {
     fi
     branch=release/bump-$next
     worktree=$ROOT_DIR/.worktrees/release-bump-$next
-    repository_git worktree add --quiet -b "$branch" "$worktree" origin/main
-    (
-        cd "$worktree"
-        "$worktree/scripts/release" bump "$next" >/dev/null
-        git commit --quiet -am "chore(release): start $next after $TAG"
-        git push --quiet -u origin "$branch"
+    number=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number // empty') \
+        || fail "cannot look for an open pull request from $branch"
+    if [[ -n $number ]]; then
+        printf 'Landing #%s, which starts %s.\n' "$number" "$next"
+    else
+        # Anything left of an earlier attempt that opened nothing is rebuilt.
+        [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
+        repository_git worktree prune
+        repository_git worktree add --quiet -B "$branch" "$worktree" origin/main \
+            || fail "cannot create $worktree"
+        # bump runs cargo, which mise provides only in a trusted checkout.
+        if command -v mise >/dev/null && [[ -f $worktree/mise.toml ]]; then
+            mise trust --quiet "$worktree" || fail "cannot trust $worktree for mise"
+        fi
+        "$worktree/scripts/release" bump "$next" >/dev/null || fail "the version bump to $next failed in $worktree"
+        repository_git -C "$worktree" commit --quiet -am "chore(release): start $next after $TAG" \
+            || fail "cannot commit the version bump in $worktree"
+        repository_git -C "$worktree" push --quiet --force -u origin "$branch" || fail "cannot push $branch"
         body=$(printf '%s\n' \
             "$TAG is published, so main now declares the next patch version, $next. Release bundles are prebuilt from main commits with the version those commits declare, so until this lands every main commit declares the already-tagged $VERSION and gets no usable bundle." \
             "" \
             "This is the change \`scripts/release bump $next\` makes: the four product manifests and the workspace's own \`Cargo.lock\` entries. \`release publish\` opens and lands this pull request after each release.")
         number=$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$branch" \
-            --title "chore(release): start $next after $TAG" --body "$body" | sed -n 's#.*/pull/\([0-9]*\)$#\1#p')
-        [[ -n $number ]] || exit 1
+            --title "chore(release): start $next after $TAG" --body "$body" | sed -n 's#.*/pull/\([0-9]*\)$#\1#p') \
+            || fail "cannot open the pull request from $branch"
+        [[ -n $number ]] || fail "cannot open the pull request from $branch"
         printf 'Opened #%s to start %s; landing it once its checks pass.\n' "$number" "$next"
-        "$worktree/scripts/land-pr" "$number" -R "$GITHUB_REPOSITORY"
-    ) || fail "could not start $next; open the version bump yourself: scripts/release bump $next"
-    repository_git worktree remove --force "$worktree"
+    fi
+    "$ROOT_DIR/scripts/land-pr" "$number" -R "$GITHUB_REPOSITORY" \
+        || fail "#$number, which starts $next, did not land; run scripts/release publish $VERSION again once it can"
+    [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
 }
 
 signed_bundle() {
@@ -446,14 +499,18 @@ case $COMMAND in
         ;;
     publish)
         bundle=$(signed_bundle)
-        printf 'Publishing %s makes it the update every installed cagents offers.\n' "$TAG"
-        read -r -p "Type $VERSION to publish: " answer
-        [[ $answer == "$VERSION" ]] || fail 'not published'
-        # It verifies the signature, checksums, archives and a smoke install
-        # before uploading anything.
-        # Publication requires the identical tag on origin.
-        repository_git push --quiet origin "refs/tags/$TAG"
-        "$ROOT_DIR/scripts/publish-release" --version "$VERSION" --dist "$bundle"
+        # Run again after a failure, it resumes past what is done.
+        if [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) == false ]]; then
+            printf '%s is published already.\n' "$TAG"
+        else
+            printf 'Publishing %s makes it the update every installed cagents offers.\n' "$TAG"
+            read -r -p "Type $VERSION to publish: " answer
+            [[ $answer == "$VERSION" ]] || fail 'not published'
+            # It verifies the signature, checksums, archives and a smoke
+            # install, and only then pushes the tag and uploads.
+            "$ROOT_DIR/scripts/publish-release" --version "$VERSION" --dist "$bundle" --push-tag \
+                || fail "$TAG is not published; once the cause is fixed, run scripts/release publish $VERSION again"
+        fi
         start_next_version
         ;;
     *) fail "unknown command: $COMMAND (see --help)" ;;
