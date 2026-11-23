@@ -134,7 +134,14 @@ impl Cagents {
                 (main == root).then_some((project, main))
             })?,
         };
-        if project.kind == ProjectKind::Folder || main == root {
+        // A Git directory kept elsewhere, as a submodule's is, names none of
+        // its rows, so which row is its main checkout rests on their order,
+        // which only the Git listing guarantees. There the files decide.
+        let separate = project
+            .repository
+            .file_name()
+            .is_some_and(|name| name != ".git");
+        if project.kind == ProjectKind::Folder || (main == root && !separate) {
             return Some((project.id, None));
         }
         // A checkout the daemon would refuse, such as one removed since the
