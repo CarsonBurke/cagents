@@ -32,7 +32,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import re
+import tomllib
 import shutil
 import signal
 import subprocess
@@ -285,34 +285,62 @@ def sentinel_target(sentinel):
     return sha
 
 
-# By commit, whether the version it declares is tagged on origin.
-RELEASED = {}
+# How long an answer that a commit's version is not released yet holds; a
+# release can tag it meanwhile. That it is released, kept in the store, holds.
+RELEASE_RECHECK_SECONDS = 300
+UNRELEASED = {}
+# Network git in a service: never a prompt, and never forever.
+QUIET_GIT = dict(os.environ, GIT_TERMINAL_PROMPT="0", SSH_ASKPASS_REQUIRE="never")
+NETWORK_SECONDS = 120
 
 
-def released(repository, sha):
-    """Whether SHA declares a version origin has tagged already: no bundle of
-    it could be released. A tag lookup that fails counts as unreleased."""
-    if sha in RELEASED:
-        return RELEASED[sha]
+def network_git(repository, *args):
+    try:
+        return subprocess.run(["git", "-C", str(repository), *args], text=True, capture_output=True,
+                              stdin=subprocess.DEVNULL, env=QUIET_GIT, timeout=NETWORK_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def declared_version(repository, sha):
+    """The version SHA's root Cargo.toml declares, or None."""
     if subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"{sha}^{{commit}}"],
                       stderr=subprocess.DEVNULL).returncode:
-        git(repository, "fetch", "--no-tags", "origin", "main", check=False)
-    manifest = git(repository, "show", f"{sha}:Cargo.toml", check=False)
-    match = re.search(r'^\[package\]\n(?:(?!\[).*\n)*?version = "([^"]+)"$', manifest, re.M)
-    if not match:
-        RELEASED[sha] = False
-        return False
+        network_git(repository, "fetch", "--no-tags", "origin", "main")
+    shown = subprocess.run(["git", "-C", str(repository), "show", f"{sha}:Cargo.toml"], text=True,
+                           capture_output=True)
+    if shown.returncode:
+        return None
     try:
-        tags = subprocess.run(["git", "-C", str(repository), "ls-remote", "--tags", "--refs", "origin",
-                               f"refs/tags/v{match[1]}"], text=True, capture_output=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        return False
-    if tags.returncode:
-        return False
-    RELEASED[sha] = bool(tags.stdout.strip())
-    if RELEASED[sha]:
-        say(f"{sha} declares {match[1]}, released already; waiting for main's version bump")
-    return RELEASED[sha]
+        version = tomllib.loads(shown.stdout).get("package", {}).get("version")
+    except tomllib.TOMLDecodeError:
+        return None
+    return version if isinstance(version, str) else None
+
+
+def released(repository, store, sha):
+    """The version SHA declares if origin has tagged it already, so that no
+    bundle of SHA could be released; otherwise None. A lookup that fails
+    counts as unreleased."""
+    known = read_json(store.root / "released.json") or {}
+    if sha in known:
+        return known[sha]
+    if time.monotonic() - UNRELEASED.get(sha, -RELEASE_RECHECK_SECONDS) < RELEASE_RECHECK_SECONDS:
+        return None
+    version = declared_version(repository, sha)
+    if version is None:
+        return None
+    tags = network_git(repository, "ls-remote", "--tags", "--refs", "origin", f"refs/tags/v{version}")
+    if tags is None or tags.returncode:
+        return None
+    if not tags.stdout.strip():
+        UNRELEASED[sha] = time.monotonic()
+        return None
+    # Main's last few commits are all that is ever asked about.
+    known = dict(list(known.items())[-31:]) | {sha: version}
+    write_json(store.root / "released.json", known)
+    say(f"{sha} declares {version}, released already; waiting for main's version bump")
+    return version
 
 
 def verdict_failed(sentinel, sha):
@@ -328,7 +356,8 @@ def choose(repository, store, sentinel):
             continue
         return sha, "normal"
     sha = sentinel_target(sentinel)
-    if sha and not store.built(sha) and store.final_failure(sha) is None and not released(repository, sha):
+    if sha and not store.built(sha) and store.final_failure(sha) is None \
+            and released(repository, store, sha) is None:
         return sha, "background"
     return None, None
 
@@ -524,6 +553,7 @@ def status(store, sentinel, as_json):
         "building": building,
         "requested": store.requested(),
         "target": sentinel_target(sentinel),
+        "released_target": (read_json(store.root / "released.json") or {}).get(sentinel_target(sentinel)),
         "failures": sorted((read_json(path) or {}).get("sha", path.stem)
                            for path in store.failures.glob("*.json")),
         "state": read_json(store.root / "state.json") or {},
@@ -543,6 +573,9 @@ def status(store, sentinel, as_json):
     if building:
         print(f"building {building['sha']}  {building['priority']}, for "
               f"{(time.time() - building['started_at']) / 60:.0f} min")
+    if report["released_target"]:
+        print(f"skipped  {report['target']}  {report['released_target']}, released already; "
+              "waiting for main's version bump")
     for sha in report["requested"]:
         print(f"requested {sha}")
     for sha in report["failures"]:
@@ -623,10 +656,14 @@ def wait(store, sentinel, sha, timeout):
         building = read_json(store.root / "building.json")
         if building and not Path(f"/proc/{building.get('pid')}").exists():
             building = None
-        if (building or {}).get("sha") != sha and sha not in store.requested() \
-                and sha != sentinel_target(sentinel):
-            say(f"{sha} is neither requested nor main's newest compiled commit; request it")
-            return 1
+        if (building or {}).get("sha") != sha and sha not in store.requested():
+            if sha != sentinel_target(sentinel):
+                say(f"{sha} is neither requested nor main's newest compiled commit; request it")
+                return 1
+            version = (read_json(store.root / "released.json") or {}).get(sha)
+            if version:
+                say(f"{sha} declares {version}, released already, so only a request builds it")
+                return 1
         if building and building.get("sha") == sha:
             line = f"building, {(time.time() - building['started_at']) / 60:.0f} min so far"
         else:

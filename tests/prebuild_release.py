@@ -4,9 +4,11 @@ commits carry stand-in build scripts, a private store and sentinel state, and
 stand-in memory, pressure and lock readings. Nothing builds, and the host's
 user manager is never asked."""
 
+import contextlib
 import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -208,8 +210,8 @@ class Prebuild(unittest.TestCase):
         self.assertEqual(len(self.builds()), 1)
 
     def test_a_commit_of_a_released_version_waits_for_mains_bump(self):
-        prebuild.RELEASED.clear()
-        self.addCleanup(prebuild.RELEASED.clear)
+        prebuild.UNRELEASED.clear()
+        self.addCleanup(prebuild.UNRELEASED.clear)
         origin = self.root / "origin.git"
         subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
         self.git("remote", "add", "origin", str(origin))
@@ -221,6 +223,16 @@ class Prebuild(unittest.TestCase):
         self.compiled(tagged)
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.builds(), [])
+        # Kept in the store: later runs ask origin no more, and say why.
+        self.git("remote", "set-url", "origin", str(self.root / "gone.git"))
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.builds(), [])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            prebuild.status(self.store, self.sentinel, as_json=False)
+        self.assertIn(f"skipped  {tagged}  0.2.3, released already", output.getvalue())
+        self.assertEqual(prebuild.wait(self.store, self.sentinel, tagged, timeout=None), 1)
+        self.git("remote", "set-url", "origin", str(origin))
         # Requested, it builds all the same.
         with patch.object(sys, "argv", [PROGRAM_PATH, "--repository", str(self.repository),
                                         "--store", str(self.store.root), "request", tagged]):
