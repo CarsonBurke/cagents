@@ -2301,8 +2301,15 @@ pub(super) fn local_reply_for_test(runtime: &mut Runtime) -> (u64, Ready) {
 /// inspecting widgets. Production scheduling has no test-specific bypass.
 #[cfg(test)]
 pub(super) fn drain_fixture(runtime: &mut Runtime) {
+    drain_fixture_within(runtime, 4096);
+}
+
+/// [`drain_fixture`] for a transcript with more than its few thousand
+/// preparations, such as a measurement of a long one.
+#[cfg(test)]
+pub(super) fn drain_fixture_within(runtime: &mut Runtime, limit: usize) {
     let permits = Arc::new(tokio::sync::Semaphore::new(1));
-    for _ in 0..4096 {
+    for _ in 0..limit {
         let Some((id, run, shared)) = runtime
             .preparation
             .entries

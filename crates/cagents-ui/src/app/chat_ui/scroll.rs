@@ -922,22 +922,67 @@ pub(super) fn find_anchor(
     })
 }
 
+/// Item names hashed for every row on each transcript layout. They are
+/// process-local, so a fast hasher serves, as in [`crate::fingerprint`].
+type Names<'a> = HashSet<&'a str, foldhash::fast::RandomState>;
+
+/// The transcript's items by the ids that report their bounds. Every pass of
+/// a layout asks for every row's bounds, so this is built once per layout.
+struct Aliases<'a> {
+    items: &'a [(Id, &'a str)],
+    /// The first entry of `items` each id names.
+    first: std::collections::HashMap<&'a Id, usize, foldhash::fast::RandomState>,
+    /// The next entry with the same id, or `usize::MAX`.
+    next: Vec<usize>,
+    /// The first entry naming each entry's item: an item several ids name,
+    /// such as a step in an exchange's strip, is one row of the anchor.
+    slot: Vec<usize>,
+}
+impl<'a> Aliases<'a> {
+    fn new(items: &'a [(Id, &'a str)]) -> Self {
+        let mut first = std::collections::HashMap::with_capacity_and_hasher(
+            items.len(),
+            foldhash::fast::RandomState::default(),
+        );
+        let mut next = vec![usize::MAX; items.len()];
+        for (index, (id, _)) in items.iter().enumerate().rev() {
+            if let Some(later) = first.insert(id, index) {
+                next[index] = later;
+            }
+        }
+        let mut slots = std::collections::HashMap::with_capacity_and_hasher(
+            items.len(),
+            foldhash::fast::RandomState::default(),
+        );
+        let slot = items
+            .iter()
+            .enumerate()
+            .map(|(index, (_, item))| *slots.entry(*item).or_insert(index))
+            .collect();
+        Self {
+            items,
+            first,
+            next,
+            slot,
+        }
+    }
+}
+
 /// Row bounds for anchoring, and which of them only a placeholder reported.
-struct ItemBounds<'a> {
-    ids: std::collections::HashMap<Id, Vec<&'a str>>,
-    rows: std::collections::HashMap<&'a str, Rectangle>,
+struct ItemBounds<'b, 'a> {
+    aliases: &'b Aliases<'a>,
+    /// Each item's bounds by its slot in [`Aliases`], and whether only a
+    /// placeholder reported them: an unmounted row's estimate, or the whole
+    /// virtual row for each item it aliases.
+    found: Vec<Option<(Rectangle, bool)>>,
     wanted: HashSet<u64>,
     /// Each fine-grained anchor, and whether its row is mounted.
     virtual_rows: Vec<(String, Rectangle, bool)>,
-    /// Items whose bounds came from a virtual column's placeholder rather
-    /// than their laid-out widget: an unmounted row's estimate, or the whole
-    /// virtual row for each item it aliases.
-    placeholders: HashSet<&'a str>,
     /// A virtual column reports its placeholder aliases between its
     /// [`virtualized::PlaceholderPolicy`] and its traversal of mounted rows.
     in_placeholders: bool,
 }
-impl Operation for ItemBounds<'_> {
+impl Operation for ItemBounds<'_, '_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         self.in_placeholders = false;
         visit(self);
@@ -957,17 +1002,19 @@ impl Operation for ItemBounds<'_> {
         );
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if let Some(id) = id.and_then(|id| self.ids.get(id)) {
-            for id in id {
-                self.rows.insert(*id, bounds);
-                if self.in_placeholders {
-                    self.placeholders.insert(id);
-                } else {
-                    self.placeholders.remove(id);
-                }
-            }
+        let Some(mut entry) = id.and_then(|id| self.aliases.first.get(id)).copied() else {
+            return;
+        };
+        while entry != usize::MAX {
+            self.found[self.aliases.slot[entry]] = Some((bounds, self.in_placeholders));
+            entry = self.aliases.next[entry];
         }
     }
+}
+
+/// Times one stage of the transcript's layout when tracing (`--ui-trace`).
+fn layout_part(label: &'static str) -> crate::performance::ui_trace::Scope {
+    crate::performance::ui_trace::part(crate::performance::ui_trace::Phase::Layout, label)
 }
 
 struct Anchored<'a> {
@@ -1065,7 +1112,7 @@ impl Context {
         &self,
         next: Geometry,
         rows: &[(&str, Rectangle)],
-        placeholders: &HashSet<&str>,
+        placeholders: &Names<'_>,
         follow_end: bool,
     ) -> Position {
         let Some((previous, top)) = self.geometry.zip(self.top) else {
@@ -1113,7 +1160,8 @@ impl Context {
         {
             return Position::exact(top.clamp(0.0, next.travel()));
         }
-        let next_rows: std::collections::HashMap<_, _> = rows.iter().copied().collect();
+        let next_rows: std::collections::HashMap<_, _, foldhash::fast::RandomState> =
+            rows.iter().copied().collect();
         // Preserve the first visible surviving exchange, not the transcript's
         // total height: a page may arrive while the live answer also grows.
         let visible = || {
@@ -1126,8 +1174,8 @@ impl Context {
         // now, gives an estimated place.
         fn surviving<'r>(
             row: &'r Row,
-            next_rows: &std::collections::HashMap<&str, Rectangle>,
-            placeholders: &HashSet<&str>,
+            next_rows: &std::collections::HashMap<&str, Rectangle, foldhash::fast::RandomState>,
+            placeholders: &Names<'_>,
         ) -> Option<(&'r Row, Rectangle, bool)> {
             let bounds = *next_rows.get(row.id.as_str())?;
             Some((
@@ -1195,7 +1243,7 @@ impl Context {
         &mut self,
         next: Geometry,
         rows: &[(&str, Rectangle)],
-        placeholders: &HashSet<&str>,
+        placeholders: &Names<'_>,
         top: f32,
     ) {
         for (index, (id, bounds)) in rows.iter().enumerate() {
@@ -1388,7 +1436,7 @@ impl Anchor {
         match self.layout_following(
             subagent,
             rows,
-            &HashSet::new(),
+            &Names::default(),
             next,
             current_top,
             follow_end,
@@ -1407,7 +1455,7 @@ impl Anchor {
         &mut self,
         subagent: Option<&str>,
         rows: &[(&str, Rectangle)],
-        placeholders: &HashSet<&str>,
+        placeholders: &Names<'_>,
         next: Geometry,
         current_top: Option<f32>,
         follow_end: bool,
@@ -1791,6 +1839,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         }
         let child = &mut tree.children[0];
         let mut top = ReadTop::default();
+        let read_part = layout_part("anchored read");
         if let Some(previous) = anchor.geometry().filter(|_| !restore) {
             self.content.as_widget_mut().operate(
                 child,
@@ -1799,7 +1848,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut top,
             );
         }
+        drop(read_part);
+        let content_part = layout_part("anchored content");
         let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
+        drop(content_part);
+        let aliases = Aliases::new(&self.items);
         const PASSES: usize = 4;
         let mut settle = false;
         for pass in 0..PASSES {
@@ -1807,6 +1860,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 viewport: node.size(),
                 content: node.children()[0].size(),
             };
+            let bounds_part = layout_part("anchored bounds");
             let mut rows: Vec<_> = self
                 .anchors
                 .iter()
@@ -1817,10 +1871,6 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         .map(|child| (*id, child.bounds()))
                 })
                 .collect();
-            let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
-            for (id, item) in &self.items {
-                ids.entry(id.clone()).or_default().push(item);
-            }
             let wanted = anchor
                 .active
                 .into_iter()
@@ -1832,11 +1882,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 })
                 .collect();
             let mut measured = ItemBounds {
-                ids,
-                rows: Default::default(),
+                aliases: &aliases,
+                found: vec![None; aliases.items.len()],
                 wanted,
                 virtual_rows: vec![],
-                placeholders: HashSet::new(),
                 in_placeholders: false,
             };
             self.content.as_widget_mut().operate(
@@ -1845,14 +1894,22 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut measured,
             );
-            rows.extend(measured.rows);
+            let mut placeholders = Names::default();
+            for (slot, found) in measured.found.iter().enumerate() {
+                if let Some((bounds, placeholder)) = found {
+                    let item = aliases.items[slot].1;
+                    rows.push((item, *bounds));
+                    if *placeholder {
+                        placeholders.insert(item);
+                    }
+                }
+            }
             rows.extend(
                 measured
                     .virtual_rows
                     .iter()
                     .map(|(key, bounds, _)| (key.as_str(), *bounds)),
             );
-            let mut placeholders = measured.placeholders;
             placeholders.extend(
                 measured
                     .virtual_rows
@@ -1861,6 +1918,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .map(|(key, ..)| key.as_str()),
             );
             rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+            drop(bounds_part);
             // A superseded Latest fetch may replace every old row. Wait for
             // only cold aliases touching the desired replacement viewport;
             // unrelated history preparation cannot hold the reader here.
@@ -1904,6 +1962,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 if !viewport.changed {
                     break;
                 }
+                let _relayout_part = layout_part("anchored relayout");
                 node = self.content.as_widget_mut().layout(child, renderer, limits);
                 continue;
             }
@@ -1954,6 +2013,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 top.0 = anchor.active.and_then(|index| anchor.contexts[index].top);
             }
             restore = estimated;
+            let viewport_part = layout_part("anchored viewport");
             let mut virtual_viewport = virtualized::UpdateViewport::default();
             self.content.as_widget_mut().operate(
                 child,
@@ -1961,6 +2021,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut virtual_viewport,
             );
+            drop(viewport_part);
             if !virtual_viewport.changed {
                 if estimated {
                     // Moving there mounts nothing more, so these rows are as
@@ -1976,6 +2037,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             // windows still disagree with the restored scroll position. Keep
             // the four-pass bound and continue in the next native update.
             state.needs_layout = state.revealing && !self.restoration_pending;
+            let _relayout_part = layout_part("anchored relayout");
             node = self.content.as_widget_mut().layout(child, renderer, limits);
         }
         node
