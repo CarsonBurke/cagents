@@ -84,6 +84,10 @@ On Linux, an SSH login without `XDG_RUNTIME_DIR` uses the existing
 host without that login runtime directory must configure an owned private
 `XDG_RUNTIME_DIR` for its daemon and SSH bridge command.
 
+A phone runs `cagents daemon bridge --mobile` instead, which speaks the
+stable, versioned [mobile API](mobile-api.md) rather than the daemon's
+internal protocol.
+
 The connections of one window or command share authenticated SSH transports
 through OpenSSH connection multiplexing, so only the first pays the SSH
 handshake. cagents keeps these control sockets in its private runtime directory

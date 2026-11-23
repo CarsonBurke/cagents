@@ -74,6 +74,7 @@ pub mod layout_metrics;
 pub(crate) mod lineage_birth;
 pub mod linear;
 pub mod location;
+pub mod mobile;
 pub mod model;
 pub mod notifications;
 pub mod performance;
