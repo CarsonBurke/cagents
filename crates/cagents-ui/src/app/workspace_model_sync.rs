@@ -286,6 +286,15 @@ pub(super) fn complete_reconciliations() -> usize {
     COMPLETE_RECONCILIATIONS.with(std::cell::Cell::get)
 }
 
+/// What settling a run started, kept as no task when it started none.
+fn settled_tasks(tasks: Vec<Task<Message>>) -> Task<Message> {
+    if tasks.is_empty() {
+        Task::none()
+    } else {
+        Task::batch(tasks)
+    }
+}
+
 /// Watches the daemon for shared-model edges.
 pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>) {
     let observer = std::thread::Builder::new()
@@ -1140,6 +1149,22 @@ impl Cagents {
         }
     }
 
+    /// Whether a view receipt for `scope` may retire a candidate channel by
+    /// reading which work the window's channels hold: the receipt's own
+    /// scope, or a candidate whose view is already held empty.
+    fn retirement_reads_channels(&self, scope: &crate::workspace_model::views::Scope) -> bool {
+        use crate::workspace_model::views::Scope;
+        self.channel_ui.retire_candidates.keys().any(|home| {
+            let channel = Scope::Channel(home.channel);
+            channel == *scope
+                || self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .any(|view| view.scope == channel && view.panes.is_empty())
+        })
+    }
+
     /// The complete reconciliation after a canonical edge, which a run of
     /// updates owes until its next update of another kind or its end;
     /// outside a run it runs now.
@@ -1160,25 +1185,41 @@ impl Cagents {
         update: ModelUpdate,
     ) -> (Task<Message>, Projection) {
         // Another client's move of a pane out of the channel this window
-        // shows, read before the move empties it here.
+        // shows, read before the move empties it here. Both reads are of the
+        // window's channels, which in a run hold only the edges reconciled so
+        // far: a move out of the shown channel first settles what the edges
+        // before it owe, so it meets the window as it would alone.
+        let mut tasks = Vec::new();
+        let mut settled = Projection::Unchanged;
         let departure = match &update {
             ModelUpdate::Changed { edit, changes, .. }
                 if changes
                     .identity
                     .is_none_or(|identity| identity == self.workspace_model.identity) =>
             {
+                if self.moves_out_of_shown_channel(edit) {
+                    settled = self.settle_observed_run(&mut tasks);
+                }
                 self.pane_departure(edit)
             }
             _ => None,
         };
         let (task, projection) = self.project_workspace_model_update(update);
+        let projection = projection.widen(settled);
+        // An update that settled nothing keeps its own task as it is.
+        let task = if tasks.is_empty() {
+            task
+        } else {
+            tasks.push(task);
+            Task::batch(std::mem::take(&mut tasks))
+        };
         let Some(departure) = departure else {
             return (task, projection);
         };
+        tasks.push(task);
         // The departure reads where the edit put the pane, which only the
         // reconciliation the edge owes writes into the window's channels; in
         // a run that reconciliation would otherwise wait for the run's end.
-        let mut tasks = vec![task];
         let projection = projection.widen(self.settle_observed_run(&mut tasks));
         let active = self.durable.active_channel;
         tasks.push(self.pane_departed(departure));
@@ -1622,6 +1663,15 @@ impl Cagents {
                     ModelEdit::ChangeView { operation, .. } => Some(*operation),
                     _ => None,
                 };
+                // Retiring reads the window's channels for work an emptied
+                // view leaves behind, so in a run it needs the edges before
+                // this receipt reconciled, as they would be one at a time.
+                let mut settled = Vec::new();
+                if let ModelEdit::ChangeView { scope, .. } = &edit
+                    && self.retirement_reads_channels(scope)
+                {
+                    self.settle_observed_run(&mut settled);
+                }
                 let transferred =
                     operation.and_then(|id| self.shared_views.requested_transfer_card(id));
                 let title = channel_title_only(&edit, &receipt.effects, &views);
@@ -1634,7 +1684,7 @@ impl Cagents {
                         effects: receipt.effects,
                     },
                 ) else {
-                    return Task::none();
+                    return settled_tasks(settled);
                 };
                 match &edit {
                     ModelEdit::ChangeView { scope, .. } => {
@@ -1664,7 +1714,7 @@ impl Cagents {
                 let projected = title
                     .and_then(|id| self.absorb_channel_title(id))
                     .unwrap_or_else(|| self.reconcile_after_edge());
-                Task::batch([result, finish, projected])
+                Task::batch(settled.into_iter().chain([result, finish, projected]))
             }
             ModelUpdate::ScopeConflicted {
                 identity,
@@ -2075,6 +2125,16 @@ impl Cagents {
         {
             return None;
         }
+        // Retiring a removed channel's cards or closing a removed project
+        // walks the window's channels, which in a run hold only the edges
+        // reconciled so far: a pane an earlier edge moved out would still
+        // read as the channel's own, and be torn down with it.
+        let mut tasks = Vec::new();
+        if !changes.effects.removed_channels.is_empty()
+            || !changes.effects.removed_projects.is_empty()
+        {
+            self.settle_observed_run(&mut tasks);
+        }
         self.shared_views
             .closed
             .extend(changes.effects.closed.iter().copied());
@@ -2083,7 +2143,7 @@ impl Cagents {
             sequence > self.shared_views.snapshot_sequence,
         );
         if sequence < self.shared_views.snapshot_sequence {
-            return Some(Task::none());
+            return Some(settled_tasks(tasks));
         }
         let floor = self.shared_views.snapshot_sequence;
         let (protected_channels, protected_projects) =
@@ -2186,7 +2246,6 @@ impl Cagents {
             model.agents.retain(|held| held.id != id);
         }
         model.sequence = model.sequence.max(sequence);
-        let mut tasks = Vec::new();
         for repository in closed_projects {
             tasks.push(self.close_shared_project(&repository));
         }

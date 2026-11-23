@@ -443,7 +443,7 @@ pub struct State {
     /// history, and the registry also removes their channel view. Keep their
     /// known destination so the saved picker cannot file them into whichever
     /// channel happens to be selected later. Pane identities are not reused.
-    deleted_cards: HashSet<CardId>,
+    pub(super) deleted_cards: HashSet<CardId>,
     /// Channels this window closed the last card of, as they were then, so a
     /// card reopened from one can bring it back after it retires. Explicit
     /// deletion forgets the channel; only automatic retirement is undone.

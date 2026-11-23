@@ -69,6 +69,22 @@ fn expiry_stream(expiry: &Expiry) -> impl cosmic::iced::futures::Stream<Item = M
 }
 
 impl Cagents {
+    /// Whether `edit` moves a pane out of the channel this window shows to
+    /// another channel, the only edit [`Self::pane_departure`] can answer.
+    pub(super) fn moves_out_of_shown_channel(&self, edit: &ModelEdit) -> bool {
+        matches!(
+            edit,
+            ModelEdit::ChangeView {
+                scope: Scope::Channel(from),
+                change: Change::Transfer {
+                    destination: Scope::Channel(to),
+                    ..
+                },
+                ..
+            } if from != to && self.durable.active_channel == Some(*from)
+        )
+    }
+
     /// The departure `edit` would make from the channel this window shows,
     /// read before the edit is applied. Only another client's transfer
     /// counts: this window's own move already shows the pane where the
