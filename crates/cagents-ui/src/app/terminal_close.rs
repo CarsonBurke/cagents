@@ -962,7 +962,8 @@ impl Cagents {
             !self.proven_gone_cards.remove(&id)
                 && !self.reopen_superseded(id)
                 && !matches!(&card.kind, CardKind::Chat(session)
-                    if self.existing_conversation_card(session, Some(id)).is_some())
+                    if session.launch.session_id.is_some()
+                        && self.existing_conversation_card(session, Some(id)).is_some())
         }) {
             // A pane closed again holding the same conversation, as one a
             // shared view put back is, is listed once, where it closed last.

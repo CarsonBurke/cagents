@@ -896,6 +896,30 @@ mod tests {
         assert_eq!(app.durable.kept_chat_drafts[&live].text, "keep me");
     }
 
+    /// A chat closed before its provider names its conversation is listed to
+    /// reopen with what it had not sent, though another new chat beside it
+    /// runs the same provider in the same directory: neither has a
+    /// conversation yet, so they don't share one.
+    #[test]
+    fn a_new_chat_closed_beside_another_is_listed_to_reopen() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = tempfile::tempdir().unwrap();
+        let other = live_chat_in(&mut app, Provider::Claude, project.path(), None);
+        let card = live_chat_in(&mut app, Provider::Claude, project.path(), None);
+        write(&mut app, card, "not sent yet");
+        close(&mut app, card);
+        assert!(
+            app.card_state(other)
+                .is_some_and(|state| state.existence.is_open())
+        );
+        assert!(
+            app.recently_closed
+                .iter()
+                .any(|(closed, _)| closed.id == card)
+        );
+        assert_eq!(app.durable.kept_chat_drafts[&card].text, "not sent yet");
+    }
+
     /// The edge case #2944's review left open: a first message still being
     /// sent while the chat's provider exits, or its connection drops, closes
     /// without a question. That state is reachable. What the provider never
