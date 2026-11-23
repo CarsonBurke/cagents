@@ -3625,13 +3625,13 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
 }
 
 #[test]
-fn authenticated_worktree_caller_places_child_in_its_exact_visible_view() {
+fn a_worktree_callers_child_lands_in_a_channel_for_its_checkout() {
     use crate::{
         agent_execution::{Placement, directory::Scope},
         model::{CardId, CardKind},
         workspace_model::views::Pane,
     };
-    if isolated("authenticated_worktree_caller_places_child_in_its_exact_visible_view").is_some() {
+    if isolated("a_worktree_callers_child_lands_in_a_channel_for_its_checkout").is_some() {
         return;
     }
     let (host, request, path) = fixture();
@@ -3688,20 +3688,28 @@ fn authenticated_worktree_caller_places_child_in_its_exact_visible_view() {
     let alias = path.parent().unwrap().join("project-alias");
     std::os::unix::fs::symlink(&spec.target.repository, &alias).unwrap();
     spec.target.repository = alias;
+    // Worktree views take no new pane, so the child lands in a channel. The
+    // caller's view is the project's main checkout, which, as for a child
+    // placed nowhere, gets a channel of its own.
+    let prompt = child_request.prompt.clone();
     let child = submit(&host, &authority, child_request).unwrap();
-    assert_eq!(child.agent.placement, scope);
-    assert!(child.agent.channel().is_none());
+    let placed = child.agent.channel().expect("the child lands in a channel");
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let model = registry(&host).unwrap().lock().unwrap().model().unwrap();
+    assert_eq!(model.channels.len(), channels + 1);
+    let channel = model
+        .channels
+        .iter()
+        .find(|channel| channel.id == placed)
+        .expect("the child's channel");
+    assert_eq!(channel.checkout, None);
     assert_eq!(
-        registry(&host)
-            .unwrap()
-            .lock()
-            .unwrap()
-            .model()
-            .unwrap()
-            .channels
-            .len(),
-        channels
+        Some(channel.title.clone()),
+        crate::workspace_model::channel_title_from_prompt(&prompt)
+    );
+    assert_eq!(
+        child.agent.spec.target.placement,
+        Some(Placement::Channel(placed))
     );
 }
 
