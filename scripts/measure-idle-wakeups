@@ -8,9 +8,13 @@ count from zero; those that exit are left out.
     scripts/measure-idle-wakeups --seconds 60
     scripts/measure-idle-wakeups --pattern cagentsd --seconds 10
     scripts/measure-idle-wakeups --environ XDG_RUNTIME_DIR=/run/user/1000/x
+    scripts/measure-idle-wakeups --pattern cagentsd --seconds 10 --per-thread
 
-The default pattern matches retained Claude actors
-(`cagents-native --cagents-native-actor FD`).
+The pattern is matched against the command line of processes whose name
+starts with `cagents`, so the shell that runs this script is never a target.
+The default matches retained Claude actors
+(`cagents-native --cagents-native-actor FD`). `--per-thread` also lists each
+thread by PID and TID, which tells equally named threads apart.
 """
 import argparse
 import collections
