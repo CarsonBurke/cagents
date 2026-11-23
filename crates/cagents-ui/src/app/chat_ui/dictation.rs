@@ -836,7 +836,9 @@ impl Cagents {
     /// Whether a session waits for the helper to end it: one told to stop,
     /// one whose chat closed, or one whose pane is gone. `Some(loaded)`
     /// while one does, `loaded` being whether every such session's model
-    /// has loaded.
+    /// has loaded. Waiting sessions share one watch on the helper's
+    /// silence: one that joins inherits the silence so far, as the helper
+    /// serves them in turn and is stuck for all of them alike.
     fn dictation_waiting(&self) -> Option<bool> {
         let shared = &self.chat_ui.dictation;
         shared
@@ -1000,16 +1002,7 @@ impl Cagents {
         let id = session.id;
         runtime.dictation_take_back();
         runtime.dictation = None;
-        if self
-            .chat_ui
-            .dictation
-            .active
-            .is_some_and(|(_, active)| active == id)
-        {
-            self.chat_ui.dictation.active = None;
-        }
-        self.chat_ui.dictation.sessions.remove(&id);
-        self.chat_ui.dictation.held = None;
+        self.dictation_ended(id);
         self.chat_ui.dictation.client.cancel(id);
         Task::batch([self.dictation_idle_later(), focus(target, "chat-composer")])
     }
@@ -1266,10 +1259,20 @@ impl Cagents {
             return Task::none();
         };
         let Some(runtime) = self.chat_runtime_mut(target) else {
-            // Its pane has closed.
-            self.dictation_ended(id);
-            self.chat_ui.dictation.client.cancel(id);
-            return self.dictation_idle_later();
+            // Its pane has closed. It ends when the helper says so; until
+            // then it waits, as a cancelled session, for a stuck helper to
+            // be given up on.
+            if matches!(
+                event,
+                Event::Stopped { .. } | Event::Cancelled { .. } | Event::Error { .. }
+            ) {
+                self.dictation_ended(id);
+                return self.dictation_idle_later();
+            }
+            if self.chat_ui.dictation.forgotten.insert(id) {
+                self.chat_ui.dictation.client.cancel(id);
+            }
+            return Task::none();
         };
         match event {
             Event::Listening { .. } => {
@@ -1388,9 +1391,11 @@ struct Silence {
 fn silence(silence: &Silence) -> Pin<Box<dyn iced::futures::Stream<Item = u64> + Send>> {
     let Silence { answers, loaded } = *silence;
     let patience = if loaded { STOP_PATIENCE } else { LOAD_PATIENCE };
-    Box::pin(iced::futures::stream::once(async move {
+    // It keeps firing rather than ending, so a watch whose key outlives
+    // a wait never sits idle when another wait begins under the same key.
+    Box::pin(iced::futures::stream::unfold((), move |()| async move {
         tokio::time::sleep(patience).await;
-        answers
+        Some((answers, ()))
     }))
 }
 
@@ -2033,6 +2038,23 @@ mod tests {
         hear(&mut app, Event::Cancelled { session: SESSION });
         assert!(app.chat_ui.dictation.forgotten.is_empty());
         assert_eq!(app.dictation_waiting(), None);
+
+        // Once its pane is gone, only the helper's word that it ended ends
+        // it: the microphone's news of speech is no such word, and it goes
+        // on waiting until the helper is given up on.
+        let (mut app, card, _) = dictating("Hello", 5);
+        app.chat_forget(card);
+        app.cards.remove(&card);
+        hear(
+            &mut app,
+            Event::Signal {
+                session: SESSION,
+                present: true,
+            },
+        );
+        assert_eq!(app.dictation_waiting(), Some(true));
+        app.dictation_overdue(0);
+        assert!(app.chat_ui.dictation.sessions.is_empty());
     }
 
     #[test]

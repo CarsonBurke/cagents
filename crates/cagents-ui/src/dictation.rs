@@ -66,6 +66,10 @@ impl Level {
     }
 }
 
+/// How long a released helper may take to finish and exit before it is
+/// stopped. Released, it holds no session, so this is only its shutdown.
+const RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
 struct Helper {
     generation: u64,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
@@ -203,7 +207,9 @@ impl Client {
                 }
             });
             // Releasing the helper drops `kill` unsent, and it goes on to
-            // finish; only abandoning it stops it early.
+            // finish, as long as it does so in [`RELEASE_PATIENCE`]: one that
+            // no longer reads its input would otherwise hold its model until
+            // the app exits. Abandoning it stops it at once.
             let read = std::pin::pin!(read_events(generation, stdout, &sender, &level));
             let problem = match cosmic::iced::futures::future::select(read, killed).await {
                 cosmic::iced::futures::future::Either::Left((problem, _)) => problem,
@@ -211,7 +217,15 @@ impl Client {
                     let _ = child.kill().await;
                     None
                 }
-                cosmic::iced::futures::future::Either::Right((Err(_), read)) => read.await,
+                cosmic::iced::futures::future::Either::Right((Err(_), read)) => {
+                    match tokio::time::timeout(RELEASE_PATIENCE, read).await {
+                        Ok(problem) => problem,
+                        Err(_) => {
+                            let _ = child.kill().await;
+                            None
+                        }
+                    }
+                }
             };
             // Its output has ended, or it is one this app cannot read: its
             // input closes too, so that it is not left waiting for commands.
