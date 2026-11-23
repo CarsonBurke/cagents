@@ -1085,20 +1085,20 @@ fn child_picker_filters_full_names_and_keeps_order_during_status_changes() {
         child("failed", ToolStatus::Failed, false),
     ];
     let mut picker = child_navigation::Picker::new(&children);
-    let order: Vec<_> = picker
-        .rows(&children, &Default::default(), &Default::default())
-        .iter()
-        .map(|child| child.id.clone())
-        .collect();
-    children[1].status = ToolStatus::Failed;
-    assert_eq!(
+    let rows = |picker: &child_navigation::Picker, children: &[chat::Subagent]| {
         picker
-            .rows(&children, &Default::default(), &Default::default())
+            .rows(children, &Default::default(), &Default::default())
             .iter()
             .map(|child| child.id.clone())
-            .collect::<Vec<_>>(),
-        order
-    );
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&picker, &children), ["failed", "working", "finished"]);
+    // A child that newly needs attention leads that section; the rest keep
+    // the places they opened with.
+    children[1].status = ToolStatus::Failed;
+    assert_eq!(rows(&picker, &children), ["working", "failed", "finished"]);
+    children[0].status = ToolStatus::Succeeded;
+    assert_eq!(rows(&picker, &children), ["working", "failed", "finished"]);
     picker.query = "working".into();
     assert_eq!(
         picker

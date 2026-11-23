@@ -39,7 +39,8 @@ pub(super) struct Picker {
     /// The list's scroll offset and height, which choose the rows it builds.
     pub scroll: f32,
     pub viewport: Option<f32>,
-    order: Vec<String>,
+    /// Each child's place, and the section it held, when the chooser opened.
+    order: Vec<(String, Section)>,
 }
 
 /// Tabs mounted beside the Conversation tab, apart from a selected or
@@ -352,6 +353,17 @@ const OVERSCAN: f32 = 4.0 * ROW_HEIGHT;
 /// The viewport assumed before the list has reported its own.
 const FIRST_VIEWPORT: f32 = 900.0;
 
+/// The span of the list, in its own offsets, whose rows are built: the
+/// viewport and `OVERSCAN` either side. The scrollable reports nothing
+/// while its content fits, so a stale offset (from opening on a section, or
+/// from before the window grew) is held to the furthest the list can
+/// scroll; a list that fits is built whole.
+fn built_span(total: f32, scroll: f32, viewport: Option<f32>) -> (f32, f32) {
+    let viewport = viewport.unwrap_or(FIRST_VIEWPORT);
+    let scroll = scroll.clamp(0.0, (total - viewport).max(0.0));
+    (scroll - OVERSCAN, scroll + viewport + OVERSCAN)
+}
+
 /// One line of the chooser's list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Entry<'a> {
@@ -419,7 +431,10 @@ impl Picker {
             )
         });
         Self {
-            order: order.into_iter().map(|child| child.id.clone()).collect(),
+            order: order
+                .into_iter()
+                .map(|child| (child.id.clone(), Section::of(child)))
+                .collect(),
             ..Self::default()
         }
     }
@@ -452,14 +467,18 @@ impl Picker {
             .order
             .iter()
             .enumerate()
-            .map(|(index, id)| (id.as_str(), index))
+            .map(|(index, (id, section))| (id.as_str(), (index, *section)))
             .collect();
-        // A child that arrived after the chooser opened leads its section,
-        // as the newest activity does.
+        // A child that arrived, or moved to another section, after the
+        // chooser opened leads its section, as the newest activity does.
         rows.sort_by_key(|child| {
+            let section = Section::of(child);
             (
-                Section::of(child),
-                order.get(child.id.as_str()).map_or(0, |index| index + 1),
+                section,
+                order
+                    .get(child.id.as_str())
+                    .filter(|(_, opened)| *opened == section)
+                    .map_or(0, |(index, _)| index + 1),
             )
         });
         rows
@@ -731,9 +750,16 @@ impl Runtime {
             chat::failure::Failure::parse(self.session.launch.provider, detail)
                 .map(|failure| failure.summary)
         };
+        // The section's heading and the row's mark already say a child
+        // finished or failed; a stop or a denial is worth naming.
+        let named = !matches!(
+            child.status,
+            chat::ToolStatus::Succeeded | chat::ToolStatus::Failed
+        );
         let said = |words: Option<String>| match words.filter(|words| !words.is_empty()) {
-            Some(words) if words != status => format!("{status} · {words}"),
-            _ => status.to_owned(),
+            Some(words) if words == status || !named => words,
+            Some(words) => format!("{status} · {words}"),
+            None => status.to_owned(),
         };
         match child.status {
             chat::ToolStatus::Running if child.waiting => said(failure()),
@@ -790,8 +816,11 @@ impl Runtime {
             .map_or(0, |since| {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             });
-        let view_top = picker.scroll - OVERSCAN;
-        let view_bottom = picker.scroll + picker.viewport.unwrap_or(FIRST_VIEWPORT) + OVERSCAN;
+        let (view_top, view_bottom) = built_span(
+            listed.iter().map(Entry::height).sum(),
+            picker.scroll,
+            picker.viewport,
+        );
         let mut list: Vec<([u8; 32], Element<'_, Message>)> = Vec::new();
         let mut skipped = 0.0;
         let mut top = 0.0;
@@ -1566,13 +1595,13 @@ mod tests {
             ["waiting", "failed", "first", "second", "done"]
         );
         // Reporting does not move a row under the pointer while the chooser
-        // is open; a change of state moves it to its new section, where it
-        // keeps its place among the rest.
+        // is open; a change of state moves it to the top of its new section,
+        // as its latest activity, and the rest keep their places.
         children[0].status = Running;
         children[1].status = Succeeded;
         assert_eq!(
             ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
-            ["waiting", "failed", "second", "done", "first"]
+            ["waiting", "failed", "done", "second", "first"]
         );
         picker.query = "Agent second".into();
         assert_eq!(
@@ -1722,6 +1751,24 @@ mod tests {
         );
         let none = entries(&rows[..1]);
         assert_eq!(section_offset(&none, Section::Finished), None);
+    }
+
+    /// A list that fits its viewport reports no scrolling, so an offset left
+    /// from opening on a section, or from a shorter window, must not leave
+    /// the rows above it unbuilt.
+    #[test]
+    fn a_stale_scroll_still_builds_every_row_in_view() {
+        let fits = HEADING_HEIGHT + 10.0 * ROW_HEIGHT;
+        let (top, bottom) = built_span(fits, 400.0, Some(1_000.0));
+        assert!(top <= 0.0 && bottom >= fits, "{top}..{bottom}");
+        let (top, bottom) = built_span(fits, 400.0, None);
+        assert!(top <= 0.0 && bottom >= fits, "{top}..{bottom}");
+        // A long list scrolled past its end shows its last rows.
+        let long = 1_000.0 * ROW_HEIGHT;
+        let (top, bottom) = built_span(long, 2.0 * long, Some(500.0));
+        assert_eq!((top, bottom), (long - 500.0 - OVERSCAN, long + OVERSCAN));
+        let (top, _) = built_span(long, 300.0, Some(500.0));
+        assert_eq!(top, 300.0 - OVERSCAN);
     }
 
     /// A finished child whose transcript was trimmed away is timed, ordered
