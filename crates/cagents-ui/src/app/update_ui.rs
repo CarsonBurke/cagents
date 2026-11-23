@@ -1388,7 +1388,8 @@ pub(in crate::app) mod tests {
             ))
         );
         // With a release on offer, the way on is to retry it.
-        let asset = |name| serde_json::json!({"id": 1, "name": name, "size": 1});
+        let asset =
+            |name| serde_json::json!({"id": 1, "name": name, "size": 1, "sha256": "ab".repeat(32)});
         let release = serde_json::from_value(serde_json::json!({
             "version": "9.8.7",
             "url": "https://example.invalid/release",
