@@ -97,50 +97,6 @@ use crate::{
 /// write, or the wait for a reply. Read it through [`io_timeout`].
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The ordinary budget in force on this thread. A test that has to wait one
-/// out lowers it for its own threads with [`ordinary_budget::scope`]; nothing
-/// else can change it.
-fn io_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        ordinary_budget::current()
-    }
-    #[cfg(not(test))]
-    {
-        IO_TIMEOUT
-    }
-}
-
-#[cfg(test)]
-mod ordinary_budget {
-    use std::cell::Cell;
-    use std::time::Duration;
-
-    /// Short enough that waiting one out costs little, and still long beside
-    /// an in-process exchange.
-    pub(super) const QUICK: Duration = Duration::from_secs(1);
-
-    thread_local! {
-        static BUDGET: Cell<Duration> = const { Cell::new(super::IO_TIMEOUT) };
-    }
-
-    pub(super) fn current() -> Duration {
-        BUDGET.get()
-    }
-
-    /// Lower the ordinary budget on this thread until the guard drops. A
-    /// client must be created and used on a thread holding the scope.
-    #[must_use]
-    pub(super) fn scope(budget: Duration) -> impl Drop {
-        struct Restore(Duration);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                BUDGET.set(self.0);
-            }
-        }
-        Restore(BUDGET.replace(budget))
-    }
-}
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 // A live close may outlast a slow commit or shared request at the daemon's fence
 // before its own teardown. Timing out earlier would call that wait unresponsive.
@@ -174,6 +130,51 @@ const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// for its language servers (bounded at 5s) and its window's removal (2s),
 /// then flushes its session.
 const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The ordinary budget in force on this thread. A test that has to wait one
+/// out lowers it for its own threads with [`ordinary_budget::quick`]; nothing
+/// else can change it.
+fn io_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        ordinary_budget::current()
+    }
+    #[cfg(not(test))]
+    {
+        IO_TIMEOUT
+    }
+}
+
+#[cfg(test)]
+mod ordinary_budget {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    /// Short enough that waiting one out costs little, and still long beside
+    /// an in-process exchange.
+    pub(super) const QUICK: Duration = Duration::from_secs(1);
+
+    thread_local! {
+        static BUDGET: Cell<Duration> = const { Cell::new(super::IO_TIMEOUT) };
+    }
+
+    pub(super) fn current() -> Duration {
+        BUDGET.get()
+    }
+
+    /// Lower the ordinary budget on this thread to [`QUICK`] until the guard
+    /// drops. A client must be created and used on a thread holding it.
+    #[must_use = "the budget is restored when the guard drops"]
+    pub(super) fn quick() -> impl Drop {
+        struct Restore(Duration);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BUDGET.set(self.0);
+            }
+        }
+        Restore(BUDGET.replace(QUICK))
+    }
+}
 const UI_PREDECESSOR_EXIT_POLL: Duration = Duration::from_millis(200);
 pub const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
@@ -10529,8 +10530,8 @@ mod tests {
         source_checked: bool,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         use terminal::ipc::TerminalCloseResult;
-        // "late-closed" answers after the ordinary budget; keep that short.
-        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
+        // "late-closed" answers after the ordinary budget; keep that one short.
+        let _budget = (case == "late-closed").then(ordinary_budget::quick);
         fn reply(
             stream: &mut UnixStream,
             pinned: &HostSessionProof,
@@ -10811,7 +10812,7 @@ mod tests {
 
     #[test]
     fn window_claims_outlast_the_ordinary_reply_timeout() {
-        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
+        let _budget = ordinary_budget::quick();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("presence-owner", "boot", "incarnation");
         let server = thread::spawn(move || {
@@ -11075,8 +11076,8 @@ mod tests {
         outcome: &'static str,
         ending: &'static str,
     ) -> (Result<(), ControlError>, bool) {
-        // The "timeout" ending waits out the ordinary budget; keep it short.
-        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
+        // The "timeout" ending waits out the ordinary budget; keep that short.
+        let _budget = (ending == "timeout").then(ordinary_budget::quick);
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         server_stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -11418,7 +11419,7 @@ mod tests {
 
     #[test]
     fn upgrade_impact_accepts_slow_preview_without_changing_normal_rpc_timeout() {
-        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
+        let _budget = ordinary_budget::quick();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let expected = preview_impact(pinned.clone());
@@ -11590,12 +11591,11 @@ mod tests {
                     .is_none()
             );
         });
-        let client = ControlClient::from_stream(client_stream).unwrap();
         // The reported budget tells the full deadline apart from a single
         // read's ordinary budget; a client that enforced neither never returns.
         let error = crate::test_timing::returns("a request with a long deadline", move || {
-            let _budget = ordinary_budget::scope(BUDGET);
-            let mut client = client;
+            let _budget = ordinary_budget::quick();
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
             client
                 .request_with_deadline(
                     ClientRequest::ListPage { after: None },

@@ -67,7 +67,7 @@ fn default_handshake_deadline_bounds_a_progressing_partial_connected_frame() {
     assert!(!crate::device::is_remote());
     let budget = ordinary_budget::QUICK;
     match handshake_through_trickle(budget * 3 / 5, move |stream| {
-        let _budget = ordinary_budget::scope(budget);
+        let _budget = ordinary_budget::quick();
         ControlClient::from_stream(stream)
     }) {
         Err(ControlError::ReplyTimeout { timeout, .. }) => assert!(timeout <= budget),

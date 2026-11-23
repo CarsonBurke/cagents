@@ -2968,7 +2968,7 @@ mod tests {
                     );
                 });
                 let caller = scope.spawn(move || {
-                    let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
+                    let _budget = ordinary_budget::quick();
                     let mut client = ControlClient::from_stream(client_stream).unwrap();
                     let before = client.stream.read_timeout().unwrap();
                     let read = client.agent(
@@ -3013,7 +3013,7 @@ mod tests {
 
     fn slow_durable_submission(console: bool) {
         use crate::agent_execution::ConsoleCommand;
-        let _budget = ordinary_budget::scope(ordinary_budget::QUICK);
+        let _budget = ordinary_budget::quick();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let (_, reply) = running();
         let (agent, run) = status_reply(reply).unwrap();
