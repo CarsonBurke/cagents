@@ -1,4 +1,5 @@
-#![cfg(target_os = "linux")]
+// Nothing here depends on a feature, so only the cli lane runs this target.
+#![cfg(all(target_os = "linux", not(any(feature = "host", feature = "ui"))))]
 
 use std::{
     fs,

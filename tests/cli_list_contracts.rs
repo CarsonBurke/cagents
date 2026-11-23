@@ -1,4 +1,6 @@
-#![cfg(target_os = "linux")]
+// The shipped `cagents` command has no features, so only the cli lane runs
+// this target: the host and ui lanes would test a build nobody ships.
+#![cfg(all(target_os = "linux", not(any(feature = "host", feature = "ui"))))]
 //! Real CLI formatting against bounded private framed peers, without providers.
 use cagents::{
     account::info::Report,
