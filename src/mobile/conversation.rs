@@ -82,13 +82,16 @@ impl Watch {
     /// Attach to `session` over `stream`, a daemon connection that has asked
     /// nothing since its handshake, and send the phone the whole conversation.
     /// Answers the phone's request `id` once the conversation is attached.
+    /// `ended` runs when the watch ends, with why the conversation can't be
+    /// followed when that is the reason; it tells the phone, unless the watch
+    /// was replaced or stopped meanwhile.
     pub fn start(
         id: u64,
         session: chat::Session,
         stream: UnixStream,
         proof: HostSessionProof,
         outbox: Outbox,
-        ended: impl FnOnce(TerminalId) + Send + 'static,
+        ended: impl FnOnce(TerminalId, Option<String>) + Send + 'static,
     ) -> Self {
         let (commands, inputs) = mpsc::channel();
         let feed = commands.clone();
@@ -110,20 +113,14 @@ impl Watch {
                 };
                 let end = connection.run(id, session, feed);
                 let _ = connection.stream.shutdown(std::net::Shutdown::Both);
-                ended(chat_id);
+                let unfollowable = match &end {
+                    End::Conversation(message) => Some(message.clone()),
+                    End::Phone | End::Daemon(_) => None,
+                };
+                ended(chat_id, unfollowable);
                 connection.abandon(&end);
-                match end {
-                    End::Phone => {}
-                    End::Conversation(message) => {
-                        let outbox = &connection.outbox;
-                        connection.current.send(|| {
-                            outbox.event(api::Event::ConversationEnded {
-                                session: chat_id.to_string(),
-                                message,
-                            });
-                        });
-                    }
-                    End::Daemon(message) => connection.outbox.close(message),
+                if let End::Daemon(message) = end {
+                    connection.outbox.close(message);
                 }
             })
             .expect("spawn mobile conversation thread");
@@ -317,7 +314,7 @@ impl Connection {
     /// those sent to the daemon and those still waiting behind the end.
     fn abandon(&mut self, end: &End) {
         let message = match end {
-            End::Phone => "The conversation was closed on the phone before the computer answered.",
+            End::Phone => "The conversation stopped being followed before the computer answered.",
             End::Conversation(_) => "The conversation ended before the computer answered.",
             End::Daemon(_) => "The computer's cagents daemon stopped before it answered.",
         };
@@ -616,3 +613,7 @@ fn api_error(code: api::ErrorCode, message: &str) -> api::Error {
         message: message.into(),
     }
 }
+
+#[cfg(test)]
+#[path = "conversation_tests.rs"]
+mod tests;

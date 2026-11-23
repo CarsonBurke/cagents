@@ -527,22 +527,33 @@ impl Bridge {
         let mut watching = self.conversations.lock().unwrap();
         drop(watching.remove(&session));
         let conversations = Arc::downgrade(&self.conversations);
+        let outbox = self.outbox.clone();
         let watch = conversation::Watch::start(
             id,
             chat,
             stream,
             proof,
             self.outbox.clone(),
-            move |chat_id| {
-                // Forget the watch, unless the phone has already replaced it.
-                if let Some(conversations) = conversations.upgrade() {
-                    let mut conversations = conversations.lock().unwrap();
-                    if conversations
-                        .get(&chat_id)
-                        .is_some_and(|(current, _)| *current == generation)
-                    {
-                        conversations.remove(&chat_id);
-                    }
+            move |chat_id, unfollowable| {
+                // Forget the watch, unless the phone has already replaced or
+                // stopped it. Telling the phone under the same lock keeps the
+                // notice ahead of any watch started after it.
+                let Some(conversations) = conversations.upgrade() else {
+                    return;
+                };
+                let mut conversations = conversations.lock().unwrap();
+                if !conversations
+                    .get(&chat_id)
+                    .is_some_and(|(current, _)| *current == generation)
+                {
+                    return;
+                }
+                drop(conversations.remove(&chat_id));
+                if let Some(message) = unfollowable {
+                    outbox.event(api::Event::ConversationEnded {
+                        session: chat_id.to_string(),
+                        message,
+                    });
                 }
             },
         );
