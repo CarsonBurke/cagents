@@ -125,7 +125,7 @@ impl Cagents {
             ));
             return Task::none();
         };
-        let source = source.or(self.workspace.focused());
+        let source = source.or_else(|| self.placement_anchor());
         let channel = self
             .durable
             .channels
@@ -166,41 +166,53 @@ impl Cagents {
                 })
             })
             .unwrap_or_else(ProjectId::new);
-        // Prefer the exact file, even when dirty. Only dedicated, clean file
-        // panes are candidates for replacement; repository browsing is separate.
-        let candidates = self.workspace.order().filter_map(|card| {
-            // A newly focused editor may still be entering the viewport. Its
-            // reveal animation must not turn a rapid second link into another
-            // pane; unrelated offscreen panes remain ineligible.
-            if self.workspace.focused() != Some(card)
-                && self.workspace.visibility(card) != Some(VisibilityClass::Visible)
-            {
-                return None;
-            }
+        // A pane already showing the file, even dirty, shows it again,
+        // wherever it is in the strip, so one file never opens twice.
+        // Otherwise only a dedicated, clean file pane is replaced, and only
+        // the source itself or the pane directly after it, which the source's
+        // last link opened: what a link opens appears beside it. Repository
+        // browsing is separate.
+        let in_scope = |card: CardId| {
             let owner = self
                 .durable
                 .channels
                 .iter()
                 .find(|channel| channel.cards.contains(&card));
-            if owner.map(|channel| channel.id) != channel.map(|(id, _)| id)
-                || (channel.is_none()
-                    && self
+            owner.map(|channel| channel.id) == channel.map(|(id, _)| id)
+                && (channel.is_some()
+                    || self
                         .card_state(card)
                         .and_then(|state| self.card_worktree(state))
-                        != scope.as_deref())
-            {
-                return None;
-            }
-            let CardRuntime::Repository(runtime) = self.cards.get(&card)? else {
-                return None;
-            };
-            let exact = runtime
-                .selected_path()
-                .is_some_and(|selected| runtime.descriptor.worktree.join(selected) == path);
-            (exact || (runtime.descriptor.selected_file.is_some() && !runtime.blocks_navigation()))
-                .then_some((card, exact))
+                        == scope.as_deref())
+        };
+        let file_pane = |card: CardId| match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) if in_scope(card) => Some(runtime),
+            _ => None,
+        };
+        let exact = self.workspace.order().find(|card| {
+            file_pane(*card).is_some_and(|runtime| {
+                runtime
+                    .selected_path()
+                    .is_some_and(|selected| runtime.descriptor.worktree.join(selected) == path)
+            })
         });
-        let candidate = candidates.max_by_key(|(_, exact)| *exact);
+        let beside = source
+            .filter(|source| self.workspace.card(*source).is_some())
+            .and_then(|source| {
+                let next = self
+                    .workspace
+                    .order()
+                    .skip_while(|card| *card != source)
+                    .nth(1);
+                [Some(source), next].into_iter().flatten().find(|card| {
+                    file_pane(*card).is_some_and(|runtime| {
+                        runtime.descriptor.selected_file.is_some() && !runtime.blocks_navigation()
+                    })
+                })
+            });
+        let candidate = exact
+            .map(|card| (card, true))
+            .or_else(|| beside.map(|card| (card, false)));
         if let Some((card, true)) = candidate {
             let jump = match (self.cards.get_mut(&card), fragment) {
                 (Some(CardRuntime::Repository(runtime)), Some(fragment)) => {
@@ -247,18 +259,10 @@ impl Cagents {
             let _ = self.workspace.rename_card(card, title);
             self.workspace.focus(card)
         } else {
-            let (index, durable_index) = source
-                .and_then(|source| {
-                    Some((
-                        self.workspace.order().position(|id| id == source)? + 1,
-                        self.durable
-                            .cards
-                            .iter()
-                            .position(|state| state.id == source)?
-                            + 1,
-                    ))
-                })
-                .unwrap_or_else(|| self.pane_insertion_indices());
+            let (index, durable_index) = source.map_or_else(
+                || self.pane_insertion_indices(),
+                |source| self.pane_insertion_indices_after(source),
+            );
             let width = self.new_pane_fraction(self.settings.default_native_pane_fraction);
             let state = CardState {
                 id: card,
@@ -735,6 +739,64 @@ mod tests {
         );
     }
 
+    /// A link opens beside its terminal even when a clean file pane further
+    /// along could take it, and a file already open is shown where it is.
+    #[tokio::test]
+    async fn file_links_open_beside_their_source_not_in_a_further_file_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        std::fs::write(&first, "first file").unwrap();
+        std::fs::write(&second, "second file").unwrap();
+        let mut app = app();
+        let terminal = app.workspace.focused().unwrap();
+        let scope = PathBuf::from("/source-worktree");
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(terminal, scope.clone());
+        app.worktree_owners.insert(terminal, scope);
+        let link = |app: &mut Cagents, path: &Path| {
+            app.update(Message::OpenDocumentLink(
+                terminal,
+                Url::from_file_path(path).unwrap().into(),
+            ))
+        };
+        let task = link(&mut app, &first);
+        settle(&mut app, task).await;
+        let far = app.workspace.focused().unwrap();
+        // A copy of the terminal now sits between it and the file.
+        drop(app.update(Message::FocusCard(terminal)));
+        drop(app.clone_focused_pane());
+        let between = app.workspace.focused().unwrap();
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [terminal, between, far]
+        );
+
+        drop(app.update(Message::FocusCard(terminal)));
+        let task = link(&mut app, &second);
+        settle(&mut app, task).await;
+        let beside = app.workspace.focused().unwrap();
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [terminal, beside, between, far]
+        );
+        assert_eq!(
+            runtime(&app, far).editor_text().as_deref(),
+            Some("first file")
+        );
+
+        drop(app.update(Message::FocusCard(terminal)));
+        let task = link(&mut app, &first);
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(far));
+        assert_eq!(app.workspace.cards().len(), 4);
+        assert_eq!(
+            runtime(&app, beside).editor_text().as_deref(),
+            Some("second file")
+        );
+    }
+
     #[tokio::test]
     async fn dirty_file_links_preserve_buffers_and_channel_ownership() {
         let directory = tempfile::tempdir().unwrap();
@@ -954,7 +1016,7 @@ mod tests {
             .insert(source_a, scope_a.clone());
         app.worktree_owners.insert(source_a, scope_a.clone());
         drop(
-            app.add_repository_card(project_b, scope_b.clone(), scope_b.clone())
+            app.add_repository_card(project_b, scope_b.clone(), scope_b.clone(), None)
                 .1,
         );
         let browser = app.workspace.focused().unwrap();

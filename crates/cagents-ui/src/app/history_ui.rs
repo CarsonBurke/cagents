@@ -165,7 +165,8 @@ impl Cagents {
             oid,
             parent: changes.commit.parent.clone(),
         };
-        self.open_committed_file(key, path, old_path, basis)
+        let opener = self.panel_opener();
+        self.open_committed_file(key, path, old_path, basis, opener)
     }
 }
 

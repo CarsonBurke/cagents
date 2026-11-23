@@ -2474,8 +2474,70 @@ mod tests {
         assert_eq!(app.workspace.focused(), Some(a[0].id));
     }
 
+    /// A row clicked in the first of five panes' inspector opens second,
+    /// not in the browser at the end of the strip, and the rows clicked
+    /// after it reuse that browser rather than opening more.
     #[test]
-    fn file_selection_focuses_its_pane_and_leaves_the_inspector_showing_changes() {
+    fn a_file_opened_from_a_panes_inspector_opens_directly_after_it() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/a"]);
+        let shells = [
+            terminal("/a"),
+            terminal("/a"),
+            terminal("/a"),
+            terminal("/a"),
+        ];
+        let far = repository("/a");
+        let ids = shells
+            .iter()
+            .chain([&far])
+            .map(|card| card.id)
+            .collect::<Vec<_>>();
+        app.durable = Arc::new(WorkspaceState {
+            cards: shells
+                .iter()
+                .chain([&far])
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            focused: Some(ids[3]),
+            ..WorkspaceState::default()
+        });
+        app.window_width = 1_600.0;
+        app.context_sections
+            .set_open(context_sections::Section::Workspace, true);
+        let _ = app.restore_worktree_scope();
+        drop(app.workspace.resize_viewport(2_400.0));
+        app.open_pane_inspector_now(ids[0]);
+        drop(app.update(Message::FocusCard(ids[0])));
+        assert!(app.pane_shows_source_control(ids[0]));
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let open = |app: &mut Cagents, path: &str| {
+            drop(app.update(Message::Sidebar(SidebarAction::OpenFile {
+                key: key.clone(),
+                path: RepoPath::parse(path).unwrap(),
+            })));
+        };
+
+        open(&mut app, "src/main.rs");
+        let opened = app.workspace.focused().unwrap();
+        assert!(!ids.contains(&opened), "the far browser is left alone");
+        let order = [ids[0], opened, ids[1], ids[2], ids[3], ids[4]];
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+        assert_eq!(app.durable.cards[1].id, opened);
+
+        // The next row, still clicked in pane 1's inspector, replaces it.
+        open(&mut app, "src/lib.rs");
+        assert_eq!(app.workspace.focused(), Some(opened));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+        assert_eq!(
+            app.pending_panel_open.as_ref().map(|open| open.card),
+            Some(opened)
+        );
+    }
+
+    #[test]
+    fn file_selection_opens_beside_its_pane_and_leaves_the_inspector_showing_changes() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         register_worktrees(&mut app, &["/a", "/b"]);
         let editor = repository("/a");
@@ -2492,8 +2554,18 @@ mod tests {
         drop(app.workspace.resize_viewport(2_400.0));
         app.open_pane_inspector_now(shell.id);
         let key = app.sidebar_state.active_worktree().unwrap().clone();
-        let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
-        assert_eq!(app.workspace.focused(), Some(editor.id));
+        let _ = app.route_panel_open(
+            &key,
+            &RepoPath::parse("src/main.rs").unwrap(),
+            app.panel_opener(),
+        );
+        // The browser before the shell is not the one after it, so the file
+        // opens in a new browser beside the shell.
+        let opened = app.workspace.focused().unwrap();
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [editor.id, shell.id, opened]
+        );
         // The shell's inspector stays open, still drawing the changes the
         // file was chosen from, beside the editor it opened in.
         assert!(app.pane_inspectors.is_open(shell.id));
@@ -2506,7 +2578,11 @@ mod tests {
 
         let _ = app.select_worktree("/b".into(), false);
         app.pending_panel_open = None;
-        let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
+        let _ = app.route_panel_open(
+            &key,
+            &RepoPath::parse("src/main.rs").unwrap(),
+            app.panel_opener(),
+        );
         assert!(app.pending_panel_open.is_none());
         assert!(app.workspace.cards().is_empty());
     }

@@ -418,7 +418,8 @@ impl Cagents {
                 self.reload_source_control(&key)
             },
             SidebarAction::OpenFile { key, path } => {
-                self.route_panel_open(&key, &path)
+                let opener = self.panel_opener();
+                self.route_panel_open(&key, &path, opener)
             }
             SidebarAction::OpenFileInEditor { key, path, editor_id } => {
                 if !self.source_control_is_bound(&key) {
@@ -434,7 +435,8 @@ impl Cagents {
                 // The card has two diff bases. A conflict has no staged
                 // side to show, so it is opened against the working
                 // tree like any other unstaged change.
-                self.open_working_change(key, path, area)
+                let opener = self.panel_opener();
+                self.open_working_change(key, path, area, opener)
             }
             SidebarAction::Stage { key, selection } => {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
