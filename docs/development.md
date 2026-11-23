@@ -1032,9 +1032,34 @@ build:
   that gets CPU time only when nothing else wants it. It runs its own Cargo
   jobs and holds none of the shared jobserver's tokens.
 - **Memory:** it starts only with at least 16 GiB available, no memory
-  pressure, and no build waiting for build memory shares. It stops when any of
-  those changes for two checks in a row. It tries again ten minutes later,
+  pressure, and no build waiting for build memory shares. It stops when a
+  build waits for shares, or, once the gate admits it, when memory runs below
+  6 GiB or comes under pressure, for two checks in a row. It tries again ten minutes later,
   resuming from its warm build directory.
+- **Starvation:** fw16 is rarely idle, so yielding to every build could leave
+  releases with no bundle. The prebuild counts as starved in either of two
+  cases. One is when main has had commits newer than its newest bundle for
+  two hours. That counts from the first such commit, so the first commit
+  after a quiet night is not starved. It counts only bundles of the target's
+  own history. With no such bundle, it is starved once the commit to build is
+  two hours old. The other is when it has kept making way for half an hour,
+  since it was first stopped or deferred, without finishing a bundle. A
+  target that ends any other way, whether it was requested, released or
+  failed, ends that clock.
+- **A starved prebuild** builds like any other build. It queues fairly for
+  its build memory shares, keeps them while others wait, and runs in the
+  build slice at normal CPU weight. If it stayed on idle CPU time, a host busy
+  enough to starve it would leave it holding shares while hardly running. Its
+  two shares budget its memory: a release build peaks near 12 GiB, under
+  those 8 GiB and the 6 GiB floor. So it starts without waiting for 16 GiB,
+  and stops only below 2 GiB available or under heavy memory pressure. It
+  takes no backoff: a background build that crosses into starvation while
+  it runs queues again at once. Any prebuild queued at the gate ignores memory
+  until admitted, since the gate's admission already guards it.
+- **Timing:** `status` shows when the prebuild is starved and why. Each
+  bundle records two times. `waited_seconds` runs from the first try at its
+  commit to the gate's admission of the build that finished it. `seconds`
+  is how long that build then took.
 
 `prebuild-release request SHA` builds a commit next at normal priority,
 interrupting a background prebuild of another commit; requests build in the

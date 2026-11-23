@@ -15,7 +15,12 @@ A background prebuild never delays main's checks or tests, or anyone else's
 build: its build scope runs only on CPU time nothing else wants, with Cargo
 jobs of its own, it starts only while memory is plentiful, and it stops, to
 resume from its warm build directory later, once any build waits for build
-memory shares or memory runs short. A commit requested with `request` builds
+memory shares or memory runs short. On a host that is never idle that could
+starve it, leaving releases nothing to sign: once main has gone two hours
+without a bundle of its newer commits, or the prebuild has made way for half
+an hour without finishing one, it builds as any other build does, queuing
+for its build memory shares and sharing CPU time equally, and stops only
+when memory runs short. A commit requested with `request` builds
 at normal priority, ahead of the background prebuild.
 
   (none)            prebuild until nothing is left to do
@@ -58,6 +63,11 @@ FLOOR_GIB = 6
 # Memory pressure (pressure/memory `some avg10`) above which it neither
 # starts nor keeps running.
 PRESSURE_LIMIT = 10.0
+# A starved prebuild's gate shares (two of 4 GiB) budget its memory, so it
+# stops only as the host nears running out: a release build peaks near
+# 12 GiB, under its shares and the floor above.
+STARVED_FLOOR_GIB = 2
+STARVED_PRESSURE_LIMIT = 40.0
 # How often the running build is watched, and how many watches in a row a
 # reason to stop must last, so that a build only passing through admission
 # does not stop it.
@@ -66,8 +76,14 @@ SUSTAINED = 2
 # How long a stopped background prebuild waits before it looks again.
 BACKOFF_SECONDS = 600
 # A build's whole admission wait: a background one that cannot start almost
-# at once gives up and tries again later rather than queue ahead of others.
-ADMISSION_SECONDS = {"background": 10, "normal": None}
+# at once gives up and tries again later rather than queue ahead of others; a
+# starved one queues.
+ADMISSION_SECONDS = {"background": 10, "starved": None, "normal": None}
+# When a background prebuild counts as starved: the oldest main commit newer
+# than every bundle of its history is this old (or, with no bundle, the commit to build is),
+# or it first made way this long ago without finishing a bundle since.
+STALE_BUNDLE_SECONDS = 2 * 3600
+STARVED_SECONDS = 30 * 60
 GRACE_SECONDS = 60
 # A failed build is tried once more this long after, in case what failed was
 # the host rather than the commit; a second failure, or failing tests, is final.
@@ -168,21 +184,28 @@ def has_open(pid, found):
     return False
 
 
-def busy_reason():
-    """Why a background prebuild should not run now, or None."""
-    if share_waiter():
+def busy_reason(starved=False, queued=False):
+    """Why a background prebuild should not run now, or None. A starved one
+    does not count builds waiting for shares and stops only as memory runs
+    out; one queued at the gate uses no memory yet, which the gate's
+    admission guards."""
+    if not starved and share_waiter():
         return "a build is waiting for build memory shares"
-    if available_gib() < FLOOR_GIB:
-        return f"less than {FLOOR_GIB} GiB of memory is available"
-    if memory_pressure() > PRESSURE_LIMIT:
+    if queued:
+        return None
+    floor, limit = (STARVED_FLOOR_GIB, STARVED_PRESSURE_LIMIT) if starved else (FLOOR_GIB, PRESSURE_LIMIT)
+    if available_gib() < floor:
+        return f"less than {floor} GiB of memory is available"
+    if memory_pressure() > limit:
         return "memory is under pressure"
     return None
 
 
-def start_reason():
-    """Why a background prebuild should not start now, or None."""
-    reason = busy_reason()
-    if reason is None and available_gib() < START_GIB:
+def start_reason(starved=False):
+    """Why a background prebuild should not start now, or None. A starved one
+    starts on what keeps it running, its shares guarding build memory."""
+    reason = busy_reason(starved)
+    if reason is None and not starved and available_gib() < START_GIB:
         reason = f"less than {START_GIB} GiB of memory is available"
     return reason
 
@@ -362,6 +385,44 @@ def choose(repository, store, sentinel):
     return None, None
 
 
+def is_ancestor(repository, ancestor, sha):
+    return subprocess.run(["git", "-C", str(repository), "merge-base", "--is-ancestor", ancestor, sha],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def commit_time(repository, sha):
+    shown = git(repository, "show", "-s", "--format=%ct", sha, check=False)
+    return int(shown) if shown.isdigit() else None
+
+
+def starved(repository, store, sha, state):
+    """Whether the background prebuild of `sha` is starved, as ("waited" or
+    "stale", why), or (None, None)."""
+    since = state.get("stopped_since")
+    if since and time.time() - since >= STARVED_SECONDS:
+        return "waited", f"it has made way for {(time.time() - since) / 60:.0f} min without finishing a bundle"
+    # Only bundles of main's history up to the target say how far behind it
+    # they are.
+    bundled = [(commit_time(repository, bundle["sha"]), bundle["sha"])
+               for bundle in (read_json(path / "bundle.json") for path in store.kept())
+               if bundle and is_ancestor(repository, bundle["sha"], sha)]
+    bundled = [entry for entry in bundled if entry[0] is not None]
+    if bundled:
+        # How long main has had commits newer than every bundle: after a quiet
+        # night, the morning's first commit is new, however old the bundle.
+        newest = max(bundled)[1]
+        newer = git(repository, "rev-list", "--first-parent", "--reverse", f"{newest}..{sha}", check=False).split()
+        oldest = commit_time(repository, newer[0]) if newer else None
+        if oldest is not None and time.time() - oldest >= STALE_BUNDLE_SECONDS:
+            return "stale", (f"main has had commits newer than its newest bundle for "
+                             f"{(time.time() - oldest) / 3600:.1f} h")
+        return None, None
+    built = commit_time(repository, sha)
+    if built is not None and time.time() - built >= STALE_BUNDLE_SECONDS:
+        return "stale", f"there is no bundle, and {sha} is {(time.time() - built) / 3600:.1f} h old"
+    return None, None
+
+
 def prepare_checkout(repository, sha):
     """The commit's own scripts build it, from a checkout this owns."""
     if subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"{sha}^{{commit}}"],
@@ -399,9 +460,10 @@ def clear_cache_runs(cache):
             shutil.rmtree(run_directory, ignore_errors=True)
 
 
-def build(repository, store, sentinel, cache, sha, priority):
+def build(repository, store, sentinel, cache, sha, priority, first_tried_at=None):
     """Builds `sha`'s bundle into the store. Returns True once it is bundled,
-    False once its build failed, and raises Stopped if it was stopped."""
+    False once its build failed, and raises Stopped if it was stopped.
+    `first_tried_at` is when its first try began, for the wait it records."""
     try:
         checkout = prepare_checkout(repository, sha)
     except subprocess.CalledProcessError as error:
@@ -411,6 +473,9 @@ def build(repository, store, sentinel, cache, sha, priority):
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(mode=0o700)
     environment = dict(os.environ, CAGENTS_RELEASE_CACHE=str(cache), CAGENTS_RELEASE_SMOKE_CACHE=str(SMOKE_CACHE))
+    # A starved build runs as any other, in the build slice: on the idle
+    # slice, of a host busy enough to starve it, it would hold its build
+    # memory shares while hardly running.
     if priority == "background":
         environment["CAGENTS_BUILD_IDLE"] = "1"
     seconds = ADMISSION_SECONDS[priority]
@@ -419,11 +484,14 @@ def build(repository, store, sentinel, cache, sha, priority):
     # The release writes the notes it signs; these only keep the builder from
     # reading every commit since a tag this repository may not have fetched.
     (partial / "notes.md").write_text("Prebuilt bundle; the release writes its notes.\n")
-    command = [str(checkout / "scripts/cargo-gate"), "exec", str(checkout / "scripts/build-release-linux"),
+    # The gate runs the command once it is admitted, which the first line says.
+    command = [str(checkout / "scripts/cargo-gate"), "exec", "sh", "-c", f'echo "{ADMITTED} $(date +%s.%N)"; exec "$0" "$@"',
+               str(checkout / "scripts/build-release-linux"),
                "--ref", sha, "--output", str(partial / "dist"), "--notes", str(partial / "notes.md")]
     write_json(store.root / "building.json",
                {"sha": sha, "priority": priority, "started_at": time.time(), "pid": os.getpid()})
-    started = time.monotonic()
+    started = time.time()
+    admitted = None
     say(f"building {sha} ({priority})")
     with (partial / "build.log").open("w") as log:
         child = subprocess.Popen(command, cwd=checkout, env=environment, stdin=subprocess.DEVNULL,
@@ -436,7 +504,9 @@ def build(repository, store, sentinel, cache, sha, priority):
                 break
             except subprocess.TimeoutExpired:
                 pass
-            now = why_stop(store, sentinel, sha, priority)
+            if admitted is None:
+                admitted = admitted_at(partial / "build.log")
+            now = why_stop(store, sentinel, sha, priority, queued=admitted is None)
             count = count + 1 if now and now == reason else 1 if now else 0
             reason = now
             if count >= SUSTAINED:
@@ -463,9 +533,15 @@ def build(repository, store, sentinel, cache, sha, priority):
         if metadata.get("source_commit") != sha or "version" not in metadata or "protocol" not in metadata:
             raise Failed("its release metadata does not name this commit, a version and a protocol")
         size = sum(path.stat().st_size for path in (partial / "dist").iterdir())
+        finished = time.time()
+        admitted = admitted or admitted_at(partial / "build.log") or started
+        waited = admitted - (first_tried_at or started)
         write_json(partial / "bundle.json", {
             "schema": 1, "sha": sha, "version": metadata["version"], "protocol": metadata["protocol"],
-            "built_at": time.time(), "seconds": round(time.monotonic() - started), "priority": priority,
+            "built_at": finished, "seconds": round(finished - admitted, 1), "priority": priority,
+            # From the first try at this commit to the admission of the build
+            # that finished it: the stopped tries and backoffs, then its queue.
+            "waited_seconds": round(waited, 1),
             "bytes": size, "builder": f"scripts/build-release-linux at {sha}",
         })
         # An incomplete directory a crash left would refuse the rename.
@@ -476,11 +552,29 @@ def build(repository, store, sentinel, cache, sha, priority):
         shutil.rmtree(partial, ignore_errors=True)
         return False
     say(f"bundled {sha} ({metadata['version']}, {size / 2**30:.2f} GiB) in "
-        f"{(time.monotonic() - started) / 60:.0f} min")
+        f"{(finished - admitted) / 60:.0f} min, after waiting {waited / 60:.0f} min")
     return True
 
 
-def why_stop(store, sentinel, sha, priority):
+ADMITTED = "prebuild-release: admitted"
+
+
+def admitted_at(log):
+    """When the gate admitted the build, from the line it printed first."""
+    try:
+        with log.open(errors="replace") as lines:
+            for line in lines:
+                if line.startswith(f"{ADMITTED} "):
+                    try:
+                        return float(line.split()[-1])
+                    except ValueError:
+                        return None
+    except OSError:
+        pass
+    return None
+
+
+def why_stop(store, sentinel, sha, priority, queued=False):
     if verdict_failed(sentinel, sha):
         return "its tests failed"
     if priority == "normal":
@@ -490,7 +584,7 @@ def why_stop(store, sentinel, sha, priority):
     others = [other for other in store.requested() if other != sha and not store.built(other)]
     if others:
         return f"{others[0]} was requested"
-    return busy_reason()
+    return busy_reason(starved=priority == "starved", queued=queued)
 
 
 def stop(child):
@@ -516,28 +610,68 @@ def run(repository, store, sentinel, cache, keep):
         while True:
             sha, priority = choose(repository, store, sentinel)
             if sha is None:
+                # Nothing left to build, however its target ended: built,
+                # failed or released. The next target's tries start afresh.
+                if read_json(store.root / "state.json"):
+                    write_json(store.root / "state.json", {})
                 return 0
-            state = read_json(store.root / "state.json") or {}
-            if priority == "background":
-                waiting = state.get("retry_after", 0) - time.time()
-                reason = start_reason() if waiting <= 0 else "it was stopped to make way"
-                if reason:
-                    # The service stays, looking again shortly, so that a
-                    # request does not wait out the backoff.
-                    pause(WATCH_SECONDS * 6)
-                    continue
-            try:
-                done = build(repository, store, sentinel, cache, sha, priority)
-            except Stopped as stopped:
-                write_json(store.root / "state.json",
-                           {"retry_after": time.time() + BACKOFF_SECONDS, "stopped": str(stopped)})
-                if priority == "normal":
+            if priority == "normal":
+                # A requested build leaves the background target's record be.
+                try:
+                    done = build(repository, store, sentinel, cache, sha, priority)
+                except Stopped:
                     # Only a checkout that failed stops a requested build;
                     # it is not retried at once.
                     pause(WATCH_SECONDS * 6)
+                    continue
+                store.done(sha)
+                if done:
+                    store.evict(keep)
                 continue
+            state = read_json(store.root / "state.json") or {}
+            if state.get("sha") != sha:
+                # A newer commit to build: its tries start now. While the
+                # last target went unbuilt, the backoff and how long the
+                # prebuild has made way go on; once it is built, by any
+                # route, or failed, they start afresh.
+                previous = state.get("sha")
+                ended = previous is None or store.built(previous) or store.failure(previous) is not None \
+                    or previous in (read_json(store.root / "released.json") or {})
+                state = {"sha": sha, "first_tried_at": time.time()} | ({} if ended else {
+                    key: state[key] for key in ("stopped_since", "retry_after") if state.get(key)})
+                write_json(store.root / "state.json", state)
+            kind, why = starved(repository, store, sha, state)
+            if kind:
+                priority = "starved"
+            if state.get("starved") != kind:
+                if kind:
+                    say(f"{sha} is starved: {why}; it builds as any other build does")
+                    state["starved"] = kind
+                else:
+                    state.pop("starved", None)
+                write_json(store.root / "state.json", state)
+            waiting = state.get("retry_after", 0) - time.time()
+            reason = start_reason(starved=kind is not None) if waiting <= 0 else "it was stopped to make way"
+            if reason:
+                if not state.get("stopped_since"):
+                    state["stopped_since"] = time.time()
+                    write_json(store.root / "state.json", state)
+                # The service stays, looking again shortly, so that a
+                # request does not wait out the backoff.
+                pause(WATCH_SECONDS * 6)
+                continue
+            try:
+                done = build(repository, store, sentinel, cache, sha, priority, state["first_tried_at"])
+            except Stopped as stopped:
+                state |= {"stopped": str(stopped), "stopped_since": state.get("stopped_since") or time.time()}
+                # A build that crossed into starvation while it ran, or was
+                # starved already, needs no backoff: it queues at the gate.
+                state["retry_after"] = 0 if starved(repository, store, sha, state)[0] \
+                    else time.time() + BACKOFF_SECONDS
+                write_json(store.root / "state.json", state)
+                continue
+            # Bundled or failed: the target's record ends.
             write_json(store.root / "state.json", {})
-            # Bundled or failed, as its waiter then sees.
             store.done(sha)
             if done:
                 store.evict(keep)
@@ -576,6 +710,11 @@ def status(store, sentinel, as_json):
     if report["released_target"]:
         print(f"skipped  {report['target']}  {report['released_target']}, released already; "
               "waiting for main's version bump")
+    if report["state"].get("starved"):
+        print(f"starved  {report['state'].get('sha')}  ({report['state']['starved']}): it builds as any other")
+    if report["state"].get("stopped") and not building and report["state"].get("retry_after", 0) > time.time():
+        print(f"stopped  {report['state'].get('sha')}  {report['state']['stopped']}; tries again at "
+              f"{time.strftime('%H:%M', time.localtime(report['state'].get('retry_after', 0)))}")
     for sha in report["requested"]:
         print(f"requested {sha}")
     for sha in report["failures"]:
