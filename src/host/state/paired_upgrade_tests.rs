@@ -157,6 +157,8 @@ impl Peer {
                                     {"type":"userMessage","id":"old-prompt","content":[{"type":"text","text":"existing paired prompt"}]},
                                     {"type":"agentMessage","id":"old-answer","text":"existing paired answer","phase":"final_answer"}]}],"nextCursor":null}})
                         }
+                        // The adapter reads Codex's effective configuration for where it compacts.
+                        "config/read" => serde_json::json!({"config":{}}),
                         "model/list" | "skills/list" | "thread/list" | "thread/queue/list" => serde_json::json!({"data":[],"nextCursor":null}),
                         _ => panic!("unrequested provider work: {method}"),
                     };

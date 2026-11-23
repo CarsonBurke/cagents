@@ -3622,6 +3622,7 @@ pub enum SettingsField {
     DefaultNativePaneFraction,
     ShowStatusBar,
     AccountUsageDisplay,
+    ContextUsageDisplay,
     ShowWorktreeChangesIcons,
     ShowMentionedPullRequests,
     InspectorOpenByDefault,
@@ -3796,6 +3797,7 @@ impl SettingsField {
             Self::DictationSends => "Send when dictation stops",
             Self::ShowStatusBar => "Status bar",
             Self::AccountUsageDisplay => "Account usage",
+            Self::ContextUsageDisplay => "Context usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
             Self::ShowMentionedPullRequests => "Mentioned pull requests",
             Self::InspectorOpenByDefault => "Open with each pane",
@@ -3836,7 +3838,9 @@ impl SettingsField {
     const fn category(self) -> SettingsCategory {
         match self {
             Self::Notifications(_) => SettingsCategory::Notifications,
-            Self::AccountUsageDisplay | Self::UseProvider(_) => SettingsCategory::Accounts,
+            Self::AccountUsageDisplay | Self::ContextUsageDisplay | Self::UseProvider(_) => {
+                SettingsCategory::Accounts
+            }
             Self::AppTheme
             | Self::UiScale
             | Self::ShowStatusBar
@@ -4083,6 +4087,7 @@ struct SettingsDraft {
     default_native_pane_fraction: String,
     show_status_bar: bool,
     account_usage_display: settings::AccountUsageDisplay,
+    context_usage_display: settings::AccountUsageDisplay,
     show_worktree_changes_icons: bool,
     show_mentioned_pull_requests: bool,
     inspector_open_by_default: bool,
@@ -4162,6 +4167,7 @@ impl SettingsDraft {
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
             account_usage_display: settings.account_usage_display,
+            context_usage_display: settings.context_usage_display,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
             show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
             inspector_open_by_default: settings.inspector_open_by_default,
@@ -4241,6 +4247,11 @@ impl SettingsDraft {
             SettingsField::AccountUsageDisplay => {
                 if let Some(display) = settings::AccountUsageDisplay::from_key(&value) {
                     self.account_usage_display = display;
+                }
+            }
+            SettingsField::ContextUsageDisplay => {
+                if let Some(display) = settings::AccountUsageDisplay::from_key(&value) {
+                    self.context_usage_display = display;
                 }
             }
             SettingsField::ShowWorktreeChangesIcons => {
@@ -4530,6 +4541,9 @@ fn settings_update(
             .map_err(|_| "Choose whether the status bar is shown.".to_owned()),
         SettingsField::AccountUsageDisplay => settings::AccountUsageDisplay::from_key(value)
             .map(|display| next.account_usage_display = display)
+            .ok_or_else(|| "Choose Left or Used.".to_owned()),
+        SettingsField::ContextUsageDisplay => settings::AccountUsageDisplay::from_key(value)
+            .map(|display| next.context_usage_display = display)
             .ok_or_else(|| "Choose Left or Used.".to_owned()),
         SettingsField::ShowWorktreeChangesIcons => value
             .parse::<bool>()
@@ -18813,6 +18827,7 @@ impl Cagents {
                         into.sidebar_worktrees = settings.sidebar_worktrees;
                         into.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
                         into.account_usage_display = settings.account_usage_display;
+                        into.context_usage_display = settings.context_usage_display;
                         into.confirm_terminal_close = settings.confirm_terminal_close;
                         into.confirmations = settings.confirmations.clone();
                         into.providers = settings.providers.clone();
@@ -18826,6 +18841,7 @@ impl Cagents {
                     adopt(&mut self.settings_base);
                     self.settings_draft.sidebar_worktrees = settings.sidebar_worktrees;
                     self.settings_draft.account_usage_display = settings.account_usage_display;
+                    self.settings_draft.context_usage_display = settings.context_usage_display;
                     for kind in settings::Confirmation::ALL {
                         self.settings_draft.confirmations.insert(kind, settings.asks(kind));
                     }

@@ -2050,6 +2050,8 @@ fn provider() {
                 "thread/turns/list" | "thread/queue/list" | "thread/list" => {
                     json!({"data":[],"nextCursor":null})
                 }
+                // The adapter reads Codex's effective configuration for where it compacts.
+                "config/read" => json!({"config":{}}),
                 "model/list" | "skills/list" => json!({"data":[]}),
                 _ => panic!("unexpected provider request {method}"),
             };

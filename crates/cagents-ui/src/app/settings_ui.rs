@@ -441,7 +441,7 @@ fn settings_category_controls<'a>(
                 ),
                 settings_group(
                     "Usage",
-                    "How account allowances appear throughout the app.",
+                    "How account allowances and conversation context appear throughout the app.",
                     vec![settings_choice(
                         "Account usage",
                         "Left shows remaining allowance in text and gauges. Used shows consumed allowance. Warning colours still indicate when an account is running low.",
@@ -454,7 +454,20 @@ fn settings_category_controls<'a>(
                             )
                         }),
                     )
-                    .keywords("account_usage_display remaining consumed")],
+                    .keywords("account_usage_display remaining consumed"),
+                    settings_choice(
+                        "Context usage",
+                        "Left shows how much room a conversation has before the agent auto-compacts it, summarizing older messages to make space, or before its context window fills when auto-compaction is off. Used shows how much is taken.",
+                        SettingsField::ContextUsageDisplay,
+                        settings::AccountUsageDisplay::ALL.map(|display| {
+                            (
+                                display.label(),
+                                display.key(),
+                                draft.context_usage_display == display,
+                            )
+                        }),
+                    )
+                    .keywords("context_usage_display remaining consumed compaction autocompact window tokens")],
                 ),
             ]
         }
@@ -2446,6 +2459,7 @@ fn shared_preferences_stream_inner(
                         settings.sidebar_worktrees,
                         settings.sidebar_worktree_overrides.clone(),
                         settings.account_usage_display,
+                        settings.context_usage_display,
                         settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
                         settings.sidebar_worktrees_when_shown,
                     );

@@ -487,6 +487,8 @@ fn create_inner(
         spec,
         Box::new(Codex {
             cache_reading_total: 0,
+            context_config: ContextConfig::default(),
+            usage: None,
             server_identity: None,
             retained_identity,
             thread: launch.session_id.clone(),
@@ -598,6 +600,8 @@ enum Pending {
         reasoning: Option<String>,
     },
     QueueAdd,
+    /// The effective configuration, for where the conversation compacts.
+    Config,
     /// Removing the named entry, whose answer says whether it left the queue
     /// undelivered.
     QueueDelete(String),
@@ -646,11 +650,51 @@ enum RequestKind {
     Questions,
     Elicitation,
 }
+/// The settings that move where Codex compacts a conversation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ContextConfig {
+    /// `model_auto_compact_token_limit`.
+    auto_compact: Option<u64>,
+    /// `model_context_window`, which replaces the model's own window.
+    window: Option<u64>,
+}
+
+impl ContextConfig {
+    /// The share of a model's window Codex reports as usable, by default:
+    /// the rest is headroom it keeps for the reply.
+    const USABLE_PERCENT: u64 = 95;
+    /// Codex compacts at nine tenths of the model's window, or at the
+    /// configured limit where that comes first.
+    const COMPACT_NUMERATOR: u64 = 9;
+    const COMPACT_DENOMINATOR: u64 = 10;
+
+    /// Where Codex compacts a conversation whose usage reading reports
+    /// `usable` tokens of window: the reading gives the model's window less
+    /// Codex's headroom, so the whole window is worked back from it, unless
+    /// the configuration names the window itself.
+    fn compact_limit(self, usable: u64) -> Option<u64> {
+        let window = self.window.or_else(|| {
+            (usable > 0).then(|| usable.saturating_mul(100).div_ceil(Self::USABLE_PERCENT))
+        })?;
+        let default = window.saturating_mul(Self::COMPACT_NUMERATOR) / Self::COMPACT_DENOMINATOR;
+        Some(
+            self.auto_compact
+                .map_or(default, |limit| limit.min(default)),
+        )
+    }
+}
+
 #[derive(Default)]
 struct Codex {
     /// The total input of the latest usage reading, which tells a new
     /// request's reading from a repeated one.
     cache_reading_total: u64,
+    /// What the conversation's effective configuration says of its context,
+    /// read once it connects.
+    context_config: ContextConfig,
+    /// The latest usage reading, given again with its compaction point
+    /// should the configuration be read after it, as on a resume.
+    usage: Option<Usage>,
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
@@ -2478,7 +2522,9 @@ impl Codex {
                     // Predictions are optional. Failure cannot affect chat.
                     return Ok(step);
                 }
-                if matches!(pending, Pending::ChildList) {
+                // A server without the read compacts where its model's
+                // default says, which the usage reading still gives.
+                if matches!(pending, Pending::ChildList | Pending::Config) {
                     return Ok(step);
                 }
                 if matches!(pending, Pending::QueueList) && error["code"].as_i64() == Some(-32601) {
@@ -2635,6 +2681,14 @@ impl Codex {
                         json!({"limit":100}),
                         Pending::Models,
                     )?;
+                    // Configuration layers - the home's, the project's,
+                    // profiles and overrides - are Codex's to resolve.
+                    self.call(
+                        &mut step,
+                        "config/read",
+                        json!({"includeLayers":false,"cwd":self.cwd}),
+                        Pending::Config,
+                    )?;
                     self.skills(&mut step)?;
                 }
                 Pending::Attach => {
@@ -2705,6 +2759,32 @@ impl Codex {
                         self.history(&mut step, None)?;
                     }
                     self.finish_setup(&mut step);
+                }
+                Pending::Config => {
+                    let config = &result["config"];
+                    self.context_config = ContextConfig {
+                        // A limit scoped to what grows after the carried
+                        // prefix doesn't bound the whole context the reading
+                        // reports, so only the window's own point applies.
+                        auto_compact: config["model_auto_compact_token_limit"]
+                            .as_u64()
+                            .filter(|limit| *limit > 0)
+                            .filter(|_| {
+                                config["model_auto_compact_token_limit_scope"]
+                                    .as_str()
+                                    .is_none_or(|scope| scope == "total")
+                            }),
+                        window: config["model_context_window"]
+                            .as_u64()
+                            .filter(|window| *window > 0),
+                    };
+                    if let Some(usage) = &mut self.usage {
+                        let compact_limit = self.context_config.compact_limit(usage.context_limit);
+                        if usage.compact_limit != compact_limit {
+                            usage.compact_limit = compact_limit;
+                            step.events.push(Event::Usage(usage.clone()));
+                        }
+                    }
                 }
                 Pending::Models => {
                     for value in array(result, "data")? {
@@ -3847,14 +3927,18 @@ impl Codex {
                             cached: usage["last"]["cachedInputTokens"].as_u64().unwrap_or(0),
                         }));
                 }
-                step.events.push(Event::Usage(Usage {
+                let context_limit = usage["modelContextWindow"].as_u64().unwrap_or(0);
+                let reading = Usage {
                     cost_estimate,
                     input_tokens: usage["total"]["inputTokens"].as_u64().unwrap_or(0),
                     output_tokens: usage["total"]["outputTokens"].as_u64().unwrap_or(0),
                     context_tokens: usage["last"]["totalTokens"].as_u64().unwrap_or(0),
-                    context_limit: usage["modelContextWindow"].as_u64().unwrap_or(0),
+                    context_limit,
+                    compact_limit: self.context_config.compact_limit(context_limit),
                     cost_microusd: None,
-                }));
+                };
+                self.usage = Some(reading.clone());
+                step.events.push(Event::Usage(reading));
             }
             "thread/closed" | "thread/deleted" => {
                 // Close revokes current notification ownership. Pending exact

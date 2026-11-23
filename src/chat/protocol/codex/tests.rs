@@ -2012,6 +2012,8 @@ fn codex_cost_estimate_keeps_active_turn_tariff_through_model_and_fast_changes()
 fn adapter() -> Codex {
     Codex {
         cache_reading_total: 0,
+        context_config: ContextConfig::default(),
+        usage: None,
         server_identity: None,
         retained_identity: None,
         thread: Some("thread-exact".into()),
@@ -6602,5 +6604,88 @@ fn decisions_with_terms_read_as_words() {
     assert_eq!(
         crate::chat::readable::value(&amendment["acceptWithExecpolicyAmendment"]),
         "execpolicy_amendment:\n  - git\n  - push"
+    );
+}
+
+/// Codex compacts at nine tenths of the model's whole window, or at
+/// `model_auto_compact_token_limit` where that comes first. Its usage
+/// reading reports the window less its 5% headroom, so the whole window is
+/// worked back from that unless the configuration names it.
+#[test]
+fn codex_compacts_where_its_effective_configuration_says() {
+    let usage_of = |step: &Step| {
+        step.events.iter().find_map(|event| match event {
+            Event::Usage(usage) => Some(usage.clone()),
+            _ => None,
+        })
+    };
+    let reading = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-exact","turnId":"t","tokenUsage":{"total":{"inputTokens":10,"outputTokens":5},"last":{"totalTokens":200000},"modelContextWindow":258400}}});
+    for (config, compact) in [
+        (json!({}), 244_800),
+        (json!({"model_auto_compact_token_limit":150000}), 150_000),
+        // A limit past the default changes nothing: Codex takes the lesser.
+        (json!({"model_auto_compact_token_limit":900000}), 244_800),
+        (json!({"model_context_window":400000}), 360_000),
+        // A limit on what grows after the carried prefix doesn't bound the
+        // whole context.
+        (
+            json!({"model_auto_compact_token_limit":150000,
+                "model_auto_compact_token_limit_scope":"body_after_prefix"}),
+            244_800,
+        ),
+        (
+            json!({"model_auto_compact_token_limit":150000,
+                "model_auto_compact_token_limit_scope":"total"}),
+            150_000,
+        ),
+        (
+            json!({"model_auto_compact_token_limit":null,"model_context_window":null}),
+            244_800,
+        ),
+    ] {
+        let mut adapter = adapter();
+        let mut read = Step::default();
+        adapter
+            .call(&mut read, "config/read", json!({}), Pending::Config)
+            .unwrap();
+        adapter
+            .receive(json!({"id":read.writes[0]["id"],"result":{"config":config}}))
+            .unwrap();
+        let usage = usage_of(&adapter.receive(reading.clone()).unwrap()).unwrap();
+        assert_eq!(usage.context_limit, 258_400);
+        assert_eq!(usage.compact_limit, Some(compact), "{config}");
+    }
+    // A server that cannot read its configuration still compacts at its
+    // model's default, and the failure is no concern of the reader's.
+    let mut adapter = adapter();
+    let mut read = Step::default();
+    adapter
+        .call(&mut read, "config/read", json!({}), Pending::Config)
+        .unwrap();
+    let failed = adapter
+        .receive(
+            json!({"id":read.writes[0]["id"],"error":{"code":-32601,"message":"Unknown method"}}),
+        )
+        .unwrap();
+    assert!(failed.events.is_empty(), "{:?}", failed.events);
+    let usage = usage_of(&adapter.receive(reading.clone()).unwrap()).unwrap();
+    assert_eq!(usage.compact_limit, Some(244_800));
+
+    // A configuration read after the reading, as on a resume, moves the
+    // meter at once rather than at the next turn.
+    let mut adapter = self::adapter();
+    let mut read = Step::default();
+    adapter
+        .call(&mut read, "config/read", json!({}), Pending::Config)
+        .unwrap();
+    adapter.receive(reading).unwrap();
+    let configured = adapter
+        .receive(json!({"id":read.writes[0]["id"],
+            "result":{"config":{"model_auto_compact_token_limit":150000}}}))
+        .unwrap();
+    let usage = usage_of(&configured).unwrap();
+    assert_eq!(
+        (usage.context_tokens, usage.compact_limit),
+        (200_000, Some(150_000))
     );
 }

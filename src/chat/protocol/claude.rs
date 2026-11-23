@@ -936,6 +936,7 @@ impl Claude {
         wire.remove("_cagents_turn");
         wire.remove("_cagents_permissions");
         wire.remove("_cagents_permission_update");
+        wire.remove("_cagents_automatic");
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
@@ -943,6 +944,52 @@ impl Claude {
             events: vec![],
         })
     }
+    /// Asks Claude Code where it auto-compacts, for the context meter. The
+    /// answer is display data, so a request that cannot be made now is
+    /// skipped rather than failing what prompted it.
+    fn ask_context_usage(&mut self, step: &mut Step) {
+        if let Ok(usage) =
+            self.control(json!({"subtype":"get_context_usage","_cagents_automatic":true}))
+        {
+            step.writes.extend(usage.writes);
+        }
+    }
+    /// Claude's own account of the context: `get_context_usage`'s answer, or
+    /// the structured twin of a `/context` report.
+    ///
+    /// Its `maxTokens` is the auto-compaction window while auto-compaction is
+    /// on, as Claude Code resolved it from its settings at every level,
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `/autocompact` and the model, and
+    /// the model's whole window while it is off. Compaction starts at
+    /// `autoCompactThreshold`, short of that window by the room the reply
+    /// and a margin need, so that is the budget where it is reported. The
+    /// whole window itself comes from each turn's result, which names the
+    /// model's.
+    fn context_report(&mut self, report: &Value) {
+        if let Some(tokens) = report["totalTokens"].as_u64() {
+            self.usage.context_tokens = tokens;
+        }
+        let Some(window) = report["maxTokens"].as_u64().filter(|window| *window > 0) else {
+            return;
+        };
+        match report["isAutoCompactEnabled"].as_bool() {
+            Some(true) => {
+                self.usage.compact_limit = Some(
+                    report["autoCompactThreshold"]
+                        .as_u64()
+                        .filter(|threshold| (1..=window).contains(threshold))
+                        .unwrap_or(window),
+                )
+            }
+            Some(false) => {
+                self.usage.compact_limit = None;
+                self.usage.context_limit = window;
+            }
+            // A CLI that does not say leaves the window it reports.
+            None => self.usage.context_limit = window,
+        }
+    }
+
     fn fast_mode_metadata(&mut self, data: &Value, step: &mut Step) {
         if let Some(state) = data["fast_mode_state"]
             .as_str()
@@ -2532,17 +2579,8 @@ impl Claude {
                     }
                 }
             }
-            if child.is_none()
-                && let Some(usage) = frame["context_usage"].as_object()
-            {
-                self.usage.context_tokens = usage
-                    .get("totalTokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(self.usage.context_tokens);
-                self.usage.context_limit = usage
-                    .get("maxTokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(self.usage.context_limit);
+            if child.is_none() && frame["context_usage"].is_object() {
+                self.context_report(&frame["context_usage"]);
                 step.events.push(Event::Usage(self.usage.clone()));
             }
             if let Some(error) = frame["error"].as_str() {
@@ -4285,7 +4323,12 @@ impl Claude {
                 self.carrier_order.clear();
                 self.retracted.clear();
                 self.retracted_order.clear();
-                self.usage = Usage::default();
+                // Where the conversation compacts is the session's setting,
+                // not the cleared conversation's.
+                self.usage = Usage {
+                    compact_limit: self.usage.compact_limit,
+                    ..Usage::default()
+                };
                 self.cache_read_tokens = 0;
                 self.cache_write_tokens = 0;
                 step.events.push(Event::Reset {
@@ -4349,14 +4392,20 @@ impl Claude {
                         step.writes.extend(retry.writes);
                         return Ok(step);
                     }
-                    step.events.push(Event::Error {
-                        message: format!(
-                            "Claude {}: {}",
-                            string(&request, "subtype"),
-                            string(response, "error")
-                        ),
-                        fatal: string(&request, "subtype") == "initialize",
-                    });
+                    // A context figure asked for unprompted is display data a
+                    // CLI may not offer; its absence leaves the figure the
+                    // turns report, which is nothing the reader has to act
+                    // on. A refresh the reader asked for still says why not.
+                    if request["_cagents_automatic"] != true {
+                        step.events.push(Event::Error {
+                            message: format!(
+                                "Claude {}: {}",
+                                string(&request, "subtype"),
+                                string(response, "error")
+                            ),
+                            fatal: string(&request, "subtype") == "initialize",
+                        });
+                    }
                 } else if string(response, "subtype") != "success" {
                     return Err("Unsupported Claude control response subtype".into());
                 } else {
@@ -4392,6 +4441,12 @@ impl Claude {
                                 )));
                             }
                             self.status(self.busy, "Claude connected", &mut step);
+                            // Where auto-compaction falls is Claude Code's to
+                            // resolve, from settings at every level, its
+                            // environment and the model; asking once it is
+                            // connected gives the context budget from the
+                            // start rather than after the first compaction.
+                            self.ask_context_usage(&mut step);
                             for key in [
                                 "pending_permission_requests",
                                 "pending_user_dialog_requests",
@@ -4416,6 +4471,9 @@ impl Claude {
                             self.metadata(&Value::Null, &mut step);
                             let next = self.control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}))?;
                             step.writes.extend(next.writes);
+                            // Another model has its own window, and so its own
+                            // auto-compaction point.
+                            self.ask_context_usage(&mut step);
                         }
                         "get_settings" => {
                             let snapshot =
@@ -4490,12 +4548,7 @@ impl Claude {
                             });
                         }
                         "get_context_usage" => {
-                            self.usage.context_tokens = response["response"]["totalTokens"]
-                                .as_u64()
-                                .unwrap_or(self.usage.context_tokens);
-                            self.usage.context_limit = response["response"]["maxTokens"]
-                                .as_u64()
-                                .unwrap_or(self.usage.context_limit);
+                            self.context_report(&response["response"]);
                             step.events.push(Event::Usage(self.usage.clone()));
                         }
                         _ => {}
@@ -4771,10 +4824,16 @@ impl Claude {
                                 None
                             }
                         });
-                    if let Some(data) = data {
-                        self.usage.context_limit = data["contextWindow"]
-                            .as_u64()
-                            .unwrap_or(self.usage.context_limit);
+                    if let Some(window) = data.and_then(|data| data["contextWindow"].as_u64()) {
+                        // A model changed another way than `set_model`, such
+                        // as a typed /model or Claude Code's fallback, has
+                        // its own auto-compaction point.
+                        let changed =
+                            self.usage.context_limit != 0 && self.usage.context_limit != window;
+                        self.usage.context_limit = window;
+                        if changed {
+                            self.ask_context_usage(&mut step);
+                        }
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
@@ -8013,8 +8072,7 @@ impl Claude {
                 self.compaction_summary_due |= frame["parent_tool_use_id"]
                     .as_str()
                     .is_none_or(str::is_empty);
-                let usage = self.control(json!({"subtype":"get_context_usage"}))?;
-                step.writes.extend(usage.writes);
+                self.ask_context_usage(step);
             }
             // Auxiliary session frames are not transcript data. Each one used
             // to reach the transcript as a system item holding the raw JSON of

@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 200,
+    proven_at: 201,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -133,6 +133,11 @@ pub(crate) const WAIT_KINDS: u16 = 199;
 /// the main checkout.
 pub(crate) const CHANNEL_CHECKOUT: u16 = 200;
 
+/// The first protocol whose usage says where the provider auto-compacts the
+/// conversation. A client before it is sent the usage without; one from a
+/// source before it is read as compacting nowhere short of the whole window.
+pub(crate) const USAGE_COMPACT_LIMIT: u16 = 201;
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
 /// added them. The wire format proof accepts exactly these.
@@ -153,6 +158,11 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
         "cagents::workspace_model::ModelChannel",
         &["checkout"],
         CHANNEL_CHECKOUT,
+    ),
+    (
+        "cagents::chat::Usage",
+        &["compact_limit"],
+        USAGE_COMPACT_LIMIT,
     ),
 ];
 
@@ -182,6 +192,11 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
         "cagents::chat::FileChangePatch",
         &["lines"],
         PATCH_LINE_ORIGIN,
+    ),
+    (
+        "cagents::chat::Usage",
+        &["compact_limit"],
+        USAGE_COMPACT_LIMIT,
     ),
 ];
 
@@ -875,6 +890,63 @@ mod tests {
             );
             assert_eq!(encoding_for(WAIT_KINDS, || encode(state)), encode(state));
         }
+    }
+
+    /// Usage crosses the protocol that added its compaction point both ways:
+    /// an older client is sent the fields it decodes, and usage read from an
+    /// older update source has no compaction point, which leaves the whole
+    /// window as the budget. What follows it in the message stays where it was.
+    #[test]
+    fn usage_crosses_the_compaction_point_protocol_in_both_directions() {
+        use crate::chat::Usage;
+        let older = USAGE_COMPACT_LIMIT - 1;
+        let usage = |compact_limit| Usage {
+            input_tokens: 2_000,
+            output_tokens: 800,
+            context_tokens: 230_000,
+            context_limit: 1_000_000,
+            cost_microusd: Some(12),
+            cost_estimate: None,
+            compact_limit,
+        };
+        // As the older protocol has it: six fields, then the next value.
+        let before = postcard::to_stdvec(&(
+            (
+                2_000u64,
+                800u64,
+                230_000u64,
+                1_000_000u64,
+                Some(12u64),
+                None::<crate::chat::pricing::CostEstimate>,
+            ),
+            7u8,
+        ))
+        .unwrap();
+        for compact_limit in [Some(267_000), None] {
+            let message = (usage(compact_limit), 7u8);
+            assert_eq!(
+                encoding_for(older, || postcard::to_stdvec(&message).unwrap()),
+                before
+            );
+            let current = postcard::to_stdvec(&message).unwrap();
+            assert_ne!(current, before);
+            assert_eq!(
+                postcard::from_bytes::<(Usage, u8)>(&current).unwrap(),
+                message
+            );
+        }
+        assert_eq!(
+            decoding_from(older, || postcard::from_bytes::<(Usage, u8)>(&before)).unwrap(),
+            (usage(None), 7)
+        );
+        // JSON written before the field reads without it.
+        assert_eq!(
+            serde_json::from_str::<Usage>(
+                r#"{"input_tokens":2000,"output_tokens":800,"context_tokens":230000,"context_limit":1000000,"cost_microusd":12}"#
+            )
+            .unwrap(),
+            usage(None)
+        );
     }
 
     /// A file change crosses the protocol that added its line origin both

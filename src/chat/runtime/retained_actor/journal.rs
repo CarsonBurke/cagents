@@ -1109,6 +1109,7 @@ mod tests {
                             output_tokens: u64::MAX,
                             context_tokens: u64::MAX,
                             context_limit: u64::MAX,
+                            compact_limit: Some(u64::MAX),
                             cost_microusd: Some(u64::MAX),
                             cost_estimate: Some(crate::chat::pricing::CostEstimate {
                                 microusd: u64::MAX,

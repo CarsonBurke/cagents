@@ -3323,15 +3323,103 @@ pub enum SkillReach {
     First,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub context_tokens: u64,
+    /// The model's whole context window.
     pub context_limit: u64,
     pub cost_microusd: Option<u64>,
     /// API-equivalent estimate when the provider does not report a cost.
     #[serde(default)]
     pub cost_estimate: Option<pricing::CostEstimate>,
+    /// Where the provider compacts the conversation on its own: the
+    /// auto-compaction window as the provider resolved it from its settings,
+    /// environment and model. `None` where auto-compaction is off or the
+    /// provider did not say, which leaves the whole window as the budget.
+    /// Absent from an older record or source, which said nothing about it.
+    #[serde(default)]
+    pub compact_limit: Option<u64>,
+}
+
+/// The fields of [`Usage`] before [`crate::terminal_ipc::USAGE_COMPACT_LIMIT`].
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "Usage")]
+struct UsageBefore<C> {
+    input_tokens: u64,
+    output_tokens: u64,
+    context_tokens: u64,
+    context_limit: u64,
+    cost_microusd: Option<u64>,
+    #[serde(default)]
+    cost_estimate: C,
+}
+
+/// As derived, except that a client from before the compaction point is sent
+/// the fields it decodes.
+impl Serialize for Usage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !crate::terminal_ipc::encoding_before(crate::terminal_ipc::USAGE_COMPACT_LIMIT) {
+            return Self::serialize(self, serializer);
+        }
+        UsageBefore {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            context_tokens: self.context_tokens,
+            context_limit: self.context_limit,
+            cost_microusd: self.cost_microusd,
+            cost_estimate: &self.cost_estimate,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// As derived, except that one from a source before the compaction point has
+/// none to read, which leaves the whole window as the budget.
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if !crate::terminal_ipc::decoding_before(crate::terminal_ipc::USAGE_COMPACT_LIMIT) {
+            return Self::deserialize(deserializer);
+        }
+        let UsageBefore {
+            input_tokens,
+            output_tokens,
+            context_tokens,
+            context_limit,
+            cost_microusd,
+            cost_estimate,
+        } = UsageBefore::<Option<pricing::CostEstimate>>::deserialize(deserializer)?;
+        Ok(Self {
+            input_tokens,
+            output_tokens,
+            context_tokens,
+            context_limit,
+            cost_microusd,
+            cost_estimate,
+            compact_limit: None,
+        })
+    }
+}
+
+impl Usage {
+    /// The budget a reader plans the conversation against: the
+    /// auto-compaction window where the provider compacts before the model's
+    /// window is full, otherwise the whole window. Zero where neither is known.
+    pub fn context_budget(&self) -> u64 {
+        match (self.compact_limit, self.context_limit) {
+            (Some(compact), 0) => compact,
+            (Some(compact), window) => compact.min(window),
+            (None, window) => window,
+        }
+    }
+
+    /// Whether [`Self::context_budget`] ends at auto-compaction before the
+    /// model's window does.
+    pub fn compacts_early(&self) -> bool {
+        self.compact_limit
+            .is_some_and(|compact| self.context_limit == 0 || compact < self.context_limit)
+    }
 }
 
 /// One step of a plan a provider published, with the state it is in.

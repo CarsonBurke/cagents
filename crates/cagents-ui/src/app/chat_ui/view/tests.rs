@@ -6853,7 +6853,7 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
         assert_eq!(text.contains("Synthetic account"), fit == FooterFit::Wide);
         let roomy = fit != FooterFit::Tight;
         assert_eq!(text.contains("Claude Sonnet 4.5"), roomy, "{text}");
-        assert_eq!(text.contains("42%"), roomy, "{text}");
+        assert_eq!(text.contains("58% left"), roomy, "{text}");
         assert_eq!(text.contains("$1.23"), roomy, "{text}");
         // The trailing group holds the footer's far edge at every width,
         // so model and spend never jump sides as the pane narrows.
@@ -6874,7 +6874,7 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
         let ring = laid
             .footer_names
             .iter()
-            .find(|name| name.starts_with("42% of context"))
+            .find(|name| name.starts_with("58% of context left"))
             .unwrap_or_else(|| panic!("the ring is named at {width}: {names}"));
         // Where the cost is no longer drawn, the ring says it.
         assert_eq!(ring.contains("$1.23"), !roomy, "{ring}");
@@ -13443,4 +13443,104 @@ fn a_spend_below_one_cent_never_reads_as_free() {
     assert_eq!(dollars(9_999), "<$0.01");
     assert_eq!(dollars(10_000), "$0.01");
     assert_eq!(dollars(1_234_567), "$1.23");
+}
+
+/// 262k tokens of a 1M window that compacts at 300k is most of the way to
+/// compaction, and the meter says so in whichever terms the reader chose.
+#[test]
+fn the_context_meter_measures_against_auto_compaction_in_the_chosen_terms() {
+    use crate::settings::AccountUsageDisplay::{Left, Used};
+    let usage = crate::chat::Usage {
+        context_tokens: 262_000,
+        context_limit: 1_000_000,
+        compact_limit: Some(300_000),
+        input_tokens: 1_500,
+        output_tokens: 950,
+        ..Default::default()
+    };
+    let left = ContextMeter::of(&usage, Left).unwrap();
+    assert_eq!(left.figure, "13% left");
+    assert!(
+        (left.fraction - 38.0 / 300.0).abs() < 1e-4,
+        "{}",
+        left.fraction
+    );
+    assert_eq!(
+        left.detail,
+        "13% left before auto-compact · 262k of 300k tokens (1M window) · 1.5k in · 950 out"
+    );
+    let used = ContextMeter::of(&usage, Used).unwrap();
+    assert_eq!(used.figure, "87% used");
+    assert!((used.fraction - 262.0 / 300.0).abs() < 1e-4);
+    assert!(
+        used.detail
+            .starts_with("87% of the way to auto-compact · 262k of 300k tokens (1M window)")
+    );
+
+    // At the edges a figure never claims the budget untouched or spent
+    // while it is neither, and counts near a million read as one.
+    let edge = |context_tokens| crate::chat::Usage {
+        context_tokens,
+        context_limit: 1_000_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        ContextMeter::of(&edge(999_000), Left).unwrap().figure,
+        "1% left"
+    );
+    assert_eq!(
+        ContextMeter::of(&edge(999_000), Used).unwrap().figure,
+        "99% used"
+    );
+    assert_eq!(
+        ContextMeter::of(&edge(1_000), Left).unwrap().figure,
+        "99% left"
+    );
+    assert_eq!(
+        ContextMeter::of(&edge(1_000), Used).unwrap().figure,
+        "1% used"
+    );
+    assert_eq!(ContextMeter::of(&edge(0), Used).unwrap().figure, "0% used");
+    assert_eq!(
+        ContextMeter::of(&edge(1_000_000), Left).unwrap().figure,
+        "0% left"
+    );
+    assert_eq!(token_count(999_600), "1M");
+    assert_eq!(token_count(999_400), "999k");
+}
+
+/// With auto-compaction off, or at the model's own window, the whole window
+/// is the budget and the meter does not speak of compaction.
+#[test]
+fn the_context_meter_falls_back_to_the_whole_window() {
+    use crate::settings::AccountUsageDisplay::{Left, Used};
+    for compact_limit in [None, Some(1_000_000)] {
+        let usage = crate::chat::Usage {
+            context_tokens: 262_000,
+            context_limit: 1_000_000,
+            compact_limit,
+            ..Default::default()
+        };
+        let used = ContextMeter::of(&usage, Used).unwrap();
+        assert_eq!(used.figure, "26% used");
+        assert!(
+            used.detail
+                .starts_with("26% of context used · 262k of 1M tokens")
+        );
+        assert!(!used.detail.contains("auto-compact"));
+        assert_eq!(ContextMeter::of(&usage, Left).unwrap().figure, "74% left");
+    }
+    // Before a turn names the model's window, the compaction point alone.
+    let early = crate::chat::Usage {
+        context_tokens: 14_000,
+        compact_limit: Some(300_000),
+        ..Default::default()
+    };
+    assert!(
+        ContextMeter::of(&early, Left)
+            .unwrap()
+            .detail
+            .starts_with("95% left before auto-compact · 14k of 300k tokens · ")
+    );
+    assert_eq!(ContextMeter::of(&crate::chat::Usage::default(), Left), None);
 }

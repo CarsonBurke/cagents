@@ -226,7 +226,8 @@ pub enum TerminalCursorStyle {
     Underline,
 }
 
-/// Whether account allowance labels and gauges describe what remains or was used.
+/// Whether a budget's labels and gauges describe what remains or what was
+/// used: an account's allowances, and a conversation's context.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountUsageDisplay {
@@ -1355,6 +1356,10 @@ pub struct AppSettings {
     /// What account allowance labels and gauges show throughout the app.
     #[serde(default)]
     pub account_usage_display: AccountUsageDisplay,
+    /// What a conversation's context figure and gauge show: the room left
+    /// before auto-compaction (or a full window), or the context used.
+    #[serde(default)]
+    pub context_usage_display: AccountUsageDisplay,
     /// Preview rows by provider: `window:<provider key>` or `credits`.
     /// An absent provider retains its automatic headline; an empty list
     /// deliberately shows only the provider control.
@@ -1510,6 +1515,7 @@ impl Default for AppSettings {
             default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
             account_usage_display: AccountUsageDisplay::default(),
+            context_usage_display: AccountUsageDisplay::default(),
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             show_mentioned_pull_requests: false,
