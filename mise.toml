@@ -228,7 +228,7 @@ description = "Install, upgrade and remove fixture packages in a networkless roo
 run = "scripts/smoke-package-upgrades"
 
 [tasks.release]
-description = "Cut a release: bump, build on the build host, rehearse, publish (scripts/release --help)"
+description = "Release a prebuilt bundle: cut, rehearse, publish (scripts/release --help)"
 raw = true
 run = "scripts/release"
 

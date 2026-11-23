@@ -10,6 +10,7 @@ REPOSITORY=CarsonBurke/cagents
 TARGET=x86_64-unknown-linux-gnu
 VERSION=
 VERIFY_ONLY=false
+PUSH_TAG=false
 SMOKE_ROOTFS=
 export LC_ALL=C
 
@@ -20,13 +21,14 @@ fail() {
 
 usage() {
     printf '%s\n' \
-        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--smoke-rootfs DIR] [--verify-only]' \
+        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--smoke-rootfs DIR] [--verify-only | --push-tag]' \
         'Validate an existing local bundle and publish it through authenticated gh.' \
         'Defaults: version from Cargo manifests; dist from CAGENTS_DIST_DIR or checkout/dist.' \
         '--verify-only validates local files and the local tag without network access.' \
         'Both modes install/run/remove artifacts in private offline rootfs copies before publication.' \
         '--smoke-rootfs overrides the runtime image prepared by the local release builder.' \
         'Publication requires the identical existing tag on github.com/CarsonBurke/cagents.' \
+        '--push-tag pushes the local tag to origin once the local checks pass, so a refused bundle leaves none there.' \
         'Only drafts owned by this local publisher for this exact bundle may be resumed.' \
         'This command never builds, runs Actions, creates tags, or changes published releases.'
 }
@@ -40,10 +42,12 @@ while (($#)); do
             shift 2
             ;;
         --verify-only) VERIFY_ONLY=true; shift ;;
+        --push-tag) PUSH_TAG=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
 done
+! { "$VERIFY_ONLY" && "$PUSH_TAG"; } || fail '--verify-only does not push; drop --push-tag'
 
 for command in git jq sed sort sha256sum tar mktemp cp cmp ssh-keygen; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
@@ -322,6 +326,11 @@ unset GH_DEBUG
 
 # API errors (including authentication failures) are fatal, never treated as absence.
 gh api --hostname github.com user --jq .login >/dev/null
+if "$PUSH_TAG"; then
+    # Idempotent: origin refuses a different tag of the same name, and
+    # check_remote_tag confirms origin is this repository.
+    checkout_git push --quiet origin "refs/tags/$TAG" || fail "cannot push $TAG to origin"
+fi
 check_remote_tag() {
     local object kind sha depth=0
     object=$(gh api --hostname github.com "repos/$REPOSITORY/git/ref/tags/$TAG")
