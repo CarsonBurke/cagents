@@ -139,6 +139,15 @@ impl CloseSafetyShell {
             },
         )
         .unwrap();
+        // Shutdown confirms cleanup through whole-host /proc censuses within
+        // fixed reserves of its deadline. These tests assert what shutdown
+        // decides, not how fast a shared, loaded host scans /proc, so a census
+        // that starts within its budget is allowed to finish.
+        terminal
+            .inner
+            .published
+            .shutdown_census_instant
+            .store(true, Ordering::Release);
         Self {
             terminal,
             wakes,

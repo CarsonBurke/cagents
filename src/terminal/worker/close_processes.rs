@@ -20,6 +20,7 @@ const MAX_PROCESSES: usize = 65_536;
 thread_local! {
     static FAIL_NEXT_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DELAY_NEXT_CENSUS: std::cell::RefCell<Option<crossbeam_channel::Sender<Instant>>> = const { std::cell::RefCell::new(None) };
+    static INSTANT_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -30,6 +31,17 @@ pub(super) fn fail_next_census_for_test() {
 #[cfg(test)]
 pub(super) fn delay_next_census_for_test(finished: crossbeam_channel::Sender<Instant>) {
     DELAY_NEXT_CENSUS.set(Some(finished));
+}
+
+/// Run this thread's later censuses in virtual time: a census that starts
+/// before its deadline completes, however long the host takes to scan /proc.
+/// Each census still refuses to start after its deadline, so a budget that an
+/// earlier step consumed is still caught; only the scan's own wall-clock cost,
+/// which a loaded host can stretch past any fixed reserve, no longer decides
+/// a test's outcome.
+#[cfg(test)]
+pub(super) fn instant_census_for_test() {
+    INSTANT_CENSUS.set(true);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,6 +505,11 @@ fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
     #[cfg(test)]
     if FAIL_NEXT_CENSUS.replace(false) {
         return Err("injected terminal process census failure".into());
+    }
+    #[cfg(test)]
+    if INSTANT_CENSUS.get() {
+        check_deadline(deadline)?;
+        return census_with(Instant::now() + Duration::from_secs(3600), read_process);
     }
     census_with(deadline, read_process)
 }
