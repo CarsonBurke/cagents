@@ -1847,38 +1847,64 @@ fn perform_update(
         .relaunch_closed_windows(&installation.prefix.join("current/bin/cagents-ui"))
         .map_err(UpdateError::from);
     // A build that cannot open a single window must not leave the person
-    // with none. When the daemon was kept, the previous build still matches
-    // it, so it takes the installation back and reopens the windows.
+    // with none. While the daemon is still the previous build's, that build
+    // matches it, so it takes the installation back and reopens the windows.
     let restored = match &reopen_result {
-        Err(error) if install_result.is_ok() && !confirmed.replaces_daemon && !slots.is_empty() => {
+        Err(error)
+            if restores_previous_build(
+                install_result.is_ok(),
+                confirmed.replaces_daemon,
+                &slots,
+                crate::daemon::running_executable()
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+                &previous,
+            ) =>
+        {
+            eprintln!(
+                "cagents {} could not open its window: {error}",
+                release.version
+            );
             let candidate = installation.prefix.join("versions").join(&release.version);
-            Some(
-                restore_previous_build(&installation.prefix, &candidate, &previous, &slots)
-                    .map(|()| error.to_string()),
-            )
+            Some(restore_previous_build(
+                &installation.prefix,
+                &candidate,
+                &previous,
+                &slots,
+            ))
         }
         _ => None,
     };
     let handoff_kind = verify_reopened_service(&recovery, state, job)?;
-    if let Some(Ok(reason)) = restored {
-        // The phase in progress no longer describes anything.
-        job.message.clear();
-        return report_recovery_failure(
-            state,
-            job,
-            invalid(format!(
-                "cagents {} could not open its window: {reason}. cagents {} was restored and reopened your windows; your agents and terminals kept running.",
-                release.version, installation.version
-            )),
-        );
-    }
-    if let Some(Err(error)) = &restored {
-        eprintln!(
-            "Could not restore cagents {}: {error}",
-            installation.version
-        );
+    let (new, old) = (&release.version, &installation.version);
+    match restored {
+        Some(Ok(Ok(()))) => {
+            // The phase in progress no longer describes anything.
+            job.message.clear();
+            return report_recovery_failure(
+                state,
+                job,
+                invalid(format!(
+                    "cagents {new} closed while starting, so cagents {old} was put back and your windows reopened with it. Agents and terminals kept running."
+                )),
+            );
+        }
+        Some(Ok(Err(error))) => {
+            job.message.clear();
+            return report_recovery_failure(
+                state,
+                job,
+                invalid(format!(
+                    "cagents {new} closed while starting, so cagents {old} was put back, but its windows did not reopen either: {error}. Run `cagents ui` to open them. Agents and terminals kept running."
+                )),
+            );
+        }
+        Some(Err(error)) => eprintln!("Could not put back cagents {old}: {error}"),
+        None => (),
     }
     if let Err(error) = reopen_result {
+        job.message.clear();
         return report_recovery_failure(
             state,
             job,
@@ -1890,21 +1916,51 @@ fn perform_update(
     install_result.map(|()| handoff_kind)
 }
 
+/// Whether an installed update whose windows did not reopen goes back to
+/// `previous`: only when it installed, closed windows that all failed to
+/// reopen, and the daemon serving now is still the previous build's. A daemon
+/// the update started, even at the same protocol, may have moved the store on.
+fn restores_previous_build(
+    installed: bool,
+    replaced_daemon: bool,
+    slots: &[String],
+    daemon: Option<&Path>,
+    previous: &Path,
+) -> bool {
+    installed
+        && !replaced_daemon
+        && !slots.is_empty()
+        && daemon.is_some_and(|daemon| daemon.starts_with(previous))
+}
+
 /// Point the installation back at `previous` and reopen `slots` with its
-/// application, unless a window of the new build did open after all.
+/// application, unless a window of the new build did open after all. The
+/// outer error means the installation was left as it was; the inner one that
+/// it was put back but the windows did not reopen.
 fn restore_previous_build(
     prefix: &Path,
     candidate: &Path,
     previous: &Path,
     slots: &[String],
-) -> Result<(), UpdateError> {
-    let guard = crate::instance::UiUpdateGuard::acquire()?;
+) -> Result<io::Result<()>, UpdateError> {
+    // A window or daemon starting this moment holds the launch fence briefly.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let guard = loop {
+        match crate::instance::UiUpdateGuard::acquire() {
+            Ok(guard) => break guard,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     if guard.has_running_windows()? {
         return Err(invalid("a window of the new build is open"));
     }
     installed::restore_current(prefix, &candidate.canonicalize()?, previous)?;
-    guard.relaunch_windows(slots, &previous.join("bin/cagents-ui"))?;
-    Ok(())
+    Ok(guard.relaunch_windows(slots, &previous.join("bin/cagents-ui")))
 }
 
 fn verify_reopened_service(
@@ -3188,6 +3244,55 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_update_that_kept_the_daemon_puts_the_previous_build_back() {
+        let previous = Path::new("/install/versions/1.0.0");
+        let old_daemon = Path::new("/install/versions/1.0.0/bin/cagentsd");
+        let new_daemon = Path::new("/install/versions/1.0.1/bin/cagentsd");
+        let slots = ["primary".to_owned()];
+        assert!(restores_previous_build(
+            true,
+            false,
+            &slots,
+            Some(old_daemon),
+            previous
+        ));
+        // The installer started the new daemon: the old application may not
+        // speak to it, and it may have moved the store on.
+        assert!(!restores_previous_build(
+            true,
+            false,
+            &slots,
+            Some(new_daemon),
+            previous
+        ));
+        assert!(!restores_previous_build(
+            true, false, &slots, None, previous
+        ));
+        assert!(!restores_previous_build(
+            true,
+            true,
+            &slots,
+            Some(old_daemon),
+            previous
+        ));
+        assert!(!restores_previous_build(
+            false,
+            false,
+            &slots,
+            Some(old_daemon),
+            previous
+        ));
+        // Windows that never closed are reopened by the guard itself.
+        assert!(!restores_previous_build(
+            true,
+            false,
+            &[],
+            Some(old_daemon),
+            previous
+        ));
+    }
+
     #[test]
     fn recovery_installer_shell_requires_high_descriptor_support_before_shutdown() {
         preflight_recovery_shell(Path::new("/bin/bash")).unwrap();
