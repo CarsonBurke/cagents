@@ -12353,10 +12353,7 @@ fn pane_attention_tracks_semantic_events_and_a_hover_never_reads_a_pane() {
     app.observe_agent_activity_for_card(first, activity(ActivityState::Idle));
     assert!(!app.sidebar_state.has_card_update(first));
     app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
-    app.observe_agent_activity_for_card(third_id, activity(ActivityState::Working));
-    app.observe_agent_activity_for_card(third_id, activity(ActivityState::Idle));
     assert!(app.sidebar_state.has_card_update(second_id));
-    assert!(app.sidebar_state.has_card_update(third_id));
     let offset = app.workspace.camera().offset();
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
@@ -12375,13 +12372,22 @@ fn pane_attention_tracks_semantic_events_and_a_hover_never_reads_a_pane() {
     }));
     assert!(app.sidebar_state.has_card_update(second_id));
     // News for a pane the pointer only rests on is news.
-    app.observe_agent_activity_for_card(first, activity(ActivityState::Working));
+    app.observe_agent_activity_for_card(third_id, activity(ActivityState::Working));
+    let _ = app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::PointerEntered(third_id),
+    });
+    app.observe_agent_activity_for_card(third_id, activity(ActivityState::Idle));
+    assert!(app.sidebar_state.has_card_update(third_id));
+    // The pane chosen before the pointer wandered is chosen again on return,
+    // so its news is read as it arrives.
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
         event: WorkspaceViewportEvent::PointerEntered(first),
     });
+    app.observe_agent_activity_for_card(first, activity(ActivityState::Working));
     app.observe_agent_activity_for_card(first, activity(ActivityState::Idle));
-    assert!(app.sidebar_state.has_card_update(first));
+    assert!(!app.sidebar_state.has_card_update(first));
     app.settings.focus_follows_mouse = false;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
@@ -12443,6 +12449,17 @@ fn choosing_a_pane_reads_its_update_at_once() {
     assert!(app.sidebar_state.has_card_update(ids[1]));
     drop(app.update(Message::FocusCard(ids[1])));
     assert!(!app.sidebar_state.has_card_update(ids[1]));
+
+    // The pointer drifting over another pane and back leaves the chosen pane
+    // chosen: news there is read as it arrives, while the pane passed over
+    // still has its own.
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[2]));
+    app.observe_agent_update_for_card(ids[2]);
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[1]));
+    assert_eq!(app.workspace.focused(), Some(ids[1]));
+    app.observe_agent_update_for_card(ids[1]);
+    assert!(!app.sidebar_state.has_card_update(ids[1]), "still chosen");
+    assert!(app.sidebar_state.has_card_update(ids[2]));
 }
 
 /// Moving focus alone is saved once per burst rather than once per move,

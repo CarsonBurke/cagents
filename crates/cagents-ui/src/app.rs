@@ -6339,6 +6339,24 @@ impl Cagents {
         }
     }
 
+    /// Focuses `id` as the reader's choice. Choosing the pane the pointer
+    /// had already focused makes it chosen and reads it too.
+    fn choose_workspace_card(&mut self, id: CardId) -> Task<Message> {
+        let focus = self.focus_workspace_card(id);
+        let read = self.note_chosen(id);
+        Task::batch([focus, read])
+    }
+
+    /// Records that the reader chose `id`, if it holds the focus, and reads
+    /// it. Only a pane that took the focus was chosen.
+    fn note_chosen(&mut self, id: CardId) -> Task<Message> {
+        if self.workspace.focused() != Some(id) {
+            return Task::none();
+        }
+        self.hover_focus = None;
+        self.acknowledge_active_pane()
+    }
+
     fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
         // Publish the stopped-pane display index before shared views arrive.
         if let Err(error) = crate::upgrade::floor::load() {
@@ -9252,6 +9270,7 @@ impl Cagents {
         // Attention belongs to the native parent. Reveal its transcript before
         // acknowledging it, but only after navigation has actually succeeded.
         let (transcript, read) = if self.workspace.focused() == Some(id) {
+            self.hover_focus = None;
             let parent = match self.cards.get(&id) {
                 Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
                 _ => None,
@@ -10711,7 +10730,8 @@ impl Cagents {
                     Some(hover) if Some(hover.card) == previous => hover.explicit,
                     _ => previous,
                 };
-                self.hover_focus = Some(HoverFocus {
+                // Coming back to the pane last chosen leaves it chosen.
+                self.hover_focus = (explicit != Some(card)).then_some(HoverFocus {
                     card,
                     explicit,
                     keyboard_outside: false,
@@ -15675,7 +15695,8 @@ impl Cagents {
                 Task::none()
             }
         };
-        Task::batch([rehome, focus])
+        let read = self.note_chosen(id);
+        Task::batch([rehome, focus, read])
     }
 
     fn add_utility_card(&mut self, kind: CardKind) -> Task<Message> {
@@ -18510,15 +18531,7 @@ impl Cagents {
                 // Explicit activation also cancels a pending entry on this same
                 // card, even if no view has observed its acknowledgment yet.
                 self.set_terminal_review_owner(None);
-                let task = self.focus_workspace_card(id);
-                // Only a pane that took the focus was chosen. Choosing the
-                // pane the pointer had already focused reads it too.
-                if self.workspace.focused() == Some(id) {
-                    self.hover_focus = None;
-                    Task::batch([task, self.acknowledge_active_pane()])
-                } else {
-                    task
-                }
+                self.choose_workspace_card(id)
             }
             Message::PaneWidgetFocused(id) => {
                 self.set_terminal_review_owner(None);
@@ -18557,7 +18570,7 @@ impl Cagents {
                 }
                 if active {
                     self.set_terminal_review_owner(Some(card));
-                    self.focus_workspace_card(card)
+                    self.choose_workspace_card(card)
                 } else {
                     if self.terminal_review_card == Some(card) {
                         self.set_terminal_review_owner(None);
