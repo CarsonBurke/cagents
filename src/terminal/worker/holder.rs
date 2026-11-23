@@ -331,7 +331,7 @@ pub(super) fn spawn_reserved(
         });
     }
     // The root inherits the holder's limit.
-    crate::host::descriptor_limit::inherit(&mut process);
+    crate::descriptor_limit::inherit(&mut process);
     // `/proc/self/exe` runs this image even after an upgrade has replaced the
     // file it was loaded from, so a holder always matches its daemon.
     let process = spawn_original(&mut process, reservation)

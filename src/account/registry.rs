@@ -1151,7 +1151,7 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_create_pending_reserved(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         homes: &Homes,
         provider: Provider,
         started_at: u64,
@@ -1257,7 +1257,7 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_register_pending_reserved(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         homes: &Homes,
         account: Registered,
         system: &[(Provider, Identity)],
@@ -1311,7 +1311,7 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_restore_reserved(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         homes: &Homes,
         account: Registered,
         system: &[(Provider, Identity)],
@@ -1426,7 +1426,7 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_update_reserved<T>(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         change: impl FnOnce(&mut Registry) -> T,
     ) -> io::Result<(Registry, T)> {
         self.try_update_reserved_then(reservation, change, |_| {})
@@ -1437,7 +1437,7 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_update_reserved_then<T>(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         change: impl FnOnce(&mut Registry) -> T,
         after_write: impl FnOnce(&Registry),
     ) -> io::Result<(Registry, T)> {

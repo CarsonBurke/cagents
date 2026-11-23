@@ -965,6 +965,48 @@ impl Reservation {
     }
 }
 
+impl crate::account::remote::Reservation for Reservation {
+    fn verify(&self) -> std::io::Result<()> {
+        Reservation::verify(self)
+    }
+
+    fn verify_registry(&self, registry: &Registry) -> Result<(), String> {
+        Reservation::verify_registry(self, registry)
+    }
+
+    fn link_home(
+        &self,
+        provider: crate::agent::Provider,
+        key: uuid::Uuid,
+        operand: &Path,
+    ) -> Result<PathBuf, String> {
+        Reservation::link_home(self, provider, key, operand)
+    }
+
+    fn create_pending_home(
+        &self,
+        store: &Store,
+        homes: &crate::account::home::Homes,
+        provider: crate::agent::Provider,
+        started_at: u64,
+        system: Option<&Path>,
+        config: crate::account::home::CodexConfig,
+    ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
+        Reservation::create_pending_home(self, store, homes, provider, started_at, system, config)
+    }
+
+    fn patiently<T>(&self, attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+        Reservation::patiently(self, attempt)
+    }
+
+    fn commit<T>(
+        &self,
+        effect: impl FnMut() -> std::io::Result<T>,
+    ) -> Result<T, crate::account::remote::LifecycleError> {
+        Reservation::commit(self, effect)
+    }
+}
+
 /// How many times a sweep asks again about a home whose check was refused by
 /// something busy - a window holding the registry lock, another probe of the
 /// same provider, a reservation that overlaps it.

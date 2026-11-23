@@ -1081,7 +1081,7 @@ impl RemoteActor {
             .stderr(Stdio::null());
         // Exec resets the process-local saved limit. Restore it before the
         // helper starts, so its provider and tools inherit the caller's limit.
-        crate::host::descriptor_limit::inherit(&mut command);
+        crate::descriptor_limit::inherit(&mut command);
         unsafe {
             command.pre_exec(move || {
                 crate::daemon::seal_inherited_descriptors()?;

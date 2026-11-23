@@ -1,6 +1,7 @@
 mod account_lifecycle;
 #[cfg(test)]
 mod account_restore_tests;
+#[cfg(test)]
 pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
@@ -9,7 +10,6 @@ mod chat;
 mod client;
 mod control_gate;
 mod delivery;
-pub(crate) mod descriptor_limit;
 mod device_trust;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
@@ -451,7 +451,7 @@ pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn observe_fixture_startup(phase: &'static str, error: Option<&str>) {
-    exit_drain_tests::observe_startup(phase, error);
+    crate::fixture_startup::observe(phase, error);
 }
 
 /// Saves the conversation IDs an abandoned update's checkpoint alone records,
@@ -560,7 +560,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("host run entered", None);
     daemon::install_signal_handlers()?;
-    descriptor_limit::raise();
+    crate::descriptor_limit::raise();
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,

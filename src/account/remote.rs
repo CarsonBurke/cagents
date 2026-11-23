@@ -225,10 +225,47 @@ pub(crate) fn execute(_operation: Operation) -> Result<serde_json::Value, String
     Err("Account lifecycle requires the selected daemon's scoped admission reservation".into())
 }
 
+/// The daemon's hold on the accounts and homes one lifecycle operation
+/// changes. While it is held no other operation can change them, and each
+/// step checks that it still is before it writes anything.
+#[cfg(feature = "host")]
+pub trait Reservation {
+    /// Checks that the reservation still holds, waiting out an account list
+    /// another process holds for a moment.
+    fn verify(&self) -> std::io::Result<()>;
+    /// Checks that the reserved homes and registrations are still as
+    /// `registry` records them.
+    fn verify_registry(&self, registry: &super::registry::Registry) -> Result<(), String>;
+    /// Links the reserved home for `provider`'s account `key` at `operand`,
+    /// returning where it now is.
+    fn link_home(
+        &self,
+        provider: crate::agent::Provider,
+        key: uuid::Uuid,
+        operand: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String>;
+    /// Creates a home for a new account of `provider` and registers it as
+    /// pending, under this reservation.
+    fn create_pending_home(
+        &self,
+        store: &super::registry::Store,
+        homes: &super::home::Homes,
+        provider: crate::agent::Provider,
+        started_at: u64,
+        system: Option<&std::path::Path>,
+        config: super::home::CodexConfig,
+    ) -> std::io::Result<(uuid::Uuid, std::path::PathBuf)>;
+    /// Makes `attempt` again while another process holds the account list,
+    /// for as long as the daemon is patient.
+    fn patiently<T>(&self, attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T>;
+    /// Runs `effect` once the reservation is verified, as one patient attempt.
+    fn commit<T>(&self, effect: impl FnMut() -> std::io::Result<T>) -> Result<T, LifecycleError>;
+}
+
 /// Why an account lifecycle operation did not complete.
 #[cfg(feature = "host")]
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum LifecycleError {
+pub enum LifecycleError {
     /// The daemon stayed too busy to admit the change. Nothing changed, so
     /// the same request can be sent again.
     #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
@@ -269,7 +306,7 @@ impl From<&str> for LifecycleError {
 #[cfg(feature = "host")]
 pub(crate) fn execute_reserved(
     operation: Operation,
-    reservation: &crate::host::AccountReservation,
+    reservation: &impl Reservation,
 ) -> Result<serde_json::Value, LifecycleError> {
     use super::{home::Homes, registry::Store};
     let homes = Homes::installation()
@@ -285,7 +322,7 @@ pub(crate) fn execute_reserved(
 #[cfg(feature = "host")]
 fn execute_at(
     operation: Operation,
-    reservation: &crate::host::AccountReservation,
+    reservation: &impl Reservation,
     homes: super::home::Homes,
     store: super::registry::Store,
 ) -> Result<serde_json::Value, LifecycleError> {
@@ -302,7 +339,7 @@ fn execute_at(
 fn create(
     provider: Provider,
     copy_codex_config: bool,
-    reservation: &crate::host::AccountReservation,
+    reservation: &impl Reservation,
     homes: &super::home::Homes,
     store: &super::registry::Store,
 ) -> Result<serde_json::Value, LifecycleError> {
@@ -351,7 +388,7 @@ fn create(
 #[cfg(feature = "host")]
 fn change(
     operation: Operation,
-    reservation: &crate::host::AccountReservation,
+    reservation: &impl Reservation,
     homes: super::home::Homes,
     store: super::registry::Store,
 ) -> Result<serde_json::Value, LifecycleError> {
@@ -550,7 +587,7 @@ thread_local! {
 /// permanent marker: a failed save must not mark a later registered account.
 #[cfg(feature = "host")]
 fn release_pending(
-    reservation: &crate::host::AccountReservation,
+    reservation: &impl Reservation,
     homes: &super::home::Homes,
     store: &super::registry::Store,
     provider: Provider,
@@ -610,7 +647,7 @@ impl<T: Into<LifecycleError>> From<T> for RestoreFailure {
 /// daemon's reservation on it. Used by the daemon's startup sweep.
 #[cfg(feature = "host")]
 pub(crate) fn restore_installation_home(
-    reservation: &crate::host::AccountReservation,
+    reservation: &impl Reservation,
     provider: Provider,
     key: uuid::Uuid,
 ) -> Result<RestoredHome, RestoreFailure> {
@@ -636,7 +673,7 @@ pub(crate) fn restore_installation_home(
 #[cfg(feature = "host")]
 fn restore_reserved(
     runtime: &tokio::runtime::Runtime,
-    reservation: &crate::host::AccountReservation,
+    reservation: &impl Reservation,
     homes: &super::home::Homes,
     store: &super::registry::Store,
     provider: Provider,

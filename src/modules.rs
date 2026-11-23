@@ -40,6 +40,9 @@ pub mod daemon;
 pub mod daemon_health;
 #[cfg(any(feature = "host", all(test, target_os = "linux")))]
 pub(crate) mod descriptor_frame;
+/// The daemon's open-descriptor limit, which the processes it starts never inherit.
+#[cfg(feature = "host")]
+pub mod descriptor_limit;
 #[cfg(feature = "ui")]
 pub mod design;
 pub mod device;
@@ -53,6 +56,13 @@ pub mod document_link;
 pub mod file_url;
 #[doc(hidden)]
 pub mod filesystem_recovery_context;
+#[cfg(all(
+    any(test, feature = "test-support"),
+    feature = "host",
+    target_os = "linux"
+))]
+#[doc(hidden)]
+pub mod fixture_startup;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod fixture_workspace;
 mod flock;

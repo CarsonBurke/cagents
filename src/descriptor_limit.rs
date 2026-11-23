@@ -14,7 +14,7 @@ use std::{io, os::unix::process::CommandExt, process::Command, sync::OnceLock};
 static INHERITED: OnceLock<libc::rlimit> = OnceLock::new();
 
 /// Raises this process's soft open-descriptor limit to its hard limit.
-pub(crate) fn raise() {
+pub fn raise() {
     let Some(limit) = current() else {
         return;
     };
@@ -38,7 +38,7 @@ pub(crate) fn raise() {
 }
 
 /// Starts `command` with the limit this daemon was started with.
-pub(crate) fn inherit(command: &mut Command) {
+pub fn inherit(command: &mut Command) {
     let Some(&limit) = INHERITED.get() else {
         return;
     };

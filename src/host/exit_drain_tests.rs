@@ -398,6 +398,7 @@ fn run_host() -> (
             error: None,
         }))
         .unwrap_or_else(|_| panic!("startup observer already registered"));
+    crate::fixture_startup::register(observe_startup);
     // A real private launch fence/HostLease is acquired; no daemon guard is
     // fabricated and no process-wide authority marker is removed or changed.
     let admission = DaemonAdmission {
