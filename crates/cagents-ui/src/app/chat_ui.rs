@@ -14638,7 +14638,16 @@ impl Cagents {
                         let before = Arc::clone(&runtime.snapshot);
                         let previous_limit = runtime.failure_ui.limit_occurrence;
                         let rehydrating = runtime.presentation_evicted;
+                        let refresh_part = crate::performance::ui_trace::part(
+                            crate::performance::ui_trace::Phase::Update,
+                            "wake refresh",
+                        );
                         runtime.refresh();
+                        drop(refresh_part);
+                        let _rest_part = crate::performance::ui_trace::part(
+                            crate::performance::ui_trace::Phase::Update,
+                            "wake rest",
+                        );
                         // An exit can be reported after what answered the
                         // last send, as the daemon reports one that happened
                         // while it was busy only once it is free. Sending
@@ -14713,6 +14722,10 @@ impl Cagents {
                             self.persist();
                         }
                         let refresh_limits = self.refresh_chat_limit_accounts();
+                        let _tasks_part = crate::performance::ui_trace::part(
+                            crate::performance::ui_trace::Phase::Update,
+                            "wake tasks",
+                        );
                         return Task::batch([
                             settled,
                             refresh_limits,

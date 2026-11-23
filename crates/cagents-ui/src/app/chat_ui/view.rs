@@ -3108,6 +3108,10 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let anchors = Vec::new();
+        let transcript_part = crate::performance::ui_trace::part(
+            crate::performance::ui_trace::Phase::View,
+            "transcript",
+        );
         let mut transcript = VirtualRows::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
@@ -3801,6 +3805,8 @@ impl Runtime {
                     .height(Length::Fill),
             )
         };
+        drop(transcript_part);
+        let transcript_layer = crate::performance::ui_trace::region("transcript", transcript_layer);
         // Keep the transcript mounted in its original layer slot while the
         // chooser or the image viewer covers it, preserving its native scroll
         // and selection state, and what arrives meanwhile, such as a message
