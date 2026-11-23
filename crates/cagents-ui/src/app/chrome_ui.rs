@@ -247,6 +247,95 @@ mod tests {
         app
     }
 
+    /// A tab's content is kept while what it shows is unchanged, so each
+    /// input it shows must reach its key: a change to any of them shows in
+    /// the next frame of the same tree, and nothing else rebuilds it.
+    #[test]
+    fn a_kept_tab_shows_each_change_to_what_it_shows() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Shown {
+            texts: Vec<String>,
+            names: Vec<String>,
+        }
+        impl Operation for Shown {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.texts.push(text.to_owned());
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(2, 1600.0);
+        let id = app.durable.cards[1].id;
+        let mut tree: Option<Tree> = None;
+        let builds = || crate::retained::BUILDS.with(std::cell::Cell::get);
+        // One frame of the tab in the same tree, and what it shows.
+        let mut frame = |app: &Cagents, focused: bool, width: f32| {
+            let mut header = app.column_header(id, focused, width);
+            let tree = tree.get_or_insert_with(|| Tree::new(header.as_widget()));
+            tree.diff(header.as_widget_mut());
+            let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node =
+                header
+                    .as_widget_mut()
+                    .layout(tree, &renderer, &layout::Limits::new(size, size));
+            let mut shown = Shown::default();
+            header
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut shown);
+            let nodes = header.as_widget().a11y_nodes(
+                Layout::new(&node),
+                tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            shown.names = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect();
+            shown
+        };
+        let first = frame(&app, false, 240.0);
+        let built = builds();
+        let again = frame(&app, false, 240.0);
+        assert_eq!(builds(), built, "an unchanged tab is kept");
+        assert_eq!(again.texts, first.texts);
+
+        app.chrome_ui.user_titles.insert(id, "Renamed tab".into());
+        drop(app.sync_chrome());
+        let renamed = frame(&app, false, 240.0);
+        assert!(
+            renamed.texts.iter().any(|text| text == "Renamed tab"),
+            "the title: {:?}",
+            renamed.texts
+        );
+
+        let close = |shown: &Shown| shown.names.iter().any(|name| name.starts_with("Close"));
+        assert!(!close(&renamed));
+        app.chrome_ui.hovered_tab = Some(id);
+        assert!(close(&frame(&app, false, 240.0)), "hovering shows close");
+        app.chrome_ui.hovered_tab = None;
+        assert!(!close(&frame(&app, false, 240.0)));
+        assert!(close(&frame(&app, true, 240.0)), "focus shows close");
+        let focused = frame(&app, true, 240.0);
+        assert!(
+            focused
+                .names
+                .iter()
+                .any(|name| name.contains("Renamed tab")),
+            "{:?}",
+            focused.names
+        );
+        let compact = frame(&app, false, design::TAB_MIN_WIDTH - 1.0);
+        assert!(!close(&compact), "a narrow tab has no room to close");
+    }
+
     #[test]
     fn tab_density_fits_four_compact_and_real_titles_when_comfortable() {
         let app = tab_fixture(30, 900.0);
@@ -2333,6 +2422,153 @@ fn command<'a>(
         .into()
 }
 
+/// Where a pane's icon comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardIcon {
+    /// The code editor's own icon.
+    Editor,
+    Provider(crate::agent::Provider),
+    Generic(Icon),
+}
+
+impl CardIcon {
+    fn handle(self) -> widget::icon::Handle {
+        match self {
+            Self::Editor => crate::ui_controls::ceditor_icon(),
+            Self::Provider(provider) => crate::ui_controls::provider_icon(provider),
+            Self::Generic(icon) => icon.handle(),
+        }
+    }
+}
+
+/// Everything a tab shows inside its frame: the tab's content is built from
+/// this alone and kept while it is unchanged (see [`crate::retained`]).
+#[derive(Debug, PartialEq)]
+struct TabContent {
+    id: CardId,
+    compact: bool,
+    icon: CardIcon,
+    title: String,
+    /// A terminal's ordinal, shown apart from its title.
+    suffix: Option<String>,
+    focus_id: widget::Id,
+    /// The title control's accessible name.
+    name: String,
+    tip: String,
+    /// What the pane is busy with, and whether it is still working on it.
+    status: Option<(&'static str, bool)>,
+    /// The chat whose microphone is on in this pane.
+    microphone: Option<chat_ui::Target>,
+    attention: sidebar::AttentionSummary,
+    switch: Option<TabSwitch>,
+    close: Option<TabClose>,
+}
+
+/// The focused tab's control that switches a pane between chat and terminal.
+#[derive(Debug, PartialEq)]
+struct TabSwitch {
+    icon: Icon,
+    label: String,
+    ready: bool,
+}
+
+/// The close control of a focused or hovered tab.
+#[derive(Debug, PartialEq)]
+struct TabClose {
+    label: String,
+    id: widget::Id,
+    enabled: bool,
+}
+
+impl TabContent {
+    fn view(&self) -> Element<'static, Message> {
+        let id = self.id;
+        let mut title_children = vec![
+            self.icon.handle().icon().size(design::ROW_ICON_SIZE).into(),
+            crate::ui_controls::fade_text(self.title.clone())
+                .width(Length::Fill)
+                .into(),
+        ];
+        if let Some(suffix) = &self.suffix {
+            title_children.push(
+                design::caption(suffix.clone())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            );
+        }
+        let title_control = widget::button::custom(
+            widget::row::with_children(title_children)
+                .spacing(if self.compact { space::XS } else { space::S })
+                .align_y(Alignment::Center)
+                .height(Length::Fill),
+        )
+        .id(self.focus_id.clone())
+        .name(self.name.clone())
+        .class(column_title_style())
+        .padding([0.0, space::XS])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .on_press(Message::FocusCard(id));
+        let mut children = vec![tooltip(
+            crate::reorder::handle(title_control, id),
+            self.tip.clone(),
+        )];
+        if let Some((label, busy)) = self.status {
+            let indicator: Element<'static, Message> = if busy {
+                crate::ui_controls::activity_spinner(
+                    design::TAB_STATUS_ICON_SIZE as f32,
+                    design::accent_color,
+                )
+            } else {
+                Icon::Warning
+                    .handle()
+                    .icon()
+                    .size(design::TAB_STATUS_ICON_SIZE)
+                    .into()
+            };
+            children.push(tooltip(indicator, label));
+        }
+        if let Some(target) = self.microphone {
+            // The microphone is on for this chat, wherever its tab is.
+            children.push(
+                crate::ui_controls::icon_button(Icon::Microphone, "Microphone on: stop dictating")
+                    .selected(true)
+                    .tone(crate::design::Tone::Themed(design::accent_color))
+                    .id(card_control_id(id, "stop-dictating"))
+                    .on_press(Message::ChatUi(chat_ui::Action::DictationStop(target)))
+                    .into(),
+            );
+        }
+        if let Some(indicator) = sidebar::attention_indicator(self.attention) {
+            children.push(indicator);
+        }
+        if let Some(switch) = &self.switch {
+            children.push(command(
+                switch.icon,
+                switch.label.clone(),
+                card_control_id(id, "switch"),
+                switch
+                    .ready
+                    .then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
+            ));
+        }
+        if let Some(close) = &self.close {
+            children.push(command(
+                Icon::Close,
+                close.label.clone(),
+                close.id.clone(),
+                close.enabled.then_some(Message::CloseCard(id)),
+            ));
+        }
+        widget::row::with_children(children)
+            .align_y(Alignment::Center)
+            .height(Length::Fill)
+            .spacing(space::XXS)
+            .width(Length::Fill)
+            .into()
+    }
+}
+
 impl Cagents {
     fn dismiss_rename(&mut self) -> Task<Message> {
         if self.chrome_ui.rename.take().is_none() {
@@ -3768,24 +4004,30 @@ impl Cagents {
     /// and the inspector heading. Agents wear their provider's mark, whether
     /// they run in a native chat or a terminal.
     pub(super) fn card_icon(&self, id: CardId) -> widget::icon::Handle {
+        self.card_icon_source(id).handle()
+    }
+
+    /// Where pane `id`'s icon comes from, which a tab compares rather than
+    /// the icon's handle.
+    fn card_icon_source(&self, id: CardId) -> CardIcon {
         let kind = self.card_state(id).map(|card| &card.kind);
-        let generic = || self.card_labels(kind).icon.handle();
+        let generic = || CardIcon::Generic(self.card_labels(kind).icon);
         match kind {
-            Some(CardKind::Repository(_)) => crate::ui_controls::ceditor_icon(),
-            Some(CardKind::Chat(session)) => {
-                crate::ui_controls::provider_icon(session.launch.provider)
-            }
+            Some(CardKind::Repository(_)) => CardIcon::Editor,
+            Some(CardKind::Chat(session)) => CardIcon::Provider(session.launch.provider),
             Some(CardKind::Terminal(session)) => self
                 .sidebar_state
                 .card_activity(id)
                 .map(|activity| activity.provider)
                 .or_else(|| crate::agent::Provider::recognize_launch(&session.launch))
-                .map_or_else(generic, crate::ui_controls::provider_icon),
+                .map_or_else(generic, CardIcon::Provider),
             _ => generic(),
         }
     }
 
-    fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
+    /// What tab `id` shows inside its frame, `width` wide, which its
+    /// content is retained on.
+    fn tab_content(&self, id: CardId, focused: bool, width: f32) -> TabContent {
         let card = self.card_state(id);
         let labels = self.card_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
@@ -3793,7 +4035,6 @@ impl Cagents {
             || card.map_or("Column", |card| self.card_display_title(card)),
             |chrome| chrome.title.as_str(),
         );
-        let focus_id = self.card_header_widget_id(id);
         let caption = chrome
             .map(|chrome| Cow::Borrowed(chrome.caption.as_str()))
             .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
@@ -3810,50 +4051,23 @@ impl Cagents {
                 .and_then(|suffix| title.strip_suffix(suffix))
                 .unwrap_or(title)
         };
-        let mut title_children = vec![
-            self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
-            crate::ui_controls::fade_text(visible_title)
-                .width(Length::Fill)
-                .into(),
-        ];
-        if let Some(suffix) = suffix {
-            title_children.push(
-                design::caption(suffix.trim())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-            );
-        }
-        let title_control = widget::button::custom(
-            widget::row::with_children(title_children)
-                .spacing(if compact { space::XS } else { space::S })
-                .align_y(Alignment::Center)
-                .height(Length::Fill),
-        )
-        .id(focus_id)
-        .name(chrome.map_or_else(
+        let name = chrome.map_or_else(
             || {
-                Cow::Owned(card_accessible_name(
+                card_accessible_name(
                     labels.type_label,
                     title,
                     caption.as_deref().unwrap_or(""),
                     focused,
-                ))
+                )
             },
-            |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
-        ))
-        .class(column_title_style())
-        .padding([0.0, space::XS])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .on_press(Message::FocusCard(id));
+            |chrome| chrome.accessible_name(focused).to_owned(),
+        );
         let tip = chrome.map_or_else(
-            || {
-                Cow::Owned(match caption {
-                    Some(caption) => format!("{title}\n{caption}"),
-                    None => title.to_owned(),
-                })
+            || match &caption {
+                Some(caption) => format!("{title}\n{caption}"),
+                None => title.to_owned(),
             },
-            |chrome| Cow::Borrowed(chrome.tooltip.as_str()),
+            |chrome| chrome.tooltip.clone(),
         );
         let attention = self.sidebar_state.card_attention(id);
         let tip = if attention != sidebar::AttentionSummary::default() {
@@ -3867,11 +4081,10 @@ impl Cagents {
                 tip.push('\n');
                 tip.push_str(&preview.text);
             }
-            Cow::Owned(tip)
+            tip
         } else {
             tip
         };
-        let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
             _ if self.terminal_close_in_progress(id) => Some(("Checking before closing", true)),
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
@@ -3896,92 +4109,79 @@ impl Cagents {
             }
             _ => None,
         };
-        if let Some((label, busy)) = status {
-            let indicator: Element<'_, Message> = if busy {
-                crate::ui_controls::activity_spinner(
-                    design::TAB_STATUS_ICON_SIZE as f32,
-                    design::accent_color,
-                )
-            } else {
-                Icon::Warning
-                    .handle()
-                    .icon()
-                    .size(design::TAB_STATUS_ICON_SIZE)
-                    .into()
-            };
-            children.push(tooltip(indicator, label));
-        }
-        if let Some(target) = self.dictation_microphone_in(id) {
-            // The microphone is on for this chat, wherever its tab is.
-            children.push(
-                crate::ui_controls::icon_button(Icon::Microphone, "Microphone on: stop dictating")
-                    .selected(true)
-                    .tone(crate::design::Tone::Themed(design::accent_color))
-                    .id(card_control_id(id, "stop-dictating"))
-                    .on_press(Message::ChatUi(chat_ui::Action::DictationStop(target)))
-                    .into(),
-            );
-        }
-        if let Some(indicator) = sidebar::attention_indicator(attention) {
-            children.push(indicator);
-        }
-        if focused && self.chat_switch_available(id) {
+        let switch = (focused && self.chat_switch_available(id)).then(|| {
             let blocker = self.chat_switch_blocker(id);
-            let ready = blocker.is_none();
-            children.push(command(
-                if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
+            TabSwitch {
+                icon: if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
                     Icon::Terminal
                 } else {
                     Icon::Chat
                 },
-                blocker.unwrap_or_else(|| Cow::Borrowed(self.chat_switch_label(id))),
-                card_control_id(id, "switch"),
-                ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
-            ));
-        }
-        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= 112.0 {
-            children.push(command(
-                Icon::Close,
-                {
-                    let label = chrome.map_or_else(
-                        || Cow::Owned(card_close_name(labels.type_label, title)),
-                        |chrome| Cow::Borrowed(chrome.close_name.as_str()),
-                    );
-                    if focused {
-                        Cow::Owned(workspace_widget::shortcut_tooltip_named(
+                ready: blocker.is_none(),
+                label: blocker
+                    .unwrap_or_else(|| Cow::Borrowed(self.chat_switch_label(id)))
+                    .into_owned(),
+            }
+        });
+        let close =
+            ((focused || self.chrome_ui.hovered_tab == Some(id)) && width >= 112.0).then(|| {
+                let label = chrome.map_or_else(
+                    || Cow::Owned(card_close_name(labels.type_label, title)),
+                    |chrome| Cow::Borrowed(chrome.close_name.as_str()),
+                );
+                TabClose {
+                    label: if focused {
+                        workspace_widget::shortcut_tooltip_named(
                             workspace_widget::GlobalShortcut::CloseFocusedCard,
                             &self.settings.keyboard_shortcuts,
                             &label,
-                        ))
+                        )
                     } else {
-                        label
-                    }
-                },
-                chrome.map_or_else(
-                    || card_control_id(id, "close"),
-                    |chrome| chrome.close_id.clone(),
-                ),
-                (!self.terminal_close_in_progress(id)).then_some(Message::CloseCard(id)),
-            ));
+                        label.into_owned()
+                    },
+                    id: chrome.map_or_else(
+                        || card_control_id(id, "close"),
+                        |chrome| chrome.close_id.clone(),
+                    ),
+                    enabled: !self.terminal_close_in_progress(id),
+                }
+            });
+        TabContent {
+            id,
+            compact,
+            icon: self.card_icon_source(id),
+            title: visible_title.to_owned(),
+            suffix: suffix.map(|suffix| suffix.trim().to_owned()),
+            focus_id: self.card_header_widget_id(id),
+            name,
+            tip,
+            status,
+            microphone: self.dictation_microphone_in(id),
+            attention,
+            switch,
+            close,
         }
+    }
+
+    fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
+        let chrome = self.card_chrome.get(&id);
+        let children = crate::retained::keyed(
+            self.tab_content(id, focused, width),
+            iced::Size::new(Length::Fill, Length::Fill),
+            TabContent::view,
+        );
         let tab = crate::tab_strip::middle_click_close(
-            widget::container(
-                widget::row::with_children(children)
-                    .align_y(Alignment::Center)
-                    .height(Length::Fill)
-                    .spacing(space::XXS)
-                    .width(Length::Fill),
-            )
-            .padding([0.0, space::XS])
-            .height(design::PRIMARY_CONTROL_SIZE)
-            .id(chrome.map_or_else(
-                || card_control_id(id, "tab"),
-                |chrome| chrome.tab_id.clone(),
-            ))
-            .width(width)
-            .class(cosmic::theme::Container::custom(move |theme| {
-                column_tab_style(theme, focused, self.chrome_ui.hovered_tab == Some(id))
-            })),
+            widget::container(children)
+                .padding([0.0, space::XS])
+                .height(design::PRIMARY_CONTROL_SIZE)
+                .id(chrome.map_or_else(
+                    || card_control_id(id, "tab"),
+                    |chrome| chrome.tab_id.clone(),
+                ))
+                .width(width)
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    column_tab_style(theme, focused, self.chrome_ui.hovered_tab == Some(id))
+                })),
             Message::CloseCard(id),
         );
         let tab = iced::widget::mouse_area(tab)
