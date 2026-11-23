@@ -2,3 +2,4 @@
 # cagents-release`), one per line. A build trusts only the releases these keys
 # signed; until a key is listed here, this build offers no release update.
 # See docs/releasing.md#signing for how the key is made and kept.
+sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIDKhNA91YlzyJCyLikv3bPApza0mzQJTjBUNVTp3q+CUAAAABHNzaDo= cagents-release
