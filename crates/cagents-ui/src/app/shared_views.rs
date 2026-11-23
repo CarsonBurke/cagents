@@ -194,9 +194,10 @@ enum ViewScopeAuthorities<'a> {
         repositories: HashMap<&'a Path, &'a Path>,
         projects: HashSet<&'a Path>,
     },
-    Owned {
-        repositories: HashMap<PathBuf, PathBuf>,
-        projects: HashSet<PathBuf>,
+    /// The topology discovery keeps between passes.
+    Kept {
+        repositories: &'a HashMap<PathBuf, PathBuf>,
+        projects: &'a HashSet<PathBuf>,
     },
 }
 
@@ -210,14 +211,14 @@ impl ViewScopeAuthorities<'_> {
     fn repository_for(&self, path: &Path) -> Option<&Path> {
         match self {
             Self::Borrowed { repositories, .. } => repositories.get(path).copied(),
-            Self::Owned { repositories, .. } => repositories.get(path).map(PathBuf::as_path),
+            Self::Kept { repositories, .. } => repositories.get(path).map(PathBuf::as_path),
         }
     }
 
     fn contains_repository(&self, repository: &Path) -> bool {
         match self {
             Self::Borrowed { projects, .. } => projects.contains(repository),
-            Self::Owned { projects, .. } => projects.contains(repository),
+            Self::Kept { projects, .. } => projects.contains(repository),
         }
     }
 }
@@ -362,6 +363,9 @@ pub(super) struct State {
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
     pub(super) topology_build_count: std::cell::Cell<usize>,
+    /// Structural passes, complete or over a repository's scopes.
+    #[cfg(test)]
+    pub(super) structural_pass_count: std::cell::Cell<usize>,
     #[cfg(test)]
     view_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -592,6 +596,7 @@ impl State {
             closed,
             local_projection_count: _,
             topology_build_count: _,
+            structural_pass_count: _,
             view_projection_count: _,
             selected_projection_count: _,
             scope_discovery_count: _,
@@ -1036,6 +1041,15 @@ impl Cagents {
             .any(|view| view.panes.iter().any(|pane| pane.id == card))
     }
 
+    /// Every card the registry shows in some view.
+    fn registry_listed_panes(&self) -> HashSet<CardId> {
+        self.workspace_model
+            .views
+            .iter()
+            .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+            .collect()
+    }
+
     /// Admits again the hydration of a restored terminal whose start was held
     /// for the registry. The lifecycle already counts it as hydrating, so it
     /// would otherwise never be asked to start and its pane would stay on
@@ -1075,6 +1089,15 @@ impl Cagents {
             return Task::none();
         }
         self.retire_startup_registry_waits();
+        // Which panes the registry lists, read at most once rather than by a
+        // walk of every view for each candidate. The release leaves the
+        // model's views as they are.
+        let listed = std::cell::OnceCell::new();
+        let listed_in_registry = |card: CardId| {
+            listed
+                .get_or_init(|| self.registry_listed_panes())
+                .contains(&card)
+        };
         let held = self
             .durable
             .cards
@@ -1092,14 +1115,21 @@ impl Cagents {
                         && !self.pane_close_owned(card.id) =>
                 {
                     let opening = matches!(self.residency(card.id), Residency::Hydrating { .. });
-                    if !opening && self.listed_in_registry(card.id) {
+                    let unlisted = !listed_in_registry(card.id);
+                    if !opening && !unlisted {
                         return None;
                     }
                     #[cfg(test)]
                     self.shared_views
                         .held_descriptor_clones
                         .set(self.shared_views.held_descriptor_clones.get() + 1);
-                    Some((card.id, self.exposure(card.id), opening, session.clone()))
+                    Some((
+                        card.id,
+                        self.exposure(card.id),
+                        opening,
+                        unlisted,
+                        session.clone(),
+                    ))
                 }
                 _ => None,
             })
@@ -1113,7 +1143,7 @@ impl Cagents {
         // any release mutates attached custody.
         let needs_scope_admission = held
             .iter()
-            .any(|(card, _, opening, _)| !opening && !self.listed_in_registry(*card));
+            .any(|&(_, _, opening, unlisted, _)| !opening && unlisted);
         let views_settled = !needs_scope_admission
             || self.shared_views.registry_unavailable
             || self
@@ -1122,13 +1152,13 @@ impl Cagents {
         let confirmed = self.workspace_model.identity != crate::workspace_model::NO_REGISTRY;
         let mut tasks = Vec::new();
         let mut hydrate = false;
-        for (card, exposure, opening, session) in held {
+        for (card, exposure, opening, unlisted, session) in held {
             // An unopened terminal waits until the view that may yet list it
             // has been admitted, exactly as before candidate collection.
             if !views_settled && !opening {
                 continue;
             }
-            if !self.listed_in_registry(card) {
+            if unlisted {
                 self.shared_views.attached.remove(&card);
                 if self.prepare_saved_terminal(card, &session) {
                     self.restored_agent_attaches
@@ -1363,29 +1393,6 @@ impl Cagents {
                     .projects
                     .iter()
                     .map(|project| project.repository.as_path())
-                    .collect(),
-            },
-        }
-    }
-
-    /// Reconciliation owns just its authority paths while it mutates cards.
-    /// Its root backing is independently owned by the caller, not borrowed
-    /// from mutable window state.
-    fn view_scope_topology<'a>(
-        &self,
-        roots: worktree_ui::WorktreeRoots<'a>,
-    ) -> ViewScopeTopology<'a> {
-        #[cfg(test)]
-        self.record_topology_build();
-        ViewScopeTopology {
-            roots,
-            authorities: ViewScopeAuthorities::Owned {
-                repositories: self.owned_view_repositories(),
-                projects: self
-                    .sidebar_model
-                    .projects
-                    .iter()
-                    .map(|project| project.repository.clone())
                     .collect(),
             },
         }
@@ -3406,12 +3413,18 @@ impl Cagents {
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before selecting either owner.
         self.retarget_transferred_pane_updates(None);
+        #[cfg(test)]
+        self.shared_views
+            .structural_pass_count
+            .set(self.shared_views.structural_pass_count.get() + 1);
         // Roots and repository authority stay fixed for this whole pass, so
         // admission, alias repair, projection and release share one index.
-        let root_paths = self.worktree_root_paths();
-        let topology = self.view_scope_topology(worktree_ui::WorktreeRoots::new(
-            root_paths.iter().map(PathBuf::as_path),
-        ));
+        // The one discovery keeps, built again only when the projects or
+        // the known roots changed; the save after this pass refreshes the same.
+        let mut phase = WorkspaceProjectionTiming::new(true);
+        let kept = self.kept_view_topology();
+        let topology = kept.scope_topology();
+        phase.mark("shared_topology");
         let selected = repository.map(|(repository, adopted)| {
             self.repository_view_scopes_with_topology(repository, adopted, &topology)
         });
@@ -3443,10 +3456,16 @@ impl Cagents {
             ViewProjection::Structural(scopes) => Some(scopes),
             _ => None,
         };
-        let mut phase = WorkspaceProjectionTiming::new(presentation);
+        // A selected pass reports its own stages; a structural pass reports
+        // finer ones, since it is the one every changing edge pays.
+        let mut phase = WorkspaceProjectionTiming::new(true);
+        let stage = |selected: &'static str, structural: &'static str| {
+            if presentation { selected } else { structural }
+        };
         if !presentation {
             self.shared_views.prune_restoration_requests(&self.durable);
             self.admit_existing_views_with_topology(selected, topology);
+            phase.mark("shared_admit");
             // A delayed tombstone must not borrow a newer local actor's identity.
             // Record only raw authoritative panes, never the pending overlay below.
             let local_cards = self
@@ -3487,6 +3506,7 @@ impl Cagents {
             for id in ambiguous {
                 self.shared_views.observed_chats.remove(&id);
             }
+            phase.mark("shared_observe");
         } else if let ViewProjection::Selected(scopes) = projection {
             // Preserve the same raw source evidence the complete pass records
             // for a future close, without scanning unrelated local history.
@@ -3565,6 +3585,9 @@ impl Cagents {
                 }
             }
         }
+        if !presentation {
+            phase.mark("shared_overlay");
+        }
         // A scoped read or a deferred receipt may prove a close beyond the
         // snapshot that supplied a descriptor. Exact closed identity wins over
         // both that older descriptor and a pending local insertion overlay.
@@ -3598,6 +3621,9 @@ impl Cagents {
         if let Some(topology) = topology {
             self.prepare_shared_aliases_in(&views, &owned, selected, topology);
         }
+        if !presentation {
+            phase.mark("shared_aliases");
+        }
         // Root discovery is immutable during this projection, so index it once
         // over owned paths that outlive each mutable view update. Keep only
         // owned card paths too, and refresh the panes each view changes before
@@ -3623,7 +3649,7 @@ impl Cagents {
                 }
             }
         }
-        phase.mark("selected_prepare");
+        phase.mark(stage("selected_prepare", "shared_worktrees"));
         let mut projected_scopes = Vec::new();
         for view in views {
             if selected.is_some_and(|selected| !selected.contains(&view.scope)) {
@@ -3676,8 +3702,11 @@ impl Cagents {
             }
             projected_scopes.push(view.scope);
         }
+        if !presentation {
+            phase.mark("shared_project");
+        }
         tasks.push(self.finish_shared_viewport_projection(viewport));
-        phase.mark("selected_project");
+        phase.mark(stage("selected_project", "shared_viewport"));
         self.shared_views.applying = false;
         // Capture after the active strip snapshot, then share this immutable
         // pass between settled baselines and publication. Uninitialized scopes
@@ -3697,7 +3726,7 @@ impl Cagents {
             };
             app.publish_reconciled_views(projected, projection, projected_scopes);
         });
-        phase.mark("selected_save");
+        phase.mark(stage("selected_save", "shared_save"));
         tasks.push(self.run_deferred_default_pane());
         // A closed pane a view brought back after its conversation stopped
         // goes again, now that the views it is removed from are settled.
@@ -3709,26 +3738,27 @@ impl Cagents {
         // input: source, membership, ownership, placement and project identity.
         // Journal snapshots attribute their own new evidence independently.
         if !presentation {
+            phase.mark("shared_deferred");
             self.reproject_notification_unread();
+            phase.mark("shared_unread");
         }
         tasks.push(self.release_held_terminals_with_topology(topology));
+        phase.mark(stage("selected_terminals", "shared_terminals"));
         // Every change to a scope's admission (a seed receipt or refusal, or
         // the blocked set rebuilt above) is followed by this pass, after the
         // pane's Insert was queued above.
         tasks.push(self.release_admitted_first_sends());
+        phase.mark(stage("selected_first_sends", "shared_first_sends"));
         // Restored shared panes queued for an attach wait for the registry.
         tasks.push(self.attach_next_restored_agent());
-        phase.mark("selected_postlude");
+        phase.mark(stage("selected_postlude", "shared_postlude"));
         Task::batch(tasks)
     }
 
     #[cfg(test)]
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
-        let root_paths = self.worktree_root_paths();
-        let topology = self.view_scope_topology(worktree_ui::WorktreeRoots::new(
-            root_paths.iter().map(PathBuf::as_path),
-        ));
-        self.prepare_shared_aliases_in(views, owned, None, &topology);
+        let kept = self.kept_view_topology();
+        self.prepare_shared_aliases_in(views, owned, None, &kept.scope_topology());
         // Outside a reconciliation, no projection follows to take the
         // detached aliases out of the strip.
         self.remove_detached_from_strip();

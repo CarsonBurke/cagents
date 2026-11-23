@@ -44,10 +44,13 @@ use super::settlement::KeyChanges;
 use super::*;
 use crate::revision::next_revision;
 use crate::sidebar::{Revisioned, SidebarProject};
+use std::sync::atomic::Ordering::Relaxed;
 
 #[derive(Default)]
 pub(in crate::app) struct ViewDiscovery {
-    topology: Option<Topology>,
+    /// Shared with the structural pass, which reads it while it mutates the
+    /// window and before its save refreshes discovery.
+    topology: Option<Arc<Topology>>,
     cards: CardWorktrees,
     worktrees: Option<Worktrees>,
     /// Passes that followed changes rather than discovering every worktree
@@ -62,10 +65,12 @@ pub(in crate::app) struct ViewDiscovery {
 
 /// What `view_scope_topology` builds, kept between saves with what it was
 /// built from.
-struct Topology {
+pub(super) struct Topology {
     revision: u64,
     roots_generation: u64,
-    projects_revision: u64,
+    /// Advanced in place when the projects take a revision without changing
+    /// what this was built from, so a pass holding it keeps it.
+    projects_revision: std::sync::atomic::AtomicU64,
     /// Each project's repository and worktree paths, in sidebar order, for
     /// when the projects took a revision without changing them.
     projects: Vec<(PathBuf, Vec<PathBuf>)>,
@@ -75,6 +80,18 @@ struct Topology {
 }
 
 impl Topology {
+    /// The topology a structural pass resolves scopes and card worktrees
+    /// with, borrowed rather than built again.
+    pub(super) fn scope_topology(&self) -> ViewScopeTopology<'_> {
+        ViewScopeTopology {
+            roots: worktree_ui::WorktreeRoots::indexed(&self.roots),
+            authorities: ViewScopeAuthorities::Kept {
+                repositories: &self.repositories,
+                projects: &self.project_repositories,
+            },
+        }
+    }
+
     fn lists(&self, projects: &[SidebarProject]) -> bool {
         self.projects.len() == projects.len()
             && self
@@ -460,11 +477,12 @@ impl Cagents {
         let roots_generation = self.known_worktree_roots.generation();
         let projects = &self.sidebar_model.projects;
         let projects_revision = Revisioned::revision(projects);
-        if let Some(topology) = &mut discovery.topology
+        if let Some(topology) = &discovery.topology
             && topology.roots_generation == roots_generation
-            && (topology.projects_revision == projects_revision || topology.lists(projects))
+            && (topology.projects_revision.load(Relaxed) == projects_revision
+                || topology.lists(projects))
         {
-            topology.projects_revision = projects_revision;
+            topology.projects_revision.store(projects_revision, Relaxed);
             return topology.revision;
         }
         #[cfg(test)]
@@ -472,7 +490,7 @@ impl Cagents {
         let topology = Topology {
             revision: next_revision(),
             roots_generation,
-            projects_revision,
+            projects_revision: projects_revision.into(),
             projects: projects
                 .iter()
                 .map(|project| {
@@ -494,8 +512,18 @@ impl Cagents {
             roots: self.worktree_root_paths().into_iter().collect(),
         };
         let revision = topology.revision;
-        discovery.topology = Some(topology);
+        discovery.topology = Some(Arc::new(topology));
         revision
+    }
+
+    /// The kept topology, built again first if the projects or the known
+    /// roots changed, for a structural pass to share with the save after it.
+    pub(super) fn kept_view_topology(&mut self) -> Arc<Topology> {
+        let mut discovery = std::mem::take(&mut self.shared_views.discovery);
+        self.refresh_view_topology(&mut discovery);
+        let topology = Arc::clone(discovery.topology.as_ref().expect("refreshed above"));
+        self.shared_views.discovery = discovery;
+        topology
     }
 
     /// Resolves again each card whose directory, owner, filing or channel
@@ -1918,5 +1946,36 @@ mod tests {
         }
         assert_eq!(app.shared_views.scope_discovery_count.get(), 0);
         assert!(app.shared_views.discovery.reused >= reused + 4);
+    }
+
+    /// A structural pass shares the kept topology, which a root learned since
+    /// replaces before the pass resolves any directory with it.
+    #[test]
+    fn a_structural_pass_resolves_with_a_root_learned_since_the_topology_was_kept() {
+        use crate::app::worktree_ui::ResolveRoot;
+        let (mut app, _, directory) = large_workspace(&SMALL);
+        app.prime_view_discovery();
+        let root = directory.path().join("learned-root");
+        let inside = root.join("src");
+        app.shared_views.topology_build_count.set(0);
+        let kept = app.kept_view_topology();
+        assert_eq!(app.shared_views.topology_build_count.get(), 0, "kept");
+        assert_ne!(
+            kept.scope_topology().roots.resolve(&inside),
+            Some(root.as_path())
+        );
+        drop(kept);
+
+        app.known_worktree_roots.insert(root.clone());
+        let kept = app.kept_view_topology();
+        assert_eq!(app.shared_views.topology_build_count.get(), 1);
+        assert_eq!(
+            kept.scope_topology().roots.resolve(&inside),
+            Some(root.as_path())
+        );
+        // The save after the pass refreshes the same topology, not another.
+        drop(app.reconcile_shared_views());
+        assert_eq!(app.shared_views.topology_build_count.get(), 1);
+        assert!(Arc::ptr_eq(&kept, &app.kept_view_topology()));
     }
 }

@@ -123,11 +123,9 @@ fn immutable_authority_lookup_borrows_the_first_project_repository() {
             vec![],
         ));
     }
+    let kept_topology = app.kept_view_topology();
     let borrowed = app.borrowed_view_scope_topology();
-    let root_paths = app.worktree_root_paths();
-    let owned = app.view_scope_topology(worktree_ui::WorktreeRoots::new(
-        root_paths.iter().map(PathBuf::as_path),
-    ));
+    let kept = kept_topology.scope_topology();
     let first = app.sidebar_model.projects[0].repository.as_path();
     assert!(
         std::ptr::eq(borrowed.authorities.repository_for(&shared).unwrap(), first,),
@@ -141,13 +139,13 @@ fn immutable_authority_lookup_borrows_the_first_project_repository() {
     ] {
         assert_eq!(
             borrowed.authorities.repository_for(path),
-            owned.authorities.repository_for(path)
+            kept.authorities.repository_for(path)
         );
     }
-    assert_eq!(owned.authorities.repository_for(&shared), Some(first));
+    assert_eq!(kept.authorities.repository_for(&shared), Some(first));
     for repository in [Path::new("/first/.git"), Path::new("/second/.git")] {
         assert!(borrowed.authorities.contains_repository(repository));
-        assert!(owned.authorities.contains_repository(repository));
+        assert!(kept.authorities.contains_repository(repository));
     }
 }
 
@@ -1854,6 +1852,7 @@ fn repository_loads_project_only_their_affected_views() {
     }
     app.shared_views.view_projection_count.set(0);
     app.shared_views.topology_build_count.set(0);
+    app.shared_views.structural_pass_count.set(0);
     for loaded in loaded {
         drop(app.update(Message::RepositoryLoaded {
             open_cards: false,
@@ -1863,7 +1862,7 @@ fn repository_loads_project_only_their_affected_views() {
         }));
     }
     assert_eq!(
-        app.shared_views.topology_build_count.get(),
+        app.shared_views.structural_pass_count.get(),
         0,
         "a run of background loads waits for one reconciliation"
     );
@@ -1874,6 +1873,7 @@ fn repository_loads_project_only_their_affected_views() {
     );
     drop(app.update(Message::RepositoryReconciliationDue));
     assert!(app.pending_repository_reconciliation.is_empty());
+    assert_eq!(app.shared_views.structural_pass_count.get(), 1);
     assert_eq!(
         app.shared_views.topology_build_count.get(),
         1,
@@ -4167,8 +4167,8 @@ fn a_structural_pass_releases_held_terminals_through_its_own_topology() {
     app.cards.insert(unlisted.id, CardRuntime::Loading);
     app.register_presence(unlisted.id, Exposure::Offscreen, Residency::Cold);
     app.shared_views.attached.insert(unlisted.id);
-    // The discovery a complete pass publishes through is kept between passes,
-    // so its topology is built once rather than for each.
+    // The pass and the save after it share the topology discovery keeps
+    // between passes, which nothing here changes.
     app.prime_view_discovery();
     app.shared_views.topology_build_count.set(0);
     app.shared_views.held_descriptor_clones.set(0);
@@ -4178,7 +4178,7 @@ fn a_structural_pass_releases_held_terminals_through_its_own_topology() {
         "the pass reaches its release tail with the unlisted terminal held"
     );
     assert!(!app.listed_in_registry(unlisted.id));
-    assert_eq!(app.shared_views.topology_build_count.get(), 1);
+    assert_eq!(app.shared_views.topology_build_count.get(), 0);
 }
 
 #[test]
@@ -6765,8 +6765,10 @@ fn repository_refresh_adopts_cross_repository_alias_without_losing_its_draft() {
     view.panes.push(canonical.clone());
     app.workspace_model.views = vec![View::empty(source), view];
     app.shared_views.topology_build_count.set(0);
+    app.shared_views.structural_pass_count.set(0);
     drop(app.reconcile_shared_views_for_repository(&destination_repository, &HashSet::new()));
-    assert_eq!(app.shared_views.topology_build_count.get(), 1);
+    assert_eq!(app.shared_views.structural_pass_count.get(), 1);
+    assert!(app.shared_views.topology_build_count.get() <= 1);
     assert!(!app.card_state(alias).unwrap().existence.is_open());
     assert!(app.card_state(canonical.id).unwrap().existence.is_open());
     assert!(
@@ -6869,8 +6871,10 @@ fn blocked_view_does_not_partially_retire_terminal_aliases() {
     view.panes = panes;
     app.workspace_model.views = vec![view];
     app.shared_views.topology_build_count.set(0);
+    app.shared_views.structural_pass_count.set(0);
     drop(app.reconcile_shared_views());
-    assert_eq!(app.shared_views.topology_build_count.get(), 1);
+    assert_eq!(app.shared_views.structural_pass_count.get(), 1);
+    assert!(app.shared_views.topology_build_count.get() <= 1);
     assert!(app.shared_views.blocked.contains(&Scope::Channel(a)));
     assert!(app.shared_views.adoptions.is_empty());
     for alias in &aliases {
