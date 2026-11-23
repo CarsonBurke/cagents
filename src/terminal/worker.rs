@@ -516,6 +516,8 @@ struct PublishedState {
     #[cfg(test)]
     shutdown_census_delay: Mutex<Option<Sender<Instant>>>,
     #[cfg(test)]
+    shutdown_census_instant: AtomicBool,
+    #[cfg(test)]
     test_holder_reservation: Mutex<Option<crate::daemon::child_reaper::Reservation>>,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
@@ -627,6 +629,8 @@ impl PublishedState {
             shutdown_census_failure: AtomicBool::new(false),
             #[cfg(test)]
             shutdown_census_delay: Mutex::new(None),
+            #[cfg(test)]
+            shutdown_census_instant: AtomicBool::new(false),
             #[cfg(test)]
             test_holder_reservation: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
@@ -3731,6 +3735,14 @@ impl Worker {
             self.capture_when_ready(false);
         }
         let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
+            #[cfg(test)]
+            if self
+                .published
+                .shutdown_census_instant
+                .load(Ordering::Acquire)
+            {
+                close_processes::instant_census_for_test();
+            }
             if exited {
                 let cleanup = if self.checked_shutdown {
                     Ok(())
@@ -6178,10 +6190,16 @@ fn confirm_exited_family(
             _ => break,
         }
     }
-    if ended(deadline)? {
-        Ok(())
-    } else {
-        Err("Terminal process cleanup remains unconfirmed".into())
+    // A final census that cannot finish, for instance one a loaded host's
+    // scan of /proc runs past the deadline, confirms nothing: the root has
+    // exited and nothing was stopped, so report the open obligation itself.
+    match ended(deadline) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("Terminal process cleanup remains unconfirmed".into()),
+        Err(error) => {
+            tracing::warn!(%error, "could not confirm the terminal family's cleanup");
+            Err("Terminal process cleanup remains unconfirmed".into())
+        }
     }
 }
 
