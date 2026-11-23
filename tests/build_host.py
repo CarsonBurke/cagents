@@ -1056,6 +1056,47 @@ class Slice(unittest.TestCase):
                          (False, []))
 
 
+class IdleBuilds(unittest.TestCase):
+    """A background build runs only on CPU time nothing else wants, and holds
+    no jobserver tokens while it waits for it."""
+
+    def scope_command(self, idle):
+        commands = []
+
+        class Started(Exception):
+            pass
+
+        def popen(command, **_):
+            commands.append(command)
+            raise Started
+
+        with unittest.mock.patch.object(build_host.subprocess, "Popen", popen), \
+                self.assertRaises(Started):
+            build_host.run(["true"], {}, True, idle=idle)
+        return commands[0][:commands[0].index("--")]
+
+    def test_an_idle_scope_has_idle_cpu_and_the_lowest_io_weight(self):
+        self.assertTrue(set(build_host.IDLE_PROPERTIES) <= set(self.scope_command(True)))
+        self.assertFalse(set(build_host.IDLE_PROPERTIES) & set(self.scope_command(False)))
+
+    def test_an_idle_build_joins_no_jobserver_and_runs_its_own_jobs(self):
+        joined = []
+        for setting, expected in (("1", []), ("0", ["joined"])):
+            with self.subTest(setting=setting), \
+                    unittest.mock.patch.dict(os.environ, {build_host.IDLE_SETTING: setting}), \
+                    unittest.mock.patch.object(build_host, "prepare_slice", lambda: True), \
+                    unittest.mock.patch.object(build_host, "within_build", lambda: False), \
+                    unittest.mock.patch.object(build_host, "slice_directory", lambda: None), \
+                    unittest.mock.patch.object(build_host, "Jobserver",
+                                               lambda *_: joined.append("joined") or types.SimpleNamespace(
+                                                   auth="3,4", close=lambda: None)):
+                joined.clear()
+                build = build_host.Build(0, None)
+                with build.admitted():
+                    self.assertEqual(build.jobserver is None, setting == "1")
+                self.assertEqual(joined, expected)
+
+
 class CacheTrimming(unittest.TestCase):
     """Near its cap, the build slice drops page cache rather than letting the
     kernel swap builds out."""

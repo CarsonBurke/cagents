@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=37
+gate_version=38
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -170,6 +170,9 @@ Environment:
                          (default /var/tmp/cagents-cargo.lock)
   CAGENTS_BUILD_SCOPE=0  Build in place, without the systemd slice and the
                          shared jobserver
+  CAGENTS_BUILD_IDLE=1   Build in the background of every other build and
+                         test: only on CPU time nothing else wants, with
+                         Cargo jobs of its own
 
 Share 0 is the plain lock file, so a command still run under
 `flock --close /var/tmp/cagents-cargo.lock` holds exactly one share. Without
