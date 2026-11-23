@@ -480,6 +480,10 @@ pub struct State {
     /// Whether a complete model or a worktree listing arrived since this
     /// window last moved its strip-only panes into channels.
     pub(in crate::app) strip_adoption_pending: bool,
+    /// The branch each worktree this window has listed was on, by folder, so
+    /// a channel whose worktree is removed can recreate it on that branch:
+    /// once Git forgets the worktree, nothing else records it.
+    pub(in crate::app) known_branches: HashMap<PathBuf, String>,
 }
 
 /// The startup sweep waits for this window's restore to verify what it saved,

@@ -26,12 +26,40 @@ pub(in crate::app) struct Missing {
     pub(in crate::app) project: String,
     pub(in crate::app) repository: PathBuf,
     pub(in crate::app) path: PathBuf,
-    /// The branch to check out again: the channel's name, which is the
-    /// branch it was named after.
-    pub(in crate::app) branch: String,
+    /// The branch the worktree was last seen on, when this window listed it.
+    /// A channel's name is no guide: it may be the folder's, or the user's.
+    pub(in crate::app) branch: Option<String>,
+}
+
+impl Missing {
+    /// The branch, else the folder's name.
+    fn name(&self) -> String {
+        self.branch.clone().unwrap_or_else(|| {
+            self.path.file_name().map_or_else(
+                || self.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+    }
 }
 
 impl Cagents {
+    /// Records the branch of each worktree `project_id` lists, for the
+    /// channel whose worktree is later removed.
+    pub(in crate::app) fn remember_worktree_branches(&mut self, project_id: ProjectId) {
+        let Some(project) = self.sidebar_model.project(project_id) else {
+            return;
+        };
+        for worktree in &project.worktrees {
+            if let Some(branch) = &worktree.branch {
+                let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+                self.channel_ui
+                    .known_branches
+                    .insert(worktree.path.clone(), branch.to_owned());
+            }
+        }
+    }
+
     /// The worktree channel `id` records, when its project's worktrees have
     /// been listed and none of them is it. A project still loading, or one
     /// whose checkout cannot be read, says nothing yet.
@@ -57,7 +85,7 @@ impl Cagents {
             project: project.name.clone(),
             repository: project.repository.clone(),
             path: path.to_path_buf(),
-            branch: channel.title.clone(),
+            branch: self.channel_ui.known_branches.get(path).cloned(),
         })
     }
 
@@ -67,11 +95,17 @@ impl Cagents {
                 let Some(missing) = self.missing_checkout(id) else {
                     return Task::none();
                 };
+                // A folder deleted without Git still names its branch in
+                // Git's records; one Git removed does not, and then the
+                // dialog asks for it rather than guess.
+                let branch = missing.branch.or_else(|| {
+                    cagents::workspace_model::checkout_branch(&missing.repository, &missing.path)
+                });
                 self.open_worktree_dialog(
                     missing.project_id,
                     missing.repository,
                     WorktreeDraft {
-                        branch: missing.branch,
+                        branch: branch.unwrap_or_default(),
                         destination: missing.path.display().to_string(),
                         ..WorktreeDraft::default()
                     },
@@ -96,13 +130,9 @@ impl Cagents {
         };
         let severity = NoticeSeverity::Warning;
         let enabled = !self.modal_is_open();
-        let folder = missing.path.file_name().map_or_else(
-            || missing.path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
         let text = format!(
-            "The worktree {folder} is missing, so this channel's panes start in {}'s main \
-             checkout.",
+            "The worktree {} was removed. New terminals open in {}'s main checkout.",
+            missing.name(),
             missing.project
         );
         let actions = vec![

@@ -18372,6 +18372,7 @@ impl Cagents {
                 result,
             } => {
                 let task = self.repository_loaded(open_cards, project_id, generation, result);
+                self.remember_worktree_branches(project_id);
                 // A strip whose project's rows were still loading waits for them.
                 self.adopt_strip_cards();
                 handled!(task)

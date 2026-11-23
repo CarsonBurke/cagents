@@ -164,8 +164,8 @@ impl Cagents {
     /// started. A pane only this window had, never published, is still in
     /// its strip here; left there, it would keep the strip alive and the
     /// daemon refuses it. It joins the channel the daemon would have chosen:
-    /// a worktree's oldest channel, or a new one named after the branch, and
-    /// for the main checkout a channel of its own.
+    /// a worktree's oldest channel, the main checkout's oldest one named
+    /// after it, or else a new one named after the branch.
     pub(in crate::app) fn adopt_strip_cards(&mut self) {
         if !std::mem::take(&mut self.channel_ui.strip_adoption_pending)
             || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
@@ -207,13 +207,14 @@ impl Cagents {
                 self.channel_ui.strip_adoption_pending = true;
                 continue;
             };
-            let existing = checkout
-                .as_deref()
-                .and_then(|checkout| self.channel_for_checkout(project_id, Some(checkout)));
+            let title = self.checkout_title(project_id, &root);
+            let existing = match checkout.as_deref() {
+                Some(checkout) => self.channel_for_checkout(project_id, Some(checkout)),
+                None => self.main_checkout_channel(project_id, &title),
+            };
             let id = match existing {
                 Some(id) => id,
                 None => {
-                    let title = self.checkout_title(project_id, &root);
                     match self.create_channel(
                         project_id,
                         title,
@@ -240,6 +241,28 @@ impl Cagents {
             self.persist();
             self.publish_view_changes();
         }
+    }
+
+    /// The channel the daemon's startup repair moved the main checkout's
+    /// strip into: the oldest channel of no checkout named after it by hand,
+    /// as the daemon chooses (`checkout_channel` in the registry). Panes this
+    /// window alone kept join it rather than a second channel of that name.
+    fn main_checkout_channel(&self, project_id: ProjectId, title: &str) -> Option<ChannelId> {
+        let title =
+            crate::workspace_model::channel_title(title).unwrap_or_else(|| title.to_owned());
+        self.durable
+            .channels
+            .iter()
+            .filter(|channel| {
+                channel.project_id == project_id
+                    && channel.checkout.is_none()
+                    && channel.title == title
+                    && channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && !self.channel_ui.is_deleting(channel.id)
+                    && !self.channel_retiring(channel.id)
+            })
+            .min_by_key(|channel| (channel.ordinal, channel.id))
+            .map(|channel| channel.id)
     }
 
     /// A new channel's name for the checkout at `root`: its branch, or the
@@ -693,6 +716,32 @@ mod tests {
         assert!(channel.checkout.is_some());
     }
 
+    /// A main-checkout strip pane only this window had joins the channel the
+    /// daemon's repair made for that strip, named after the checkout, rather
+    /// than a second channel of that name or an unrelated conversation.
+    #[test]
+    fn a_main_checkout_strip_pane_joins_the_channel_named_after_it() {
+        let mut fixture = fixture();
+        let main = fixture.main.path().to_path_buf();
+        let pane = strip_pane(&main);
+        Arc::make_mut(&mut fixture.app.durable).cards = vec![pane.clone()].into();
+        let conversation = fixture.channel(1, None);
+        let repaired = fixture.channel(2, None);
+        Arc::make_mut(&mut fixture.app.durable)
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == repaired)
+            .unwrap()
+            .title = "main".into();
+        fixture.connect();
+
+        fixture.app.adopt_strip_cards();
+
+        assert_eq!(fixture.app.durable.channels.len(), 2);
+        assert_eq!(fixture.cards(repaired), vec![pane.id]);
+        assert!(fixture.cards(conversation).is_empty());
+    }
+
     /// Before the window holds the daemon's model it cannot tell its own
     /// panes from the daemon's, so it moves nothing; a pane the daemon holds
     /// is the daemon's to move.
@@ -724,7 +773,8 @@ mod tests {
     }
 
     /// A channel whose worktree is no longer listed says so and offers to
-    /// make it again on its branch, where it was.
+    /// make it again where it was, on the branch this window last saw there.
+    /// The channel's own name is not taken for the branch.
     #[test]
     fn a_channel_whose_worktree_is_gone_offers_to_recreate_it() {
         let mut fixture = fixture();
@@ -738,13 +788,42 @@ mod tests {
         assert_eq!(fixture.app.missing_checkout(main), None);
         let found = fixture.app.missing_checkout(missing).expect("missing");
         assert_eq!(found.path, gone);
-        assert_eq!(found.branch, "Channel 2");
-
+        assert_eq!(found.branch, None, "no listing ever named its branch");
         drop(fixture.app.update(Message::MissingCheckout(
             super::super::missing_checkout::Action::Recreate(missing),
         )));
         let dialog = fixture.app.worktree_dialog.as_ref().expect("the dialog");
-        assert_eq!(dialog.draft.branch, "Channel 2");
+        assert_eq!(dialog.draft.branch, "", "an unknown branch is asked for");
         assert_eq!(dialog.draft.destination, gone.display().to_string());
+        fixture.app.worktree_dialog = None;
+
+        fixture
+            .app
+            .channel_ui
+            .known_branches
+            .insert(gone.clone(), "feat/two".into());
+        drop(fixture.app.update(Message::MissingCheckout(
+            super::super::missing_checkout::Action::Recreate(missing),
+        )));
+        let dialog = fixture.app.worktree_dialog.as_ref().expect("the dialog");
+        assert_eq!(dialog.draft.branch, "feat/two");
+    }
+
+    /// A listing records each worktree's branch, so it outlives the worktree.
+    #[test]
+    fn a_listing_remembers_each_worktrees_branch() {
+        let mut fixture = fixture();
+        let linked = fixture.linked.path().to_path_buf();
+        let project = fixture.project;
+        fixture.app.remember_worktree_branches(project);
+        assert_eq!(
+            fixture
+                .app
+                .channel_ui
+                .known_branches
+                .get(&linked)
+                .map(String::as_str),
+            Some("feature")
+        );
     }
 }
