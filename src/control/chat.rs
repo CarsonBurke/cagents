@@ -152,7 +152,7 @@ fn execute_requests(
 
 fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) -> CommandOutput {
     let suffix = if capacity.used >= capacity.limit {
-        "\nFull: new chats are refused until one closes. Open chats keep working, and saved history still opens. Close a chat you have finished with, or raise the limit with cagents chat capacity set N."
+        "\nFull: a new chat first stops a finished Claude chat that no window shows, and is refused if none can be. Open chats keep working, and saved history still opens. Close a chat you have finished with, or raise the limit with cagents chat capacity set N."
     } else {
         ""
     };
