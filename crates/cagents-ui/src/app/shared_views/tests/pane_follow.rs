@@ -502,7 +502,10 @@ fn a_run_deleting_a_channel_keeps_the_pane_moved_out_of_it() {
             },
         };
         deliver(&mut app, vec![transfer, deleted], run);
+        // Torn down and adopted again would also end open where it went, so
+        // the deletion must not have counted it among the channel's cards.
         (
+            app.channel_ui.deleted_cards.contains(&moved.id),
             app.card_state(moved.id)
                 .is_some_and(|state| state.existence.is_open()),
             holds(&app, destination, moved.id),
@@ -510,8 +513,8 @@ fn a_run_deleting_a_channel_keeps_the_pane_moved_out_of_it() {
     };
     assert_eq!(
         outcome(false),
-        (true, true),
+        (false, true, true),
         "one at a time, the moved pane stays open where it went"
     );
-    assert_eq!(outcome(true), (true, true));
+    assert_eq!(outcome(true), (false, true, true));
 }

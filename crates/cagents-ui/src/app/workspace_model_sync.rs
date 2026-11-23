@@ -2125,6 +2125,16 @@ impl Cagents {
         {
             return None;
         }
+        // Retiring a removed channel's cards or closing a removed project
+        // walks the window's channels, which in a run hold only the edges
+        // reconciled so far: a pane an earlier edge moved out would still
+        // read as the channel's own, and be torn down with it.
+        let mut tasks = Vec::new();
+        if !changes.effects.removed_channels.is_empty()
+            || !changes.effects.removed_projects.is_empty()
+        {
+            self.settle_observed_run(&mut tasks);
+        }
         self.shared_views
             .closed
             .extend(changes.effects.closed.iter().copied());
@@ -2133,7 +2143,7 @@ impl Cagents {
             sequence > self.shared_views.snapshot_sequence,
         );
         if sequence < self.shared_views.snapshot_sequence {
-            return Some(Task::none());
+            return Some(settled_tasks(tasks));
         }
         let floor = self.shared_views.snapshot_sequence;
         let (protected_channels, protected_projects) =
@@ -2236,7 +2246,6 @@ impl Cagents {
             model.agents.retain(|held| held.id != id);
         }
         model.sequence = model.sequence.max(sequence);
-        let mut tasks = Vec::new();
         for repository in closed_projects {
             tasks.push(self.close_shared_project(&repository));
         }
