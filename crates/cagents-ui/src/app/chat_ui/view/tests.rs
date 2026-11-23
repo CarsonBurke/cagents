@@ -12664,6 +12664,74 @@ fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
     }
 }
 
+/// Stop and Send now are the two ways to reach a working turn, and each
+/// says how it differs from the other: Stop cancels the turn and what it
+/// started, Send now cancels nothing.
+#[test]
+fn stop_and_send_now_each_say_what_the_other_does() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    let renderer = crate::app::tests::headless_renderer();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.capabilities.queue_remove = true;
+    snapshot.capabilities.send_queued_now = true;
+    snapshot.capabilities.interrupt_stops_background = true;
+    snapshot.queued_messages = vec![chat::QueuedMessage::new("a".into(), "First".into())];
+    let mut element = runtime.view(
+        None,
+        false,
+        true,
+        &shortcuts,
+        960.0,
+        0.0,
+        Place { branch: None },
+        true,
+        None,
+        vec![],
+        true,
+    );
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(960.0, 900.0)),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    let nodes: Vec<_> = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .map(|node| {
+            (
+                node.node().label().unwrap_or_default().to_owned(),
+                node.node().description().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let stop = nodes
+        .iter()
+        .find(|(label, _)| label.starts_with("Cancel active turn"))
+        .unwrap_or_else(|| panic!("Stop: {nodes:?}"));
+    assert!(
+        stop.0
+            .ends_with("Send now delivers queued messages without cancelling the turn."),
+        "{stop:?}"
+    );
+    let send_now = nodes
+        .iter()
+        .find(|(label, _)| label == "Send the queued message now")
+        .unwrap_or_else(|| panic!("Send now: {nodes:?}"));
+    assert!(
+        send_now.1.contains("keep running") && send_now.1.contains("Stop cancels the turn"),
+        "{send_now:?}"
+    );
+}
+
 /// An agent started, a step, a thought and a report are each a line of the
 /// timeline by the one rule, so the space between any two of them is the
 /// one gap between lines, the same gap a group of steps puts between its
@@ -13545,4 +13613,95 @@ fn the_context_meter_falls_back_to_the_whole_window() {
             .starts_with("95% left before auto-compact · 14k of 300k tokens · ")
     );
     assert_eq!(ContextMeter::of(&crate::chat::Usage::default(), Left), None);
+}
+
+#[test]
+fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
+    let mut runtime = Runtime::draft(
+        Target {
+            card: CardId::new(),
+            generation: 0,
+        },
+        chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                session_id: None,
+                draft_model: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::ReconnectOnly,
+        },
+        Snapshot::default(),
+        true,
+        crate::settings::EditorSyntaxTheme::default(),
+    );
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.queue_remove = true;
+    snapshot.queued_messages = vec![
+        chat::QueuedMessage::new("a".into(), "First".into()),
+        chat::QueuedMessage::new("b".into(), "Second".into()),
+    ];
+    snapshot.busy = true;
+    // Without the provider's say-so the queue waits for the turn.
+    assert_eq!(runtime.send_now_count(), 0);
+    assert!(!runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .send_queued_now = true;
+    assert_eq!(runtime.send_now_count(), 2);
+    assert!(runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+
+    // A message on its way back to the composer does not go early.
+    runtime.taken_back.push("b".into());
+    assert_eq!(runtime.send_now_count(), 1);
+    runtime.taken_back.clear();
+
+    // One request at a time, and the heading says it is on its way.
+    for state in [chat::SendNow::Requested, chat::SendNow::Delivering] {
+        Arc::make_mut(&mut runtime.snapshot).send_now = Some(state);
+        assert!(!runtime.can_send_now());
+        assert_eq!(runtime.queue_title(2), "Queued · 2 · sending now…");
+    }
+    Arc::make_mut(&mut runtime.snapshot).send_now = Some(chat::SendNow::Stopped);
+    assert!(!runtime.can_send_now());
+    assert_eq!(
+        runtime.queue_title(2),
+        "Queued · 2 · reply cut short, sending now…"
+    );
+    // Declined leaves the queue to the turn, not to be asked again until
+    // the queue changes.
+    Arc::make_mut(&mut runtime.snapshot).send_now = Some(chat::SendNow::Declined);
+    assert!(!runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2 · couldn't send early");
+
+    // Between turns the queue starts on its own; nothing to send early.
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.send_now = None;
+    snapshot.busy = false;
+    assert_eq!(runtime.send_now_count(), 0);
+    assert!(!runtime.can_send_now());
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    runtime.disconnected = true;
+    assert!(!runtime.can_send_now());
+    runtime.disconnected = false;
+
+    // The control fits beside the heading at narrow and wide widths.
+    let renderer = crate::app::tests::headless_renderer();
+    for width in [320.0, 960.0] {
+        let mut element = runtime.queue_view().unwrap();
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0)),
+        );
+        assert_eq!(node.size().width, width);
+    }
 }

@@ -2561,6 +2561,114 @@ impl Runtime {
                 .any(|outgoing| !outgoing.in_transcript())
     }
 
+    /// How many waiting messages Send now would hand to the running turn:
+    /// those the provider holds, where it can take them early, and not on
+    /// their way back to the composer. Messages this app still holds, such
+    /// as follow-ups for a provider without a queue, cannot go early.
+    pub(super) fn send_now_count(&self) -> usize {
+        if !self.snapshot.capabilities.send_queued_now || !self.snapshot.busy {
+            return 0;
+        }
+        self.snapshot
+            .queued_messages
+            .iter()
+            .filter(|queued| {
+                !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
+            })
+            .count()
+    }
+
+    /// Whether Send now can be asked for this moment: one already on its way
+    /// is not asked for twice, and one Claude declined is not asked again
+    /// until the queue changes.
+    pub(super) fn can_send_now(&self) -> bool {
+        self.send_now_count() > 0
+            && self.snapshot.send_now.is_none()
+            && !self.disconnected
+            && !self.snapshot.exited
+            && self.snapshot.read_only_reason.is_none()
+    }
+
+    /// The queue's heading: how many wait, and how a Send now stands.
+    fn queue_title(&self, count: usize) -> String {
+        let send_now = self.send_now_count();
+        match self.snapshot.send_now {
+            Some(chat::SendNow::Requested | chat::SendNow::Delivering) if send_now > 0 => {
+                format!("Queued · {count} · sending now…")
+            }
+            Some(chat::SendNow::Stopped) if send_now > 0 => {
+                format!("Queued · {count} · reply cut short, sending now…")
+            }
+            Some(chat::SendNow::Declined) if send_now > 0 => {
+                format!("Queued · {count} · couldn't send early")
+            }
+            _ => format!("Queued · {count}"),
+        }
+    }
+
+    /// Send now, beside the queue's heading while the turn could take what
+    /// the provider holds. It names how many go, since it sends them all.
+    fn send_now_control(&self) -> Option<Element<'_, Message>> {
+        let count = self.send_now_count();
+        // Nothing to send, or a conversation that can take nothing now
+        // (disconnected, ended or read-only), offers no Send now; one asked
+        // for or declined stays, saying how it stands.
+        if count == 0 || (self.snapshot.send_now.is_none() && !self.can_send_now()) {
+            return None;
+        }
+        let (label, name): (Cow<'_, str>, Cow<'_, str>) = if count == 1 {
+            ("Send now".into(), "Send the queued message now".into())
+        } else {
+            (
+                format!("Send {count} now").into(),
+                format!("Send the {count} queued messages now").into(),
+            )
+        };
+        // Enabled, it says how it differs from Stop, the other way to reach
+        // a working turn; disabled, it says why: Claude found nothing it could
+        // take early, which holds until the queue changes, or a request is on
+        // its way.
+        let (it, they) = if count == 1 {
+            ("it", "it waits")
+        } else {
+            ("them", "they wait")
+        };
+        let tooltip: Cow<'_, str> = match self.snapshot.send_now {
+            Some(chat::SendNow::Declined) => format!(
+                "Claude couldn't take {it} early, so {they} in the queue. You can try again \
+                 once the queue changes."
+            )
+            .into(),
+            Some(_) => "Sending now…".into(),
+            None => {
+                // Where Stop also ends background subagents, say so: that
+                // is the difference that makes Send now worth choosing.
+                let stop = if self.snapshot.capabilities.interrupt_stops_background {
+                    " Stop cancels the turn and its background subagents."
+                } else {
+                    ""
+                };
+                format!(
+                    "Send {it} to Claude now. Subagents and background work keep running; the \
+                     reply being written may be cut short.{stop}"
+                )
+                .into()
+            }
+        };
+        Some(crate::interaction::tooltip(
+            crate::ui_controls::button::secondary(label)
+                .icon(Icon::Send)
+                .id(card_control_id(self.target.card, "chat-send-now"))
+                .name(name)
+                .description(tooltip.clone())
+                .on_press_maybe(
+                    self.can_send_now()
+                        .then(|| action(Action::SendQueuedNow(self.target))),
+                ),
+            tooltip,
+        ))
+    }
+
     /// Whether the conversation's status reads "Sending": a message is on
     /// its way, and the queue is not already saying so above a working agent.
     fn says_sending(&self) -> bool {
@@ -4829,16 +4937,25 @@ impl Runtime {
             "subagents"
         };
         let armed = self.interrupt_armed.is_some() && at_stake > 0;
+        // Send now reaches the turn without cancelling it, so while it is on
+        // offer Stop points there.
+        let instead = match (self.can_send_now(), at_stake > 0) {
+            (true, true) => {
+                ". Send now delivers queued messages without stopping the turn or its subagents."
+            }
+            (true, false) => ". Send now delivers queued messages without cancelling the turn.",
+            (false, _) => "",
+        };
         let tooltip = if armed {
             Cow::Owned(format!(
-                "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc)"
+                "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc){instead}"
             ))
         } else if at_stake > 0 {
             Cow::Owned(format!(
-                "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
+                "Cancel active turn and its {at_stake} background {subagents} (Esc){instead}"
             ))
         } else if self.turn_running() {
-            Cow::Borrowed("Cancel active turn (Esc)")
+            Cow::Owned(format!("Cancel active turn (Esc){instead}"))
         } else {
             Cow::Borrowed(
                 "Stop before the turn begins (Esc). Unsent messages return to the composer.",
@@ -6919,7 +7036,7 @@ impl Runtime {
             rows.push(design::caption("Showing the first 128 queued messages").into());
         }
         let mut header: Vec<Element<'_, Message>> = vec![
-            design::caption(format!("Queued · {count}"))
+            design::caption(self.queue_title(count))
                 .width(Length::Fill)
                 .into(),
         ];
@@ -6941,10 +7058,12 @@ impl Runtime {
                 },
             ));
         }
+        header.extend(self.send_now_control());
         Some(
             widget::container(
                 widget::column::with_children(vec![
                     widget::row::with_children(header)
+                        .align_y(Alignment::Center)
                         .spacing(step::GAP_S)
                         .padding([0.0, step::GAP_XS])
                         .into(),
