@@ -83,3 +83,9 @@ Why: this copy returned early whenever the cursor had no position, before its ho
 `Tooltip` and `row::Wrapping` report their content's accessibility nodes (`a11y_nodes`). Upstream they kept the trait's empty default, so a control under a tooltip, or in a row that wraps, was missing from the accessibility tree. Screen readers couldn't find it, and focus or click requests addressed to it never arrived. A tooltip reports its content and leaves the tooltip text out, as upstream does when it draws the tooltip. Wrapping reports what its row would.
 
 Why: the composer's attachment tiles each sit under a tooltip in a wrapping row, and none of them reached assistive tools. The same applies to every other tooltip-wrapped control in the app. The regression test is `assistive_tools_find_every_tile_in_the_tray` in crates/cagents-ui/src/app/chat_ui/attachment_tile.rs. Remove this change when upstream forwards these nodes.
+
+Local change: selection span (src/text_editor.rs)
+
+`Content::selection_span` returns the editor's `selection_span`: the span a
+word or line selection covers, which `Content::cursor` does not report. See
+vendor/iced-core/README.cagents.md.

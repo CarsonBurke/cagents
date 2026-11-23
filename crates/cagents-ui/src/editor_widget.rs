@@ -1339,13 +1339,7 @@ where
             return false;
         }
         let count = self.line_count();
-        let selection = if cursor.selection.is_some() {
-            let first = cursor.position.line.min(anchor.line).saturating_sub(1);
-            let last = (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1));
-            self.selected_span(&self.excerpt(first, last), cursor)
-        } else {
-            cursor
-        };
+        let selection = self.selected_cursor();
         let anchor = selection.selection.unwrap_or(selection.position);
         let (start, end) = if (anchor.line, anchor.column)
             <= (selection.position.line, selection.position.column)
@@ -1607,13 +1601,12 @@ where
     /// a delete that joins lines — are read before and after, and compared.
     /// That costs a copy of those few lines, not of the document.
     pub fn perform_edit(&mut self, edit: Edit) -> Option<RecordedEdit> {
-        let cursor = self.cursor();
-        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let selection = self.selected_cursor();
+        let anchor = selection.selection.unwrap_or(selection.position);
         let count = self.line_count();
-        let first = cursor.position.line.min(anchor.line).saturating_sub(1);
-        let last = (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1));
+        let first = selection.position.line.min(anchor.line).saturating_sub(1);
+        let last = (selection.position.line.max(anchor.line) + 1).min(count.saturating_sub(1));
         let before = self.excerpt(first, last);
-        let selection = self.selected_span(&before, cursor);
         // The edit begins no later than the selection or the caret —
         // Backspace one character before it — which settles where a change
         // beside a repeated character is recorded.
@@ -1643,99 +1636,11 @@ where
         })
     }
 
-    /// Exact selected span, including native word/line selections.
+    /// The caret with the exact span it has selected, including a native
+    /// word or line selection, whose [`Self::cursor`] reports only the points
+    /// it was made between. A selection of nothing is no selection.
     pub(crate) fn selected_cursor(&self) -> Cursor {
-        let cursor = self.cursor();
-        let anchor = cursor.selection.unwrap_or(cursor.position);
-        let first = cursor.position.line.min(anchor.line).saturating_sub(1);
-        let last =
-            (cursor.position.line.max(anchor.line) + 1).min(self.line_count().saturating_sub(1));
-        self.selected_span(&self.excerpt(first, last), cursor)
-    }
-
-    /// The caret with the exact span it has selected.
-    ///
-    /// A word or line selection reports only the point it was anchored at,
-    /// not the span it covers, so the span is found as the selected text
-    /// around both of its reported ends. A selection of nothing is no
-    /// selection.
-    fn selected_span(&self, excerpt: &Excerpt, cursor: Cursor) -> Cursor {
-        let caret = Cursor {
-            position: cursor.position,
-            selection: None,
-        };
-        let Some(anchor) = cursor.selection else {
-            return caret;
-        };
-        let Some(selected) = self.selection().filter(|selected| !selected.is_empty()) else {
-            return caret;
-        };
-        // Native copy_selection joins native lines with LF, even when their
-        // stored endings are CRLF, LFCR, or bare CR. Locate the same native
-        // positions in that normalized view when the exact excerpt differs.
-        let locate = |excerpt: &Excerpt| -> Option<Cursor> {
-            let (Some(caret_at), Some(anchor_at)) =
-                (excerpt.offset(cursor.position), excerpt.offset(anchor))
-            else {
-                return None;
-            };
-            let text = excerpt.text();
-            let (low, high) = (caret_at.min(anchor_at), caret_at.max(anchor_at));
-            // Only starts whose end covers both reported points can match.
-            // Earlier candidates make repeated-character selections quadratic.
-            let mut search = high.saturating_sub(selected.len());
-            if search > low {
-                return None;
-            }
-            while !text.is_char_boundary(search) {
-                search -= 1;
-            }
-            let mut limit = (high + selected.len()).min(text.len());
-            while !text.is_char_boundary(limit) {
-                limit += 1;
-            }
-            let mut span = None;
-            while let Some(found) = text
-                .get(search..limit)
-                .and_then(|rest| rest.find(&selected))
-            {
-                let start = search + found;
-                if start > low {
-                    break;
-                }
-                if start + selected.len() >= high {
-                    span = Some(start..start + selected.len());
-                    break;
-                }
-                search = start + text[start..].chars().next().map_or(1, char::len_utf8);
-            }
-            let span = span?;
-            let (start, end) = (excerpt.position(span.start), excerpt.position(span.end));
-            Some(if caret_at < anchor_at {
-                Cursor {
-                    position: start,
-                    selection: Some(end),
-                }
-            } else {
-                Cursor {
-                    position: end,
-                    selection: Some(start),
-                }
-            })
-        };
-        if let Some(span) = locate(excerpt) {
-            return span;
-        }
-        let first = excerpt.position(0).line;
-        let last =
-            (cursor.position.line.max(anchor.line) + 1).min(self.line_count().saturating_sub(1));
-        let internal = self.0.borrow();
-        let lines = &internal.editor.buffer().lines;
-        let mut normalized = Excerpt::new(first);
-        for (index, line) in lines.iter().enumerate().take(last + 1).skip(first) {
-            normalized.push_line(line.text(), if index + 1 < lines.len() { "\n" } else { "" });
-        }
-        locate(&normalized).unwrap_or(cursor)
+        self.0.borrow().editor.selection_span()
     }
 
     /// Serializes lines `first..=last` exactly as [`Content::text`] would.
@@ -6008,7 +5913,7 @@ mod tests {
         content.perform(Action::SelectWord);
         assert_eq!(content.selection().as_deref(), Some("ab"));
         assert_eq!(
-            content.selected_span(&Excerpt::document(text), content.cursor()),
+            content.selected_cursor(),
             Cursor {
                 position: Position { line: 0, column: 2 },
                 selection: Some(Position { line: 0, column: 0 }),

@@ -7574,8 +7574,12 @@ fn late_image_insert_preserves_a_later_native_word_selection() {
     });
 }
 
+/// A native word selection whose text repeats around the point it was made
+/// at (#3693): its cursor reports only that point, and the selected text
+/// fits two places there. Every edit is still measured at the span the
+/// selection covers, so the undo history keeps every step.
 #[test]
-fn ambiguous_native_word_selection_refuses_image_removal_without_losing_metadata_or_text() {
+fn a_word_selection_whose_text_repeats_is_edited_and_undone_where_it_is() {
     chat::attachment_assets::with_test_image(|image| {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -7585,35 +7589,47 @@ fn ambiguous_native_word_selection_refuses_image_removal_without_losing_metadata
         write(&mut app, card, &text);
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.merge_attachments([image.clone()]);
+        let at = |column| text_editor::Position { line: 0, column };
+        let word = token.len() + 1;
+        runtime.composer_undo.seal();
         runtime.composer.move_to(text_editor::Cursor {
-            position: text_editor::Position {
-                line: 0,
-                column: token.len() + 1 + "中".len(),
-            },
+            position: at(word + "中".len()),
             selection: None,
         });
-        runtime.composer.perform(text_editor::Action::SelectWord);
-        let selected = runtime.composer.selection().unwrap();
-        assert_eq!(
-            selected, "中中",
-            "native boundary-expanded selection is the ambiguity fixture"
-        );
-        assert!(!attachment_draft::Bookmark::capture(&runtime.composer).valid);
-        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
-        let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.attachments, [image.clone()]);
-        assert_eq!(runtime.composer.text(), text);
+        runtime.composer_action(text_editor::Action::SelectWord);
         assert_eq!(
             runtime.composer.selection().as_deref(),
-            Some(selected.as_str())
+            Some("中中"),
+            "the selected text fits at either of two places around the click"
         );
-        assert!(
-            runtime
-                .composer_note
-                .as_deref()
-                .unwrap()
-                .contains("Clear it before removing")
+        let span = text_editor::Cursor {
+            position: at(word + "中中".len()),
+            selection: Some(at(word)),
+        };
+        assert_eq!(
+            attachment_draft::Bookmark::capture(&runtime.composer).cursor,
+            span
         );
+
+        // Removing the tile takes its reference out and keeps the selection.
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.composer.text(), " 中中中");
+        assert_eq!(runtime.composer.selection().as_deref(), Some("中中"));
+
+        // Typing over the selection replaces the words it covers.
+        runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+        assert_eq!(runtime.composer.text(), " x中");
+
+        // Neither edit cleared the history: each undoes in turn.
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), " 中中中");
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), text);
+        assert_eq!(runtime.attachments, [image.clone()]);
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), "");
     });
 }
 
@@ -7959,7 +7975,6 @@ fn refreshed_history_keeps_identical_prose_turns_separate_and_replays_all_image_
         assert!(runtime.history_cursor.is_none());
         assert_eq!(runtime.composer.text(), "Unsent image draft");
         assert_eq!(runtime.attachments, [draft.clone()]);
-        assert!(runtime.history_attachment_stash.is_none());
 
         runtime.set_visible(false).unwrap();
         runtime.cool();
@@ -8196,13 +8211,10 @@ fn valid_empty_paste_keeps_recalled_history_and_down_restores_the_image_draft() 
                 .history_stash
                 .as_ref()
                 .expect("unsent editor retained");
-            assert_eq!(stash.text(), draft_text);
-            assert_eq!(stash.cursor(), draft_cursor);
-            assert_eq!(stash.selection(), draft_selection);
-            assert_eq!(
-                runtime.history_attachment_stash.as_deref(),
-                Some([draft.clone()].as_slice())
-            );
+            assert_eq!(stash.composer.text(), draft_text);
+            assert_eq!(stash.composer.cursor(), draft_cursor);
+            assert_eq!(stash.composer.selection(), draft_selection);
+            assert_eq!(stash.attachments, [draft.clone()]);
             assert_eq!(runtime.unsent_text(), draft_text);
             assert_eq!(runtime.unsent_attachments(), [draft.clone()]);
             assert_eq!(runtime.attachments, [sent.clone()]);
@@ -8221,7 +8233,6 @@ fn valid_empty_paste_keeps_recalled_history_and_down_restores_the_image_draft() 
             assert_eq!(runtime.attachments, [draft.clone()]);
             assert!(runtime.history_cursor.is_none());
             assert!(runtime.history_stash.is_none());
-            assert!(runtime.history_attachment_stash.is_none());
             assert!(runtime.commands.is_idle());
         }
     });

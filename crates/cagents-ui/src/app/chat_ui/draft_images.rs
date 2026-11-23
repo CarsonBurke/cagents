@@ -13,12 +13,14 @@
 //! holds are pieces; other bracketed text is the reader's own.
 //!
 //! The composer's own undo history lives here too, since an image's removal
-//! and return are text edits it replays.
+//! and return are text edits it replays. A tile whose image no reference in
+//! the text holds, or a file's, goes and returns as a step of its own.
+use super::attachment_draft::Bookmark;
 use crate::chat::Attachment;
-use crate::editor_history::{EditBuffer, EditKind};
+use crate::editor_history::{EditBuffer, EditKind, TextChange};
 use cosmic::iced::advanced::text::editor::Direction;
 use cosmic::widget::text_editor::{self, Content, Cursor, Motion, Position};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -140,22 +142,17 @@ pub(super) fn whole(
     live: &HashSet<String>,
     toward: Toward,
 ) -> Option<Cursor> {
-    let cursor = content.cursor();
-    let selecting = content
-        .selection()
-        .is_some_and(|selection| !selection.is_empty());
-    if !selecting {
-        let position = moved_out(content, live, cursor.position, toward);
-        return (position != cursor.position).then_some(Cursor {
+    // A word or line selection's cursor reports where it was made, not the
+    // words or lines it covers; its span is what the references must not cut.
+    let span = content.selection_span();
+    let Some(anchor) = span.selection else {
+        let position = moved_out(content, live, span.position, toward);
+        return (position != span.position).then_some(Cursor {
             position,
             selection: None,
         });
-    }
-    // A word or line selection reports the place it began rather than its
-    // ends; this reads the span it actually covers. A plain selection's
-    // cursor is its span, so it stands in when that read is ambiguous.
-    let span = super::attachment_draft::selection_span(content).unwrap_or(cursor);
-    let (caret, anchor) = (span.position, span.selection?);
+    };
+    let caret = span.position;
     let forward = (anchor.line, anchor.column) <= (caret.line, caret.column);
     let (away, back) = if forward {
         (Toward::End, Toward::Start)
@@ -441,6 +438,110 @@ pub(super) fn kind(edit: &text_editor::Edit, selected: bool) -> EditKind {
     }
 }
 
+/// A tile the reader took off the draft that no text change brings back: an
+/// image whose reference the text does not hold, such as one brought back
+/// with an image-only message, or a file. Its removal is an undo step of its
+/// own.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Removed(Detached);
+
+/// The composer's undo history: its text, and the tiles taken off beside it.
+pub(super) type History = crate::editor_history::History<Removed>;
+
+/// Takes the `index`th attachment off the draft, as an undo step's effect.
+pub(super) fn remove(attachments: &mut Vec<Attachment>, index: usize) -> Option<Removed> {
+    (index < attachments.len()).then(|| {
+        Removed(Detached {
+            index,
+            attachment: attachments.remove(index),
+        })
+    })
+}
+
+/// Whether two attachments are the same one: the same receipt, or the same
+/// file.
+fn same(left: &Attachment, right: &Attachment) -> bool {
+    match (&left.reference, &right.reference) {
+        (Some(left), Some(right)) => left.id == right.id && left.device == right.device,
+        (None, None) => left.path == right.path,
+        _ => false,
+    }
+}
+
+/// The draft as the composer's undo history replays it: its text, the
+/// insertions still loading, which follow the text as they follow any edit,
+/// and its attachments, for the tiles a step took off.
+pub(super) struct Draft<'a> {
+    pub text: Buffer<'a>,
+    pub bookmarks: &'a mut HashMap<uuid::Uuid, Bookmark>,
+    /// Other places that follow the text, such as where dictation writes
+    /// next.
+    pub followers: Vec<&'a mut Bookmark>,
+    pub attachments: &'a mut Vec<Attachment>,
+    /// The most attachments a tile coming back may make.
+    pub capacity: usize,
+    /// The labels of tiles that could not come back for the limit.
+    pub refused: Vec<String>,
+    /// Whether the attachments changed.
+    pub changed: bool,
+}
+
+impl EditBuffer<Removed> for Draft<'_> {
+    fn replace(
+        &mut self,
+        start: Position,
+        expected: &str,
+        replacement: &str,
+        replacement_breaks: &[usize],
+    ) -> bool {
+        self.text
+            .replace(start, expected, replacement, replacement_breaks)
+    }
+
+    fn set_cursor(&mut self, cursor: Cursor) {
+        self.text.set_cursor(cursor);
+    }
+
+    fn replayed(&mut self, change: &TextChange, undone: bool) {
+        if self.bookmarks.is_empty() && self.followers.is_empty() {
+            return;
+        }
+        let inverse;
+        let change = if undone {
+            inverse = change.inverse();
+            &inverse
+        } else {
+            change
+        };
+        let followers = self.followers.iter_mut().map(|bookmark| &mut **bookmark);
+        for bookmark in self.bookmarks.values_mut().chain(followers) {
+            bookmark.changed(change);
+        }
+    }
+
+    fn effect(&mut self, Removed(entry): &Removed, undone: bool) {
+        let held = self
+            .attachments
+            .iter()
+            .position(|attachment| same(attachment, &entry.attachment));
+        match (undone, held) {
+            (true, None) if self.attachments.len() >= self.capacity => {
+                self.refused.push(entry.attachment.label());
+            }
+            (true, None) => {
+                let index = entry.index.min(self.attachments.len());
+                self.attachments.insert(index, entry.attachment.clone());
+                self.changed = true;
+            }
+            (false, Some(index)) => {
+                self.attachments.remove(index);
+                self.changed = true;
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+    }
+}
+
 /// The composer as the undo history rewinds it: each replacement is a native
 /// paste over the exact span, verified before it is made.
 pub(super) struct Buffer<'a>(pub &'a mut Content<cosmic::Renderer>);
@@ -456,12 +557,8 @@ impl EditBuffer for Buffer<'_> {
         // An upper bound on the lines `expected` spans; the excerpt stops at
         // the buffer's end.
         let lines = expected.matches(['\n', '\r']).count();
-        let view = super::attachment_draft::excerpt(
-            self.0,
-            start.line,
-            start.line.saturating_add(lines),
-            false,
-        );
+        let view =
+            super::attachment_draft::excerpt(self.0, start.line, start.line.saturating_add(lines));
         let Some(from) = view.offset(start) else {
             return false;
         };

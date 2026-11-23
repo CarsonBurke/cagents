@@ -530,6 +530,12 @@ where
         self.0.borrow().editor.cursor()
     }
 
+    /// Returns the span the current selection of the [`Content`] covers;
+    /// see [`text::Editor::selection_span`].
+    pub fn selection_span(&self) -> Cursor {
+        self.0.borrow().editor.selection_span()
+    }
+
     /// Returns the amount of lines of the [`Content`].
     pub fn line_count(&self) -> usize {
         self.0.borrow().editor.line_count()

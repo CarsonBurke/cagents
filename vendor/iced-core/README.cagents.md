@@ -127,3 +127,18 @@ Run its standalone tests with:
 ```sh
 scripts/cargo-gate test --manifest-path vendor/iced-core/Cargo.toml -- svg::tests window::animation_request
 ```
+
+## Selection span (#3693)
+
+`text::Editor::selection_span` reports the span the selection covers, as a
+`Cursor` whose `selection` is the end the reader is not moving. A word or line
+selection's `cursor` reports only the points the reader clicked and dragged
+to, which the selected text alone cannot always place: in `中中中`, the `中中`
+selected around a click between the first two fits at either of two places.
+The default returns `cursor`, which is exact for an editor whose selections
+are plain ranges; iced_graphics overrides it with cosmic-text's selection
+bounds (vendor/iced-graphics/README.cagents.md), and iced_widget's
+`text_editor::Content::selection_span` exposes it. The app's composer and
+code editor measure edits, keep `[Image N]` references whole and place late
+insertions from it. `attachment_draft::tests::word_and_line_selections_report_and_edit_the_span_they_cover`
+covers it.

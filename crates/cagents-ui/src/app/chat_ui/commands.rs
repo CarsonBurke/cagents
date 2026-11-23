@@ -1392,7 +1392,7 @@ mod tests {
             assert_eq!(runtime.composer.text(), "earlier prompt");
             assert_eq!(runtime.unsent_text(), draft);
             assert_eq!(runtime.history_cursor, Some(0));
-            assert!(runtime.history_attachment_stash.is_some());
+            assert!(runtime.history_stash.is_some());
             target
         }
 
@@ -1401,7 +1401,6 @@ mod tests {
             assert_eq!(runtime.composer.text(), draft);
             assert!(runtime.history_cursor.is_none());
             assert!(runtime.history_stash.is_none());
-            assert!(runtime.history_attachment_stash.is_none());
         }
 
         fn send_recalled_prompt(draft: &str, attachments: Vec<Attachment>) {
@@ -1412,6 +1411,7 @@ mod tests {
                 .history_stash
                 .as_ref()
                 .unwrap()
+                .composer
                 .cursor();
 
             drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
@@ -1540,7 +1540,6 @@ mod tests {
                 );
                 assert_eq!(runtime.attachments, [image.clone()]);
                 assert!(runtime.history_cursor.is_none());
-                assert!(runtime.history_attachment_stash.is_none());
             });
         }
 

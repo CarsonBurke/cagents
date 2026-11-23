@@ -242,6 +242,40 @@ impl editor::Editor for Editor {
         }
     }
 
+    fn selection_span(&self) -> Cursor {
+        let editor = &self.internal().editor;
+        let caret = editor.cursor();
+        let position = |cursor: cosmic_text::Cursor| Position {
+            line: cursor.line,
+            column: cursor.index,
+        };
+
+        // cagents: a word or line selection's bounds are the words or lines
+        // around its anchor and caret, which `cursor` does not report.
+        let anchor = match editor.selection() {
+            cosmic_text::Selection::None => None,
+            cosmic_text::Selection::Normal(anchor)
+            | cosmic_text::Selection::Line(anchor)
+            | cosmic_text::Selection::Word(anchor) => Some(anchor),
+        };
+        match (anchor, editor.selection_bounds()) {
+            (Some(anchor), Some((start, end))) if start != end => {
+                let forward =
+                    (anchor.line, anchor.index) <= (caret.line, caret.index);
+                let (moving, fixed) =
+                    if forward { (end, start) } else { (start, end) };
+                Cursor {
+                    position: position(moving),
+                    selection: Some(position(fixed)),
+                }
+            }
+            _ => Cursor {
+                position: position(caret),
+                selection: None,
+            },
+        }
+    }
+
     fn perform(&mut self, action: Action) {
         let mut font_system =
             text::font_system().write().expect("Write font system");

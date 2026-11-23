@@ -56,3 +56,12 @@ It answers whether a cheap frame's presentation is CPU encoding or waiting on
 the GPU or the compositor. `present_timing` in `crates/iced-contracts` covers
 it. Remove it when the pinned dependency offers
 equivalent timing.
+
+# Selection span (#3693)
+
+`Editor::selection_span` implements `text::Editor::selection_span`
+(vendor/iced-core/README.cagents.md) from cosmic-text's `selection_bounds`,
+which expand a word or line selection to the words or lines around its anchor
+and caret. Its moving end is the caret's side: the end when the anchor is at
+or before the caret, the start otherwise. An empty span is no selection.
+Remove it when the pinned upstream editor reports a selection's bounds.

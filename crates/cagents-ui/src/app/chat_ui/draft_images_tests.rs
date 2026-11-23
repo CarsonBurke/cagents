@@ -1,7 +1,8 @@
 //! A draft's `[Image N]` references and its attachments stay one object
 //! through the composer's real edit, undo, paste and tray paths (#3259).
 use super::tests::{
-    chat_runtime, composer_key_messages, draft_chat, draft_chat_for_provider, task_focuses, write,
+    chat_runtime, composer_key_messages, draft_chat, draft_chat_for_provider, live_chat,
+    task_focuses, write,
 };
 use super::*;
 
@@ -228,17 +229,230 @@ fn undoing_a_removal_at_the_attachment_limit_brings_back_the_image_it_removed() 
 }
 
 #[test]
-fn a_file_tile_goes_without_touching_the_text() {
+fn a_file_tile_goes_without_touching_the_text_and_undo_brings_it_back() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = draft_chat(&mut app);
     let target = chat_runtime(&app, card).target;
     write(&mut app, card, "Read this");
     let runtime = app.chat_runtime_mut(target).unwrap();
-    runtime.attach([PathBuf::from("/project/notes.pdf")]);
+    runtime.attach([
+        PathBuf::from("/project/notes.pdf"),
+        PathBuf::from("/project/plan.md"),
+    ]);
+    let files = runtime.attachments.clone();
     drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
     let runtime = chat_runtime(&app, card);
-    assert!(runtime.attachments.is_empty());
+    assert_eq!(runtime.attachments, files[1..]);
     assert_eq!(runtime.composer.text(), "Read this");
+    drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.attachments, files, "back in its place");
+    assert_eq!(runtime.composer.text(), "Read this");
+    drop(app.handle_chat_ui(Action::ComposerUndo(target, true)));
+    assert_eq!(chat_runtime(&app, card).attachments, files[1..]);
+    // The step before it is the text's, which undo reaches next.
+    drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
+    drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
+    assert_eq!(chat_runtime(&app, card).composer.text(), "");
+}
+
+/// An image-only message brought back holds its image with no reference in
+/// the text (#3680); removing its tile is still a step undo takes back.
+#[test]
+fn removing_an_image_the_text_never_named_can_be_undone() {
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.take_back("", vec![image.clone()], PromptMode::Queue);
+        assert!(!runtime.composer.text().contains(&token(&image)));
+        assert!(!runtime.composer_undo.can_undo());
+
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Pointer)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.attachments.is_empty());
+        assert!(runtime.composer_undo.can_undo());
+
+        drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.attachments, [image.clone()]);
+        assert_eq!(sent_attachments(runtime), [image.clone()]);
+        assert_eq!(runtime.composer.text(), "");
+
+        drop(app.handle_chat_ui(Action::ComposerUndo(target, true)));
+        assert!(chat_runtime(&app, card).attachments.is_empty());
+    });
+}
+
+/// An image paste still being saved when the reader undoes an earlier step
+/// lands where it was aimed, which the undone text moved (#3713).
+#[test]
+fn undo_moves_an_image_paste_still_saving_along_with_the_text() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "one");
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        caret_after(runtime, "");
+        for character in "zero ".chars() {
+            edit(runtime, text_editor::Edit::Insert(character));
+        }
+        caret_after(runtime, "one");
+        let ticket = runtime.begin_attachment_insert();
+
+        // The reader takes back "zero " before the image has saved.
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), "one");
+        assert!(
+            runtime.attachment_ticket(ticket.id).is_some(),
+            "still wanted"
+        );
+        assert!(runtime.finish_attachment_insert(ticket.id, "", vec![image.clone()]));
+        assert_eq!(runtime.composer.text(), format!("one {} ", token(&image)));
+        assert_eq!(runtime.attachments, [image.clone()]);
+
+        // One whose place the undone step rewrote is given up, and says so.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let draft = runtime.composer.text();
+        caret_after(runtime, &draft);
+        for character in "two".chars() {
+            edit(runtime, text_editor::Edit::Insert(character));
+        }
+        caret_after(runtime, " tw");
+        let ticket = runtime.begin_attachment_insert();
+        assert!(runtime.undo_composer(false));
+        assert!(runtime.attachment_ticket(ticket.id).is_none());
+        assert!(!runtime.finish_attachment_insert(ticket.id, "", vec![image.clone()]));
+    });
+}
+
+/// What the focused tile at `index` does in the laid-out chat: the messages
+/// each key sends, and its accessible node's description.
+fn tile_keys(
+    app: &Cagents,
+    card: CardId,
+    index: usize,
+    keys: &[iced::keyboard::Event],
+) -> (Vec<Vec<Message>>, Option<String>) {
+    use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+    let renderer = crate::app::tests::headless_renderer();
+    let viewport = iced::Rectangle::with_size(iced::Size::new(720.0, 720.0));
+    let mut element = app.chat_view(card);
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+    );
+    let id = view::attachment_tile_id(card, index);
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    let a11y_id = iced_accessibility::A11yId::from(id.clone());
+    let description = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .find(|node| *node.id() == a11y_id)
+        .expect("the tile is in the accessibility tree")
+        .node()
+        .description()
+        .map(str::to_owned);
+    element.as_widget_mut().operate(
+        &mut tree,
+        Layout::new(&node),
+        &renderer,
+        &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+    );
+    let sent = keys
+        .iter()
+        .map(|key| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Keyboard(key.clone()),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        })
+        .collect();
+    (sent, description)
+}
+
+/// While the composer refuses edits, its tray does too: a tile offers no
+/// removal to the keyboard or to assistive tools, and leaves the message's
+/// history alone (#3713).
+#[test]
+fn a_read_only_drafts_tiles_neither_remove_nor_step_its_history() {
+    use iced::keyboard::{self, key::Code, key::Named, key::Physical};
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("read-only-tray"));
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "Look ");
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let ticket = runtime.begin_attachment_insert();
+        assert!(runtime.finish_attachment_insert(ticket.id, "", vec![image.clone()]));
+        assert!(runtime.composer_undo.can_undo());
+        let key = |key: keyboard::Key, physical, modifiers| keyboard::Event::KeyPressed {
+            modified_key: key.clone(),
+            key,
+            physical_key: Physical::Code(physical),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        let keys = [
+            key(
+                keyboard::Key::Named(Named::Delete),
+                Code::Delete,
+                keyboard::Modifiers::empty(),
+            ),
+            key(
+                keyboard::Key::Character("z".into()),
+                Code::KeyZ,
+                keyboard::Modifiers::CTRL,
+            ),
+        ];
+        let removes = |messages: &[Message]| {
+            messages.iter().any(|message| {
+                matches!(message, Message::ChatUi(Action::RemoveAttachment(found, 0, _)) if *found == target)
+            })
+        };
+        let undoes = |messages: &[Message]| {
+            messages.iter().any(|message| {
+                matches!(message, Message::ChatUi(Action::ComposerUndo(found, false)) if *found == target)
+            })
+        };
+
+        // An editable draft's tile removes and undoes.
+        let (sent, description) = tile_keys(&app, card, 0, &keys);
+        assert!(removes(&sent[0]) && undoes(&sent[1]));
+        assert!(description.unwrap().contains("Delete removes it"));
+
+        // A refused saved conversation that can't start fresh fixes it.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.start_blocked = Some(blocked_recovery::Reopen::UpdateStopped);
+        let (sent, description) = tile_keys(&app, card, 0, &keys);
+        assert!(!removes(&sent[0]), "Delete removes nothing");
+        assert!(!undoes(&sent[1]), "Ctrl+Z is left to the workspace");
+        assert!(
+            !description.is_some_and(|text| text.contains("Delete")),
+            "assistive tools are not offered a removal"
+        );
+        assert_eq!(chat_runtime(&app, card).attachments, [image]);
+    });
 }
 
 #[test]
@@ -757,7 +971,7 @@ fn copying_a_reference_into_another_draft_brings_its_image() {
 }
 
 #[test]
-fn an_image_a_full_draft_refused_from_a_paste_comes_with_its_redo_once_there_is_room() {
+fn an_image_a_full_draft_refused_from_a_paste_comes_back_with_its_reference_once_there_is_room() {
     let _admission = attachment_draft::test_admission();
     chat::attachment_assets::with_test_image(|image| {
         let limit = chat::AttachmentRules::for_provider(Provider::Claude)
@@ -789,12 +1003,30 @@ fn an_image_a_full_draft_refused_from_a_paste_comes_with_its_redo_once_there_is_
         let note = runtime.composer_note.clone().unwrap();
         assert!(note.contains("attachment limit"), "{note}");
 
-        // A file goes, and redoing the paste brings the image it left out.
+        // Removing a file is a step of its own: undo brings the file back
+        // first, then takes the paste out.
         drop(app.handle_chat_ui(Action::RemoveAttachment(other, 0, Removal::Pointer)));
         let runtime = app.chat_runtime_mut(other).unwrap();
+        assert_eq!(runtime.attachments.len(), limit - 1);
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.attachments.len(), limit);
+        assert!(!runtime.attachments.contains(&image));
         assert!(runtime.undo_composer(false));
         assert_eq!(runtime.composer.text(), "");
+        // Redoing the paste into the full draft still leaves the image out,
+        // and redoing the file's removal makes room without slipping it in:
+        // that step never touched the reference.
         assert!(runtime.undo_composer(true));
+        assert_eq!(runtime.composer.text(), reference);
+        assert!(!runtime.attachments.contains(&image));
+        assert!(runtime.undo_composer(true));
+        assert_eq!(runtime.composer.text(), reference);
+        assert_eq!(runtime.attachments.len(), limit - 1);
+        // A step that brings the reference back now brings its image.
+        runtime.composer_action(text_editor::Action::SelectAll);
+        edit(runtime, text_editor::Edit::Backspace);
+        assert_eq!(runtime.composer.text(), "");
+        assert!(runtime.undo_composer(false));
         assert_eq!(runtime.composer.text(), reference);
         assert_eq!(runtime.attachments.len(), limit);
         assert!(runtime.attachments.contains(&image));

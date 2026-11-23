@@ -416,7 +416,7 @@ pub(super) fn apply(
     composer: &mut text_editor::Content<cosmic::Renderer>,
     token: &Token,
     insertion: &str,
-) -> Result<Option<crate::editor_history::TextChange>, ()> {
+) -> Option<crate::editor_history::TextChange> {
     let next = composer
         .line(token.line)
         .and_then(|line| line.text.get(token.end..)?.chars().next());
