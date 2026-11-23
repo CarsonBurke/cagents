@@ -18,10 +18,21 @@ const BASELINE: &str = "baseline\n";
 const FIXTURE_ORDINAL: u32 = 7;
 
 /// The project rows the daemon publishes with each edit this peer streams,
-/// as `public_effects` records them, so the window acts on real effects.
-fn canonical_effects(edit: &ModelEdit) -> EditEffects {
+/// as `public_effects` records them, so the window acts on real effects. A
+/// close deletes the folder's strip view and closes the editor in it, as
+/// `record_project_removal` does.
+fn canonical_effects(edit: &ModelEdit, editor: CardId) -> EditEffects {
     match edit {
         ModelEdit::CloseProject { repository } => EditEffects {
+            views: vec![crate::workspace_model::delta::ViewRevision {
+                scope: crate::workspace_model::views::Scope::Worktree {
+                    repository: repository.clone(),
+                    path: repository.clone(),
+                },
+                before: Some(1),
+                after: None,
+            }],
+            closed: vec![editor],
             removed_projects: vec![repository.clone()],
             ..Default::default()
         },
@@ -352,6 +363,22 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
     let project = ProjectId::new();
     let card = CardId::new();
     let registry = uuid::Uuid::new_v4();
+    let descriptor = RepositoryView {
+        project,
+        repository: root.clone(),
+        worktree: root.clone(),
+        selected_file: Some("notes.txt".into()),
+    };
+    let editor_card = CardState {
+        id: card,
+        generation: 0,
+        title: "notes.txt".into(),
+        width_fraction: 1.0,
+        existence: Existence::Open,
+        kind: CardKind::Repository(descriptor.clone()),
+    };
+    // The editor is in the folder's strip, as the registry knows it: a
+    // window adopts into channels only the strip panes the registry lacks.
     let model = WorkspaceModel {
         identity: registry,
         sequence: 1,
@@ -360,6 +387,17 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             name: "Fixture folder".into(),
             kind: ProjectKind::Folder,
             ordinal: FIXTURE_ORDINAL,
+        }],
+        views: vec![crate::workspace_model::views::View {
+            scope: crate::workspace_model::views::Scope::Worktree {
+                repository: root.clone(),
+                path: root.clone(),
+            },
+            revision: 1,
+            panes: vec![
+                crate::workspace_model::views::Pane::from_card(&editor_card, None).unwrap(),
+            ],
+            retired: Vec::new(),
         }],
         ..Default::default()
     };
@@ -397,7 +435,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
                         proof: proof(),
                         message: ServerMessage::WorkspaceModelEdited {
                             sequence: index as u64 + 2,
-                            effects: canonical_effects(&edit),
+                            effects: canonical_effects(&edit, card),
                             edit,
                         },
                     },
@@ -476,12 +514,6 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
         )
         .with_kind(ProjectKind::Folder),
     );
-    let descriptor = RepositoryView {
-        project,
-        repository: root.clone(),
-        worktree: root.clone(),
-        selected_file: Some("notes.txt".into()),
-    };
     // Load the real file so later Save owns its original read root. Every
     // edit below is emitted by the mounted editor; no dirty flag is patched.
     let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
@@ -498,14 +530,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
     assert_eq!(runtime.editor_text().as_deref(), Some(BASELINE));
     let durable = Arc::make_mut(&mut app.durable);
     durable.workspace_model_identity = Some(registry);
-    durable.cards.push(CardState {
-        id: card,
-        generation: 0,
-        title: "notes.txt".into(),
-        width_fraction: 1.0,
-        existence: Existence::Open,
-        kind: CardKind::Repository(descriptor),
-    });
+    durable.cards.push(editor_card);
     durable.focused = Some(card);
     app.workspace = Cagents::rebuild_workspace(&app.durable);
     app.active_workspace = Some(root.clone());
