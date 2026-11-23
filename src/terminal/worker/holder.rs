@@ -2942,6 +2942,7 @@ mod tests {
             Some(&root_identity),
             &exited,
             false,
+            super::super::ShutdownBudget::PATIENT,
         )
         .expect("normal shutdown must confirm the exact root was reaped");
         assert!(!held.child.unreaped());
@@ -2953,14 +2954,9 @@ mod tests {
         drop(held);
         assert_eq!(reaper.free(), 1);
         assert!(!owner.is_current());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while root.is_current() {
-            assert!(
-                Instant::now() < deadline,
-                "normal holder close left its root"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        crate::test_timing::eventually("the normal holder close to end its root", || {
+            !root.is_current()
+        });
     }
 
     #[test]

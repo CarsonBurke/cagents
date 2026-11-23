@@ -139,15 +139,9 @@ impl CloseSafetyShell {
             },
         )
         .unwrap();
-        // Shutdown confirms cleanup through whole-host /proc censuses within
-        // fixed reserves of its deadline. These tests assert what shutdown
-        // decides, not how fast a shared, loaded host scans /proc, so a census
-        // that starts within its budget is allowed to finish.
-        terminal
-            .inner
-            .published
-            .shutdown_census_instant
-            .store(true, Ordering::Release);
+        // These tests assert what shutdown decides, not how fast a shared,
+        // loaded host runs it. A test of a budget running out sets its own.
+        terminal.set_shutdown_budget_for_test(ShutdownBudget::PATIENT);
         Self {
             terminal,
             wakes,
@@ -404,6 +398,15 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
             .parse()
             .unwrap(),
     );
+    // Capture gets half a second, which the injected delay uses up; the
+    // hangup grace and a patient confirmation still follow it.
+    let budget = ShutdownBudget {
+        deadline: ShutdownBudget::PATIENT.confirmation_reserve
+            + ShutdownBudget::PATIENT.hangup_grace
+            + Duration::from_millis(500),
+        ..ShutdownBudget::PATIENT
+    };
+    shell.terminal.set_shutdown_budget_for_test(budget);
     let (finished, capture_finished) = crossbeam_channel::bounded(1);
     *shell
         .terminal
@@ -415,10 +418,12 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
     let terminal = shell.terminal.clone();
     let started = Instant::now();
     let shutdown = std::thread::spawn(move || terminal.shutdown());
-    let captured_at = capture_finished.recv_timeout(WORKER_JOIN_TIMEOUT).unwrap();
+    let captured_at = capture_finished
+        .recv_timeout(crate::test_timing::EVENTUALLY)
+        .unwrap();
     let killed_before_grace = holder::exits_within(
         &root.0,
-        CHILD_HANGUP_GRACE.saturating_sub(captured_at.elapsed()),
+        budget.hangup_grace.saturating_sub(captured_at.elapsed()),
     )
     .unwrap();
     let outcome = shutdown.join().unwrap();
@@ -457,7 +462,7 @@ fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
     // wait out the drain budget kept for jobs that linger.
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < ShutdownBudget::PATIENT.deadline / 2,
         "a family that exits on hangup must not wait for the drain deadline: {elapsed:?}"
     );
     assert!(
@@ -481,7 +486,7 @@ fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits()
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_ok());
     assert!(
-        started.elapsed() >= CHILD_HANGUP_GRACE,
+        started.elapsed() >= ShutdownBudget::PATIENT.hangup_grace,
         "a HUP-ignoring job must receive the existing grace before escalation"
     );
     assert!(
@@ -506,7 +511,7 @@ fn ordinary_shutdown_leaves_a_process_that_left_the_session_holding_the_pty() {
     let elapsed = started.elapsed();
     assert!(outcome.is_ok(), "shutdown: {outcome:?}");
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < ShutdownBudget::PATIENT.deadline / 2,
         "a PTY held outside the family must not delay shutdown: {elapsed:?}"
     );
     assert!(
@@ -559,9 +564,17 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     assert!(!holder::exits_within(&child.0, Duration::ZERO).unwrap());
     let unpublished = reaper.reserve().unwrap();
     let drain = reaper.begin_exit_drain();
+    // The job ignores its hangup and outlives the shell, so confirmation
+    // must run out: give it the product's deadline, and the caller enough
+    // patience to see the worker report that rather than give up first.
+    let budget = ShutdownBudget {
+        join: ShutdownBudget::PATIENT.join,
+        ..ShutdownBudget::PRODUCT
+    };
+    shell.terminal.set_shutdown_budget_for_test(budget);
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_err());
-    assert!(started.elapsed() < WORKER_JOIN_TIMEOUT);
+    assert!(started.elapsed() < budget.join);
     assert!(!shell.terminal.is_completed());
     assert!(shell.terminal.worker_joined_for_test());
     let events = shell.terminal.events().try_iter().collect::<Vec<_>>();
@@ -620,7 +633,7 @@ fn ordinary_shutdown_force_kills_its_pinned_root_when_the_census_fails() {
         .store(true, Ordering::Release);
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_ok());
-    assert!(started.elapsed() < WORKER_JOIN_TIMEOUT);
+    assert!(started.elapsed() < ShutdownBudget::PATIENT.join);
     assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
     assert!(!shell.home.path().join("unexpected-root-exit").exists());
     assert!(shell.terminal.is_completed());

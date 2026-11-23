@@ -1396,6 +1396,7 @@ fn a_terminal_that_cannot_be_carried_keeps_running_here() {
     let directory = tempdir().unwrap();
     let session = shell_session("echo before; read line; echo \"after:$line\"; read line");
     let handle = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
+    handle.set_shutdown_budget_for_test(ShutdownBudget::PATIENT);
     wait_for_text(&handle, "before");
     let unreachable = directory.path().join("missing").join("holder.sock");
     assert!(handle.carry(unreachable).is_err());
@@ -3414,9 +3415,17 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
         assert_eq!(&ready, b"ready");
         let root = RootIdentity::capture(held.child.pid(), None).unwrap();
         let started = std::time::Instant::now();
-        let status =
-            shutdown_child_exit(&held.child, &held.master, Some(&root), &exits, false).unwrap();
-        assert!(started.elapsed() < CHILD_SHUTDOWN_DEADLINE);
+        let budget = ShutdownBudget::PATIENT;
+        let status = shutdown_child_exit(
+            &held.child,
+            &held.master,
+            Some(&root),
+            &exits,
+            false,
+            budget,
+        )
+        .unwrap();
+        assert!(started.elapsed() < budget.deadline);
         match expected_code {
             Some(code) => assert_eq!(status.exit_code(), code),
             None => assert!(status.signal().is_some()),
@@ -3446,7 +3455,7 @@ fn shutdown_does_not_fabricate_completion_when_holder_reporting_fails() {
     let (sender, disconnected) = crossbeam_channel::bounded(1);
     drop(sender);
     assert!(
-        matches!(shutdown_child_exit(&held.child, &held.master, None, &disconnected, true), Err(message) if message == "child reaper closed")
+        matches!(shutdown_child_exit(&held.child, &held.master, None, &disconnected, true, ShutdownBudget::PRODUCT), Err(message) if message == "child reaper closed")
     );
     assert!(matches!(
         child_exit_event(&mut false, Err("child reaper closed".into()), false),
