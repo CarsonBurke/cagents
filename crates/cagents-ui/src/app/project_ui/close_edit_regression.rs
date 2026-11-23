@@ -352,6 +352,22 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
     let project = ProjectId::new();
     let card = CardId::new();
     let registry = uuid::Uuid::new_v4();
+    let descriptor = RepositoryView {
+        project,
+        repository: root.clone(),
+        worktree: root.clone(),
+        selected_file: Some("notes.txt".into()),
+    };
+    let editor_card = CardState {
+        id: card,
+        generation: 0,
+        title: "notes.txt".into(),
+        width_fraction: 1.0,
+        existence: Existence::Open,
+        kind: CardKind::Repository(descriptor.clone()),
+    };
+    // The editor is in the folder's strip, as the registry knows it: a
+    // window adopts into channels only the strip panes the registry lacks.
     let model = WorkspaceModel {
         identity: registry,
         sequence: 1,
@@ -360,6 +376,17 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             name: "Fixture folder".into(),
             kind: ProjectKind::Folder,
             ordinal: FIXTURE_ORDINAL,
+        }],
+        views: vec![crate::workspace_model::views::View {
+            scope: crate::workspace_model::views::Scope::Worktree {
+                repository: root.clone(),
+                path: root.clone(),
+            },
+            revision: 1,
+            panes: vec![
+                crate::workspace_model::views::Pane::from_card(&editor_card, None).unwrap(),
+            ],
+            retired: Vec::new(),
         }],
         ..Default::default()
     };
@@ -476,12 +503,6 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
         )
         .with_kind(ProjectKind::Folder),
     );
-    let descriptor = RepositoryView {
-        project,
-        repository: root.clone(),
-        worktree: root.clone(),
-        selected_file: Some("notes.txt".into()),
-    };
     // Load the real file so later Save owns its original read root. Every
     // edit below is emitted by the mounted editor; no dirty flag is patched.
     let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
@@ -498,14 +519,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
     assert_eq!(runtime.editor_text().as_deref(), Some(BASELINE));
     let durable = Arc::make_mut(&mut app.durable);
     durable.workspace_model_identity = Some(registry);
-    durable.cards.push(CardState {
-        id: card,
-        generation: 0,
-        title: "notes.txt".into(),
-        width_fraction: 1.0,
-        existence: Existence::Open,
-        kind: CardKind::Repository(descriptor),
-    });
+    durable.cards.push(editor_card);
     durable.focused = Some(card);
     app.workspace = Cagents::rebuild_workspace(&app.durable);
     app.active_workspace = Some(root.clone());
