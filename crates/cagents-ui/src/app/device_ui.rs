@@ -1603,8 +1603,16 @@ mod tests {
         app.refresh_ui
             .projects
             .insert(closed, CancellationToken::new());
+        app.repository_generations.insert(closed, 2);
         drop(app.device_project_loaded(closed, 1, Err("late reply".into())));
         app.refresh_ui.focused = true;
+        assert!(
+            app.refresh_ui.projects.contains_key(&closed),
+            "a late result must not erase a newer remote read's fence"
+        );
+        // Closing retires that generation. The scheduler ignores and prunes
+        // its leftover marker before it chooses a surviving project.
+        app.repository_generations.remove(&closed);
         app.refresh_ui.schedule_remote_started(project_id);
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
         assert!(!app.refresh_ui.projects.contains_key(&closed));

@@ -936,6 +936,9 @@ impl Cagents {
             .is_some_and(|active| scope.contains(active));
         self.sidebar_model.projects.remove(index);
         self.refresh_ui.git.forget(id);
+        if let Some(cancellation) = self.refresh_ui.projects.remove(&id) {
+            cancellation.cancel();
+        }
         self.github_availability.remove(&id);
         self.review_repositories.remove(&id);
         self.project_ui.projects.remove(&id);

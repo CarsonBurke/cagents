@@ -16341,6 +16341,11 @@ impl Application for Cagents {
         _theme: &cosmic::cosmic_theme::Theme,
     ) -> Task<Message> {
         self.document_tone_stale = self.settings.app_theme == AppTheme::System;
+        if self.document_tone_stale {
+            // This hook is outside `update()`, so it cannot rely on the
+            // normal reconciliation pass to discover the stale document.
+            self.refresh_ui.arm_reconciliation();
+        }
         Task::none()
     }
 
@@ -16748,6 +16753,7 @@ impl Application for Cagents {
                 .collect();
             app.lifecycle = LifecycleManager::new(LifecycleBudget::default());
             app.pane_inspectors = pane_inspector::PaneInspectors::default();
+            app.sync_refresh_reconciliation_deadline();
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
@@ -16791,6 +16797,7 @@ impl Application for Cagents {
                 }),
         );
         let task = Task::batch(tasks);
+        app.sync_refresh_reconciliation_deadline();
         let chrome = app.sync_chrome();
         (app, Task::batch([task, chrome]))
     }
@@ -17685,6 +17692,7 @@ impl Application for Cagents {
                 oracle_message,
             },
         );
+        self.sync_refresh_reconciliation_deadline();
         self.attention_scope_changed = enclosing_scope_changed;
         task
     }
@@ -19917,7 +19925,10 @@ impl Cagents {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
                 }
-                Task::none()
+                // A recovered writer can persist a terminal handoff right
+                // away.  Waiting for RefreshUi is only the fallback for
+                // state changes that do not publish a health event.
+                self.commit_terminal_handoffs()
             }
             Message::RetrySharedViewSeeds => {
                 self.retry_view_seeds();
