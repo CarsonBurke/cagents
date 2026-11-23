@@ -41,7 +41,7 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 protocol 185 retired; the Work board (`cagents work`) tracks pull requests. It withholds notifications the CLI couldn't read.
 What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
-running, and on protocols before 198, an agent waiting for approval or for
+running, and on protocols before 199, an agent waiting for approval or for
 an answer reads as waiting.
 An admitted CLI from before protocol 179 receives store contention as a
 retryable `Internal` error so it can decode the reply. One from before protocol 188

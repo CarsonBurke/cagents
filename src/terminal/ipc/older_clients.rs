@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 198,
+    proven_at: 199,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -126,7 +126,7 @@ pub(crate) const PATCH_LINE_ORIGIN: u16 = 195;
 
 /// The first protocol whose agent activity says what a waiting agent waits
 /// for. An older client is told it waits, as it was before.
-pub(crate) const WAIT_KINDS: u16 = 198;
+pub(crate) const WAIT_KINDS: u16 = 199;
 
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
