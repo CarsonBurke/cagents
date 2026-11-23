@@ -53,11 +53,13 @@
 #           its tool call - opening and closing while the row keeps focus)
 #           and keyboard-enter (Enter on the started agent, which opens it)
 #
-#   runs    message-runs and message-runs-open: the conversation of
+#   runs    message-runs, message-runs-hover, message-runs-menu and
+#           message-runs-open: the conversation of
 #           message-card-scene/runs.jsonl instead, which tells seven agents
 #           the same thing in two runs, a Bash call between them, one
-#           refused; then two different messages, and one alone. The second
-#           shot opens the run with the refused message.
+#           refused; then two different messages, and one alone. The run
+#           with the refused message shows its tooltip and its menu, then
+#           opens.
 #
 # The cards, narrow, long and keys scenes open the four messages' group, which
 # they fold into, before reaching their rows.
@@ -185,6 +187,18 @@ if [ "$scene" = runs ]; then
     [ -n "$refused" ] || refused=$(locate 'Messaged')
     [ -n "$refused" ] || "$ne" drive observe 2>&1 | grep -iE 'agents|sent|queued' | sed 's/^/   observed: /'
     if [ -n "$refused" ]; then
+        # Its tooltip says how each message went, and its menu copies the
+        # words they share.
+        "$ne" drive hover "$refused" >/dev/null 2>&1 || log "hover failed"
+        sleep 3
+        "$ne" shot message-runs-hover >/dev/null && log "shot message-runs-hover" ||
+            log "shot failed: message-runs-hover"
+        "$ne" drive click --button right "$refused" >/dev/null 2>&1 || log "right click failed"
+        sleep 2
+        "$ne" shot message-runs-menu >/dev/null && log "shot message-runs-menu" ||
+            log "shot failed: message-runs-menu"
+        "$ne" drive key Escape >/dev/null 2>&1 || :
+        sleep 1
         "$ne" drive click "$refused" >/dev/null 2>&1 || log "click failed"
         sleep 2
     else

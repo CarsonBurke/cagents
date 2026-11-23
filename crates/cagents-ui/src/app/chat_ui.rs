@@ -1879,6 +1879,40 @@ fn carry_step_disclosures(
     }
 }
 
+/// A message the reader had open stays in view when the next one folds the
+/// two into a group: the group they now share opens over it, as a lone
+/// step's does when a second joins it. Only a group the messages newly
+/// formed, which the reader has made no choice about.
+fn open_folded_messages(
+    opened: &mut Revised<HashMap<String, bool>>,
+    search: &mut find::Disclosure,
+    expanded: &HashSet<String>,
+    previous: &[turn::Turn],
+    next: &[turn::Turn],
+    next_items: &[Arc<chat::Item>],
+) {
+    for (index, turn) in next.iter().enumerate().filter(|(_, turn)| turn.messages) {
+        let Some(first) = turn
+            .steps
+            .first()
+            .and_then(|step| next_items.get(step.index))
+        else {
+            continue;
+        };
+        if !expanded.contains(&first.id) || search.reader_turn(&turn.key, opened).is_some() {
+            continue;
+        }
+        let was = previous
+            .get(index)
+            .filter(|old| old.key == turn.key)
+            .or_else(|| previous.iter().find(|old| old.key == turn.key));
+        if was.is_some_and(|old| old.messages) {
+            continue;
+        }
+        search.inherit_turn(&turn.key, true, opened);
+    }
+}
+
 /// How a step ended when that is worth a word: without doing what it was
 /// asked. A step that worked says nothing, as its group's mark already does,
 /// and one still running says so in its verb ("Running", "Editing").
@@ -6357,6 +6391,14 @@ impl Runtime {
                 &turns,
                 &self.snapshot.items,
             );
+            open_folded_messages(
+                &mut self.opened,
+                &mut self.find_disclosure,
+                &self.expanded,
+                &self.turns,
+                &turns,
+                &self.snapshot.items,
+            );
             self.turns = turns.into();
             reconcile_disclosure(&mut self.opened, &self.turns);
         }
@@ -6831,6 +6873,14 @@ impl Runtime {
                 &mut self.find_disclosure,
                 &self.turns,
                 &self.snapshot.items,
+                turns,
+                &snapshot.items,
+            );
+            open_folded_messages(
+                &mut self.opened,
+                &mut self.find_disclosure,
+                &self.expanded,
+                &self.turns,
                 turns,
                 &snapshot.items,
             );

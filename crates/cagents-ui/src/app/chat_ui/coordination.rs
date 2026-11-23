@@ -534,6 +534,12 @@ pub(super) struct MessageRun {
     /// Whether the preview is the words each agent was sent.
     shared: bool,
     state: RowStatus,
+    /// Whom each message went to and how it stands, for the tooltip.
+    each: Vec<String>,
+    /// The whole of the words they share, for the tooltip and to copy.
+    full: Option<String>,
+    /// The first message, whose words copying takes when they share them.
+    first: String,
 }
 
 /// One agent a run of messages went to: every name a send to it went by,
@@ -544,6 +550,36 @@ struct Agent {
 }
 
 impl Agent {
+    /// The one agent a message reached, by every name the send went by:
+    /// what it was addressed to, the agent the provider resolved, and the
+    /// session the CLI reports.
+    fn sent(
+        message: &Outbound,
+        reading: &Coordination,
+        listed: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
+        let mut names = vec![message.to.clone()];
+        for agent in &reading.subagents {
+            names.push(agent.clone());
+            names.extend(listed(agent));
+        }
+        if let Some(receipt) = &reading.outcome.receipt {
+            match receipt.recipient.strip_prefix("session ") {
+                Some(rest) => {
+                    let (session, title) = rest.split_once(' ').unwrap_or((rest, ""));
+                    names.push(session.to_owned());
+                    names.push(title.trim_matches('"').to_owned());
+                }
+                None => names.push(receipt.recipient.clone()),
+            }
+        }
+        names.retain(|name| !name.is_empty());
+        Self {
+            names,
+            shown: recipient(message, reading, listed).plain(),
+        }
+    }
+
     /// Whether `other` is this agent: by a session or agent ID, matching
     /// any of its abbreviations, where both know one, since sessions that
     /// share a title are not one; otherwise by any name of theirs.
@@ -578,12 +614,25 @@ impl MessageRun {
         let mut bodies = Vec::new();
         let mut agents: Vec<Agent> = Vec::new();
         let mut states = Vec::new();
+        let mut each = Vec::new();
+        let mut first = None;
+        // How many agents the messages reached between them, and whether
+        // one went to every teammate, which is more than this can count.
+        let (mut reached, mut everyone) = (0, false);
         for (item, coordinated) in sent {
-            let Kind::Message(message) = &coordinated.reading.kind else {
+            let reading = &coordinated.reading;
+            let Kind::Message(message) = &reading.kind else {
                 return None;
             };
+            first.get_or_insert_with(|| item.id.clone());
             let (status, output) = reported(item, coordinated);
-            states.push(message_state(&coordinated.reading, message, status, output));
+            let state = message_state(reading, message, status, output);
+            each.push(format!(
+                "{}: {}",
+                recipient(message, reading, listed).plain(),
+                state.reason()
+            ));
+            states.push(state);
             // Compared whole, as the agent wrote them: messages that open
             // alike and differ further on are not one message.
             bodies.push(
@@ -592,53 +641,48 @@ impl MessageRun {
                     .inline()
                     .map(|body| (body, coordinated.plain.said.first())),
             );
-            // A send that failed is known only by what it was addressed to,
-            // and its retry also by the agent or session it reached: every
-            // agent sharing one of those names is one.
-            let mut names = vec![message.to.clone()];
-            for agent in &coordinated.reading.subagents {
-                names.push(agent.clone());
-                names.extend(listed(agent));
-            }
-            if let Some(receipt) = &coordinated.reading.outcome.receipt {
-                match receipt.recipient.strip_prefix("session ") {
-                    Some(rest) => {
-                        let (session, title) = rest.split_once(' ').unwrap_or((rest, ""));
-                        names.push(session.to_owned());
-                        names.push(title.trim_matches('"').to_owned());
-                    }
-                    None => names.push(receipt.recipient.clone()),
-                }
-            }
-            names.retain(|name| !name.is_empty());
-            // The latest send to an agent names it best: it reached it.
-            let mut agent = Agent {
-                names,
-                shown: recipient(message, &coordinated.reading, listed).plain(),
+            everyone |= message.to == "*" && reading.subagents.is_empty();
+            let sends: Vec<Agent> = match reading.subagents.as_slice() {
+                // One message to several agents reached each of them.
+                several @ [_, _, ..] => several
+                    .iter()
+                    .map(|agent| Agent {
+                        names: std::iter::once(agent.clone())
+                            .chain(listed(agent))
+                            .collect(),
+                        shown: agents_phrase(reading, std::slice::from_ref(agent), listed),
+                    })
+                    .collect(),
+                _ => vec![Agent::sent(message, reading, listed)],
             };
-            agents.retain_mut(|known| {
-                let same = known.is(&agent);
-                if same {
-                    agent.names.append(&mut known.names);
-                }
-                !same
-            });
-            agents.push(agent);
+            reached += sends.len();
+            for mut agent in sends {
+                // The latest send to an agent names it best: it reached it.
+                agents.retain_mut(|known| {
+                    let same = known.is(&agent);
+                    if same {
+                        agent.names.append(&mut known.names);
+                    }
+                    !same
+                });
+                agents.push(agent);
+            }
         }
         let count = bodies.len();
         // The same words to several is one message said to each of them,
         // which is what the reader needs from the row; different words are
         // told apart by whom they went to, each message's own row giving
         // its words.
-        let shared = match bodies.split_first() {
+        let full = match bodies.split_first() {
             Some((Some((first, said)), rest)) if !first.trim().is_empty() => rest
                 .iter()
                 .all(|body| body.is_some_and(|(body, _)| body == *first))
-                .then(|| said.map(|said| one_line_of(said)).unwrap_or_default())
-                .filter(|said| !said.is_empty()),
+                .then(|| said.cloned().unwrap_or_default())
+                .filter(|said| !said.trim().is_empty()),
             _ => None,
         };
-        let each = agents.len() == count;
+        let shared = full.as_deref().map(one_line_of);
+        let distinct = !everyone && agents.len() == reached;
         let mut recipients: Vec<&str> = Vec::new();
         for agent in &agents {
             if !recipients.contains(&agent.shown.as_str()) {
@@ -652,8 +696,9 @@ impl MessageRun {
             format!("to {}", recipients.join(", "))
         };
         let (verb, count, preview, shares) = match shared {
-            Some(said) if each => ("Messaged", format!("{count} agents"), said, true),
-            // The same words sent again, as a retry is, still say whom to.
+            Some(said) if distinct => ("Messaged", format!("{} agents", agents.len()), said, true),
+            // The same words sent again, as a retry is, or to every
+            // teammate, still say whom to.
             Some(said) => (
                 "Sent",
                 format!("{count} messages"),
@@ -668,7 +713,24 @@ impl MessageRun {
             preview,
             shared: shares,
             state: rollup(states),
+            each,
+            full,
+            first: first?,
         })
+    }
+
+    /// The tooltip: whom each message went to and how it stands, then the
+    /// words they share.
+    pub(super) fn tip(&self) -> String {
+        const LISTED: usize = 12;
+        let mut tip = vec![format!("{} {}", self.verb, self.count)];
+        let mut each = self.each.iter().take(LISTED).cloned().collect::<Vec<_>>();
+        if self.each.len() > LISTED {
+            each.push(format!("and {} more", self.each.len() - LISTED));
+        }
+        tip.push(each.join("\n"));
+        tip.extend(self.full.as_deref().map(bounded));
+        tip.join("\n\n")
     }
 
     /// The row as one line of plain text.
@@ -1203,6 +1265,18 @@ impl RowStatus {
     fn error(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Error, false)
     }
+    /// The state in words with its reason, as a tooltip lists it.
+    fn reason(&self) -> String {
+        match self
+            .detail
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty())
+        {
+            Some(detail) if self.text.is_empty() => detail.to_owned(),
+            Some(detail) => format!("{}: {detail}", self.text),
+            None => self.text.to_string(),
+        }
+    }
 }
 
 /// How a run stands, as a row's status, naming the agent that runs it in
@@ -1248,6 +1322,28 @@ impl widget::menu::Action for RowCommand<'_> {
             Action::Copy(self.target, id, CopyPart::Text)
         } else {
             Action::Toggle(self.target, id)
+        })
+    }
+}
+
+/// A folded run of messages' context menu entry: copy the words its first
+/// message shares with the rest, or show or hide the group `key`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RunCommand<'a> {
+    target: Target,
+    key: &'a str,
+    first: &'a str,
+    copy: bool,
+}
+
+impl widget::menu::Action for RunCommand<'_> {
+    type Message = Message;
+
+    fn message(&self) -> Message {
+        action(if self.copy {
+            Action::Copy(self.target, self.first.to_owned(), CopyPart::Text)
+        } else {
+            Action::ToggleTurn(self.target, self.key.to_owned())
         })
     }
 }
@@ -1926,7 +2022,7 @@ impl Runtime {
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
             .width(Length::Fill);
-        Some(crate::interaction::a11y_target(
+        let button = crate::interaction::a11y_target(
             widget::button::custom(line)
                 .name(run.line())
                 .description(if open {
@@ -1938,7 +2034,36 @@ impl Runtime {
                 .width(Length::Fill)
                 .padding([step::GAP_XS as u16, step::GAP_S as u16])
                 .on_press(action(toggle)),
-        ))
+        );
+        let row = crate::interaction::tooltip(button, run.tip());
+        // As each message's row does: copy the words they share, and show
+        // or hide the messages.
+        let (target, key, first, shared) =
+            (self.target, turn.key.clone(), run.first, run.full.is_some());
+        let shows = if open {
+            "Hide messages"
+        } else {
+            "Show messages"
+        };
+        let menu = move || {
+            let command = |copy| RunCommand {
+                target,
+                key: &key,
+                first: &first,
+                copy,
+            };
+            let mut entries = Vec::new();
+            if shared {
+                entries.push(widget::menu::Item::Button(
+                    "Copy message",
+                    None,
+                    command(true),
+                ));
+            }
+            entries.push(widget::menu::Item::Button(shows, None, command(false)));
+            widget::menu::items(&HashMap::new(), entries)
+        };
+        Some(crate::interaction::context_menu_lazy(row, menu))
     }
 
     /// How the agents a step left running in the background are doing now,

@@ -13255,6 +13255,65 @@ fn a_group_opens_over_the_step_the_reader_opened_before_it_grew() {
     );
 }
 
+/// A message the reader opened stays open when the next folds the two into
+/// a group: the group opens over it. Its row, a menu and a tooltip say
+/// how each went.
+#[test]
+fn a_run_of_messages_opens_over_the_message_the_reader_opened() {
+    let send = |id: &str, to: &str, at: u64| chat::Item {
+        id: id.into(),
+        role: chat::Role::Assistant,
+        content: ItemContent::Tool {
+            name: "SendMessage".into(),
+            input: serde_json::json!({"to": to, "message": "Main is green again."}).to_string(),
+            output: String::new(),
+            status: chat::ToolStatus::Succeeded,
+        },
+        started_at: None,
+        at: Some(at),
+    };
+    let (runtime, handle) = frame_cost::live_runtime(&[send("toolu_m1", "docs-review", 1_000)]);
+    let target = runtime.target;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.cards
+        .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    drop(app.handle_chat_ui(Action::Toggle(target, "toolu_m1".into())));
+
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.permission_mode = runtime.snapshot.permission_mode.clone();
+    snapshot.generation += 1;
+    snapshot
+        .items
+        .push(Arc::new(send("toolu_m2", "perf-audit", 2_000)));
+    handle.publish_delta_snapshot_for_test(snapshot);
+    runtime.refresh();
+    preparation::drain_fixture(runtime);
+    let turn = runtime
+        .turns
+        .iter()
+        .find(|turn| turn.messages)
+        .expect("the two messages fold into a group")
+        .clone();
+    assert_eq!(turn.steps.len(), 2);
+    assert!(runtime.group_open(&turn));
+    assert!(runtime.item_expanded("toolu_m1"));
+    // The run's row, then both messages, the first with its detail open.
+    let texts = turn_texts(runtime);
+    assert_eq!(
+        texts[..4],
+        ["Messaged", "2 agents", "Main is green again.", "Delivered"],
+        "{texts:?}"
+    );
+    let first = texts.iter().position(|text| text == "docs-review");
+    let detail = texts.iter().position(|text| text == "Input");
+    let second = texts.iter().position(|text| text == "perf-audit");
+    assert!(
+        first < detail && detail < second && first.is_some(),
+        "{texts:?}"
+    );
+}
+
 /// A coordinating step reads in the past tense, so one still running
 /// without the spinner says it is working, as its group's strip did. The
 /// spinner moves on to newer work once the agent writes again.
