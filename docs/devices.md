@@ -160,11 +160,11 @@ connection's latest proof: the agents it starts on the device with
 `agent spawn` get no more than it could give them here, and it may approve
 their tool requests there only if it could here. A terminal it starts with
 `terminal spawn` runs any command on the device as you, and, as on this
-computer, the permission ceiling does not
-cover a provider CLI it starts that way. Allowing agents on a device therefore
-lets sessions here run commands there as you. An agent it starts on the device
-is a session of that device, so it may use the device's own links to further
-devices if a person there allowed them.
+computer, the permission ceiling does not cover a provider CLI it starts that
+way. Allowing agents on a device therefore lets sessions here run commands
+there as you. An agent it starts on the device is a session of that device, so
+it may use the device's own links to further devices if a person there allowed
+them.
 
 | Command | What it does |
 | --- | --- |
