@@ -2375,6 +2375,8 @@ fn update_workspace_viewport(
         // `focus_pane_keyboard_after_entry` and `_after_press`, which leave a
         // control the person chose where it is. The workspace's own request
         // would focus the pane's control regardless.
+        // Reading a pane moves nothing; the owner answers it before this.
+        WorkspaceViewportEvent::PointerScrolled(_) => (ViewportUpdate::unchanged(), false),
         WorkspaceViewportEvent::PointerEntered(card) => {
             let update = workspace
                 .focus_without_scrolling(card)
@@ -6345,6 +6347,20 @@ impl Cagents {
         let focus = self.focus_workspace_card(id);
         let read = self.note_chosen(id);
         Task::batch([focus, read])
+    }
+
+    /// Scrolling a pane's content is reading it: its news is read, and the
+    /// pane the pointer had only rested on becomes the one chosen. A pane
+    /// scrolled without holding the focus is read where it stands.
+    fn read_scrolled_pane(&mut self, id: CardId) -> Task<Message> {
+        if self.workspace.focused() == Some(id) {
+            self.hover_focus = None;
+        }
+        if self.sidebar_state.has_card_update(id) {
+            self.mark_cards_read(vec![id])
+        } else {
+            Task::none()
+        }
     }
 
     /// Records that the reader chose `id`, if it holds the focus, and reads
@@ -17698,6 +17714,11 @@ impl Application for Cagents {
                         let generation = self.workspace_view_generation;
                         move |event| Message::Viewport { generation, event }
                     },
+                    // Scrolling reads a pane that has news, and chooses the
+                    // pane the pointer only rested on.
+                    reads_on_scroll: |id| {
+                        self.sidebar_state.has_card_update(id) || self.hover_focused(id)
+                    },
                 },
             )
         };
@@ -19147,9 +19168,13 @@ impl Cagents {
                     event,
                     WorkspaceViewportEvent::PointerFocused { .. }
                         | WorkspaceViewportEvent::PointerEntered(_)
+                        | WorkspaceViewportEvent::PointerScrolled(_)
                 ) && self.workspace_inputs_blocked()
                 {
                     return Task::none();
+                }
+                if let WorkspaceViewportEvent::PointerScrolled(card) = event {
+                    return self.read_scrolled_pane(card);
                 }
                 if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
                     && (!self.settings.focus_follows_mouse

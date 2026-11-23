@@ -2325,7 +2325,10 @@ mod tests {
                         .into()
                 },
                 workspace_widget::card_widget_id,
-                workspace_widget::Events { viewport: |_| () },
+                workspace_widget::Events {
+                    viewport: |_| (),
+                    reads_on_scroll: |_| false,
+                },
             )
         };
         let _ = app.select_worktree("/a".into(), false);

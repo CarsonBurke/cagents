@@ -43,6 +43,9 @@ pub enum WorkspaceViewportEvent {
     /// The pointer moved into this pane, and was still over it when the next
     /// frame was drawn.
     PointerEntered(CardId),
+    /// The wheel turned over this pane's content: someone is reading it.
+    /// Published only for a pane [`Events::reads_on_scroll`] names.
+    PointerScrolled(CardId),
     Reordered {
         card: CardId,
         before: Option<CardId>,
@@ -1169,10 +1172,14 @@ pub fn shortcut_event_matches_unmodified(
 }
 
 /// The application's constructors for the events the strip reports.
-pub struct Events<ViewportMessage> {
+pub struct Events<ViewportMessage, ReadsOnScroll> {
     /// Scroll offsets and width changes, which the owner applies to the
     /// workspace so the next frame's projection matches what was drawn.
     pub viewport: ViewportMessage,
+    /// Whether scrolling a pane's content tells the owner anything, so the
+    /// wheel publishes [`WorkspaceViewportEvent::PointerScrolled`] only for
+    /// those panes rather than on every turn over any pane.
+    pub reads_on_scroll: ReadsOnScroll,
 }
 
 /// Renders the workspace strip.
@@ -1191,7 +1198,7 @@ pub struct Events<ViewportMessage> {
 ///
 /// `input` is the trace the owner's [`crate::input_trace::observe`] keeps for
 /// the whole window, which hover activation reads.
-pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage>(
+pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage, ReadsOnScroll>(
     workspace: &'a Workspace,
     shortcuts: &'a KeyboardShortcuts,
     focused_pane: FocusedPane,
@@ -1201,16 +1208,18 @@ pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage>(
     scroll_id: widget::Id,
     build_card: BuildCard,
     container_id: ContainerId,
-    events: Events<ViewportMessage>,
+    events: Events<ViewportMessage, ReadsOnScroll>,
 ) -> Element<'a, Message>
 where
     Message: Clone + 'static,
     BuildCard: Fn(CardViewContext) -> Element<'a, Message> + 'a,
     ContainerId: Fn(CardId) -> widget::Id + 'a,
     ViewportMessage: Fn(WorkspaceViewportEvent) -> Message + Clone + 'a,
+    ReadsOnScroll: Fn(CardId) -> bool,
 {
     let Events {
         viewport: on_viewport,
+        reads_on_scroll,
     } = events;
     let projection = workspace.projection(viewport_width);
     let strip =
@@ -1253,6 +1262,9 @@ where
                             // The active pane has nothing to gain from an entry.
                             .on_pointer_enter((focus_follows_mouse && !focused).then(|| {
                                 on_viewport(WorkspaceViewportEvent::PointerEntered(card.id))
+                            }))
+                            .on_pointer_scroll(reads_on_scroll(card.id).then(|| {
+                                on_viewport(WorkspaceViewportEvent::PointerScrolled(card.id))
                             }))
                             .into(),
                     })
@@ -1301,6 +1313,7 @@ struct CardSurface<'a, Message> {
     /// Published for a primary press and for any other press.
     on_pointer_focus: Option<(Message, Message)>,
     on_pointer_enter: Option<Message>,
+    on_pointer_scroll: Option<Message>,
     input: InputTrace,
     on_screen: bool,
 }
@@ -1311,6 +1324,7 @@ impl<'a, Message> CardSurface<'a, Message> {
             content: content.into(),
             on_pointer_focus: None,
             on_pointer_enter: None,
+            on_pointer_scroll: None,
             input: InputTrace::default(),
             on_screen: false,
         }
@@ -1341,6 +1355,13 @@ impl<'a, Message> CardSurface<'a, Message> {
     /// see [`CardPointerState`] for what counts.
     fn on_pointer_enter(mut self, message: Option<Message>) -> Self {
         self.on_pointer_enter = message;
+        self
+    }
+
+    /// Published when the wheel turns over this pane, before its content
+    /// scrolls.
+    fn on_pointer_scroll(mut self, message: Option<Message>) -> Self {
+        self.on_pointer_scroll = message;
         self
     }
 
@@ -1545,6 +1566,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
             } else {
                 other.clone()
             });
+        }
+        // Observed before the content scrolls and captures the wheel.
+        if !shell.is_event_captured()
+            && let Event::Mouse(mouse::Event::WheelScrolled { .. }) = event
+            && cursor.is_over(clipped)
+            && let Some(message) = &self.on_pointer_scroll
+        {
+            shell.publish(message.clone());
         }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
