@@ -880,6 +880,37 @@ about 0.6 GiB each. Evidence of main then copies them instead of compiling. A
 build that fails is logged to `logs/SHA-evidence.log` and not retried; evidence
 of that commit compiles it as before.
 
+Then it runs every lane's tests on that same commit, once, in the ordinary
+test profile on the sentinel's warm build directory:
+`scripts/cargo-gate test --locked --all-targets --no-fail-fast` for the CLI,
+`--features host`, the shared library and application with `ui`, the same
+with the integrated browser (`cagents-ui/browser-protocol-fixture`, which
+gives the shared library its `full` identity and browser paths), `-p ceditor`
+and the dictation helper: at least what each `mise run test:*` lane runs. The
+UI and browser lanes run two test threads (#2058), the others one per CPU, and
+a caller's `CAGENTS_TEST_*`, `RUST_TEST_*` and compiler-flag variables are
+not passed on. These are the test targets a release once ran itself, now
+unoptimized and with debug assertions on; the release smoke checks the packaged
+artifacts' production identity.
+`verdicts/SHA.json` in the state directory records each lane's exit status and
+time, and `logs/SHA-test-LANE.log` its output. Main moves faster than the tests
+run, so only the newest checked commit is tested, when it compiled; while main
+does not compile, nothing is tested. On failure the sentinel keeps one issue
+titled **Main test sentinel: test failure**, as for compilation, quoting each
+failing test with its output and each lane's command, and comments when a later
+commit passes. A lane that stops with a status other than Cargo's 101, such as
+the disk guard's refusal or a kill, says nothing about the code: it keeps no
+verdict, opens no issue, and the commit is tested again 30 minutes later.
+
+`scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
+commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a
+lane stopped outside the code and 4 if it could not get a verdict at all. A commit without a verdict, such as a version
+bump that main moved past before it was tested, is tested first, after any
+running check finishes, fetching main first if fw16 does not have it yet.
+A failing verdict is not retested on its own: to test a commit again, such as
+after a flaky failure, remove its `verdicts/SHA.json`. If that commit is the
+newest one tested, the watcher tests it again on its next run.
+
 After this change merges, install **one** user timer on fw16, from an updated
 main checkout. Put this in `~/.config/systemd/user/cagents-main-sentinel.service`,
 replacing `/absolute/path/to/cagents` in both places:

@@ -45,6 +45,13 @@ def sentinel_lanes():
     return module.LANES
 
 
+def sentinel_test_lanes():
+    loader = importlib.machinery.SourceFileLoader("main_build_sentinel", str(ROOT / "scripts/main-build-sentinel"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module.TEST_LANES
+
+
 def load():
     return tomllib.loads(CONFIG.read_text())
 
@@ -108,6 +115,18 @@ class Structure(unittest.TestCase):
                 self.assertLessEqual(packages(lanes[sentinel]) or {"cagents"}, packages(arguments) or {"cagents"})
                 self.assertLessEqual(features(lanes[sentinel]), features(arguments))
                 task = self.tasks[f"check:{lane}"]
+
+    def test_mains_test_lanes_run_every_lanes_tests(self):
+        # The verdict a release requires runs at least what each lane task tests.
+        lanes = sentinel_test_lanes()
+        variables = self.config["vars"]
+        for lane in LANES:
+            with self.subTest(lane=lane):
+                arguments = variables[lane].split()
+                selection = lanes[lane]
+                self.assertEqual("--no-default-features" in selection, "--no-default-features" in arguments)
+                self.assertLessEqual(packages(arguments) or {"cagents"}, packages(selection) or {"cagents"})
+                self.assertLessEqual(features(arguments), features(selection))
 
     def test_lane_and_aggregate_tasks_repeat_one_usage_spec(self):
         for name in ("check:cli", "check:host", "check:ui", "check:browser", "test:cli", "test:host", "test:ui"):
