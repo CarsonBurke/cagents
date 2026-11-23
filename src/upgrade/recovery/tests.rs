@@ -421,6 +421,52 @@ fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
 }
 
 #[test]
+fn a_reviewed_conversation_whose_provider_ended_need_not_be_checkpointed() {
+    use crate::update::impact::{Disposition, PROVIDER_ENDED, SessionImpact};
+    let root = crate::test_fixture::tempdir().unwrap();
+    let mut preparation = preparation(root.path());
+    let bytes = checkpoint(&preparation, "Prepared");
+    let chat = |reason: &str| SessionImpact {
+        id: TerminalId::new(),
+        kind: SessionKind::NativeChat,
+        title: String::new(),
+        identity: "ended-owner".into(),
+        disposition: Disposition::Resumes,
+        reason: reason.into(),
+        interrupted_subagents: Vec::new(),
+    };
+    let check = |preparation: &mut Preparation, row: SessionImpact| {
+        let mut reviewed = preparation.authority.reviewed.clone().unwrap();
+        reviewed.sessions.push(row);
+        preparation.authority.expected = checkpointed_owners(&reviewed);
+        validate_checkpoint(&preparation.authority, &bytes)
+    };
+    // The source skips a conversation with nothing left to carry; its
+    // window restarts the saved conversation.
+    assert_eq!(
+        check(&mut preparation, chat(PROVIDER_ENDED)).unwrap(),
+        "Prepared"
+    );
+    // Any other reviewed conversation must still be in the checkpoint.
+    assert_eq!(
+        check(
+            &mut preparation,
+            chat("The saved conversation will reopen with a new provider process.")
+        )
+        .unwrap_err(),
+        "The acknowledged checkpoint omitted a reviewed source owner"
+    );
+    // Only a reopening conversation is exempt, not a terminal or an owner
+    // that carries or waits, whatever its reason says.
+    let mut terminal = chat(PROVIDER_ENDED);
+    terminal.kind = SessionKind::Terminal;
+    assert!(check(&mut preparation, terminal).is_err());
+    let mut continues = chat(PROVIDER_ENDED);
+    continues.disposition = Disposition::Continues;
+    assert!(check(&mut preparation, continues).is_err());
+}
+
+#[test]
 fn census_work_in_flight_is_optional_and_names_only_its_own_conversations() {
     use crate::update::in_flight::InFlight;
     let root = crate::test_fixture::tempdir().unwrap();

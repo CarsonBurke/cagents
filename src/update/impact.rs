@@ -20,14 +20,23 @@ pub enum SessionKind {
     NativeChat,
 }
 
+/// A conversation has messages accepted for it but not yet delivered. They
+/// cannot be carried through an update, so it waits under either policy.
+pub const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
 /// A source refuses to carry a conversation whose provider stopped without
 /// confirming its work settled, and asks for it to be closed. Every source
 /// line since the candidate line (128) reports it in exactly these words, so
 /// the updater can recognize the one blocker that closing resolves.
-/// A conversation has messages accepted for it but not yet delivered. They
-/// cannot be carried through an update, so it waits under either policy.
-pub const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
 pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may still hold unfinished work. Close this conversation to release it.";
+/// A conversation whose provider already stopped and left nothing to carry.
+/// The source does not checkpoint it: its window restarts the saved
+/// conversation, as after any daemon restart. The updater recognizes these
+/// exact words so it does not require the checkpoint to name it. Every source
+/// line reports it in exactly these words, and a settled recovery record
+/// re-derives its required owners from them with the current build, so they
+/// must never change.
+pub const PROVIDER_ENDED: &str =
+    "Its provider already stopped. The saved conversation will reopen with a new provider process.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +76,14 @@ pub struct SessionReview {
 }
 
 impl SessionImpact {
+    /// Whether the source's checkpoint must carry this owner. Only a
+    /// conversation whose provider already ended is reviewed without one.
+    pub fn checkpointed(&self) -> bool {
+        !(self.kind == SessionKind::NativeChat
+            && self.disposition == Disposition::Resumes
+            && self.reason == PROVIDER_ENDED)
+    }
+
     pub fn review(&self) -> SessionReview {
         let reason = match self.disposition {
             Disposition::Continues => match self.kind {

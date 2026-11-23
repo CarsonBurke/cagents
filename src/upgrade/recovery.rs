@@ -599,11 +599,7 @@ impl Authority {
             source: source.clone(),
             census: census.clone(),
             windows: windows.to_vec(),
-            expected: reviewed
-                .sessions
-                .iter()
-                .map(|item| (item.kind, item.id))
-                .collect(),
+            expected: checkpointed_owners(reviewed),
             checkpoint_path: path(),
             checkpoint_hash: hash(),
             worker_path: path(),
@@ -1402,11 +1398,7 @@ impl Preparation {
                 source: daemon.capability.proof.clone(),
                 census,
                 windows: guard.prepared_window_slots().to_vec(),
-                expected: daemon
-                    .sessions
-                    .iter()
-                    .map(|item| (item.kind, item.id))
-                    .collect(),
+                expected: checkpointed_owners(daemon),
                 checkpoint_path: store.path,
                 checkpoint_hash: String::new(),
                 worker_path,
@@ -1948,11 +1940,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
         source: daemon.capability.proof.clone(),
         census: census.clone(),
         windows: Vec::new(),
-        expected: daemon
-            .sessions
-            .iter()
-            .map(|item| (item.kind, item.id))
-            .collect(),
+        expected: checkpointed_owners(daemon),
         checkpoint_path: PathBuf::new(),
         checkpoint_hash: String::new(),
         worker_path: PathBuf::new(),
@@ -1969,6 +1957,18 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
         return Err("The acknowledged preparation is still Prepared; previous provider shutdown is unconfirmed and ordinary startup is refused".into());
     }
     Ok(())
+}
+
+/// The reviewed owners the source's checkpoint must name. A conversation
+/// whose provider already ended is reviewed, so the user sees it reopen, but
+/// the source has nothing of it to checkpoint and leaves it out.
+pub(crate) fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, TerminalId)> {
+    reviewed
+        .sessions
+        .iter()
+        .filter(|item| item.checkpointed())
+        .map(|item| (item.kind, item.id))
+        .collect()
 }
 
 fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, String> {
@@ -2510,10 +2510,9 @@ fn validate_settled_identity(
         windows: record.windows.clone(),
         expected: record
             .reviewed
-            .iter()
-            .flat_map(|reviewed| reviewed.sessions.iter())
-            .map(|item| (item.kind, item.id))
-            .collect(),
+            .as_ref()
+            .map(checkpointed_owners)
+            .unwrap_or_default(),
         checkpoint_path: checkpoint_path.to_owned(),
         checkpoint_hash: record.checkpoint_hash.clone(),
         worker_path: PathBuf::new(),
