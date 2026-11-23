@@ -432,6 +432,7 @@ mod tests {
                 .into(),
             },
             session_id: None,
+            draft_model: None,
         }
     }
 

@@ -166,6 +166,7 @@ mod tests {
             provider,
             recipe,
             session_id: Some(ID.into()),
+            draft_model: None,
         }
     }
 

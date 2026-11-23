@@ -290,6 +290,7 @@ mod tests {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         }
     }

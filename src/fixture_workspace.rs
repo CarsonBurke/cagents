@@ -420,6 +420,7 @@ impl Plan {
                     },
                     recipe: self.recipe(program, arguments, cwd, environment)?,
                     session_id: session_id.clone(),
+                    draft_model: None,
                 },
                 proof: None,
                 terminal: None,
@@ -687,6 +688,7 @@ mod tests {
                     )]),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             };
             let (_, mut adapter) = crate::chat::protocol::create_history(&launch)
                 .unwrap_or_else(|error| panic!("{session_id}: {error}"));

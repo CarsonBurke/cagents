@@ -138,6 +138,7 @@ fn shared_close_fences_pending_terminal_and_native_starts() {
                         provider: crate::agent::Provider::Claude,
                         recipe: source.launch.clone(),
                         session_id: None,
+                        draft_model: None,
                     },
                     proof: Some(proof),
                     terminal: None,

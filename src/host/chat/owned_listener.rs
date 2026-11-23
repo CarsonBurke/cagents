@@ -411,6 +411,7 @@ mod tests {
                     environment: Default::default(),
                 },
                 session_id: session_id.map(str::to_owned),
+                draft_model: None,
             },
             proof: None,
             terminal: None,

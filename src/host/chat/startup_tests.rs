@@ -69,6 +69,7 @@ fn managed_codex_start_releases_bundle_lease_before_provider_spawn() {
                 unset_environment: Default::default(),
             },
             session_id: None,
+            draft_model: None,
         },
     };
     let host = Arc::new(crate::host::state::HostLock::new(HostState::new(

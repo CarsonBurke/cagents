@@ -1579,6 +1579,7 @@ mod tests {
                         unset_environment: Default::default(),
                         working_directory: "/project".into(),
                     },
+                    draft_model: None,
                 },
             }),
         };

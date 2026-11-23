@@ -3537,6 +3537,7 @@ pub(in crate::app) mod tests {
                     environment: Default::default(),
                 },
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: None,

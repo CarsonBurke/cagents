@@ -410,6 +410,7 @@ mod tests {
                         environment: Default::default(),
                         unset_environment: Default::default(),
                     },
+                    draft_model: None,
                 },
             };
             let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();

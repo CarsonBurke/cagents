@@ -2383,6 +2383,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: None,
+                draft_model: None,
             },
             proof: None,
             terminal: None,

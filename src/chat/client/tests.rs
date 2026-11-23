@@ -1334,6 +1334,7 @@ fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Sess
                 environment: BTreeMap::new(),
             },
             session_id: conversation.map(str::to_owned),
+            draft_model: None,
         },
         proof,
         terminal: None,

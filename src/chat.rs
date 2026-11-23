@@ -239,6 +239,7 @@ mod acp_permission_tests {
             provider: Provider::Antigravity,
             recipe: recipe(&["--mode", "plan", "--model", "m"]),
             session_id: Some("98608bab-5eb6-4cf5-8f9b-46019bf29df7".into()),
+            draft_model: None,
         };
         for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
             let terminal = launch.terminal_recipe_with_permission_mode(mode).unwrap();
@@ -323,12 +324,78 @@ pub fn now_ms() -> Option<u64> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Launch {
     pub provider: Provider,
     /// The original agent executable, launch options, working directory and environment.
     pub recipe: LaunchRecipe,
     /// An exact provider conversation identifier, never a latest-session selector.
     pub session_id: Option<String>,
+    /// The model and effort chosen for an unstarted draft's first message, so
+    /// that every window showing the draft shows and starts it on them. It
+    /// applies only to the draft it was chosen in (see
+    /// [`ChatDraftModel::applies_to`]) and never reaches the provider's
+    /// process. Absent from an older record or peer, which kept the choice
+    /// with the window.
+    #[serde(default)]
+    /// Boxed because it is rarely present and every launch carries the slot.
+    pub draft_model: Option<Box<crate::model::ChatDraftModel>>,
+}
+
+/// As derived, except that a peer from before [`Launch::draft_model`] is sent
+/// the fields it decodes. A saved launch without a choice is written as it
+/// was before the field, so a record an older release digested, such as an
+/// update's census, digests alike.
+impl Serialize for Launch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let before =
+            crate::terminal_ipc::encoding_before(crate::terminal_ipc::DRAFT_MODEL_IN_LAUNCH)
+                || (serializer.is_human_readable() && self.draft_model.is_none());
+        if !before {
+            return Self::serialize(self, serializer);
+        }
+        #[derive(Serialize)]
+        #[serde(rename = "Launch")]
+        struct Before<'a> {
+            provider: &'a Provider,
+            recipe: &'a LaunchRecipe,
+            session_id: &'a Option<String>,
+        }
+        Before {
+            provider: &self.provider,
+            recipe: &self.recipe,
+            session_id: &self.session_id,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// As derived, except that one from a peer before [`Launch::draft_model`]
+/// carries no draft choice.
+impl<'de> Deserialize<'de> for Launch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if !crate::terminal_ipc::decoding_before(crate::terminal_ipc::DRAFT_MODEL_IN_LAUNCH) {
+            return Self::deserialize(deserializer);
+        }
+        #[derive(Deserialize)]
+        #[serde(rename = "Launch")]
+        struct Before {
+            provider: Provider,
+            recipe: LaunchRecipe,
+            session_id: Option<String>,
+        }
+        let Before {
+            provider,
+            recipe,
+            session_id,
+        } = Before::deserialize(deserializer)?;
+        Ok(Self {
+            provider,
+            recipe,
+            session_id,
+            draft_model: None,
+        })
+    }
 }
 
 impl Launch {
@@ -3714,6 +3781,7 @@ mod retained_native_pair_tests {
                 provider: Provider::Claude,
                 recipe: recipe.clone(),
                 session_id: confirmed.then(|| uuid::Uuid::new_v4().to_string()),
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: Some(Box::new(TerminalSession {
@@ -4067,6 +4135,7 @@ mod tests {
                 unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
             },
             session_id: Some("d1714898-6c54-4727-8113-0d5b9db7aeb9".into()),
+            draft_model: None,
         };
         let recipe = launch
             .terminal_recipe_with_permission_mode(Some("acceptEdits"))
@@ -4486,6 +4555,7 @@ mod tests {
                 environment: Default::default(),
             },
             session_id: Some("01a0ab66-21d6-7065-9fe5-95f302b669e1".into()),
+            draft_model: None,
         };
         let recipe = launch
             .terminal_recipe()
@@ -4520,6 +4590,7 @@ mod tests {
                     environment: Default::default(),
                 },
                 session_id: session_id.map(str::to_owned),
+                draft_model: None,
             },
             proof: None,
             terminal: None,
@@ -4729,6 +4800,7 @@ pub fn fresh_session(
             provider,
             recipe,
             session_id: None,
+            draft_model: None,
         },
         proof: None,
         terminal: None,

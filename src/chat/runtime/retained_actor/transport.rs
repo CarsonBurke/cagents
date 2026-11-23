@@ -457,6 +457,7 @@ pub(super) fn fixture_source() -> chat::Session {
                 unset_environment: Default::default(),
             },
             session_id: None,
+            draft_model: None,
         },
         proof: Some(HostSessionProof {
             boot_id: crate::model::BootId::new("fixture-boot"),

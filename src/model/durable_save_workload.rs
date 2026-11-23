@@ -30,6 +30,7 @@ fn workspace(count: usize) -> WorkspaceState {
                             unset_environment: Default::default(),
                         },
                         session_id: Some(uuid::Uuid::new_v4().to_string()),
+                        draft_model: None,
                     },
                     native_continuity: Default::default(),
                     owned_codex_listener: None,

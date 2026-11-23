@@ -32,6 +32,7 @@ fn claude(root: &Path, session_id: Option<String>) -> Session {
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     }
 }
@@ -52,6 +53,7 @@ fn unrestored_codex(
             environment: Default::default(),
             unset_environment: Default::default(),
         },
+        draft_model: None,
     };
     crate::upgrade::handoff::Chat {
         source: Session {

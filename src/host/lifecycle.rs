@@ -1495,6 +1495,7 @@ mod tests {
                             provider: crate::agent::Provider::Claude,
                             recipe: replacement.launch.clone(),
                             session_id: Some("already-returned-handoff-fixture".into()),
+                            draft_model: None,
                         },
                         proof: Some(proof.clone()),
                         terminal: None,

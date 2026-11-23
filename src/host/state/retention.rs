@@ -329,6 +329,7 @@ mod tests {
                         provider: crate::agent::Provider::Claude,
                         recipe: replacement.launch.clone(),
                         session_id: Some("retention-policy-metadata".into()),
+                        draft_model: None,
                     },
                     proof: None,
                     terminal: None,

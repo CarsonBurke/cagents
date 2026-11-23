@@ -1116,6 +1116,7 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
             provider: Provider::Antigravity,
             recipe,
             session_id: None,
+            draft_model: None,
         },
         proof: Some(state.proof().clone()),
         terminal: None,

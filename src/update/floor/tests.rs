@@ -462,6 +462,7 @@ fn add_chat(
             provider: crate::agent::Provider::Claude,
             recipe: source.inventory.terminals[0].session.launch.clone(),
             session_id: recorded.then(|| format!("recorded-{id}")),
+            draft_model: None,
         },
         proof: Some(
             source
@@ -1309,6 +1310,7 @@ fn pending_source() -> (FakeSource, TerminalId) {
             provider: crate::agent::Provider::Claude,
             recipe: source.inventory.terminals[0].session.launch.clone(),
             session_id: None,
+            draft_model: None,
         },
         proof: Some(daemon.capability.proof.clone()),
         terminal: None,
@@ -1384,6 +1386,7 @@ fn paired_chat_and_console_are_listed_as_one_pane() {
             provider: crate::agent::Provider::Codex,
             recipe: terminal.launch.clone(),
             session_id: Some("recorded".into()),
+            draft_model: None,
         },
         proof: source
             .preview

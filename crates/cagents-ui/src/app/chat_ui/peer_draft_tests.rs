@@ -29,6 +29,7 @@ fn draft_session(directory: &std::path::Path) -> chat::Session {
                 unset_environment: Default::default(),
                 environment: Default::default(),
             },
+            draft_model: None,
         },
     }
 }

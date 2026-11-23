@@ -544,6 +544,7 @@ mod tests {
                         unset_environment: Default::default(),
                     },
                     session_id: recorded.then(|| "recorded-conversation".into()),
+                    draft_model: None,
                 },
                 proof: None,
                 terminal: None,

@@ -62,6 +62,7 @@ fn issued(id: TerminalId, proof: &HostSessionProof) -> crate::chat::Session {
                 unset_environment: Default::default(),
             },
             session_id: None,
+            draft_model: None,
         },
         proof: Some(proof.clone()),
         terminal: None,

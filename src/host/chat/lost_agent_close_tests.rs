@@ -82,6 +82,7 @@ fn retained_source(host: &SharedHost, saved_boot: &str) -> Fixture {
                 .into(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
         proof: Some(proof),
         terminal: None,

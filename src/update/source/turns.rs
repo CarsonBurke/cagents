@@ -225,6 +225,14 @@ mod tests {
         crate::terminal_ipc::encoding_for(156, || crate::terminal_ipc::write_frame(writer, value))
     }
 
+    /// Runs a fake protocol 156 source on its own thread, reading the client's
+    /// requests as that daemon decodes them.
+    fn spawn_source<R: Send + 'static>(
+        source: impl FnOnce() -> R + Send + 'static,
+    ) -> thread::JoinHandle<R> {
+        thread::spawn(move || crate::terminal_ipc::decoding_from(156, source))
+    }
+
     fn child(status: ToolStatus) -> crate::chat::Subagent {
         crate::chat::Subagent {
             id: "background-child".into(),
@@ -376,6 +384,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("parent-thread".into()),
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: None,
@@ -383,7 +392,7 @@ mod tests {
             native_continuity: Default::default(),
         };
         let source = session.clone();
-        let server = thread::spawn(move || {
+        let server = spawn_source(move || {
             let response = |stream: &mut UnixStream, request_id, response| {
                 write_frame(
                     stream,

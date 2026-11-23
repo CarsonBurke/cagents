@@ -2837,6 +2837,7 @@ mod tests {
                 provider: agent.spec.provider,
                 session_id: None,
                 recipe: console.launch,
+                draft_model: None,
             },
         };
         agent.spec.surface = crate::agent_execution::Surface::Chat;
@@ -2906,6 +2907,7 @@ mod tests {
                     provider: agent.spec.provider,
                     session_id: None,
                     recipe: console.launch.clone(),
+                    draft_model: None,
                 },
             };
             agent.session = Some(HostedSession::Chat(native.clone()));
@@ -3034,6 +3036,7 @@ mod tests {
                 provider: agent.spec.provider,
                 session_id: None,
                 recipe: console.launch.clone(),
+                draft_model: None,
             },
         };
         agent.session = Some(HostedSession::Chat(native.clone()));
@@ -3080,6 +3083,7 @@ mod tests {
                 provider: agent.spec.provider,
                 session_id: None,
                 recipe: console.launch.clone(),
+                draft_model: None,
             },
         };
         agent.session = Some(HostedSession::Chat(native));

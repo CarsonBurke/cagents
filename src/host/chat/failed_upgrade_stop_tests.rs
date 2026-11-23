@@ -22,6 +22,7 @@ fn failed_upgrade_stop_requires_its_listener_to_be_unserved() {
                 unset_environment: Default::default(),
             },
             session_id: None,
+            draft_model: None,
         },
         proof: None,
         terminal: None,

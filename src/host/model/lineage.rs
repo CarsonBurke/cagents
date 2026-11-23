@@ -568,6 +568,7 @@ mod tests {
                 provider: Provider::Claude,
                 recipe: shell(id, None).launch,
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
+                draft_model: None,
             },
             proof: None,
             terminal: Some(Box::new(shell(id, recovery_origin))),

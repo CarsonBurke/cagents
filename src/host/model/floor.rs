@@ -259,6 +259,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("recorded".into()),
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: None,

@@ -469,6 +469,7 @@ mod tests {
                 provider: Provider::Claude,
                 recipe: terminal.launch.clone(),
                 session_id: None,
+                draft_model: None,
             },
             proof: terminal.continuity.live_proof(),
             terminal: Some(Box::new(terminal.clone())),

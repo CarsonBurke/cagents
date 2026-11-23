@@ -583,6 +583,7 @@ mod tests {
                     environment: environment.clone(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             };
             let skills = crate::chat::skills::discover(&launch);
             assert!(

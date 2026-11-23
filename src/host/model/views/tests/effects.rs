@@ -267,6 +267,7 @@ fn a_new_primary_conversation_carries_the_channel_title_it_reset() {
             provider: crate::agent::Provider::Codex,
             recipe: terminal.launch.clone(),
             session_id: Some("first-thread".into()),
+            draft_model: None,
         },
         proof: terminal.continuity.live_proof(),
         terminal: None,

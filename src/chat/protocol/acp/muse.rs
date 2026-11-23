@@ -213,6 +213,7 @@ mod tests {
                 unset_environment: Default::default(),
             },
             session_id: session.map(str::to_owned),
+            draft_model: None,
         }
     }
 

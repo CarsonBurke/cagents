@@ -46,6 +46,7 @@ pub(super) fn retained_chat(title: &str) -> CardState {
             provider: crate::agent::Provider::Claude,
             recipe,
             session_id: Some(uuid::Uuid::new_v4().to_string()),
+            draft_model: None,
         },
     };
     assert!(session.has_valid_native_continuity());

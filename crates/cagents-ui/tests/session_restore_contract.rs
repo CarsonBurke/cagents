@@ -337,6 +337,7 @@ fn managed_image_drafts_survive_debounced_shutdown_navigation_and_metadata_only_
                         ..fixture.launch.clone()
                     },
                     session_id: None,
+                    draft_model: None,
                 },
                 proof: None,
                 terminal: None,

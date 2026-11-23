@@ -18,6 +18,7 @@ fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
                 home.to_string_lossy().into_owned(),
             )]),
         },
+        draft_model: None,
     }
 }
 
@@ -1698,6 +1699,7 @@ fn an_explicit_default_remote_starts_new_threads_on_the_shared_server() {
                 home.path().to_string_lossy().into_owned(),
             )]),
         },
+        draft_model: None,
     };
     let (spec, mut adapter) = create(&launch).unwrap();
     assert!(matches!(
@@ -4360,6 +4362,7 @@ fn joins_exact_thread_without_settings_or_history_overrides() {
                 directory.path().to_str().unwrap().into(),
             )]),
         },
+        draft_model: None,
     };
     let (spec, mut adapter) = create(&launch).unwrap();
     assert!(matches!(
@@ -4401,6 +4404,7 @@ fn a_new_thread_carries_the_terminal_bypass_into_its_own_settings() {
                 directory.path().to_str().unwrap().into(),
             )]),
         },
+        draft_model: None,
     };
     let (spec, mut adapter) = create(&launch).unwrap();
     assert_eq!(spec.arguments, vec!["app-server"]);
@@ -4431,6 +4435,7 @@ fn a_new_thread_takes_its_reasoning_effort_as_a_start_override() {
                 directory.path().to_str().unwrap().into(),
             )]),
         },
+        draft_model: None,
     };
     for (arguments, effort) in [
         (&["--config", "model_reasoning_effort=low"][..], "low"),

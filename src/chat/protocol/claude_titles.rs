@@ -232,6 +232,7 @@ mod tests {
                 environment: [("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into())].into(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         };
         // An explicit config requires no HOME and resolves relative paths in
         // the launch directory, just like the existing exact history reader.
@@ -363,6 +364,7 @@ mod tests {
                 environment: [("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into())].into(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         };
         (directory, launch, id, path)
     }

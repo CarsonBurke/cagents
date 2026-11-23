@@ -1099,6 +1099,7 @@ mod tests {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
             proof: Some(crate::model::HostSessionProof {
                 host_session_id: crate::model::HostSessionId::new("host"),

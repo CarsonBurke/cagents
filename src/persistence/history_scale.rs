@@ -52,6 +52,7 @@ fn kind(name: &str, index: usize) -> CardKind {
                 provider: crate::agent::Provider::Claude,
                 recipe: recipe(index, "claude"),
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
+                draft_model: None,
             },
             proof: None,
             terminal: None,

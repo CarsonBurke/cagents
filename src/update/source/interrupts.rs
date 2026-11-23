@@ -579,6 +579,14 @@ mod tests {
         crate::terminal_ipc::encoding_for(156, || crate::terminal_ipc::write_frame(writer, value))
     }
 
+    /// Runs a fake protocol 156 source on its own thread, reading the client's
+    /// requests as that daemon decodes them.
+    fn spawn_source<R: Send + 'static>(
+        source: impl FnOnce() -> R + Send + 'static,
+    ) -> thread::JoinHandle<R> {
+        thread::spawn(move || crate::terminal_ipc::decoding_from(156, source))
+    }
+
     fn fixture() -> (Session, impact::DaemonImpact, directory::Entry) {
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new("source"),
@@ -597,6 +605,7 @@ mod tests {
                     unset_environment: Default::default(),
                 },
                 session_id: Some("exact-thread".into()),
+                draft_model: None,
             },
             proof: Some(proof.clone()),
             terminal: None,
@@ -721,7 +730,7 @@ mod tests {
         let source = session.clone();
         let impact = daemon.clone();
         let late_run = RunId::new();
-        let server = thread::spawn(move || {
+        let server = spawn_source(move || {
             while let Some(envelope) = read_frame::<ClientEnvelope>(&mut server_stream).unwrap() {
                 let phase = server_phase.load(Ordering::SeqCst);
                 let response = match envelope.request {
@@ -932,7 +941,7 @@ mod tests {
         let proof = consent.capability.proof.clone();
         let impact = consent.clone();
         let source = session.clone();
-        let server = thread::spawn(move || {
+        let server = spawn_source(move || {
             while let Some(envelope) = read_frame::<ClientEnvelope>(&mut server_stream).unwrap() {
                 let response = match envelope.request {
                     ClientRequest::Connect { .. } => ServerResponse::Connected {

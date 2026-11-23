@@ -151,6 +151,7 @@ fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session
             provider: crate::agent::Provider::Claude,
             recipe,
             session_id: None,
+            draft_model: None,
         },
     };
     host.lock().unwrap().chats.insert(

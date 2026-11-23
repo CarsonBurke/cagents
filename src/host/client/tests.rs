@@ -402,6 +402,7 @@ fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences()
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         };
         {
@@ -467,6 +468,7 @@ fn admission_refusing_an_automatic_switch_marks_it_not_admitted() {
                 environment: Default::default(),
                 unset_environment: Default::default(),
             },
+            draft_model: None,
         },
     };
     let mut replacement = source.clone();
@@ -716,6 +718,7 @@ fn destructive_terminal_replies_drain_before_ordinary_exit_seals_delivery() {
                 provider: crate::agent::Provider::Omp,
                 recipe,
                 session_id: None,
+                draft_model: None,
             },
         };
         {
@@ -1536,6 +1539,7 @@ fn completed_close_preserves_a_replacement_worker_and_exact_native_pair() {
                         provider: crate::agent::Provider::Codex,
                         recipe: current.launch.clone(),
                         session_id: Some("pair-one".into()),
+                        draft_model: None,
                     },
                     native_continuity: Default::default(),
                     owned_codex_listener: None,
@@ -1900,6 +1904,7 @@ fn explicit_close_retains_registered_original_until_actual_holder_receipt() {
             provider: crate::agent::Provider::Claude,
             recipe: refused_recipe,
             session_id: None,
+            draft_model: None,
         },
         native_continuity: Default::default(),
         owned_codex_listener: None,
@@ -2085,6 +2090,7 @@ fn resident_release_drains_admitted_control_operations_before_retirement() {
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
+                draft_model: None,
             },
         },
         execution_instance: uuid::Uuid::new_v4(),
@@ -2343,6 +2349,7 @@ fn assert_completed_native_confirmation_case(
                         provider,
                         recipe,
                         session_id: Some("exact-thread".into()),
+                        draft_model: None,
                     },
                 },
                 handle: actor.clone(),
@@ -2507,6 +2514,7 @@ pub(in crate::host) fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdo
                         provider: Provider::Claude,
                         recipe,
                         session_id: None,
+                        draft_model: None,
                     },
                     proof: Some(proof),
                     terminal: None,
