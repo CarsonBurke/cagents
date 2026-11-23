@@ -61,6 +61,13 @@ pub(super) fn checked_caller(
     host: &SharedHost,
     authority: &Authority,
 ) -> Result<(Origin, Option<TerminalId>), super::model::AuthorityError> {
+    // A linked computer's session has no session here; its connection proved
+    // which of that computer's lineages it acts for.
+    if let Some(origin) = super::device_trust::peer_origin(host, authority) {
+        return origin
+            .map(|origin| (origin, None))
+            .map_err(super::model::AuthorityError::Denied);
+    }
     let registry = registry(host)?;
     let (origin, source) = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -105,6 +112,11 @@ pub(super) fn caller_ceiling(
     authority: &Authority,
 ) -> Result<Option<crate::agent_execution::permission::Ceiling>, String> {
     use crate::agent_execution::permission::Ceiling;
+    // A linked computer's session is held to the ceiling its own daemon
+    // vouched for when its connection proved it.
+    if let Some(ceiling) = super::device_trust::peer_ceiling(host, authority) {
+        return ceiling.map(Some);
+    }
     let source = registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())

@@ -1546,6 +1546,39 @@ fn process_admitted_request(
             super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::DeviceTrust { request } => {
+            drop(_shared);
+            let reply = super::device_trust::process(request)?;
+            Ok((ServerResponse::DeviceTrust(reply), Vec::new(), false))
+        }
+        ClientRequest::PeerChallenge => {
+            let nonce = super::device_trust::challenge(host, client_id)?;
+            Ok((ServerResponse::PeerChallenge { nonce }, Vec::new(), false))
+        }
+        ClientRequest::PeerAuthenticate { peer, claim, proof } => {
+            drop(_shared);
+            let authority =
+                super::device_trust::authenticate(host, client_id, peer, &claim, &proof)?;
+            Ok((
+                ServerResponse::PeerAuthenticated { authority },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::SignDeviceChallenge {
+            authority,
+            device,
+            nonce,
+        } => {
+            drop(_shared);
+            let (peer, claim, proof) =
+                super::device_trust::sign(host, &authority, &device, &nonce)?;
+            Ok((
+                ServerResponse::DeviceProof { peer, claim, proof },
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::RetiredChannelWork => Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
             crate::terminal_ipc::RETIRED_CHANNEL_WORK,

@@ -37,6 +37,8 @@ A native conversation's mode is the one its provider confirmed most recently. Un
 
 `--name reviewer` gives a new agent a durable handle unique among your open agents. Names start with a lowercase letter and contain up to 64 lowercase letters, digits, hyphens or underscores; whole UUIDs are reserved for IDs. Another owner may use the same name. Closing the agent releases its name for reuse. For example, spawn with `cagents agent spawn --name reviewer 'Review this change'`, then continue with `cagents agent send reviewer 'Check the tests too'`. List and JSON output include the name. The agent's tab combines that name with the first line of its original task, such as `reviewer · Review this change`. It keeps that label before and after the conversation opens; explicit pane and channel names keep their existing precedence. Pressing the parent's spawn row opens the child. Its hover arrow uses the shared compact Open glyph; the context menu copies the prompt or shows launch details.
 
+A session can also start and drive agents on a linked device with `--device NAME`, once a person has allowed it; see [Agents on a device](devices.md#agents-on-a-device).
+
 ## Results and retries
 
 ```sh

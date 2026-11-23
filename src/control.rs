@@ -30,6 +30,7 @@ mod chat;
 #[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
+mod devices;
 mod fields;
 mod format;
 mod gh;
@@ -249,6 +250,11 @@ pub enum TopCommand {
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
+    /// Link this computer to saved devices and choose which sessions here may use them.
+    Device {
+        #[command(subcommand)]
+        command: devices::DeviceCommand,
+    },
     /// Read GitHub status through a shared local cache.
     Gh {
         #[command(subcommand)]
@@ -790,6 +796,10 @@ pub enum ControlError {
     IncrementalSnapshot,
     #[error("shutdown request rejected: {0:?}")]
     ShutdownRejected(ShutdownOutcome),
+    /// This computer or the device refused to let the calling session act on
+    /// the device, for the reason the message gives.
+    #[error("{0}")]
+    DeviceAccess(String),
 }
 
 fn remote_display(code: ProtocolErrorCode, message: &str, retryable: bool) -> String {
@@ -939,6 +949,9 @@ pub struct ControlClient {
     /// are not retained, but queued notifications can outlive a Detach reply,
     /// so remember their IDs for this connection's lifetime.
     terminal_streams: BTreeSet<TerminalId>,
+    /// On another device, the capability this connection proved for the
+    /// calling session's lineage, used in place of the session's own.
+    device_peer: Option<Authority>,
 }
 
 impl std::fmt::Debug for ControlClient {
@@ -1137,6 +1150,7 @@ impl ControlClient {
             observed_conversation: None,
             attached_chats: BTreeSet::new(),
             terminal_streams: BTreeSet::new(),
+            device_peer: None,
         })
     }
 
@@ -2561,6 +2575,111 @@ impl ControlClient {
         }
     }
 
+    /// `request` as the calling session makes it on the selected device.
+    ///
+    /// A session's own capability names it only to this computer's daemon.
+    /// On another device, the first request that carries it proves the
+    /// session's lineage on this connection instead: the device sends a
+    /// nonce, this computer's daemon signs it if a person allowed sessions
+    /// here to use the device, and the device answers with a capability for
+    /// that lineage, which every request of this connection then carries.
+    fn for_device(&mut self, request: ClientRequest) -> Result<ClientRequest, ControlError> {
+        let session = match &request {
+            ClientRequest::Agent { authority, .. }
+            | ClientRequest::Automation { authority, .. }
+            | ClientRequest::Authenticate { authority } => authority,
+            _ => return Ok(request),
+        };
+        let Some(device) = crate::device::selected() else {
+            return Ok(request);
+        };
+        if session.token().is_none() {
+            return Ok(request);
+        }
+        let peer = match &self.device_peer {
+            Some(peer) => peer.clone(),
+            None => {
+                let peer = self.prove_session(session.clone(), &device.name)?;
+                self.device_peer = Some(peer.clone());
+                peer
+            }
+        };
+        Ok(match request {
+            ClientRequest::Agent { operation, .. } => ClientRequest::Agent {
+                authority: peer,
+                operation,
+            },
+            ClientRequest::Automation { operation, .. } => ClientRequest::Automation {
+                authority: peer,
+                operation,
+            },
+            ClientRequest::Authenticate { .. } => ClientRequest::Authenticate { authority: peer },
+            request => request,
+        })
+    }
+
+    fn prove_session(
+        &mut self,
+        session: Authority,
+        device: &str,
+    ) -> Result<Authority, ControlError> {
+        // A daemon that answered, refusing or unable to use its device
+        // links, is not a connection failure: say which computer and why,
+        // rather than suggest starting the device's daemon.
+        let answered = |whose: String| {
+            move |error: ControlError| match error {
+                ControlError::Remote {
+                    code: ProtocolErrorCode::PermissionDenied,
+                    message,
+                    ..
+                } => ControlError::DeviceAccess(message),
+                ControlError::Remote {
+                    code: ProtocolErrorCode::Internal,
+                    message,
+                    ..
+                } => ControlError::DeviceAccess(format!("{whose}: {message}")),
+                error => error,
+            }
+        };
+        let nonce = match self.request_strict(ClientRequest::PeerChallenge)? {
+            ServerResponse::PeerChallenge { nonce } => nonce,
+            response => return Err(unexpected_response("a device challenge", &response)),
+        };
+        let local =
+            crate::terminal::ipc::local_daemon_socket_path().map_err(ControlError::Connect)?;
+        let (peer, claim, proof) = match ControlClient::connect(&local)?
+            .request_strict(ClientRequest::SignDeviceChallenge {
+                authority: session,
+                device: device.to_owned(),
+                nonce,
+            })
+            .map_err(answered(
+                "This computer could not vouch for the session".to_owned(),
+            ))? {
+            ServerResponse::DeviceProof { peer, claim, proof } => (peer, claim, proof),
+            response => return Err(unexpected_response("a device proof", &response)),
+        };
+        match self
+            .request_strict(ClientRequest::PeerAuthenticate { peer, claim, proof })
+            .map_err(answered(format!(
+                "{device} could not check this computer's proof"
+            )))? {
+            ServerResponse::PeerAuthenticated { authority } => Ok(authority),
+            response => Err(unexpected_response("a device capability", &response)),
+        }
+    }
+
+    /// A person's request about this daemon's device links and peers.
+    pub fn device_trust(
+        &mut self,
+        request: crate::device_trust::Request,
+    ) -> Result<crate::device_trust::Reply, ControlError> {
+        match self.request_strict(ClientRequest::DeviceTrust { request })? {
+            ServerResponse::DeviceTrust(reply) => Ok(reply),
+            response => Err(unexpected_response("a device link reply", &response)),
+        }
+    }
+
     pub fn device_operation(
         &mut self,
         operation: crate::device_service::Operation,
@@ -2642,6 +2761,7 @@ impl ControlClient {
         streaming_terminal: Option<TerminalId>,
         deadline: Option<Instant>,
     ) -> Result<ServerResponse, ControlError> {
+        let request = self.for_device(request)?;
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
         let result = self.request_inner_unobserved(request, streaming_terminal, deadline);
@@ -3123,6 +3243,10 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::RetiredChannelWork => "channel_work",
         ServerResponse::StartupState(_) => "startup_state",
         ServerResponse::DeviceOperation { .. } => "device_operation",
+        ServerResponse::DeviceTrust(_) => "device_trust",
+        ServerResponse::PeerChallenge { .. } => "peer_challenge",
+        ServerResponse::PeerAuthenticated { .. } => "peer_authenticated",
+        ServerResponse::DeviceProof { .. } => "device_proof",
     }
 }
 
@@ -3483,6 +3607,10 @@ where
                 | AccountCommand::Remove { .. }
                 | AccountCommand::Reset { .. },
         } => Some("Account changes require your own terminal".into()),
+        // An agent must never link a device or grant itself access to one.
+        TopCommand::Device { command } if command.changes_access() => {
+            Some("Device links and grants require your own terminal".into())
+        }
         _ => None,
     };
     if hosted && let Some(message) = user_only_message {
@@ -3649,6 +3777,37 @@ where
         };
     }
 
+    // Links are this computer's: the command reaches each device itself.
+    if let TopCommand::Device { command } = cli.command {
+        if cli
+            .global
+            .device
+            .as_deref()
+            .is_some_and(|name| name != "local")
+            || crate::device::is_remote()
+        {
+            emit_error(
+                cli.global.json,
+                &AppError::new(
+                    "device",
+                    "Run `cagents device` without --device; it names the device itself",
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+        let _device_cleanup = crate::device::Cleanup;
+        return match devices::execute(command) {
+            Ok(output) => {
+                emit_success(cli.global.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.global.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let _device_cleanup = crate::device::Cleanup;
     if let Err(error) = crate::device::select(cli.global.device.as_deref()) {
         emit_error(cli.global.json, &AppError::new("device", error));
@@ -3669,12 +3828,6 @@ where
     // legacy write uses this client's selected host.
     let project_channel_context =
         legacy_model_command_mutates(&cli.command).then(ProjectChannelContext::capture);
-    if let Some(context) = &project_channel_context
-        && let Err(error) = context.admit_remote()
-    {
-        emit_error(cli.global.json, &error);
-        return ExitCode::FAILURE;
-    }
     // Preserve the original caller before operational recovery or delegation
     // to a staged CLI whose caller-scoped service transport may predate this policy.
     let service_context = (matches!(
@@ -3685,12 +3838,6 @@ where
         TopCommand::Agent { command } if !matches!(command, AgentCommand::Console { .. })
     ))
     .then(ServiceRequestContext::capture);
-    if let Some(context) = &service_context
-        && let Err(error) = context.admit_remote()
-    {
-        emit_error(cli.global.json, &error);
-        return ExitCode::FAILURE;
-    }
     if !crate::device::is_remote()
         && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
         && !service_context
@@ -3756,7 +3903,12 @@ where
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
         }
-        emit_error(cli.global.json, &AppError::new("device", error));
+        let kind = if error.kind() == io::ErrorKind::PermissionDenied {
+            "permission_denied"
+        } else {
+            "device"
+        };
+        emit_error(cli.global.json, &AppError::new(kind, error));
         return ExitCode::FAILURE;
     }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
@@ -3807,6 +3959,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
         TopCommand::Completions { .. }
             | TopCommand::Diagnostics
             | TopCommand::Gh { .. }
+            | TopCommand::Device { .. }
             // A paired console already has its exact daemon endpoint and
             // opaque execution authority. It starts during daemon restore,
             // while the updater still holds the installation launch fence.
@@ -3875,6 +4028,7 @@ fn execute_with_model_context(
         }
         TopCommand::Linear(command) => linear::execute(command),
         TopCommand::Gh { command } => gh::execute(command),
+        TopCommand::Device { command } => devices::execute(command),
         TopCommand::Automation { command } => match service_context {
             Some(context) => automations::execute_with_context(command, &context),
             None => automations::execute(command),
@@ -5259,6 +5413,7 @@ fn terminal_output(
 fn protocol_error(error: ControlError) -> AppError {
     let kind = match &error {
         ControlError::WaitTimeout { .. } | ControlError::SnapshotTimeout => "timeout",
+        ControlError::DeviceAccess(_) => "permission_denied",
         ControlError::Connect(_)
         | ControlError::Configure(_)
         | ControlError::Frame(_)
@@ -5290,14 +5445,12 @@ fn protocol_error(error: ControlError) -> AppError {
 #[derive(Clone)]
 struct ServiceRequestContext {
     authority: Authority,
-    remote: bool,
 }
 
 impl ServiceRequestContext {
     fn capture() -> Self {
         Self {
             authority: Authority::from_environment(),
-            remote: crate::device::is_remote(),
         }
     }
 
@@ -5305,18 +5458,7 @@ impl ServiceRequestContext {
         self.authority.token().is_some()
     }
 
-    fn admit_remote(&self) -> Result<(), AppError> {
-        if self.scoped() && self.remote {
-            return Err(AppError::new(
-                "permission_denied",
-                "Agent, automation and work commands from an agent session require your own terminal on the remote device",
-            ));
-        }
-        Ok(())
-    }
-
     fn connect(&self) -> Result<ControlClient, AppError> {
-        self.admit_remote()?;
         if !self.scoped() {
             return control_daemon_client();
         }
@@ -5328,7 +5470,6 @@ impl ServiceRequestContext {
 /// Caller scope for legacy terminal and shared-model CLI mutations.
 struct ProjectChannelContext {
     authority: Authority,
-    remote: bool,
     no_start: bool,
 }
 
@@ -5336,7 +5477,6 @@ impl ProjectChannelContext {
     fn capture() -> Self {
         Self {
             authority: Authority::from_environment(),
-            remote: crate::device::is_remote(),
             no_start: daemon_autostart_disabled(),
         }
     }
@@ -5358,16 +5498,6 @@ impl ProjectChannelContext {
         )
     }
 
-    fn admit_remote(&self) -> Result<(), AppError> {
-        if self.authority.token().is_some() && self.remote {
-            return Err(AppError::new(
-                "permission_denied",
-                "Project, channel and terminal commands from an agent session require your own terminal on the remote device",
-            ));
-        }
-        Ok(())
-    }
-
     /// `ready` connects to the daemon on the connection that proved it
     /// ready; `connect` reaches the `existing` one.
     fn connect_with(
@@ -5378,7 +5508,6 @@ impl ProjectChannelContext {
         connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
     ) -> Result<ControlClient, AppError> {
         let scoped = self.authority.token().is_some();
-        self.admit_remote()?;
         let mut client = if (scoped && mutation) || self.no_start {
             connect(&existing()?).map_err(|error| AppError::new("daemon_connection", error))?
         } else {
@@ -5458,9 +5587,6 @@ fn execute_project_as(
     command: ProjectCommand,
     context: &ProjectChannelContext,
 ) -> Result<CommandOutput, AppError> {
-    // Remote path discovery can itself resolve a bridge; refuse its captured
-    // local-session scope before filesystem or device discovery as well.
-    context.admit_remote()?;
     execute_project_with(command, |mutation| context.connect(mutation))
 }
 
@@ -5688,7 +5814,6 @@ fn execute_channel_as(
     command: ChannelCommand,
     context: &ProjectChannelContext,
 ) -> Result<CommandOutput, AppError> {
-    context.admit_remote()?;
     execute_channel_with(command, |mutation| context.connect(mutation))
 }
 

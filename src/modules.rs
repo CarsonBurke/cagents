@@ -44,6 +44,7 @@ pub(crate) mod descriptor_frame;
 pub mod design;
 pub mod device;
 pub mod device_service;
+pub mod device_trust;
 pub mod diagnostics;
 #[cfg(feature = "ui")]
 pub mod document_link;

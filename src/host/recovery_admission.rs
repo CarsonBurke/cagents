@@ -104,7 +104,12 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::RetiredChannelWork
         // Inspects what holds a lost helper's Close, ending only processes
         // the person chose and the daemon proves are that conversation's.
-        | R::ChatLostProcesses { .. } => Access::Open,
+        | R::ChatLostProcesses { .. }
+        // Device links name no hosted process.
+        | R::DeviceTrust { .. }
+        | R::PeerChallenge
+        | R::PeerAuthenticate { .. }
+        | R::SignDeviceChallenge { .. } => Access::Open,
         R::ApplyWorkspaceEdit { edit } | R::EditWorkspaceModel { edit } => model_access(edit),
         // A channel creation and a view change, both open as edits; when the
         // move fails it retires its own channel as `RetireEmptyChannel` does.
