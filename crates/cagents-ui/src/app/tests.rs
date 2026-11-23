@@ -14392,6 +14392,46 @@ fn a_pane_opened_without_an_opener_follows_the_chosen_pane_not_the_hovered_one()
         },
     );
     assert_eq!(app.placement_anchor(), Some(ids[1]));
+
+    // Choosing the hovered pane by its tab, a row or a command chooses it;
+    // its own widget taking the keyboard, as a hover handoff does, does not.
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[3]));
+    drop(app.update(Message::PaneWidgetFocused(ids[3])));
+    assert_eq!(app.placement_anchor(), Some(ids[1]));
+    drop(app.update(Message::FocusCard(ids[3])));
+    assert_eq!(app.placement_anchor(), Some(ids[3]));
+}
+
+/// Typing goes to a field outside the strip, such as sidebar search, when it
+/// kept the keyboard as the pointer crossed a pane; that typing chooses no
+/// pane.
+#[test]
+fn typing_in_a_field_outside_the_strip_chooses_no_pane() {
+    let (mut app, ids) = four_terminals();
+    app.settings.focus_follows_mouse = true;
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[2]));
+    drop(app.update(Message::HoverKeyboardHeldOutside(ids[2])));
+    type_key(
+        &mut app,
+        keyboard::Key::Character("a".into()),
+        keyboard::Modifiers::empty(),
+    );
+    assert_eq!(app.placement_anchor(), Some(ids[0]));
+}
+
+/// A copy sits beside the pane it copies, even one the pointer focused.
+#[test]
+fn a_clone_opens_beside_its_source_not_the_chosen_pane() {
+    let (mut app, ids) = four_terminals();
+    app.settings.focus_follows_mouse = true;
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[2]));
+    drop(app.clone_focused_pane());
+    let copy = app.workspace.focused().unwrap();
+    assert!(!ids.contains(&copy));
+    assert_eq!(
+        app.workspace.order().collect::<Vec<_>>(),
+        [ids[0], ids[1], ids[2], copy, ids[3]]
+    );
 }
 
 /// When no pane in the strip was chosen, because the chosen one closed
@@ -14411,13 +14451,15 @@ fn a_pane_opened_without_a_chosen_pane_goes_at_the_end() {
     assert_eq!(app.durable.cards.last().map(|card| card.id), Some(review));
 }
 
-/// A browser opens beside the pane it was opened from, like every other
-/// pane.
+/// A browser opened from the sidebar or a menu opens beside the pane last
+/// chosen, like every other pane, not the one the pointer crossed.
 #[cfg(feature = "integrated-browser")]
 #[test]
 fn a_browser_opens_after_the_focused_pane() {
     let (mut app, ids) = four_terminals();
+    app.settings.focus_follows_mouse = true;
     drop(app.update(Message::FocusCard(ids[1])));
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[3]));
     let _ = app.add_browser(Url::parse("https://example.com").unwrap());
     let browser = app.workspace.focused().unwrap();
     assert!(!ids.contains(&browser));

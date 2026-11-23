@@ -1575,6 +1575,17 @@ impl Cagents {
             self.placement_anchor(),
         )
     }
+
+    /// Where a pane opened from `opener` goes: directly after it, or as
+    /// [`Self::pane_insertion_indices`] places it when `opener` is not in
+    /// the strip.
+    pub(super) fn pane_insertion_indices_after(&self, opener: CardId) -> (usize, usize) {
+        if self.workspace.card(opener).is_some() {
+            insertion_indices(self.workspace.cards(), &self.durable.cards, Some(opener))
+        } else {
+            self.pane_insertion_indices()
+        }
+    }
 }
 
 #[cfg(test)]

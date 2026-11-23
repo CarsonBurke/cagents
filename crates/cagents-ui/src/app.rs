@@ -3274,6 +3274,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::PaneWidgetFocused(_)
         | Message::MovePaneToChannel { .. }
         | Message::PaneDropToChannel { .. }
         | Message::TerminalReviewMode { .. }
@@ -3476,6 +3477,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::MovePaneToChannel { .. }
             | Message::PaneDropToChannel { .. }
             | Message::FocusCard(_)
+            | Message::PaneWidgetFocused(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -5101,7 +5103,15 @@ pub enum Message {
     FoldInProgress {
         refocus: bool,
     },
+    /// The person chose this pane: its tab, its row, a command or a link
+    /// to it. See [`Cagents::placement_anchor`].
     FocusCard(CardId),
+    /// A pane's own widget took the keyboard, which a hover handoff does
+    /// too, so this focuses the pane without choosing it.
+    PaneWidgetFocused(CardId),
+    /// A field outside the strip kept the keyboard when the pointer entered
+    /// this pane.
+    HoverKeyboardHeldOutside(CardId),
     AcknowledgeVisiblePane {
         card: CardId,
         epoch: u64,
@@ -5934,6 +5944,9 @@ struct HoverFocus {
     card: CardId,
     /// The pane last focused by a click, a keystroke or a command, if any.
     explicit: Option<CardId>,
+    /// A field outside the strip, such as sidebar search, kept the keyboard
+    /// when the pointer entered, so typing goes there rather than the pane.
+    keyboard_outside: bool,
 }
 
 pub struct Cagents {
@@ -7525,7 +7538,8 @@ impl Cagents {
         if let Some(title) = &user_title {
             card.title = title.clone();
         }
-        let (index, durable_index) = self.pane_insertion_indices();
+        // A copy has a source, so it sits beside it whatever else has focus.
+        let (index, durable_index) = self.pane_insertion_indices_after(source_id);
         let id = card.id;
         let update = match self.workspace.add_card(
             WorkspaceCard::new(
@@ -10586,6 +10600,7 @@ impl Cagents {
         workspace_widget::focus_unless_held_outside(
             self.workspace_scroll_id.clone(),
             self.card_keyboard_focus(card),
+            Some(Message::HoverKeyboardHeldOutside(card)),
         )
         .map(cosmic::Action::App)
     }
@@ -10626,14 +10641,6 @@ impl Cagents {
         .map(cosmic::Action::App)
     }
 
-    /// Answers a key, with the projection its answer needs. A key that
-    /// does something projects everything, as the rest of `update` does:
-    /// what it did may move the focus, close a surface or change what any
-    /// part of the workspace shows, and nothing after it is relied on to
-    /// project that. Only an answer that changed nothing a projection
-    /// reads projects nothing: a key nothing took, a key a dialog's or the
-    /// palette's own field answers, a step with nowhere to go. Typing
-    /// reaches those at input rate.
     /// Typing in the pane the pointer focused chooses it: from then on it is
     /// where a new pane opens. A shortcut, or a modifier pressed on its way
     /// to one, chooses nothing.
@@ -10652,6 +10659,7 @@ impl Cagents {
                         | keyboard::key::Named::Super
                         | keyboard::key::Named::Meta
                         | keyboard::key::Named::Hyper
+                        | keyboard::key::Named::AltGraph
                 )
             )
             || workspace_widget::global_shortcut(
@@ -10663,10 +10671,9 @@ impl Cagents {
         {
             return;
         }
-        if self
-            .hover_focus
-            .is_some_and(|hover| self.workspace.focused() == Some(hover.card))
-        {
+        if self.hover_focus.is_some_and(|hover| {
+            !hover.keyboard_outside && self.workspace.focused() == Some(hover.card)
+        }) {
             self.hover_focus = None;
         }
     }
@@ -10683,7 +10690,11 @@ impl Cagents {
                     Some(hover) if Some(hover.card) == previous => hover.explicit,
                     _ => previous,
                 };
-                self.hover_focus = Some(HoverFocus { card, explicit });
+                self.hover_focus = Some(HoverFocus {
+                    card,
+                    explicit,
+                    keyboard_outside: false,
+                });
             }
             WorkspaceViewportEvent::PointerFocused { .. } => self.hover_focus = None,
             _ => {}
@@ -10701,6 +10712,14 @@ impl Cagents {
         }
     }
 
+    /// Answers a key, with the projection its answer needs. A key that
+    /// does something projects everything, as the rest of `update` does:
+    /// what it did may move the focus, close a surface or change what any
+    /// part of the workspace shows, and nothing after it is relied on to
+    /// project that. Only an answer that changed nothing a projection
+    /// reads projects nothing: a key nothing took, a key a dialog's or the
+    /// palette's own field answers, a step with nowhere to go. Typing
+    /// reaches those at input rate.
     fn key_event(&mut self, event: keyboard::Event, captured: bool) -> (Task<Message>, Projection) {
         // A held chord copies once, so its repeats must not cancel the
         // copy its first press started.
@@ -12692,7 +12711,7 @@ impl Cagents {
                                 },
                             )
                         })
-                        .on_focus(Message::FocusCard(id))
+                        .on_focus(Message::PaneWidgetFocused(id))
                         .on_open_link(move |url, gesture| Message::OpenLink(id, url, gesture))
                         .on_command_error(move |error| Message::TerminalError {
                             card: id,
@@ -12735,7 +12754,7 @@ impl Cagents {
                 .obscured(self.pane_content_inputs_blocked(id))
                 .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(card_focused)
-                .on_focus(Message::FocusCard(id))
+                .on_focus(Message::PaneWidgetFocused(id))
                 .scale_factor(effective_surface_scale(
                     self.window_scale_factor,
                     self.settings.ui_scale,
@@ -17965,6 +17984,7 @@ impl Cagents {
                 | Message::Sidebar(_)
                 | Message::FoldInProgress { .. }
                 | Message::FocusCard(_)
+                | Message::PaneWidgetFocused(_)
                 | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized { .. }
@@ -18446,10 +18466,21 @@ impl Cagents {
                 if due { self.acknowledge_visible_pane() } else { Task::none() }
             }
             Message::FocusCard(id) => {
+                self.hover_focus = None;
                 // Explicit activation also cancels a pending entry on this same
                 // card, even if no view has observed its acknowledgment yet.
                 self.set_terminal_review_owner(None);
                 self.focus_workspace_card(id)
+            }
+            Message::PaneWidgetFocused(id) => {
+                self.set_terminal_review_owner(None);
+                self.focus_workspace_card(id)
+            }
+            Message::HoverKeyboardHeldOutside(card) => {
+                if let Some(hover) = self.hover_focus.as_mut().filter(|hover| hover.card == card) {
+                    hover.keyboard_outside = true;
+                }
+                Task::none()
             }
             Message::MovePaneToChannel { card, channel } => {
                 self.move_pane_to_channel(card, channel)
