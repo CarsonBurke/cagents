@@ -26,7 +26,7 @@ deliberately keep that socket namespace, so a newer daemon cannot start as a
 second owner while an incompatible older daemon is still running. The
 handshake rejects incompatible clients without terminating their PTYs.
 Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
-together.
+together, with the dictation helper `cagents-dictate` that ships beside them.
 
 A session carried across an update keeps running the `cagents` CLI it was
 launched with. The daemon still serves that CLI when its protocol is listed as

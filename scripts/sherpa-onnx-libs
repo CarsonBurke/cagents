@@ -1,0 +1,51 @@
+#!/bin/sh
+# Prints the directory of sherpa-onnx's verified prebuilt static libraries,
+# fetching them into CACHE first when needed.
+#
+# The dictation helper statically links these libraries. Without
+# SHERPA_ONNX_LIB_DIR, the sherpa-onnx-sys build script downloads them itself
+# and links whatever it receives. Release builds and packages instead point
+# SHERPA_ONNX_LIB_DIR at this script's output, so they link only the pinned
+# bytes. Updating the sherpa-onnx crate means updating this pin with it.
+set -eu
+
+PROGRAM=sherpa-onnx-libs
+RELEASE=v2.0.2
+STEM=sherpa-onnx-$RELEASE-linux-x64-static-lib
+SHA256=082743c80ec9d3fd739df174b9e46ab08ac77c9f57a1d2b09977a7fd5324727d
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+[ "$#" = 1 ] && [ -n "$1" ] || fail 'usage: sherpa-onnx-libs CACHE'
+case $(uname -s)/$(uname -m) in
+    Linux/x86_64) ;;
+    *) fail 'the pinned libraries are for Linux x86_64 only' ;;
+esac
+# The digest names the directory, so a changed pin never reuses old bytes.
+DESTINATION=$1/$SHA256
+if [ ! -d "$DESTINATION/$STEM/lib" ]; then
+    for command in bzip2 curl mktemp sha256sum tar; do
+        command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
+    done
+    mkdir -p -- "$1"
+    WORK=$(mktemp -d "$1/.fetch.XXXXXX")
+    trap 'rm -rf -- "$WORK"' EXIT
+    trap 'exit 1' HUP INT TERM
+    curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/$RELEASE/$STEM.tar.bz2" \
+        --output "$WORK/archive.tar.bz2" \
+        || fail "could not download $STEM"
+    printf '%s  %s\n' "$SHA256" "$WORK/archive.tar.bz2" | sha256sum --check --strict --status \
+        || fail "$STEM does not match its pinned SHA-256"
+    mkdir "$WORK/tree"
+    tar -xjf "$WORK/archive.tar.bz2" -C "$WORK/tree" --no-same-owner "$STEM/lib" \
+        || fail "could not unpack $STEM"
+    chmod -R u+rwX,go+rX "$WORK/tree"
+    # Another build may have finished first; its copy holds the same bytes.
+    mv -T -- "$WORK/tree" "$DESTINATION" 2>/dev/null || [ -d "$DESTINATION/$STEM/lib" ] \
+        || fail "could not place $STEM in $1"
+fi
+printf '%s\n' "$DESTINATION/$STEM/lib"

@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -253,13 +254,17 @@ class InstallerCoordinator(unittest.TestCase):
         self.python(self.payload / "bin/cagents", COORDINATOR)
         self.python(self.payload / "bin/cagentsd", "SOURCE = 'candidate'\n" + INSPECTOR)
         self.executable(self.payload / "bin/cagents-ui", '#!/bin/sh\nexit 98\n')
+        self.executable(self.payload / "bin/cagents-dictate", '#!/bin/sh\nexit 95\n')
+        # The installer, not the archive, decides the helper's mode.
+        (self.payload / "bin/cagents-dictate").chmod(0o700)
         self.executable(self.payload / "bin/cagents-uninstall", (ROOT / "packaging/cagents-uninstall").read_text())
         self.write(self.payload / "bin/.cagents-ui-lease-v1", "1\n")
         for name in ("applications/dev.cagents.Cagents.desktop",
                      "autostart/dev.cagents.Cagents.Daemon.desktop",
                      "icons/hicolor/scalable/apps/dev.cagents.Cagents.svg",
                      "icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
-                     "metainfo/dev.cagents.Cagents.metainfo.xml", "doc/cagents/LICENSE"):
+                     "metainfo/dev.cagents.Cagents.metainfo.xml", "doc/cagents/LICENSE",
+                     "doc/cagents/THIRD-PARTY-NOTICES"):
             source = "LICENSE" if name == "doc/cagents/LICENSE" else "packaging/" + Path(name).name
             path = self.payload / "share" / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,10 +274,11 @@ class InstallerCoordinator(unittest.TestCase):
         self.package()
         self.environment.update(CAGENTS_ARCHIVE=str(self.archive), CAGENTS_CHECKSUMS=str(self.checksums))
 
-    def package(self, *, exclude=None):
+    def package(self, *, exclude=()):
+        excluded = {f"{TOP}/{member}" for member in ((exclude,) if isinstance(exclude, str) else exclude)}
         with tarfile.open(self.archive, "w:gz") as archive:
             archive.add(self.payload, arcname=TOP,
-                        filter=lambda entry: None if entry.name == f"{TOP}/{exclude}" else entry)
+                        filter=lambda entry: None if entry.name in excluded else entry)
         self.checksums.write_text(f"{hashlib.sha256(self.archive.read_bytes()).hexdigest()}  {ARCHIVE_NAME}\n")
 
     @staticmethod
@@ -329,6 +335,10 @@ class InstallerCoordinator(unittest.TestCase):
         installed = self.prefix / "current/bin"
         for name in ("cagents", "cagentsd", "cagents-ui"):
             self.assertEqual((installed / name).read_bytes(), (self.payload / "bin" / name).read_bytes())
+        if (self.payload / "bin/cagents-dictate").exists():
+            helper = installed / "cagents-dictate"
+            self.assertEqual(helper.read_bytes(), (self.payload / "bin/cagents-dictate").read_bytes())
+            self.assertEqual(stat.S_IMODE(helper.stat().st_mode), 0o755)
         self.assertEqual(os.readlink(self.home / ".local/bin/cagents"), str(installed / "cagents"))
         events = self.events()
         self.assertEqual([e['source'] for e in events if e['event'] == 'inspect'], [source])
@@ -397,6 +407,18 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
 
     def test_archive_requires_autostart_independently_of_the_ui_lease_marker(self):
         self.assert_missing_member_rejected('share/autostart/dev.cagents.Cagents.Daemon.desktop')
+
+    def test_archive_from_before_dictation_installs_without_the_helper(self):
+        for member in ("bin/cagents-dictate", "share/doc/cagents/THIRD-PARTY-NOTICES"):
+            (self.payload / member).unlink()
+        self.package()
+        self.assert_installed(self.install(), 'candidate')
+        self.assertFalse((self.prefix / "current/bin/cagents-dictate").exists())
+
+    def test_archive_ships_the_helper_only_with_its_notices(self):
+        for member in ("bin/cagents-dictate", "share/doc/cagents/THIRD-PARTY-NOTICES"):
+            with self.subTest(missing=member):
+                self.assert_missing_member_rejected(member)
 
     def managed_link(self, member):
         if member == "bin/cagents":

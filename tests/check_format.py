@@ -28,6 +28,7 @@ HANG_GUARD = 60
 INCLUDED = (
     "src/modules.rs",
     "crates/cagents-ui/src/modules.rs",
+    "build/stated_version.rs",
     "crates/cagents-ui/src/app/repository_clone_lsp_ownership_tests.rs",
     "src/control/handshake_deadline_tests.rs",
     "src/terminal/worker/bounded_input_tests.rs",
@@ -80,7 +81,7 @@ sys.exit({status})
         return log, env
 
     def cache_fixture(self):
-        for name in ("src", "tests", "crates"):
+        for name in ("src", "tests", "crates", "build"):
             (self.root / name).mkdir()
         for relative in INCLUDED:
             self.write(relative, "fn clean() {}\n")

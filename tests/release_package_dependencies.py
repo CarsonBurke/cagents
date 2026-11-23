@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = "9.9.9"
 # Bounds only a hang; a passing run returns as soon as its process exits.
 HANG_GUARD = 60
+# Every executable a package ships, in the order the packager inspects them.
+PACKAGED = ("cagents", "cagents-ui", "cagentsd", "cagents-dictate")
 
 
 def provisioned_runtime_packages():
@@ -143,6 +145,8 @@ class PackageDependencies(unittest.TestCase):
             f'printf "cagents-ui {VERSION}\\n"\n',
             self.binaries / "cagentsd": '#!/bin/sh\n[ "$*" = --version ] || exit 94\n'
             f'printf "cagentsd {VERSION}\\n"\n',
+            self.binaries / "cagents-dictate": '#!/bin/sh\n[ "$*" = --version ] || exit 98\n'
+            f'printf "cagents-dictate {VERSION}\\n"\n',
         }
         for path, contents in fixtures.items():
             path.write_text(contents)
@@ -205,7 +209,7 @@ class PackageDependencies(unittest.TestCase):
             f'printf "%s\\n" "${{3##*/}}" >> {shlex.quote(str(self.invocations))}\n'
             'case ${3##*/} in\n'
         )
-        for binary in ("cagents", "cagents-ui", "cagentsd"):
+        for binary in PACKAGED:
             output = outputs.get(binary, self.version_info("GLIBC_2.2.5", "GLIBC_2.35"))
             source += (
                 f"{binary})\n"
@@ -234,7 +238,7 @@ class PackageDependencies(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             self.invocations.read_text().splitlines(),
-            ["cagents", "cagents-ui", "cagentsd"],
+            list(PACKAGED),
         )
         name = "cagents" if variant == "full" else "cagents-browserless"
         metadata = subprocess.check_output(
@@ -257,6 +261,8 @@ class PackageDependencies(unittest.TestCase):
                 self.assertIn("libc6 (>= 2.35)", dependencies)
                 self.assertEqual("libegl1" in dependencies, variant == "full")
                 self.assertEqual("xdg-utils" in dependencies, variant == "browserless")
+                # The dictation helper captures audio through ALSA in both.
+                self.assertIn("libasound2", dependencies)
                 # Keep preparation self-contained for every declared runtime
                 # package instead of relying on incidental apt transitivity.
                 required_packages = set()
@@ -275,14 +281,14 @@ class PackageDependencies(unittest.TestCase):
     def test_explicit_strip_opt_out_preserves_all_executable_payloads(self):
         originals = {
             binary: (self.binaries / binary).read_bytes()
-            for binary in ("cagents", "cagents-ui", "cagentsd")
+            for binary in PACKAGED
         }
         strip_calls = self.work / "strip-calls"
         marker = b"# fixture strip mutation\n"
         # A real byte change makes both an ignored opt-out and accidentally
         # disabled default stripping observable in the generated artifacts.
         (self.tools / "strip").write_text(
-            '#!/bin/sh\n[ "$#" = 4 ] && [ "$1" = --strip-unneeded ] || exit 97\n'
+            '#!/bin/sh\n[ "$#" = 5 ] && [ "$1" = --strip-unneeded ] || exit 97\n'
             'shift\nfor binary in "$@"; do\n'
             f'  printf "%s\\n" "${{binary##*/}}" >> {shlex.quote(str(strip_calls))}\n'
             '  printf "# fixture strip mutation\\n" >> "$binary"\ndone\n'
@@ -320,7 +326,7 @@ class PackageDependencies(unittest.TestCase):
                             self.assertEqual((self.binaries / binary).read_bytes(), original)
 
     def test_newer_requirement_from_each_packaged_elf_raises_both_variants(self):
-        for newer in ("cagents", "cagents-ui", "cagentsd"):
+        for newer in PACKAGED:
             self.readelf({newer: self.version_info("GLIBC_2.2.5", "GLIBC_2.39")})
             for variant in ("full", "browserless"):
                 with self.subTest(binary=newer, variant=variant):
@@ -336,14 +342,14 @@ class PackageDependencies(unittest.TestCase):
         ]:
             self.readelf({
                 binary: self.version_info(f"GLIBC_{version}")
-                for binary, version in zip(("cagents", "cagents-ui", "cagentsd"), versions)
+                for binary, version in zip(PACKAGED, versions)
             })
             for variant in ("full", "browserless"):
                 with self.subTest(versions=versions, variant=variant):
                     self.assertIn(f"libc6 (>= {expected})", self.dependencies(variant))
 
     def test_failed_inspection_is_not_hidden_by_valid_stdout_or_later_binaries(self):
-        for binary in ("cagents", "cagents-ui", "cagentsd"):
+        for binary in PACKAGED:
             self.readelf({}, failures={binary: 7})
             for variant in ("full", "browserless"):
                 with self.subTest(binary=binary, variant=variant):

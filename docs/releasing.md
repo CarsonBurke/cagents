@@ -16,11 +16,14 @@ Pushing a tag does not start a hosted build.
 Ubuntu 22.04 environment with Rust 1.93, Zig 0.15.2, and Git 2.55. This
 keeps the glibc 2.35 baseline instead of inheriting a newer workstation's libc.
 The builder runs locked tests for the isolated CLI, host, browserless UI,
-integrated UI, and editor boundaries with the `release-test` profile: release
+integrated UI, dictation helper, and editor boundaries with the `release-test` profile: release
 semantics (optimized, production identity, no debug assertions) without the
 link-time optimization and single codegen unit of shipped binaries. It then
 packages the shipped binaries with `release` and checks them and the desktop
-metadata.
+metadata. Both cagents packages ship the dictation helper `cagents-dictate`,
+linked against the sherpa-onnx libraries `scripts/sherpa-onnx-libs` verifies,
+with its third-party notices; the builder and the publisher refuse a package
+from a source with the helper that lacks either.
 
 Before exposing the bundle, the builder installs and removes each Debian
 package and extracts each portable archive in a disposable Ubuntu 24.04 runtime
@@ -239,5 +242,6 @@ Debian variants depend on `tzdata`; portable Linux installations also need that
 package (or the distribution's equivalent zoneinfo database). The build and
 offline runtime images install it explicitly, including UTC and named regional
 zones, so minimal images exercise the same schedule contract as desktops. The
-runtime smoke cache uses provisioning version 2; choose a new cache directory
-when upgrading a previously prepared version-1 image.
+runtime smoke cache uses provisioning version 4, which adds ALSA for the
+dictation helper; choose a new cache directory (`CAGENTS_RELEASE_SMOKE_CACHE`)
+when upgrading a previously prepared image.

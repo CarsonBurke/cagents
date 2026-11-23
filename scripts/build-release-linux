@@ -71,7 +71,12 @@ SOURCE_COMMIT=$(git -C "$ROOT_DIR" rev-parse --verify --end-of-options "$REF^{co
     || fail "not a committed Git ref: $REF"
 SOURCE_DATE_EPOCH=$(git -C "$ROOT_DIR" show -s --format=%ct "$SOURCE_COMMIT")
 git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:Cargo.lock" || fail 'source ref must include Cargo.lock'
-for manifest in Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml; do
+manifests=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml)
+# Sources from before the dictation helper have no manifest for it.
+if git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:crates/cagents-dictate/Cargo.toml" 2>/dev/null; then
+    manifests+=(crates/cagents-dictate/Cargo.toml)
+fi
+for manifest in "${manifests[@]}"; do
     source_version=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:$manifest" \
         | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}')
     [[ $source_version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
@@ -163,7 +168,7 @@ fi
 # This namespace maps the host caller to root, not a subordinate UID range.
 # Ubuntu fakeroot handles package ownership for otherwise unmapped system users.
 # A separate namespace below maps that same caller to their ordinary nonzero UID.
-if [[ ! -f $CACHE/rootfs/opt/.cagents-release-provisioned-v4 ]]; then
+if [[ ! -f $CACHE/rootfs/opt/.cagents-release-provisioned-v5 ]]; then
     bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-ipc --unshare-uts \
         --die-with-parent --new-session --clearenv \
         --bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/provision-tmp" /tmp --tmpfs /run \
