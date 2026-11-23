@@ -136,7 +136,19 @@ if sys.argv[1:3] == ['issue', 'create']:
     print('https://github.com/fixture/repository/issues/42')
 ''')
         gh.chmod(0o755)
+        # Records each start of the prebuild service with how many lanes were
+        # tested by then; the host's own manager is never asked.
+        systemctl = self.bin / "systemctl"
+        systemctl.write_text('''#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+tests = Path(os.environ['SENTINEL_TESTS'])
+with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
+    out.write(json.dumps([sys.argv[1:], len(tests.read_text().splitlines()) if tests.exists() else 0]) + '\\n')
+''')
+        systemctl.chmod(0o755)
         self.environment = patch.dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+                                      SENTINEL_SYSTEMCTL=str(self.root / "systemctl"),
                                       SENTINEL_CALLS=str(self.calls),
                                       SENTINEL_LANES=json.dumps(sentinel.LANES),
                                       SENTINEL_TESTS=str(self.root / "tests"),
@@ -448,6 +460,20 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.assertEqual(list(verdict["lanes"]), lanes)
         self.assertEqual(json.loads((self.state / "state.json").read_text())["tested"], tip)
         self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+
+    def test_the_prebuild_starts_before_the_tests_without_waiting_and_on_every_tick(self):
+        self.tick()
+        self.now += 1
+        self.tick()
+        calls = [json.loads(line) for line in (self.root / "systemctl").read_text().splitlines()]
+        start = ["--user", "start", "--no-block", sentinel.PREBUILD_SERVICE]
+        # Before the first lane's tests, after them, and on a tick with nothing to do.
+        self.assertEqual(calls, [[start, 0], [start, len(self.tested())], [start, len(self.tested())]])
+
+    def test_a_host_without_the_prebuild_service_still_tests(self):
+        (self.bin / "systemctl").write_text("#!/bin/sh\nexit 5\n")
+        self.tick()
+        self.assertTrue(json.loads((self.state / "verdicts" / f"{self.first}.json").read_text())["passed"])
 
     def test_a_commit_that_does_not_compile_is_not_tested(self):
         self.tick()

@@ -1056,6 +1056,72 @@ class Slice(unittest.TestCase):
                          (False, []))
 
 
+class IdleBuilds(unittest.TestCase):
+    """A background build runs only on CPU time nothing else wants, and holds
+    no jobserver tokens while it waits for it."""
+
+    def scope_slice(self, idle):
+        commands = []
+
+        class Started(Exception):
+            pass
+
+        def popen(command, **_):
+            commands.append(command)
+            raise Started
+
+        with unittest.mock.patch.object(build_host.subprocess, "Popen", popen), \
+                self.assertRaises(Started):
+            build_host.run(["true"], {}, True, idle=idle)
+        return next(argument for argument in commands[0] if argument.startswith("--slice="))
+
+    def test_an_idle_scope_goes_in_the_idle_slice_at_the_top_of_the_manager(self):
+        self.assertEqual(self.scope_slice(True), f"--slice={build_host.IDLE_SLICE}")
+        self.assertEqual(self.scope_slice(False), f"--slice={build_host.BUILD_SLICE}")
+        # Idle only among its siblings, which must be app.slice and background.slice.
+        self.assertNotIn("-", build_host.IDLE_SLICE)
+
+    def test_the_idle_slice_is_made_idle_and_capped_where_it_differs(self):
+        calls = []
+
+        def systemctl(*arguments):
+            calls.append(arguments)
+            shown = "MemoryHigh=infinity\nCPUWeight=[not set]\nIOWeight=[not set]\n" if len(calls) == 1 else \
+                f"CPUWeight=idle\nIOWeight=1\nMemoryHigh={3 * 2**29}\n"
+            return subprocess.CompletedProcess(arguments, 0, shown, "")
+
+        with unittest.mock.patch.object(build_host, "systemctl", systemctl), \
+                unittest.mock.patch.object(build_host, "budget", lambda: 3 * 2**30 + 1), \
+                unittest.mock.patch.dict(os.environ):
+            os.environ.pop("CAGENTS_BUILD_SCOPE", None)
+            self.assertTrue(build_host.prepare_slice(build_host.IDLE_SLICE))
+            self.assertTrue(build_host.prepare_slice(build_host.IDLE_SLICE))
+        self.assertEqual(calls, [
+            ("show", "cagentsidle.slice", "--property=MemoryHigh", "--property=CPUWeight", "--property=IOWeight"),
+            ("set-property", "--runtime", "cagentsidle.slice", f"MemoryHigh={3 * 2**29}", "CPUWeight=idle",
+             "IOWeight=1"),
+            ("show", "cagentsidle.slice", "--property=MemoryHigh", "--property=CPUWeight", "--property=IOWeight")])
+
+    def test_an_idle_build_joins_no_jobserver_and_runs_its_own_jobs(self):
+        joined, prepared = [], []
+        for setting, expected in (("1", []), ("0", ["joined"])):
+            with self.subTest(setting=setting), \
+                    unittest.mock.patch.dict(os.environ, {build_host.IDLE_SETTING: setting}), \
+                    unittest.mock.patch.object(build_host, "prepare_slice",
+                                               lambda name=build_host.BUILD_SLICE: prepared.append(name) or True), \
+                    unittest.mock.patch.object(build_host, "within_build", lambda: False), \
+                    unittest.mock.patch.object(build_host, "slice_directory", lambda: None), \
+                    unittest.mock.patch.object(build_host, "Jobserver",
+                                               lambda *_: joined.append("joined") or types.SimpleNamespace(
+                                                   auth="3,4", close=lambda: None)):
+                joined.clear()
+                build = build_host.Build(0, None)
+                with build.admitted():
+                    self.assertEqual(build.jobserver is None, setting == "1")
+                self.assertEqual(joined, expected)
+        self.assertEqual(prepared, [build_host.IDLE_SLICE, build_host.BUILD_SLICE])
+
+
 class CacheTrimming(unittest.TestCase):
     """Near its cap, the build slice drops page cache rather than letting the
     kernel swap builds out."""

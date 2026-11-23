@@ -83,6 +83,10 @@ Environment:
   CAGENTS_BUILD_JOBSERVER
                        The jobserver's directory, for tests
                        (default /run/user/UID/cagents-jobserver)
+  CAGENTS_BUILD_IDLE=1 Run the build in the background of every other: its
+                       scope has CPU time only when nothing else wants it,
+                       the lowest IO weight, and Cargo jobs of its own
+                       rather than the shared jobserver's
 """
 HERE = os.path.dirname(os.path.realpath(__file__))
 SHARE = 4 * 2**30
@@ -467,18 +471,21 @@ def manager_environment():
             if key not in MANAGER_VARIABLES} | manager_environment_only()
 
 
-def prepare_slice():
-    """Whether builds can run in scopes here, capping the build slice's
-    memory first when its cap differs."""
+def prepare_slice(name=BUILD_SLICE):
+    """Whether builds can run in scopes of the slice `name` here, capping its
+    memory first, and for the idle slice making it idle, where they differ."""
     if os.environ.get("CAGENTS_BUILD_SCOPE") == "0":
         return False
-    wanted = f"MemoryHigh={budget() // 4096 * 4096}"
+    # The idle slice throttles itself at half the builds' memory, before it
+    # could squeeze the build slice beside it.
+    cap = budget() // (2 if name == IDLE_SLICE else 1) // 4096 * 4096
+    wanted = [f"MemoryHigh={cap}", *(IDLE_SLICE_SETTINGS if name == IDLE_SLICE else ())]
     try:
-        shown = systemctl("show", BUILD_SLICE, "--property=MemoryHigh")
+        shown = systemctl("show", name, *(f"--property={setting.split('=')[0]}" for setting in wanted))
         if shown.returncode != 0:
             return False
-        if shown.stdout.strip() != wanted:
-            return systemctl("set-property", "--runtime", BUILD_SLICE, wanted).returncode == 0
+        if sorted(shown.stdout.split()) != sorted(wanted):
+            return systemctl("set-property", "--runtime", name, *wanted).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
     return True
@@ -718,6 +725,21 @@ def follow_parent(parent):
 
 
 MANAGER_VARIABLES = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+# A background build, such as a release prebuilt beside main's checks, that
+# nothing else waits behind. It runs in its own slice at the top of the user
+# manager, which the kernel schedules only on CPU time that no sibling, such
+# as app.slice's tests and sessions or the build slice, wants: an idle group
+# yields only to its siblings, so it must not sit inside the build slice.
+# Starved, it would sit on jobserver tokens other builds need, so it takes
+# none and runs its own Cargo jobs instead.
+IDLE_SETTING = "CAGENTS_BUILD_IDLE"
+# A dash would nest it in another slice.
+IDLE_SLICE = "cagentsidle.slice"
+IDLE_SLICE_SETTINGS = ("CPUWeight=idle", "IOWeight=1")
+
+
+def idle():
+    return os.environ.get(IDLE_SETTING) == "1"
 
 
 class Interrupted(Exception):
@@ -726,14 +748,15 @@ class Interrupted(Exception):
         self.number = number
 
 
-def run(command, environment, scoped, group=True, capture=False):
+def run(command, environment, scoped, group=True, capture=False, idle=False):
     """Runs `command` to its end, in a scope of the build slice when
     `scoped`, and returns its status, with its standard output when
     `capture`. A signal to this process interrupts it: first as a Ctrl-C
     would, then, if it is still running five seconds later, by stopping its
     whole scope. Unscoped, the command's own process group stands in for the
     scope, unless `group` is false, as for a command within another build,
-    whose scope or group ends it."""
+    whose scope or group ends it. An `idle` scope runs in the idle slice,
+    behind everything else."""
     unit = f"cagents-build-{os.getpid()}-{time.monotonic_ns()}.scope"
     if scoped:
         # The command runs as this child: systemd-run execs it after making
@@ -741,7 +764,8 @@ def run(command, environment, scoped, group=True, capture=False):
         settings = [f"{name}={environment[name]}" if name in environment else f"--unset={name}"
                     for name in MANAGER_VARIABLES]
         command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-                   f"--slice={BUILD_SLICE}", f"--unit={unit}", "--property=TimeoutStopSec=5", "--",
+                   f"--slice={IDLE_SLICE if idle else BUILD_SLICE}", f"--unit={unit}",
+                   "--property=TimeoutStopSec=5", "--",
                    "env", *sorted(settings, key=lambda setting: not setting.startswith("--")),
                    *command]
         environment = {key: value for key, value in environment.items()
@@ -1042,16 +1066,16 @@ class Build:
                 # under `cargo-gate exec`, runs in its scope, with its
                 # jobserver, which its environment names.
                 self.nested = within_build()
-                self.scoped = not self.nested and prepare_slice()
+                self.scoped = not self.nested and (prepare_slice(IDLE_SLICE) if idle() else prepare_slice())
                 self.jobserver = None
-                if self.scoped or self.nested and lost_jobserver():
+                if (self.scoped or self.nested and lost_jobserver()) and not idle():
                     try:
                         self.jobserver = Jobserver(jobserver_directory(), os.cpu_count() or 1)
                     except OSError as error:
                         say(f"building without the shared jobserver: {error}")
                 trimmer = None
                 try:
-                    directory = slice_directory() if self.scoped else None
+                    directory = slice_directory() if self.scoped and not idle() else None
                     if directory:
                         trimmer = CacheTrimmer(directory, jobserver_directory() + ".reclaim")
                     yield self
@@ -1069,7 +1093,7 @@ class Build:
             return self.probe.run(command, build_environment(os.environ, None), capture)
         auth = self.jobserver.auth if self.jobserver else None
         return run(command, build_environment(os.environ, auth), self.scoped,
-                   group=not self.nested, capture=capture)
+                   group=not self.nested, capture=capture, idle=idle())
 
 
 def separate(arguments):
