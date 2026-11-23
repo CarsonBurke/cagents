@@ -632,6 +632,7 @@ impl LocalHandle {
         let native_installed = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
         let startup_lock_wait = Arc::new(AtomicU64::new(0));
+        let startup_budget = StartupBudget::current();
         #[cfg(test)]
         let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(usize::MAX));
         let native_holder = match ownership {
@@ -763,6 +764,7 @@ impl LocalHandle {
                     first_frame: false,
                     stdout_noise: spec.stdout_noise,
                     started: Instant::now(),
+                    startup: startup_budget,
                     write_started: None,
                     #[cfg(test)]
                     idle_frame_buffer_capacity,
@@ -2517,14 +2519,62 @@ struct Actor {
     first_frame: bool,
     stdout_noise: Option<fn(&[u8]) -> bool>,
     started: Instant,
+    startup: StartupBudget,
     write_started: Option<Instant>,
     #[cfg(test)]
     idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
 
-/// Each valid frame earns a fresh `IO_TIMEOUT`, up to `STARTUP_LIMIT` overall.
-fn startup_expired(started: Instant, last_progress: Instant, now: Instant) -> bool {
-    now.duration_since(last_progress) > IO_TIMEOUT || now.duration_since(started) > STARTUP_LIMIT
+/// How long an unfinished initialization may go without a valid frame, and
+/// how long frames can keep extending it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StartupBudget {
+    pub(super) renewal: Duration,
+    pub(super) limit: Duration,
+}
+
+impl StartupBudget {
+    pub(super) const PRODUCTION: Self = Self {
+        renewal: IO_TIMEOUT,
+        limit: STARTUP_LIMIT,
+    };
+
+    /// Each valid frame earns a fresh `renewal`, up to `limit` overall.
+    fn expired(self, started: Instant, last_progress: Instant, now: Instant) -> bool {
+        now.duration_since(last_progress) > self.renewal || now.duration_since(started) > self.limit
+    }
+
+    #[cfg(not(test))]
+    fn current() -> Self {
+        Self::PRODUCTION
+    }
+
+    /// The budget a test scoped to its own thread, so real-pipe deadline
+    /// tests need not wait out the production deadlines.
+    #[cfg(test)]
+    fn current() -> Self {
+        TEST_STARTUP_BUDGET.get()
+    }
+
+    /// Apply this budget to protocol actors started on this thread until
+    /// the guard drops.
+    #[cfg(test)]
+    #[must_use = "the budget applies only while the guard lives"]
+    pub(super) fn scope(self) -> impl Drop {
+        struct Restore(StartupBudget);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_STARTUP_BUDGET.set(self.0);
+            }
+        }
+        Restore(TEST_STARTUP_BUDGET.replace(self))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STARTUP_BUDGET: std::cell::Cell<StartupBudget> =
+        const { std::cell::Cell::new(StartupBudget::PRODUCTION) };
 }
 
 /// A provider that exited without being asked to, naming memory exhaustion
@@ -2962,7 +3012,9 @@ impl Actor {
                 ));
             }
             if (!self.first_frame || self.adapter.initialization_pending())
-                && startup_expired(self.started, startup_progress, Instant::now())
+                && self
+                    .startup
+                    .expired(self.started, startup_progress, Instant::now())
             {
                 return Err(with_ignored_output(
                     if self.first_frame {
