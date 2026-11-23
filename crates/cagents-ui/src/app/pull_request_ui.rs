@@ -949,7 +949,7 @@ mod tests {
             },
         ) = conversation_app();
         // Projects lists /repo/main and /repo/fix-sidebar.
-        app.sidebar_model = crate::sidebar::test_support::panel_model();
+        app.sidebar_model = crate::sidebar::tests::panel_model();
         app.refresh_sidebar_worktree_panes();
         app.sync_pull_request_inspector();
         drop(app.handle_pull_request_ui(listed_with(
@@ -1098,7 +1098,7 @@ mod tests {
             },
         ) = conversation_app();
         // Projects lists /repo/main and /repo/fix-sidebar.
-        app.sidebar_model = crate::sidebar::test_support::panel_model();
+        app.sidebar_model = crate::sidebar::tests::panel_model();
         // As the update that loads Projects does.
         app.refresh_sidebar_worktree_panes();
         app.sync_pull_request_inspector();

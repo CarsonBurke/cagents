@@ -2,16 +2,6 @@ use super::*;
 
 const CONFIRMATION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
-/// How long a waiting update pauses before it reads its decision and the
-/// conversations it would stop again. Half a second is too short for a
-/// person answering a prompt to notice; tests answer at once, so a pause
-/// would only slow them.
-const DECISION_POLL: Duration = if cfg!(test) {
-    Duration::from_millis(10)
-} else {
-    Duration::from_millis(500)
-};
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
     pub nonce: String,
@@ -478,7 +468,7 @@ fn wait_for(
             // Ctrl-C still cancels while windows are saving and closing.
             return Ok(preview);
         }
-        thread::sleep(DECISION_POLL);
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -649,7 +639,7 @@ pub(super) fn wait_stop(
         }
         preview = current;
         list = current_list;
-        thread::sleep(DECISION_POLL);
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -1228,13 +1218,12 @@ mod tests {
         for whole_update in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().to_owned();
-            // One preview: each fixture mints new pane IDs, which would
-            // renew the nonce on every poll and race the decision below.
-            let blocked = impact::tests::blocked_preview();
             let worker = thread::spawn(move || {
                 let mut job = job(&path);
                 initialize(&path, &job.id).unwrap();
-                wait(&path, &mut job, false, |_| Ok(blocked.clone()))
+                wait(&path, &mut job, false, |_| {
+                    Ok(impact::tests::blocked_preview())
+                })
             });
             let current = published(directory.path(), None);
             if whole_update {
@@ -1272,11 +1261,8 @@ mod tests {
                 } else {
                     preview(false)
                 };
-                // One list: each fixture mints new IDs, which would renew
-                // the nonce on every poll and race the decision below.
-                let list = stop_list();
                 wait_stop(&path, &mut job, true, || {
-                    Ok((reviewed.clone(), list.clone()))
+                    Ok((reviewed.clone(), stop_list()))
                 })
             });
             let current = published(directory.path(), None);

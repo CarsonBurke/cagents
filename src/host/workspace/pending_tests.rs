@@ -74,19 +74,10 @@ impl Fixture {
                 kind: Default::default(),
             })
             .unwrap();
-        // A channel: a worktree view takes no new pane, and these tests add
-        // neighbors beside the pending one.
-        let channel = crate::model::ChannelId::new();
-        registry
-            .apply(&ModelEdit::CreateChannel {
-                id: channel,
-                repository: directory.path().into(),
-                title: "fixture".into(),
-                title_source: Default::default(),
-                checkout: None,
-            })
-            .unwrap();
-        let scope = Scope::Channel(channel);
+        let scope = Scope::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().into(),
+        };
         let session = session(directory.path());
         let pane = Pane {
             id: CardId::new(),

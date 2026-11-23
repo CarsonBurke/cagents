@@ -2108,9 +2108,9 @@ impl Workspace {
     #[cfg(any(test, feature = "test-support"))]
     pub fn rebuild_counts() -> (usize, usize, usize) {
         (
-            rebuilds::CARD_INDEX_BUILDS.get(),
-            rebuilds::GEOMETRY_BUILDS.get(),
-            rebuilds::VISIBILITY_REFRESHES.get(),
+            tests::CARD_INDEX_BUILDS.get(),
+            tests::GEOMETRY_BUILDS.get(),
+            tests::VISIBILITY_REFRESHES.get(),
         )
     }
 
@@ -2120,7 +2120,7 @@ impl Workspace {
 
     fn rebuild_card_indices(&mut self) {
         #[cfg(any(test, feature = "test-support"))]
-        rebuilds::CARD_INDEX_BUILDS.set(rebuilds::CARD_INDEX_BUILDS.get() + 1);
+        tests::CARD_INDEX_BUILDS.set(tests::CARD_INDEX_BUILDS.get() + 1);
         self.card_indices = Arc::new(
             self.cards
                 .iter()
@@ -2152,7 +2152,7 @@ impl Workspace {
 
     fn rebuild_geometry(&mut self) {
         #[cfg(any(test, feature = "test-support"))]
-        rebuilds::GEOMETRY_BUILDS.set(rebuilds::GEOMETRY_BUILDS.get() + 1);
+        tests::GEOMETRY_BUILDS.set(tests::GEOMETRY_BUILDS.get() + 1);
         let geometry = self.build_geometry(self.viewport_width);
         if geometry == self.geometry {
             return;
@@ -2282,7 +2282,7 @@ impl Workspace {
 
     fn refresh_visibility(&mut self, offset_changed: bool) -> ViewportUpdate {
         #[cfg(any(test, feature = "test-support"))]
-        rebuilds::VISIBILITY_REFRESHES.set(rebuilds::VISIBILITY_REFRESHES.get() + 1);
+        tests::VISIBILITY_REFRESHES.set(tests::VISIBILITY_REFRESHES.get() + 1);
         if self.layout_transition.is_none() {
             self.opening.clear();
         } else {
@@ -2494,10 +2494,19 @@ fn validate_nonnegative_finite(value: f32, field: &'static str) -> Result<(), Wo
     }
 }
 
-/// The work counters behind `Workspace::rebuild_counts`, which the
-/// application's tests read too.
 #[cfg(any(test, feature = "test-support"))]
-mod rebuilds {
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests {
+    use super::*;
+
     thread_local! {
         /// How many times this thread has indexed a strip's cards.
         pub(super) static CARD_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2506,12 +2515,6 @@ mod rebuilds {
         /// How many times this thread has classed a strip's cards by visibility.
         pub(super) static VISIBILITY_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rebuilds::*;
-    use super::*;
 
     fn card(width: CardWidth) -> WorkspaceCard {
         WorkspaceCard::new(CardId::new(), "Test card", width).unwrap()

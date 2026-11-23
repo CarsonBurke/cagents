@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn a_panes_place_is_looked_up_in_an_index_built_again_only_when_projects_change() {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.sidebar_model = crate::sidebar::test_support::panel_model();
+        app.sidebar_model = crate::sidebar::tests::panel_model();
 
         assert_eq!(
             place_in(&mut app, "/repo/fix-sidebar"),
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn a_folder_listed_twice_is_placed_as_the_scan_placed_it() {
         let project = |name: &str, repository: &str, worktrees: &[(&str, &str)]| {
-            let mut project = crate::sidebar::test_support::panel_model().projects[0].clone();
+            let mut project = crate::sidebar::tests::panel_model().projects[0].clone();
             project.name = name.into();
             project.repository = repository.into();
             let template = project.worktrees[0].clone();

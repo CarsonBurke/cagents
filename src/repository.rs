@@ -3334,21 +3334,6 @@ pub struct CreateWorktreeRequest {
     /// checking for an existing branch; reported with the created worktree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolution_warnings: Vec<ProcessFailure>,
-    /// Git still registers a worktree at `destination` whose folder was
-    /// deleted, so `git worktree add` takes that registration over.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub replaces_missing: bool,
-}
-
-/// Whether Git registers `worktree` at `destination` while its folder is gone.
-fn missing_registration(worktree: &WorktreeRecord, destination: &Path) -> bool {
-    worktree.path == destination
-        && !worktree.bare
-        && !worktree.lock.locked
-        && matches!(
-            fs::symlink_metadata(&worktree.path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
 }
 
 /// User intent, resolved without creating directories or changing Git refs.
@@ -6393,7 +6378,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 "An existing branch keeps its history; clear the base override or choose a new branch".into()
             ).into());
         }
-        let listed = self.list_worktrees(&repository, cancellation)?;
+        if let Some(worktree) = self
+            .list_worktrees(&repository, cancellation)?
+            .iter()
+            .find(|worktree| worktree.branch.as_deref() == Some(branch.full_ref().as_str()))
+        {
+            return Err(ValidationError::InvalidBranch(format!(
+                "{} is already checked out at {}; use that worktree or switch its branch first",
+                branch.as_str(),
+                worktree.path.display()
+            ))
+            .into());
+        }
         let (base, track) = if let Some((remote, name)) = selected_remote {
             (
                 BaseRevision::remote_ref(format!("refs/remotes/{remote}/{name}"))?,
@@ -6454,26 +6450,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if inspect_destination(&destination) != DestinationResidualState::Absent {
             return Err(ValidationError::DestinationOccupied.into());
         }
-        // A worktree deleted without Git stays registered at its missing
-        // folder, still holding its branch. Recreating it in that same folder
-        // takes the registration over; any other checkout of the branch, or a
-        // registration elsewhere, still refuses.
-        let replaces_missing = listed
-            .iter()
-            .any(|worktree| missing_registration(worktree, &destination));
-        if let Some(worktree) = listed.iter().find(|worktree| {
-            worktree.branch.as_deref() == Some(branch.full_ref().as_str())
-                && !missing_registration(worktree, &destination)
-        }) {
-            return Err(ValidationError::InvalidBranch(format!(
-                "{} is already checked out at {}; use that worktree or switch its branch first",
-                branch.as_str(),
-                worktree.path.display()
-            ))
-            .into());
-        }
         Ok(CreateWorktreeRequest {
-            replaces_missing,
             setup_intent: None,
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
@@ -6692,17 +6669,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 OsString::from("--lock"),
                 OsString::from("--reason"),
                 format!("cagents:{}", request.operation_id).into(),
-            ]
-            .into_iter()
-            // As for an existing branch: only a missing folder's registration.
-            .chain(request.replaces_missing.then(|| OsString::from("--force")))
-            .chain([
                 OsString::from("--no-track"),
                 OsString::from("-b"),
                 request.branch.as_str().into(),
                 request.destination.as_os_str().to_owned(),
                 base_oid.into(),
-            ]),
+            ],
         ))
     }
 
@@ -9100,7 +9072,6 @@ mod tests {
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
             resolution_warnings: Vec::new(),
-            replaces_missing: false,
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
@@ -9134,7 +9105,6 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
             resolution_warnings: Vec::new(),
-            replaces_missing: false,
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
@@ -11239,7 +11209,6 @@ mod tests {
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
                 resolution_warnings: Vec::new(),
-                replaces_missing: false,
                 setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
@@ -12759,34 +12728,6 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
 
 pub use crate::worktree_cleanup::RemovedWorktree;
 
-/// The worktree Git still has registered at `destination` although its folder
-/// is gone, found by the administrative directory whose `gitdir` names it.
-#[cfg(feature = "ui")]
-fn missing_registration_at(common_dir: &Path, destination: &Path) -> Option<RemovedWorktree> {
-    if !matches!(fs::symlink_metadata(destination), Err(error) if error.kind() == io::ErrorKind::NotFound)
-    {
-        return None;
-    }
-    let named = destination.join(".git");
-    let admin_dir = fs::read_dir(common_dir.join("worktrees"))
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|admin| {
-            fs::read_to_string(admin.join("gitdir"))
-                .is_ok_and(|line| Path::new(line.trim_end()) == named)
-        })?;
-    let branch = fs::read_to_string(admin_dir.join("HEAD"))
-        .ok()
-        .and_then(|head| head.trim_end().strip_prefix("ref: ").map(str::to_owned));
-    Some(RemovedWorktree {
-        common_dir: common_dir.to_path_buf(),
-        admin_dir: fs::canonicalize(&admin_dir).ok()?,
-        path: destination.to_path_buf(),
-        branch,
-    })
-}
-
 /// Releases the identities held by the applied creations of `removed`.
 ///
 /// An applied creation keeps its identity so that a replay of the request
@@ -13255,19 +13196,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             created_at_unix_ms: created_at,
             updated_at_unix_ms: created_at,
         };
-        // Recreating a worktree deleted without Git, where it was, is the user
-        // asking to replace it, so the creation that made it no longer holds
-        // its identity, as it would not had the app deleted it.
-        if request.replaces_missing
-            && let Some(removed) =
-                missing_registration_at(&journal.common_dir, &request.destination)
-            && let Err(failures) = release_deleted_worktree_creations(store, &removed)
-        {
-            tracing::warn!(
-                ?failures,
-                "a missing worktree's creation could not be released"
-            );
-        }
         if let Err(error) = store.begin_operation(&operation) {
             emit(WorktreeProgressStage::Finished);
             let state = if error.to_string().contains("lease is occupied") {
@@ -13348,8 +13276,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .iter()
                 .find(|worktree| {
                     worktree.branch.as_deref() == Some(journal.request.branch.full_ref().as_str())
-                        && !(journal.request.replaces_missing
-                            && missing_registration(worktree, &journal.request.destination))
                 })
             {
                 return Err(ValidationError::InvalidBranch(format!(
@@ -13566,21 +13492,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         OsString::from("--lock"),
                         OsString::from("--reason"),
                         format!("cagents:{}", journal.request.operation_id).into(),
-                    ]
-                    .into_iter()
-                    // Takes over only the missing folder's registration:
-                    // resolution refused every other checkout of the branch.
-                    .chain(
-                        journal
-                            .request
-                            .replaces_missing
-                            .then(|| OsString::from("--force")),
-                    )
-                    .chain([
                         OsString::from("--"),
                         journal.request.destination.as_os_str().to_owned(),
                         journal.request.branch.as_str().into(),
-                    ]),
+                    ],
                 )
             } else {
                 if branch.exit_code != Some(1) {
@@ -14188,7 +14103,6 @@ mod worktree_journal_tests {
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
                 resolution_warnings: Vec::new(),
-                replaces_missing: false,
                 setup_intent: None,
                 repository,
                 managed_root: root.clone(),
@@ -14362,38 +14276,6 @@ mod worktree_journal_tests {
             BaseRevision::LocalBranch(ValidatedBranchName::parse("foo").unwrap()),
             "the kept branch is checked out as it is"
         );
-        let report = fixture.run(&CancellationToken::new());
-        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        assert!(destination.join("tracked.txt").is_file());
-    }
-
-    /// A worktree whose folder was deleted without Git is still registered
-    /// there, holding its branch. Recreating it in the same folder takes that
-    /// registration over, while another folder for the branch still refuses.
-    #[test]
-    fn a_worktree_deleted_without_git_can_be_created_again_where_it_was() {
-        let mut fixture = Fixture::new();
-        fixture.resolve(fixture.input("foo"));
-        let report = fixture.run(&CancellationToken::new());
-        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        let destination = fixture.request.destination.clone();
-        fs::remove_dir_all(&destination).unwrap();
-
-        let mut elsewhere = fixture.input("foo");
-        elsewhere.destination = destination
-            .with_file_name("foo-elsewhere")
-            .display()
-            .to_string();
-        let error = fixture
-            .service
-            .resolve_worktree_request(&elsewhere, &CancellationToken::new())
-            .unwrap_err();
-        assert!(error.to_string().contains("already checked out"), "{error}");
-
-        let mut again = fixture.input("foo");
-        again.destination = destination.display().to_string();
-        fixture.resolve(again);
-        assert!(fixture.request.replaces_missing);
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert!(destination.join("tracked.txt").is_file());

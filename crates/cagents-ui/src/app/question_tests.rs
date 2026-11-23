@@ -103,7 +103,7 @@ fn review_question(
     before: &[crate::pull_request_review::discussion_ui::Action],
     prepare: crate::pull_request_review::discussion_ui::Action,
 ) -> Opened {
-    use crate::pull_request_review::discussion_ui::test_support as review;
+    use crate::pull_request_review::discussion_ui::tests as review;
     let (mut app, _) = tests::pull_request_test_app(&[1]);
     let (card, _) = app.add_pull_requests_card("/repo".into());
     drop(app.workspace.focus(card));
@@ -297,7 +297,7 @@ fn use_existing_checkout() -> Opened {
 /// [`use_existing_checkout`], with `meanwhile` done to the app while the
 /// checkout prepares.
 fn existing_checkout_offered(meanwhile: impl FnOnce(&mut Cagents, CardId)) -> Opened {
-    use crate::pull_request_review::checkout_ui::test_support::ExistingCheckout;
+    use crate::pull_request_review::checkout_ui::tests::ExistingCheckout;
     let fixture = ExistingCheckout::new();
     let (mut app, project) = tests::pull_request_test_app(&[1]);
     let (card, _) = app.add_pull_requests_card("/repo".into());

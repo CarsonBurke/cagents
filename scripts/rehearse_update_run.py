@@ -778,6 +778,65 @@ class Rehearsal:
             raise ValueError(f'agent {agent_id} is closed')
         return record
 
+    def end_provider(self, name):
+        """Kill the named Codex chat's provider after its first turn, as a crash would.
+
+        The daemon then holds a conversation whose provider already stopped with
+        nothing left to carry: its update review says it reopens with a new
+        provider, and the source leaves it out of its checkpoint (#3844).
+        """
+        import signal
+        entry = {'state':'ended-provider','name':name,'exit':1}
+        fixture = self.root/'codex-fixture.json'
+        pause = json.loads(fixture.read_text()).get('pause',0) if fixture.exists() else 0
+        deadline = time.monotonic()+pause+60
+        def row():
+            _, listing = self.cli('sessions','--all',check=False)
+            agents = [a for a in self.listed_agents(start=True) if a['name']==name]
+            rows = [r for r in listing.get('data',{}).get('sessions',[])
+                    if len(agents)==1 and r.get('agent')==agents[0]['id']]
+            return rows[0] if len(rows)==1 else None
+        while True:
+            chat = row()
+            # Its first turn is done and its provider sits idle on a recorded thread.
+            if chat and chat.get('state')=='idle' and chat.get('run_state')=='succeeded':
+                break
+            if time.monotonic() >= deadline:
+                self.errors.append(f'{name}: its first turn never finished, so its provider was not ended')
+                entry['chat'] = chat
+                return entry
+            time.sleep(.5)
+        entry['agent_id'], entry['chat_id'], entry['before'] = chat['agent'], chat['id'], chat
+        try:
+            record = json.loads((self.root/'rt/cagents/native-holders'/f'{chat["id"]}.json').read_text())
+            for role in ('holder','root'):
+                process = record[role]
+                proc = Path(f'/proc/{process["pid"]}')
+                env = proc.joinpath('environ').read_bytes().split(b'\0')
+                stat = proc.joinpath('stat').read_text().rsplit(')',1)[1].split()
+                if f'HOME={self.root}/home'.encode() not in env or int(stat[19]) != process['start']:
+                    raise ValueError(f'{role} {process["pid"]} is not this chat\'s provider process')
+            # The provider's whole process group, then its holder, as a crash leaves them.
+            os.killpg(os.getpgid(record['root']['pid']), signal.SIGKILL)
+            os.kill(record['holder']['pid'], signal.SIGKILL)
+            entry['killed_pids'] = [record['root']['pid'], record['holder']['pid']]
+        except (OSError,ValueError,KeyError) as error:
+            self.errors.append(f'{name}: could not end its provider: {error}')
+            return entry
+        deadline = time.monotonic()+30
+        while time.monotonic() < deadline:
+            chat = row()
+            if chat and chat.get('state')!='idle':
+                break
+            time.sleep(.5)
+        entry['after'] = chat
+        _, entry['verified_status'] = self.cli('agent','status',entry['agent_id'],check=False)
+        if not chat or chat.get('state')=='idle':
+            self.errors.append(f'{name}: the daemon never reported its provider stopped')
+        else:
+            entry['exit'] = 0
+        return entry
+
     def listed_agents(self, *, start=False):
         """Each open agent's `id`, `name` and lowercase `state`, as either CLI lists them."""
         _, listing = self.cli(*(() if start else ('--no-start',)),'agent','list',check=False)
@@ -1486,6 +1545,11 @@ class Rehearsal:
             codex_channel_id = codex_channel['response']['data']['channel']['id']
             seed('codex-chat', ['agent','spawn','--provider','codex','--surface','chat','--name','codex-alpha',
                                '--channel',codex_channel_id,'Offline Codex rehearsal'], 'alpha')
+            if args.ended_provider:
+                ended_channel = seed('ended-provider-channel', ['channel','spawn','--repository',alpha,'--title','Ended provider'])
+                seed('ended-provider-chat', ['agent','spawn','--provider','codex','--surface','chat','--name','codex-ended',
+                                            '--channel',ended_channel['response']['data']['channel']['id'],
+                                            'Provider ends after this turn'], 'alpha')
         for index in range(args.untitled):
             # Empty channel title is the product's actual untitled state.
             channel = seed(f'untitled-channel-{index+1}', ['channel','spawn','--repository',beta])
@@ -1550,6 +1614,8 @@ class Rehearsal:
                 if entry['state'] == 'codex-chat' and matching:
                     _, status = self.cli('agent','status',matching[0]['id'],check=False)
                     entry['verified_status'] = status
+        if args.ended_provider:
+            evidence.append(self.end_provider('codex-ended'))
         # After the Codex startup check: seeding takes minutes, longer than its turn.
         if args.scale_chats:
             self.seed_scale(args, seed)
@@ -1955,6 +2021,8 @@ def seed_options(parser):
     parser.add_argument('--no-child',action='store_true')
     for flag in ('ignore-term','no-init','exit-mid-turn','uncarryable','unreachable'):
         parser.add_argument('--'+flag,action='store_true')
+    parser.add_argument('--ended-provider',action='store_true',
+                        help="also open a Codex chat and kill its provider after its first turn, as a crash would, so the update reviews a conversation whose provider already stopped")
     parser.add_argument('--scale-chats',type=int,default=0,metavar='N',
                         help='also open N idle chats with long transcripts, every third Codex, as a long-running daemon holds')
     parser.add_argument('--scale-entries',type=int,default=400,metavar='COUNT',
@@ -1968,7 +2036,7 @@ def seed_flags(args):
     if args.scale_chats:
         flags += ['--scale-chats',str(args.scale_chats),'--scale-entries',str(args.scale_entries),
                   '--scale-bytes',str(args.scale_bytes)]
-    for flag in ('no_codex','no_console','no_child','ignore_term','no_init','exit_mid_turn','uncarryable','unreachable'):
+    for flag in ('no_codex','no_console','no_child','ignore_term','no_init','exit_mid_turn','uncarryable','unreachable','ended_provider'):
         if getattr(args,flag):
             flags.append('--'+flag.replace('_','-'))
     return flags
@@ -2050,6 +2118,8 @@ def main():
         parser.error('--new-terminal-after-restore requires --reopen-existing-only')
     if args.command == 'run' and args.expect_terminal_restart_failure and not args.new_terminal_after_restore:
         parser.error('--expect-terminal-restart-failure requires --new-terminal-after-restore')
+    if args.command in ('run','seed') and args.ended_provider and args.no_codex:
+        parser.error('--ended-provider opens a Codex chat; it cannot be combined with --no-codex')
     if args.command == 'run' and args.require_working and args.no_codex:
         parser.error('--require-working requires the seeded Codex chat')
     rehearsal=Rehearsal(args.root,args.shell)

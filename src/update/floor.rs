@@ -34,11 +34,9 @@ pub(super) fn preview_stop_list(
         return Ok(None);
     };
     let mut client = source_client_for(daemon)?;
-    let terminals = client.list()?;
     let inventory = Inventory {
         chats: client.list_chats()?,
-        processes: super::floor_display::TerminalProcesses::observe(&terminals),
-        terminals,
+        terminals: client.list()?,
         chat_states: BTreeMap::new(),
     };
     let service = needs_service_stop(daemon)
@@ -63,9 +61,6 @@ struct Inventory {
     chats: Vec<crate::chat::Session>,
     chat_states: BTreeMap<TerminalId, String>,
     terminals: Vec<TerminalDescriptor>,
-    /// The terminals' processes, observed with them, so their foreground
-    /// commands can label the stop list.
-    processes: super::floor_display::TerminalProcesses,
 }
 
 fn stop_list(
@@ -77,6 +72,7 @@ fn stop_list(
         .daemon
         .as_ref()
         .ok_or_else(|| invalid("The source service is no longer running"))?;
+    let processes = super::floor_display::TerminalProcesses::observe();
     let mut items = Vec::new();
     for item in &daemon.sessions {
         let label = preview.labels.names.get(&item.id).unwrap_or(&item.title);
@@ -118,7 +114,7 @@ fn stop_list(
                     .continuity
                     .can_resume_live(&daemon.capability.proof)
                 {
-                    items.push(terminal_item(terminal, item, label, &inventory.processes));
+                    items.push(terminal_item(terminal, item, label, &processes));
                 }
             }
             _ => (),
@@ -171,7 +167,7 @@ fn stop_list(
                 .unwrap_or("Terminal");
             let item =
                 descriptor_impact(id, impact::SessionKind::Terminal, label, &terminal.session)?;
-            items.push(terminal_item(terminal, &item, label, &inventory.processes));
+            items.push(terminal_item(terminal, &item, label, &processes));
         }
     }
     items.sort_by_key(|item| (item.kind, item.id));
@@ -377,7 +373,6 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         Ok(Inventory {
             chats,
             chat_states,
-            processes: super::floor_display::TerminalProcesses::observe(&terminals),
             terminals,
         })
     }
@@ -1060,14 +1055,6 @@ fn quiesce_inner(
     }
 }
 
-/// How long the update pauses between checks that the confirmed
-/// interruptions have ended; tests settle at once, so they check sooner.
-const INTERRUPT_POLL: Duration = if cfg!(test) {
-    Duration::from_millis(10)
-} else {
-    Duration::from_millis(100)
-};
-
 /// A preparation still refused as busy after the reviewed conversations ended.
 /// The terminal service and its terminals kept running.
 const PREPARE_BUSY_AFTER_ENDS: &str = "The source daemon stayed busy finishing another operation, so it did not checkpoint. The terminal service and its terminals were not stopped; the conversations below had already ended. Retry the update once it finishes.";
@@ -1177,7 +1164,9 @@ fn settle_interrupts(
             }
             return Ok(current);
         }
-        thread::sleep(INTERRUPT_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 

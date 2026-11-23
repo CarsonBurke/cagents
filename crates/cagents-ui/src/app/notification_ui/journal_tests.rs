@@ -650,7 +650,7 @@ fn explicit_review_row_keeps_existing_ack_semantics_while_journal_reading_does_n
 #[test]
 fn focused_original_save_refuses_queued_attention_and_popup_close_has_no_focus_effect() {
     const NAME: &str = "app::notification_ui::journal_tests::focused_original_save_refuses_queued_attention_and_popup_close_has_no_focus_effect";
-    if crate::repository_widget::test_support::isolated_test(NAME) {
+    if crate::repository_widget::retained_save_tests::isolated_test(NAME) {
         return;
     }
     let mut renderer = super::super::tests::headless_renderer();

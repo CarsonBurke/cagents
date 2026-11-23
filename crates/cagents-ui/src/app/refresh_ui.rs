@@ -808,8 +808,8 @@ mod tests {
 
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().expect("fixture has a focused card");
-        app.sidebar_model = sidebar::test_support::panel_model();
-        app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         app.open_pane_inspector_now(card);
         drop(app.handle_context_section(ContextAction::Show(WorkspaceView::SourceControl)));
         assert!(app.workspace_view_shown().is_some());

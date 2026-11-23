@@ -2999,7 +2999,6 @@ fn creation_request(
             BaseRevision::object_id(fixture.original.as_str()).unwrap()
         },
         track,
-        replaces_missing: false,
         operation_id: OperationId::new(),
         setup_intent: Some(WorktreeSetupIntent::default()),
     };
