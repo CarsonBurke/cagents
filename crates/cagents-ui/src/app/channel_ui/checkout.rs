@@ -716,9 +716,7 @@ mod tests {
             .push(crate::workspace_model::views::View {
                 scope: crate::workspace_model::views::Scope::Channel(ChannelId::new()),
                 revision: 1,
-                panes: vec![
-                    crate::workspace_model::views::Pane::from_card(&pane, None).unwrap(),
-                ],
+                panes: vec![crate::workspace_model::views::Pane::from_card(&pane, None).unwrap()],
                 retired: vec![],
             });
         fixture.app.adopt_strip_cards();
@@ -742,13 +740,9 @@ mod tests {
         assert_eq!(found.path, gone);
         assert_eq!(found.branch, "Channel 2");
 
-        drop(
-            fixture
-                .app
-                .update(Message::MissingCheckout(super::super::missing_checkout::Action::Recreate(
-                    missing,
-                ))),
-        );
+        drop(fixture.app.update(Message::MissingCheckout(
+            super::super::missing_checkout::Action::Recreate(missing),
+        )));
         let dialog = fixture.app.worktree_dialog.as_ref().expect("the dialog");
         assert_eq!(dialog.draft.branch, "Channel 2");
         assert_eq!(dialog.draft.destination, gone.display().to_string());

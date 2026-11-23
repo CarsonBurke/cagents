@@ -3619,13 +3619,13 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
 }
 
 #[test]
-fn authenticated_worktree_caller_places_child_in_its_exact_visible_view() {
+fn a_worktree_callers_child_lands_in_a_channel_for_its_checkout() {
     use crate::{
         agent_execution::{Placement, directory::Scope},
         model::{CardId, CardKind},
         workspace_model::views::Pane,
     };
-    if isolated("authenticated_worktree_caller_places_child_in_its_exact_visible_view").is_some() {
+    if isolated("a_worktree_callers_child_lands_in_a_channel_for_its_checkout").is_some() {
         return;
     }
     let (host, request, path) = fixture();
@@ -3682,9 +3682,12 @@ fn authenticated_worktree_caller_places_child_in_its_exact_visible_view() {
     let alias = path.parent().unwrap().join("project-alias");
     std::os::unix::fs::symlink(&spec.target.repository, &alias).unwrap();
     spec.target.repository = alias;
+    // Worktree views take no new pane, so the child lands in a channel. The
+    // caller's view is the project's main checkout, which, as for a child
+    // placed nowhere, gets a channel of its own.
     let child = submit(&host, &authority, child_request).unwrap();
-    assert_eq!(child.agent.placement, scope);
-    assert!(child.agent.channel().is_none());
+    assert_ne!(child.agent.placement, scope);
+    assert!(child.agent.channel().is_some());
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
     assert_eq!(
         registry(&host)
@@ -3695,7 +3698,7 @@ fn authenticated_worktree_caller_places_child_in_its_exact_visible_view() {
             .unwrap()
             .channels
             .len(),
-        channels
+        channels + 1
     );
 }
 

@@ -243,6 +243,7 @@ fn place_agents(
     let Scope::Worktree { repository, path } = scope else {
         return Ok(0);
     };
+    let (repository, path) = (repository_key(repository)?, repository_key(path)?);
     let placed: Vec<String> = transaction
         .prepare(
             "SELECT id FROM agents
@@ -252,10 +253,7 @@ fn place_agents(
         )
         .and_then(|mut statement| {
             statement
-                .query_map(
-                    params![repository_key(repository)?, repository_key(path)?],
-                    |row| row.get(0),
-                )?
+                .query_map(params![repository, path], |row| row.get(0))?
                 .collect()
         })
         .map_err(|error| error.to_string())?;
@@ -547,7 +545,7 @@ mod tests {
             .apply(&ModelEdit::ReorderNavigation {
                 repository: store.checkout.repository.clone(),
                 source: items[1].clone(),
-                before: None,
+                before: Some(items[0].clone()),
                 fallback: items.clone(),
             })
             .unwrap();
@@ -568,9 +566,9 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                NavigationItem::Worktree(main),
                 NavigationItem::Channel(channel),
                 NavigationItem::Worktree(linked),
+                NavigationItem::Worktree(main),
             ]
         );
     }

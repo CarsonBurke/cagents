@@ -36,7 +36,11 @@ impl Cagents {
     /// been listed and none of them is it. A project still loading, or one
     /// whose checkout cannot be read, says nothing yet.
     pub(in crate::app) fn missing_checkout(&self, id: ChannelId) -> Option<Missing> {
-        let channel = self.durable.channels.iter().find(|channel| channel.id == id)?;
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
         let path = channel.checkout.as_deref()?;
         let project = self.sidebar_model.project(channel.project_id)?;
         if project.kind != ProjectKind::Git
@@ -92,12 +96,10 @@ impl Cagents {
         };
         let severity = NoticeSeverity::Warning;
         let enabled = !self.modal_is_open();
-        let folder = missing
-            .path
-            .file_name()
-            .map_or_else(|| missing.path.display().to_string(), |name| {
-                name.to_string_lossy().into_owned()
-            });
+        let folder = missing.path.file_name().map_or_else(
+            || missing.path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         let text = format!(
             "The worktree {folder} is missing, so this channel's panes start in {}'s main \
              checkout.",
@@ -110,9 +112,8 @@ impl Cagents {
                     .name("Make the worktree again on its branch, where it was")
                     .class(notice_surface_button(severity))
                     .on_press_maybe(
-                        enabled.then_some(Message::MissingCheckout(Action::Recreate(
-                            missing.channel,
-                        ))),
+                        enabled
+                            .then_some(Message::MissingCheckout(Action::Recreate(missing.channel))),
                     ),
                 missing.path.display().to_string(),
             ),

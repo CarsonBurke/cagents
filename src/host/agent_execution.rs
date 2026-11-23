@@ -318,7 +318,8 @@ fn accept(
         if let Some(crate::agent_execution::Placement::Worktree { path, .. }) =
             &selected.target.placement
         {
-            selected.target.placement = checkout_placement(host, &selected.target.repository, path)?;
+            selected.target.placement =
+                checkout_placement(host, &selected.target.repository, path)?;
         }
         Some(selected)
     } else {

@@ -748,32 +748,25 @@ mod tests {
             first
         );
 
-        // Move through a second channel, then to a worktree. The latter has
-        // no channel of its own and must not erase the lineage's last one.
-        let worktree = Scope::Worktree {
-            repository: repository.clone(),
-            path: repository,
-        };
-        let mut source = Scope::Channel(first);
-        for destination in [Scope::Channel(second), worktree.clone()] {
-            registry
-                .apply(&ModelEdit::ChangeView {
-                    expected_revision: registry.view_revision(&source).unwrap(),
-                    scope: source,
-                    operation: uuid::Uuid::new_v4(),
-                    change: Change::Transfer {
-                        id: pane.id,
-                        destination: destination.clone(),
-                        before: None,
-                    },
-                })
-                .unwrap();
-            source = destination;
-        }
+        // Move to a second channel, then close the pane there. A missing
+        // pane must not erase the lineage's last channel.
+        let (source, moved) = (Scope::Channel(first), Scope::Channel(second));
         registry
             .apply(&ModelEdit::ChangeView {
-                expected_revision: registry.view_revision(&worktree).unwrap(),
-                scope: worktree,
+                expected_revision: registry.view_revision(&source).unwrap(),
+                scope: source,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id: pane.id,
+                    destination: moved.clone(),
+                    before: None,
+                },
+            })
+            .unwrap();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                expected_revision: registry.view_revision(&moved).unwrap(),
+                scope: moved,
                 operation: uuid::Uuid::new_v4(),
                 change: Change::Remove { id: pane.id },
             })

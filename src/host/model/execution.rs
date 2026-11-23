@@ -4799,10 +4799,7 @@ mod tests {
             );
             assert!(registry.cleanup_execution_is_quiescent().unwrap());
             // Moving the stopped card keeps the stop record.
-            let moved = Scope::Worktree {
-                repository: directory.path().into(),
-                path: directory.path().into(),
-            };
+            let moved = other_channel(&mut registry, directory.path());
             registry
                 .apply(&ModelEdit::ChangeView {
                     scope: scope.clone(),
@@ -4815,13 +4812,7 @@ mod tests {
                     },
                 })
                 .unwrap();
-            assert_eq!(
-                registry.agent(accepted.agent.id).unwrap().placement,
-                Placement::Worktree {
-                    repository: directory.path().into(),
-                    path: directory.path().into(),
-                }
-            );
+            assert_eq!(registry.agent(accepted.agent.id).unwrap().placement, moved);
             assert!(registry.agent_process_ended(accepted.agent.id).unwrap());
             let scope = moved;
 
@@ -4994,10 +4985,7 @@ mod tests {
                     closed: vec![],
                 })
                 .unwrap();
-            let target = Scope::Worktree {
-                repository: directory.path().into(),
-                path: directory.path().into(),
-            };
+            let target = other_channel(&mut registry, directory.path());
             registry
                 .apply(&ModelEdit::ChangeView {
                     scope: scope.clone(),
@@ -5218,10 +5206,7 @@ mod tests {
         use crate::workspace_model::views::{Change, Scope};
         let (mut registry, directory, accepted, pane) = closed_pane_fixture();
         let source = Scope::Channel(accepted.agent.channel().unwrap());
-        let target = Scope::Worktree {
-            repository: directory.path().into(),
-            path: directory.path().into(),
-        };
+        let target = other_channel(&mut registry, directory.path());
         let mut other = pane.clone();
         other.id = crate::model::CardId::new();
         let crate::model::CardKind::Chat(session) = &mut other.kind else {
@@ -5479,10 +5464,7 @@ mod tests {
         for reject_close in [false, true] {
             let (mut registry, directory, accepted, pane) = closed_pane_fixture();
             let initial = Scope::Channel(accepted.agent.channel().unwrap());
-            let moved = Scope::Worktree {
-                repository: directory.path().into(),
-                path: directory.path().into(),
-            };
+            let moved = other_channel(&mut registry, directory.path());
             registry
                 .apply(&ModelEdit::SeedView {
                     scope: initial.clone(),
@@ -6163,6 +6145,25 @@ mod tests {
         context.verify_directory(directory.path()).unwrap();
         let replacement = tempfile::tempdir().unwrap();
         assert!(context.verify_directory(replacement.path()).is_err());
+    }
+
+    /// A channel beside the agent's own, to move its pane into: worktree
+    /// views take no new pane.
+    fn other_channel(
+        registry: &mut Registry,
+        repository: &std::path::Path,
+    ) -> crate::workspace_model::views::Scope {
+        let id = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id,
+                repository: repository.into(),
+                title: "Other".into(),
+                title_source: Default::default(),
+                checkout: None,
+            })
+            .unwrap();
+        crate::workspace_model::views::Scope::Channel(id)
     }
 
     fn fixture() -> (Registry, tempfile::TempDir, Submit) {

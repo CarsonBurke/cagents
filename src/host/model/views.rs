@@ -737,23 +737,20 @@ pub(super) fn apply_recorded(
                         view.apply(&Change::Remove { id: *id })?
                     }
                 }
-                Change::Insert { .. } | Change::InsertIfEmpty { .. }
-                    if let Some(reason) = refusal(transaction, scope, change)? =>
-                {
-                    return Err(reason);
-                }
-                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
-                    if resource_owner(transaction, pane)?.is_some() =>
-                {
-                    false
-                }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
-                    if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
-                        return Err(
-                            "pane already belongs to another view; use an atomic transfer".into(),
-                        );
+                    if let Some(reason) = refusal(transaction, scope, change)? {
+                        return Err(reason);
                     }
-                    view.apply(change)?
+                    if resource_owner(transaction, pane)?.is_some() {
+                        false
+                    } else {
+                        if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
+                            return Err("pane already belongs to another view; use an atomic \
+                                        transfer"
+                                .into());
+                        }
+                        view.apply(change)?
+                    }
                 }
                 Change::Update { before, pane }
                 | Change::UpdateTerminalSource { before, pane, .. } => {
@@ -1682,20 +1679,29 @@ mod tests {
             repository: "/repo".into(),
             path: "/repo/tree".into(),
         };
+        // A worktree's legacy strip hands its pane to a channel, the one way
+        // a pane crosses between them now.
         let p = pane();
-        seed(&mut r, a, vec![p.clone()]);
-        let transfer = edit(
-            &mut r,
-            a,
-            Change::Transfer {
+        r.apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![p.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+        seed(&mut r, a, vec![]);
+        let transfer = ModelEdit::ChangeView {
+            expected_revision: r.view_revision(&scope).unwrap(),
+            scope: scope.clone(),
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Transfer {
                 id: p.id,
-                destination: scope.clone(),
+                destination: Scope::Channel(a),
                 before: None,
             },
-        );
+        };
         r.apply(&transfer).unwrap();
-        assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
-        assert_eq!(read(&r.db, &scope).unwrap().panes, vec![p]);
+        assert!(read(&r.db, &scope).unwrap().panes.is_empty());
+        assert_eq!(read(&r.db, &Scope::Channel(a)).unwrap().panes, vec![p]);
         r.apply(&ModelEdit::CloseProject {
             repository: "/repo".into(),
         })

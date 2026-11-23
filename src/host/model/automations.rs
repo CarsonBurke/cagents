@@ -3420,135 +3420,126 @@ mod tests {
             model::{CardId, CardKind, ChannelId},
             workspace_model::views::{Change, Pane},
         };
-        for move_to_worktree in [false, true] {
-            let (mut registry, directory, definition) = fixture();
-            let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
-            let owned_channel = agent.channel().unwrap();
-            let destination = if move_to_worktree {
-                Placement::Worktree {
-                    repository: directory.path().into(),
-                    path: directory.path().into(),
-                }
-            } else {
-                let id = ChannelId::new();
-                registry
-                    .apply(&ModelEdit::CreateChannel {
-                        id,
-                        repository: directory.path().into(),
-                        title: "User channel".into(),
-                        title_source: Default::default(),
-                        checkout: None,
-                    })
-                    .unwrap();
-                Placement::Channel(id)
-            };
+        let (mut registry, directory, definition) = fixture();
+        let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+        let owned_channel = agent.channel().unwrap();
+        let id = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id,
+                repository: directory.path().into(),
+                title: "User channel".into(),
+                title_source: Default::default(),
+                checkout: None,
+            })
+            .unwrap();
+        let destination = Placement::Channel(id);
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: destination.clone(),
+                panes: vec![],
+                closed: vec![],
+            })
+            .unwrap();
+        let pane = Pane {
+            id: CardId::from_uuid(agent.id.as_uuid()),
+            title: "Reusable agent".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Chat(match agent.session.clone().unwrap() {
+                HostedSession::Chat(session) => session,
+                _ => unreachable!(),
+            }),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: agent.placement.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                expected_revision: registry.view_revision(&agent.placement).unwrap(),
+                scope: agent.placement.clone(),
+                operation: Uuid::new_v4(),
+                change: Change::Transfer {
+                    id: pane.id,
+                    destination: destination.clone(),
+                    before: None,
+                },
+            })
+            .unwrap();
+        // A user move may race the scheduler's idle proof. Only placement
+        // differs from that exact session proof; release must retain it.
+        registry
+            .finish_automation_release(firing.id, &agent, 230)
+            .unwrap();
+        let claim = |registry: &mut Registry, now| {
             registry
-                .apply(&ModelEdit::SeedView {
-                    scope: destination.clone(),
-                    panes: vec![],
-                    closed: vec![],
-                })
-                .unwrap();
-            let pane = Pane {
-                id: CardId::from_uuid(agent.id.as_uuid()),
-                title: "Reusable agent".into(),
-                user_title: None,
-                pending_terminal_start: false,
-                width_fraction: 0.5,
-                scope: None,
-                kind: CardKind::Chat(match agent.session.clone().unwrap() {
-                    HostedSession::Chat(session) => session,
-                    _ => unreachable!(),
-                }),
-            };
-            registry
-                .apply(&ModelEdit::SeedView {
-                    scope: agent.placement.clone(),
-                    panes: vec![pane.clone()],
-                    closed: vec![],
-                })
-                .unwrap();
-            registry
-                .apply(&ModelEdit::ChangeView {
-                    expected_revision: registry.view_revision(&agent.placement).unwrap(),
-                    scope: agent.placement.clone(),
-                    operation: Uuid::new_v4(),
-                    change: Change::Transfer {
-                        id: pane.id,
-                        destination: destination.clone(),
-                        before: None,
+                .claim_automation(
+                    automation.id,
+                    automation.execution_revision,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
                     },
-                })
-                .unwrap();
-            // A user move may race the scheduler's idle proof. Only placement
-            // differs from that exact session proof; release must retain it.
-            registry
-                .finish_automation_release(firing.id, &agent, 230)
-                .unwrap();
-            let claim = |registry: &mut Registry, now| {
-                registry
-                    .claim_automation(
-                        automation.id,
-                        automation.execution_revision,
-                        None,
-                        crate::automations::Trigger::Manual {
-                            request: Uuid::new_v4(),
-                        },
-                        None,
-                        true,
-                        now,
-                    )
-                    .unwrap()
-            };
-            let next = claim(&mut registry, 300).accepted.unwrap();
-            assert_eq!(next.agent.id, agent.id);
-            assert_eq!(next.agent.placement, destination);
-            assert_eq!(
-                registry.automation(automation.id).unwrap().channel,
-                Some(owned_channel)
-            );
-            let started = registry
-                .update_agent_run(
-                    next.run.id,
-                    next.run.revision,
-                    Update::Started {
-                        provider_key: "second-turn".into(),
-                    },
-                    305,
+                    None,
+                    true,
+                    now,
                 )
-                .unwrap();
-            registry
-                .update_agent_run(
-                    next.run.id,
-                    started.revision,
-                    Update::Finished {
-                        state: State::Succeeded,
-                        result: Default::default(),
-                    },
-                    310,
-                )
-                .unwrap();
-            let firing = registry
-                .reconcile_automation_run(next.run.id, 320)
                 .unwrap()
-                .unwrap();
-            let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+        };
+        let next = claim(&mut registry, 300).accepted.unwrap();
+        assert_eq!(next.agent.id, agent.id);
+        assert_eq!(next.agent.placement, destination);
+        assert_eq!(
+            registry.automation(automation.id).unwrap().channel,
+            Some(owned_channel)
+        );
+        let started = registry
+            .update_agent_run(
+                next.run.id,
+                next.run.revision,
+                Update::Started {
+                    provider_key: "second-turn".into(),
+                },
+                305,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                next.run.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                310,
+            )
+            .unwrap();
+        let firing = registry
+            .reconcile_automation_run(next.run.id, 320)
+            .unwrap()
+            .unwrap();
+        let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+        registry
+            .finish_automation_release(firing.id, &closed, 330)
+            .unwrap();
+        let fresh = claim(&mut registry, 400).accepted.unwrap();
+        assert_ne!(fresh.agent.id, agent.id);
+        assert_eq!(fresh.agent.channel(), Some(owned_channel));
+        assert_eq!(
             registry
-                .finish_automation_release(firing.id, &closed, 330)
-                .unwrap();
-            let fresh = claim(&mut registry, 400).accepted.unwrap();
-            assert_ne!(fresh.agent.id, agent.id);
-            assert_eq!(fresh.agent.channel(), Some(owned_channel));
-            assert_eq!(
-                registry
-                    .model()
-                    .unwrap()
-                    .channel(owned_channel)
-                    .unwrap()
-                    .title,
-                "Review daily"
-            );
-        }
+                .model()
+                .unwrap()
+                .channel(owned_channel)
+                .unwrap()
+                .title,
+            "Review daily"
+        );
     }
 
     #[test]
