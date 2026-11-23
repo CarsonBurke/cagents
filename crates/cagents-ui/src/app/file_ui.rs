@@ -125,7 +125,7 @@ impl Cagents {
             ));
             return Task::none();
         };
-        let source = source.or(self.workspace.focused());
+        let source = source.or_else(|| self.placement_anchor());
         let channel = self
             .durable
             .channels
@@ -166,41 +166,53 @@ impl Cagents {
                 })
             })
             .unwrap_or_else(ProjectId::new);
-        // Prefer the exact file, even when dirty. Only dedicated, clean file
-        // panes are candidates for replacement; repository browsing is separate.
-        let candidates = self.workspace.order().filter_map(|card| {
-            // A newly focused editor may still be entering the viewport. Its
-            // reveal animation must not turn a rapid second link into another
-            // pane; unrelated offscreen panes remain ineligible.
-            if self.workspace.focused() != Some(card)
-                && self.workspace.visibility(card) != Some(VisibilityClass::Visible)
-            {
-                return None;
-            }
+        // A pane already showing the file, even dirty, shows it again,
+        // wherever it is in the strip, so one file never opens twice.
+        // Otherwise only a dedicated, clean file pane is replaced, and only
+        // the source itself or the pane directly after it, which the source's
+        // last link opened: what a link opens appears beside it. Repository
+        // browsing is separate.
+        let in_scope = |card: CardId| {
             let owner = self
                 .durable
                 .channels
                 .iter()
                 .find(|channel| channel.cards.contains(&card));
-            if owner.map(|channel| channel.id) != channel.map(|(id, _)| id)
-                || (channel.is_none()
-                    && self
+            owner.map(|channel| channel.id) == channel.map(|(id, _)| id)
+                && (channel.is_some()
+                    || self
                         .card_state(card)
                         .and_then(|state| self.card_worktree(state))
-                        != scope.as_deref())
-            {
-                return None;
-            }
-            let CardRuntime::Repository(runtime) = self.cards.get(&card)? else {
-                return None;
-            };
-            let exact = runtime
-                .selected_path()
-                .is_some_and(|selected| runtime.descriptor.worktree.join(selected) == path);
-            (exact || (runtime.descriptor.selected_file.is_some() && !runtime.blocks_navigation()))
-                .then_some((card, exact))
+                        == scope.as_deref())
+        };
+        let file_pane = |card: CardId| match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) if in_scope(card) => Some(runtime),
+            _ => None,
+        };
+        let exact = self.workspace.order().find(|card| {
+            file_pane(*card).is_some_and(|runtime| {
+                runtime
+                    .selected_path()
+                    .is_some_and(|selected| runtime.descriptor.worktree.join(selected) == path)
+            })
         });
-        let candidate = candidates.max_by_key(|(_, exact)| *exact);
+        let beside = source
+            .filter(|source| self.workspace.card(*source).is_some())
+            .and_then(|source| {
+                let next = self
+                    .workspace
+                    .order()
+                    .skip_while(|card| *card != source)
+                    .nth(1);
+                [Some(source), next].into_iter().flatten().find(|card| {
+                    file_pane(*card).is_some_and(|runtime| {
+                        runtime.descriptor.selected_file.is_some() && !runtime.blocks_navigation()
+                    })
+                })
+            });
+        let candidate = exact
+            .map(|card| (card, true))
+            .or_else(|| beside.map(|card| (card, false)));
         if let Some((card, true)) = candidate {
             let jump = match (self.cards.get_mut(&card), fragment) {
                 (Some(CardRuntime::Repository(runtime)), Some(fragment)) => {
@@ -247,18 +259,10 @@ impl Cagents {
             let _ = self.workspace.rename_card(card, title);
             self.workspace.focus(card)
         } else {
-            let (index, durable_index) = source
-                .and_then(|source| {
-                    Some((
-                        self.workspace.order().position(|id| id == source)? + 1,
-                        self.durable
-                            .cards
-                            .iter()
-                            .position(|state| state.id == source)?
-                            + 1,
-                    ))
-                })
-                .unwrap_or_else(|| self.pane_insertion_indices());
+            let (index, durable_index) = source.map_or_else(
+                || self.pane_insertion_indices(),
+                |source| self.pane_insertion_indices_after(source),
+            );
             let width = self.new_pane_fraction(self.settings.default_native_pane_fraction);
             let state = CardState {
                 id: card,
@@ -954,7 +958,7 @@ mod tests {
             .insert(source_a, scope_a.clone());
         app.worktree_owners.insert(source_a, scope_a.clone());
         drop(
-            app.add_repository_card(project_b, scope_b.clone(), scope_b.clone())
+            app.add_repository_card(project_b, scope_b.clone(), scope_b.clone(), None)
                 .1,
         );
         let browser = app.workspace.focused().unwrap();

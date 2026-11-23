@@ -8485,6 +8485,7 @@ mod repository_clone_navigation {
             RepoPath::parse("other.txt").unwrap(),
             None,
             basis.clone(),
+            app.panel_opener(),
         );
         settle(&mut app, task).await;
         assert_eq!(app.workspace.focused(), Some(second));
@@ -8499,6 +8500,7 @@ mod repository_clone_navigation {
             RepoPath::parse("current.txt").unwrap(),
             None,
             basis.clone(),
+            app.panel_opener(),
         );
         settle(&mut app, task).await;
         assert_eq!(app.workspace.focused(), Some(first));
@@ -8519,6 +8521,7 @@ mod repository_clone_navigation {
             RepoPath::parse("current.txt").unwrap(),
             Some(RepoPath::parse("previous.txt").unwrap()),
             basis,
+            app.panel_opener(),
         );
         settle(&mut app, task).await;
         assert_eq!(app.workspace.focused(), Some(first));
@@ -8583,7 +8586,11 @@ mod repository_clone_navigation {
         let key = bind_sidebar(&mut app, &fixture, clone);
         let project = runtime(&app, clone).descriptor.project;
         assert_eq!(app.repository_browsers(&fixture.root).next(), Some(source));
-        assert_eq!(app.repository_panel_destination(&fixture.root), Some(clone));
+        let other = Path::new("other.txt");
+        assert_eq!(
+            app.repository_panel_destination(&fixture.root, other, Some(clone)),
+            Some(clone)
+        );
         let task = app.update(Message::Sidebar(SidebarAction::OpenFile {
             key,
             path: RepoPath::parse("other.txt").unwrap(),
@@ -8603,9 +8610,10 @@ mod repository_clone_navigation {
             Some(fixture.text.clone())
         );
 
-        // Ineligible focus must preserve the existing first-browser
-        // fallback. None of these cases may retarget a fixed file or a
-        // pane belonging to another worktree/channel.
+        // An ineligible opener takes the browser after it, never the first
+        // browser further back in the strip: here there is none, so a new
+        // one opens beside it. None of these cases may retarget a fixed file
+        // or a pane belonging to another worktree/channel.
         let eligible = app.card_state(clone).unwrap().clone();
         for fixed_file in [true, false] {
             let CardKind::Repository(view) = &mut app.card_state_mut(clone).unwrap().kind else {
@@ -8617,14 +8625,22 @@ mod repository_clone_navigation {
                 view.worktree = fixture.root.join("different-worktree");
             }
             assert_eq!(
-                app.repository_panel_destination(&fixture.root),
+                app.repository_panel_destination(&fixture.root, other, Some(clone)),
+                None
+            );
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root, other, Some(source)),
                 Some(source)
             );
             *app.card_state_mut(clone).unwrap() = eligible.clone();
         }
         app.card_state_mut(clone).unwrap().kind = CardKind::Settings;
         assert_eq!(
-            app.repository_panel_destination(&fixture.root),
+            app.repository_panel_destination(&fixture.root, other, Some(clone)),
+            None
+        );
+        assert_eq!(
+            app.repository_panel_destination(&fixture.root, other, Some(source)),
             Some(source)
         );
         *app.card_state_mut(clone).unwrap() = eligible.clone();
@@ -8632,7 +8648,11 @@ mod repository_clone_navigation {
             operation_id: crate::model::OperationId::new(),
         };
         assert_eq!(
-            app.repository_panel_destination(&fixture.root),
+            app.repository_panel_destination(&fixture.root, other, Some(clone)),
+            None
+        );
+        assert_eq!(
+            app.repository_panel_destination(&fixture.root, other, Some(source)),
             Some(source)
         );
         *app.card_state_mut(clone).unwrap() = eligible.clone();
@@ -8649,7 +8669,11 @@ mod repository_clone_navigation {
                 focused: Some(clone),
             });
         assert_eq!(
-            app.repository_panel_destination(&fixture.root),
+            app.repository_panel_destination(&fixture.root, other, Some(clone)),
+            None
+        );
+        assert_eq!(
+            app.repository_panel_destination(&fixture.root, other, Some(source)),
             Some(source)
         );
         Arc::make_mut(&mut app.durable).channels.pop();
@@ -8662,7 +8686,11 @@ mod repository_clone_navigation {
         Arc::make_mut(&mut app.durable).cards.remove(position);
         assert_eq!(app.workspace.focused(), Some(clone));
         assert_eq!(
-            app.repository_panel_destination(&fixture.root),
+            app.repository_panel_destination(&fixture.root, other, Some(clone)),
+            None
+        );
+        assert_eq!(
+            app.repository_panel_destination(&fixture.root, other, Some(source)),
             Some(source)
         );
         Arc::make_mut(&mut app.durable)

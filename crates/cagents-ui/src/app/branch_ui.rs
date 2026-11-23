@@ -275,6 +275,7 @@ impl Cagents {
         if !current {
             return Task::none();
         }
+        let opener = self.panel_opener();
         self.open_committed_file(
             key,
             path,
@@ -284,6 +285,7 @@ impl Cagents {
                 head,
                 merge_base,
             },
+            opener,
         )
     }
 
@@ -293,19 +295,25 @@ impl Cagents {
         path: RepoPath,
         old_path: Option<RepoPath>,
         basis: DiffBasis,
+        opener: Option<CardId>,
     ) -> Task<Message> {
         // A pane derives a committed comparison's rename source only from a
         // committed selection, so a rename cannot be shown beside an open
         // buffer.
         let in_place = old_path.is_none();
-        self.open_diff_card(key, path.clone(), basis.clone(), in_place, move |card| {
-            RepositoryAction::OpenCommittedFile {
+        self.open_diff_card(
+            key,
+            path.clone(),
+            basis.clone(),
+            in_place,
+            opener,
+            move |card| RepositoryAction::OpenCommittedFile {
                 card,
                 path,
                 old_path,
                 basis,
-            }
-        })
+            },
+        )
     }
 
     pub(super) fn open_working_change(
@@ -313,6 +321,7 @@ impl Cagents {
         key: ActiveWorktreeKey,
         path: RepoPath,
         area: crate::repository::ChangeArea,
+        opener: Option<CardId>,
     ) -> Task<Message> {
         use crate::repository::ChangeArea;
         if self.modal_is_open() || !self.source_control_is_bound(&key) {
@@ -348,7 +357,7 @@ impl Cagents {
         } else {
             DiffBasis::IndexToWorktree
         };
-        self.open_diff_card(key, path, basis.clone(), true, move |card| {
+        self.open_diff_card(key, path, basis.clone(), true, opener, move |card| {
             RepositoryAction::OpenWorkingDiff { card, file, basis }
         })
     }
@@ -359,13 +368,16 @@ impl Cagents {
     /// opening a second, stale copy of that file. It switches to `basis` in
     /// place when it can (`in_place` says whether its own comparison would be
     /// faithful), as its toolbar would, comparing the live buffer. Otherwise
-    /// the notice says why the comparison did not open.
+    /// the notice says why the comparison did not open. Any other comparison
+    /// opens where [`Self::repository_panel_destination`] places a row opened
+    /// from `opener`: beside it, never in a browser further along the strip.
     fn open_diff_card(
         &mut self,
         key: ActiveWorktreeKey,
         path: RepoPath,
         basis: DiffBasis,
         in_place: bool,
+        opener: Option<CardId>,
         open: impl FnOnce(CardId) -> RepositoryAction,
     ) -> Task<Message> {
         // A historical path may be deleted, renamed, or never exist in the
@@ -405,14 +417,16 @@ impl Cagents {
             }));
             return focus;
         }
-        let (card, prepare) = match self.repository_panel_destination(&key.canonical_path) {
-            Some(card) => (card, self.focus_pane(card)),
-            None => self.add_repository_card(
-                key.project_id,
-                key.canonical_path.clone(),
-                key.canonical_path.clone(),
-            ),
-        };
+        let (card, prepare) =
+            match self.repository_panel_destination(&key.canonical_path, path.as_path(), opener) {
+                Some(card) => (card, self.focus_pane(card)),
+                None => self.add_repository_card(
+                    key.project_id,
+                    key.canonical_path.clone(),
+                    key.canonical_path.clone(),
+                    opener,
+                ),
+            };
         let open = cosmic::task::message(Message::Repository(open(card)));
         Task::batch([prepare, open])
     }

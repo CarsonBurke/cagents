@@ -461,6 +461,7 @@ pub(in crate::app) mod tests {
                 project,
                 "/selection-project".into(),
                 "/selection-project-wt/wt-1".into(),
+                None,
             )
             .1,
         );

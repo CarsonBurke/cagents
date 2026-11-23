@@ -7879,11 +7879,10 @@ impl Cagents {
             _ => 0,
         };
         let (area, path) = paths[index];
-        cosmic::task::message(Message::Sidebar(SidebarAction::OpenChange {
-            key: source.key.clone(),
-            path: path.clone(),
-            area,
-        }))
+        let (key, path) = (source.key.clone(), path.clone());
+        // The review shortcut moves this pane to the next file, so the pane
+        // opens it, not whichever inspector draws source control.
+        self.open_working_change(key, path, area, Some(card))
     }
 
     fn ensure_pull_request_source(&mut self, card: CardId) -> Task<Message> {
@@ -8454,6 +8453,7 @@ impl Cagents {
         project: ProjectId,
         repository: PathBuf,
         worktree: PathBuf,
+        opener: Option<CardId>,
     ) -> (CardId, Task<Message>) {
         let card_id = CardId::new();
         let view = RepositoryView {
@@ -8474,7 +8474,10 @@ impl Cagents {
             existence: Existence::Open,
             kind: CardKind::Repository(view.clone()),
         };
-        let (index, durable_index) = self.pane_insertion_indices();
+        let (index, durable_index) = opener.map_or_else(
+            || self.pane_insertion_indices(),
+            |opener| self.pane_insertion_indices_after(opener),
+        );
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card);
         durable.focused = Some(card_id);
@@ -8509,7 +8512,7 @@ impl Cagents {
 
     fn open_link_in(&mut self, url: Url, destination: LinkOpenDestination) -> Task<Message> {
         if url.scheme() == "file" {
-            return self.open_document_link(self.workspace.focused(), url.as_str());
+            return self.open_document_link(self.placement_anchor(), url.as_str());
         }
         match destination {
             LinkOpenDestination::IntegratedBrowser => self.add_browser(url),
@@ -13534,39 +13537,61 @@ impl Cagents {
         })
     }
 
-    /// The repository browser that sidebar navigation into this worktree
-    /// should drive: the focused browser if it can navigate, otherwise the
-    /// first that can.
+    /// The repository browser in the strip that a row opened from `opener`
+    /// shows `path` of this worktree in, or `None` for a new browser directly
+    /// after `opener`.
+    ///
+    /// A browser already showing `path` shows it again, wherever it is, so
+    /// one file never opens twice. Otherwise the row reuses `opener` itself
+    /// when it is a browser of this worktree, as a pane's own inspector or
+    /// review shortcut does, or the browser directly after it, which the
+    /// last row opened from `opener` created. A browser further along the
+    /// strip is never taken, so what opens appears beside what opened it.
     ///
     /// A browser holding unsaved edits, a save, editor recovery or a
     /// durability warning refuses navigation, so routing a click to it would
-    /// only focus it and drop the request. `None` means the caller opens a
-    /// new browser, as a file link does when every file pane is busy.
-    fn repository_panel_destination(&self, worktree: &Path) -> Option<CardId> {
-        self.repository_browser_where(worktree, |card| {
-            !matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
-        })
-    }
-
-    /// The focused browser for this worktree if it satisfies `accept`,
-    /// otherwise the first that does.
-    fn repository_browser_where(
+    /// only focus it and drop the request.
+    fn repository_panel_destination(
         &self,
         worktree: &Path,
-        accept: impl Fn(CardId) -> bool,
+        path: &Path,
+        opener: Option<CardId>,
     ) -> Option<CardId> {
-        self.workspace
-            .focused()
-            .filter(|focused| {
-                accept(*focused)
-                    && self
-                        .repository_browsers(worktree)
-                        .any(|card| card == *focused)
-            })
-            .or_else(|| {
-                self.repository_browsers(worktree)
-                    .find(|card| accept(*card))
-            })
+        let navigable = |card: CardId| {
+            self.workspace.card(card).is_some()
+                && !matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        };
+        let shows_path = |card: CardId| {
+            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.selected_path() == Some(path))
+        };
+        let browsers = self
+            .repository_browsers(worktree)
+            .filter(|card| navigable(*card))
+            .collect::<Vec<_>>();
+        if let Some(card) = browsers.iter().copied().find(|card| shows_path(*card)) {
+            return Some(card);
+        }
+        let opener = opener.filter(|card| self.workspace.card(*card).is_some())?;
+        let next = self
+            .workspace
+            .order()
+            .skip_while(|card| *card != opener)
+            .nth(1);
+        [Some(opener), next]
+            .into_iter()
+            .flatten()
+            .find(|card| browsers.contains(card))
+    }
+
+    /// The pane a source control or files row was opened from: the pane
+    /// whose inspector draws those panels, since only one does, or the pane
+    /// last chosen when none in the strip does.
+    pub(super) fn panel_opener(&self) -> Option<CardId> {
+        self.pane_inspectors
+            .source_control()
+            .filter(|card| self.workspace.card(*card).is_some())
+            .or_else(|| self.placement_anchor())
     }
 
     /// The repository pane whose unsaved work on `worktree`'s `path` keeps
@@ -13606,11 +13631,17 @@ impl Cagents {
     ///
     /// A browser already editing that file is focused as it is. Otherwise the
     /// row goes to [`Self::repository_panel_destination`], and a new browser
-    /// opens if no existing one can navigate. Either way the navigation
+    /// opens directly after `opener` when no browser there can take it.
+    /// Either way the navigation
     /// is parked in [`Self::pending_panel_open`] and performed when that card's
     /// file list lands, because the card resolves a path against the list it
     /// holds and the sidebar's rows come from a snapshot the list may predate.
-    fn route_panel_open(&mut self, key: &ActiveWorktreeKey, path: &RepoPath) -> Task<Message> {
+    fn route_panel_open(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        path: &RepoPath,
+        opener: Option<CardId>,
+    ) -> Task<Message> {
         if self.sidebar_state.active_worktree() != Some(key) {
             return Task::none();
         }
@@ -13633,7 +13664,7 @@ impl Cagents {
             return self.focus_pane(card);
         }
         let path = path.as_path().to_path_buf();
-        match self.repository_panel_destination(&key.canonical_path) {
+        match self.repository_panel_destination(&key.canonical_path, &path, opener) {
             Some(card) => {
                 self.pending_panel_open = Some(PendingPanelOpen {
                     card,
@@ -13656,6 +13687,7 @@ impl Cagents {
                     key.project_id,
                     key.canonical_path.clone(),
                     key.canonical_path.clone(),
+                    opener,
                 );
                 self.pending_panel_open = Some(PendingPanelOpen {
                     card,
