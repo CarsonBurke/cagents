@@ -142,7 +142,10 @@ sudo apt-get install --yes --no-install-recommends libasound2-dev
 The dictation helper links sherpa-onnx statically. Its build script downloads
 the prebuilt library from the sherpa-onnx release the crate pins, so the first
 build of `check:dictate` needs network access; set `SHERPA_ONNX_ARCHIVE_DIR` to
-a directory holding that archive to build without it.
+a directory holding that archive to build without it. Packages instead link the
+libraries `scripts/sherpa-onnx-libs` fetches and checks against a pinned
+SHA-256; update that pin with the `sherpa-onnx` crate, and the library list in
+`packaging/THIRD-PARTY-NOTICES` with it.
 
 Install [rustup](https://rustup.rs/); `mise run setup` below installs the Rust
 toolchain `rust-toolchain.toml` pins, which rustup then selects in the checkout.

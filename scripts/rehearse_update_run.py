@@ -121,8 +121,18 @@ def candidate_tree(candidate):
     return result
 
 
+MATCHED=('cagents','cagents-ui','cagentsd')
+# Releases from before dictation ship no helper; later ones stage it with the rest.
+HELPER='cagents-dictate'
+
+
+def staged_executables(candidate):
+    helper=candidate/'bin'/HELPER
+    return MATCHED+((HELPER,) if helper.exists() or helper.is_symlink() else ())
+
+
 def candidate_versions(candidate, version):
-    for name in ('cagents','cagents-ui','cagentsd'):
+    for name in staged_executables(candidate):
         result=subprocess.run([str(candidate/'bin'/name),'--version'],capture_output=True,text=True,timeout=10)
         if result.returncode or result.stdout.strip()!=f'{name} {version}' or result.stderr.strip():
             raise RuntimeError(f'staged {name} does not report the exact matched version')
@@ -145,7 +155,10 @@ def staged_candidate(root, archive_dir, version, installer, *, record=False, tra
         if Path(transcript).read_text().splitlines().count(expected)!=1:
             raise RuntimeError('stage did not print the exact installed upgrade command')
         with tarfile.open(source,'r:gz') as archive:
-            for name in ('cagents','cagents-ui','cagentsd'):
+            names=staged_executables(candidate)
+            if HELPER not in names and any(m.name==f'cagents-{version}/bin/{HELPER}' for m in archive.getmembers()):
+                raise RuntimeError(f'staged candidate lacks the archive\'s {HELPER}')
+            for name in names:
                 members=[m for m in archive.getmembers() if m.name==f'cagents-{version}/bin/{name}']
                 if len(members)!=1 or not members[0].isreg() or not 0<members[0].size<=2*1024**3:
                     raise RuntimeError(f'archive requires one bounded regular {name}')

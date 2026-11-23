@@ -16,7 +16,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = "x86_64-unknown-linux-gnu"
-PRODUCTS = ("cagents", "cagentsd", "cagents-ui")
+PRODUCTS = ("cagents", "cagentsd", "cagents-ui", "cagents-dictate")
+# The order the packager probes prebuilt versions and inspects glibc needs.
+INSPECTED = ("cagents", "cagents-ui", "cagentsd", "cagents-dictate")
 VERSION = "9.9.9"
 # Bounds only a hang; a passing run returns as soon as its process exits.
 HANG_GUARD = 60
@@ -35,8 +37,13 @@ class PackageLinuxArtifacts(unittest.TestCase):
         for name in ("dev.cagents.Cagents.desktop", "dev.cagents.Cagents.Daemon.desktop",
                      "dev.cagents.Cagents.svg", "dev.cagents.Cagents.png",
                      "dev.cagents.Cagents.metainfo.xml", "cagents-package-lifecycle",
-                     "cagents-uninstall"):
+                     "cagents-uninstall", "THIRD-PARTY-NOTICES"):
             shutil.copy2(ROOT / "packaging" / name, self.checkout / "packaging" / name)
+        # Never downloads: names the fixture libraries and records the cache.
+        self.sherpa = self.directory / "sherpa-onnx libraries"
+        self.executable(self.checkout / "scripts/sherpa-onnx-libs",
+                        '#!/bin/sh\nprintf "%s\\n" "$1" >> "$MOCK_SHERPA_CALLS"\n'
+                        f'printf "%s\\n" {shlex.quote(str(self.sherpa))}\n')
         for name in ("LICENSE", "install.sh"):
             shutil.copy2(ROOT / name, self.checkout / name)
         (self.checkout / "Cargo.toml").write_text('[package]\nversion = "9.9.9"\n')
@@ -64,6 +71,8 @@ if args[0] == 'tree':
     print('fixture v1')
     sys.exit(0)
 assert args[0] == 'build', args
+# Only the verified libraries may reach the helper's link.
+assert os.environ.get('SHERPA_ONNX_LIB_DIR') == os.environ['MOCK_SHERPA_LIB_DIR'], os.environ.get('SHERPA_ONNX_LIB_DIR')
 if 'MOCK_EXPECTED_BUILD_METADATA' in os.environ:
     assert os.environ.get('CAGENTS_BUILD_METADATA') == os.environ['MOCK_EXPECTED_BUILD_METADATA']
 name = args[args.index('--bin') + 1]
@@ -130,7 +139,7 @@ if sys.argv[1:3] == ['--wide', '--dyn-syms']:
     sys.exit(int(os.environ.get('MOCK_UI_DYNSYM_EXIT', '0')))
 assert sys.argv[1:3] == ['--wide', '--version-info'], sys.argv
 name = Path(sys.argv[3]).name
-version = {'cagents': '2.2.5', 'cagentsd': '2.36', 'cagents-ui': '2.39'}[name]
+version = {'cagents': '2.2.5', 'cagentsd': '2.36', 'cagents-ui': '2.39', 'cagents-dictate': '2.34'}[name]
 print("Version definition section '.gnu.version_d' contains 1 entry:")
 print('  0x0000: Rev: 1 Flags: none Index: 2 Cnt: 1 Name: GLIBC_999.0')
 print("Version needs section '.gnu.version_r' contains 1 entry:")
@@ -147,7 +156,10 @@ print('  0x0010: Name: GLIBC_' + version + ' Flags: none Version: 2')
             VERSION=VERSION, SOURCE_DATE_EPOCH="0",
             MOCK_CALLS=str(self.calls), MOCK_PRODUCTS=str(self.reported),
             MOCK_PROTOCOL=str(self.protocol),
+            MOCK_SHERPA_CALLS=str(self.directory / "sherpa-calls"),
+            MOCK_SHERPA_LIB_DIR=str(self.sherpa),
         )
+        self.environment.pop("SHERPA_ONNX_LIB_DIR", None)
 
     @staticmethod
     def executable(path, text):
@@ -245,11 +257,18 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                         self.assertEqual(payload.extractfile(member).read(), expected)
             daemon = ((self.reported / "cagentsd" / NATIVE / "cagentsd").read_bytes() if fresh
                       else (self.target / profile / "cagentsd").read_bytes())
+            notices = (ROOT / "packaging/THIRD-PARTY-NOTICES").read_bytes()
+            self.assertEqual(
+                portable.extractfile(f"{name}-{version}/share/doc/cagents/THIRD-PARTY-NOTICES").read(),
+                notices)
+            copyright = debian.extractfile(f"./usr/share/doc/{name}/copyright").read()
+            self.assertEqual(copyright, (ROOT / "LICENSE").read_bytes() + b"\n" + notices)
             marker = debian.extractfile(f"./usr/libexec/{name}/.cagents-daemon-protocol").read()
             self.assertEqual(marker, f"127 {hashlib.sha256(daemon).hexdigest()}\n".encode())
         depends = subprocess.check_output(["dpkg-deb", "--field", str(deb), "Depends"],
                                           env=self.environment, text=True, timeout=HANG_GUARD)
         self.assertIn("libc6 (>= 2.39)", depends)
+        self.assertIn("libasound2", [dependency.strip() for dependency in depends.split(",")])
         self.assertEqual("libegl1" in depends, variant == "full")
         self.assertEqual("xdg-utils" in depends, variant == "browserless")
         checksum = "SHA256SUMS" if variant == "full" else "SHA256SUMS-browserless"
@@ -270,8 +289,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
             self.assertEqual(Path(inspections[0][2]).name, "cagents-ui")
             inspections = inspections[1:]
         self.assertTrue(all(args[:2] == ["--wide", "--version-info"] for args in inspections))
-        self.assertEqual([Path(args[2]).name for args in inspections],
-                         ["cagents", "cagents-ui", "cagentsd"])
+        self.assertEqual([Path(args[2]).name for args in inspections], list(INSPECTED))
 
     def test_native_build_uses_exact_artifacts_for_both_variants_and_configured_targets(self):
         for variant in ("full", "browserless"):
@@ -293,6 +311,8 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                         common + defaults + ["--bin", "cagents"] + message,
                         common + defaults + ["--features", "host", "--bin", "cagentsd"] + message,
                         common + ["-p", "cagents-ui"] + ui + ["--bin", "cagents-ui"] + message,
+                        common + ["-p", "cagents-dictate", "--features", "engine",
+                                  "--bin", "cagents-dictate"] + message,
                     ])
                     for path, original in self.decoys.items():
                         self.assertEqual(path.read_bytes(), original)
@@ -439,7 +459,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                 result = self.package(variant, CAGENTS_SKIP_BUILD="1", PATH=str(self.tools))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.builds(), [])
-                self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                self.assertEqual(self.version_probes(), list(INSPECTED))
                 self.assert_packages(variant, fresh=False)
 
     def test_matching_prebuilt_full_versions_package_exact_bytes(self):
@@ -452,7 +472,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     result = self.package(variant, CAGENTS_SKIP_BUILD="1", VERSION=version)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(self.builds(), [])
-                    self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                    self.assertEqual(self.version_probes(), list(INSPECTED))
                     self.assert_packages(variant, fresh=False, version=version)
                     for path, original in self.prebuilt_bytes.items():
                         self.assertEqual(path.read_bytes(), original)
@@ -503,7 +523,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.builds(), [])
                 self.assertEqual(self.events("cargo"), [])
-                self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                self.assertEqual(self.version_probes(), list(INSPECTED))
                 name = "cagents" if variant == "full" else "cagents-browserless"
                 archive = f"{name}-{version}-{NATIVE}.tar.gz"
                 checksum = "SHA256SUMS" if variant == "full" else "SHA256SUMS-browserless"
@@ -520,6 +540,32 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         result = self.package("full", "--archive-only", CAGENTS_SKIP_BUILD="1",
                               CAGENTS_CARGO_PROFILE="local", CAGENTS_SKIP_STRIP="1", VERSION=version)
         self.assert_prebuilt_failure(result, "cagentsd", "does not report requested version")
+
+    def test_the_helper_links_only_verified_or_caller_named_sherpa_libraries(self):
+        calls = self.directory / "sherpa-calls"
+        result = self.package("full", "--archive-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls.read_text().splitlines(), [str(self.target / "sherpa-onnx")])
+        # The fixture cargo refuses any other library directory.
+        named = self.directory / "caller libraries"
+        for overrides in ({"SHERPA_ONNX_LIB_DIR": str(named), "MOCK_SHERPA_LIB_DIR": str(named)},
+                          {"CAGENTS_SKIP_BUILD": "1", "CAGENTS_SKIP_STRIP": "1"}):
+            with self.subTest(overrides=overrides):
+                self.reset_outputs()
+                calls.unlink(missing_ok=True)
+                if "CAGENTS_SKIP_BUILD" in overrides:
+                    for product in PRODUCTS:
+                        self.prebuilt_product(product)
+                result = self.package("full", "--archive-only", **overrides)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(calls.exists())
+        self.reset_outputs()
+        self.executable(self.checkout / "scripts/sherpa-onnx-libs", "#!/bin/sh\nexit 1\n")
+        result = self.package("full")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not provide the verified sherpa-onnx libraries", result.stderr)
+        self.assertEqual(self.builds(), [])
+        self.assertFalse(self.dist.exists())
 
     def test_normal_build_metadata_still_reaches_cargo_without_prebuilt_probes(self):
         metadata = "local.1234567"

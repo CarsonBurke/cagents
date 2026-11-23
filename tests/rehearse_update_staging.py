@@ -39,16 +39,23 @@ class CandidateStaging(unittest.TestCase):
         self.installer=self.root/'install.sh'
         self.installer.write_text('# installer source\n')
         self.archive=self.root/'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
+        self.package(('cagents','cagents-ui','cagentsd','cagents-dictate'))
+        self.log=self.root/'stage.log'
+        self.log.write_text('Staged cagents new; existing windows and the previous service state were preserved. Run cagents daemon upgrade to apply it when ready.\n')
+
+    def package(self,names,staged=None):
+        for path in (self.candidate/'bin').iterdir():
+            path.unlink()
         with tarfile.open(self.archive,'w:gz') as archive:
-            for name in ('cagents','cagents-ui','cagentsd'):
+            for name in names:
                 payload=f'#!/bin/sh\nprintf "{name} new\\n"\n'.encode()
                 path=self.candidate/'bin'/name
                 path.write_bytes(payload);path.chmod(0o755)
                 info=tarfile.TarInfo(f'cagents-new/bin/{name}');info.size=len(payload)
                 archive.addfile(info,io.BytesIO(payload))
+        for name in set(names)-set(staged or names):
+            (self.candidate/'bin'/name).unlink()
         self.checksum()
-        self.log=self.root/'stage.log'
-        self.log.write_text('Staged cagents new; existing windows and the previous service state were preserved. Run cagents daemon upgrade to apply it when ready.\n')
 
     def checksum(self):
         (self.root/'SHA256SUMS').write_text(f'{hashlib.sha256(self.archive.read_bytes()).hexdigest()}  {self.archive.name}\n')
@@ -106,6 +113,29 @@ class CandidateStaging(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'differs from the checksum-verified archive'):
             self.stage(True)
         self.assertFalse((self.root/'staged-candidate.json').exists())
+
+    def test_the_helper_is_staged_and_bound_like_the_rest_when_the_release_has_one(self):
+        def versions(argv,**kwargs):
+            return subprocess.CompletedProcess(argv,0,f'{Path(argv[0]).name} new\n','')
+        with patch.object(scenario.subprocess,'run',side_effect=versions) as run:
+            self.stage(True)
+        (self.root/'staged-candidate.json').unlink()
+        with patch.object(scenario.subprocess,'run',side_effect=versions) as run:
+            scenario.candidate_versions(self.candidate,'new')
+        self.assertEqual([Path(call.args[0][0]).name for call in run.call_args_list],
+                         ['cagents','cagents-ui','cagentsd','cagents-dictate'])
+        (self.candidate/'bin/cagents-dictate').write_text('unmatched helper')
+        with self.assertRaisesRegex(RuntimeError,'cagents-dictate differs'):
+            self.stage(True)
+        # An archive from before dictation stages without it.
+        self.package(('cagents','cagents-ui','cagentsd'))
+        self.assertEqual(self.stage(True),self.candidate/'bin/cagents')
+        (self.root/'staged-candidate.json').unlink()
+        # A candidate that lost the archive's helper is not the archive's.
+        self.package(('cagents','cagents-ui','cagentsd','cagents-dictate'),
+                     staged=('cagents','cagents-ui','cagentsd'))
+        with self.assertRaisesRegex(RuntimeError,"lacks the archive's cagents-dictate"):
+            self.stage(True)
 
     def test_all_three_versions_must_match(self):
         with patch.object(scenario.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'cagents wrong\n','')):

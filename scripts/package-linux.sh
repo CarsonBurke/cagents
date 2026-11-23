@@ -143,6 +143,15 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     fi
     unset CAGENTS_BUILD_METADATA_SUPPLIED
 
+    # Link the dictation helper against sherpa-onnx's verified libraries,
+    # never ones its build script downloads unchecked, unless the caller
+    # names the libraries to use.
+    if [ -z "${SHERPA_ONNX_LIB_DIR:-}" ]; then
+        SHERPA_ONNX_LIB_DIR=$("$SCRIPT_DIR/sherpa-onnx-libs" "$TARGET_DIR/sherpa-onnx") \
+            || fail 'could not provide the verified sherpa-onnx libraries'
+    fi
+    export SHERPA_ONNX_LIB_DIR
+
     build_target() {
         product=$1
         shift
@@ -168,6 +177,8 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
         HOST_BINARY=$(build_target cagentsd --features host --bin cagentsd)
         UI_BINARY=$(build_target cagents-ui -p cagents-ui --features integrated-browser --bin cagents-ui)
     fi
+    # Both variants ship the same helper: it has no browser.
+    DICTATE_BINARY=$(build_target cagents-dictate -p cagents-dictate --features engine --bin cagents-dictate)
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
 else
@@ -175,6 +186,7 @@ else
     CLI_BINARY=$TARGET_DIR/$PROFILE/cagents
     HOST_BINARY=$TARGET_DIR/$PROFILE/cagentsd
     UI_BINARY=$TARGET_DIR/$PROFILE/cagents-ui
+    DICTATE_BINARY=$TARGET_DIR/$PROFILE/cagents-dictate
 fi
 
 # Only the release size report reads this.
@@ -186,7 +198,8 @@ if [ "$ARCHIVE_ONLY" = 0 ]; then
     if [ "$VARIANT" = browserless ]; then
         RESOLVED_PACKAGE_IDS=$(
             cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-                -p cagents -p cagents-ui --no-default-features --features cagents/host \
+                -p cagents -p cagents-ui -p cagents-dictate --no-default-features \
+                --features cagents/host,cagents-dictate/engine \
                 --edges normal --prefix none |
                 sed -e 's/ (\*)$//' -e '/^$/d' |
                 LC_ALL=C sort -u |
@@ -195,7 +208,8 @@ if [ "$ARCHIVE_ONLY" = 0 ]; then
     else
         RESOLVED_PACKAGE_IDS=$(
             cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-                -p cagents -p cagents-ui --features cagents/host,cagents-ui/integrated-browser \
+                -p cagents -p cagents-ui -p cagents-dictate \
+                --features cagents/host,cagents-ui/integrated-browser,cagents-dictate/engine \
                 --edges normal --prefix none |
                 sed -e 's/ (\*)$//' -e '/^$/d' |
                 LC_ALL=C sort -u |
@@ -205,7 +219,7 @@ if [ "$ARCHIVE_ONLY" = 0 ]; then
     RESOLVED_PACKAGE_IDS=$((RESOLVED_PACKAGE_IDS))
 fi
 
-for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY"; do
+for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY" "$DICTATE_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
 if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ]; then
@@ -222,6 +236,7 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ]; then
     require_prebuilt_version cagents "$CLI_BINARY"
     require_prebuilt_version cagents-ui "$UI_BINARY"
     require_prebuilt_version cagentsd "$HOST_BINARY"
+    require_prebuilt_version cagents-dictate "$DICTATE_BINARY"
 fi
 
 PROTOCOL_VERSION=$("$CLI_BINARY" daemon protocol-version) \
@@ -252,6 +267,7 @@ install -d -m 0755 \
 install -m 0755 "$CLI_BINARY" "$BIN_DIR/cagents"
 install -m 0755 "$UI_BINARY" "$BIN_DIR/cagents-ui"
 install -m 0755 "$HOST_BINARY" "$BIN_DIR/cagentsd"
+install -m 0755 "$DICTATE_BINARY" "$BIN_DIR/cagents-dictate"
 install -m 0644 /dev/null "$BIN_DIR/.cagents-ui-lease-v1"
 if [ "$VARIANT" = full ]; then
     install -m 0755 "$ROOT_DIR/packaging/cagents-uninstall" "$BIN_DIR/cagents-uninstall"
@@ -261,7 +277,7 @@ fi
 # Opt in when repacking already-qualified executable bytes. Skipping the build
 # alone must retain the normal release stripping behavior.
 if [ "${CAGENTS_SKIP_STRIP:-0}" != 1 ]; then
-    strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+    strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd" "$BIN_DIR/cagents-dictate"
 fi
 
 # Inspect the exact bytes about to enter both package formats, including
@@ -331,7 +347,7 @@ fi
 # packager host version or unrelated exported version definitions.
 GLIBC_REQUIREMENTS=$WORK_DIR/glibc-requirements
 printf '%s\n' 2.35 > "$GLIBC_REQUIREMENTS"
-for binary in cagents cagents-ui cagentsd; do
+for binary in cagents cagents-ui cagentsd cagents-dictate; do
     VERSION_INFO=$WORK_DIR/$binary-version-info
     VERSION_ERRORS=$WORK_DIR/$binary-version-errors
     LC_ALL=C readelf --wide --version-info "$BIN_DIR/$binary" \
@@ -388,6 +404,7 @@ sed \
     "$ROOT_DIR/packaging/dev.cagents.Cagents.metainfo.xml" \
     > "$SHARE_DIR/metainfo/$DESKTOP_ID.metainfo.xml"
 install -m 0644 "$ROOT_DIR/LICENSE" "$SHARE_DIR/doc/cagents/LICENSE"
+install -m 0644 "$ROOT_DIR/packaging/THIRD-PARTY-NOTICES" "$SHARE_DIR/doc/cagents/THIRD-PARTY-NOTICES"
 
 
 install -d -m 0755 "$DIST_DIR"
@@ -430,6 +447,7 @@ install -d -m 0755 \
 install -m 0755 "$BIN_DIR/cagents" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents"
 install -m 0755 "$BIN_DIR/cagents-ui" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents-ui"
 install -m 0755 "$BIN_DIR/cagentsd" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagentsd"
+install -m 0755 "$BIN_DIR/cagents-dictate" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents-dictate"
 install -m 0644 "$BIN_DIR/.cagents-ui-lease-v1" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-ui-lease-v1"
 DAEMON_DIGEST=$(sha256sum "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagentsd")
 DAEMON_DIGEST=${DAEMON_DIGEST%% *}
@@ -451,14 +469,20 @@ chmod 0644 "$DEB_ROOT/etc/xdg/autostart/$DESKTOP_ID.Daemon.desktop"
 install -m 0644 "$SHARE_DIR/icons/hicolor/scalable/apps/$DESKTOP_ID.svg" "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/$DESKTOP_ID.svg"
 install -m 0644 "$SHARE_DIR/icons/hicolor/128x128/apps/$DESKTOP_ID.png" "$DEB_ROOT/usr/share/icons/hicolor/128x128/apps/$DESKTOP_ID.png"
 install -m 0644 "$SHARE_DIR/metainfo/$DESKTOP_ID.metainfo.xml" "$DEB_ROOT/usr/share/metainfo/$DESKTOP_ID.metainfo.xml"
-install -m 0644 "$SHARE_DIR/doc/cagents/LICENSE" "$DEB_ROOT/usr/share/doc/$PACKAGE_NAME/copyright"
+# Debian keeps a package's copyright and license notices in this one file.
+{
+    cat "$SHARE_DIR/doc/cagents/LICENSE"
+    printf '\n'
+    cat "$SHARE_DIR/doc/cagents/THIRD-PARTY-NOTICES"
+} > "$DEB_ROOT/usr/share/doc/$PACKAGE_NAME/copyright"
+chmod 0644 "$DEB_ROOT/usr/share/doc/$PACKAGE_NAME/copyright"
 
 cat > "$DEB_ROOT/DEBIAN/control" <<EOF
 Package: $PACKAGE_NAME
 Version: $VERSION
 Architecture: $DEB_ARCH
 Maintainer: cagents contributors <maintainers@cagents.dev>
-Depends: ca-certificates, tzdata, curl, git (>= 2.36), libsecret-tools, libc6 (>= $GLIBC_MINIMUM), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
+Depends: ca-certificates, tzdata, curl, git (>= 2.36), libsecret-tools, libc6 (>= $GLIBC_MINIMUM), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, libasound2, zlib1g$EXTRA_DEPENDS
 Recommends: gh
 Section: devel
 Priority: optional
@@ -480,7 +504,7 @@ find "$DEB_ROOT" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH dpkg-deb --root-owner-group --build "$DEB_ROOT" "$DIST_DIR/$DEB_NAME"
 
 INSTALLED_BYTES=0
-for binary in cagents cagents-ui cagentsd; do
+for binary in cagents cagents-ui cagentsd cagents-dictate; do
     binary_bytes=$(wc -c < "$BIN_DIR/$binary")
     INSTALLED_BYTES=$((INSTALLED_BYTES + binary_bytes))
 done

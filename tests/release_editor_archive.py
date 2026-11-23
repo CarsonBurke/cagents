@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the publisher's actual editor archive validator without publication."""
+"""Exercise the publisher's actual archive validator without publication."""
 import os
 from pathlib import Path
 import subprocess
@@ -122,6 +122,80 @@ class EditorArchive(unittest.TestCase):
             self.validate(f"lib/ceditor/releases/{VERSION}/bin/cagents").returncode, 0
         )
 
+
+
+class CagentsArchive(unittest.TestCase):
+    """The same validator on the cagents archives, which carry the dictation
+    helper and its notices exactly when the tagged source has the helper."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp", prefix="cagents-archive-contract-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        source = (ROOT / "scripts/publish-release").read_text()
+        function = source.split("check_archive() {", 1)[1].split(
+            '\n}\n\ncheck_asset_set "$DIST_DIR"', 1
+        )[0]
+        self.validator = self.work / "validate"
+        self.validator.write_text(
+            '#!/usr/bin/env bash\nset -euo pipefail\nexport LC_ALL=C\n'
+            'VERSION=$1\nWORK_DIR=$2\nDICTATE=$5\nfail() { printf "%s\\n" "$*" >&2; exit 1; }\n'
+            'check_archive() {' + function + '\n}\n'
+            'check_archive "$3" "$4" cagents dev.cagents.Cagents\n'
+        )
+        self.root = self.work / f"cagents-{VERSION}"
+        for name in ("cagents", "cagents-ui", "cagentsd", "cagents-uninstall", "cagents-dictate"):
+            self.write(f"bin/{name}", 0o755)
+        self.write("bin/.cagents-ui-lease-v1", 0o644, "")
+        for relative in (
+            "share/applications/dev.cagents.Cagents.desktop",
+            "share/autostart/dev.cagents.Cagents.Daemon.desktop",
+            "share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg",
+            "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
+            "share/metainfo/dev.cagents.Cagents.metainfo.xml",
+            "share/doc/cagents/LICENSE",
+            "share/doc/cagents/THIRD-PARTY-NOTICES",
+        ):
+            self.write(relative, 0o644)
+
+    def write(self, relative, mode, text="fixture; never run\n"):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(mode)
+
+    def validate(self, dictate):
+        archive = self.work / "cagents.tar.gz"
+        with tarfile.open(archive, "w:gz", format=tarfile.GNU_FORMAT) as output:
+            output.add(self.root, arcname=self.root.name)
+        return subprocess.run(
+            ["bash", str(self.validator), VERSION, str(self.work), str(self.work), archive.name,
+             str(int(dictate))],
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+
+    def test_a_release_with_the_helper_must_ship_it_and_its_notices(self):
+        result = self.validate(dictate=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for member in ("bin/cagents-dictate", "share/doc/cagents/THIRD-PARTY-NOTICES"):
+            with self.subTest(missing=member):
+                original = (self.root / member).stat().st_mode
+                (self.root / member).unlink()
+                self.assertIn("missing", self.validate(dictate=True).stderr)
+                self.write(member, original & 0o777)
+
+    def test_the_helper_must_be_a_nonempty_executable(self):
+        (self.root / "bin/cagents-dictate").chmod(0o644)
+        self.assertIn("missing executable permissions", self.validate(dictate=True).stderr)
+        self.write("bin/cagents-dictate", 0o755, "")
+        self.assertIn("empty binary", self.validate(dictate=True).stderr)
+
+    def test_a_release_from_before_the_helper_has_neither(self):
+        self.assertIn("unexpected", self.validate(dictate=False).stderr)
+        (self.root / "bin/cagents-dictate").unlink()
+        (self.root / "share/doc/cagents/THIRD-PARTY-NOTICES").unlink()
+        result = self.validate(dictate=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

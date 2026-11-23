@@ -115,6 +115,7 @@ JOBS = (
         Suite("doctor", "tests/doctor.py", sources=("scripts/doctor",)),
         Suite("Zig discovery", "tests/run-development-zig.py", sources=("scripts/run-development",), isolated=False),
         Suite("installer coordinator extraction", "tests/installer_coordinator.py", isolated=False),
+        Suite("pinned sherpa-onnx libraries", "tests/sherpa_onnx_libs.py", sources=("scripts/sherpa-onnx-libs",)),
         Suite("formatter", "tests/check_format.py",
               sources=("scripts/check-format", "scripts/check-format-cache.py"),
               isolated=False, env=(("CHECK_FORMAT_CARGO_FIXTURE", "1"),)),

@@ -52,7 +52,7 @@ if [[ ${1:-} == --provision ]]; then
         ca-certificates tzdata build-essential clang cmake curl git libclang-dev \
         libdbus-1-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
         libgbm-dev libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
-        libxkbcommon-dev ninja-build pkg-config python3 xz-utils \
+        libxkbcommon-dev ninja-build pkg-config python3 xz-utils libasound2-dev bzip2 \
         appstream desktop-file-utils dpkg-dev jq fakeroot libfakeroot libcurl4-openssl-dev \
         dbus
     audit=$(dpkg --audit)
@@ -60,7 +60,8 @@ if [[ ${1:-} == --provision ]]; then
     [[ -x /usr/bin/clang && -x /usr/bin/clang++ && -d /usr/lib/llvm-14/lib ]]
     # Earlier marked roots already contain the checksum-pinned toolchains.
     # Upgrade runtime/build prerequisites without downloading them again.
-    if [[ ! -f /opt/.cagents-release-provisioned-v2 && ! -f /opt/.cagents-release-provisioned-v3 ]]; then
+    if [[ ! -f /opt/.cagents-release-provisioned-v2 && ! -f /opt/.cagents-release-provisioned-v3 \
+        && ! -f /opt/.cagents-release-provisioned-v4 ]]; then
         # Install the three official, version-pinned Rust components directly;
         # no mutable rustup bootstrap or host toolchain is involved.
         for component in rustc cargo rust-std; do
@@ -108,7 +109,7 @@ if [[ ${1:-} == --provision ]]; then
     [[ -x /usr/bin/dbus-run-session ]]
     [[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]]
     printf '%s\n' 'Ubuntu 22.04; Rust 1.93.0; Zig 0.15.2; Git 2.55.0; system Git diverted' \
-        > /opt/.cagents-release-provisioned-v4
+        > /opt/.cagents-release-provisioned-v5
     exit 0
 fi
 
@@ -130,6 +131,14 @@ application_version=$(jq -er '.packages[] | select(.name == "cagents-ui") | .ver
 [[ $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'expected a stable version'
 [[ $editor_version == "$VERSION" ]] || fail 'cagents and ceditor versions must match'
 [[ $application_version == "$VERSION" ]] || fail 'cagents and cagents-ui versions must match'
+# Sources from before the dictation helper (#3615) build and ship without it;
+# every later one must ship it in both cagents packages.
+dictate=0
+if [[ -f crates/cagents-dictate/Cargo.toml ]]; then
+    dictate=1
+    dictate_version=$(jq -er '.packages[] | select(.name == "cagents-dictate") | .version' <<< "$metadata")
+    [[ $dictate_version == "$VERSION" ]] || fail 'cagents and cagents-dictate versions must match'
+fi
 # Explicit commits and branches are useful for pre-release verification, while
 # a selected version tag may never disagree with the exported manifests.
 case $SOURCE_REF in
@@ -170,6 +179,11 @@ cargo test --locked --profile release-test --package cagents-ui --all-targets
 cargo test --locked --profile release-test --package ceditor --all-targets
 cargo test --locked --profile release-test --features integrated-browser --all-targets
 cargo test --locked --profile release-test --package cagents-ui --features integrated-browser --all-targets
+if ((dictate)); then
+    SHERPA_ONNX_LIB_DIR=$(scripts/sherpa-onnx-libs "$CARGO_TARGET_DIR/sherpa-onnx")
+    export SHERPA_ONNX_LIB_DIR
+    cargo test --locked --profile release-test --package cagents-dictate --features engine --all-targets
+fi
 ./scripts/package-linux.sh --variant full
 ./scripts/package-linux.sh --variant browserless
 ./scripts/package-ceditor-linux.sh
@@ -226,10 +240,19 @@ for product in cagents cagents-browserless; do
     grep -Fqx "TryExec=$product" "$root/share/applications/$desktop.desktop"
     grep -Fqx "StartupWMClass=$desktop" "$root/share/applications/$desktop.desktop"
     [[ -x $root/bin/$product && -s $root/share/icons/hicolor/scalable/apps/$desktop.svg ]]
-    for binary in cagents cagents-ui cagentsd; do
+    binaries=(cagents cagents-ui cagentsd)
+    if ((dictate)); then binaries+=(cagents-dictate); fi
+    for binary in "${binaries[@]}"; do
         [[ -x $root/bin/$binary ]]
         check_glibc "$root/bin/$binary"
     done
+    if ((dictate)); then
+        [[ $("$root/bin/cagents-dictate" --version) == "cagents-dictate $VERSION" ]] \
+            || fail "$product ships a dictation helper from another build"
+        "$root/bin/cagents-dictate" models >/dev/null || fail "$product's dictation helper does not run"
+        grep -Fq 'sherpa-onnx' "$root/share/doc/cagents/THIRD-PARTY-NOTICES" \
+            || fail "$product does not carry the helper's third-party notices"
+    fi
     [[ $("$root/bin/$product" --version) == "cagents $VERSION" ]]
     appstreamcli validate --no-net "$root/share/metainfo/$desktop.metainfo.xml"
     dpkg-deb --info "/dist/${product}_${VERSION}_${DEB_ARCH}.deb" >/dev/null
@@ -244,6 +267,12 @@ for product in cagents cagents-browserless; do
     grep -Fqx "StartupWMClass=$desktop" "$debian_root/usr/share/applications/$desktop.desktop"
     appstreamcli validate --no-net "$debian_root/usr/share/metainfo/$desktop.metainfo.xml"
     [[ $("$debian_root/usr/bin/$product" --version) == "cagents $VERSION" ]]
+    if ((dictate)); then
+        [[ $("$debian_root/usr/libexec/$product/cagents-dictate" --version) == "cagents-dictate $VERSION" ]] \
+            || fail "the $product package ships no matching dictation helper"
+        grep -Fq 'sherpa-onnx' "$debian_root/usr/share/doc/$product/copyright" \
+            || fail "the $product package does not carry the helper's third-party notices"
+    fi
 done
 
 tar -xzf "/dist/ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" -C "$staging"

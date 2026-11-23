@@ -1,6 +1,6 @@
 //! `cagents-dictate`: local speech recognition for cagents.
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, sync::OnceLock};
 
 use cagents_dictate::{
     catalog,
@@ -16,11 +16,27 @@ use clap::{Parser, Subcommand};
 /// Local speech recognition for cagents. The app starts this itself; the
 /// subcommands other than `serve` are for installing models and measuring.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = version())]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+/// The version of the release this helper ships in, with the build metadata
+/// the other executables state, so the release checks can hold all four to
+/// one build.
+fn version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        resolve(
+            env!("CARGO_PKG_VERSION"),
+            option_env!("CAGENTS_BUILD_METADATA"),
+            option_env!("CAGENTS_CHECKOUT_METADATA"),
+        )
+    })
+}
+
+include!("../../../build/stated_version.rs");
 
 #[derive(Subcommand)]
 enum Command {

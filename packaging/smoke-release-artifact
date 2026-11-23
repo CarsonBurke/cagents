@@ -58,6 +58,11 @@ if [[ $product == ceditor ]]; then
     executables=(ceditor cagents cagentsd)
 else
     executables=(cagents cagents-ui cagentsd)
+    # The release build and the publisher require the dictation helper of
+    # every release that has one; here it must also load and run offline.
+    if [[ -e $binaries/cagents-dictate || -L $binaries/cagents-dictate ]]; then
+        executables+=(cagents-dictate)
+    fi
 fi
 for executable in "${executables[@]}"; do
     [[ -f $binaries/$executable && ! -L $binaries/$executable && -x $binaries/$executable ]] || fail "missing executable: $executable"
@@ -66,6 +71,12 @@ for executable in "${executables[@]}"; do
     "$binaries/$executable" --help > /tmp/help
     [[ -s /tmp/help ]] || fail "empty help: $executable"
 done
+if [[ ${executables[*]} == *cagents-dictate* ]]; then
+    # Lists the speech models from the empty data directory: no download.
+    "$binaries/cagents-dictate" models > /tmp/models || fail 'the dictation helper does not run'
+    [[ -s /tmp/models ]] || fail 'the dictation helper lists no models'
+    [[ ! -e /root/data/cagents-speech-models ]] || fail 'listing models wrote to the data directory'
+fi
 if [[ $product == ceditor ]]; then
     daemon_cli=$binaries/cagents
 else

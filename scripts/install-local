@@ -260,7 +260,9 @@ EOF
     have=$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')
     tar -xzf "$OUTPUT/$ARCHIVE" -C "$OUTPUT" "cagents-$VERSION/bin"
     versions=
-    for binary in cagents cagentsd cagents-ui; do
+    for binary in cagents cagentsd cagents-ui cagents-dictate; do
+        # Commits from before the dictation helper build without it.
+        [[ $binary != cagents-dictate || -e $OUTPUT/cagents-$VERSION/bin/$binary ]] || continue
         versions+=$(LC_ALL=C readelf --wide --version-info "$OUTPUT/cagents-$VERSION/bin/$binary")$'\n' \
             || fail "could not read the glibc versions $binary requires"
     done

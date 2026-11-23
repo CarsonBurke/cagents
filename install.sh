@@ -1110,6 +1110,7 @@ if ! awk -v top="$TOP_LEVEL" '
             path == top "/bin/cagents" ||
             path == top "/bin/cagents-ui" ||
             path == top "/bin/cagentsd" ||
+            path == top "/bin/cagents-dictate" ||
             path == top "/bin/.cagents-ui-lease-v1" ||
             path == top "/bin/cagents-uninstall" ||
             path == top "/share/" ||
@@ -1129,7 +1130,8 @@ if ! awk -v top="$TOP_LEVEL" '
             path == top "/share/metainfo/dev.cagents.Cagents.metainfo.xml" ||
             path == top "/share/doc/" ||
             path == top "/share/doc/cagents/" ||
-            path == top "/share/doc/cagents/LICENSE"
+            path == top "/share/doc/cagents/LICENSE" ||
+            path == top "/share/doc/cagents/THIRD-PARTY-NOTICES"
     }
     !allowed($0) || seen[$0]++ { exit 1 }
     $0 == top "/bin/cagents" { required[1] = 1 }
@@ -1143,8 +1145,13 @@ if ! awk -v top="$TOP_LEVEL" '
     $0 == top "/share/metainfo/dev.cagents.Cagents.metainfo.xml" { required[7] = 1 }
     $0 == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" { required[11] = 1 }
     $0 == top "/share/doc/cagents/LICENSE" { required[8] = 1 }
+    # Releases from before dictation have no helper or notices; later ones
+    # carry both together.
+    $0 == top "/bin/cagents-dictate" { dictate = 1 }
+    $0 == top "/share/doc/cagents/THIRD-PARTY-NOTICES" { notices = 1 }
     END {
         for (i = 1; i <= 11; i++) if (!required[i]) exit 1
+        if (dictate != notices) exit 1
     }
 ' "$ARCHIVE_LIST"; then
     fail 'archive has an unexpected or incomplete entry structure'
@@ -1528,6 +1535,9 @@ chmod 0755 \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-ui" \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagentsd" \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-uninstall"
+if [ -e "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-dictate" ]; then
+    chmod 0755 "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-dictate"
+fi
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type d -exec chmod 0755 {} +
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type f -exec chmod 0644 {} +
 

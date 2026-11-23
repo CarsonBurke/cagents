@@ -30,7 +30,9 @@ and unknown version results before installing or updating. Existing installation
 can still be removed on older glibc systems.
 
 The `.deb` declares `git (>= 2.36)`, `libc6 (>= 2.35)`, Fontconfig, FreeType,
-GCC/libstdc++, Wayland client, xkbcommon, and zlib runtime dependencies. The
+GCC/libstdc++, Wayland client, xkbcommon, ALSA (`libasound2`, which dictation's
+microphone capture uses, through PipeWire or PulseAudio where they run) and zlib
+runtime dependencies. The
 full package also requires `libegl1` for the integrated browser; the browserless
 package does not add this dependency. The portable archive needs equivalent
 libraries. Git 2.36 or newer is required for
@@ -193,8 +195,10 @@ How Debian upgrades treat a running daemon is described in
 ## Portable archive
 
 The archive is self-contained as a directory layout, not as a static
-executable. Keep its `bin` directory intact: `cagents`, `cagents-ui`, and
-`cagentsd` must stay together.
+executable. Keep its `bin` directory intact: `cagents`, `cagents-ui`,
+`cagentsd`, and the dictation helper `cagents-dictate` must stay together.
+`share/doc/cagents/THIRD-PARTY-NOTICES` lists the open-source libraries the
+helper includes and their licenses.
 
 ```sh
 VERSION='0.1.2'
