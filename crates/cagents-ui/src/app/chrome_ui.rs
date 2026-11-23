@@ -3911,6 +3911,15 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
+        if let Some(target) = self.dictation_microphone_in(id) {
+            // The microphone is on for this chat, wherever its tab is.
+            children.push(command(
+                Icon::Microphone,
+                "Microphone on: stop dictating",
+                card_control_id(id, "stop-dictating"),
+                Some(Message::ChatUi(chat_ui::Action::DictationStop(target))),
+            ));
+        }
         if let Some(indicator) = sidebar::attention_indicator(attention) {
             children.push(indicator);
         }

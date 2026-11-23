@@ -17571,6 +17571,7 @@ impl Application for Cagents {
             self.daemon_health_banner(),
             self.update_resume_banner(),
             self.automation_approval_banner(),
+            self.dictation_banner(),
             bar,
         ])
         .width(Length::Fill)
