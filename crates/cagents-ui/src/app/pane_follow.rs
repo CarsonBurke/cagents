@@ -13,8 +13,9 @@ use crate::model::ChannelId;
 use crate::workspace_model::ModelEdit;
 use crate::workspace_model::views::{Change, Scope};
 
-/// How long the notice stays while the window is in front.
-const LIFETIME: Duration = Duration::from_secs(8);
+/// How long the notice stays while the window is in front: long enough to
+/// read and act on a move the person did not make.
+const LIFETIME: Duration = Duration::from_secs(15);
 
 /// The pane a peer's transfer took out of the channel this window shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
