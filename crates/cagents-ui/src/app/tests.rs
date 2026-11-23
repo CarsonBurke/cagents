@@ -8291,6 +8291,117 @@ mod repository_clone_navigation {
         }
     }
 
+    /// Four panes, none of them a repository browser, with the first focused
+    /// and Source control bound to the fixture worktree showing other.txt
+    /// modified.
+    async fn four_panes_first_focused(
+        fixture: &Fixture,
+    ) -> (Cagents, Vec<CardId>, ActiveWorktreeKey) {
+        let mut app = context_inspector_test_app(false);
+        let cards: Vec<CardState> = (0..4).map(|_| terminal_card_state()).collect();
+        let ids: Vec<CardId> = cards.iter().map(|card| card.id).collect();
+        app.durable = Arc::new(WorkspaceState {
+            cards: cards.into_iter().collect(),
+            focused: Some(ids[0]),
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        for id in &ids {
+            app.cards.insert(*id, CardRuntime::Loading);
+        }
+        assert_eq!(app.workspace.focused(), Some(ids[0]));
+        let project = ProjectId::new();
+        app.sidebar_model = SidebarModel::ready(
+            sidebar::SidebarMode::Expanded,
+            vec![SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "placement fixture".into(),
+                fixture.root.join(".git"),
+                vec![SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    fixture.root.clone(),
+                    None,
+                )],
+                Vec::new(),
+            )],
+        );
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: fixture.root.clone(),
+            },
+        ));
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        std::fs::write(fixture.root.join("other.txt"), "changed on disk\n").unwrap();
+        let snapshot = RepositoryService::system("git")
+            .snapshot_with_options(
+                &fixture.root,
+                crate::repository::SnapshotOptions::default(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        app.sidebar_model.source_control = Some(SourceControlModel::ready(key.clone(), &snapshot));
+        (app, ids, key)
+    }
+
+    /// The pane at `index` in the strip and in the saved cards.
+    fn pane_at(app: &Cagents, index: usize) -> (CardId, CardId) {
+        (
+            app.workspace.order().nth(index).unwrap(),
+            app.durable.cards[index].id,
+        )
+    }
+
+    /// A file opened from the first of four panes's Source control opens as
+    /// the second pane, beside the pane it was opened from, not as the fifth
+    /// at the far end of the strip.
+    #[tokio::test]
+    async fn source_control_opens_a_new_pane_beside_the_pane_it_came_from() {
+        let fixture = Fixture::new().await;
+        let (mut app, ids, key) = four_panes_first_focused(&fixture).await;
+
+        let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
+        let opened = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert!(!ids.contains(&opened), "a new pane opened");
+        assert_eq!(pane_at(&app, 1), (opened, opened));
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [ids[0], opened, ids[1], ids[2], ids[3]]
+        );
+        assert_shows(&app, opened, "other.txt", &DiffBasis::IndexToWorktree);
+
+        // The same file again reuses that pane rather than opening another.
+        drop(app.update(Message::FocusCard(ids[2])));
+        let task = open_file(&mut app, &key, "other.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(opened));
+        assert_eq!(app.workspace.cards().len(), 5);
+    }
+
+    /// A Files row takes the same placement, and so does a pull request pane
+    /// opened while a later pane is focused.
+    #[tokio::test]
+    async fn files_rows_and_pull_requests_open_beside_the_focused_pane() {
+        let fixture = Fixture::new().await;
+        let (mut app, ids, key) = four_panes_first_focused(&fixture).await;
+        drop(app.update(Message::FocusCard(ids[2])));
+
+        let task = open_file(&mut app, &key, "current.txt");
+        let opened = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert_eq!(pane_at(&app, 3), (opened, opened));
+
+        drop(app.update(Message::FocusCard(ids[0])));
+        let (review, _) = app.add_pull_requests_card(fixture.root.clone());
+        assert_eq!(pane_at(&app, 1), (review, review));
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [ids[0], review, ids[1], ids[2], opened, ids[3]]
+        );
+    }
+
     /// Files rows take the same route, parked until the chosen browser's
     /// file list lands.
     #[tokio::test]
