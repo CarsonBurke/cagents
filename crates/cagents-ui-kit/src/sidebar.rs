@@ -115,7 +115,7 @@ const HEADER_ACTION_WIDTH: f32 = 3.0 * ICON_CONTROL_SIZE;
 
 /// The glyph for "a worktree on a branch": [`Icon::Worktree`], wherever a
 /// worktree is shown, so the same idea is not drawn two ways.
-pub(crate) fn worktree_icon() -> widget::icon::Handle {
+pub fn worktree_icon() -> widget::icon::Handle {
     Icon::Worktree.handle()
 }
 const RESIZE_HANDLE_NAME: &str = "Resize sidebar";
@@ -574,13 +574,13 @@ pub struct SidebarChannel {
 }
 
 impl SidebarChannel {
-    #[cfg(test)]
-    pub(crate) fn tooltip_for_test(&self) -> &str {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tooltip_for_test(&self) -> &str {
         &self.tooltip
     }
 
-    #[cfg(test)]
-    pub(crate) fn accessible_name_for_test(&self) -> &str {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn accessible_name_for_test(&self) -> &str {
         &self.accessible_name
     }
 
@@ -1322,7 +1322,7 @@ fn paneless_name(accessible_name: &str) -> Box<str> {
     format!("{accessible_name}, no open panes").into_boxed_str()
 }
 
-pub(crate) fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) -> String {
+pub fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) -> String {
     branch
         .filter(|_| !detached)
         .filter(|name| !name.is_empty())
@@ -2728,7 +2728,7 @@ impl SourceControlModel {
 
     /// What the panel says is happening, beside a spinner: the mutation it is
     /// running, or the reload it is waiting on.
-    pub(crate) fn progress_label(&self) -> Option<&'static str> {
+    pub fn progress_label(&self) -> Option<&'static str> {
         self.mutation
             .map(MutationKind::progress_label)
             .or_else(|| self.reloading.then_some("Refreshing…"))
@@ -3074,7 +3074,7 @@ pub enum ChangeTreeScope {
 /// A saved presentation value, or its default when this build does not know
 /// it: a variant renamed later, or one a newer build saved, must not cost
 /// the rest of the window's view.
-pub(crate) fn known_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub fn known_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de> + Default,
@@ -3288,7 +3288,7 @@ pub struct SidebarState {
     worktree_attention: BTreeMap<(ProjectId, WorktreeId), AttentionSummary>,
     raw_project_attention: BTreeMap<ProjectId, AttentionSummary>,
     attention_projection: Option<AttentionProjection>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     attention_projection_rebuilds: usize,
     /// Rows read, or whose waiting agent carried on, while the Attention
     /// filter listed them, with how each was dealt with. They stay listed,
@@ -3326,14 +3326,14 @@ pub struct SidebarState {
 impl SidebarState {
     /// Clears the count of attention rebuilds, so two states compare by
     /// what they hold rather than by how often they were rebuilt.
-    #[cfg(test)]
-    pub(crate) fn forget_attention_rebuilds(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forget_attention_rebuilds(&mut self) {
         self.attention_projection_rebuilds = 0;
     }
 
     /// The pane the Attention list draws as current.
-    #[cfg(test)]
-    pub(crate) fn focused_card(&self) -> Option<CardId> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn focused_card(&self) -> Option<CardId> {
         self.focused_card
     }
 
@@ -3812,11 +3812,11 @@ impl SidebarState {
         channel.needs_attention() || self.retained_in_attention(SelectionRow::Channel(channel.id))
     }
 
-    pub(crate) fn unread_updates(&self) -> &BTreeMap<CardId, Option<(ProjectId, WorktreeId)>> {
+    pub fn unread_updates(&self) -> &BTreeMap<CardId, Option<(ProjectId, WorktreeId)>> {
         &self.agent_updates
     }
 
-    pub(crate) fn restore_unread_updates(
+    pub fn restore_unread_updates(
         &mut self,
         updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     ) {
@@ -4233,7 +4233,7 @@ impl SidebarState {
                 )
             })
             .collect();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.attention_projection_rebuilds += 1;
         }
@@ -6304,7 +6304,7 @@ fn window_gestures<'a>(
         .into()
 }
 
-pub(crate) fn selected_project<'a>(
+pub fn selected_project<'a>(
     model: &'a SidebarModel,
     state: &SidebarState,
 ) -> Option<&'a SidebarProject> {
@@ -7064,7 +7064,7 @@ fn project_identity_row(
 
 /// The primary action for a project row, shared by pointer and keyboard
 /// activation. An unreadable project offers retry rather than navigation.
-pub(crate) fn project_primary_action(
+pub fn project_primary_action(
     project: &SidebarProject,
     filter: SidebarFilter,
 ) -> Option<SidebarAction> {
@@ -7809,7 +7809,7 @@ fn project_view<'a>(
     RowInteraction::group(header, column.into(), sticky_viewport)
 }
 
-pub(crate) fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
+pub fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
     repository == worktree
         || (repository.file_name().is_some_and(|name| name == ".git")
             && repository.parent() == Some(worktree))
@@ -8135,7 +8135,7 @@ fn compact_project<'a>(
 /// even when nothing is open there. The glyph and the label follow the same
 /// rule, so a row reads as one strength rather than two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RowInk {
+pub enum RowInk {
     Full,
     Muted,
 }
@@ -8291,7 +8291,7 @@ fn row_glyph<'a, Message: 'a>(
 
 /// A workspace the sidebar lists, for drawing its row's glyph elsewhere.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum WorkspaceMark<'a> {
+pub enum WorkspaceMark<'a> {
     /// A folder project, opened as a whole.
     Project(&'a SidebarProject),
     /// A folder outside any project.
@@ -8309,7 +8309,7 @@ pub(crate) enum WorkspaceMark<'a> {
 /// and a channel's members or else its chat glyph. The workspace switcher
 /// draws its rows with it, so a workspace is recognised by the same mark in
 /// both places.
-pub(crate) fn workspace_mark<Message: 'static>(
+pub fn workspace_mark<Message: 'static>(
     mark: WorkspaceMark<'_>,
     ink: RowInk,
 ) -> Element<'static, Message> {
@@ -10339,7 +10339,7 @@ fn worktree_panel<'a>(
         .into()
 }
 
-pub(crate) fn bound_source_control<'a>(
+pub fn bound_source_control<'a>(
     model: &'a SidebarModel,
     state: &SidebarState,
 ) -> Option<&'a SourceControlModel> {
@@ -13036,7 +13036,7 @@ struct FilteredProject<'a> {
 /// Cache each visible row's rank once. Newly created channels precede the
 /// saved mixed order; new worktrees follow it. Neither changes the relative
 /// order the user chose for existing destinations.
-pub(crate) fn apply_navigation_order<T>(
+pub fn apply_navigation_order<T>(
     rows: &mut [T],
     order: &[crate::workspace_model::NavigationItem],
     item: impl Fn(&T) -> crate::workspace_model::NavigationItem,
@@ -13389,7 +13389,7 @@ fn filtered_projects<'a>(
 /// made, which is the complaint this ordering exists to answer. Among
 /// themselves they fall back to path, which is the same across frames,
 /// reloads and restarts.
-pub(crate) fn worktrees_in_display_order<'a>(
+pub fn worktrees_in_display_order<'a>(
     repository: &Path,
     sort: crate::settings::WorktreeSort,
     rows: impl IntoIterator<Item = &'a SidebarWorktree>,
@@ -13438,7 +13438,7 @@ pub(crate) fn worktrees_in_display_order<'a>(
 /// sorts where its real rank will put it. Equal assigned ranks keep their
 /// source order. At the pending sentinel, the later insertion is newer until
 /// an authoritative read supplies distinct ranks.
-pub(crate) fn channels_in_display_order<'a>(
+pub fn channels_in_display_order<'a>(
     rows: impl IntoIterator<Item = &'a SidebarChannel>,
 ) -> Vec<&'a SidebarChannel> {
     // A folded remote create can still carry the pending sentinel. Its stable
@@ -15335,8 +15335,17 @@ mod row_interaction {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests;
 
 /// Focus a navigation row and reveal it within the Projects scroll viewport.
 pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {

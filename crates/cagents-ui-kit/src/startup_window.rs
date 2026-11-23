@@ -382,7 +382,7 @@ pub fn run(request: Request) -> Result<(), Box<dyn std::error::Error>> {
                 size: iced::Size::new(640.0, 440.0),
                 min_size: Some(iced::Size::new(420.0, 340.0)),
                 exit_on_close_request: false,
-                icon: Some(crate::app::application_window_icon()),
+                icon: Some(crate::ui_controls::application_window_icon()),
                 ..iced::window::Settings::default()
             });
             let mut core = Core::default();

@@ -68,24 +68,21 @@ where
 /// through one of these, so a test can stand in for the desktop and never
 /// start a real browser.
 #[derive(Clone, Default)]
-pub(crate) enum SystemUrlOpener {
+pub enum SystemUrlOpener {
     #[default]
     Desktop,
     /// Records each URL it is given and reports it opened.
-    #[cfg(all(test, feature = "integrated-browser"))]
+    #[cfg(all(any(test, feature = "test-support"), feature = "integrated-browser"))]
     Recording(std::sync::Arc<std::sync::Mutex<Vec<Url>>>),
 }
 
 impl SystemUrlOpener {
-    pub(crate) fn open(
-        &self,
-        url: Url,
-    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
+    pub fn open(&self, url: Url) -> impl Future<Output = Result<(), String>> + Send + 'static {
         let opener = self.clone();
         async move {
             match opener {
                 Self::Desktop => open_system_url(url).await,
-                #[cfg(all(test, feature = "integrated-browser"))]
+                #[cfg(all(any(test, feature = "test-support"), feature = "integrated-browser"))]
                 Self::Recording(opened) => {
                     opened.lock().unwrap().push(url);
                     Ok(())
@@ -95,7 +92,7 @@ impl SystemUrlOpener {
     }
 }
 
-pub(crate) async fn open_system_url(url: Url) -> Result<(), String> {
+pub async fn open_system_url(url: Url) -> Result<(), String> {
     let portal_result = async {
         let request = ashpd::desktop::open_uri::OpenFileRequest::default()
             .send_uri(&url)
@@ -112,7 +109,7 @@ pub(crate) async fn open_system_url(url: Url) -> Result<(), String> {
     }
 }
 
-pub(crate) async fn open_system_url_with_opener(
+pub async fn open_system_url_with_opener(
     url: &Url,
     mut opener: tokio::process::Command,
 ) -> Result<(), String> {

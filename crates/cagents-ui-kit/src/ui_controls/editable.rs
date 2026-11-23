@@ -2,8 +2,8 @@
 //! shaping, IME, clipboard and context menus remain owned by that widget.
 mod editor;
 pub use editor::TextEditor;
-#[cfg(test)]
-pub(crate) use editor::padding_fade_geometry;
+#[cfg(any(test, feature = "test-support"))]
+pub use editor::padding_fade_geometry;
 
 use std::{borrow::Cow, cell::Cell, rc::Rc};
 

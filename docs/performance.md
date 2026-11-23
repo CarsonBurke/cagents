@@ -70,7 +70,7 @@ coalesced move per frame saves over applying every wheel notch.
 ## Activity spinner cost
 
 A visible activity spinner turns every display frame while the main window is
-focused (`SPINNER_ANIMATION` in `crates/cagents-ui/src/ui_controls/gauge.rs`).
+focused (`SPINNER_ANIMATION` in `crates/cagents-ui-kit/src/ui_controls/gauge.rs`).
 It does not redraw the window to do it: on its redraw event it asks for
 animation frames, and the window presents its last drawing again, turned by
 the renderer's clock, until something else needs the widgets drawn. See

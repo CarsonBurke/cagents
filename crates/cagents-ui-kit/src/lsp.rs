@@ -1827,7 +1827,7 @@ impl ChildProcess {
             tracing::warn!(%error, "language-server final reap is unconfirmed");
             return ChildStop::Unconfirmed;
         }
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
         tests::LSP_AFTER_REAP.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
@@ -2656,7 +2656,7 @@ fn initialize_params(root: &Path) -> Result<lsp_types::InitializeParams, String>
         }]),
         client_info: Some(lsp_types::ClientInfo {
             name: "cagents".to_owned(),
-            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            version: Some(cagents::build_version::PRODUCT.to_owned()),
         }),
         locale: None,
         work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
@@ -3784,8 +3784,10 @@ fn contains_path_provably(worktree: &Path, candidate: &Path) -> bool {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+use discovery::discover_root;
 #[cfg(test)]
-use discovery::{discover_root, workspace_manifest};
+use discovery::workspace_manifest;
 
 // ---------------------------------------------------------------------------
 // Manager
@@ -4031,7 +4033,7 @@ pub struct LspManager {
     next_discovery: u64,
     discovery_slots: Arc<tokio::sync::Semaphore>,
     discovery_admissions: Arc<tokio::sync::Semaphore>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     discovery_enter: Option<Arc<dyn Fn() + Send + Sync>>,
     idle_timeout: Duration,
     session_cap: usize,
@@ -4093,7 +4095,7 @@ impl LspManager {
             next_discovery: 1,
             discovery_slots: discovery::worker_slots(),
             discovery_admissions: discovery::admission_slots(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             discovery_enter: None,
             idle_timeout: Duration::from_secs(600),
             session_cap: 8,
@@ -4255,7 +4257,7 @@ impl LspManager {
         let markers = server.root_markers.clone();
         let events = self.events.clone();
         let slots = Arc::clone(&self.discovery_slots);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let discovery_enter = self.discovery_enter.clone();
         let task = runtime.spawn(async move {
             let _admission = admission;
@@ -4270,7 +4272,7 @@ impl LspManager {
                 // A cancelled async waiter must not release an active worker's
                 // permit while its filesystem operation is still returning.
                 let _permit = permit;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(enter) = discovery_enter {
                     enter();
                 }
@@ -4338,7 +4340,7 @@ impl LspManager {
         Some(status)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn open_at_root(
         &mut self,
         doc: LspDocumentId,
@@ -5442,7 +5444,7 @@ impl LspManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn open_for_test(
         &mut self,
         doc: LspDocumentId,
@@ -5471,7 +5473,7 @@ impl LspManager {
 
     /// Replaces the process launcher. Tests inject in-process duplex
     /// transports so no language server has to be installed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn set_transport(&mut self, transport: TransportFactory) {
         self.transport = transport;
     }
@@ -5502,5 +5504,14 @@ impl std::fmt::Debug for LspManager {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests;

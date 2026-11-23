@@ -1,8 +1,9 @@
 //! The shell's own controls, composed from the tokens in [`crate::design`].
 
-#[cfg(test)]
-pub(crate) mod accessibility_probe;
-pub(crate) mod accessible_bounds;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod accessibility_probe;
+pub mod accessible_bounds;
 pub mod button;
 mod culled_column;
 pub use culled_column::{CulledColumn, culled_column, keep_in_place};
@@ -33,14 +34,15 @@ pub use trailing::trailing;
 mod yielding;
 pub use yielding::yielding;
 
-pub use display::{badge, bounded_badge, change_counts, comment_card};
-#[cfg(test)]
-pub(crate) use gauge::activity_animates;
+pub use display::{badge, bounded_badge, change_counts, comment_card, display_path};
+#[cfg(any(test, feature = "test-support"))]
+pub use gauge::activity_animates;
 pub use gauge::{
     activity_spinner, animate_activity, budget_bar, budget_radial, budget_radial_toned,
 };
 pub use icon::{
-    Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_artwork, provider_icon,
+    APPLICATION_ICON_SIZE, Icon, application_window_icon, ceditor_icon, ceditor_window_icon,
+    passive_icon, provider_artwork, provider_icon,
 };
 pub use icon_button::{
     IconButton, control_style, focus_ring, hover_fill, icon_button, outlined_control_style,

@@ -1,0 +1,93 @@
+#!/usr/bin/python3
+"""Check that each build lane resolves only its own implementation graph.
+
+Every lane in mise.toml's [vars] is one Cargo selection. Splitting a crate, or a
+dependency added to the wrong one, can quietly pull another lane's graph into
+it: Ghostty into the UI, libcosmic or Servo into the daemon. Cargo resolves the
+whole graph for `cargo tree` without compiling, so this takes seconds where the
+dependencies have been fetched; it never fetches them itself. See
+docs/development.md#feature-boundaries.
+"""
+
+import argparse
+import shlex
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# The packages each lane must never resolve, with what they stand for.
+GHOSTTY = {"libghostty-vt": "Ghostty"}
+SERVO = {"servo": "Servo"}
+UI = {"libcosmic": "libcosmic"}
+SQLITE = {"rusqlite": "SQLite"}
+APPLICATION = {"cagents-ui": "the application"}
+FORBIDDEN = {
+    "cli": {**UI, **GHOSTTY, **SQLITE, **SERVO},
+    "host": {**UI, **SERVO},
+    "ui": {**GHOSTTY, **SERVO},
+    "browser": {**GHOSTTY},
+    # ceditor builds on the UI kit, never on the application above it.
+    "editor": {**GHOSTTY, **SERVO, **APPLICATION},
+    "dictate": {**UI, **GHOSTTY, **SERVO},
+}
+
+
+def lanes(root):
+    variables = tomllib.loads((root / "mise.toml").read_text())["vars"]
+    missing = set(FORBIDDEN) - set(variables)
+    if missing:
+        sys.exit(f"check-lane-isolation: mise.toml has no lane {', '.join(sorted(missing))}")
+    return {lane: shlex.split(variables[lane]) for lane in FORBIDDEN}
+
+
+def cargo_tree(cargo, root, selection, *extra, stderr=subprocess.PIPE):
+    # Normal, build and dev edges: a lane's check and tests compile all three.
+    # Offline, so a missing dependency fails here instead of fetching a graph
+    # as large as Servo's onto whichever host runs this.
+    return subprocess.run([cargo, "tree", "--offline", *selection, "--edges", "normal,build,dev", *extra],
+                          cwd=root, stdout=subprocess.PIPE, stderr=stderr, text=True)
+
+
+def check(cargo, root, lane, selection):
+    """Returns a description of each forbidden package the lane resolves."""
+    # Cargo's own messages pass through: an error, or that it is waiting for
+    # the package cache another build holds.
+    result = cargo_tree(cargo, root, selection, "--prefix", "none", "--format", "{p}", stderr=None)
+    if result.returncode:
+        return ["cargo tree failed, above (run `cargo fetch --locked` if a dependency is missing)"]
+    # `name vVERSION`, one line per resolved package.
+    resolved = {}
+    for line in result.stdout.splitlines():
+        if line.strip():
+            name, version = line.split()[:2]
+            resolved.setdefault(name, set()).add(version.removeprefix("v"))
+    problems = []
+    for package, name in sorted(FORBIDDEN[lane].items()):
+        for version in sorted(resolved.get(package, ())):
+            why = cargo_tree(cargo, root, selection, "--invert", f"{package}@{version}", "--depth", "6")
+            problems.append(f"resolves {name} ({package}), through:\n{(why.stdout or why.stderr).rstrip()}")
+    return problems
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--cargo", default="cargo", help="Cargo to run (default: cargo on PATH)")
+    parser.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
+    arguments = parser.parse_args()
+    failed = False
+    for lane, selection in lanes(arguments.root).items():
+        problems = check(arguments.cargo, arguments.root, lane, selection)
+        for problem in problems:
+            print(f"check-lane-isolation: the {lane} lane {problem}", file=sys.stderr)
+        failed |= bool(problems)
+    if failed:
+        return 1
+    print(f"check-lane-isolation: {len(FORBIDDEN)} lanes resolve only their own graphs")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

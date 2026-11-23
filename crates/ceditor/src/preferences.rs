@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cagents_ui::editor::language::DocumentLanguage;
+use cagents_ui_kit::editor::language::DocumentLanguage;
 
 const fn default_sidebar_open() -> bool {
     true

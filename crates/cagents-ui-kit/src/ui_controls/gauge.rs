@@ -80,8 +80,8 @@ pub fn animate_activity(focused: bool) {
     ANIMATE_ACTIVITY.set(focused);
 }
 
-#[cfg(test)]
-pub(crate) fn activity_animates() -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn activity_animates() -> bool {
     ANIMATE_ACTIVITY.get()
 }
 

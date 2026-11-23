@@ -133,7 +133,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui"],
+                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui", "-p", "cagents-ui-kit"],
                         [str(self.root), "rustfmt", "--edition", "2024", "--check", *INCLUDED],
                     ],
                 )
@@ -154,7 +154,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-ui"],
+                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-ui", "-p", "cagents-ui-kit"],
                         [str(self.root), "rustfmt", "--edition", "2024", *INCLUDED],
                     ],
                 )
@@ -635,7 +635,7 @@ sys.exit({status})
 
     def exercise_included_sources(self, env):
         self.write("Cargo.toml", """[workspace]
-members = [".", "crates/cagents-ui"]
+members = [".", "crates/cagents-ui", "crates/cagents-ui-kit"]
 [package]
 name = "cagents"
 version = "0.0.0"
@@ -646,6 +646,12 @@ name = "cagents-ui"
 version = "0.0.0"
 edition = "2024"
 """)
+        self.write("crates/cagents-ui-kit/Cargo.toml", """[package]
+name = "cagents-ui-kit"
+version = "0.0.0"
+edition = "2024"
+""")
+        self.write("crates/cagents-ui-kit/src/lib.rs", "pub fn kit() {}\n")
         self.write("src/lib.rs", 'include!("modules.rs");\n')
         self.write("crates/cagents-ui/src/lib.rs", 'include!("modules.rs");\n')
         self.write("src/modules.rs", '#[cfg(feature = "ui")]\nmod gated;\n')
@@ -667,7 +673,7 @@ include!("../tests/support/repository_scale.rs");
                 path.write_text(original + "fn   malformed( ) { }\n")
                 before = {path: path.read_bytes() for path in self.root.rglob("*.rs")}
                 cargo = subprocess.run(
-                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui"],
+                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui", "-p", "cagents-ui-kit"],
                     cwd=self.root, env=env,
                     capture_output=True, text=True, timeout=HANG_GUARD,
                 )

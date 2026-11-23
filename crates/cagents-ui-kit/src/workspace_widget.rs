@@ -1037,7 +1037,7 @@ fn shortcut_matches(
 
 /// A character chord that this physical event can actually dispatch. Number
 /// bindings use the number row even when Shift changes the logical character.
-pub(crate) fn recordable_shortcut_character(
+pub fn recordable_shortcut_character(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
 ) -> Option<char> {
@@ -1074,7 +1074,7 @@ pub(crate) fn defers_to_focused_editor(
 /// Whether the pane's content took a chord the workspace left to it first
 /// ([`defers_to_focused_editor`]), so the workspace's own action for that
 /// chord does not also run.
-pub(crate) fn deferred_shortcut_taken(
+pub fn deferred_shortcut_taken(
     event: &keyboard::Event,
     captured: bool,
     focused: FocusedPane,
@@ -2568,10 +2568,7 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
 /// The strip mounts cards past its edges and scrolls them without clipping
 /// their drop targets, so a card scrolled half out of view would otherwise
 /// reach under the sidebar and take a drop aimed there.
-pub(crate) fn clip_drag_destinations(
-    rectangles: &mut Vec<DndDestinationRectangle>,
-    bounds: Rectangle,
-) {
+pub fn clip_drag_destinations(rectangles: &mut Vec<DndDestinationRectangle>, bounds: Rectangle) {
     let (left, top) = (f64::from(bounds.x), f64::from(bounds.y));
     let (right, bottom) = (
         left + f64::from(bounds.width),
@@ -2602,6 +2599,7 @@ impl<'a, Message: 'a> From<WorkspaceSurface<'a, Message>> for Element<'a, Messag
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 #[path = "widget_forwarding_test.rs"]
-pub(crate) mod forwarding_test;
+pub mod forwarding_test;

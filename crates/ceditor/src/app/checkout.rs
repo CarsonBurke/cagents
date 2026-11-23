@@ -7,7 +7,7 @@ use cagents::{
         WorktreeOperationReport, WorktreeOperationState,
     },
 };
-use cagents_ui::pull_request_review::CheckoutTarget;
+use cagents_ui_kit::pull_request_review::CheckoutTarget;
 
 #[derive(Clone)]
 pub(crate) struct Journal(Arc<StateStore>);
@@ -30,7 +30,7 @@ pub(crate) enum Action {
     Resolved(OperationId, Result<Box<CreateWorktreeRequest>, String>),
     Prepared(
         OperationId,
-        Result<Box<cagents_ui::pull_request_review::checkout::PreparedCheckout>, String>,
+        Result<Box<cagents_ui_kit::pull_request_review::checkout::PreparedCheckout>, String>,
     ),
     Create,
     ReconcileExisting,
@@ -53,7 +53,7 @@ pub(super) struct Dialog {
     completed: Option<PathBuf>,
     existing_receipt: Option<VerifiedPrCheckout>,
     accepted: bool,
-    prepared: Option<cagents_ui::pull_request_review::checkout::PreparedCheckout>,
+    prepared: Option<cagents_ui_kit::pull_request_review::checkout::PreparedCheckout>,
 }
 impl Dialog {
     pub(super) fn busy(&self) -> bool {
@@ -68,7 +68,7 @@ impl Dialog {
     #[cfg(test)]
     pub(super) fn fixture_prepared(
         &mut self,
-        prepared: cagents_ui::pull_request_review::checkout::PreparedCheckout,
+        prepared: cagents_ui_kit::pull_request_review::checkout::PreparedCheckout,
     ) -> OperationId {
         self.prepared = Some(prepared);
         self.id
@@ -195,7 +195,7 @@ impl Editor {
 
     fn checkout_plan_is_current(
         &self,
-        prepared: &cagents_ui::pull_request_review::checkout::PreparedCheckout,
+        prepared: &cagents_ui_kit::pull_request_review::checkout::PreparedCheckout,
     ) -> bool {
         if !self.checkout_origin_is_current() {
             return false;
@@ -294,7 +294,7 @@ impl Editor {
                             .and_then(|plan| plan.reconciliation.as_ref())
                             .is_none_or(|plan| {
                                 d.existing_receipt.as_ref().is_some_and(|receipt| {
-                                    cagents_ui::pull_request_review::checkout::verified_existing_path(
+                                    cagents_ui_kit::pull_request_review::checkout::verified_existing_path(
                                         &d.target, plan, receipt,
                                     )
                                     .as_ref()
@@ -346,7 +346,7 @@ impl Editor {
                     let target = dialog.target.clone();
                     return cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
-                            cagents_ui::pull_request_review::checkout::prepare(
+                            cagents_ui_kit::pull_request_review::checkout::prepare(
                                 &target,
                                 &cancellation,
                             )
@@ -522,7 +522,7 @@ impl Editor {
                                 "The checkout plan was replaced. Prepare checkout again.".to_owned()
                             })
                             .and_then(|plan| {
-                                cagents_ui::pull_request_review::checkout::verified_existing_path(
+                                cagents_ui_kit::pull_request_review::checkout::verified_existing_path(
                                     &dialog.target,
                                     plan,
                                     &receipt,
@@ -567,7 +567,7 @@ impl Editor {
                 let id = dialog.id;
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        cagents_ui::pull_request_review::checkout::create(
+                        cagents_ui_kit::pull_request_review::checkout::create(
                             &journal.0,
                             &request,
                             consent.as_ref(),

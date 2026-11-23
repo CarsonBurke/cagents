@@ -45,8 +45,8 @@ impl Confirmation {
 }
 
 impl State {
-    #[cfg(test)]
-    pub(crate) fn fixture_existing_checkout_pending(&mut self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_existing_checkout_pending(&mut self) -> u64 {
         self.existing_checkout.ticket = self.existing_checkout.ticket.wrapping_add(1);
         self.existing_checkout.accepted = true;
         self.existing_checkout.cancellation = Some(CancellationToken::new());
@@ -126,7 +126,7 @@ impl State {
     /// The question the pane asks where Escape answers it, and its
     /// dismissal: the review popover's while the popover is open in front of
     /// the pane, asking or not, or else the existing-checkout offer's.
-    pub(crate) fn pane_question(&self) -> Option<(Question, super::Action)> {
+    pub fn pane_question(&self) -> Option<(Question, super::Action)> {
         if let Some(dismiss) = self.review_escape() {
             return self.review_question().map(|question| (question, dismiss));
         }
@@ -139,8 +139,8 @@ impl State {
 
     /// The existing-checkout offer's dismissal and committing action, and
     /// Check out pull request, which asks it.
-    #[cfg(test)]
-    pub(crate) fn existing_checkout_ids(&self) -> (widget::Id, widget::Id, widget::Id) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn existing_checkout_ids(&self) -> (widget::Id, widget::Id, widget::Id) {
         (
             self.question_ids.offer_dismiss.clone(),
             self.question_ids.offer_confirm.clone(),
@@ -342,14 +342,23 @@ impl State {
         );
         let rows = widget::column::with_children(rows).spacing(space::S);
         Some(match self.existing_checkout_question() {
-            Some(question) => crate::app::dialog_ui::inline_question(question, rows),
+            Some(question) => crate::question::inline_question(question, rows),
             None => rows.into(),
         })
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests {
     use super::*;
     use crate::repository::test_fixture::isolated_fixture_case;
     use crate::repository::{ExistingPrCheckoutRequest, PrCheckoutTracking, ValidatedRefName};
@@ -386,7 +395,7 @@ pub(crate) mod tests {
     /// #7's branch, `feature`, at the reviewed head but tracks nothing: the
     /// checkout a review of #7 offers to reconcile by setting its upstream.
     /// Its plan runs Git, so its test runs under [`isolated_fixture_case`].
-    pub(crate) struct ExistingCheckout {
+    pub struct ExistingCheckout {
         /// Holds the repositories until the fixture is dropped.
         _directory: tempfile::TempDir,
         repository: PathBuf,
@@ -397,7 +406,11 @@ pub(crate) mod tests {
     }
 
     impl ExistingCheckout {
-        pub(crate) fn new() -> Self {
+        #[allow(
+            clippy::new_without_default,
+            reason = "it creates repositories on disk, which is no default value"
+        )]
+        pub fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
             let repository = directory.path().join("repository");
             let remote = directory.path().join("remote.git");
@@ -465,7 +478,7 @@ pub(crate) mod tests {
         }
 
         /// The plan preparing #7's checkout finds: set the upstream.
-        pub(crate) fn plan(&self) -> ExistingPrCheckoutPlan {
+        pub fn plan(&self) -> ExistingPrCheckoutPlan {
             let request = ExistingPrCheckoutRequest {
                 repository: self.repository.clone(),
                 worktree: self.worktree.clone(),
@@ -482,7 +495,7 @@ pub(crate) mod tests {
         }
 
         /// What Check out pull request asks to check out.
-        pub(crate) fn target(&self) -> CheckoutTarget {
+        pub fn target(&self) -> CheckoutTarget {
             CheckoutTarget {
                 repository: self.repository.clone(),
                 number: 7,
@@ -523,7 +536,7 @@ pub(crate) mod tests {
 
         /// Shows the review of #7 in `state`, loaded as the pane loads it,
         /// so Check out pull request can ask for this checkout.
-        pub(crate) fn open_review(&self, state: &mut State) {
+        pub fn open_review(&self, state: &mut State) {
             drop(state.update(super::super::Action::Open(ReviewTarget {
                 repository: self.key.clone(),
                 worktree: self.repository.clone(),

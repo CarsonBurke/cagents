@@ -202,7 +202,7 @@ impl<Message: Clone + 'static> TextEditor<'_, Message> {
 /// height, so a short field keeps its middle crisp, and stops short of
 /// `caret`, the line being edited in a focused editor, which stays legible
 /// at the edge it was scrolled to. A caret scrolled out of view is ignored.
-pub(crate) fn padding_fade_geometry(
+pub fn padding_fade_geometry(
     bounds: Rectangle,
     padding: Padding,
     overscan: (f32, f32),

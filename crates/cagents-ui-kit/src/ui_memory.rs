@@ -110,7 +110,7 @@ fn trace_global_font_sources() {
 /// Read allocator accounting only at existing presentation retirement boundaries.
 /// These are reserved/used allocation bytes, not resident or reclaimable bytes;
 /// native smaps observations supply that separate measurement.
-pub(crate) fn trace_allocator(boundary: &'static str) {
+pub fn trace_allocator(boundary: &'static str) {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         if !tracing::enabled!(target: "cagents::memory", tracing::Level::TRACE) {

@@ -5,7 +5,7 @@ use cosmic::iced::futures::StreamExt;
 
 /// Re-executes exactly one owning test with private filesystem identity. No
 /// environment variable is changed in the parallel parent test process.
-pub(crate) fn isolated_test(name: &str) -> bool {
+pub fn isolated_test(name: &str) -> bool {
     isolated_test_inner(name, false)
 }
 
@@ -67,13 +67,13 @@ fn isolated_test_inner(name: &str, ignored: bool) -> bool {
 
 /// A checkout nested below an owned private parent, so production recovery
 /// can select that parent without weakening outside-checkout placement rules.
-pub(super) struct Checkout {
+pub struct Checkout {
     _parent: tempfile::TempDir,
     source: PathBuf,
 }
 
 impl Checkout {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let parent = tempfile::tempdir().unwrap();
         let source = parent.path().join("checkout");
         std::fs::create_dir(&source).unwrap();
@@ -83,13 +83,13 @@ impl Checkout {
         }
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.source
     }
 }
 
 #[derive(Debug)]
-pub(super) struct LoadCompletion {
+pub struct LoadCompletion {
     action: &'static str,
     accepted: bool,
     stale: bool,
@@ -100,7 +100,7 @@ pub(super) struct LoadCompletion {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct TaskTrace {
+pub struct TaskTrace {
     reads: Vec<LoadCompletion>,
     details: Vec<String>,
 }
@@ -108,7 +108,7 @@ pub(super) struct TaskTrace {
 impl TaskTrace {
     /// Whether an actual file-worker completion for the selected document
     /// reached the runtime.
-    pub(super) fn answered(&self) -> bool {
+    pub fn answered(&self) -> bool {
         self.reads.iter().any(|read| read.accepted)
     }
 }
@@ -146,10 +146,7 @@ fn load_state(runtime: &RepositoryRuntime) -> String {
 /// whole test takes about 0.1 s on its own.
 const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub(super) async fn finish(
-    runtime: &mut RepositoryRuntime,
-    task: Task<RepositoryAction>,
-) -> TaskTrace {
+pub async fn finish(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) -> TaskTrace {
     let mut trace = TaskTrace::default();
     let settled = tokio::time::timeout(SETTLE_LIMIT, async {
         let mut tasks = vec![task];

@@ -3,7 +3,8 @@
 
 use std::sync::OnceLock;
 
-const PRODUCT: &str = env!("CARGO_PKG_VERSION");
+/// The product version without build metadata, as a release reports it.
+pub const PRODUCT: &str = env!("CARGO_PKG_VERSION");
 const UNSTAMPED: &str = concat!(env!("CARGO_PKG_VERSION"), "+unstamped");
 
 static VERSION: OnceLock<&'static str> = OnceLock::new();

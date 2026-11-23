@@ -2105,8 +2105,8 @@ impl Workspace {
 
     /// How many times this thread has indexed, laid out and classed the
     /// visibility of a strip, for tests that bound an edit's work.
-    #[cfg(test)]
-    pub(crate) fn rebuild_counts() -> (usize, usize, usize) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rebuild_counts() -> (usize, usize, usize) {
         (
             tests::CARD_INDEX_BUILDS.get(),
             tests::GEOMETRY_BUILDS.get(),
@@ -2119,7 +2119,7 @@ impl Workspace {
     }
 
     fn rebuild_card_indices(&mut self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         tests::CARD_INDEX_BUILDS.set(tests::CARD_INDEX_BUILDS.get() + 1);
         self.card_indices = Arc::new(
             self.cards
@@ -2151,7 +2151,7 @@ impl Workspace {
     }
 
     fn rebuild_geometry(&mut self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         tests::GEOMETRY_BUILDS.set(tests::GEOMETRY_BUILDS.get() + 1);
         let geometry = self.build_geometry(self.viewport_width);
         if geometry == self.geometry {
@@ -2281,7 +2281,7 @@ impl Workspace {
     }
 
     fn refresh_visibility(&mut self, offset_changed: bool) -> ViewportUpdate {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         tests::VISIBILITY_REFRESHES.set(tests::VISIBILITY_REFRESHES.get() + 1);
         if self.layout_transition.is_none() {
             self.opening.clear();
@@ -2494,8 +2494,17 @@ fn validate_nonnegative_finite(value: f32, field: &'static str) -> Result<(), Wo
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests {
     use super::*;
 
     thread_local! {

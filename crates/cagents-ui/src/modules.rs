@@ -7,47 +7,21 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 use cagents::*;
 
 pub mod app;
-pub mod automation_ui;
 #[cfg(feature = "integrated-browser")]
 pub mod browser;
-pub mod capability;
-pub(crate) mod desktop_cursor_blink;
-pub mod dialog_ui;
-pub mod dictation;
-pub mod diff_view;
-pub mod document_render;
-pub mod editor;
-pub(crate) mod editor_assistance;
-pub(crate) mod editor_highlight;
-pub(crate) mod editor_history;
-pub mod editor_search;
-pub mod external_editor;
-pub mod file_drop;
-pub mod file_icon;
-pub mod file_manager;
-pub(crate) mod fingerprint;
-pub mod inspector;
-pub mod interaction;
+
+// The widgets and views live in cagents-ui-kit, so that editing the
+// application does not recompile them. They keep their paths here, as
+// `crate::sidebar` or `cagents_ui::editor`, from when they were this crate's.
 #[cfg(feature = "latency-harness")]
-pub mod latency_fixture;
-pub mod lifecycle;
-pub mod lsp;
-pub mod operation_recovery;
-pub mod pull_request_review;
-pub mod reorder;
-pub mod repository_widget;
-pub(crate) mod revision;
-pub mod session;
-pub mod settings_widgets;
-pub mod sidebar;
-pub mod startup_window;
-mod sticky_tree;
-pub mod tab_history;
-pub mod tab_strip;
-pub mod ui_controls;
-pub mod ui_memory;
-pub mod window_system;
-pub mod work_ui;
-pub mod workspace;
-pub mod workspace_widget;
-pub mod worktrees_ui;
+pub use cagents_ui_kit::latency_fixture;
+pub use cagents_ui_kit::{
+    automation_ui, capability, dialog_ui, dictation, diff_view, document_render, editor,
+    editor_search, external_editor, file_drop, file_icon, file_manager, inspector, interaction,
+    lifecycle, lsp, operation_recovery, pull_request_review, question, reorder, repository_widget,
+    session, settings_widgets, sidebar, startup_window, tab_history, tab_strip, ui_controls,
+    ui_memory, window_system, work_ui, workspace, workspace_widget, worktrees_ui,
+};
+pub(crate) use cagents_ui_kit::{
+    desktop_cursor_blink, editor_assistance, editor_history, fingerprint, revision,
+};

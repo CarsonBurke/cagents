@@ -672,7 +672,7 @@ pub(super) fn discover(
     Some(reference_root.or(nearest).unwrap_or(budget.root))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn discover_root(path: &Path, worktree: &Path, markers: &[String]) -> PathBuf {
     discover(path, worktree, markers, &AtomicBool::new(false))
         .unwrap_or_else(|| worktree.to_owned())

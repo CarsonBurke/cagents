@@ -324,7 +324,7 @@ impl FileRead {
             _ => false,
         }
     }
-    pub(crate) fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) {
+    pub fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) {
         (self.root, self.result)
     }
 }

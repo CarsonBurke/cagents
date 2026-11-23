@@ -2,6 +2,8 @@
 //! and the frame around a review comment.
 
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use cosmic::{
     Element, Theme,
@@ -168,4 +170,22 @@ pub fn comment_card<'a, Message: 'a>(
         true,
     ))
     .into()
+}
+
+/// A path as a person would write it, with the home directory as `~`.
+///
+/// Every path this application shows lives under the user's home, so the
+/// absolute prefix is noise that costs the readable tail its space when the
+/// label has to ellipsize.
+pub fn display_path(path: &Path) -> Cow<'_, str> {
+    static HOME: LazyLock<Option<PathBuf>> =
+        LazyLock::new(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().to_owned()));
+    let relative = HOME
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+        .filter(|relative| !relative.as_os_str().is_empty());
+    match relative {
+        Some(relative) => Cow::Owned(format!("~/{}", relative.display())),
+        None => path.to_string_lossy(),
+    }
 }

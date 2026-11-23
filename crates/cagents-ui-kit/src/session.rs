@@ -751,8 +751,11 @@ impl std::fmt::Debug for SessionRuntime {
 }
 
 impl SessionRuntime {
-    #[cfg(all(test, not(feature = "integrated-browser")))]
-    pub(crate) fn poison_queue_for_test(&self) {
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        not(feature = "integrated-browser")
+    ))]
+    pub fn poison_queue_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = self.queue.0.lock().unwrap();
             panic!("test poisoned session queue");
@@ -1149,7 +1152,7 @@ impl SessionRuntime {
 
     /// Queue a grant-bound attachment and await the same one-shot durable
     /// receipt as ordinary recovery. Descriptor arguments come only from it.
-    pub(crate) fn rebind_authenticated_chat_upgrade(
+    pub fn rebind_authenticated_chat_upgrade(
         &self,
         card_id: CardId,
         recovery: crate::chat::client::UpgradeRecovery,

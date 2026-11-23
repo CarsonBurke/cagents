@@ -91,7 +91,7 @@ pub struct DiffSyntax {
 }
 
 impl DiffSyntax {
-    pub(crate) fn line(&self, old: bool, line: Option<u32>, dark: bool) -> &[SyntaxSpan] {
+    pub fn line(&self, old: bool, line: Option<u32>, dark: bool) -> &[SyntaxSpan] {
         let side = if old { &self.old } else { &self.new };
         line.and_then(|line| line.checked_sub(1))
             .and_then(|line| side[usize::from(dark)].get(line as usize))
@@ -201,8 +201,8 @@ fn highlight_side(
 
 /// A whole snippet highlighted in one pass, which is what highlighting it a
 /// line at a time through [`SnippetHighlighter`] is checked against.
-#[cfg(test)]
-pub(crate) fn highlight_snippet(
+#[cfg(any(test, feature = "test-support"))]
+pub fn highlight_snippet(
     code: &str,
     token: &str,
     theme: crate::settings::EditorSyntaxTheme,
@@ -224,14 +224,14 @@ pub(crate) fn highlight_snippet(
 /// for each of them costs its whole length every time. The lexical state
 /// after a line depends only on the lines before it, so the caller keeps this
 /// at the last whole line it has and feeds it what came after.
-pub(crate) struct SnippetHighlighter {
+pub struct SnippetHighlighter {
     parser: HighlightParser,
     /// A snippet is highlighted where it is cached, so nothing cancels it.
     uncancelled: CancellationToken,
 }
 
 impl SnippetHighlighter {
-    pub(crate) fn new(token: &str, theme: crate::settings::EditorSyntaxTheme) -> Self {
+    pub fn new(token: &str, theme: crate::settings::EditorSyntaxTheme) -> Self {
         Self {
             parser: HighlightParser::new(token, theme),
             uncancelled: CancellationToken::new(),
@@ -240,7 +240,7 @@ impl SnippetHighlighter {
 
     /// Highlights the snippet's next line, in both palettes, and moves past
     /// it.
-    pub(crate) fn line(&mut self, line: &str) -> [Vec<SyntaxSpan>; 2] {
+    pub fn line(&mut self, line: &str) -> [Vec<SyntaxSpan>; 2] {
         self.parser
             .line(line, &self.uncancelled)
             .unwrap_or_else(|Cancelled| unreachable!("a fresh token is never cancelled"))
@@ -248,7 +248,7 @@ impl SnippetHighlighter {
 
     /// Highlights a last line that has no ending yet without moving past it,
     /// so the rest of the line can still arrive.
-    pub(crate) fn unfinished(&mut self, line: &str) -> [Vec<SyntaxSpan>; 2] {
+    pub fn unfinished(&mut self, line: &str) -> [Vec<SyntaxSpan>; 2] {
         let state = (self.parser.parser.clone(), self.parser.stack.clone());
         let spans = self.line(line);
         (self.parser.parser, self.parser.stack) = state;
@@ -258,7 +258,7 @@ impl SnippetHighlighter {
 
 /// The spans that draw one line of `text` under its highlights alone, with no
 /// change to mark.
-pub(crate) fn syntax_spans<'a>(
+pub fn syntax_spans<'a>(
     text: &'a str,
     syntax: &[SyntaxSpan],
 ) -> Vec<cosmic::iced::widget::text::Span<'a>> {
@@ -377,7 +377,7 @@ impl SyntaxCache {
 
 /// A parser's share of the grammar. Returning it counts as use, so the
 /// grammar lingers from when the last parser finished, however long it ran.
-pub(crate) struct SyntaxLease(Arc<parsing::SyntaxSet>, Arc<SyntaxCache>);
+pub struct SyntaxLease(Arc<parsing::SyntaxSet>, Arc<SyntaxCache>);
 
 impl Drop for SyntaxLease {
     fn drop(&mut self) {
@@ -405,7 +405,7 @@ pub(crate) fn syntect_theme(
     &THEMES.themes[syntect_theme_name(theme, dark)]
 }
 
-pub(crate) fn syntax_lease() -> SyntaxLease {
+pub fn syntax_lease() -> SyntaxLease {
     static CACHE: LazyLock<Arc<SyntaxCache>> = LazyLock::new(|| Arc::new(SyntaxCache::new(LINGER)));
     CACHE.acquire()
 }
@@ -534,7 +534,7 @@ impl HighlightParser {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn highlight_lines(
     text: &str,
     token: &str,
@@ -554,7 +554,7 @@ fn highlight_lines(
 /// Reuse common text only when the complete lexical states also agree.
 /// Bounded checkpoints suffice; a changed multiline string/comment must reparse
 /// the suffix, even when every subsequent source line is byte-identical.
-pub(crate) fn highlight_comparison(
+pub fn highlight_comparison(
     before: &str,
     after: &str,
     path: &Path,
@@ -651,7 +651,7 @@ pub(crate) fn highlight_comparison(
 }
 
 #[derive(Debug)]
-pub(crate) struct Cancelled;
+pub struct Cancelled;
 
 fn check_cancelled(cancellation: &CancellationToken) -> Result<(), Cancelled> {
     if cancellation.is_cancelled() {
@@ -798,7 +798,7 @@ impl<'a> ShapeKey<'a> {
 /// native paragraphs or copies of source text, and no cache shared between
 /// documents.
 #[derive(Default)]
-pub(crate) struct LineMeasurer<'a> {
+pub struct LineMeasurer<'a> {
     measured: HashMap<ShapeKey<'a>, f32>,
     words: HashMap<ShapeKey<'a>, f32>,
 }
@@ -806,12 +806,7 @@ pub(crate) struct LineMeasurer<'a> {
 impl<'a> LineMeasurer<'a> {
     /// The width `text` draws at under `syntax`, every span in `font`'s
     /// family.
-    pub(crate) fn width(
-        &mut self,
-        text: &'a str,
-        syntax: &[SyntaxSpan],
-        font: cosmic::iced::Font,
-    ) -> f32 {
+    pub fn width(&mut self, text: &'a str, syntax: &[SyntaxSpan], font: cosmic::iced::Font) -> f32 {
         let key = ShapeKey::new(text, syntax, font);
         if let Some(width) = self.measured.get(&key) {
             return *width;
@@ -1341,15 +1336,15 @@ fn build_diff_rows(
 }
 
 /// Unchanged rows kept beside every change, as `git diff` does by default.
-pub(crate) const FOLD_CONTEXT: usize = 3;
+pub const FOLD_CONTEXT: usize = 3;
 /// A fold stands in for its rows with one row of its own, so hiding only a
 /// handful would cost nearly as much height as it saves.
-pub(crate) const FOLD_MIN_HIDDEN: usize = 4;
+pub const FOLD_MIN_HIDDEN: usize = 4;
 
 /// The reference size widths are measured at: the default editor font size.
 /// The surface scales them to the editor's actual size, since glyph advances
 /// scale with it; a different family is measured again instead.
-pub(crate) const DIFF_FONT_SIZE: f32 = 14.0;
+pub const DIFF_FONT_SIZE: f32 = 14.0;
 /// The default editor line: [`DIFF_FONT_SIZE`] at the editor's 1.5 spacing.
 pub(crate) const DIFF_LINE_HEIGHT: f32 = 21.0;
 
@@ -1453,7 +1448,7 @@ pub(crate) fn line_spans<'a, Link>(
 /// The colours diff rows draw with, resolved from the theme once for a whole
 /// view rather than once per row.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DiffPalette {
+pub struct DiffPalette {
     context: cosmic::iced::Color,
     added: cosmic::iced::Color,
     removed: cosmic::iced::Color,
@@ -1461,11 +1456,11 @@ pub(crate) struct DiffPalette {
     added_emphasis: cosmic::iced::Color,
     removed_emphasis: cosmic::iced::Color,
     foreground: cosmic::iced::Color,
-    pub(crate) dark: bool,
+    pub dark: bool,
 }
 
 impl DiffPalette {
-    pub(crate) fn new(theme: &cosmic::Theme) -> Self {
+    pub fn new(theme: &cosmic::Theme) -> Self {
         let dark = theme.theme_type.is_dark();
         // Keep additions and deletions distinct without obscuring their text.
         let alpha = if dark { 0.24 } else { 0.18 };
@@ -1488,7 +1483,7 @@ impl DiffPalette {
         }
     }
 
-    pub(crate) fn row_background(&self, kind: DiffRowKind) -> cosmic::iced::Color {
+    pub fn row_background(&self, kind: DiffRowKind) -> cosmic::iced::Color {
         match kind {
             DiffRowKind::Addition => self.added,
             DiffRowKind::Deletion => self.removed,
@@ -1510,7 +1505,7 @@ impl DiffPalette {
 ///
 /// `family`, when given, is the family every span is drawn in; syntax keeps
 /// its weight and style in it, as the row was measured.
-pub(crate) fn styled_line_spans<'a, Link>(
+pub fn styled_line_spans<'a, Link>(
     text: &'a str,
     changed: &[Range<usize>],
     syntax: &[SyntaxSpan],
@@ -1634,7 +1629,7 @@ pub(crate) fn diff_tint(
 
 /// A row that stands in for unchanged lines: a fold, or the lines between
 /// two hunks.
-pub(crate) fn diff_fold_background(theme: &cosmic::Theme) -> cosmic::iced::Color {
+pub fn diff_fold_background(theme: &cosmic::Theme) -> cosmic::iced::Color {
     let mut accent = crate::design::accent_color(theme);
     accent.a = if theme.theme_type.is_dark() {
         0.10
@@ -1645,7 +1640,7 @@ pub(crate) fn diff_fold_background(theme: &cosmic::Theme) -> cosmic::iced::Color
 }
 
 /// A line number in a diff's gutter: the text colour, faded.
-pub(crate) fn diff_gutter_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+pub fn diff_gutter_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
     let mut color: cosmic::iced::Color = theme.current_container().on.into();
     color.a = crate::design::DIFF_GUTTER_ALPHA;
     cosmic::iced::widget::text::Style {
@@ -1666,7 +1661,7 @@ pub(crate) fn diff_row_background(theme: &cosmic::Theme, kind: DiffRowKind) -> c
 /// as evidence. A bounded weighted sequence alignment keeps matches monotonic,
 /// allowing leading insertions/deletions without shifting every intraline pair.
 /// Oversized or exhausted hunks conservatively remain whole-line changes.
-pub(crate) fn replacement_matches(
+pub fn replacement_matches(
     before: &[DisplayLine<'_>],
     after: &[DisplayLine<'_>],
     budget: &mut usize,
@@ -1780,7 +1775,7 @@ fn substantive_similarity(before: &[&str], after: &[&str]) -> u32 {
     }
 }
 
-pub(crate) fn whole_line_change(text: &str) -> Vec<Range<usize>> {
+pub fn whole_line_change(text: &str) -> Vec<Range<usize>> {
     if text.is_empty() {
         Vec::new()
     } else {
@@ -1791,7 +1786,7 @@ pub(crate) fn whole_line_change(text: &str) -> Vec<Range<usize>> {
 /// Word/whitespace/punctuation tokens preserve the original UTF-8 slices. The
 /// byte, token-product and whole-file budgets bound pathological replacement
 /// hunks; when exhausted the actual entire changed line remains highlighted.
-pub(crate) fn intraline_changes(
+pub fn intraline_changes(
     before: &str,
     after: &str,
     budget: &mut usize,
@@ -1918,7 +1913,7 @@ impl LineEnding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DisplayLine<'a> {
+pub struct DisplayLine<'a> {
     text: &'a str,
     ending: LineEnding,
 }
@@ -1940,7 +1935,7 @@ impl DisplayLine<'_> {
     }
 }
 
-pub(crate) fn display_line(line: &str) -> DisplayLine<'_> {
+pub fn display_line(line: &str) -> DisplayLine<'_> {
     if let Some(text) = line.strip_suffix("\r\n") {
         DisplayLine {
             text,
@@ -3604,7 +3599,9 @@ mod tests {
     fn benchmark_large_source_diff() {
         let path = std::env::var_os("CAGENTS_DIFF_BENCH_PATH")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"));
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../cagents-ui/src/app.rs")
+            });
         let text = std::fs::read_to_string(&path).unwrap();
         let before: Arc<str> = Arc::from(text.as_str());
         let after = format!("// inserted header\n{text}");

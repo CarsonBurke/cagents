@@ -25,13 +25,13 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    app::dialog_ui::Question,
     design::{self, ROW_ICON_SIZE, space},
     github::{
         FileViewedState, GitHubRepoKey, GitHubReviewApi, PullRequest, PullRequestFiles,
         PullRequestKey, PullRequestPage, ReviewContext, ReviewMutationOutcome,
         remote_for_repository,
     },
+    question::Question,
     repository::{
         CancellationToken, ChangeKind, DiffBasis, DiffEntry, Oid, PullRequestRange, RepoPath,
         RepositoryError, RepositoryService, ValidatedBranchName, build_file_tree,
@@ -876,8 +876,8 @@ impl State {
         self.source.as_ref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn browser_is_refreshing(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn browser_is_refreshing(&self) -> bool {
         self.list_request.loading
     }
 
@@ -3689,8 +3689,8 @@ pub type SharedApi = Arc<dyn GitHubReviewApi>;
 
 /// A review API that records mutations and answers from a script, for tests
 /// of the state machine above and of the shells that drive it.
-#[cfg(test)]
-pub(crate) struct ScriptedApi {
+#[cfg(any(test, feature = "test-support"))]
+pub struct ScriptedApi {
     pub viewed: std::sync::Mutex<Vec<(String, bool)>>,
     pub viewed_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
     pub conversation: std::sync::Mutex<crate::github::PullRequestConversation>,
@@ -3706,7 +3706,7 @@ pub(crate) struct ScriptedApi {
     pub searches: std::sync::Mutex<Vec<(String, Option<String>)>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ScriptedApi {
     pub(crate) fn new() -> Self {
         Self {
@@ -3727,7 +3727,7 @@ impl ScriptedApi {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl GitHubReviewApi for ScriptedApi {
     fn search_pull_requests(
         &self,
@@ -3971,8 +3971,17 @@ impl GitHubReviewApi for ScriptedApi {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests {
     use super::*;
     use crate::github::{PullRequestFile, RemoteValue};
     use crate::repository::ValidatedRefName;
@@ -4026,7 +4035,7 @@ pub(crate) mod tests {
         RepoPath::parse(value).unwrap()
     }
 
-    pub(crate) fn entry(value: &str, kind: ChangeKind) -> DiffEntry {
+    pub fn entry(value: &str, kind: ChangeKind) -> DiffEntry {
         DiffEntry {
             path: path(value),
             old_path: None,
@@ -4036,7 +4045,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn remote_file(value: &str, viewed: bool) -> PullRequestFile {
+    pub fn remote_file(value: &str, viewed: bool) -> PullRequestFile {
         PullRequestFile {
             path: value.to_owned(),
             additions: 1,
@@ -4050,11 +4059,11 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn pull_request(number: u64) -> PullRequest {
+    pub fn pull_request(number: u64) -> PullRequest {
         crate::github::fixture_pull_request(number)
     }
 
-    pub(crate) fn target(number: u64) -> ReviewTarget {
+    pub fn target(number: u64) -> ReviewTarget {
         ReviewTarget {
             repository: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
             worktree: PathBuf::from("/repo"),
@@ -4062,7 +4071,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn loaded(entries: Vec<DiffEntry>, files: Vec<PullRequestFile>) -> Loaded {
+    pub fn loaded(entries: Vec<DiffEntry>, files: Vec<PullRequestFile>) -> Loaded {
         let head = Oid::parse("a".repeat(40)).unwrap();
         Loaded {
             discussion_stamp: None,
@@ -4093,7 +4102,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn state() -> (State, Arc<ScriptedApi>) {
+    pub fn state() -> (State, Arc<ScriptedApi>) {
         let api = Arc::new(ScriptedApi::new());
         let state = State::new(api.clone(), RepositoryService::system("git"));
         (state, api)
@@ -4740,7 +4749,7 @@ pub(crate) mod tests {
     }
 
     /// Answers the load the state is waiting on, as the worker would.
-    pub(crate) fn finish_load(state: &mut State, loaded: Loaded) {
+    pub fn finish_load(state: &mut State, loaded: Loaded) {
         drop(state.update(Action::Loaded {
             generation: state.generation,
             load: state.load_generation,
@@ -4748,7 +4757,7 @@ pub(crate) mod tests {
         }));
     }
 
-    pub(crate) fn ready_due_browser(state: &mut State) {
+    pub fn ready_due_browser(state: &mut State) {
         drop(state.update(Action::ListLoaded {
             generation: state.list_request.generation,
             result: Ok(PullRequestPage {

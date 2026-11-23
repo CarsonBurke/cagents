@@ -56,12 +56,12 @@ pub struct PreparedCheckout {
     pub notice: String,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl PreparedCheckout {
     /// What [`prepare`] reports when a worktree already holds the pull
     /// request's branch: `reconciliation`, offered for confirmation. Tests
     /// build it here because [`prepare`] asks GitHub for the head first.
-    pub(crate) fn reconciling(reconciliation: ExistingPrCheckoutPlan, branch: &str) -> Self {
+    pub fn reconciling(reconciliation: ExistingPrCheckoutPlan, branch: &str) -> Self {
         let request = reconciliation.request().clone();
         Self {
             repository: request.repository.clone(),

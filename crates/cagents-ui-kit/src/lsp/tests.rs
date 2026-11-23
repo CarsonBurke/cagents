@@ -411,7 +411,7 @@ fn incremental_capabilities() -> Value {
 }
 
 /// Positive fixture roots must match discovery's canonical session keys.
-pub(super) fn canonical_tempdir() -> tempfile::TempDir {
+pub fn canonical_tempdir() -> tempfile::TempDir {
     let parent = std::env::temp_dir().canonicalize().expect("temp parent");
     tempfile::tempdir_in(parent).expect("tempdir")
 }
@@ -438,15 +438,15 @@ fn rust_language() -> LspLanguage {
 }
 
 /// A real manager binding and in-process LSP wire for UI progress tests.
-pub(crate) struct ProgressFixture {
-    pub(crate) doc: LspDocumentId,
-    pub(crate) ready: LspEvent,
+pub struct ProgressFixture {
+    pub doc: LspDocumentId,
+    pub ready: LspEvent,
     handle: FakeHandle,
     events: async_channel::Receiver<LspEvent>,
     _root: tempfile::TempDir,
 }
 
-pub(crate) async fn progress_fixture() -> (LspManager, ProgressFixture) {
+pub async fn progress_fixture() -> (LspManager, ProgressFixture) {
     let (root, worktree, file) = workspace();
     let mut manager = rust_manager();
     let doc = LspDocumentId(1);
@@ -475,7 +475,7 @@ pub(crate) async fn progress_fixture() -> (LspManager, ProgressFixture) {
 }
 
 impl ProgressFixture {
-    pub(crate) async fn publish(&self, progress: LspProgress) -> LspEvent {
+    pub async fn publish(&self, progress: LspProgress) -> LspEvent {
         let value = if progress.done {
             json!({"kind":"end", "message":progress.message})
         } else {
@@ -4680,7 +4680,7 @@ fn published_group(child: &ChildProcess) -> PublishedGroup {
 // hook; production and ordinary tests never do.
 #[cfg(target_os = "linux")]
 thread_local! {
-    pub(super) static LSP_AFTER_REAP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    pub static LSP_AFTER_REAP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
 

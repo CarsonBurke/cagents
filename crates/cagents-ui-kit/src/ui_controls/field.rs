@@ -4,8 +4,8 @@
 //! A field here is one dense row high with the same corner as the buttons
 //! beside it and a hairline edge, so a form reads as one column of controls.
 
-#[cfg(test)]
-pub(crate) use super::editable::padding_fade_geometry;
+#[cfg(any(test, feature = "test-support"))]
+pub use super::editable::padding_fade_geometry;
 pub use super::editable::{TextEditor, TextInput};
 use std::borrow::Cow;
 

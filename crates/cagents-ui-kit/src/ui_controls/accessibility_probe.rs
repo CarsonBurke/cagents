@@ -4,7 +4,7 @@ use cosmic::iced::advanced::{
     widget::{Tree, tree},
 };
 use cosmic::iced::{Length, Rectangle, Size};
-pub(crate) struct Probe;
+pub struct Probe;
 impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Probe {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<iced_accessibility::Id>()
@@ -57,7 +57,7 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Probe {
     }
 }
 
-pub(crate) fn headless_renderer() -> cosmic::Renderer {
+pub fn headless_renderer() -> cosmic::Renderer {
     use cosmic::iced::advanced::renderer::Headless;
 
     tokio::runtime::Builder::new_current_thread()

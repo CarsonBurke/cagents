@@ -1259,7 +1259,7 @@ impl State {
         }
         let rows = widget::column::with_children(rows).spacing(space::M);
         let rows = match self.review_question() {
-            Some(question) => crate::app::dialog_ui::inline_question(question, rows),
+            Some(question) => crate::question::inline_question(question, rows),
             None => rows.into(),
         };
         widget::container(rows)
@@ -1269,13 +1269,13 @@ impl State {
     }
 
     /// The review popover's content, as the pane's actions.
-    #[cfg(test)]
-    pub(crate) fn review_popup_for_test(&self) -> Element<'_, super::Action> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn review_popup_for_test(&self) -> Element<'_, super::Action> {
         self.review_popup().map(|action| self.review_action(action))
     }
 
     /// The question the review popover asks, while it is open.
-    pub(crate) fn review_question(&self) -> Option<Question> {
+    pub fn review_question(&self) -> Option<Question> {
         if !self.discussion.review_open {
             None
         } else if self.discussion.discard_confirmation.is_some() {
@@ -1289,7 +1289,7 @@ impl State {
 
     /// What Escape does to the review popover: answers its question with
     /// the question's dismissal, and otherwise closes it.
-    pub(crate) fn review_escape(&self) -> Option<super::Action> {
+    pub fn review_escape(&self) -> Option<super::Action> {
         if !self.discussion.review_open {
             return None;
         }
@@ -1303,8 +1303,8 @@ impl State {
 
     /// The controls that ask the review popover's questions: Discard pending
     /// review and Submit review.
-    #[cfg(test)]
-    pub(crate) fn review_opener_ids(&self) -> (widget::Id, widget::Id) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn review_opener_ids(&self) -> (widget::Id, widget::Id) {
         (
             self.question_ids.discard_in_review.clone(),
             self.question_ids.submit.clone(),
@@ -1312,8 +1312,8 @@ impl State {
     }
 
     /// The review popover's question's dismissal and committing action.
-    #[cfg(test)]
-    pub(crate) fn review_question_ids(&self) -> (widget::Id, widget::Id) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn review_question_ids(&self) -> (widget::Id, widget::Id) {
         (
             self.question_ids.dismiss.clone(),
             self.question_ids.confirm.clone(),
@@ -1988,13 +1988,22 @@ impl State {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests {
     use super::*;
     use crate::github::ReviewDiffSide;
     use crate::pull_request_review::tests::{entry, loaded, target};
 
-    pub(crate) fn ready() -> State {
+    pub fn ready() -> State {
         let mut state = State::new(
             Arc::new(ScriptedApi::new()),
             RepositoryService::system("git"),
@@ -2885,7 +2894,7 @@ pub(crate) mod tests {
         assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 10));
     }
 
-    pub(crate) fn with_old_head_review(state: &mut State) {
+    pub fn with_old_head_review(state: &mut State) {
         let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
         next.context.pending = Some(crate::github::PendingReview {
             id: "REVIEW_old".into(),

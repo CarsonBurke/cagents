@@ -217,6 +217,23 @@ pub fn ceditor_window_icon() -> cosmic::iced::window::Icon {
         .expect("embedded editor icon must contain valid RGBA pixels")
 }
 
+const APPLICATION_ICON_PNG: &[u8] = include_bytes!("../../../../packaging/dev.cagents.Cagents.png");
+/// The width and height of [`application_window_icon`], in pixels.
+pub const APPLICATION_ICON_SIZE: u32 = 128;
+
+/// Embedded artwork for initial window creation, independent of icon themes.
+pub fn application_window_icon() -> cosmic::iced::window::Icon {
+    let rgba = image::load_from_memory_with_format(APPLICATION_ICON_PNG, image::ImageFormat::Png)
+        .expect("embedded application icon must be a valid PNG")
+        .into_rgba8();
+    cosmic::iced::window::icon::from_rgba(
+        rgba.into_raw(),
+        APPLICATION_ICON_SIZE,
+        APPLICATION_ICON_SIZE,
+    )
+    .expect("embedded application icon dimensions must match its RGBA pixels")
+}
+
 /// A provider's mark as SVG source, and whether it is a symbolic drawing
 /// that takes the surrounding icon colour rather than its own.
 pub fn provider_artwork(provider: crate::agent::Provider) -> (&'static [u8], bool) {
@@ -265,7 +282,7 @@ mod tests {
             assert_eq!(image.get_pixel(x, y)[3], 0);
         }
         assert!(image.pixels().any(|pixel| pixel[3] == 255));
-        assert_ne!(pixels, crate::app::application_window_icon().into_raw().0);
+        assert_ne!(pixels, application_window_icon().into_raw().0);
     }
 
     #[test]

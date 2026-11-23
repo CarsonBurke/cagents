@@ -199,7 +199,7 @@ fn save_file_with_read_hook(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn save_file_with_cleanup_warning_at(
     root: &Root,
     relative_path: &Path,

@@ -257,7 +257,7 @@ impl<'a> Iterator for Chunks<'a> {
 pub struct TextSnapshot {
     root: Option<Arc<Node>>,
     serialized: Arc<OnceLock<Arc<str>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     serializations: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl PartialEq for TextSnapshot {
@@ -302,7 +302,7 @@ impl TextSnapshot {
         Self {
             root: build(&lines),
             serialized: Arc::new(OnceLock::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             serializations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -312,7 +312,7 @@ impl TextSnapshot {
         Self {
             root: self.root.clone(),
             serialized: Arc::new(OnceLock::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             serializations: Arc::clone(&self.serializations),
         }
     }
@@ -435,14 +435,14 @@ impl TextSnapshot {
             ending: line.ending,
         })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_materialized(&self) -> bool {
         self.serialized.get().is_some()
     }
     /// Serialize a transient payload without retaining a second full copy
     /// in every historical native snapshot (for example LSP wire messages).
     pub fn to_string_uncached(&self) -> String {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.serializations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut text = String::with_capacity(self.len());
@@ -451,7 +451,7 @@ impl TextSnapshot {
         }
         text
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn serialization_count(&self) -> usize {
         self.serializations
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -477,7 +477,7 @@ impl TextSnapshot {
         let (_, right) = split(rest, old_end - first);
         self.root = join(join(left, replacement.root), right);
         self.serialized = Arc::new(OnceLock::new());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.serializations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         }

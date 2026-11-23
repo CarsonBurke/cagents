@@ -20,12 +20,12 @@ use crate::{
 /// replaced, are both silent corruptions, and neither is recoverable by
 /// looking at the answer alone.
 #[derive(Debug, Default)]
-pub(crate) struct AttachmentState {
-    pub(crate) context: LspInspectorContext,
+pub struct AttachmentState {
+    pub context: LspInspectorContext,
     /// The document, once opened. `None` while no file is open, or when no
     /// configured server claims this file's extension, or another independent
     /// buffer already owns its language-server attachment.
-    pub(crate) document: Option<LspDocumentId>,
+    pub document: Option<LspDocumentId>,
     /// The version the diagnostics were computed for, as the manager stamped
     /// them. Compared against the manager's document version and never against
     /// a count of this side's own: the manager re-opens a document on a
@@ -42,7 +42,7 @@ pub(crate) struct AttachmentState {
 impl AttachmentState {
     /// Retire a request even when a new intent leaves the text/caret unchanged.
     /// The shell cancels the returned request at the manager boundary.
-    pub(crate) fn reconcile_completion_intent(&mut self, intent: u64) -> Option<LspRequestId> {
+    pub fn reconcile_completion_intent(&mut self, intent: u64) -> Option<LspRequestId> {
         if self.completion_intent == intent {
             return None;
         }
@@ -57,7 +57,7 @@ impl AttachmentState {
     /// replaces them wholesale on its own schedule, and blanking them on each
     /// keystroke would make the list flicker empty while the user typed. They
     /// are refused at the point of use by version rather than erased here.
-    pub(crate) fn invalidate_answers(&mut self) {
+    pub fn invalidate_answers(&mut self) {
         self.context.locations = None;
         self.context.completions.clear();
         self.completion_request = None;
@@ -67,7 +67,7 @@ impl AttachmentState {
 
     /// Rebase only a current standing set through exact edits. An inexact
     /// transition has no safe coordinate mapping, including for native marks.
-    pub(crate) fn document_changed(
+    pub fn document_changed(
         &mut self,
         previous_version: Option<i32>,
         synchronized_version: Option<i32>,
@@ -84,42 +84,42 @@ impl AttachmentState {
 
     /// Forget the standing diagnostics, for a buffer whose server will
     /// republish from scratch or whose coordinates can no longer be mapped.
-    pub(crate) fn clear_diagnostics(&mut self) {
+    pub fn clear_diagnostics(&mut self) {
         self.context.diagnostics.clear();
         self.diagnostics_version = None;
     }
 
     /// Forget everything shown for a closed document. Outstanding request
     /// identities stay; their responses no longer route to this buffer.
-    pub(crate) fn clear_results(&mut self) {
+    pub fn clear_results(&mut self) {
         self.context = LspInspectorContext::default();
         self.diagnostics_version = None;
     }
 
     /// Record the completion request answering the caret at `at`.
-    pub(crate) fn completion_requested(&mut self, request: LspRequestId, at: LspPosition) {
+    pub fn completion_requested(&mut self, request: LspRequestId, at: LspPosition) {
         self.completion_request = Some((request, at));
     }
 
     /// Retire the pending hover so the shell can cancel it before asking again.
-    pub(crate) fn take_hover_request(&mut self) -> Option<LspRequestId> {
+    pub fn take_hover_request(&mut self) -> Option<LspRequestId> {
         self.hover_request.take().map(|(request, _)| request)
     }
 
     /// Record the hover request answering the pointer at `at`.
-    pub(crate) fn hover_requested(&mut self, request: LspRequestId, at: LspPosition) {
+    pub fn hover_requested(&mut self, request: LspRequestId, at: LspPosition) {
         self.hover_request = Some((request, at));
     }
 
     /// Record the definition request whose answer may move the caret.
-    pub(crate) fn navigation_requested(&mut self, request: LspRequestId) {
+    pub fn navigation_requested(&mut self, request: LspRequestId) {
         self.navigation_request = Some(request);
     }
 
     /// Refuse a delayed publication without erasing a newer standing set.
     /// On acceptance the shell copies the set into native editor marks.
     #[must_use]
-    pub(crate) fn accept_diagnostics(
+    pub fn accept_diagnostics(
         &mut self,
         items: Vec<LspDiagnostic>,
         version: i32,
@@ -133,28 +133,24 @@ impl AttachmentState {
         true
     }
 
-    #[cfg(test)]
-    pub(crate) const fn diagnostics_version(&self) -> Option<i32> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn diagnostics_version(&self) -> Option<i32> {
         self.diagnostics_version
     }
 
-    #[cfg(test)]
-    pub(crate) const fn completion_request(&self) -> Option<(LspRequestId, LspPosition)> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn completion_request(&self) -> Option<(LspRequestId, LspPosition)> {
         self.completion_request
     }
 
-    pub(crate) const fn diagnostics_are_current(&self, document_version: Option<i32>) -> bool {
+    pub const fn diagnostics_are_current(&self, document_version: Option<i32>) -> bool {
         diagnostics_are_current(self.diagnostics_version, document_version)
     }
 
     /// Admit only the pending request at its original caret. The shell then
     /// publishes the candidates through the editor and records its targets.
     #[must_use]
-    pub(crate) fn accept_completion(
-        &mut self,
-        request: LspRequestId,
-        caret: Option<LspPosition>,
-    ) -> bool {
+    pub fn accept_completion(&mut self, request: LspRequestId, caret: Option<LspPosition>) -> bool {
         if let Some((expected, at)) = self.completion_request
             && request == expected
             && caret == Some(at)
@@ -166,7 +162,7 @@ impl AttachmentState {
     }
 
     /// The shell places a matching hover at the request's captured position.
-    pub(crate) fn hover_position(&self, request: LspRequestId) -> Option<LspPosition> {
+    pub fn hover_position(&self, request: LspRequestId) -> Option<LspPosition> {
         self.hover_request
             .filter(|(expected, _)| request == *expected)
             .map(|(_, at)| at)
@@ -174,7 +170,7 @@ impl AttachmentState {
 
     /// A definition response can trigger navigation only once, for its request.
     #[must_use]
-    pub(crate) fn accept_navigation(&mut self, request: LspRequestId) -> bool {
+    pub fn accept_navigation(&mut self, request: LspRequestId) -> bool {
         if self.navigation_request != Some(request) {
             return false;
         }

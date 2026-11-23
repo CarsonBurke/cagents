@@ -21,7 +21,7 @@ pub(crate) fn columns(left: f32, right: f32) -> Rectangle {
 /// Moves every node of `accessible`, laid out in layout coordinates, to the
 /// screen by `offset`. With a `clip` in the same layout coordinates, a node
 /// outside it is hidden and one crossing it keeps only its shown part.
-pub(crate) fn place(accessible: &mut A11yTree, offset: Vector, clip: Option<Rectangle>) {
+pub fn place(accessible: &mut A11yTree, offset: Vector, clip: Option<Rectangle>) {
     let place_node = |node: &mut A11yNode| {
         let node = node.node_mut();
         let Some(mut bounds) = node.bounds() else {

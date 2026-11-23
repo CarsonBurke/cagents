@@ -90,7 +90,7 @@ fn integer(value: &Value<'_>) -> Option<i64> {
 /// time it changes. Without a session bus it ends at once; with a bus but no
 /// settings portal, the read fails and no change ever arrives, so cursors keep
 /// the default.
-pub(crate) fn stream() -> impl Stream<Item = Option<Blink>> {
+pub fn stream() -> impl Stream<Item = Option<Blink>> {
     cosmic::iced::stream::channel(1, async |mut output| {
         let settings = match Settings::new().await {
             Ok(settings) => settings,

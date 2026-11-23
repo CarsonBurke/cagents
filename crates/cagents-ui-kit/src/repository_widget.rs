@@ -9,7 +9,7 @@ use std::{
 };
 
 #[path = "editor_widget.rs"]
-pub(crate) mod text_editor;
+pub mod text_editor;
 
 mod diff_layout;
 mod document_watch;
@@ -17,8 +17,17 @@ mod document_watch;
 mod live_tests;
 use document_watch::DocumentWatch;
 mod preview;
-#[cfg(test)]
-pub(crate) mod retained_save_tests;
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod retained_save_tests;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
@@ -1016,7 +1025,7 @@ struct EditorDocument {
     /// use.
     _markdown_grammar: Option<crate::diff_view::SyntaxLease>,
     /// How many times the content was read to infer its language.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     inferences: usize,
     markdown_items: Vec<markdown::Item>,
     /// Whether [`EditorDocument::markdown_items`] still describes the buffer.
@@ -1053,7 +1062,7 @@ struct EditorDocument {
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
     /// a document loaded afresh starts a history of its own.
     history: History,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     history_time: Option<Instant>,
 }
 
@@ -1120,7 +1129,7 @@ impl EditorDocument {
             markdown,
             language,
             _markdown_grammar: markdown_grammar,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             inferences: 0,
             // Source editing does not consume the preview AST. Parse only
             // when preview is first mounted, alongside its text snapshot.
@@ -1142,7 +1151,7 @@ impl EditorDocument {
             durability_warning: None,
             cleanup_recovery: None,
             history: History::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             history_time: None,
         }
     }
@@ -1166,7 +1175,7 @@ impl EditorDocument {
 
     /// A document that is its own file, which is every fixture that is not
     /// about links.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn unlinked(path: PathBuf, text: String, disk_hash: blake3::Hash, markdown: bool) -> Self {
         Self::new(path.clone(), path, text, disk_hash, markdown)
     }
@@ -1197,7 +1206,7 @@ impl EditorDocument {
                     protocol_edit(&self.content, &recorded.change)
                 };
                 let now = Instant::now();
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 let now = self.history_time.unwrap_or(now);
                 self.history.record(
                     recorded.change,
@@ -1442,7 +1451,7 @@ impl EditorDocument {
             return;
         };
         *stale = false;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.inferences += 1;
         }
@@ -2589,7 +2598,7 @@ pub struct RepositoryRuntime {
     find_snapshot: Option<(u64, u64, Arc<text_editor::SearchSnapshot>)>,
     find_active: Option<FindJob>,
     find_replacement: Option<FindReplacementJob>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     find_replacement_pause: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     find_origin: Option<(usize, usize)>,
     find_error: Option<String>,
@@ -2798,7 +2807,7 @@ impl RepositoryRuntime {
             find_snapshot: None,
             find_active: None,
             find_replacement: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             find_replacement_pause: None,
             find_origin: None,
             find_error: None,
@@ -3271,8 +3280,8 @@ impl RepositoryRuntime {
         self.file_search_generation = self.file_search_generation.wrapping_add(1);
     }
 
-    #[cfg(test)]
-    pub(crate) fn post_persist_failure_fixture(card: CardId) -> (Self, RepositoryAction) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn post_persist_failure_fixture(card: CardId) -> (Self, RepositoryAction) {
         let path = PathBuf::from("notes.txt");
         let descriptor = RepositoryView {
             selected_file: None,
@@ -3332,8 +3341,8 @@ impl RepositoryRuntime {
         (runtime, completion)
     }
 
-    #[cfg(test)]
-    pub(crate) fn post_persist_warning_fixture(card: CardId) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn post_persist_warning_fixture(card: CardId) -> Self {
         let (mut runtime, completion) = Self::post_persist_failure_fixture(card);
         let _ = runtime.update(completion);
         runtime
@@ -3344,8 +3353,8 @@ impl RepositoryRuntime {
     ///
     /// For callers that need [`Self::can_open_file`] to answer truthfully
     /// without also inheriting a fixture's document state.
-    #[cfg(test)]
-    pub(crate) fn file_list_fixture(descriptor: RepositoryView, paths: &[&str]) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn file_list_fixture(descriptor: RepositoryView, paths: &[&str]) -> Self {
         let mut runtime = Self::new(descriptor);
         runtime.files = FileListState::Ready(
             paths
@@ -3364,8 +3373,8 @@ impl RepositoryRuntime {
         runtime
     }
 
-    #[cfg(test)]
-    pub(crate) fn dirty_fixture(card: CardId) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dirty_fixture(card: CardId) -> Self {
         let (mut runtime, _) = Self::post_persist_failure_fixture(card);
         let DocumentState::Editable(document) = &mut runtime.document else {
             unreachable!("post-persist fixture has an editable document");
@@ -3411,8 +3420,8 @@ impl RepositoryRuntime {
     /// The same fixture under a chosen file name, so a test can vary the one
     /// thing a selection tells the highlighter: the extension it was opened
     /// under.
-    #[cfg(test)]
-    pub(crate) fn selection_fixture(card: CardId, name: &str) -> (Self, AsyncIdentity) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn selection_fixture(card: CardId, name: &str) -> (Self, AsyncIdentity) {
         let path = PathBuf::from(name);
         let descriptor = RepositoryView {
             selected_file: None,
@@ -3449,8 +3458,8 @@ impl RepositoryRuntime {
 
     /// The same card once `notes.txt` has loaded as an editable buffer holding
     /// `text`, with the resulting intents still queued.
-    #[cfg(test)]
-    pub(crate) fn lsp_open_fixture(card: CardId, text: &str) -> (Self, AsyncIdentity) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn lsp_open_fixture(card: CardId, text: &str) -> (Self, AsyncIdentity) {
         let (mut runtime, identity) = Self::open_fixture(card, "notes.txt", text);
         runtime.set_lsp_document(Some(LspDocumentId(0)));
         (runtime, identity)
@@ -3458,8 +3467,8 @@ impl RepositoryRuntime {
 
     /// An unstaged file with its comparison on screen, for callers that
     /// change the settings comparisons are presented in.
-    #[cfg(test)]
-    pub(crate) fn shown_diff_fixture(card: CardId) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shown_diff_fixture(card: CardId) -> Self {
         let (mut runtime, _) = Self::open_fixture(card, "notes.txt", "added\nkept\n");
         runtime.source_surface = SourceSurface::Diff;
         runtime.set_diff_state(
@@ -3477,8 +3486,8 @@ impl RepositoryRuntime {
     /// or, for one retained only for a restyle, rebuilt from the live buffer,
     /// which then asks Git nothing. A cancelled or differently styled rebuild
     /// does not count.
-    #[cfg(test)]
-    pub(crate) fn requests_shown_diff(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn requests_shown_diff(&self) -> bool {
         matches!(
             self.diff_state(&self.diff_basis),
             Some(DiffState::Loading { .. })
@@ -3493,8 +3502,8 @@ impl RepositoryRuntime {
     }
 
     /// The same, under a chosen file name.
-    #[cfg(test)]
-    pub(crate) fn open_fixture(card: CardId, name: &str, text: &str) -> (Self, AsyncIdentity) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_fixture(card: CardId, name: &str, text: &str) -> (Self, AsyncIdentity) {
         let (mut runtime, identity) = Self::selection_fixture(card, name);
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity: identity.clone(),
@@ -3535,15 +3544,15 @@ impl RepositoryRuntime {
     /// Drives a document load as the shell would, including the re-read the
     /// runtime starts when its watch invalidates a read, and reports whether
     /// the real file worker answered. Other follow-up tasks are dropped.
-    #[cfg(test)]
-    pub(crate) async fn settle_document_read(&mut self, task: Task<RepositoryAction>) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn settle_document_read(&mut self, task: Task<RepositoryAction>) -> bool {
         retained_save_tests::finish(self, task).await.answered()
     }
 
     /// Whether `action` is a file-read completion for the selected document.
     /// Shell-level drivers check this before applying the action.
-    #[cfg(test)]
-    pub(crate) fn accepts_document_read(&self, action: &RepositoryAction) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn accepts_document_read(&self, action: &RepositoryAction) -> bool {
         matches!(action,
             RepositoryAction::FileLoadedAt { identity, .. }
                 | RepositoryAction::DocumentReloaded { identity, .. }
@@ -3551,14 +3560,14 @@ impl RepositoryRuntime {
     }
 
     /// Whether an accepted read left the document loading behind a re-read.
-    #[cfg(test)]
-    pub(crate) fn rereading_document(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rereading_document(&self) -> bool {
         matches!(self.document, DocumentState::Loading { .. }) && self.document_reading
     }
 
     /// Apply only navigation for this exact pane recipe. Shared projections can
     /// replace the recipe but cannot replace another window's local selection.
-    pub(crate) fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {
+    pub fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {
         if navigation.project != self.descriptor.project
             || navigation.worktree != self.descriptor.worktree
             || navigation
@@ -3576,7 +3585,7 @@ impl RepositoryRuntime {
         self.restored_navigation = Some(navigation.clone());
     }
 
-    pub(crate) fn navigation(&self) -> Option<crate::model::RepositoryNavigation> {
+    pub fn navigation(&self) -> Option<crate::model::RepositoryNavigation> {
         if self.committed_selection.is_some() {
             return None;
         }
@@ -3681,11 +3690,7 @@ impl RepositoryRuntime {
 
     /// Reuses a clean file pane without resetting async generations: an older
     /// read must not win after links switch A → B → A before loading finishes.
-    pub(crate) fn retarget_file(
-        &mut self,
-        card: CardId,
-        view: RepositoryView,
-    ) -> Task<RepositoryAction> {
+    pub fn retarget_file(&mut self, card: CardId, view: RepositoryView) -> Task<RepositoryAction> {
         if self.descriptor.selected_file.is_none()
             || view.selected_file.is_none()
             || self.blocks_navigation()
@@ -4237,7 +4242,7 @@ impl RepositoryRuntime {
     /// Only Edit mounts it. The comparison surface renders the diff model, and
     /// Markdown preview renders the parsed document, so neither has a buffer
     /// to focus or search.
-    pub(crate) fn editable_surface_visible(&self) -> bool {
+    pub fn editable_surface_visible(&self) -> bool {
         let DocumentState::Editable(_) = &self.document else {
             return false;
         };
@@ -4725,11 +4730,11 @@ impl RepositoryRuntime {
             ticket,
             cancellation: cancellation.clone(),
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let pause = self.find_replacement_pause.take();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some((entered, release)) = pause {
                     let _ = entered.send(());
                     release
@@ -6253,8 +6258,8 @@ impl RepositoryRuntime {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn request_save_with_sync_warning_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn request_save_with_sync_warning_for_test(
         &mut self,
         card: CardId,
     ) -> Task<RepositoryAction> {
@@ -6390,7 +6395,7 @@ impl RepositoryRuntime {
                         &root, &destination, &known,
                     )
                     .map_err(|error| {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             use std::io::Write as _;
                             let _ = writeln!(
@@ -6420,7 +6425,7 @@ impl RepositoryRuntime {
                             overwrite,
                             &context,
                         );
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         if let Err(error) = &result {
                             use std::io::Write as _;
                             let _ = writeln!(
@@ -8758,7 +8763,7 @@ impl RepositoryRuntime {
         identity.worktree == self.descriptor.worktree && identity.generation == self.generation
     }
 
-    pub(crate) fn accepts_file_list(&self, identity: &AsyncIdentity) -> bool {
+    pub fn accepts_file_list(&self, identity: &AsyncIdentity) -> bool {
         identity.worktree == self.descriptor.worktree
             && identity.generation == self.file_list_generation
     }
@@ -9343,7 +9348,7 @@ pub fn search_directory_files_for_quick_open_cancellable(
 
 /// Lists expanded ignored folders without allowing one failed read to hide
 /// the worktree. Failed folders are retried only after an explicit user action.
-pub(crate) fn expand_ignored_directories(
+pub fn expand_ignored_directories(
     root: &Path,
     files: &mut WorkingFiles,
     expanded: &[RepoPath],
@@ -9388,10 +9393,7 @@ pub(crate) fn expand_ignored_directories(
     Ok(())
 }
 
-pub(crate) fn load_directory_listing(
-    root: &Path,
-    relative: &Path,
-) -> Result<Vec<RepositoryFile>, String> {
+pub fn load_directory_listing(root: &Path, relative: &Path) -> Result<Vec<RepositoryFile>, String> {
     use std::os::fd::AsRawFd;
     // The folder may itself be the user's link, such as `~/.gemini` into a
     // dotfiles checkout. List the directory it names, as opening it would;

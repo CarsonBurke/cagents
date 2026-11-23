@@ -12,9 +12,9 @@
 
 use std::hash::BuildHasher;
 
-pub(crate) type Hasher = foldhash::quality::FoldHasher<'static>;
+pub type Hasher = foldhash::quality::FoldHasher<'static>;
 
 /// A fresh hasher, always seeded alike.
-pub(crate) fn hasher() -> Hasher {
+pub fn hasher() -> Hasher {
     foldhash::quality::FixedState::default().build_hasher()
 }

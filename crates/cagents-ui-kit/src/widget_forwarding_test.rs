@@ -10,9 +10,9 @@ use cosmic::{Element, Renderer, Theme};
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone, Default)]
-pub(crate) struct Visits(Rc<RefCell<Vec<(&'static str, Vector)>>>);
+pub struct Visits(Rc<RefCell<Vec<(&'static str, Vector)>>>);
 impl Visits {
-    pub(crate) fn offsets(&self, action: &str) -> Vec<Vector> {
+    pub fn offsets(&self, action: &str) -> Vec<Vector> {
         self.0
             .borrow()
             .iter()
@@ -25,7 +25,7 @@ struct Leaf {
     destinations: Vec<(u128, Rectangle)>,
     visits: Visits,
 }
-pub(crate) fn leaf<Message: 'static>(
+pub fn leaf<Message: 'static>(
     size: Size,
     destinations: Vec<(u128, Rectangle)>,
 ) -> (Element<'static, Message>, Visits) {
@@ -152,13 +152,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Leaf {
         }
     }
 }
-pub(crate) struct Traverse;
+pub struct Traverse;
 impl Operation for Traverse {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
         operate(self);
     }
 }
-pub(crate) fn renderer() -> Renderer {
+pub fn renderer() -> Renderer {
     use cosmic::iced::advanced::renderer::Headless;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -172,9 +172,9 @@ pub(crate) fn renderer() -> Renderer {
         .expect("headless renderer")
 }
 
-pub(crate) type Press = (&'static str, Vector, Rectangle);
+pub type Press = (&'static str, Vector, Rectangle);
 
-pub(crate) fn native_button(label: &'static str, size: Size) -> Element<'static, Press> {
+pub fn native_button(label: &'static str, size: Size) -> Element<'static, Press> {
     cosmic::widget::button::custom(cosmic::widget::text(label))
         .name(label)
         .width(size.width)
@@ -186,7 +186,7 @@ pub(crate) fn native_button(label: &'static str, size: Size) -> Element<'static,
 
 /// Inspect actual advertised controls and dispatch their native Click actions.
 /// This exercises widget routing, not the compositor or accessibility bridge.
-pub(crate) fn native_controls(
+pub fn native_controls(
     element: &mut Element<'_, Press>,
     tree: &mut Tree,
     node: &layout::Node,

@@ -25,34 +25,40 @@ import cargo_warnings
 
 TITLE = "Main Rust build sentinel: compilation failure"
 # Each lane's selection after `clippy --locked --no-default-features --all-targets`.
-# `app` is the application package, absent from commits before it was split out;
-# `browser` is that package's integrated-browser graph. Its protocol-fixture
-# feature adds only the Wayland registry test server, so one check covers every
-# integrated-browser target.
+# `app` is the application package and the widgets and views it composes,
+# absent from commits before each was split out; `browser` is that graph with
+# the integrated browser. Its protocol-fixture feature adds only the Wayland
+# registry test server, so one check covers every integrated-browser target.
+# `editor` lints the kit as it ships: the application's tests enable the kit's
+# test-support feature, which `app` and `browser` therefore lint it with.
 LANES = {
     "cli": [],
     "host": ["--features", "host"],
     "ui": ["--features", "ui"],
-    "app": ["-p", "cagents-ui"],
-    "browser": ["-p", "cagents-ui", "--features", "browser-protocol-fixture"],
+    "app": ["-p", "cagents-ui", "-p", "cagents-ui-kit"],
+    "browser": ["-p", "cagents-ui", "-p", "cagents-ui-kit", "--features", "cagents-ui/browser-protocol-fixture"],
     "dictate": ["-p", "cagents-dictate", "--features", "engine"],
+    "editor": ["-p", "ceditor"],
 }
 APPLICATION_LANES = {"app", "browser"}
 # Lanes whose package an older commit may not have, and the manifest that
 # says it does.
 LANE_MANIFESTS = {lane: "crates/cagents-ui/Cargo.toml" for lane in APPLICATION_LANES}
 LANE_MANIFESTS["dictate"] = "crates/cagents-dictate/Cargo.toml"
+LANE_MANIFESTS["editor"] = "crates/ceditor/Cargo.toml"
 # Each test lane's selection after `test --locked --all-targets --no-fail-fast`,
 # in the ordinary test profile. Together they run every test a release used to
 # run itself: the shared library without features and with `host` and `ui`,
 # the application without and with the integrated browser (the shared library
 # then has its `full` identity and browser paths), the editor and the
-# dictation helper. A missing package skips its lane, as for the checks.
+# dictation helper. A missing package skips its lane, and a missing kit is
+# left out of its lane, as for the checks.
 TEST_LANES = {
     "cli": ["--no-default-features"],
     "host": ["--no-default-features", "--features", "host"],
-    "ui": ["--no-default-features", "-p", "cagents", "-p", "cagents-ui", "--features", "cagents/ui"],
-    "browser": ["--no-default-features", "-p", "cagents", "-p", "cagents-ui",
+    "ui": ["--no-default-features", "-p", "cagents", "-p", "cagents-ui", "-p", "cagents-ui-kit",
+           "--features", "cagents/ui"],
+    "browser": ["--no-default-features", "-p", "cagents", "-p", "cagents-ui", "-p", "cagents-ui-kit",
                 "--features", "cagents-ui/browser-protocol-fixture"],
     "editor": ["-p", "ceditor"],
     "dictate": ["--no-default-features", "-p", "cagents-dictate", "--features", "engine"],
@@ -102,6 +108,23 @@ def workspace_packages(checkout):
     except cargo_warnings.WorkspaceUnreadable as error:
         print(f"main-build-sentinel: workspace members unreadable, warnings not counted: {error}", flush=True)
         return None
+
+
+def present(arguments, packages):
+    """A lane's arguments without the packages a commit from before they were
+    split out does not have; all of them when its members are unknown."""
+    if packages is None:
+        return list(arguments)
+    kept = []
+    pairs = iter(arguments)
+    for argument in pairs:
+        if argument == "-p":
+            package = next(pairs)
+            if package in packages:
+                kept += [argument, package]
+        else:
+            kept.append(argument)
+    return kept
 
 
 def check_lane(command, checkout, environment, log_path, warnings_path, packages):
@@ -168,7 +191,7 @@ def check_commit(repository, directory, sha, lanes):
         if lane in LANE_MANIFESTS and not (checkout / LANE_MANIFESTS[lane]).exists():
             continue
         command = [str(checkout / "scripts/cargo-gate"), "clippy", "--locked",
-                   "--no-default-features", "--all-targets", *LANES[lane]]
+                   "--no-default-features", "--all-targets", *present(LANES[lane], packages)]
         print(f"main-build-sentinel: {sha} {lane}", flush=True)
         # No priority bypass, held lease, or local compilation override.
         environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
@@ -330,8 +353,9 @@ def read_verdict(directory, sha):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def test_command(lane):
-    return ["scripts/cargo-gate", "test", "--locked", "--all-targets", "--no-fail-fast", *TEST_LANES[lane]]
+def test_command(lane, packages=None):
+    return ["scripts/cargo-gate", "test", "--locked", "--all-targets", "--no-fail-fast",
+            *present(TEST_LANES[lane], packages)]
 
 
 def test_environment(lane):
@@ -351,12 +375,13 @@ def test_commit(repository, directory, sha):
     checkout = checkout_commit(repository, sha)
     (directory / "logs").mkdir(exist_ok=True)
     lanes = {}
+    packages = workspace_packages(checkout)
     for lane in TEST_LANES:
         if lane in TEST_LANE_MANIFESTS and not (checkout / TEST_LANE_MANIFESTS[lane]).exists():
             continue
         print(f"main-build-sentinel: {sha} test {lane}", flush=True)
         started = time.monotonic()
-        command = test_command(lane)
+        command = test_command(lane, packages)
         with (directory / "logs" / f"{sha}-test-{lane}.log").open("w") as log:
             status = subprocess.run([str(checkout / command[0]), *command[1:]], cwd=checkout,
                                     env=test_environment(lane), stdout=log,

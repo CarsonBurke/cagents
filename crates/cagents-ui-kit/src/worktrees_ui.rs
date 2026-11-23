@@ -237,8 +237,8 @@ impl State {
             .find_map(|card| self.homes.get(&card).copied())
     }
 
-    #[cfg(test)]
-    pub(crate) fn agents(&self) -> &Agents {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn agents(&self) -> &Agents {
         &self.agents
     }
 
@@ -636,7 +636,7 @@ impl<'a> View<'a> {
             design::heading(project.name.as_str())
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            crate::ui_controls::fade_text(crate::app::display_path(&project.repository))
+            crate::ui_controls::fade_text(crate::ui_controls::display_path(&project.repository))
                 .edge(crate::ui_controls::FadeEdge::Start)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
@@ -724,7 +724,7 @@ impl<'a> View<'a> {
                 popover_item(
                     Icon::CopyPath.handle(),
                     "Copy path",
-                    crate::app::display_path(&project.repository),
+                    crate::ui_controls::display_path(&project.repository),
                     command(ProjectCommand::CopyPath),
                 )
                 .into(),
@@ -916,7 +916,7 @@ impl<'a> View<'a> {
         title.push(self.worktree_menu(project, worktree, primary));
 
         let mut second = vec![
-            crate::ui_controls::fade_text(crate::app::display_path(&worktree.path))
+            crate::ui_controls::fade_text(crate::ui_controls::display_path(&worktree.path))
                 .edge(crate::ui_controls::FadeEdge::Start)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
@@ -1173,7 +1173,7 @@ impl<'a> View<'a> {
                 popover_item(
                     Icon::CopyPath.handle(),
                     "Copy path",
-                    crate::app::display_path(&worktree.path),
+                    crate::ui_controls::display_path(&worktree.path),
                     command(ProjectCommand::CopyPath),
                 )
                 .into(),

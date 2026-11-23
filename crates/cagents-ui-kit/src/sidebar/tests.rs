@@ -8926,23 +8926,23 @@ mod row_probe {
         rc::Rc,
     };
 
-    pub(super) type Log = Rc<RefCell<Vec<usize>>>;
+    pub type Log = Rc<RefCell<Vec<usize>>>;
 
     #[derive(Clone, Default)]
-    pub(super) struct Logs {
-        pub(super) updates: Log,
-        pub(super) queries: Log,
+    pub struct Logs {
+        pub updates: Log,
+        pub queries: Log,
         /// Rows whose controls an operation visited, such as a row finding
         /// its focus.
-        pub(super) operations: Log,
-        pub(super) overlays: Log,
-        pub(super) menu: Rc<Cell<Option<usize>>>,
-        pub(super) focus: Rc<Cell<Option<usize>>>,
+        pub operations: Log,
+        pub overlays: Log,
+        pub menu: Rc<Cell<Option<usize>>>,
+        pub focus: Rc<Cell<Option<usize>>>,
     }
 
     impl Logs {
         /// `count` action rows of probes, in a column.
-        pub(super) fn rows(&self, count: usize) -> Element<'static, SidebarAction> {
+        pub fn rows(&self, count: usize) -> Element<'static, SidebarAction> {
             widget::column::with_children(
                 (0..count)
                     .map(|row| {
@@ -8961,7 +8961,7 @@ mod row_probe {
 
         /// `count` selectable rows of probes, in a column. A probe's focus
         /// is not the row's own target, as a row's delete button isn't.
-        pub(super) fn selectable_rows(&self, count: usize) -> Element<'static, SidebarAction> {
+        pub fn selectable_rows(&self, count: usize) -> Element<'static, SidebarAction> {
             let state = SidebarState::default();
             widget::column::with_children(
                 (0..count)
@@ -8983,7 +8983,7 @@ mod row_probe {
 
         /// The rows each log names since it was last taken, in order and
         /// without repeats.
-        pub(super) fn take(log: &Log) -> Vec<usize> {
+        pub fn take(log: &Log) -> Vec<usize> {
             let mut rows = std::mem::take(&mut *log.borrow_mut());
             rows.dedup();
             rows
@@ -12272,7 +12272,7 @@ fn panel_worktree(key: &ActiveWorktreeKey, branch: &str) -> SidebarWorktree {
 
 /// A project holding both fixture worktrees, so the panel has somewhere to
 /// bind and somewhere to rebind to.
-pub(crate) fn panel_model() -> SidebarModel {
+pub fn panel_model() -> SidebarModel {
     SidebarModel::ready(
         SidebarMode::Expanded,
         vec![SidebarProject::new(
@@ -12297,7 +12297,7 @@ fn focus_on(key: &ActiveWorktreeKey) -> SidebarFocus {
 }
 
 /// A pane bound to `main` with every panel section open.
-pub(crate) fn panel_state(model: &SidebarModel) -> SidebarState {
+pub fn panel_state(model: &SidebarModel) -> SidebarState {
     let mut state = SidebarState::default();
     assert!(state.sync_active_worktree(model, &focus_on(&main_key())));
     for section in PanelSection::ALL {
@@ -12314,7 +12314,7 @@ pub(crate) fn panel_state(model: &SidebarModel) -> SidebarState {
 /// A headless `cosmic::Renderer`. `Widget::update` and `Widget::operate`
 /// take one by reference; with no graphics device it falls back to
 /// `tiny-skia`, which needs neither a device nor a surface.
-pub(super) fn headless_renderer() -> cosmic::Renderer {
+pub fn headless_renderer() -> cosmic::Renderer {
     use cosmic::iced::advanced::renderer::Headless;
     use cosmic::iced::{Font, Pixels};
 

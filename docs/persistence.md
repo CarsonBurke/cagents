@@ -2,7 +2,7 @@
 
 This document describes who owns durable workspace state, how it is stored and
 changed, and the staged plan that moves the current design to that target. It
-is the reference for changes to `src/persistence.rs`, `crates/cagents-ui/src/session.rs`,
+is the reference for changes to `src/persistence.rs`, `crates/cagents-ui-kit/src/session.rs`,
 `src/host/model/` and the runtime directory's receipts and caches.
 
 Status: design accepted for staged implementation. Each stage below names what

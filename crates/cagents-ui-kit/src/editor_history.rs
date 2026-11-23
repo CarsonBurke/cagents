@@ -29,7 +29,7 @@ use cosmic::iced::widget::text_editor::{Cursor, Position};
 /// A pause longer than this ends the typing or deleting run in progress.
 const GROUP_IDLE: Duration = Duration::from_secs(1);
 /// Most steps one document keeps.
-pub(crate) const MAX_TRANSACTIONS: usize = 10_000;
+pub const MAX_TRANSACTIONS: usize = 10_000;
 /// Most text, in bytes, one document's history retains.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Bookkeeping charged per step on top of its text, so a history of many
@@ -563,7 +563,7 @@ fn breaks(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
 }
 
 /// The position reached by inserting `text` at `start`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn advance(start: Position, text: &str) -> Position {
     let mut lines = 0;
     let mut tail = 0;

@@ -1,7 +1,7 @@
 //! Window-local drafts and paged views of daemon-owned automations. Every
 //! mutation carries the revision shown to the reader; confirmation retains an
 //! immutable launch description, never a reference to a changing editor.
-use crate::app::dialog_ui::Question;
+use crate::question::Question;
 use crate::{
     account::AccountId,
     agent::Provider,
@@ -825,7 +825,7 @@ impl State {
     }
     /// The question the pane asks in place of its content, and which asking
     /// of it this is.
-    pub(crate) fn question(&self) -> Option<(u64, Question)> {
+    pub fn question(&self) -> Option<(u64, Question)> {
         self.confirmation
             .as_ref()
             .map(|confirmation| (confirmation.generation, confirmation.question))
@@ -840,8 +840,8 @@ impl State {
     }
     pub fn draft_dialog(&self) -> Option<Element<'_, Action>> {
         let (generation, _) = self.discard_draft.as_ref()?;
-        Some(crate::app::dialog_ui::confirmation_surface(
-            crate::app::dialog_ui::Question::DiscardAutomationDraft,
+        Some(crate::question::confirmation_surface(
+            crate::question::Question::DiscardAutomationDraft,
             widget::column::with_children(vec![
                 crate::design::title("Discard automation changes?").into(),
                 crate::design::body("Your unsaved changes will be lost.").into(),
@@ -2408,7 +2408,7 @@ impl State {
             } else {
                 crate::ui_controls::button::secondary("Confirm")
             };
-            content = content.push(crate::app::dialog_ui::inline_question(
+            content = content.push(crate::question::inline_question(
                 question,
                 widget::column::with_children(vec![
                     crate::design::title(match question {
@@ -3596,28 +3596,28 @@ fn refresh_id() -> widget::Id {
 /// Where the discard question opens: on keeping the draft, since
 /// discarding it loses the changes for good.
 pub fn draft_dialog_focus_id() -> widget::Id {
-    crate::app::dialog_ui::Question::DiscardAutomationDraft
+    crate::question::Question::DiscardAutomationDraft
         .initial_focus(draft_dialog_keep_id(), draft_dialog_discard_id())
 }
 /// The control that asks `question`, where the keyboard returns when it is
 /// dismissed.
-pub(crate) fn question_opener_id(question: Question) -> widget::Id {
+pub fn question_opener_id(question: Question) -> widget::Id {
     widget::Id::new(match question {
         Question::EnableAutomation => "automation.enable",
         Question::RunAutomationNow => "automation.run-now",
         _ => "automation.remove",
     })
 }
-pub(crate) fn confirmation_cancel_id() -> widget::Id {
+pub fn confirmation_cancel_id() -> widget::Id {
     widget::Id::new("automation.confirmation.cancel")
 }
-pub(crate) fn confirmation_confirm_id() -> widget::Id {
+pub fn confirmation_confirm_id() -> widget::Id {
     widget::Id::new("automation.confirmation.confirm")
 }
-pub(crate) fn draft_dialog_keep_id() -> widget::Id {
+pub fn draft_dialog_keep_id() -> widget::Id {
     widget::Id::new("dialog.automation-draft.keep")
 }
-pub(crate) fn draft_dialog_discard_id() -> widget::Id {
+pub fn draft_dialog_discard_id() -> widget::Id {
     widget::Id::new("dialog.automation-draft.discard")
 }
 pub fn draft_editor_focus_id() -> widget::Id {
@@ -3738,11 +3738,11 @@ fn optional(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl State {
     /// Shows an automation, as selecting one in the list does once it has
     /// loaded.
-    pub(crate) fn show_automation_for_test(&mut self) {
+    pub fn show_automation_for_test(&mut self) {
         self.pending = None;
         self.selected = Some(tests::automation());
     }
@@ -3762,8 +3762,17 @@ pub fn state_label(state: crate::automations::FiringState) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
+#[doc(hidden)]
+pub mod tests {
     use super::*;
 
     pub(super) fn automation() -> Automation {

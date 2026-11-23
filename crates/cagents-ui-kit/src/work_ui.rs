@@ -878,7 +878,7 @@ impl State {
         let mut facts = self.facts(item);
         if let Some(worktree) = &item.worktree {
             facts.push(
-                design::caption(crate::app::display_path(&worktree.path))
+                design::caption(crate::ui_controls::display_path(&worktree.path))
                     .class(cosmic::theme::Text::Custom(design::muted_text))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
@@ -1081,7 +1081,7 @@ impl State {
                     popover_item(
                         Icon::OpenFolder.handle(),
                         "Open worktree",
-                        crate::app::display_path(&worktree.path),
+                        crate::ui_controls::display_path(&worktree.path),
                         Action::OpenWorktree(card.clone()),
                     )
                     .into(),

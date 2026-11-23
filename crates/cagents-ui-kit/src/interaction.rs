@@ -29,7 +29,7 @@ pub use reveal_focus::{focus_group, reveal_focus};
 use crate::design::space;
 
 /// Native menu hints come from the same grammar as shortcut dispatch.
-pub(crate) fn menu_shortcuts<'a, A: Clone + 'a>(
+pub fn menu_shortcuts<'a, A: Clone + 'a>(
     bindings: impl IntoIterator<Item = (&'a [String], A)>,
 ) -> std::collections::HashMap<widget::menu::KeyBind, A> {
     bindings
@@ -1612,7 +1612,7 @@ impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
 /// How far an overflow fade reaches into a scrolling strip: about one line
 /// of body text, or the end of a tab label. Code that scrolls something into
 /// view keeps it this far from an edge that may be fading.
-pub(crate) const OVERFLOW_FADE: f32 = 24.0;
+pub const OVERFLOW_FADE: f32 = 24.0;
 
 /// How far each edge's fade reaches, given how far the content has scrolled
 /// from its start and how much of it lies past the viewport's end.
@@ -2356,7 +2356,7 @@ fn tip_surface<'a, Message: 'a>(label: Cow<'a, str>) -> Element<'a, Message> {
 /// [`tooltip`]. Its owner keeps it while the pointer stays on that part and
 /// drops it when the pointer leaves, and asks for frames until it
 /// [settles](Self::settles_at).
-pub(crate) struct PartTip<Message> {
+pub struct PartTip<Message> {
     label: Arc<str>,
     content: Element<'static, Message>,
     tree: Tree,
@@ -2364,7 +2364,7 @@ pub(crate) struct PartTip<Message> {
 }
 
 impl<Message: 'static> PartTip<Message> {
-    pub(crate) fn new(label: Arc<str>, hovered: Instant) -> Self {
+    pub fn new(label: Arc<str>, hovered: Instant) -> Self {
         let content = tip_surface(Cow::Owned(label.to_string()));
         let tree = Tree::new(&content);
         Self {
@@ -2374,20 +2374,20 @@ impl<Message: 'static> PartTip<Message> {
             hovered,
         }
     }
-    pub(crate) fn label(&self) -> &Arc<str> {
+    pub fn label(&self) -> &Arc<str> {
         &self.label
     }
     /// When the tip starts to fade in.
-    pub(crate) fn opens_at(&self) -> Instant {
+    pub fn opens_at(&self) -> Instant {
         self.hovered + TOOLTIP_DELAY
     }
     /// When the tip has finished fading in.
-    pub(crate) fn settles_at(&self) -> Instant {
+    pub fn settles_at(&self) -> Instant {
         self.hovered + TOOLTIP_DELAY + HOVER_DURATION
     }
     /// The tip beside `anchor`, the part's bounds in the overlay's frame,
     /// once the pointer has rested there long enough.
-    pub(crate) fn overlay(
+    pub fn overlay(
         &mut self,
         anchor: Rectangle,
         now: Instant,

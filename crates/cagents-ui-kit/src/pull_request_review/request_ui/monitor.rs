@@ -124,14 +124,14 @@ impl Monitor {
         self.revision
     }
 
-    #[cfg(test)]
-    pub(crate) fn in_flight_for_test(&self) -> Option<&(GitHubRepoKey, u64)> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_flight_for_test(&self) -> Option<&(GitHubRepoKey, u64)> {
         self.busy.as_ref()
     }
 
     /// Makes every repository due, with the request budget refilled.
-    #[cfg(test)]
-    pub(crate) fn make_due_for_test(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn make_due_for_test(&mut self) {
         let now = Instant::now();
         for entry in self.entries.values_mut() {
             entry.due = now;
