@@ -7,8 +7,14 @@
 //! A session never carries its own capability to the device. For each
 //! connection, the device sends a nonce, this computer's daemon signs it for
 //! the caller's live session lineage when the grant allows, and the device then
-//! issues a capability for that peer lineage which lasts as long as the
-//! connection. On the device that capability has a session's scope: through
+//! issues a capability for that peer lineage on that connection. The
+//! capability lapses after [`CAPABILITY_LIFETIME`] unless the connection proves
+//! itself again, which the CLI does every [`CAPABILITY_RENEWAL`], so denying
+//! agents, unlinking, ending the session or lowering its mode reaches a
+//! connection that is already open: the device ends it, or holds it to the
+//! lower ceiling this computer vouches for next. Forgetting or re-keying a
+//! peer on the device ends that peer's connections at once. On the device that
+//! capability has a session's scope: through
 //! cagents requests it reaches its own children and terminals, listings and
 //! messaging, never accounts, lifecycle, installs or device links. Like a
 //! session there, a terminal it starts runs commands as the device's user.
@@ -19,6 +25,15 @@ use crate::agent_execution::Lineage;
 
 /// The bytes of a link key, a nonce and a proof.
 pub const SECRET_BYTES: usize = 32;
+
+/// How long a device capability lasts after its connection's latest proof.
+/// It bounds how long a connection keeps access that this computer has since
+/// stopped vouching for.
+pub const CAPABILITY_LIFETIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How soon after a proof the CLI proves its connection again: half the
+/// lifetime, leaving the other half for the round trips.
+pub const CAPABILITY_RENEWAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The secret two daemons share for one link. It never appears in
 /// `devices.json`, diagnostics or a public reply.

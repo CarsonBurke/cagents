@@ -28,6 +28,8 @@ mod automation_work_authority_tests;
 mod channels;
 mod chat;
 #[cfg(test)]
+mod device_peer_tests;
+#[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod devices;
@@ -955,7 +957,26 @@ pub struct ControlClient {
     terminal_streams: BTreeSet<TerminalId>,
     /// On another device, the capability this connection proved for the
     /// calling session's lineage, used in place of the session's own.
-    device_peer: Option<Authority>,
+    device_peer: Option<DevicePeer>,
+}
+
+/// Sends a `SignDeviceChallenge` to this computer's daemon.
+type Signer = fn(ClientRequest) -> Result<ServerResponse, ControlError>;
+
+fn sign_here(request: ClientRequest) -> Result<ServerResponse, ControlError> {
+    let local = crate::terminal::ipc::local_daemon_socket_path().map_err(ControlError::Connect)?;
+    ControlClient::connect(&local)?.request_strict(request)
+}
+
+/// The capability a connection proved on another device, and what it needs
+/// to prove itself again.
+struct DevicePeer {
+    capability: Authority,
+    proved: Instant,
+    /// The calling session's own capability, which only this computer's
+    /// daemon sees.
+    session: Authority,
+    device: String,
 }
 
 impl std::fmt::Debug for ControlClient {
@@ -2587,7 +2608,46 @@ impl ControlClient {
     /// nonce, this computer's daemon signs it if a person allowed sessions
     /// here to use the device, and the device answers with a capability for
     /// that lineage, which every request of this connection then carries.
+    ///
+    /// The capability lapses unless the connection proves itself again, so
+    /// a proved connection does so every
+    /// [`CAPABILITY_RENEWAL`](crate::device_trust::CAPABILITY_RENEWAL) before
+    /// its next request, whatever it is. This computer's daemon then vouches
+    /// for the session as it is now: refusing once agents are denied, the
+    /// device unlinked or the session ended, and with its current mode.
     fn for_device(&mut self, request: ClientRequest) -> Result<ClientRequest, ControlError> {
+        self.for_device_with(request, sign_here)
+    }
+
+    /// [`Self::for_device`], with `sign` asking this computer's daemon to
+    /// vouch for the session.
+    fn for_device_with(
+        &mut self,
+        request: ClientRequest,
+        sign: Signer,
+    ) -> Result<ClientRequest, ControlError> {
+        if let Some(peer) = &self.device_peer
+            && peer.proved.elapsed() >= crate::device_trust::CAPABILITY_RENEWAL
+            // A proof's own requests, which renewing sends.
+            && !matches!(
+                request,
+                ClientRequest::PeerChallenge | ClientRequest::PeerAuthenticate { .. }
+            )
+        {
+            let (session, device) = (peer.session.clone(), peer.device.clone());
+            // A refusal ends the connection's use of the device; nothing
+            // falls back to the capability it held.
+            self.device_peer = None;
+            // Timed from before the device issues it, so it is renewed early
+            // rather than late.
+            let proved = Instant::now();
+            self.device_peer = Some(DevicePeer {
+                capability: self.prove_session(session.clone(), &device, sign)?,
+                proved,
+                session,
+                device,
+            });
+        }
         let session = match &request {
             ClientRequest::Agent { authority, .. }
             | ClientRequest::Automation { authority, .. }
@@ -2601,10 +2661,16 @@ impl ControlClient {
             return Ok(request);
         }
         let peer = match &self.device_peer {
-            Some(peer) => peer.clone(),
+            Some(peer) => peer.capability.clone(),
             None => {
-                let peer = self.prove_session(session.clone(), &device.name)?;
-                self.device_peer = Some(peer.clone());
+                let proved = Instant::now();
+                let peer = self.prove_session(session.clone(), &device.name, sign)?;
+                self.device_peer = Some(DevicePeer {
+                    capability: peer.clone(),
+                    proved,
+                    session: session.clone(),
+                    device: device.name.clone(),
+                });
                 peer
             }
         };
@@ -2626,6 +2692,7 @@ impl ControlClient {
         &mut self,
         session: Authority,
         device: &str,
+        sign: Signer,
     ) -> Result<Authority, ControlError> {
         // A daemon that answered, refusing or unable to use its device
         // links, is not a connection failure: say which computer and why,
@@ -2649,17 +2716,14 @@ impl ControlClient {
             ServerResponse::PeerChallenge { nonce } => nonce,
             response => return Err(unexpected_response("a device challenge", &response)),
         };
-        let local =
-            crate::terminal::ipc::local_daemon_socket_path().map_err(ControlError::Connect)?;
-        let (peer, claim, proof) = match ControlClient::connect(&local)?
-            .request_strict(ClientRequest::SignDeviceChallenge {
-                authority: session,
-                device: device.to_owned(),
-                nonce,
-            })
-            .map_err(answered(
-                "This computer could not vouch for the session".to_owned(),
-            ))? {
+        let (peer, claim, proof) = match sign(ClientRequest::SignDeviceChallenge {
+            authority: session,
+            device: device.to_owned(),
+            nonce,
+        })
+        .map_err(answered(
+            "This computer could not vouch for the session".to_owned(),
+        ))? {
             ServerResponse::DeviceProof { peer, claim, proof } => (peer, claim, proof),
             response => return Err(unexpected_response("a device proof", &response)),
         };

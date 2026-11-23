@@ -5076,7 +5076,7 @@ fn a_linked_computers_session_owns_the_agents_it_starts_on_the_device() {
     // goes on to authenticate: what is the person's alone is refused, and so
     // is every authority but the capability the proof issued.
     use crate::terminal_ipc::{ClientRequest, ProtocolErrorCode, ServerResponse};
-    let _delivery = host.lock().unwrap().register_client(client);
+    let delivery = host.lock().unwrap().register_client(client);
     let dispatch = |request| crate::host::client::process_request(&host, client, request);
     for refused in [
         ClientRequest::DeviceTrust {
@@ -5133,9 +5133,47 @@ fn a_linked_computers_session_owns_the_agents_it_starts_on_the_device() {
         assert!(error.contains("does not own"), "{error}");
     }
 
+    // A person stops sessions here using the device. This computer no longer
+    // vouches for the session, so the open connection cannot prove itself
+    // again, and once its capability lapses the device refuses it everything
+    // and closes it.
+    device_trust::process_at(
+        &trust,
+        Request::SetAgentsAllowed {
+            device: "devx".into(),
+            allowed: false,
+        },
+    )
+    .unwrap();
+    let nonce = device_trust::challenge(&host, client).unwrap();
+    let error = device_trust::sign_at(&trust, &host, &local, "devx", &nonce).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    host.lock().unwrap().peers.lapse_now(client);
+    for refused in [
+        ClientRequest::Agent {
+            authority: remote.clone(),
+            operation: Operation::List,
+        },
+        ClientRequest::List,
+        ClientRequest::PeerChallenge,
+    ] {
+        let error = dispatch(refused).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::PermissionDenied, "{error:?}");
+    }
+    let error = requests(&remote).unwrap_err();
+    assert!(error.contains("capability has ended"), "{error}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !delivery.is_closed() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the device must close the lapsed connection"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
     host.lock().unwrap().peers.disconnect(client);
     let error = requests(&remote).unwrap_err();
-    assert!(error.contains("ended with its connection"), "{error}");
+    assert!(error.contains("capability has ended"), "{error}");
 }
 
 #[test]
@@ -5184,6 +5222,7 @@ fn a_linked_computers_session_reads_only_its_own_mail() {
     }
     let token = host.lock().unwrap().peers.issue(
         1,
+        uuid::Uuid::new_v4(),
         peer,
         crate::agent_execution::permission::Ceiling::unknown(),
     );

@@ -203,6 +203,16 @@ pub(in crate::host) fn admit(
     client_id: ClientId,
     request: &ClientRequest,
 ) -> Result<(), ProtocolError> {
+    // A linked computer's connection whose capability lapsed or was revoked
+    // is closing; until it has, it may do nothing, not even prove itself.
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .peers
+        .ended(client_id)
+    {
+        return Err(denied(super::super::device_trust::ended()));
+    }
     if carries_foreign_peer_capability(host, client_id, request) {
         return Err(denied(
             "A device capability acts only on the connection that proved it",
