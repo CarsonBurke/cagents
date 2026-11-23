@@ -2526,7 +2526,7 @@ mod tests {
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
         assert_eq!(app.durable.cards[1].id, opened);
 
-        drop(app.update(Message::FocusCard(ids[0])));
+        // The next row, still clicked in pane 1's inspector, replaces it.
         open(&mut app, "src/lib.rs");
         assert_eq!(app.workspace.focused(), Some(opened));
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);

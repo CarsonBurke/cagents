@@ -739,6 +739,64 @@ mod tests {
         );
     }
 
+    /// A link opens beside its terminal even when a clean file pane further
+    /// along could take it, and a file already open is shown where it is.
+    #[tokio::test]
+    async fn file_links_open_beside_their_source_not_in_a_further_file_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        std::fs::write(&first, "first file").unwrap();
+        std::fs::write(&second, "second file").unwrap();
+        let mut app = app();
+        let terminal = app.workspace.focused().unwrap();
+        let scope = PathBuf::from("/source-worktree");
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(terminal, scope.clone());
+        app.worktree_owners.insert(terminal, scope);
+        let link = |app: &mut Cagents, path: &Path| {
+            app.update(Message::OpenDocumentLink(
+                terminal,
+                Url::from_file_path(path).unwrap().into(),
+            ))
+        };
+        let task = link(&mut app, &first);
+        settle(&mut app, task).await;
+        let far = app.workspace.focused().unwrap();
+        // A copy of the terminal now sits between it and the file.
+        drop(app.update(Message::FocusCard(terminal)));
+        drop(app.clone_focused_pane());
+        let between = app.workspace.focused().unwrap();
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [terminal, between, far]
+        );
+
+        drop(app.update(Message::FocusCard(terminal)));
+        let task = link(&mut app, &second);
+        settle(&mut app, task).await;
+        let beside = app.workspace.focused().unwrap();
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [terminal, beside, between, far]
+        );
+        assert_eq!(
+            runtime(&app, far).editor_text().as_deref(),
+            Some("first file")
+        );
+
+        drop(app.update(Message::FocusCard(terminal)));
+        let task = link(&mut app, &first);
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(far));
+        assert_eq!(app.workspace.cards().len(), 4);
+        assert_eq!(
+            runtime(&app, beside).editor_text().as_deref(),
+            Some("second file")
+        );
+    }
+
     #[tokio::test]
     async fn dirty_file_links_preserve_buffers_and_channel_ownership() {
         let directory = tempfile::tempdir().unwrap();

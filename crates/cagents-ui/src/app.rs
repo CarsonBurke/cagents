@@ -7880,6 +7880,12 @@ impl Cagents {
         };
         let (area, path) = paths[index];
         let (key, path) = (source.key.clone(), path.clone());
+        // The panel marks the change, as a click on its row would.
+        self.sidebar_state.apply(&SidebarAction::OpenChange {
+            key: key.clone(),
+            path: path.clone(),
+            area,
+        });
         // The review shortcut moves this pane to the next file, so the pane
         // opens it, not whichever inspector draws source control.
         self.open_working_change(key, path, area, Some(card))
@@ -13541,12 +13547,13 @@ impl Cagents {
     /// shows `path` of this worktree in, or `None` for a new browser directly
     /// after `opener`.
     ///
-    /// A browser already showing `path` shows it again, wherever it is, so
-    /// one file never opens twice. Otherwise the row reuses `opener` itself
-    /// when it is a browser of this worktree, as a pane's own inspector or
-    /// review shortcut does, or the browser directly after it, which the
-    /// last row opened from `opener` created. A browser further along the
-    /// strip is never taken, so what opens appears beside what opened it.
+    /// `opener` itself takes the row when it is a browser of this worktree,
+    /// as a browser's own inspector or review shortcut moves it to another
+    /// file. Otherwise a browser already showing `path` shows it again,
+    /// wherever it is, so one file never opens twice; then the browser
+    /// directly after `opener`, which the last row opened from it created.
+    /// A browser further along the strip is never taken, so what opens
+    /// appears beside what opened it.
     ///
     /// A browser holding unsaved edits, a save, editor recovery or a
     /// durability warning refuses navigation, so routing a click to it would
@@ -13569,19 +13576,19 @@ impl Cagents {
             .repository_browsers(worktree)
             .filter(|card| navigable(*card))
             .collect::<Vec<_>>();
+        let opener = opener.filter(|card| self.workspace.card(*card).is_some());
+        if let Some(opener) = opener.filter(|card| browsers.contains(card)) {
+            return Some(opener);
+        }
         if let Some(card) = browsers.iter().copied().find(|card| shows_path(*card)) {
             return Some(card);
         }
-        let opener = opener.filter(|card| self.workspace.card(*card).is_some())?;
-        let next = self
-            .workspace
+        let opener = opener?;
+        self.workspace
             .order()
             .skip_while(|card| *card != opener)
-            .nth(1);
-        [Some(opener), next]
-            .into_iter()
-            .flatten()
-            .find(|card| browsers.contains(card))
+            .nth(1)
+            .filter(|card| browsers.contains(card))
     }
 
     /// The pane a source control or files row was opened from: the pane
@@ -19406,8 +19413,12 @@ impl Cagents {
                 let url = self.ended_terminal(card)
                     .and_then(|session| session.transcript_path.as_ref())
                     .and_then(|path| Url::from_file_path(path).ok());
+                // The transcript opens in an editor beside its terminal.
+                let source = Some(card)
+                    .filter(|card| self.workspace.card(*card).is_some())
+                    .or_else(|| self.placement_anchor());
                 match url {
-                    Some(url) => self.open_link_in(url, LinkOpenDestination::SystemDefault),
+                    Some(url) => self.open_document_link(source, url.as_str()),
                     None => Task::none(),
                 }
             }
