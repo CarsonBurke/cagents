@@ -1114,7 +1114,7 @@ fn session_listings_report_compact_rows_and_selected_fields() {
         serde_json::from_str(&output(Listing::Sessions, true, true)).unwrap();
     assert_eq!(value["command"], "sessions");
     // The checkout is the directory, the project its name, and nothing
-    // unknown or default is spelled out. No pane shows the session, which
+    // unknown or default is spelled out. No pane shows the session;
     // `channel move` would give it one.
     assert_eq!(
         value["data"],
