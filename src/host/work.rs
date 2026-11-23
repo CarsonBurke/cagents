@@ -224,7 +224,7 @@ struct Tracked {
 }
 
 impl Tracked {
-    fn new(name: String) -> Self {
+    fn new(name: String, listings: forge::Listings) -> Self {
         Self {
             id: ProjectId::new(),
             name,
@@ -249,7 +249,7 @@ impl Tracked {
             last_fresh_poll: None,
             next_poll: Instant::now(),
             failures: 0,
-            memory: forge::Memory::default(),
+            memory: forge::Memory::with_listings(listings),
             read_at: None,
         }
     }
@@ -366,6 +366,8 @@ fn full_change() -> git_watch::Change {
 
 struct Shared {
     projects: BTreeMap<PathBuf, Tracked>,
+    /// GitHub facts shared by every local project that names the same remote.
+    listings: forge::Listings,
     pins: BTreeMap<(PathBuf, String), Column>,
     session_activity: HashMap<PathBuf, u64>,
     /// Resolved Linear tickets by reference: a linked issue's id or a branch
@@ -573,7 +575,7 @@ impl Shared {
             .projects
             .entry(repository.to_owned())
             .or_insert_with(|| {
-                let mut tracked = Tracked::new(name.to_owned());
+                let mut tracked = Tracked::new(name.to_owned(), self.listings.clone());
                 if let Some((at, snapshot)) = restored.remove(repository) {
                     tracked.restore_snapshot(at, snapshot);
                 }
@@ -678,6 +680,7 @@ impl Service {
             .ok();
         let mut shared = Shared {
             projects: BTreeMap::new(),
+            listings: forge::Listings::default(),
             pins: BTreeMap::new(),
             session_activity: HashMap::new(),
             tickets: BTreeMap::new(),
@@ -775,6 +778,7 @@ impl Handle {
             host,
             shared: Mutex::new(Shared {
                 projects: BTreeMap::new(),
+                listings: forge::Listings::default(),
                 pins: BTreeMap::new(),
                 session_activity: HashMap::new(),
                 tickets: BTreeMap::new(),
@@ -2469,7 +2473,7 @@ mod tests {
 
     #[test]
     fn pins_outlive_their_card_only_until_git_and_the_forge_disagree() {
-        let mut tracked = Tracked::new("repo".into());
+        let mut tracked = Tracked::new("repo".into(), forge::Listings::default());
         assert!(tracked.live_pin("branch:gone"), "nothing is known yet");
         let mut local = scan::Local::default();
         local.worktrees.push(scan::Worktree {

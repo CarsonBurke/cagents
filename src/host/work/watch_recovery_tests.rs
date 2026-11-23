@@ -59,6 +59,7 @@ fn fixture_handle() -> Handle {
         host: Weak::new(),
         shared: Mutex::new(Shared {
             projects: BTreeMap::new(),
+            listings: forge::Listings::default(),
             pins: BTreeMap::new(),
             session_activity: HashMap::new(),
             tickets: BTreeMap::new(),
