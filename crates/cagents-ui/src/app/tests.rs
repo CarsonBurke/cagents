@@ -12498,11 +12498,22 @@ fn scrolling_a_pane_reads_it_where_resting_the_pointer_does_not() {
     assert!(!app.sidebar_state.has_card_update(ids[1]));
 
     // A pane scrolled without the focus is read where it stands.
-    app.settings.focus_follows_mouse = false;
     viewport(&mut app, WorkspaceViewportEvent::PointerScrolled(ids[2]));
     assert_eq!(app.workspace.focused(), Some(ids[1]));
     assert!(!app.sidebar_state.has_card_update(ids[2]));
     assert!(app.sidebar_state.has_card_update(ids[3]));
+    // Only panes whose scrolling reads or chooses something hear the wheel.
+    assert!(app.reads_on_scroll(ids[3]));
+    assert!(!app.reads_on_scroll(ids[1]) && !app.reads_on_scroll(ids[2]));
+
+    // A pane the pointer rests on with nothing new is chosen by scrolling,
+    // so its later news is read as it comes.
+    app.settings.focus_follows_mouse = true;
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[0]));
+    assert!(app.reads_on_scroll(ids[0]));
+    viewport(&mut app, WorkspaceViewportEvent::PointerScrolled(ids[0]));
+    app.observe_agent_update_for_card(ids[0]);
+    assert!(!app.sidebar_state.has_card_update(ids[0]));
 }
 
 /// Moving focus alone is saved once per burst rather than once per move,

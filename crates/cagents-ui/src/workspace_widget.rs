@@ -1567,9 +1567,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
                 other.clone()
             });
         }
-        // Observed before the content scrolls and captures the wheel.
+        // Observed before the content scrolls and captures the wheel. A
+        // touchpad lifting reports a wheel that moved nothing, which is no
+        // scrolling.
         if !shell.is_event_captured()
-            && let Event::Mouse(mouse::Event::WheelScrolled { .. }) = event
+            && let Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x, y } | mouse::ScrollDelta::Pixels { x, y },
+            }) = event
+            && (*x != 0.0 || *y != 0.0)
             && cursor.is_over(clipped)
             && let Some(message) = &self.on_pointer_scroll
         {

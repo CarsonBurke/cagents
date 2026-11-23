@@ -550,6 +550,13 @@ fn the_wheel_over_a_pane_reports_reading_it_and_elsewhere_nothing() {
     assert_eq!(mem::take(&mut probe.messages), ["scroll"]);
     probe.send(wheel.clone(), mouse::Cursor::Available(EntryProbe::OUTSIDE));
     probe.send(wheel, mouse::Cursor::Available(EntryProbe::NEIGHBOUR));
+    // A touchpad lifting reports a wheel that moved nothing.
+    probe.send(
+        Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 },
+        }),
+        mouse::Cursor::Available(EntryProbe::INSIDE),
+    );
     assert!(probe.messages.is_empty());
 }
 

@@ -5140,6 +5140,56 @@ fn workspace_switcher_preview_cleanup_preserves_visible_chats_with_pane_inspecto
     }
 }
 
+/// Scrolling a subagent's transcript reads nothing of the parent's news, as
+/// a press does not; scrolling the parent's own transcript reads it.
+#[test]
+fn scrolling_a_subagent_transcript_leaves_the_parents_news_unread() {
+    use crate::app::{Message, refresh_ui};
+    use crate::workspace_widget::WorkspaceViewportEvent;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let window = cosmic::iced::window::Id::RESERVED;
+    app.core.set_main_window_id(Some(window));
+    drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+        window, true,
+    ))));
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    Arc::make_mut(&mut runtime.snapshot)
+        .subagents
+        .push(chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child".into(),
+            status: chat::ToolStatus::Succeeded,
+            background: false,
+            items: Vec::new(),
+        });
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+    app.observe_agent_update_for_card(card);
+    assert!(app.sidebar_state.has_card_update(card));
+    let scroll = |app: &mut Cagents| {
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerScrolled(card),
+        }));
+    };
+    assert!(
+        !app.reads_on_scroll(card),
+        "the wheel there reports nothing"
+    );
+    scroll(&mut app);
+    assert!(app.sidebar_state.has_card_update(card));
+
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+    assert!(app.reads_on_scroll(card));
+    scroll(&mut app);
+    assert!(!app.sidebar_state.has_card_update(card));
+}
+
 pub(super) fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
     draft_chat_in(app, provider, Path::new(FIXTURE_DIRECTORY))
 }

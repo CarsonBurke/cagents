@@ -6349,14 +6349,24 @@ impl Cagents {
         Task::batch([focus, read])
     }
 
+    /// Whether the wheel over `id` reads or chooses anything, so only those
+    /// panes report it.
+    fn reads_on_scroll(&self, id: CardId) -> bool {
+        (self.sidebar_state.has_card_update(id) && self.shows_own_transcript(id))
+            || self.hover_focused(id)
+    }
+
     /// Scrolling a pane's content is reading it: its news is read, and the
     /// pane the pointer had only rested on becomes the one chosen. A pane
-    /// scrolled without holding the focus is read where it stands.
+    /// scrolled without holding the focus is read where it stands, even in
+    /// a window without keyboard focus, since the wheel goes to the window
+    /// under the pointer. As for a press, scrolling a subagent's transcript
+    /// leaves the parent's news unread.
     fn read_scrolled_pane(&mut self, id: CardId) -> Task<Message> {
         if self.workspace.focused() == Some(id) {
             self.hover_focus = None;
         }
-        if self.sidebar_state.has_card_update(id) {
+        if self.sidebar_state.has_card_update(id) && self.shows_own_transcript(id) {
             self.mark_cards_read(vec![id])
         } else {
             Task::none()
@@ -9177,7 +9187,13 @@ impl Cagents {
             && self.workspace.focused() == Some(card)
             && !self.hover_focused(card)
             && !self.modal_is_open()
-            && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
+            && self.shows_own_transcript(card)
+    }
+
+    /// Whether `card` shows its own news: not a chat pane showing one of its
+    /// subagents' transcripts, which says nothing about the parent's.
+    fn shows_own_transcript(&self, card: CardId) -> bool {
+        !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
@@ -17714,11 +17730,7 @@ impl Application for Cagents {
                         let generation = self.workspace_view_generation;
                         move |event| Message::Viewport { generation, event }
                     },
-                    // Scrolling reads a pane that has news, and chooses the
-                    // pane the pointer only rested on.
-                    reads_on_scroll: |id| {
-                        self.sidebar_state.has_card_update(id) || self.hover_focused(id)
-                    },
+                    reads_on_scroll: |id| self.reads_on_scroll(id),
                 },
             )
         };
