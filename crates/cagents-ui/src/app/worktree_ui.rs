@@ -158,6 +158,15 @@ impl KnownWorktreeRoots {
         self.roots.contains(root)
     }
 
+    /// Whether `root` is known to be the directory whose canonical form is
+    /// `form`, as resolved by the last [`Cagents::refresh_worktree_owners`].
+    pub(super) fn is_alias(&self, form: &Path, root: &Path) -> bool {
+        self.canonical
+            .roots
+            .get(form)
+            .is_some_and(|aliases| aliases.iter().any(|alias| alias == root))
+    }
+
     pub(super) fn iter(&self) -> std::collections::hash_set::Iter<'_, PathBuf> {
         self.roots.iter()
     }
@@ -518,11 +527,21 @@ pub(super) fn project_main_checkout(project: &SidebarProject) -> PathBuf {
 /// Whether `path` is still one of `project`'s worktrees. A channel's checkout
 /// can be removed outside this window, and a channel never works in a
 /// directory that no longer exists.
-pub(super) fn project_has_worktree(project: &SidebarProject, path: &Path) -> bool {
+///
+/// The registry records a checkout in its canonical form, which need not be
+/// the spelling `git worktree list` gave the row, so a known alias of the row
+/// matches too. The answer is the row's own spelling, the one panes and
+/// strips are filed under.
+pub(super) fn listed_worktree<'a>(
+    project: &'a SidebarProject,
+    known: &KnownWorktreeRoots,
+    checkout: &Path,
+) -> Option<&'a Path> {
     project
         .worktrees
         .iter()
-        .any(|worktree| worktree.path == path)
+        .map(|worktree| worktree.path.as_path())
+        .find(|path| *path == checkout || known.is_alias(checkout, path))
 }
 
 pub(super) fn belongs_to_scope(
@@ -784,10 +803,9 @@ impl Cagents {
         Some(
             channel
                 .checkout
-                .as_ref()
-                .filter(|checkout| project_has_worktree(project, checkout))
-                .cloned()
-                .unwrap_or_else(|| project_main_checkout(project)),
+                .as_deref()
+                .and_then(|checkout| listed_worktree(project, &self.known_worktree_roots, checkout))
+                .map_or_else(|| project_main_checkout(project), Path::to_path_buf),
         )
     }
 

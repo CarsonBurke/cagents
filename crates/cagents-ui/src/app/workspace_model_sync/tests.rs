@@ -6075,6 +6075,41 @@ fn a_window_joining_with_an_unshared_channel_keeps_and_publishes_it() {
     );
 }
 
+/// A channel this window made in a worktree that was removed before the
+/// registry heard of it is introduced in the main checkout, where its panes
+/// already start: the registry would refuse the missing worktree every time.
+#[test]
+fn an_unshared_channel_whose_worktree_is_gone_is_published_in_the_main_checkout() {
+    let (mut app, project, _) = app_with_project();
+    let kept = tempfile::tempdir().unwrap();
+    let removed = kept.path().join("removed-worktree");
+    let gone = ChannelId::new();
+    let present = ChannelId::new();
+    let mut channel = local(gone, project, "gone", 0);
+    channel.checkout = Some(removed);
+    let mut other = local(present, project, "present", 1);
+    other.checkout = Some(kept.path().to_path_buf());
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .extend([channel, other]);
+    let published = intercept_publishes(&mut app);
+
+    let _ = app.apply_workspace_model_update(ModelUpdate::Connected(registry(Vec::new())));
+
+    let created = drain(&published)
+        .into_iter()
+        .filter_map(|edit| match edit {
+            ModelEdit::CreateChannel { id, checkout, .. } => Some((id, checkout)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(created.get(&gone), Some(&None));
+    assert_eq!(
+        created.get(&present),
+        Some(&Some(kept.path().to_path_buf()))
+    );
+}
+
 /// Once this window has recorded that the registry holds a channel, the
 /// registry's silence about it does mean something: it was deleted somewhere
 /// else, and this window honours that through its own deletion path.

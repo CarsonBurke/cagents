@@ -112,24 +112,42 @@ impl Cagents {
 
     /// The project listing the checkout at `root`, and which of its checkouts
     /// that is: `None` for the main checkout or a folder, otherwise the
-    /// linked worktree's path. A project whose worktrees have not loaded yet
-    /// still knows its main checkout, so opening it before then does not
-    /// leave a pane in its strip that would keep it out of channels.
+    /// linked worktree's canonical path. A project whose worktrees have not
+    /// loaded yet still knows its main checkout, so opening it before then
+    /// does not leave a pane in its strip that would keep it out of channels.
+    ///
+    /// The checkout is resolved as the daemon resolves a channel's, so the
+    /// answer is the form the registry records and every window compares: a
+    /// submodule's main checkout, which the rows cannot tell from a linked
+    /// worktree, is still the main checkout, and a worktree reached through a
+    /// symlink is still the one worktree. Opening a checkout is a user's
+    /// action, so the few small reads this takes stay out of the view.
     fn checkout_at(&self, root: &Path) -> Option<(ProjectId, Option<PathBuf>)> {
         use super::super::worktree_ui::project_main_checkout;
-        if let Some(key) = self.sidebar_model.worktree_at(root) {
-            let project = self.sidebar_model.project(key.project_id)?;
-            let main = project_main_checkout(project);
-            return Some((
-                key.project_id,
-                (key.canonical_path != main).then_some(key.canonical_path),
-            ));
+        let (project, main) = match self.sidebar_model.worktree_at(root) {
+            Some(key) => {
+                let project = self.sidebar_model.project(key.project_id)?;
+                (project, project_main_checkout(project))
+            }
+            None => self.sidebar_model.projects.iter().find_map(|project| {
+                let main = project_main_checkout(project);
+                (main == root).then_some((project, main))
+            })?,
+        };
+        if project.kind == ProjectKind::Folder || main == root {
+            return Some((project.id, None));
         }
-        self.sidebar_model
-            .projects
-            .iter()
-            .find(|project| project_main_checkout(project) == root)
-            .map(|project| (project.id, None))
+        // A checkout the daemon would refuse, such as one removed since the
+        // rows were listed, is offered as listed and refused there.
+        let repository = if crate::device::is_remote() {
+            project.repository.clone()
+        } else {
+            std::fs::canonicalize(&project.repository)
+                .unwrap_or_else(|_| project.repository.clone())
+        };
+        let checkout = crate::workspace_model::canonical_checkout(&repository, root)
+            .unwrap_or_else(|_| Some(root.to_path_buf()));
+        Some((project.id, checkout))
     }
 
     /// A new channel's name for the checkout at `root`: its branch, or the
@@ -393,6 +411,86 @@ mod tests {
         assert_eq!(channel.checkout, None);
         assert_eq!(app.durable.active_channel, Some(channel.id));
         assert_eq!(app.active_workspace.as_deref(), Some(main.path()));
+    }
+
+    #[test]
+    fn a_worktree_listed_through_a_symlink_opens_the_channel_the_registry_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(directory.path()).unwrap();
+        let repo = real.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |arguments: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Cagents")
+                .env("GIT_AUTHOR_EMAIL", "cagents@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Cagents")
+                .env("GIT_COMMITTER_EMAIL", "cagents@example.invalid")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {arguments:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "start"]);
+        git(&["worktree", "add", "--quiet", "-b", "feature", "../feature"]);
+        // The rows name both checkouts through a symlinked parent, while the
+        // registry recorded the worktree's canonical path.
+        let alias = real.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            alias.join("repo"),
+            Some("main".into()),
+        );
+        let feature = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            alias.join("feature"),
+            Some("feature".into()),
+        );
+        let (mut app, _state, project) = super::super::super::project_ui::tests::deletable_app(
+            &alias.join("repo/.git"),
+            &feature,
+            &primary,
+        );
+        let recorded = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: crate::model::ChannelTitleSource::Manual,
+                id: recorded,
+                project_id: project,
+                title: "feature".into(),
+                ordinal: 1,
+                shared: true,
+                cards: Vec::new(),
+                focused: None,
+                checkout: Some(real.join("feature")),
+            });
+        app.refresh_sidebar_channels();
+
+        drop(app.update(Message::Sidebar(SidebarAction::OpenWorktree {
+            project_id: project,
+            worktree_id: feature.id,
+            path: feature.path.clone(),
+        })));
+
+        assert_eq!(
+            app.durable.channels.len(),
+            1,
+            "no second channel for one worktree"
+        );
+        assert_eq!(app.durable.active_channel, Some(recorded));
+        assert_eq!(
+            app.terminal_directory(),
+            Some(feature.path.clone()),
+            "its panes start where the row says the worktree is"
+        );
     }
 
     #[test]

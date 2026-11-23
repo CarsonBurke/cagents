@@ -13079,6 +13079,7 @@ fn active_shared_channel(app: &mut Cagents) -> crate::model::ChannelId {
         shared: true,
         cards: vec![],
         focused: None,
+        checkout: None,
     });
     durable.active_channel = Some(channel);
     // The chat starts before the registry comes online in
@@ -13116,6 +13117,7 @@ fn show_in_channel_view(
         title: "shared".into(),
         title_source: Default::default(),
         ordinal: 1,
+        checkout: None,
     }];
     app.workspace_model.views = vec![view.clone()];
     app.shared_views.registry_unavailable = false;

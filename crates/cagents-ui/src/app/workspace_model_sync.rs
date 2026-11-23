@@ -3341,7 +3341,13 @@ impl Cagents {
         };
         let title = channel.title.clone();
         let title_source = channel.title_source;
-        let checkout = channel.checkout.clone();
+        // A worktree removed while the channel was unshared would have the
+        // registry refuse the channel every time it is offered, so it is
+        // offered in the main checkout, where its panes already start.
+        let checkout = channel
+            .checkout
+            .clone()
+            .filter(|checkout| crate::device::is_remote() || checkout.exists());
         let project_id = channel.project_id;
         let Some(project) = self.sidebar_model.project(project_id) else {
             return;

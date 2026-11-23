@@ -1353,7 +1353,14 @@ impl Cagents {
         let checkout = emptied.checkout.clone().filter(|checkout| {
             self.sidebar_model
                 .project(emptied.project_id)
-                .is_some_and(|project| super::worktree_ui::project_has_worktree(project, checkout))
+                .and_then(|project| {
+                    super::worktree_ui::listed_worktree(
+                        project,
+                        &self.known_worktree_roots,
+                        checkout,
+                    )
+                })
+                .is_some()
         });
         let revived = self.create_channel(
             emptied.project_id,
