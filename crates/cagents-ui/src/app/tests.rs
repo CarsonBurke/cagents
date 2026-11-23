@@ -8294,9 +8294,7 @@ mod repository_clone_navigation {
     /// Four panes, none of them a repository browser, with the first focused
     /// and Source control bound to the fixture worktree showing other.txt
     /// modified.
-    async fn four_panes_first_focused(
-        fixture: &Fixture,
-    ) -> (Cagents, Vec<CardId>, ActiveWorktreeKey) {
+    fn four_panes_first_focused(fixture: &Fixture) -> (Cagents, Vec<CardId>, ActiveWorktreeKey) {
         let mut app = context_inspector_test_app(false);
         let cards: Vec<CardState> = (0..4).map(|_| terminal_card_state()).collect();
         let ids: Vec<CardId> = cards.iter().map(|card| card.id).collect();
@@ -8359,7 +8357,7 @@ mod repository_clone_navigation {
     #[tokio::test]
     async fn source_control_opens_a_new_pane_beside_the_pane_it_came_from() {
         let fixture = Fixture::new().await;
-        let (mut app, ids, key) = four_panes_first_focused(&fixture).await;
+        let (mut app, ids, key) = four_panes_first_focused(&fixture);
 
         let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
         let opened = app.workspace.focused().unwrap();
@@ -8380,12 +8378,12 @@ mod repository_clone_navigation {
         assert_eq!(app.workspace.cards().len(), 5);
     }
 
-    /// A Files row takes the same placement, and so does a pull request pane
-    /// opened while a later pane is focused.
+    /// A Files row opened while a later pane is focused goes after that pane,
+    /// and a pull request pane takes the same placement.
     #[tokio::test]
     async fn files_rows_and_pull_requests_open_beside_the_focused_pane() {
         let fixture = Fixture::new().await;
-        let (mut app, ids, key) = four_panes_first_focused(&fixture).await;
+        let (mut app, ids, key) = four_panes_first_focused(&fixture);
         drop(app.update(Message::FocusCard(ids[2])));
 
         let task = open_file(&mut app, &key, "current.txt");
