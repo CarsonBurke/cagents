@@ -356,6 +356,7 @@ impl Cagents {
     }
 
     pub(super) fn sync_refresh_reconciliation_deadline(&mut self) {
+        self.sync_git_shown();
         let now = Instant::now();
         self.refresh_ui.schedule.observe(
             self.sidebar_model.projects.iter().map(|project| project.id),
@@ -752,7 +753,10 @@ mod tests {
 
         // A scale-factor event causes a normal app update without changing
         // the visible repository consumer or its stored refresh deadline.
-        drop(app.update(Message::WindowScaleFactorChanged(app.window_scale_factor)));
+        drop(app.update(Message::WindowScaleFactorChanged(
+            cosmic::iced::window::Id::unique(),
+            app.window_scale_factor,
+        )));
         assert_eq!(recipe_identities(app.refresh_subscription()), before);
     }
 

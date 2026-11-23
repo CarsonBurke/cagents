@@ -92,6 +92,17 @@ struct Entry {
 }
 
 impl Entry {
+    /// The watcher cannot see this project's Git metadata, or its last read
+    /// failed: its worktree list and its checkouts are read on a timer.
+    fn blind(&self) -> bool {
+        self.fallback.is_some() || self.read_failure.is_some()
+    }
+
+    /// Some of this project's checkouts depend on periodic reads.
+    fn degraded(&self) -> bool {
+        self.blind() || !self.unwatched.is_empty()
+    }
+
     fn new(snapshot: Snapshot, generation: u64, fallback: Option<String>) -> Self {
         let now = Instant::now();
         let read_at = snapshot
@@ -178,17 +189,24 @@ pub(super) struct State {
     /// [`Interest::Active`]: git_watch::Interest::Active
     /// [`Interest::Shown`]: git_watch::Interest::Shown
     work: BTreeMap<(ProjectId, WorktreeId), git_watch::Interest>,
-    /// The checkout rows in view at the last periodic check.
+    /// The checkout rows in view, as of the last update, while some project
+    /// relies on reads rather than the watcher; empty otherwise, so that a
+    /// project which loses its watch reads its stale rows in view once.
+    /// A row held in `newly_shown` is left out until it has been read.
     shown: HashSet<(ProjectId, WorktreeId)>,
+    /// Rows come into view whose status is [`SHOWN_STALE`], for the next
+    /// periodic check to read.
+    newly_shown: HashSet<(ProjectId, WorktreeId)>,
 }
 
 impl State {
-    /// The next watcher-recovery or incomplete-watch scan. A healthy watch
-    /// supplies its own event, so it contributes no deadline.
+    /// When the next periodic check has a watcher to restart or something
+    /// [`State::due`] reads. A healthy watch supplies its own events, so a
+    /// project whose files and metadata it covers contributes no deadline.
     pub(super) fn fallback_refresh_deadline(&self, now: Instant) -> Option<Instant> {
         let watcher = (self.watch.is_none() && !self.entries.is_empty())
             .then(|| self.watch_retry_at.unwrap_or(now));
-        let scan = self
+        let reads = self
             .entries
             .iter()
             // A past deadline must always name work that can actually start.
@@ -196,17 +214,86 @@ impl State {
             // it occupied the earliest deadline it would keep a stable past
             // subscription id and hide every other refresh source.
             .filter(|(project, entry)| {
-                (entry.fallback.is_some() || entry.read_failure.is_some())
-                    && entry.cancellation.is_none()
-                    && !self.queue.contains(project)
+                entry.cancellation.is_none() && !self.queue.contains(project)
             })
-            .map(|(_, entry)| entry.last_full_scan + FALLBACK_INTERVAL)
-            .min();
-        match (watcher, scan) {
-            (Some(watcher), Some(scan)) => Some(watcher.min(scan)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
+            .flat_map(|(&project, entry)| {
+                let topology = entry
+                    .blind()
+                    .then(|| entry.last_full_scan + FALLBACK_INTERVAL);
+                let worktrees = self
+                    .read_intervals(project, entry, |key| self.newly_shown.contains(key))
+                    .map(move |(worktree, interval)| {
+                        entry
+                            .read_at
+                            .get(&worktree)
+                            .map_or(now, |read| *read + interval)
+                    });
+                topology.into_iter().chain(worktrees)
+            });
+        watcher.into_iter().chain(reads).min()
+    }
+
+    /// The checkouts of `project` a periodic check reads, each with how old
+    /// its status may get first. See [`State::due`].
+    fn read_intervals<'a>(
+        &'a self,
+        project: ProjectId,
+        entry: &'a Entry,
+        newly_shown: impl Fn(&(ProjectId, WorktreeId)) -> bool + 'a,
+    ) -> impl Iterator<Item = (WorktreeId, Duration)> + 'a {
+        let blind = entry.blind();
+        entry
+            .degraded()
+            .then_some(&entry.snapshot.worktrees)
+            .into_iter()
+            .flatten()
+            .filter(move |(record, _)| {
+                !record.bare && (blind || entry.unwatched.contains(&record.id))
+            })
+            .filter_map(move |(record, _)| {
+                let key = (project, record.id);
+                let interval = if self.work.get(&key) == Some(&git_watch::Interest::Active) {
+                    FALLBACK_INTERVAL
+                } else if self.work.contains_key(&key) || newly_shown(&key) {
+                    SHOWN_STALE
+                } else {
+                    return None;
+                };
+                Some((record.id, interval))
+            })
+    }
+
+    /// Records the rows in view. One come into view whose unwatched status
+    /// is [`SHOWN_STALE`] waits in `newly_shown`, for a periodic check that
+    /// [`State::fallback_refresh_deadline`] makes immediate; the rest count
+    /// as seen at once.
+    fn note_shown(&mut self, mut shown: HashSet<(ProjectId, WorktreeId)>, now: Instant) {
+        let came_into_view = shown
+            .iter()
+            .filter(|key| !self.shown.contains(key))
+            .copied()
+            .collect::<HashSet<_>>();
+        let came_into_view = &came_into_view;
+        let stale =
+            self.entries
+                .iter()
+                .flat_map(|(&project, entry)| {
+                    self.read_intervals(project, entry, |key| came_into_view.contains(key))
+                        .filter(move |&(worktree, interval)| {
+                            came_into_view.contains(&(project, worktree))
+                                && interval == SHOWN_STALE
+                                && entry.read_at.get(&worktree).is_none_or(|read| {
+                                    now.saturating_duration_since(*read) >= interval
+                                })
+                        })
+                        .map(move |(worktree, _)| (project, worktree))
+                })
+                .collect::<HashSet<_>>();
+        for key in &stale {
+            shown.remove(key);
         }
+        self.shown = shown;
+        self.newly_shown = stale;
     }
 
     pub(super) fn remember_archived(
@@ -374,32 +461,22 @@ impl State {
     ) -> Vec<(ProjectId, git_watch::Change)> {
         let mut due = Vec::new();
         for (&project, entry) in &self.entries {
-            let blind = entry.fallback.is_some() || entry.read_failure.is_some();
             let mut change = git_watch::Change::default();
-            if blind && now.saturating_duration_since(entry.last_full_scan) >= FALLBACK_INTERVAL {
+            if entry.blind()
+                && now.saturating_duration_since(entry.last_full_scan) >= FALLBACK_INTERVAL
+            {
                 change.topology = true;
                 change.membership = true;
             }
-            for (record, _) in &entry.snapshot.worktrees {
-                if record.bare || !(blind || entry.unwatched.contains(&record.id)) {
-                    continue;
-                }
-                let key = (project, record.id);
-                let interval = if self.work.get(&key) == Some(&git_watch::Interest::Active) {
-                    FALLBACK_INTERVAL
-                } else if self.work.contains_key(&key)
-                    || (shown.contains(&key) && !self.shown.contains(&key))
-                {
-                    SHOWN_STALE
-                } else {
-                    continue;
-                };
+            let newly_shown =
+                |key: &(ProjectId, WorktreeId)| shown.contains(key) && !self.shown.contains(key);
+            for (worktree, interval) in self.read_intervals(project, entry, newly_shown) {
                 if entry
                     .read_at
-                    .get(&record.id)
+                    .get(&worktree)
                     .is_none_or(|read| now.saturating_duration_since(*read) >= interval)
                 {
-                    change.worktrees.insert(record.id);
+                    change.worktrees.insert(worktree);
                 }
             }
             if change.topology || !change.worktrees.is_empty() {
@@ -650,7 +727,21 @@ impl Cagents {
             self.refresh_ui.git.changed(project, change);
         }
         self.refresh_ui.git.shown = shown;
+        self.refresh_ui.git.newly_shown.clear();
         self.start_git_reads()
+    }
+
+    /// Notes the checkout rows that came into view in this update; see
+    /// [`State::note_shown`]. While every project is fully watched no row
+    /// needs a read for coming into view, and none are collected.
+    pub(super) fn sync_git_shown(&mut self) {
+        if !self.refresh_ui.git.entries.values().any(Entry::degraded) {
+            self.refresh_ui.git.shown.clear();
+            self.refresh_ui.git.newly_shown.clear();
+            return;
+        }
+        let shown = self.shown_worktrees();
+        self.refresh_ui.git.note_shown(shown, Instant::now());
     }
 
     pub(super) fn update_git(&mut self, action: Action) -> Task<Message> {
@@ -2172,17 +2263,10 @@ mod tests {
         state.entries.insert(
             ProjectId::new(),
             Entry {
-                snapshot,
-                generation: 1,
-                plan: None,
-                remote_started: false,
                 cancellation: None,
                 read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: Some("watch setup failed".into()),
                 last_full_scan: now,
+                ..Entry::new(snapshot, 1, Some("watch setup failed".into()))
             },
         );
 
@@ -2203,17 +2287,10 @@ mod tests {
         state.entries.insert(
             project,
             Entry {
-                snapshot,
-                generation: 1,
-                plan: None,
-                remote_started: false,
                 cancellation: Some(CancellationToken::new()),
                 read_failure: Some("dead mount".into()),
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: None,
                 last_full_scan: now.checked_sub(FALLBACK_INTERVAL).unwrap(),
+                ..Entry::new(snapshot, 1, None)
             },
         );
 
@@ -2250,17 +2327,10 @@ mod tests {
         app.refresh_ui.git.entries.insert(
             project,
             Entry {
-                snapshot,
-                generation: 1,
-                plan: None,
-                remote_started: false,
                 cancellation: None,
                 read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: Some("watch setup failed".into()),
                 last_full_scan: Instant::now(),
+                ..Entry::new(snapshot, 1, Some("watch setup failed".into()))
             },
         );
 
@@ -2373,6 +2443,38 @@ mod tests {
         let entry = &state.entries[&project];
         assert!(entry.fallback.is_none(), "the metadata is still watched");
         let shown = HashSet::from([(project, own), (project, looked_at)]);
+
+        // The refresh deadline names the first of those reads, and nothing
+        // while only the watcher's retry is left. A queued read has its own
+        // completion to wake on.
+        let retry = start + 2 * SHOWN_STALE;
+        state.watch_retry_at = Some(retry);
+        // Re-planning the watches queued a read; it has finished.
+        state.queue.clear();
+        let deadline = |state: &State| state.fallback_refresh_deadline(start);
+        assert_eq!(deadline(&state), Some(start + FALLBACK_INTERVAL));
+        let work = state.work.clone();
+        state.work.remove(&(project, worked));
+        assert_eq!(deadline(&state), Some(start + SHOWN_STALE));
+        state.work.clear();
+        assert_eq!(deadline(&state), Some(retry), "rows already seen wait");
+        state.note_shown(shown.clone(), start + SHOWN_STALE);
+        assert_eq!(
+            state.newly_shown,
+            HashSet::from([(project, looked_at)]),
+            "only the unwatched row come into view with an old status waits"
+        );
+        assert_eq!(deadline(&state), Some(start + SHOWN_STALE));
+        state.queue.push_back(project);
+        assert_eq!(deadline(&state), Some(retry));
+        state.queue.clear();
+        state.note_shown(shown.clone(), start);
+        assert!(
+            state.newly_shown.is_empty() && state.shown == shown,
+            "a row whose status is recent counts as seen at once"
+        );
+        state.shown.clear();
+        state.work = work;
         let reads = |state: &State, after: Duration| {
             state
                 .due(&shown, start + after)
