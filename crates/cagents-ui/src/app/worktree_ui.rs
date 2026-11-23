@@ -3704,6 +3704,7 @@ mod tests {
                 crate::repository::ValidatedBranchName::parse("main").unwrap(),
             ),
             track: false,
+            replaces_missing: false,
             operation_id: crate::model::OperationId::new(),
         };
         let (progress, _progress) = async_channel::bounded(8);

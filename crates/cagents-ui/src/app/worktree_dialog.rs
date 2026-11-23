@@ -824,6 +824,7 @@ mod tests {
             }
             let request = CreateWorktreeRequest {
                 resolution_warnings: Vec::new(),
+                replaces_missing: false,
                 repository: "/repo".into(),
                 managed_root: "/worktrees".into(),
                 managed_ignore_root: None,
@@ -1141,6 +1142,7 @@ mod tests {
     fn request(id: OperationId) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
             resolution_warnings: Vec::new(),
+            replaces_missing: false,
             setup_intent: None,
             repository: "/repo".into(),
             managed_root: "/".into(),
