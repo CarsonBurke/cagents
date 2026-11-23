@@ -7349,7 +7349,7 @@ impl Cagents {
             existence: Existence::Open,
             kind: CardKind::Terminal(session.clone()),
         };
-        let (index, durable_index) = slot.unwrap_or_else(|| self.terminal_insertion_indices());
+        let (index, durable_index) = slot.unwrap_or_else(|| self.pane_insertion_indices());
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(card_id);
@@ -7512,7 +7512,7 @@ impl Cagents {
         if let Some(title) = &user_title {
             card.title = title.clone();
         }
-        let (index, durable_index) = self.terminal_insertion_indices();
+        let (index, durable_index) = self.pane_insertion_indices();
         let id = card.id;
         let update = match self.workspace.add_card(
             WorkspaceCard::new(
@@ -7932,8 +7932,9 @@ impl Cagents {
             existence: Existence::Open,
             kind: CardKind::PullRequests(view.clone()),
         };
+        let (index, durable_index) = self.pane_insertion_indices();
         let durable = Arc::make_mut(&mut self.durable);
-        durable.cards.push(card);
+        durable.cards.insert(durable_index, card);
         durable.focused = Some(card_id);
         // A review is work in the workspace where the user opened it. Unlike
         // a global browser, it must not reappear when another worktree's
@@ -7948,7 +7949,6 @@ impl Cagents {
         let pane = self.pull_request_pane(&view);
         self.cards
             .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
-        let index = self.workspace.cards().len();
         let update = self
             .workspace
             .add_card(
@@ -8425,13 +8425,13 @@ impl Cagents {
             existence: Existence::Open,
             kind: CardKind::Repository(view.clone()),
         };
+        let (index, durable_index) = self.pane_insertion_indices();
         let durable = Arc::make_mut(&mut self.durable);
-        durable.cards.push(card);
+        durable.cards.insert(durable_index, card);
         durable.focused = Some(card_id);
         self.set_presence(card_id, Exposure::Visible, Residency::Hot);
         self.register_channel_card(card_id);
         let load = self.attach_repository_pane(card_id, view);
-        let index = self.workspace.cards().len();
         let update = self
             .workspace
             .add_card(
@@ -8537,18 +8537,22 @@ impl Cagents {
             self.cards.insert(card_id, CardRuntime::Loading);
         }
         let width_fraction = self.new_pane_fraction(self.settings.default_column_fraction);
+        let (index, durable_index) = self.pane_insertion_indices();
         let durable = Arc::make_mut(&mut self.durable);
-        durable.cards.push(CardState {
-            id: card_id,
-            generation: durable.generation,
-            title: url
-                .host_str()
-                .and_then(normalize_card_name)
-                .unwrap_or_else(|| "Browser".into()),
-            width_fraction,
-            existence: Existence::Open,
-            kind: CardKind::Browser(session),
-        });
+        durable.cards.insert(
+            durable_index,
+            CardState {
+                id: card_id,
+                generation: durable.generation,
+                title: url
+                    .host_str()
+                    .and_then(normalize_card_name)
+                    .unwrap_or_else(|| "Browser".into()),
+                width_fraction,
+                existence: Existence::Open,
+                kind: CardKind::Browser(session),
+            },
+        );
         durable.focused = Some(card_id);
         self.register_channel_card(card_id);
         self.register_presence(
@@ -8561,7 +8565,6 @@ impl Cagents {
         if let Some(error) = startup_error {
             self.fail_runtime(card_id, error);
         }
-        let index = self.workspace.cards().len();
         let update = self
             .workspace
             .add_card(
@@ -15558,7 +15561,7 @@ impl Cagents {
             existence: Existence::Open,
             kind,
         };
-        let (index, durable_index) = self.terminal_insertion_indices();
+        let (index, durable_index) = self.pane_insertion_indices();
         let update = match self.workspace.add_card(
             WorkspaceCard::new(id, title, CardWidth::Fraction(card.width_fraction))
                 .expect("utility card has a valid width"),
@@ -15585,7 +15588,7 @@ impl Cagents {
     /// Moves an open utility pane into the strip on screen, beside the
     /// focused card, out of whichever channel held it.
     fn rehome_utility_card(&mut self, id: CardId) -> Task<Message> {
-        let (index, durable_index) = self.terminal_insertion_indices();
+        let (index, durable_index) = self.pane_insertion_indices();
         let durable = Arc::make_mut(&mut self.durable);
         let Some(from) = durable.cards.iter().position(|card| card.id == id) else {
             return Task::none();

@@ -10214,7 +10214,7 @@ impl Cagents {
         };
         let (index, durable_index) = beside
             .map(|(_, slot)| slot)
-            .unwrap_or_else(|| self.terminal_insertion_indices());
+            .unwrap_or_else(|| self.pane_insertion_indices());
         let durable = Arc::make_mut(&mut self.durable);
         if let Some(scope) =
             beside.and_then(|(source, _)| durable.card_scopes.get(&source).cloned())

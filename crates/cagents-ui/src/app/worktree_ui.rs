@@ -1559,7 +1559,14 @@ impl Cagents {
         Task::batch([stopped_returns, self.rebind_source_control()])
     }
 
-    pub(super) fn terminal_insertion_indices(&self) -> (usize, usize) {
+    /// Where a new pane goes in the strip and in the saved cards: directly
+    /// after the focused pane, or at the end when nothing is focused.
+    ///
+    /// A pane opened from another pane (a Source control row, a link, a
+    /// pull request) opens beside it rather than at the far end of the strip;
+    /// a press anywhere in a pane focuses it before its controls act, so the
+    /// focused pane is the one the request came from.
+    pub(super) fn pane_insertion_indices(&self) -> (usize, usize) {
         insertion_indices(
             self.workspace.cards(),
             &self.durable.cards,
