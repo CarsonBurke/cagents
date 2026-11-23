@@ -1,82 +1,87 @@
-# Repository workflow
+# Working in this repository
 
-You are a senior app developer tasked with creating a great Agent Development Environment (ADE) product.
+You are a senior developer building a great Agent Development Environment (ADE). The person using it is the measure of every change.
 
-## Deliver changes through pull requests
+## How to read this file
 
-- Use Issues, worktrees and PRs to manage your work.
-- Many agents share GitHub account and secondary limits. Read CI, head, review and merge state with `scripts/gh-pr-status NUMBER -R OWNER/REPOSITORY --json`: concurrent local callers share one read per PR every two minutes. Do not use `gh pr checks --watch`, `gh run watch` or independent polling loops. Read again when needed; an idle cache issues no requests. This works with older installed CLIs: it bootstraps a cached CLI from local `origin/main` through the build gate. While that build is unavailable, a shared single-REST fallback returns PR/head/merge state with CI and review decision explicitly unknown. Inspect `data.stale`, `data.error`, `data.retry_at`, `limitations` and the returned head before acting; unknown checks do not mean passing. After pushing, add `--expect-head "$(git rev-parse HEAD)"`: exit 5 means the snapshot predates your push; read again after `data.retry_at`. See `docs/development.md` for cache and cleanup details.
-- Use `scripts/gh-observe run --real /usr/bin/gh -- bash` only when opting a repository agent shell into request measurement (see `docs/development.md`). Observation must fail open and add no admission waits or retries. Never install a global gh wrapper or enable live global cooldown state. Keep optional, reviewed content serialization separate from measurement. Honor the failed request's `Retry-After`; a primary reset applies to its account and API resource, so exhausted GraphQL must not block available REST quota. Do not query `gh api rate_limit` in a retry loop.
-- Do your work in PRs against `main`.
-- Merge as soon as CI is green and the change looks right to its reviewer, with `scripts/land-pr NUMBER -R OWNER/REPOSITORY`: it waits for CI, merges at the tested head so what lands is what was reviewed, and keeps AI attribution out of the squash message. Do not re-sync a branch with `main` or recompile it just before merging; update a branch only when it conflicts or its CI is stale against a change it depends on. Prefer many small merges over a queue of finished work. GitHub runs no CI on a pull request that conflicts with `main`, so after each push confirm the PR is mergeable; a conflicting PR waits forever with no checks.
-- GitHub CI compiles no Rust, so before asking for review the author compiles, on their own head, only the lanes the change touches (`mise run check:cli`, `check:host` for daemon code, `check:ui` for UI code, and `mise run check` for all three on shared code). Like the main build sentinel, these fail on a warning from the workspace's crates and leave out the vendored crates' warnings. Don't spend fw16 time on lanes the diff can't affect. The main build sentinel on fw16 compiles every new `main` commit in all three lanes and opens a "Main Rust build sentinel" issue when one fails; that is how two green PRs breaking `main` together gets caught. Check for that issue before assuming a compile error is yours, and fix a broken `main` forward at once, ahead of other work.
-- The lead owns the user outcome through implementation, review and merge. Give parallel workers explicit boundaries and check the assembled experience. A subtask passing tests does not establish that the feature works well.
-- For a change people interact with, state the user's task and intended before/after behavior in the PR. Follow the latest approved design and corrections across the affected flow; preserve necessary controls and information when simplifying it.
-- For interaction changes, ask an independent reviewer to assess the user experience as well as correctness, with the intended flow and native evidence, not just a diff. A broken primary flow, lost essential controls or recurring stalls block the merge; everything else can merge with a linked follow-up. Match review effort to the size and risk of the change.
+These are guidelines, not a checklist. Each one says why it exists, so you can tell when it applies. Use your judgment: if following one in your situation wouldn't serve its purpose, don't follow it, and say briefly why in the PR or report. Spend effort in proportion to risk. A one-line copy fix, a change the user has already judged, or a test-only change doesn't need the ceremony a new interaction flow does. When the user tells you what they want, that outranks anything here.
 
-## Pull request screenshots
+A few things protect other people and agents rather than your own work's quality. Treat those as firm limits:
 
-- PRs that change something people see include before and after screenshots in the PR description. Changes with no visible effect need none. Use only two side-by-side image columns, labeled Before and After; put the page or interaction-state description beneath each pair. Do not add a State, explanation, or other text column beside the images: it reduces their display size.
-- Capture each pair through the actual native app, using the development runner, with the same viewport, scale, theme, data, and interaction state. `scripts/native-evidence` does this from an SSH shell; see `docs/development.md`. A hosted agent runs it over plain `ssh fw16`: its own shell carries `CAGENTS_AGENT_AUTHORITY`, which the script refuses. Never unset, strip or forward that authority to get past a refusal. Identify the before revision and the tested after head. Capture the states the change affects; add expanded, empty, error or narrow layouts only when the change alters them.
-- Capture Before at the start of the work, from `origin/main`: fw16 keeps executables for the `main` commits the sentinel has built, usually the tip, so that side usually compiles nothing (when your starting commit isn't one, the nearest built tip will do if nothing merged between them touches the change), and the After side builds from your worktree as `mise run dev` does.
-- fw16 has a few native session slots that every agent shares, and a session may hold one for at most 30 minutes, so keep sessions short: build both revisions before taking a slot, capture every state in one session, and release it. A Before image from an earlier capture of the same state on `main` (same data, theme and viewport) may be reused instead of recapturing it. Do not wait on a second capture round for cosmetic follow-up edits; state what changed after the captured head.
-- Save images as WebP with descriptive names such as `before-channel-prs.webp` and `after-channel-prs.webp`. Check that they show the intended change and contain no secrets or private user content.
-- Keep screenshots off the product PR branch. Commit only the images under `pr-screenshots/` on a separate `<branch>-screenshots` branch, and embed immutable links in the description: `https://github.com/CarsonBurke/cagents/blob/<sha>/pr-screenshots/<name>.webp?raw=true`. Keep the screenshot branch so the images remain reachable.
-- Refresh the comparison when a later change materially alters the visible result. If a state could not be captured, say exactly what is missing; mockups and component-rendered fixtures must be labeled and do not establish actual native UI validation. Fixtures loaded into the running native app are the normal way to validate; don't explain how a fixture works. Name a gap only when the change depends on provider behavior the fixture doesn't reproduce.
+- **Shared machines.** This host and fw16 are shared with the user and other agents. Never generate artificial load (busy loops, stress tools, extra parallel copies of a build or test to reproduce a flaky failure). Diagnose timing problems by reading the race, adding instrumentation or rerunning normally. If a failure appears only under load, report that.
+- **Shared GitHub limits.** Many agents share one account's API limits. Read PR state through `scripts/gh-pr-status` (below), not polling loops, `gh pr checks --watch`, `gh run watch` or `gh api rate_limit` in a loop. Honor a failed request's `Retry-After`. Exhausted GraphQL doesn't block REST.
+- **Authority.** Never unset, strip or forward `CAGENTS_AGENT_AUTHORITY` to get past a refusal, and never install a global `gh` wrapper or enable live global cooldown state.
+- **The user's real homes.** Point fixture providers at their own config directory. Never write fixture files into the real `~/.claude` or `~/.codex`.
+- **Main stays green.** If main is broken, fix it forward ahead of other work. Check for an open "Main Rust build sentinel" issue before assuming a compile error is yours.
 
-## Design for the person using the app
+## Delivering changes
 
-- Use iced/cosmic components and theming where they serve the interaction; build custom components where they do not. Start from what the user needs to understand or do, rather than exposing the backend's structure.
-- Give each view a clear primary action and visual hierarchy. Keep routine activity compact, disclose technical detail on demand, and make state, scope and recovery understandable. Internal prompts, skill instructions, transport identifiers and implementation notes are not user messages. Avoid duplicate navigation and contradictory-looking states.
-- Exercise the complete changed flow in the actual native app. Choose representative data and states: populated and empty, working and finished, errors or stale data where relevant, and narrow and wide layouts. Check keyboard focus, hover targets, scrolling and transitions, not only a static happy-path screenshot. Use fixtures when sufficient; use a live provider only when the behavior requires one.
-- Judge responsiveness with realistic conversation length and concurrent agents. For changes to rendering, polling or data preparation, compare before/after frame stalls and resource use on the same workload. A spinner or hover freezing with unrelated updates is a product defect even when tests pass. Keep expensive work off the UI path.
-- The independent reviewer should ask: Can the user finish the intended task? Is important information visible at the right time? Do the labels and states make sense without implementation knowledge? What breaks during interaction or at realistic scale? Inspect the native evidence and exercise uncertain behavior; identify untested claims explicitly. Review effort should match the affected behavior, not expand into an unrelated redesign.
-- When review or user feedback exposes a pattern, check neighboring instances and fix the shared cause. Do not close the issue merely because the pictured instance changed; capture the applicable regression with a focused test or repeatable interaction, and link any bounded follow-up.
+- Work in issues, worktrees (under `.worktrees/`) and PRs against `main`. Prefer many small merges over a queue of finished work.
+- Read CI, head, review and merge state with `scripts/gh-pr-status NUMBER -R OWNER/REPOSITORY --json`. Concurrent callers share one read per PR every two minutes, and an idle cache makes no requests. Check `data.stale`, `data.error`, `data.retry_at`, `limitations` and the returned head. Unknown checks don't mean passing. After pushing, add `--expect-head "$(git rev-parse HEAD)"`: exit 5 means the snapshot predates your push. `scripts/gh-observe run --real /usr/bin/gh -- bash` opts a shell into request measurement. It must fail open. See `docs/development.md`.
+- Land with `scripts/land-pr NUMBER -R OWNER/REPOSITORY` once CI is green and the change looks right. It merges at the tested head and keeps AI attribution out of the squash message. Update a branch only when it conflicts or depends on something newer. GitHub runs no CI on a conflicting PR, so confirm the PR is mergeable after each push.
+- GitHub CI compiles no Rust, so compile the lanes your change touches before asking for review (see the build lanes below). Two individually green PRs can still break main together. When main has moved a lot under a change that touches shared types, a throwaway local merge compile before landing is cheap insurance. The fw16 main build sentinel catches the rest.
+- The lead owns the user's outcome through implementation, review and merge. Give parallel workers clear boundaries, and check the assembled experience: a subtask passing its tests doesn't show that the feature works well.
+- For a change people interact with, say in the PR what the user is trying to do and how the behavior changes. Follow the latest approved design and the user's corrections across the whole affected flow. When you simplify, keep the controls and information people need.
 
-## Use the mise tasks
+## Review
 
-- `mise tasks` lists the supported interface: `setup`, `doctor`, `dev`, `check:*`, `test:*`, `fmt`, `ci`, `install`, `package` and `release:*`. Pass arguments after `--`; a lane task's arguments replace its default `--all-targets`. `mise run doctor` explains a missing prerequisite or an unreachable build host. See `docs/development.md#tasks`.
-- mise reads a worktree's `mise.toml` only once it is trusted. For a worktree of this repository, run `mise trust` in it; trust nothing from outside it.
+- Get an independent review when a second pair of eyes is likely to catch something: non-trivial logic, concurrency, security, protocol changes, or a new interaction. Match its depth to the change's size and risk. A trivial or already-judged change may need none.
+- For interaction changes, the reviewer should judge the experience as well as the code: Can the user finish the task? Is the important information visible at the right time? Do labels and states make sense without knowing the implementation? What breaks during interaction or at realistic scale? Give them the intended flow and evidence, not just the diff.
+- A broken primary flow, lost essential controls or recurring stalls block a merge. Anything else can merge with a linked follow-up.
 
-## Choose the cheapest correct build lane
+## Evidence for visible changes
 
-- The compiling tasks run Cargo through `scripts/cargo-gate`; call it directly only for what no task covers. Rust compiles only on the build host (`fw16`): the gate sends every compiling command there, brings back the executables, docs and messages callers use, and waits while the host is unavailable rather than building here. Set `CAGENTS_BUILD_REMOTE=local` only when a build must run on this host. Use `scripts/cargo-gate exec COMMAND` for a script of Cargo commands, such as anything you would have run under `flock /var/tmp/cagents-cargo.lock`; its `cargo` leads back to the gate. Do not hold a build lock while tests or the app run.
-- Start with the isolated boundary that owns the change:
-  - CLI: `mise run check:cli -- --bin cagents`
-  - daemon/terminal host: `mise run check:host -- --bin cagentsd`
-  - browserless UI: `mise run check:ui -- --bin cagents-ui`
-  - integrated UI: `mise run check:browser`
-- The application (`crates/cagents-ui/src/app` and the other UI-only modules) is the `cagents-ui` package in `crates/cagents-ui`; the root package is the shared library with the `cagents` and `cagentsd` binaries. The `ui` and `browser` tasks select it with `-p cagents-ui`; a direct Cargo command must too.
-- The default `full` feature selects production identity only. `ui`, `host`, and
-  `integrated-browser` select implementation graphs; never reunify `ui` and
-  `host` in one Cargo invocation just to shorten a command.
-- Before finishing a feature or dependency change, run every affected isolated boundary. UI-only builds must not resolve Ghostty; host-only builds must not resolve libcosmic, Servo, WebRender, or SpiderMonkey.
+The point of screenshots is to let a reviewer or the user judge a visible change without running it. Include them when they do that job. Skip them when they don't add anything, for example when the change has no visible effect, the user has already judged it from other images, or the difference is too small to see.
 
-## Run the application through the development runner
+When you do capture:
 
-- Run native instances, profiling and measurements on fw16 where possible, keeping this host free for the user.
-- Use `mise run dev` (`scripts/run-development --browserless`) for ordinary UI, session, sidebar, settings, and terminal work.
-- Use `mise run dev:browser` when the changed behavior requires the embedded browser.
-- Do not use a direct `cargo run` as the normal UI workflow. The runner builds the three matched executables with separate feature sets, then selects the isolated development application ID, state, and daemon.
-- The runner uses the `dev-runtime` profile so UI dependencies remain optimized. Keep ordinary `dev` checks unoptimized; do not restore a wildcard `opt-level` under `[profile.dev.package."*"]`.
-- Add `-- --debug --log-file /tmp/cagents-ui.log` when diagnosing UI behavior.
-- Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or process-lifecycle code. It uses the daemon lock and a Linux pidfd rather than the wire protocol, so it remains safe across protocol changes; this terminates terminals hosted by that daemon.
-- Do not run two development sessions without `--instance` at the same time; they share development state. Give each concurrent native run its own `--instance NAME`.
+- Use the actual native app through the development runner, with the same viewport, scale, theme, data and interaction state for Before and After. `scripts/native-evidence` does this from an SSH shell. A hosted agent runs it over plain `ssh fw16`. See `docs/development.md`.
+- Show two side-by-side image columns, labeled Before and After, with the state described beneath each pair. A text column beside them shrinks the images.
+- Before usually comes from `origin/main`. fw16 keeps executables for the main commits the sentinel built, usually the tip, so that side rarely compiles anything. A Before from an earlier capture of the same state on main can be reused.
+- fw16 has a few native session slots shared by every agent, and a session may hold one for at most 30 minutes. Build both sides before taking a slot, capture everything in one session, and release it. Don't hold up a merge on a second capture round for cosmetic edits. Say what changed after the captured head.
+- Save WebP images with descriptive names (`before-channel-prs.webp`). Check that they show the change and contain no secrets or private content. Commit them only under `pr-screenshots/` on a separate `<branch>-screenshots` branch, keep that branch, and link them immutably: `https://github.com/CarsonBurke/cagents/blob/<sha>/pr-screenshots/<name>.webp?raw=true`.
+- Label mockups and component-rendered fixtures as such: they don't show the native UI. Fixtures loaded into the running app are the normal way to validate. Name a gap only when the change depends on provider behavior a fixture can't reproduce.
 
-## Preserve cross-feature behavior
+## Designing for the person using the app
 
-- Browserless mode must preserve saved browser descriptors and open their URLs in the system browser. It must not discard or rewrite browser session state merely because Servo is absent.
-- `cagents`, `cagents-ui`, and `cagentsd` are a matched set. Build and exercise them together when their shared behavior changes.
+- Start from what the user needs to understand or do, not from the backend's structure. Use iced/cosmic components and theming where they serve the interaction, and build custom ones where they don't.
+- Give each view a clear primary action and visual hierarchy. Keep routine activity compact, and show technical detail on demand. Make state, scope and recovery understandable. Internal prompts, skill instructions, transport identifiers and implementation notes are not user messages. Avoid duplicate navigation and contradictory-looking states.
+- Exercise the changed flow in the running app with representative states: populated and empty, working and finished, errors and stale data, narrow and wide. Where they matter, check focus, hover, scrolling and transitions too.
+- Judge responsiveness at realistic scale: long conversations, concurrent agents. For rendering, polling or data-preparation changes, compare frame stalls and resource use before and after on the same workload. A spinner or hover freezing during unrelated updates is a defect even when tests pass. Keep expensive work off the UI thread.
+- When feedback exposes a pattern, fix the shared cause and check the neighboring cases, not just the pictured instance. Add a focused test or a repeatable interaction for it, and link any bounded follow-up.
 
-## Verify the changed surface
+## Tasks and build lanes
 
-- Run the narrow test target that covers the changed contract.
-- Never generate artificial load on this machine or fw16: no busy loops (`while :; do :; done`), stress tools, or extra parallel copies of a build or test to "reproduce" a flaky or timing-dependent test. Both machines are shared with the user and other agents. Diagnose timing problems by reading the race, adding instrumentation, or rerunning the test normally; if a failure appears only under load, report that rather than simulating it.
-- A bare `cargo test` runs only the shared CLI lane: the `ui` and `host` unit tests and every gated integration target are compiled out under the default `full` feature. Run `mise run test:cli`, `test:host` and `test:ui` (or `mise run test` for all three) to cover the boundaries the change touches; narrow one with `-- --test TARGET`, or run one lane's library tests with `mise run test:lib -- LANE --prefix MODULE::`, where LANE is `cli`, `host`, `ui` (the `cagents-ui` application), `shared-ui` (the shared library under `--features ui`) or `browser` (the application with the integrated browser). While iterating on UI library tests, prefer it to `test:ui -- --lib MODULE::`, which compiles both of those test harnesses on every edit; `test:lib` does not deny warnings, so finish with the lane task.
-- For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
-  - If you need live testing with an agent (fixture isn't sufficient) you must use the cheapest model, such as haiku/luna on low reasoning.
-- Fixtures, fake providers and the development runner are yours to maintain, like product code. When one is missing a state, is flaky, leaks processes or refuses a legitimate use, fix or extend it in your PR rather than working around it, and leave it easier for the next agent. Point fixture providers at their own config directory; never write fixture files into the real `~/.claude` or `~/.codex`.
-- For browser or feature-boundary changes, verify both browserless and integrated lanes.
-- Use `mise run fmt:check` after Rust edits (`mise run fmt` rewrites). It checks Cargo roots and the Rust source trees hidden behind `include!` macros. `mise run ci` runs what GitHub CI runs, without compiling Rust.
+- `mise tasks` lists the supported interface: `setup`, `doctor`, `dev`, `check:*`, `test:*`, `fmt`, `ci`, `install`, `package` and `release:*`. Pass arguments after `--`. A lane task's arguments replace its default `--all-targets`. `mise run doctor` explains a missing prerequisite or an unreachable build host. In a new worktree of this repository, run `mise trust`. Trust nothing from outside it.
+- Rust compiles only on the build host, fw16. The compiling tasks run Cargo through `scripts/cargo-gate`, which sends the work there, brings back what callers need, and waits while the host is unavailable. Use `scripts/cargo-gate exec COMMAND` for a script of Cargo commands. Set `CAGENTS_BUILD_REMOTE=local` only when a build must run here. Don't hold a build lock while tests or the app run.
+- Compile the lanes your change can affect, and skip the ones it can't:
+  - CLI: `mise run check:cli`
+  - daemon or terminal host: `mise run check:host`
+  - browserless UI: `mise run check:ui`
+  - integrated browser: `mise run check:browser`
+  - shared code: `mise run check` (all three)
 
-The full runner option reference, test lanes, resource guidance, and troubleshooting are in `docs/development.md`.
+  Narrow with `-- --bin …` while iterating. The default `--all-targets` also checks tests, and like the main sentinel, these fail on the workspace's own warnings, which a narrowed run can miss.
+- The application (`crates/cagents-ui/src/app` and the other UI-only modules) is the `cagents-ui` package. The root package is the shared library with the `cagents` and `cagentsd` binaries. A direct Cargo command for the UI needs `-p cagents-ui`.
+- The default `full` feature selects production identity only. `ui`, `host` and `integrated-browser` select implementation graphs. Never combine `ui` and `host` in one Cargo invocation: UI-only builds must not resolve Ghostty, and host-only builds must not resolve libcosmic, Servo, WebRender or SpiderMonkey.
+
+## Running the app
+
+- Run native instances, profiling and measurements on fw16 where you can, to keep this host free for the user.
+- Use `mise run dev` (`scripts/run-development --browserless`) for ordinary UI, session, sidebar, settings and terminal work. Use `mise run dev:browser` when the behavior needs the embedded browser. Prefer the runner to `cargo run`: it builds the three matched executables with their own feature sets and selects the isolated development app ID, state and daemon.
+- The runner uses the `dev-runtime` profile so UI dependencies stay optimized. Keep ordinary `dev` checks unoptimized, and don't restore a wildcard `opt-level` under `[profile.dev.package."*"]`.
+- Add `-- --debug --log-file /tmp/cagents-ui.log` to diagnose UI behavior. Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol or process-lifecycle code. It ends the terminals that daemon hosts. Give each concurrent native run its own `--instance NAME`, because runs without one share development state.
+- If a test needs a live agent because a fixture won't do, use the cheapest model at low reasoning.
+
+## Cross-feature behavior
+
+- Browserless mode keeps saved browser descriptors and opens their URLs in the system browser. It must not discard or rewrite browser session state just because Servo is absent.
+- `cagents`, `cagents-ui` and `cagentsd` are a matched set. Build and exercise them together when shared behavior changes. For browser or feature-boundary changes, check both the browserless and integrated lanes.
+
+## Testing
+
+- Run the narrow tests that cover the contract you changed. A bare `cargo test` runs only the CLI lane. Use `mise run test:cli`, `test:host` and `test:ui` (or `mise run test`), narrowed with `-- --test TARGET`. Run one lane's library tests with `mise run test:lib -- LANE --prefix MODULE::`. LANE is `cli`, `host`, `ui`, `shared-ui` or `browser`. `test:lib` doesn't deny warnings and is the fast loop for UI library tests.
+- Run `mise run fmt:check` after Rust edits (`mise run fmt` rewrites). `mise run ci` runs what GitHub CI runs, without compiling Rust.
+- Fixtures, fake providers and the development runner are product code too. When one is missing a state, is flaky, leaks processes or refuses a legitimate use, fix it in your PR and leave it easier for the next agent.
+
+The full runner options, test lanes, resource guidance and troubleshooting are in `docs/development.md`.
