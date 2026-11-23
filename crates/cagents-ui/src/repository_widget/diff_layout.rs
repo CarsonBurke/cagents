@@ -178,11 +178,7 @@ impl RowOffsets {
     }
 }
 
-/// Unchanged rows kept beside every change, as `git diff` does by default.
-pub(super) const FOLD_CONTEXT: usize = 3;
-/// A fold stands in for its rows with one row of its own, so hiding only a
-/// handful would cost nearly as much height as it saves.
-pub(super) const FOLD_MIN_HIDDEN: usize = 4;
+pub(super) use crate::diff_view::{FOLD_CONTEXT, FOLD_MIN_HIDDEN};
 /// How many rows one directional expansion reveals.
 pub(super) const FOLD_STEP: usize = 20;
 

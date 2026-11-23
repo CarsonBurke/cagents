@@ -474,7 +474,16 @@ fn verify_tool_readers(
             verify_tool_reader(&item.id, &[5], output, proofs, verified);
         }
         ItemContent::Tool { input, output, .. } => {
-            verify_tool_reader(&item.id, &[4], input, proofs, verified);
+            // The input is verified as its reader shows it, which costs a
+            // read of the call's arguments: only when a reader holds a proof.
+            let logical = selection::logical_identity(&item.id, &[4]);
+            if [scroll::ReaderAxis::Horizontal, scroll::ReaderAxis::Vertical]
+                .into_iter()
+                .any(|axis| proofs.contains_key(&scroll::reader_key(logical, axis)))
+            {
+                let (input, _) = tool_text::tool_input(input);
+                verify_tool_reader(&item.id, &[4], &input, proofs, verified);
+            }
             verify_tool_reader(&item.id, &[5], output, proofs, verified);
         }
         ItemContent::Changes { changes, .. } => {

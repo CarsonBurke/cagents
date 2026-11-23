@@ -2,8 +2,12 @@
 //!
 //! Every glyph the shell draws is a variant of [`Icon`], so a misspelt or
 //! retired name is a compile error rather than a blank square at runtime.
-//! Whether a glyph is the application's own drawing or is left to the desktop
-//! icon theme is decided once, in the table below, and is invisible to callers.
+//! Every one is the application's own drawing under `src/icons/`, in one
+//! style: a 16-unit square, round strokes of about 1.4 units, and ink kept
+//! at least three quarters of a unit inside the edge. Icons from the desktop theme
+//! varied in weight and shape, and some were wider than tall, so they did not
+//! sit in the same box as the rest. `tests::every_glyph_stays_inside_its_box`
+//! holds every drawing to that box.
 
 use std::sync::LazyLock;
 
@@ -15,189 +19,155 @@ use cosmic::{
     },
 };
 
-/// Declares [`Icon`] from two tables: the application's own drawings, named by
-/// their file under `src/icons/`, and the names left to the desktop theme.
+/// Declares [`Icon`] from its drawings, each named by its file under
+/// `src/icons/`.
 macro_rules! icons {
-    (
-        bundled { $($bundled:ident => $file:literal,)* }
-        themed { $($themed:ident => $name:literal,)* }
-    ) => {
+    ($($icon:ident => $file:literal,)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum Icon {
-            $($bundled,)*
-            $($themed,)*
+            $($icon,)*
         }
 
         impl Icon {
-            /// Every glyph, in declaration order: the order of [`BUNDLED`].
-            const ALL: &'static [Self] = &[$(Self::$bundled,)* $(Self::$themed,)*];
+            /// Every glyph, in declaration order: the order of [`HANDLES`].
+            const ALL: &'static [Self] = &[$(Self::$icon,)*];
 
-            const fn source(self) -> Source {
+            const fn svg(self) -> &'static [u8] {
                 match self {
-                    $(Self::$bundled => Source::Bundled(
-                        include_bytes!(concat!("../icons/", $file, ".svg")),
-                    ),)*
-                    $(Self::$themed => Source::Theme($name),)*
+                    $(Self::$icon => include_bytes!(concat!("../icons/", $file, ".svg")),)*
+                }
+            }
+
+            #[cfg(test)]
+            const fn file(self) -> &'static str {
+                match self {
+                    $(Self::$icon => $file,)*
                 }
             }
         }
     };
 }
 
-#[derive(Clone, Copy)]
-enum Source {
-    /// The application's own drawing. It keeps controls legible where the
-    /// desktop theme omits a name or answers it through libcosmic's prefix
-    /// fallback, which retries `internet-web-browser-symbolic` as the
-    /// full-color application icon that a symbolic render flattens into a
-    /// solid disc.
-    Bundled(&'static [u8]),
-    /// A freedesktop name that ships under exactly that name in the stock
-    /// COSMIC theme chain (Cosmic, then Pop), which
-    /// `tests::themed_icons_ship_in_the_installed_cosmic_theme` checks.
-    Theme(&'static str),
-}
-
 icons! {
-    bundled {
-        AddedFile => "added-file",
-        Agent => "agent",
-        AgentWaiting => "waiting",
-        AgentBackground => "background-work",
-        AgentWorking => "working",
-        Attention => "attention",
-        Board => "board",
-        Branch => "branch",
-        Browser => "browser",
-        Changes => "changes",
-        Channel => "channel",
-        ChannelAdd => "channel-add",
-        Chat => "chat",
-        CheckRunning => "check-running",
-        Checkbox => "checkbox",
-        CheckboxChecked => "checkbox-checked",
-        CheckboxMixed => "checkbox-mixed",
-        ChevronDown => "chevron-down",
-        ChevronLeft => "chevron-left",
-        ChevronRight => "chevron-right",
-        ChevronUp => "chevron-up",
-        Close => "close",
-        ClosedPullRequest => "closed-pull-request",
-        Comment => "comment",
-        Commit => "commit",
-        Compress => "compress",
-        CopyPath => "copy-path",
-        CopyRelativePath => "copy-relative",
-        Diff => "diff",
-        DraftPullRequest => "draft-pull-request",
-        Duplicate => "duplicate",
-        Edit => "edit",
-        Ended => "ended",
-        ExpandAll => "expand-all",
-        ExpandDown => "expand-down",
-        ExpandUp => "expand-up",
-        Hide => "hide",
-        History => "history",
-        Info => "info",
-        InsertText => "insert-text",
-        Keyboard => "keyboard",
-        MergedPullRequest => "merged-pull-request",
-        Minus => "minus",
-        Open => "open",
-        OpenFile => "open-file",
-        OpenFolder => "open-folder",
-        Plus => "plus",
-        PopOut => "pop-out",
-        Preview => "preview",
-        PullRequest => "pull-request",
-        Push => "push",
-        Reasoning => "reasoning",
-        Rename => "rename",
-        RevertFile => "revert-file",
-        ReviewApproved => "review-approved",
-        ReviewChanges => "review-changes",
-        ReviewRequired => "review-required",
-        Save => "save",
-        Search => "search",
-        Settings => "settings",
-        Sidebar => "sidebar",
-        SplitPanel => "split-panel",
-        Tree => "tree",
-        Worktree => "worktree",
-        WorktreeAdd => "worktree-add",
-    }
-    themed {
-        Alarm => "alarm-symbolic",
-        Attachment => "mail-attachment-symbolic",
-        Avatar => "avatar-default-symbolic",
-        Brightness => "display-brightness-symbolic",
-        Cancel => "process-stop-symbolic",
-        Check => "emblem-ok-symbolic",
-        Clear => "edit-clear-symbolic",
-        Copy => "edit-copy-symbolic",
-        Delete => "edit-delete-symbolic",
-        Display => "preferences-desktop-display-symbolic",
-        Error => "dialog-error-symbolic",
-        Filter => "view-filter-symbolic",
-        First => "go-first-symbolic",
-        Folder => "folder-symbolic",
-        Grid => "view-grid-symbolic",
-        Home => "go-home-symbolic",
-        Image => "image-x-generic-symbolic",
-        Import => "document-import-symbolic",
-        Jump => "go-jump-symbolic",
-        Last => "go-last-symbolic",
-        List => "view-list-symbolic",
-        Loading => "content-loading-symbolic",
-        Lock => "changes-prevent-symbolic",
-        More => "view-more-symbolic",
-        Night => "weather-clear-night-symbolic",
-        NotificationSettings => "preferences-system-notifications-symbolic",
-        PanDown => "pan-down-symbolic",
-        PanEnd => "pan-end-symbolic",
-        Private => "view-private-symbolic",
-        Refresh => "view-refresh-symbolic",
-        Select => "object-select-symbolic",
-        Send => "mail-send-symbolic",
-        Stop => "media-playback-stop-symbolic",
-        Terminal => "utilities-terminal-symbolic",
-        TextEditor => "accessories-text-editor-symbolic",
-        TextFile => "text-x-generic-symbolic",
-        Unavailable => "action-unavailable-symbolic",
-        Undo => "edit-undo-symbolic",
-        Update => "software-update-available-symbolic",
-        Users => "system-users-symbolic",
-        Utilities => "applications-utilities-symbolic",
-        Warning => "dialog-warning-symbolic",
-        WebBrowser => "web-browser-symbolic",
-        ZoomFit => "zoom-fit-best-symbolic",
-        ZoomIn => "zoom-in-symbolic",
-        ZoomOut => "zoom-out-symbolic",
-    }
+    AddedFile => "added-file",
+    Agent => "agent",
+    AgentWaiting => "waiting",
+    AgentBackground => "background-work",
+    AgentWorking => "working",
+    Alarm => "alarm",
+    Attachment => "attachment",
+    Attention => "attention",
+    Avatar => "avatar",
+    Board => "board",
+    Branch => "branch",
+    Brightness => "brightness",
+    Browser => "browser",
+    Cancel => "cancel",
+    Changes => "changes",
+    Channel => "channel",
+    ChannelAdd => "channel-add",
+    Chat => "chat",
+    Check => "check",
+    CheckRunning => "check-running",
+    Checkbox => "checkbox",
+    CheckboxChecked => "checkbox-checked",
+    CheckboxMixed => "checkbox-mixed",
+    ChevronDown => "chevron-down",
+    ChevronLeft => "chevron-left",
+    ChevronRight => "chevron-right",
+    ChevronUp => "chevron-up",
+    Clear => "clear",
+    Close => "close",
+    ClosedPullRequest => "closed-pull-request",
+    Comment => "comment",
+    Commit => "commit",
+    Compress => "compress",
+    Copy => "copy",
+    CopyPath => "copy-path",
+    CopyRelativePath => "copy-relative",
+    Delete => "delete",
+    Diff => "diff",
+    Display => "display",
+    DraftPullRequest => "draft-pull-request",
+    Edit => "edit",
+    Ended => "ended",
+    Error => "error",
+    ExpandAll => "expand-all",
+    ExpandDown => "expand-down",
+    ExpandUp => "expand-up",
+    Filter => "filter",
+    First => "first",
+    Folder => "folder",
+    Grid => "grid",
+    Hide => "hide",
+    History => "history",
+    Home => "home",
+    Image => "image",
+    Import => "import",
+    Inbox => "inbox",
+    Info => "info",
+    InsertText => "insert-text",
+    Jump => "jump",
+    Keyboard => "keyboard",
+    Last => "last",
+    List => "list",
+    Lock => "lock",
+    MergedPullRequest => "merged-pull-request",
+    Microphone => "microphone",
+    Minus => "minus",
+    More => "more",
+    Night => "night",
+    Open => "open",
+    OpenFile => "open-file",
+    OpenFolder => "open-folder",
+    Plus => "plus",
+    PopOut => "pop-out",
+    Preview => "preview",
+    PullRequest => "pull-request",
+    Push => "push",
+    Reasoning => "reasoning",
+    Refresh => "refresh",
+    Rename => "rename",
+    RevertFile => "revert-file",
+    ReviewApproved => "review-approved",
+    ReviewChanges => "review-changes",
+    ReviewRequired => "review-required",
+    Save => "save",
+    Search => "search",
+    Send => "send",
+    Settings => "settings",
+    Sidebar => "sidebar",
+    SplitPanel => "split-panel",
+    Stop => "stop",
+    Terminal => "terminal",
+    TextFile => "text-file",
+    Tree => "tree",
+    Unavailable => "unavailable",
+    Undo => "undo",
+    Update => "update",
+    Users => "users",
+    Utilities => "utilities",
+    Warning => "warning",
+    Worktree => "worktree",
+    WorktreeAdd => "worktree-add",
+    ZoomFit => "zoom-fit",
+    ZoomIn => "zoom-in",
+    ZoomOut => "zoom-out",
 }
 
-/// One handle per bundled glyph for the life of the process. A stable handle
-/// keeps its rasterization in the renderer's cache instead of re-keying it on
-/// every view. Themed glyphs have no entry: their name is resolved against
-/// the icon theme each time, so a theme changed at runtime takes effect.
-static BUNDLED: LazyLock<Vec<Option<Handle>>> = LazyLock::new(|| {
+/// One handle per glyph for the life of the process. A stable handle keeps
+/// its rasterization in the renderer's cache instead of re-keying it on every
+/// view.
+static HANDLES: LazyLock<Vec<Handle>> = LazyLock::new(|| {
     Icon::ALL
         .iter()
-        .map(|icon| match icon.source() {
-            Source::Bundled(svg) => Some(icon::from_svg_bytes(svg).symbolic(true)),
-            Source::Theme(_) => None,
-        })
+        .map(|icon| icon::from_svg_bytes(icon.svg()).symbolic(true))
         .collect()
 });
 
 impl Icon {
     pub fn handle(self) -> Handle {
-        match self.source() {
-            Source::Bundled(_) => BUNDLED[self as usize]
-                .clone()
-                .expect("a bundled glyph has a cached handle"),
-            Source::Theme(name) => icon::from_name(name).handle(),
-        }
+        HANDLES[self as usize].clone()
     }
 }
 
@@ -275,7 +245,7 @@ pub fn provider_icon(provider: crate::agent::Provider) -> Handle {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     #[test]
     fn editor_window_icon_preserves_its_distinct_transparent_artwork() {
@@ -300,64 +270,97 @@ mod tests {
         for (index, icon) in Icon::ALL.iter().enumerate() {
             assert_eq!(*icon as usize, index, "{icon:?}");
         }
-        assert_eq!(BUNDLED.len(), Icon::ALL.len());
+        assert_eq!(HANDLES.len(), Icon::ALL.len());
     }
 
     #[test]
-    fn bundled_drawings_are_symbolic_svg() {
+    fn drawings_are_symbolic_svg() {
         for icon in Icon::ALL {
-            if let Source::Bundled(svg) = icon.source() {
-                let svg = std::str::from_utf8(svg).expect("an icon is UTF-8");
-                assert!(svg.starts_with("<svg "), "{icon:?}");
-                // Symbolic recoloring replaces black; any other ink would
-                // survive it and ignore the control's tone.
-                assert!(!svg.contains("stroke=\"#"), "{icon:?}");
-                assert!(!svg.contains("fill=\"#"), "{icon:?}");
-            }
+            let svg = std::str::from_utf8(icon.svg()).expect("an icon is UTF-8");
+            assert!(svg.starts_with("<svg "), "{icon:?}");
+            // Symbolic recoloring replaces black; any other ink would
+            // survive it and ignore the control's tone.
+            assert!(!svg.contains("stroke=\"#"), "{icon:?}");
+            assert!(!svg.contains("fill=\"#"), "{icon:?}");
         }
     }
 
-    /// Where the COSMIC theme chain is installed, confirm it still carries
-    /// every name the application leaves to it.
+    /// Every drawing in `src/icons/` that is not provider artwork has a
+    /// variant, so none is left behind to be drawn some other way.
     #[test]
-    fn themed_icons_ship_in_the_installed_cosmic_theme() {
-        fn visit(dir: &Path, stems: &mut BTreeSet<String>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for path in entries.flatten().map(|entry| entry.path()) {
-                if path.is_dir() {
-                    visit(&path, stems);
-                } else if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    stems.insert(stem.to_owned());
-                }
-            }
-        }
-        let data_dirs = std::env::var_os("XDG_DATA_DIRS")
-            .filter(|dirs| !dirs.is_empty())
-            .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-        let theme_roots: Vec<PathBuf> = std::env::split_paths(&data_dirs)
-            .flat_map(|dir| ["Cosmic", "Pop"].map(|theme| dir.join("icons").join(theme)))
-            .filter(|root| root.is_dir())
-            .collect();
-        if !theme_roots.iter().any(|root| root.ends_with("Cosmic")) {
-            eprintln!("the Cosmic icon theme is not installed; skipping");
-            return;
-        }
-        let mut stems = BTreeSet::new();
-        for root in &theme_roots {
-            visit(root, &mut stems);
-        }
-        let missing: Vec<_> = Icon::ALL
-            .iter()
-            .filter_map(|icon| match icon.source() {
-                Source::Theme(name) if !stems.contains(name) => Some((icon, name)),
-                _ => None,
+    fn every_drawing_is_a_glyph() {
+        let providers = ["antigravity", "claude", "codex", "muse", "omp"];
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/icons");
+        let used: BTreeSet<&str> = Icon::ALL.iter().map(|icon| icon.file()).collect();
+        let unused: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let stem = path.file_stem()?.to_str()?.to_owned();
+                (path.extension()? == "svg"
+                    && !used.contains(stem.as_str())
+                    && !providers.contains(&stem.as_str()))
+                .then_some(stem)
             })
             .collect();
         assert!(
-            missing.is_empty(),
-            "missing from {theme_roots:?}; draw them under src/icons instead: {missing:?}"
+            unused.is_empty(),
+            "drawings with no Icon variant: {unused:?}"
         );
+    }
+
+    /// How far ink must stay from each edge of the 16-unit box.
+    const MARGIN: f32 = 0.75;
+
+    /// Draws `tree` at `pixels` per unit, as the renderer fills a square
+    /// raster, into a pixmap with `pad` whole pixels of empty border on each
+    /// side, and returns the ink's bounds in units of the box: left, top,
+    /// right, bottom.
+    fn ink_bounds(tree: &resvg::usvg::Tree, pixels: f32, pad: u32) -> Option<[f32; 4]> {
+        let side = (16.0 * pixels).ceil() as u32 + 2 * pad;
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(side, side).unwrap();
+        resvg::render(
+            tree,
+            resvg::tiny_skia::Transform::from_row(pixels, 0.0, 0.0, pixels, pad as f32, pad as f32),
+            &mut pixmap.as_mut(),
+        );
+        let mut bounds: Option<[u32; 4]> = None;
+        for (index, pixel) in pixmap.pixels().iter().enumerate() {
+            // Faint antialiasing below 1/32 coverage is not visible ink.
+            if pixel.alpha() > 8 {
+                let (x, y) = (index as u32 % side, index as u32 / side);
+                let b = bounds.get_or_insert([x, y, x, y]);
+                *b = [b[0].min(x), b[1].min(y), b[2].max(x + 1), b[3].max(y + 1)];
+            }
+        }
+        bounds.map(|b| b.map(|edge| (edge as f32 - pad as f32) / pixels))
+    }
+
+    /// No glyph touches or crosses the edge of its box. The box is a
+    /// 16-unit square, so the renderer scales it uniformly into a square
+    /// icon of any size, and ink kept inside the margin stays inside the
+    /// raster at every size and scale, clear of its edge.
+    #[test]
+    fn every_glyph_stays_inside_its_box() {
+        let options = resvg::usvg::Options::default();
+        for icon in Icon::ALL {
+            let tree = resvg::usvg::Tree::from_data(icon.svg(), &options).expect("an icon parses");
+            assert_eq!(
+                (tree.size().width(), tree.size().height()),
+                (16.0, 16.0),
+                "{icon:?} must draw in a 16-unit square"
+            );
+
+            // Measured finely, the ink keeps its margin on every side.
+            let [left, top, right, bottom] = ink_bounds(&tree, 32.0, 64).expect("an icon has ink");
+            let inset = [left, top, 16.0 - right, 16.0 - bottom];
+            // One measuring pixel of tolerance.
+            assert!(
+                inset.iter().all(|edge| *edge >= MARGIN - 1.0 / 32.0),
+                "{icon:?} ({}.svg) comes within {inset:?} units of its edge; keep {MARGIN}",
+                icon.file()
+            );
+        }
     }
 }

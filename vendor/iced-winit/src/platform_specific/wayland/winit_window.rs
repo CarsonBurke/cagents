@@ -30,7 +30,9 @@ pub struct SctkWinitWindow {
 
 impl Drop for SctkWinitWindow {
     fn drop(&mut self) {
-        self.tx.send(Action::Dropped(self.id)).unwrap();
+        // The SCTK thread stops once the Wayland connection is lost, and
+        // then has no surface left to release.
+        _ = self.tx.send(Action::Dropped(self.id));
     }
 }
 

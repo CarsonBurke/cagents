@@ -1,7 +1,10 @@
 use super::*;
 use crate::{
     model::{CardId, CardKind},
-    workspace_model::views::{Change, Pane, Scope, View},
+    workspace_model::{
+        PaneDestination, PaneMove,
+        views::{Pane, Scope, View},
+    },
 };
 
 fn session_id(pane: &Pane) -> Option<TerminalId> {
@@ -103,89 +106,94 @@ fn find_pane<'a>(
     Ok(found)
 }
 
-fn repository<'a>(model: &'a WorkspaceModel, scope: &'a Scope) -> Option<&'a Path> {
-    match scope {
-        Scope::Channel(id) => model
-            .channel(*id)
-            .map(|channel| channel.repository.as_path()),
-        Scope::Worktree { repository, .. } => Some(repository),
+/// Moves the named pane, or with no name the calling agent session's own,
+/// through the daemon, which authorizes an agent's move and makes a new
+/// channel only for the pane it moves.
+pub(super) fn move_pane(
+    client: &mut ControlClient,
+    target: Option<&str>,
+    to: PaneDestination,
+) -> Result<CommandOutput, AppError> {
+    let pane = match target {
+        Some(target) => {
+            let model = client.read_workspace_model().map_err(protocol_error)?;
+            Some(find_pane(&model, target)?.1.id)
+        }
+        None => None,
+    };
+    let moved = client.move_pane(pane, to).map_err(refusal)?;
+    let human = moved_line(&moved, pane.is_none());
+    let placement = Scope::Channel(moved.channel.id);
+    let unchanged = moved.from == placement;
+    Ok(CommandOutput {
+        command: "channel.move",
+        data: json!({
+            "pane": moved.pane,
+            "placement": placement,
+            "from": moved.from,
+            "channel": moved.channel,
+            "created": moved.created,
+            "moved": !unchanged,
+            "sequence": moved.sequence,
+        }),
+        human,
+    })
+}
+
+/// The daemon's refusal says what to do instead; keep it as its sentence.
+fn refusal(error: ControlError) -> AppError {
+    match error {
+        ControlError::Remote {
+            code: code @ (ProtocolErrorCode::PermissionDenied | ProtocolErrorCode::InvalidRequest),
+            message,
+            ..
+        } => {
+            let kind = if code == ProtocolErrorCode::PermissionDenied {
+                "permission_denied"
+            } else {
+                "invalid_target"
+            };
+            AppError::new(kind, message)
+        }
+        // Anything else, such as a busy daemon, keeps its retry guidance.
+        error => protocol_error(error),
     }
 }
 
-pub(super) fn move_pane(
-    client: &mut ControlClient,
-    target: &str,
-    to: ChannelId,
-) -> Result<CommandOutput, AppError> {
-    let operation = uuid::Uuid::new_v4();
-    let mut pane_id: Option<CardId> = None;
-    for attempt in 0..3 {
-        let model = client.read_workspace_model().map_err(protocol_error)?;
-        let (view, pane) = find_pane(
-            &model,
-            pane_id
-                .map(|id| id.to_string())
-                .as_deref()
-                .unwrap_or(target),
-        )?;
-        pane_id = Some(pane.id);
-        let channel = model
-            .channel(to)
-            .ok_or_else(|| AppError::new("not_found", format!("Channel {to} is no longer open")))?;
-        if repository(&model, &view.scope) != Some(channel.repository.as_path()) {
-            return Err(AppError::new(
-                "invalid_target",
-                "Panes can only move between channels of the same project",
-            ));
-        }
-        let destination = Scope::Channel(to);
-        let result = client.edit_workspace_model(ModelEdit::ChangeView {
-            scope: view.scope.clone(),
-            expected_revision: view.revision,
-            operation,
-            change: Change::Transfer {
-                id: pane.id,
-                destination: destination.clone(),
-                before: None,
-            },
-        });
-        let result = match result {
-            Err(ControlError::Remote {
-                code: ProtocolErrorCode::ViewConflict,
-                ..
-            }) if attempt < 2 => continue,
-            result => result.map_err(protocol_error)?,
-        };
-        let pane = result
-            .views
-            .iter()
-            .find(|view| view.scope == destination)
-            .and_then(|view| view.panes.iter().find(|item| item.id == pane.id))
-            .ok_or_else(|| {
-                AppError::new(
-                    "protocol",
-                    "The daemon did not confirm the requested pane placement",
-                )
-            })?;
-        let channel = result.channel(to).ok_or_else(|| {
-            AppError::new(
-                "protocol",
-                "The daemon did not return the destination channel",
-            )
-        })?;
-        return Ok(CommandOutput {
-            command: "channel.move",
-            data: json!({ "pane": pane, "placement": destination, "channel": channel, "sequence": result.sequence }),
-            human: format!(
-                "{}\t{}\t{}\t{}",
-                pane.id,
-                to,
-                channel.repository.display(),
-                channel.title
-            ),
-        });
+/// One line saying where the pane is now.
+fn moved_line(moved: &PaneMove, own: bool) -> String {
+    let channel = &moved.channel;
+    let title = if channel.title.is_empty() {
+        "New channel"
+    } else {
+        channel.title.as_str()
+    };
+    let pane = if own {
+        "your pane".to_owned()
+    } else {
+        let name = moved
+            .pane
+            .user_title
+            .as_deref()
+            .unwrap_or(moved.pane.title.as_str());
+        format!("pane \"{name}\"")
+    };
+    let repository = channel.repository.display();
+    if moved.from == Scope::Channel(channel.id) {
+        let mut pane = pane;
+        pane[..1].make_ascii_uppercase();
+        format!("{pane} is already in channel \"{title}\" ({}).", channel.id)
+    } else if moved.created {
+        format!(
+            "Created channel \"{title}\" ({}) in {repository} and moved {pane} into it.",
+            channel.id
+        )
+    } else {
+        format!(
+            "Moved {pane} to channel \"{title}\" ({}) in {repository}.",
+            channel.id
+        )
     }
-    unreachable!("the final revision conflict is returned")
 }
 
 #[cfg(test)]
@@ -300,11 +308,32 @@ mod tests {
             ])
             .unwrap();
             assert!(
-                matches!(cli.command, TopCommand::Channel { command: ChannelCommand::Move { target: asked, to: destination } } if asked == target && destination == to)
+                matches!(cli.command, TopCommand::Channel { command: ChannelCommand::Move { target: Some(asked), to: Some(destination), new: None } } if asked == target && destination == to)
             );
             assert_eq!(find_pane(&model, &target).unwrap().1, &pane);
         }
         assert!(Cli::try_parse_from(["cagents", "channel", "move", "worker"]).is_err());
+        assert!(Cli::try_parse_from(["cagents", "channel", "move"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "channel",
+                "move",
+                "--to",
+                &to.to_string(),
+                "--new",
+                "Both"
+            ])
+            .is_err()
+        );
+        let own =
+            Cli::try_parse_from(["cagents", "channel", "move", "--new", "Auth refactor"]).unwrap();
+        assert!(matches!(
+            own.command,
+            TopCommand::Channel {
+                command: ChannelCommand::Move { target: None, to: None, new: Some(title) }
+            } if title == "Auth refactor"
+        ));
         assert_eq!(find_pane(&model, "absent").unwrap_err().kind, "not_found");
         let mut ambiguous = model.clone();
         let mut other = ambiguous.agents[0].clone();
@@ -461,20 +490,13 @@ mod tests {
             host_incarnation: HostIncarnation::new("host"),
         }
     }
-    fn model_response(request_id: u64, model: WorkspaceModel) -> ServerEnvelope {
-        envelope(
-            request_id,
-            ServerMessage::Response {
-                response: ServerResponse::WorkspaceModel { model },
-            },
-        )
-    }
 
-    #[test]
-    fn channel_move_rebases_a_revision_conflict_and_reports_confirmed_placement_without_respawn() {
-        let (mut model, pane, to) = fixture();
-        let original = pane.clone();
-        let target = model.agents[0].id.to_string()[..8].to_owned();
+    /// Serves one connection: answers `Connect`, then each request in turn
+    /// with `reply`, and checks that nothing follows.
+    fn serve(
+        mut reply: impl FnMut(ClientRequest) -> ServerMessage + Send + 'static,
+        requests: usize,
+    ) -> (ControlClient, thread::JoinHandle<()>) {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         server_stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -495,158 +517,204 @@ mod tests {
                 ),
             )
             .unwrap();
-            let mut first_operation = None;
-            for attempt in 0..2 {
-                let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(read.request, ClientRequest::ReadWorkspaceModel));
-                write_frame(
-                    &mut server_stream,
-                    &model_response(read.request_id, model.clone()),
-                )
-                .unwrap();
-                let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                let ClientRequest::EditWorkspaceModel {
-                    edit:
-                        ModelEdit::ChangeView {
-                            scope,
-                            expected_revision,
-                            operation,
-                            change:
-                                Change::Transfer {
-                                    id,
-                                    destination,
-                                    before,
-                                },
-                        },
-                } = edit.request
-                else {
-                    panic!("move may only edit shared membership, never close or spawn a session")
-                };
-                assert_eq!(scope, model.views[0].scope);
-                assert_eq!(id, pane.id);
-                assert_eq!(expected_revision, model.views[0].revision);
-                assert_eq!(destination, Scope::Channel(to));
-                assert_eq!(before, None);
-                if attempt == 0 {
-                    first_operation = Some(operation);
-                    model.views[0].revision += 1;
-                    write_frame(
-                        &mut server_stream,
-                        &envelope(
-                            edit.request_id,
-                            ServerMessage::Error(ProtocolError::new(
-                                ProtocolErrorCode::ViewConflict,
-                                "concurrent view edit",
-                                true,
-                            )),
-                        ),
-                    )
-                    .unwrap();
-                } else {
-                    assert_eq!(Some(operation), first_operation);
-                    model.views[0].panes.clear();
-                    model.views.push(View {
-                        scope: destination.clone(),
-                        revision: 1,
-                        panes: vec![pane.clone()],
-                        retired: vec![],
-                    });
-                    model.agents[0].placement = destination;
-                    model.sequence += 1;
-                    write_frame(
-                        &mut server_stream,
-                        &model_response(edit.request_id, model.clone()),
-                    )
-                    .unwrap();
-                }
+            for _ in 0..requests {
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let message = reply(request.request);
+                write_frame(&mut server_stream, &envelope(request.request_id, message)).unwrap();
             }
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none(),
+                "the move sent a request it was not expected to"
+            );
         });
-        let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let output = move_pane(&mut client, &target, to).unwrap();
+        (ControlClient::from_stream(client_stream).unwrap(), server)
+    }
+
+    fn moved(model: &WorkspaceModel, pane: &Pane, to: ChannelId, created: bool) -> ServerMessage {
+        ServerMessage::Response {
+            response: ServerResponse::PaneMoved(PaneMove {
+                pane: pane.clone(),
+                from: model.views[0].scope.clone(),
+                channel: model.channel(to).unwrap().clone(),
+                created,
+                sequence: model.sequence + 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_named_pane_moves_through_the_daemon_and_says_where_it_is() {
+        let (model, pane, to) = fixture();
+        let target = model.agents[0].id.to_string()[..8].to_owned();
+        let served = model.clone();
+        let expected = pane.clone();
+        let (mut client, server) = serve(
+            move |request| match request {
+                ClientRequest::ReadWorkspaceModel => ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: served.clone(),
+                    },
+                },
+                ClientRequest::MovePane {
+                    pane, destination, ..
+                } => {
+                    assert_eq!(pane, Some(expected.id));
+                    assert_eq!(destination, PaneDestination::Channel(to));
+                    moved(&served, &expected, to, false)
+                }
+                other => panic!("a move sends only a read and the move, not {other:?}"),
+            },
+            2,
+        );
+        let output = move_pane(&mut client, Some(&target), PaneDestination::Channel(to)).unwrap();
+        drop(client);
         server.join().unwrap();
         assert_eq!(output.command, "channel.move");
         assert_eq!(output.data["placement"], json!(Scope::Channel(to)));
-        assert_eq!(
-            output.data["pane"],
-            serde_json::to_value(&original).unwrap()
-        );
+        assert_eq!(output.data["from"], json!(model.views[0].scope));
+        assert_eq!(output.data["moved"], json!(true));
+        assert_eq!(output.data["created"], json!(false));
+        assert_eq!(output.data["pane"], serde_json::to_value(&pane).unwrap());
         assert_eq!(
             output.human,
-            format!("{}\t{to}\t/repo\tchannel", original.id)
+            format!("Moved pane \"my worker\" to channel \"channel\" ({to}) in /repo.")
         );
     }
 
     #[test]
-    fn channel_move_rejects_invalid_targets_before_editing_the_daemon() {
-        for failure in ["pane", "channel", "project", "unconfirmed"] {
-            let (mut model, pane, to) = fixture();
-            if failure == "channel" {
-                model.channels.retain(|channel| channel.id != to);
-            }
-            if failure == "project" {
-                model
-                    .channels
-                    .iter_mut()
-                    .find(|channel| channel.id == to)
-                    .unwrap()
-                    .repository = "/other".into();
-            }
-            let target = if failure == "pane" {
-                CardId::new().to_string()
-            } else {
-                pane.id.to_string()
-            };
-            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-            let server = thread::spawn(move || {
-                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                write_frame(
-                    &mut server_stream,
-                    &envelope(
-                        connect.request_id,
-                        ServerMessage::Response {
-                            response: ServerResponse::Connected {
-                                proof: proof(),
-                                resumed: vec![],
-                            },
-                        },
-                    ),
-                )
-                .unwrap();
-                let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(read.request, ClientRequest::ReadWorkspaceModel));
-                write_frame(
-                    &mut server_stream,
-                    &model_response(read.request_id, model.clone()),
-                )
-                .unwrap();
-                if failure == "unconfirmed" {
-                    let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                    assert!(matches!(
-                        edit.request,
-                        ClientRequest::EditWorkspaceModel { .. }
-                    ));
-                    write_frame(&mut server_stream, &model_response(edit.request_id, model))
-                        .unwrap();
+    fn an_agent_moves_its_own_pane_into_a_channel_it_names() {
+        let (mut model, pane, _) = fixture();
+        let made = ChannelId::new();
+        model.channels.push(ModelChannel {
+            id: made,
+            repository: "/repo".into(),
+            title: "Auth refactor".into(),
+            title_source: Default::default(),
+            ordinal: 3,
+        });
+        let served = model.clone();
+        let expected = pane.clone();
+        let (mut client, server) = serve(
+            move |request| {
+                let ClientRequest::MovePane {
+                    pane: None,
+                    destination: PaneDestination::NewChannel { title, .. },
+                    ..
+                } = request
+                else {
+                    panic!("an agent's own move names no pane and reads nothing first: {request:?}")
+                };
+                assert_eq!(title, "Auth refactor");
+                moved(&served, &expected, made, true)
+            },
+            1,
+        );
+        let output = move_pane(
+            &mut client,
+            None,
+            PaneDestination::NewChannel {
+                id: made,
+                title: "Auth refactor".into(),
+            },
+        )
+        .unwrap();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(output.data["created"], json!(true));
+        assert_eq!(
+            output.human,
+            format!(
+                "Created channel \"Auth refactor\" ({made}) in /repo and moved your pane into it."
+            )
+        );
+    }
+
+    #[test]
+    fn a_pane_already_in_the_channel_says_so() {
+        let (model, pane, _) = fixture();
+        let Scope::Channel(here) = model.views[0].scope else {
+            unreachable!()
+        };
+        let moved = PaneMove {
+            pane,
+            from: Scope::Channel(here),
+            channel: model.channel(here).unwrap().clone(),
+            created: false,
+            sequence: 5,
+        };
+        assert_eq!(
+            moved_line(&moved, true),
+            format!("Your pane is already in channel \"channel\" ({here}).")
+        );
+    }
+
+    #[test]
+    fn a_refusal_keeps_the_daemons_sentence_and_an_unknown_handle_sends_no_move() {
+        let sentence = "Pane 1 belongs to another session. Ask the person to move it";
+        let (mut client, server) = serve(
+            move |_| {
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::PermissionDenied,
+                    sentence,
+                    false,
+                ))
+            },
+            1,
+        );
+        let error = move_pane(
+            &mut client,
+            None,
+            PaneDestination::Channel(ChannelId::new()),
+        )
+        .err()
+        .unwrap();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(error.kind, "permission_denied");
+        assert_eq!(error.message, sentence);
+
+        // Anything else keeps the daemon's code and whether to try again.
+        let (mut client, server) = serve(
+            |_| {
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::ViewConflict,
+                    "The view changed",
+                    true,
+                ))
+            },
+            1,
+        );
+        let error = move_pane(
+            &mut client,
+            None,
+            PaneDestination::Channel(ChannelId::new()),
+        )
+        .err()
+        .unwrap();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(error.kind, "protocol");
+        assert_eq!(error.details.unwrap()["retryable"], true);
+
+        let (model, _, to) = fixture();
+        let (mut client, server) = serve(
+            move |request| {
+                assert!(matches!(request, ClientRequest::ReadWorkspaceModel));
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: model.clone(),
+                    },
                 }
-                assert!(
-                    read_frame::<ClientEnvelope>(&mut server_stream)
-                        .unwrap()
-                        .is_none(),
-                    "a rejected move must send no mutation"
-                );
-            });
-            let mut client = ControlClient::from_stream(client_stream).unwrap();
-            let error = move_pane(&mut client, &target, to).err().unwrap();
-            assert_eq!(
-                error.kind,
-                match failure {
-                    "project" => "invalid_target",
-                    "unconfirmed" => "protocol",
-                    _ => "not_found",
-                }
-            );
-            drop(client);
-            server.join().unwrap();
-        }
+            },
+            1,
+        );
+        let error = move_pane(&mut client, Some("absent"), PaneDestination::Channel(to))
+            .err()
+            .unwrap();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(error.kind, "not_found");
     }
 }

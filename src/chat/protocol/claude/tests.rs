@@ -4060,8 +4060,11 @@ fn a_bash_result_loses_its_terminal_escapes_and_a_read_file_does_not() {
 #[test]
 fn an_edit_is_a_file_change_that_its_result_completes() {
     let input = json!({"file_path":"/workspace/src/app.rs","old_string":"let a = 1;","new_string":"let a = 2;","replace_all":false});
+    // Made from the call, the patch counts from the text it finds; only
+    // the applied one has the file's line numbers.
     let called = ItemContent::Changes {
         changes: vec![FileChange {
+            lines: crate::chat::LineOrigin::Excerpt,
             path: "/workspace/src/app.rs".into(),
             kind: ChangeKind::Updated,
             diff: "@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;\n".into(),
@@ -4075,6 +4078,7 @@ fn an_edit_is_a_file_change_that_its_result_completes() {
         "message":{"content":[{"type":"tool_result","tool_use_id":"edit","content":"The file /workspace/src/app.rs has been updated successfully."}]}});
     let applied = ItemContent::Changes {
         changes: vec![FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "/workspace/src/app.rs".into(),
             kind: ChangeKind::Updated,
             diff: "@@ -41,3 +41,3 @@\n fn main() {\n-    let a = 1;\n+    let a = 2;\n }\n".into(),
@@ -4113,6 +4117,39 @@ fn an_edit_is_a_file_change_that_its_result_completes() {
     assert_eq!(items(&streamed.receive(result).unwrap()), vec![applied]);
 }
 
+/// An edit waiting to be allowed is still the patch made from its call,
+/// numbered from the text it finds; once allowed and applied it has the
+/// file's numbers.
+#[test]
+fn an_edit_waiting_for_approval_is_numbered_from_its_snippet_until_applied() {
+    let input =
+        json!({"file_path":"src/app.rs","old_string":"let a = 1;","new_string":"let a = 2;"});
+    let origins = |step: &Step| {
+        items(step)
+            .into_iter()
+            .flat_map(|content| match content {
+                ItemContent::Changes { changes, .. } => changes,
+                _ => Vec::new(),
+            })
+            .map(|change| change.lines)
+            .collect::<Vec<_>>()
+    };
+    let mut adapter = Claude::default();
+    let call = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"tool-1","name":"Edit","input":input}]}})).unwrap();
+    assert_eq!(origins(&call), [crate::chat::LineOrigin::Excerpt]);
+    let asked = adapter.receive(approval("p", "Edit", input)).unwrap();
+    assert!(
+        origins(&asked)
+            .iter()
+            .all(|lines| *lines == crate::chat::LineOrigin::Excerpt),
+        "asking for approval places nothing"
+    );
+    let applied = adapter.receive(json!({"type":"user","uuid":"u1","tool_use_result":{
+        "structuredPatch":[{"oldStart":41,"oldLines":1,"newStart":41,"newLines":1,"lines":["-let a = 1;","+let a = 2;"]}]},
+        "message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}})).unwrap();
+    assert_eq!(origins(&applied), [crate::chat::LineOrigin::File]);
+}
+
 /// A write is an addition, or an update where its result says the file
 /// was already there; a transcript names the structured result
 /// differently from the wire and is read the same.
@@ -4144,6 +4181,7 @@ fn a_write_is_an_addition_until_its_result_says_it_overwrote() {
             items(&adapter.receive(result).unwrap()),
             vec![ItemContent::Changes {
                 changes: vec![FileChange {
+                    lines: crate::chat::LineOrigin::File,
                     path: "notes.md".into(),
                     kind,
                     diff: diff.into(),
@@ -4175,10 +4213,65 @@ fn a_failed_edit_is_the_tool_call_and_its_error() {
         vec![ItemContent::Tool {
             name: "MultiEdit".into(),
             input: input.to_string(),
-            output: "<tool_use_error>String to replace not found in file.</tool_use_error>".into(),
+            output: "String to replace not found in file.".into(),
             status: ToolStatus::Failed,
         }]
     );
+}
+
+/// Claude Code wraps an error its harness raised in tags for the model.
+/// The reader gets the sentence, and a tool the model made up is named as
+/// one rather than reported as missing from the harness.
+#[test]
+fn a_harness_error_is_shown_without_its_framing() {
+    let cases = [
+        (
+            "cagents",
+            json!({"command":"reply 67218a1b \"lead: noted\""}),
+            "<tool_use_error>Error: No such tool available: cagents</tool_use_error>",
+            "Claude called a tool that doesn't exist: cagents",
+        ),
+        (
+            "Monitor",
+            json!({"command":"sleep 30"}),
+            "<tool_use_error>Blocked: standalone sleep 30.</tool_use_error>",
+            "Blocked: standalone sleep 30.",
+        ),
+        (
+            "WebFetch",
+            json!({"url":"example"}),
+            "<tool_use_error>InputValidationError: Invalid URL</tool_use_error>",
+            "InputValidationError: Invalid URL",
+        ),
+        (
+            "mcp__docs__search",
+            json!({"query":"seal"}),
+            "<tool_use_error>Error: No such tool available: mcp__docs__search</tool_use_error>",
+            "Claude called mcp__docs__search, which isn't available. Its MCP server may not be connected.",
+        ),
+        (
+            "Tasks",
+            json!({}),
+            "\n<tool_use_error>Error: No such tool available: Tasks. Did you mean Task?</tool_use_error>\n",
+            "Claude called a tool that doesn't exist: Tasks\nDid you mean Task?",
+        ),
+    ];
+    for (name, input, result, shown) in cases {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"call","name":name,"input":input}]}})).unwrap();
+        let failed = adapter.receive(json!({"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"call","is_error":true,"content":result}]}})).unwrap();
+        let [ItemContent::Tool { output, status, .. }] = &items(&failed)[..] else {
+            panic!("{name}: {:#?}", items(&failed))
+        };
+        assert_eq!(output, shown, "{name}");
+        assert_eq!(*status, ToolStatus::Failed, "{name}");
+    }
+    // A successful result is the tool's own text, even when it quotes tags.
+    let mut adapter = Claude::default();
+    adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"call","name":"WebFetch","input":{"url":"https://example.com"}}]}})).unwrap();
+    let quoted = "<tool_use_error>Error: No such tool available: x</tool_use_error>";
+    let done = adapter.receive(json!({"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":quoted}]}})).unwrap();
+    assert!(matches!(&items(&done)[..], [ItemContent::Tool { output, .. }] if output == quoted));
 }
 
 /// A write too large for its input to be held, and an edit whose input
@@ -13412,18 +13505,20 @@ fn claude_history_correlates_edits_across_every_100_record_page_boundary() {
         assert_eq!(*status, ToolStatus::Succeeded);
         assert!(changes[0].diff.contains("+actually applied"));
         assert!(!changes[0].diff.contains("+requested"));
+        assert_eq!(changes[0].lines, crate::chat::LineOrigin::File);
     }
     assert!(
         matches!(&items["edit-145"].content,ItemContent::Tool{name,status:ToolStatus::Failed,output,..} if name=="Edit"&&output=="permission denied")
     );
     // Left without a result by a process before this one, which this
     // one never runs.
+    // Nor did it ever say where in the file its lines are.
     assert!(matches!(
         &items["edit-146"].content,
         ItemContent::Changes {
             status: ToolStatus::Stopped,
-            ..
-        }
+            changes,
+        } if changes[0].lines == crate::chat::LineOrigin::Excerpt
     ));
 }
 #[test]
@@ -14915,4 +15010,106 @@ fn a_main_request_reports_its_start_and_what_the_cache_served() {
         )
         .unwrap();
     assert!(evidence(step).is_empty());
+}
+
+/// Recorded from Claude Code 2.1.325 on the cheapest model: the lead starts a
+/// background agent, "Outer", which runs a foreground agent, "Inner", to the
+/// end and then resumes it with `SendMessage`. The resumed run's task names the
+/// message's call, but Claude Code forwards Inner's conversation under the
+/// `Agent` call that first started it, with Inner's task as its `agent_id`.
+const RESUMED_HELPER: &str =
+    include_str!("../../../../tests/fixtures/claude-nested-agent-resumed-live.jsonl");
+const RESUMED_OUTER: &str = "toolu_01L7yVqgWPaXHA9MUXPysRiz";
+const RESUMED_INNER_CALL: &str = "toolu_01D4f3tdnUHvNUWeYACuqUdQ";
+
+#[test]
+fn a_helper_resumed_by_its_worker_is_not_a_lead_agent() {
+    // Whether or not the lead saw the helper's first run: Claude Code may
+    // have restarted since, as it does when cagents resumes the conversation.
+    for first_run_seen in [true, false] {
+        let mut lead = Lead::default();
+        let mut skipping = false;
+        for line in RESUMED_HELPER.lines() {
+            let frame: Value = serde_json::from_str(line).unwrap();
+            let calls = |name: &str| {
+                frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|block| block["type"] == "tool_use" && block["name"] == name)
+                    })
+            };
+            if !first_run_seen {
+                skipping = (skipping
+                    || calls("Agent") && frame["parent_tool_use_id"] == RESUMED_OUTER)
+                    && !calls("SendMessage");
+                if skipping {
+                    continue;
+                }
+            }
+            lead.receive(frame);
+            assert!(
+                subagent_ids(&lead.snapshot)
+                    .iter()
+                    .all(|agent| *agent == RESUMED_OUTER),
+                "first run seen: {first_run_seen}: {:?}",
+                subagent_ids(&lead.snapshot)
+            );
+        }
+        assert_eq!(subagent_ids(&lead.snapshot), [RESUMED_OUTER]);
+        assert_eq!(lead.snapshot.subagents[0].status, ToolStatus::Succeeded);
+        assert_eq!(agent_counts(&lead.snapshot), (0, 0, 0, 0));
+        assert!(
+            !lead
+                .snapshot
+                .items
+                .iter()
+                .any(|item| item.id == RESUMED_INNER_CALL),
+            "the helper's call is its worker's row, not the lead's"
+        );
+    }
+}
+
+#[test]
+fn images_left_after_a_reference_is_deleted_keep_their_own_labels() {
+    // The composer drops an image whose reference was deleted and never
+    // renumbers the rest, so a prompt can name [Image N] and [Image N+2]
+    // alone, in either order.
+    crate::chat::attachment_assets::with_test_image(|first| {
+        let _removed = crate::chat::attachment_assets::test_image("removed.png");
+        let third = crate::chat::attachment_assets::test_image("third.png");
+        let label = |image: &Attachment| image.reference.clone().unwrap();
+        let text = format!(
+            "Compare {} with {}",
+            label(&third).token(),
+            label(&first).token()
+        );
+        let mut adapter = Claude {
+            ready: true,
+            ..Default::default()
+        };
+        let submitted = adapter
+            .send_prompt(
+                text.clone(),
+                vec![first.clone(), third.clone()],
+                PromptMode::Send,
+            )
+            .unwrap();
+        let content = submitted.writes[0]["message"]["content"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(content.len(), 5);
+        assert_eq!(content[0], json!({"type":"text","text":text}));
+        for (caption, image, attachment) in [(1, 2, &third), (3, 4, &first)] {
+            assert_eq!(content[caption]["text"], label(attachment).token());
+            assert_eq!(
+                STANDARD
+                    .decode(content[image]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+        }
+    });
 }

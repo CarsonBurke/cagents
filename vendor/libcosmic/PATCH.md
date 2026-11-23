@@ -60,3 +60,15 @@ while it runs, and Tab moves on from it.
 The application regression `disabled_buttons_are_not_focus_stops` in
 `src/ui_controls/button.rs` covers traversal in both directions, locating, and
 disabling a focused button.
+
+# The settings portal reconnects with a backoff
+
+`desktop_settings` reconnected to the desktop settings portal as soon as both
+of its change streams ended. When the session bus is gone, every call fails at
+once, so the subscription spun and logged five errors per pass (about 6,000
+passes while an application shut down after its session ended). It now waits
+before reconnecting, one second after a working connection ends and doubling
+after each consecutive failure up to a minute, as it already did when the
+proxy could not be created. Reading a setting resets the wait. Without the
+`tokio` feature there is no timer, so the subscription stops there instead, as
+the proxy failure path already did.

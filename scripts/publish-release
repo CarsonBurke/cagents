@@ -45,9 +45,11 @@ while (($#)); do
     esac
 done
 
-for command in git jq sed sort sha256sum tar mktemp cp cmp; do
+for command in git jq sed sort sha256sum tar mktemp cp cmp ssh-keygen; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+# scripts/release-metadata runs on the system Python.
+[[ -x /usr/bin/python3 ]] || fail 'required command not found: /usr/bin/python3'
 
 checkout_git() (
     # A caller's Git routing must not redirect this checkout's tag checks.
@@ -89,10 +91,10 @@ EDITOR_ARCHIVE=ceditor-$VERSION-$TARGET.tar.gz
 PAYLOADS=(
     "$FULL_ARCHIVE" "$FULL_DEB" "$FULL_SIZES" "$COMPARISON"
     "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
-    "$EDITOR_ARCHIVE" SHA256SUMS-browserless SHA256SUMS-ceditor
-    release-metadata.json install.sh
+    "$EDITOR_ARCHIVE" SHA256SUMS-browserless SHA256SUMS-ceditor install.sh
 )
-ASSETS=("${PAYLOADS[@]}" SHA256SUMS)
+# The signed metadata names every other asset with its size and digest.
+ASSETS=("${PAYLOADS[@]}" SHA256SUMS release-metadata.json release-metadata.json.sig)
 EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
 
 check_asset_set() {
@@ -106,7 +108,7 @@ check_asset_set() {
     done
     shopt -u nullglob dotglob
     actual=$(printf '%s\n' "${names[@]}" | sort)
-    [[ $actual == "$EXPECTED_ASSETS" ]] || fail 'release directory must contain exactly the 13 expected assets (no extra files or directories)'
+    [[ $actual == "$EXPECTED_ASSETS" ]] || fail 'release directory must contain exactly the 14 expected assets (no extra files or directories)'
 }
 
 # Parse names before sha256sum: even a valid checksum must never read outside dist.
@@ -136,36 +138,45 @@ check_checksums() {
     check_manifest "$1" SHA256SUMS-ceditor "$EDITOR_ARCHIVE"
 }
 
+# An allowed-signers file for the trusted key lines of a release-keys.pub.
+allowed_signers() {
+    sed -n 's/^[[:space:]]*\(ssh-ed25519\|sk-ssh-ed25519@openssh\.com\) \([A-Za-z0-9+/=]*\).*$/cagents-release namespaces="cagents-release" \1 \2/p' <<< "$1"
+}
+
+verify_signature() {
+    ssh-keygen -q -Y verify -f "$2" -I cagents-release -n cagents-release \
+        -s "$1/release-metadata.json.sig" < "$1/release-metadata.json" >/dev/null
+}
+
 check_metadata() {
-    jq -se --arg version "$VERSION" --arg source "$SOURCE_COMMIT" --arg target "$TARGET" '
-        length == 1 and .[0] == {
-            schema_version: 1,
-            repository: "CarsonBurke/cagents",
-            version: $version,
-            source_commit: $source,
-            targets: [{
-                target: $target, os: "linux", architecture: "x86_64", libc: "gnu",
-                minimum_glibc: "2.35",
-                products: {
-                    cagents: {
-                        archive: ("cagents-" + $version + "-" + $target + ".tar.gz"),
-                        deb: ("cagents_" + $version + "_amd64.deb"),
-                        installer: "install.sh", checksums: "SHA256SUMS"
-                    },
-                    "cagents-browserless": {
-                        archive: ("cagents-browserless-" + $version + "-" + $target + ".tar.gz"),
-                        deb: ("cagents-browserless_" + $version + "_amd64.deb"),
-                        checksums: "SHA256SUMS-browserless"
-                    },
-                    ceditor: {
-                        archive: ("ceditor-" + $version + "-" + $target + ".tar.gz"),
-                        checksums: "SHA256SUMS-ceditor"
-                    }
-                }
-            }]
-        }
-    ' "$1/release-metadata.json" >/dev/null \
-        || fail 'release metadata does not match the supported schema, target, version, products, and local tag commit'
+    local keys source protocol previous
+    source=$(checkout_git show "$SOURCE_COMMIT:src/terminal/ipc.rs") || fail "$TAG has no src/terminal/ipc.rs"
+    protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9]*\);$/\1/p' <<< "$source")
+    [[ $protocol =~ ^[1-9][0-9]*$ ]] || fail "cannot read the daemon protocol at $TAG"
+    "$ROOT_DIR/scripts/release-metadata" check --dir "$1" --version "$VERSION" \
+        --source-commit "$SOURCE_COMMIT" >/dev/null \
+        || fail 'release metadata does not match the supported schema, version, local tag commit and assets'
+    jq -e --argjson protocol "$protocol" '.protocol == $protocol' "$1/release-metadata.json" >/dev/null \
+        || fail "release metadata does not name the tagged daemon protocol $protocol"
+    # Builds trust the keys their source lists; the tagged list must already
+    # hold the signing key, so the release's own build accepts its successor.
+    keys=$(checkout_git show "$SOURCE_COMMIT:src/update/release-keys.pub") \
+        || fail "$TAG has no src/update/release-keys.pub"
+    allowed_signers "$keys" > "$WORK_DIR/allowed-signers"
+    [[ -s $WORK_DIR/allowed-signers ]] || fail "$TAG trusts no release signing key; see docs/releasing.md#signing"
+    verify_signature "$1" "$WORK_DIR/allowed-signers" \
+        || fail 'release-metadata.json.sig is not a signature by a key the tagged source trusts'
+    # Installed builds of the previous release verify this one with that
+    # release's keys, so a rotation must still be signed by a key it lists.
+    previous=$(checkout_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$SOURCE_COMMIT^" 2>/dev/null) \
+        || previous=
+    if [[ -n $previous ]] && keys=$(checkout_git show "$previous:src/update/release-keys.pub" 2>/dev/null); then
+        allowed_signers "$keys" > "$WORK_DIR/previous-signers"
+        if [[ -s $WORK_DIR/previous-signers ]]; then
+            verify_signature "$1" "$WORK_DIR/previous-signers" \
+                || fail "release-metadata.json.sig is not signed by a key $previous trusts, so its users could not update"
+        fi
+    fi
     [[ $(sed -n '/^DEFAULT_REPOSITORY=/p' "$1/install.sh") == "DEFAULT_REPOSITORY='$REPOSITORY'" ]] \
         || fail 'installer is not stamped for the canonical repository'
 }
@@ -274,7 +285,7 @@ check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
 smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
 if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
 "$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
-printf 'Validated %s: 13 assets, checksums, archive layouts, and source %s\n' "$TAG" "$SOURCE_COMMIT"
+printf 'Validated %s: 14 assets, the signed metadata, checksums, archive layouts, and source %s\n' "$TAG" "$SOURCE_COMMIT"
 if "$VERIFY_ONLY"; then
     exit 0
 fi
@@ -319,48 +330,41 @@ check_remote_tag() {
 check_remote_tag
 
 RELEASE_MARKER='<!-- cagents-local-release -->'
-BUNDLE_HASH=$(sha256sum "$DIST_DIR/SHA256SUMS")
+BUNDLE_HASH=$(sha256sum "$DIST_DIR/release-metadata.json")
 BUNDLE_HASH=${BUNDLE_HASH%% *}
-BUNDLE_MARKER="<!-- source_commit=$SOURCE_COMMIT SHA256SUMS=$BUNDLE_HASH -->"
+BUNDLE_MARKER="<!-- source_commit=$SOURCE_COMMIT release-metadata.json=$BUNDLE_HASH -->"
 NOTES=$WORK_DIR/release-notes.txt
-cat > "$NOTES" <<EOF
-$RELEASE_MARKER
-$BUNDLE_MARKER
+{
+    printf '%s\n%s\n\n' "$RELEASE_MARKER" "$BUNDLE_MARKER"
+    # Commit subjects can name people; quoted, a name notifies no one.
+    jq -r '.notes' "$DIST_DIR/release-metadata.json" | sed -E 's/(^|[[:space:](])@([A-Za-z0-9][-A-Za-z0-9]*)/\1`@\2`/g'
+    cat <<EOF
 
-## Linux x86_64 binaries
+## Install
 
-Full cagents, browserless cagents, and the standalone ceditor are available
-for \`$TARGET\` (glibc 2.35 or newer, Wayland).
-Repository features require Git 2.36 or newer; upgrade Ubuntu 22.04's default Git separately.
-Windows and macOS binaries are not provided.
+Linux x86_64 with glibc 2.35 or newer and Wayland. Repository features need
+Git 2.36 or newer. Windows and macOS builds are not provided.
 
-Built and validated locally from \`$SOURCE_COMMIT\`; no GitHub Actions are used.
-
-Authenticate with \`gh auth login\` for private-repository access, then download
-and verify the complete release before running its installer:
+An installed cagents offers this release under Update and installs it itself
+after checking its signature. To install by hand:
 
 \`\`\`sh
-gh release download "$TAG" --repo CarsonBurke/cagents --dir "cagents-$VERSION-release"
-cd "cagents-$VERSION-release"
-sha256sum --check --strict SHA256SUMS
-CAGENTS_ARCHIVE="\$PWD/$FULL_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS" sh ./install.sh --restart-daemon
+base=https://github.com/$REPOSITORY/releases/download/$TAG
+mkdir "cagents-$VERSION" && cd "cagents-$VERSION"
+curl --fail --location --remote-name-all "\$base/$FULL_ARCHIVE" "\$base/SHA256SUMS" "\$base/install.sh"
+sha256sum --check --strict --ignore-missing SHA256SUMS
+CAGENTS_ARCHIVE="\$PWD/$FULL_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS" sh ./install.sh --version $VERSION --restart-daemon
 \`\`\`
 
-The Update action performs the same verified full-package migration for
-supported self-managed installs. Debian packages must be upgraded with the
-system package manager; browserless and source installations are not
-self-replaced by Update.
+Debian packages are upgraded with the system package manager. The standalone
+ceditor archive unpacks into \`~/.local\`:
+\`tar -xzf $EDITOR_ARCHIVE --strip-components=1 -C ~/.local\`.
 
-To install only ceditor after checksum verification (without cagents):
-
-\`\`\`sh
-mkdir -p "\$HOME/.local"
-tar -xzf "$EDITOR_ARCHIVE" --strip-components=1 -C "\$HOME/.local"
-\`\`\`
-
-Ensure \`\$HOME/.local/bin\` is on PATH. Archive desktop entries and icons
-reside under \`share/\`; \`release-metadata.json\` lists exact supported assets.
+Built and verified locally from \`$SOURCE_COMMIT\`.
+\`release-metadata.json\` lists every asset with its SHA-256 and is signed in
+\`release-metadata.json.sig\` (\`ssh-keygen -Y verify -n cagents-release\`).
 EOF
+} > "$NOTES"
 
 release_for_tag() {
     gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
@@ -423,6 +427,7 @@ for asset in "${ASSETS[@]}"; do
         || fail "refusing to publish: GitHub served different bytes for $asset"
 done
 check_checksums "$WORK_DIR/downloaded"
+check_metadata "$WORK_DIR/downloaded"
 check_remote_tag
 assert_current_draft
 gh api --hostname github.com --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \

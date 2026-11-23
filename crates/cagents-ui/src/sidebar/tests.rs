@@ -4072,11 +4072,18 @@ fn project_drag_label_stays_plain_and_inset_navigation_states_are_rounded() {
     assert!(active(false, &theme).background.is_none());
     assert!(hovered(false, &theme).background.is_none());
     assert!(pressed(false, &theme).background.is_none());
+    // Keyboard focus is an accent ring, never a fill: a fill would read as
+    // hover or as a second selection.
     let focused = hovered(true, &theme);
     assert!(
-        focused.background.is_some(),
+        focused.background.is_none(),
+        "keyboard focus does not fill the row"
+    );
+    assert!(
+        focused.outline_width > 0.0,
         "keyboard focus remains visible"
     );
+    assert_eq!(focused.outline_color, design::accent_color(&theme));
     assert_eq!(
         focused.border_radius,
         theme.cosmic().corner_radii.radius_s.into()

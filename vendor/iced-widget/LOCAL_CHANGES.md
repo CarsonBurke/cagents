@@ -77,3 +77,9 @@ Why: upstream's minimum is 2 pixels. A transcript sized for its whole conversati
 `MouseArea` publishes `on_exit` when it was hovered and a pointer event arrives with no cursor position: the pointer left the window, a scrollable withholds the cursor because it is outside the scrollable's viewport, or a layer above makes it levitate. The area then counts as left, so moving back over it publishes `on_enter` again.
 
 Why: this copy returned early whenever the cursor had no position, before its hover bookkeeping, so none of those cases ended the hover. The workspace tab strip is a scrollable whose tabs track hover through `on_enter`/`on_exit`; moving the pointer from a tab down into the pane left that tab drawn hovered, with its close button, beside the selected tab (cagents #3637). Upstream iced compares the cursor position on every event and so ends the hover. Coverage: `app::tests::tab_hover_ends_when_the_pointer_leaves_the_strip` in crates/cagents-ui. Remove this when the pinned upstream mouse area ends hover without a cursor.
+
+## Accessibility through tooltips and wrapping rows (cagents #3259)
+
+`Tooltip` and `row::Wrapping` report their content's accessibility nodes (`a11y_nodes`). Upstream they kept the trait's empty default, so a control under a tooltip, or in a row that wraps, was missing from the accessibility tree. Screen readers couldn't find it, and focus or click requests addressed to it never arrived. A tooltip reports its content and leaves the tooltip text out, as upstream does when it draws the tooltip. Wrapping reports what its row would.
+
+Why: the composer's attachment tiles each sit under a tooltip in a wrapping row, and none of them reached assistive tools. The same applies to every other tooltip-wrapped control in the app. The regression test is `assistive_tools_find_every_tile_in_the_tray` in crates/cagents-ui/src/app/chat_ui/attachment_tile.rs. Remove this change when upstream forwards these nodes.

@@ -175,7 +175,7 @@ STUBS = {
         printf '%s\\n' "${CAGENTS_BUILD_SEED:-unset}" >> "$STUB_LOG/cargo-seed"
         printf '%s\\n' "${CAGENTS_BUILD_REMOTE_LOOPBACK:-unset}" >> "$STUB_LOG/cargo-loopback"
         mkdir -p "$CARGO_TARGET_DIR/dev-runtime"
-        for name in cagents cagentsd cagents-ui; do
+        for name in cagents cagentsd cagents-ui cagents-dictate; do
             cp "$STUB_BIN/fixture-cli" "$CARGO_TARGET_DIR/dev-runtime/$name"
         done
     """,
@@ -572,9 +572,12 @@ class Evidence(unittest.TestCase):
     def executables(self, directory: Path, checkout: Path) -> None:
         """Executables as build would make them of CHECKOUT, and what it built them with."""
         directory.mkdir(parents=True)
-        for name in ("cagents", "cagentsd", "cagents-ui"):
-            shutil.copy(self.bin / "fixture-cli", directory / name)
-        (directory / "arguments").write_text(self.run_tool("__build-arguments", cwd=checkout).stdout)
+        arguments = self.run_tool("__build-arguments", cwd=checkout).stdout
+        # One executable per build, named last on its line: the runner's
+        # three, and dictation's helper where the checkout's UI uses it.
+        for line in arguments.splitlines():
+            shutil.copy(self.bin / "fixture-cli", directory / line.split()[-1])
+        (directory / "arguments").write_text(arguments)
 
     def test_a_main_commit_the_sentinel_built_is_taken_without_compiling(self) -> None:
         checkout = self.checkout()

@@ -17,6 +17,7 @@ use std::{
     time::Instant,
 };
 
+mod pane_move;
 #[cfg(all(test, target_os = "linux"))]
 mod pending_tests;
 #[cfg(test)]
@@ -34,6 +35,10 @@ pub(super) fn pending_start_test_hook() {
         hook();
     }
 }
+
+#[cfg(test)]
+pub(super) use pane_move::before_transfer;
+pub(super) use pane_move::move_pane;
 
 fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, message, false)

@@ -3,8 +3,10 @@
 //! session, the terminals it started and the sessions of the agents it
 //! delegated to. Typing into a delegated agent's session, an agent console or
 //! a provider CLI acts as the person at it, who can approve tool requests, so
-//! only an agent whose own approvals are not limited may do it. Anything
-//! outside the terminal surface stays with the user.
+//! only an agent whose own approvals are not limited may do it. By the same
+//! rule it may move the panes of the sessions it controls into another
+//! channel of their project, making that channel for the move if it asks.
+//! Anything else outside the terminal surface stays with the user.
 //!
 //! The boundary is the `cagents` CLI, which authenticates before it changes a
 //! terminal from inside a hosted session. A process that reaches the socket
@@ -26,6 +28,9 @@ enum Access<'a> {
     /// clicking at it would.
     Input(TerminalId),
     Spawn(&'a TerminalSession),
+    /// Moves a pane to another channel. The handler authorizes the pane it
+    /// reads, at the view revision it moves it at, with [`authorize_move`].
+    Place,
     /// Belongs to the user alone, or carries an authority of its own.
     Refused,
 }
@@ -82,6 +87,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
             Access::Control(session.id)
         }
         R::Spawn { session, .. } => Access::Spawn(session),
+        R::MovePane { .. } => Access::Place,
         R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
@@ -109,6 +115,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatAttach { .. }
         | R::ChatDetach { .. }
         | R::ChatCommand { .. }
+        | R::ChatDeliver { .. }
         | R::ChatVisibility { .. }
         | R::ChatRead { .. }
         | R::ChatClose { .. }
@@ -182,6 +189,7 @@ pub(in crate::host) fn admit(
             "An agent session's connection may only read terminals and change its own",
         )),
         Access::Spawn(session) => fresh(host, session),
+        Access::Place => Ok(()),
         Access::Control(terminal) | Access::Input(terminal) => {
             let control = controls(host, lineage, terminal).map_err(internal)?;
             let Some(control) = control else {
@@ -276,6 +284,74 @@ pub(in crate::host) fn adopt(
         .unwrap_or_else(|p| p.into_inner())
         .own_terminal(Lineage(terminal), owner)
         .map_err(internal)
+}
+
+/// What an agent's request to move a pane is about.
+pub(in crate::host) enum Mover {
+    /// A person's connection, which may move any pane.
+    Person,
+    /// A connection acting for an agent session, whose live session is
+    /// `session`: its own pane is the one showing it.
+    Agent {
+        lineage: Lineage,
+        session: TerminalId,
+    },
+}
+
+/// Who a connection moves panes for. An agent connection whose issuing
+/// session is no longer live moves nothing.
+pub(in crate::host) fn mover(
+    host: &SharedHost,
+    client_id: ClientId,
+) -> Result<Mover, ProtocolError> {
+    let Some(lineage) = acting_for(host, client_id) else {
+        return Ok(Mover::Person);
+    };
+    let authority = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_client_authorities
+        .get(&client_id)
+        .cloned()
+        .ok_or_else(|| denied("This connection's agent authority is no longer recorded"))?;
+    match super::caller(host, &authority).map_err(denied)? {
+        (_, Some(session)) => Ok(Mover::Agent { lineage, session }),
+        (_, None) => Err(denied(
+            "Only a live agent session can move its pane; ask the person to move it",
+        )),
+    }
+}
+
+/// Refuses moving `pane` for an agent that does not control its session: its
+/// own session, a terminal it started, or the session or console of an
+/// agent it delegated to, as for terminal control. A pane that shows no
+/// session, such as a browser or editor, is never an agent's to move.
+pub(in crate::host) fn authorize_move(
+    host: &SharedHost,
+    mover: &Mover,
+    pane: &crate::workspace_model::views::Pane,
+) -> Result<(), ProtocolError> {
+    let Mover::Agent { lineage, .. } = mover else {
+        return Ok(());
+    };
+    let session = match &pane.kind {
+        crate::model::CardKind::Chat(session) => Some(session.id),
+        crate::model::CardKind::Terminal(session) => Some(session.id),
+        _ => None,
+    };
+    let controlled = match session {
+        Some(terminal) => controls(host, *lineage, terminal)
+            .map_err(internal)?
+            .is_some(),
+        None => false,
+    };
+    if controlled {
+        return Ok(());
+    }
+    Err(denied(format!(
+        "Pane {} belongs to another session. An agent moves only its own pane and those of the terminals and agents it started; message that session with `cagents send`, or ask the person to move it",
+        pane.id
+    )))
 }
 
 fn acting_for(host: &SharedHost, client_id: ClientId) -> Option<Lineage> {

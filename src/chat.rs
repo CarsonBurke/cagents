@@ -2170,6 +2170,11 @@ impl Command {
     }
 }
 
+/// What the sender of a message calls one send of it, the same each time it
+/// asks: asked again under the same key, the actor reports what became of the
+/// first send rather than sending it twice.
+pub type DeliveryKey = uuid::Uuid;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Verify login on the same live actor without replaying any failed prompt.
@@ -2450,14 +2455,79 @@ pub enum ChangeKind {
     },
 }
 
+/// What a patch's hunk ranges count from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineOrigin {
+    /// Positions in the file: line 12 of the patch is line 12 of the file.
+    File,
+    /// Not known to be file positions, such as the start of the text a Claude
+    /// `Edit` searches for, which can be anywhere in the file. The lines'
+    /// order and context hold; their numbers don't say where they are. A
+    /// patch whose origin was not recorded is read this way.
+    #[default]
+    Excerpt,
+}
+
 /// One file's worth of a provider's edit, carrying the patch rather than a
 /// rendering of it so the view can use the repository pane's diff canvas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct FileChange {
     pub path: String,
     pub kind: ChangeKind,
     /// Unified diff for this path alone.
     pub diff: String,
+    /// What the diff's line numbers count from. Absent from an older record
+    /// or source, which said nothing about it.
+    #[serde(default)]
+    pub lines: LineOrigin,
+}
+
+/// As derived, except that a client from before [`LineOrigin`] is sent the
+/// fields it decodes.
+impl Serialize for FileChange {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !crate::terminal_ipc::encoding_before(crate::terminal_ipc::PATCH_LINE_ORIGIN) {
+            return Self::serialize(self, serializer);
+        }
+        #[derive(Serialize)]
+        #[serde(rename = "FileChange")]
+        struct Before<'a> {
+            path: &'a str,
+            kind: &'a ChangeKind,
+            diff: &'a str,
+        }
+        Before {
+            path: &self.path,
+            kind: &self.kind,
+            diff: &self.diff,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// As derived, except that one from a source before [`LineOrigin`] has no
+/// origin to read and is taken as an excerpt.
+impl<'de> Deserialize<'de> for FileChange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if !crate::terminal_ipc::decoding_before(crate::terminal_ipc::PATCH_LINE_ORIGIN) {
+            return Self::deserialize(deserializer);
+        }
+        #[derive(Deserialize)]
+        #[serde(rename = "FileChange")]
+        struct Before {
+            path: String,
+            kind: ChangeKind,
+            diff: String,
+        }
+        let Before { path, kind, diff } = Before::deserialize(deserializer)?;
+        Ok(Self {
+            path,
+            kind,
+            diff,
+            lines: LineOrigin::Excerpt,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2521,6 +2591,7 @@ pub struct FilePatchCursor {
     pub offset: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct FileChangePatch {
     pub ownership_unverified: bool,
     pub item_id: String,
@@ -2530,6 +2601,66 @@ pub struct FileChangePatch {
     pub offset: usize,
     pub total_bytes: usize,
     pub diff: String,
+    /// What the edit's line numbers count from, as [`FileChange::lines`].
+    #[serde(default)]
+    pub lines: LineOrigin,
+}
+
+/// The fields of a [`FileChangePatch`] before [`LineOrigin`], in order.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "FileChangePatch")]
+struct PatchBefore<Text, Kind> {
+    ownership_unverified: bool,
+    item_id: Text,
+    kind: Kind,
+    status: ToolStatus,
+    imported: bool,
+    offset: usize,
+    total_bytes: usize,
+    diff: Text,
+}
+
+/// As derived, except that a client from before [`LineOrigin`] is sent the
+/// fields it decodes.
+impl Serialize for FileChangePatch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !crate::terminal_ipc::encoding_before(crate::terminal_ipc::PATCH_LINE_ORIGIN) {
+            return Self::serialize(self, serializer);
+        }
+        PatchBefore {
+            ownership_unverified: self.ownership_unverified,
+            item_id: self.item_id.as_str(),
+            kind: &self.kind,
+            status: self.status,
+            imported: self.imported,
+            offset: self.offset,
+            total_bytes: self.total_bytes,
+            diff: self.diff.as_str(),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// As derived, except that one from a source before [`LineOrigin`] is taken
+/// as an excerpt.
+impl<'de> Deserialize<'de> for FileChangePatch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if !crate::terminal_ipc::decoding_before(crate::terminal_ipc::PATCH_LINE_ORIGIN) {
+            return Self::deserialize(deserializer);
+        }
+        let before = PatchBefore::<String, ChangeKind>::deserialize(deserializer)?;
+        Ok(Self {
+            ownership_unverified: before.ownership_unverified,
+            item_id: before.item_id,
+            kind: before.kind,
+            status: before.status,
+            imported: before.imported,
+            offset: before.offset,
+            total_bytes: before.total_bytes,
+            diff: before.diff,
+            lines: LineOrigin::Excerpt,
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileChangePage {

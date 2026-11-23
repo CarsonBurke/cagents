@@ -183,6 +183,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::SearchTerminal { .. }
             | ClientRequest::CopyTerminalSelection { .. }
             | ClientRequest::ChatCommand { .. }
+            | ClientRequest::ChatDeliver { .. }
             | ClientRequest::ChatVisibility { .. }
             | ClientRequest::ChatRead { .. }
             | ClientRequest::ChatAcknowledge { .. }
@@ -1927,6 +1928,7 @@ fn process_admitted_request(
         | ClientRequest::ChatAttach { .. }
         | ClientRequest::ChatDetach { .. }
         | ClientRequest::ChatCommand { .. }
+        | ClientRequest::ChatDeliver { .. }
         | ClientRequest::ChatVisibility { .. }
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
@@ -2084,6 +2086,15 @@ fn process_admitted_request(
             let receipt = super::workspace::edit_delta(host, client_id, edit)?;
             crate::daemon::wake();
             Ok((ServerResponse::WorkspaceEdit(receipt), Vec::new(), false))
+        }
+        ClientRequest::MovePane {
+            pane,
+            destination,
+            operation,
+        } => {
+            let moved = super::workspace::move_pane(host, client_id, pane, destination, operation)?;
+            crate::daemon::wake();
+            Ok((ServerResponse::PaneMoved(moved), Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
             let model = super::workspace::edit(host, client_id, edit)?;

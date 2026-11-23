@@ -51,7 +51,7 @@ fn kind_glyph(content: &ItemContent) -> Icon {
             chat::CommandAction::Run => Icon::Terminal,
         },
         ItemContent::Changes { .. } => Icon::Changes,
-        ItemContent::WebSearch { .. } => Icon::WebBrowser,
+        ItemContent::WebSearch { .. } => Icon::Browser,
         ItemContent::Tool { .. } => Icon::Utilities,
         ItemContent::Image { .. } => Icon::Image,
         ItemContent::Delivery {
@@ -229,7 +229,7 @@ fn change_view(change: &FileChange) -> Element<'static, Message> {
 
 impl Runtime {
     /// Group indices refer to the selected transcript, including child streams.
-    fn step_items(&self) -> &[Arc<chat::Item>] {
+    pub(super) fn step_items(&self) -> &[Arc<chat::Item>] {
         self.selected_subagent
             .as_ref()
             .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
@@ -429,32 +429,44 @@ impl Runtime {
         } else {
             turn.duration_label(0)
         };
-        let text = self.strip_headline(turn);
-        let name = text.plain();
-        let mut kinds = turn.steps.iter().filter_map(|step| {
-            self.step_items().get(step.index).map(|item| {
-                self.presentation_cache()
-                    .get(&item.id)
-                    .and_then(|cached| cached.coordination.as_deref())
-                    .and_then(Coordinated::glyph)
-                    .unwrap_or_else(|| kind_glyph(&item.content))
-            })
-        });
-        let first = kinds.next().unwrap_or(Icon::Utilities);
-        let kind = if kinds.all(|kind| kind == first) {
-            first
-        } else {
-            Icon::Utilities
+        let toggle = Action::ToggleTurn(target, key.to_owned());
+        // Messages fold into a row drawn as each of theirs is, which keeps
+        // how they stand in view as their words fade.
+        let header = match turn
+            .messages
+            .then(|| self.message_run_row(turn, open, toggle.clone()))
+            .flatten()
+        {
+            Some(header) => header,
+            None => {
+                let text = self.strip_headline(turn);
+                let name = text.plain();
+                let mut kinds = turn.steps.iter().filter_map(|step| {
+                    self.step_items().get(step.index).map(|item| {
+                        self.presentation_cache()
+                            .get(&item.id)
+                            .and_then(|cached| cached.coordination.as_deref())
+                            .and_then(Coordinated::glyph)
+                            .unwrap_or_else(|| kind_glyph(&item.content))
+                    })
+                });
+                let first = kinds.next().unwrap_or(Icon::Utilities);
+                let kind = if kinds.all(|kind| kind == first) {
+                    first
+                } else {
+                    Icon::Utilities
+                };
+                disclosure::row(
+                    text,
+                    name,
+                    kind,
+                    self.strip_status(turn),
+                    elapsed,
+                    Some(open),
+                    Some(toggle),
+                )
+            }
         };
-        let header = disclosure::row(
-            text,
-            name,
-            kind,
-            self.strip_status(turn),
-            elapsed,
-            Some(open),
-            Some(Action::ToggleTurn(target, key.to_owned())),
-        );
         // Keep the header at the same tree path through repeated keyboard
         // toggles. Only the body is appended when the group opens.
         let mut content = vec![header];
@@ -813,7 +825,7 @@ impl Runtime {
                 rows.push(literal_content::search_view(self, item, cached, settings))
             }
             ItemContent::Tool { input, output, .. } => {
-                if !input.is_empty() {
+                if !super::tool_input::is_empty(input) {
                     rows.push(self.tool_code_surface(
                         item,
                         cached,

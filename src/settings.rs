@@ -312,6 +312,11 @@ pub struct KeyboardShortcuts {
     pub focus_pane_9: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
+    /// Opens the Work pane on its Worktrees view.
+    pub open_worktrees: Vec<String>,
+    /// Starts or stops dictating into a chat's composer; held, it dictates
+    /// until it is let go.
+    pub dictate: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -355,6 +360,8 @@ impl Default for KeyboardShortcuts {
             focus_pane_9: vec!["Alt+9".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
+            open_worktrees: vec!["Ctrl+Shift+E".to_owned()],
+            dictate: vec!["Ctrl+Shift+Space".to_owned()],
         }
     }
 }
@@ -368,7 +375,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 40] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -408,6 +415,8 @@ impl KeyboardShortcuts {
             &self.focus_pane_9,
             &self.toggle_projects,
             &self.rename_pane,
+            &self.open_worktrees,
+            &self.dictate,
         ]
     }
 
@@ -452,6 +461,8 @@ impl KeyboardShortcuts {
             35 => self.focus_pane_9 = chords,
             36 => self.toggle_projects = chords,
             37 => self.rename_pane = chords,
+            38 => self.open_worktrees = chords,
+            39 => self.dictate = chords,
             _ => panic!("unknown shortcut action"),
         }
     }
@@ -520,7 +531,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 40] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -559,6 +570,8 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_9",
     "toggle_projects",
     "rename_pane",
+    "open_worktrees",
+    "dictate",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -732,6 +745,7 @@ pub enum ShortcutKey {
     ArrowUp,
     ArrowDown,
     Tab,
+    Space,
     PageUp,
     PageDown,
     Function(u8),
@@ -774,6 +788,8 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::ArrowDown)
             } else if token.eq_ignore_ascii_case("tab") {
                 Some(ShortcutKey::Tab)
+            } else if token.eq_ignore_ascii_case("space") {
+                Some(ShortcutKey::Space)
             } else if token.eq_ignore_ascii_case("pageup") {
                 Some(ShortcutKey::PageUp)
             } else if token.eq_ignore_ascii_case("pagedown") {
@@ -799,7 +815,7 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                     }
                     _ => {
                         return Err(
-                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)",
+                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, Space, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)",
                         );
                     }
                 }
@@ -847,6 +863,7 @@ pub fn shortcut_search_keywords(value: &str) -> String {
                 ShortcutKey::ArrowUp => "Up".into(),
                 ShortcutKey::ArrowDown => "Down".into(),
                 ShortcutKey::Tab => "Tab".into(),
+                ShortcutKey::Space => "Space".into(),
                 ShortcutKey::PageUp => "PageUp".into(),
                 ShortcutKey::PageDown => "PageDown".into(),
                 ShortcutKey::Function(number) => format!("F{number}"),
@@ -1242,6 +1259,14 @@ pub struct AppSettings {
     /// moves sending to Ctrl+Enter, which suits composing long prompts.
     #[serde(default = "default_chat_enter_sends")]
     pub chat_enter_sends: bool,
+    /// The speech model dictation uses, by its catalog id; none is the
+    /// recommended one.
+    #[serde(default)]
+    pub dictation_model: Option<String>,
+    /// Whether the message is sent when dictation stops, rather than left
+    /// in the composer to read over first.
+    #[serde(default)]
+    pub dictation_sends: bool,
     #[serde(default)]
     pub chat_expand_tool_groups: bool,
     /// Legacy preference retained for settings-file compatibility. Native chat
@@ -1407,6 +1432,8 @@ impl Default for AppSettings {
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
+            dictation_model: None,
+            dictation_sends: false,
             chat_expand_tool_groups: false,
             chat_content_fraction: default_native_fraction(),
             default_native_pane_fraction: default_native_fraction(),
@@ -1861,7 +1888,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 35] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1895,6 +1922,8 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "open_worktrees",
+    "dictate",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -5244,6 +5273,14 @@ new_thread = "Alt+Shift+G"
         assert_eq!(
             parse_shortcut("Ctrl+Shift+PageDown").unwrap().key,
             ShortcutKey::PageDown
+        );
+        assert_eq!(
+            parse_shortcut("ctrl+shift+space").unwrap().key,
+            ShortcutKey::Space
+        );
+        assert_eq!(
+            shortcut_search_keywords("Control+Shift+space"),
+            "Ctrl+Shift+Space"
         );
         // Shift+PageUp scrolls a terminal's own scrollback.
         assert!(parse_shortcut("Shift+PageUp").is_err());

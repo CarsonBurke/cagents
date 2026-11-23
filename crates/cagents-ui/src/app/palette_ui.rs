@@ -555,6 +555,9 @@ impl Cagents {
             } = event
             {
                 let name = match key {
+                    keyboard::Key::Character(value) if value.as_str() == " " => {
+                        Some("Space".into())
+                    }
                     keyboard::Key::Character(value) if value.chars().count() == 1 => {
                         workspace_widget::recordable_shortcut_character(key, *physical_key)
                             .map(|character| character.to_ascii_uppercase().to_string())
@@ -1233,6 +1236,7 @@ impl Cagents {
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
+            Command::Dictate => self.dictate_focused(None),
             Command::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
             Command::RenamePane => self.workspace.focused().map_or_else(Task::none, |id| {
                 self.update_chrome(chrome_ui::Action::Rename(id))
@@ -1243,6 +1247,7 @@ impl Cagents {
             }
             Command::ToggleInspector => self.dispatch(Message::ToggleContextInspector),
             Command::OpenSettings => self.dispatch(Message::Sidebar(SidebarAction::OpenSettings)),
+            Command::OpenWorktrees => self.open_worktrees(),
             Command::NewTerminal => self.dispatch(Message::NewTerminal),
             Command::NewChannel => self.new_project_channel(),
             Command::ClonePane => self.clone_focused_pane(),
@@ -1399,8 +1404,10 @@ impl SettingsField {
             Self::ShortcutChatPermissions => Some(Command::ChatPermissions),
             Self::ShortcutChatModel => Some(Command::ChatModel),
             Self::ShortcutChatAccount => Some(Command::ChatAccount),
+            Self::ShortcutDictate => Some(Command::Dictate),
             Self::ShortcutToggleInspector => Some(Command::ToggleInspector),
             Self::ShortcutOpenSettings => Some(Command::OpenSettings),
+            Self::ShortcutOpenWorktrees => Some(Command::OpenWorktrees),
             Self::ShortcutMovePaneLeft => Some(Command::MovePaneLeft),
             Self::ShortcutMovePaneRight => Some(Command::MovePaneRight),
             Self::ShortcutReopenPane => Some(Command::ReopenPane),
@@ -1471,8 +1478,10 @@ impl ShortcutDraft {
             (Command::ChatPermissions, self.chat_permissions.as_str()),
             (Command::ChatModel, self.chat_model.as_str()),
             (Command::ChatAccount, self.chat_account.as_str()),
+            (Command::Dictate, self.dictate.as_str()),
             (Command::ToggleInspector, self.toggle_inspector.as_str()),
             (Command::OpenSettings, self.open_settings.as_str()),
+            (Command::OpenWorktrees, self.open_worktrees.as_str()),
             (Command::MovePaneLeft, self.move_pane_left.as_str()),
             (Command::MovePaneRight, self.move_pane_right.as_str()),
             (Command::ReopenPane, self.reopen_pane.as_str()),

@@ -222,6 +222,11 @@ run = "scripts/package-linux.sh"
 description = "Install, upgrade and remove fixture packages in a networkless root"
 run = "scripts/smoke-package-upgrades"
 
+[tasks.release]
+description = "Cut a release: bump, build on the build host, rehearse, publish (scripts/release --help)"
+raw = true
+run = "scripts/release"
+
 [tasks."release:build"]
 description = "Build an exact tag in the glibc-baseline release environment (--ref TAG --output DIR)"
 run = "scripts/build-release-linux"

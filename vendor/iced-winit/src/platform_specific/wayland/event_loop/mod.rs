@@ -50,7 +50,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
 };
-use wayland_backend::client::Backend;
+use wayland_backend::client::{Backend, WaylandError};
 use wayland_client::globals::GlobalError;
 use wayland_protocols::wp::{
     keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1,
@@ -485,6 +485,18 @@ impl SctkEventLoop {
                     if let Err(err) =
                         state.event_loop.dispatch(None, &mut state.state)
                     {
+                        // A Wayland connection that failed stays failed, and
+                        // every later dispatch returns at once with the same
+                        // error. Stop this thread instead of spinning until
+                        // the application notices and drops its receiver.
+                        if let Err(cause) = state.state.connection.flush() {
+                            if !is_would_block(&cause) {
+                                log::error!(
+                                    "SCTK stopped: the Wayland connection was lost: {cause}"
+                                );
+                                return Err(Error::Calloop(err));
+                            }
+                        }
                         log::error!("SCTK dispatch error: {err}");
                     }
                     let had_events = !state.state.sctk_events.is_empty();
@@ -570,4 +582,10 @@ impl SctkEventLoop {
             Ok(action_tx)
         }
     }
+}
+
+/// Whether a failed flush only means the compositor has not yet drained the
+/// socket, which leaves the connection usable.
+fn is_would_block(error: &WaylandError) -> bool {
+    matches!(error, WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
 }

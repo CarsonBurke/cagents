@@ -947,7 +947,9 @@ impl SidebarProject {
         self.github_ready = false;
     }
 
-    fn matches(&self, folded_query: &str) -> bool {
+    /// Whether a query, folded by [`fold_query`], finds this row as the
+    /// sidebar search does.
+    pub(crate) fn matches(&self, folded_query: &str) -> bool {
         self.search_rank(folded_query).is_some()
     }
 
@@ -1195,11 +1197,15 @@ impl SidebarWorktree {
         self.refresh_status_chrome();
     }
 
-    fn matches(&self, folded_query: &str) -> bool {
+    /// Whether a query, folded by [`fold_query`], finds this row as the
+    /// sidebar search does.
+    pub(crate) fn matches(&self, folded_query: &str) -> bool {
         self.search_rank(folded_query).is_some()
     }
 
-    fn search_rank(&self, query: &str) -> Option<usize> {
+    /// How well a folded query finds this row, lower first; `None` when it
+    /// does not.
+    pub(crate) fn search_rank(&self, query: &str) -> Option<usize> {
         search_score(&self.chrome.folded_label, query)
             .into_iter()
             .chain(
@@ -1511,11 +1517,11 @@ impl SidebarPullRequest {
 
     // Keep the last remote facts for a later refresh or reopening, but do not
     // present them as outstanding work after the pull request has finished.
-    fn review_requested(&self) -> bool {
+    pub(crate) fn review_requested(&self) -> bool {
         self.needs_review && !self.is_terminal()
     }
 
-    fn active_checks(&self) -> Option<CheckStatus> {
+    pub(crate) fn active_checks(&self) -> Option<CheckStatus> {
         (!self.is_terminal()).then_some(self.checks)
     }
 
@@ -9759,7 +9765,7 @@ fn file_commands(
 ) -> impl Iterator<Item = (&'static str, Icon, FileCommand)> {
     [
         ("Rename…", Icon::Rename, FileCommand::Rename),
-        ("Duplicate file…", Icon::Duplicate, FileCommand::CopyFile),
+        ("Duplicate file…", Icon::Copy, FileCommand::CopyFile),
         ("Copy path", Icon::CopyPath, FileCommand::CopyPath),
         (
             "Copy relative path",
@@ -13570,6 +13576,11 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
         );
     }
     destinations
+}
+
+/// A search query in the form row matchers compare it in.
+pub(crate) fn fold_query(query: &str) -> Box<str> {
+    fold(query.trim())
 }
 
 /// Case-folds a filter key. Entities store the result so the free-text filter

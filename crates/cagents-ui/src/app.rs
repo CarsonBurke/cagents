@@ -74,6 +74,7 @@ mod update_resume;
 mod update_ui;
 mod work_ui;
 mod workspace_model_sync;
+mod worktrees_pane;
 #[cfg(test)]
 use workspace_model_sync::{TestModelRequests, test_model_channel};
 mod workspace_switcher;
@@ -3317,6 +3318,10 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AccountUi(action) => action.blocked_while_modal(),
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
+        // Its actions open dialogs of their own, which a dialog already open
+        // must refuse. A menu still closes: a dialog that opened over it
+        // hides it, and it must not come back when the dialog goes.
+        Message::WorktreesUi(action) => !action.closes_menu(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -3605,6 +3610,8 @@ pub enum SettingsField {
     ChatEnterSends,
     ChatExpandToolGroups,
     ChatContentFraction,
+    DictationModel,
+    DictationSends,
     DefaultNativePaneFraction,
     ShowStatusBar,
     AccountUsageDisplay,
@@ -3661,11 +3668,13 @@ pub enum SettingsField {
     ShortcutFocusPane9,
     ShortcutToggleProjects,
     ShortcutRenamePane,
+    ShortcutOpenWorktrees,
+    ShortcutDictate,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 40] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3704,6 +3713,8 @@ impl SettingsField {
         Self::ShortcutFocusPane9,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
+        Self::ShortcutOpenWorktrees,
+        Self::ShortcutDictate,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3754,8 +3765,10 @@ impl SettingsField {
             Self::ShortcutChatPermissions => "Choose chat permission mode",
             Self::ShortcutChatModel => "Choose chat model",
             Self::ShortcutChatAccount => "Choose chat account",
+            Self::ShortcutDictate => "Dictate",
             Self::ShortcutToggleInspector => "Toggle inspector",
             Self::ShortcutOpenSettings => "Open settings",
+            Self::ShortcutOpenWorktrees => "Open worktrees",
             Self::ShortcutMovePaneLeft => "Move pane left",
             Self::ShortcutMovePaneRight => "Move pane right",
             Self::ShortcutReopenPane => "Reopen closed pane",
@@ -3772,6 +3785,8 @@ impl SettingsField {
             Self::ChatContentFraction => "Chat content width",
             Self::DefaultNativePaneFraction => "Native pane minimum width",
             Self::ChatEnterSends => "Chat send key",
+            Self::DictationModel => "Speech model",
+            Self::DictationSends => "Send when dictation stops",
             Self::ShowStatusBar => "Status bar",
             Self::AccountUsageDisplay => "Account usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
@@ -3842,9 +3857,11 @@ impl SettingsField {
             | Self::DefaultChannelPane
             | Self::Confirm(_)
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
-                SettingsCategory::NativeChat
-            }
+            Self::ChatEnterSends
+            | Self::ChatExpandToolGroups
+            | Self::ChatContentFraction
+            | Self::DictationModel
+            | Self::DictationSends => SettingsCategory::NativeChat,
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::InspectorOpenByDefault
             | Self::InspectorShowActivity
@@ -3871,8 +3888,10 @@ impl SettingsField {
             | Self::ShortcutChatPermissions
             | Self::ShortcutChatModel
             | Self::ShortcutChatAccount
+            | Self::ShortcutDictate
             | Self::ShortcutToggleInspector
             | Self::ShortcutOpenSettings
+            | Self::ShortcutOpenWorktrees
             | Self::ShortcutMovePaneLeft
             | Self::ShortcutMovePaneRight
             | Self::ShortcutReopenPane
@@ -3929,8 +3948,10 @@ struct ShortcutDraft {
     chat_permissions: String,
     chat_model: String,
     chat_account: String,
+    dictate: String,
     toggle_inspector: String,
     open_settings: String,
+    open_worktrees: String,
     move_pane_left: String,
     move_pane_right: String,
     reopen_pane: String,
@@ -3972,8 +3993,10 @@ impl ShortcutDraft {
             chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
             chat_model: settings::format_chords(&shortcuts.chat_model),
             chat_account: settings::format_chords(&shortcuts.chat_account),
+            dictate: settings::format_chords(&shortcuts.dictate),
             toggle_inspector: settings::format_chords(&shortcuts.toggle_inspector),
             open_settings: settings::format_chords(&shortcuts.open_settings),
+            open_worktrees: settings::format_chords(&shortcuts.open_worktrees),
             move_pane_left: settings::format_chords(&shortcuts.move_pane_left),
             move_pane_right: settings::format_chords(&shortcuts.move_pane_right),
             reopen_pane: settings::format_chords(&shortcuts.reopen_pane),
@@ -4048,6 +4071,8 @@ struct SettingsDraft {
     chat_enter_sends: bool,
     chat_expand_tool_groups: bool,
     chat_content_fraction: String,
+    dictation_model: String,
+    dictation_sends: bool,
     default_native_pane_fraction: String,
     show_status_bar: bool,
     account_usage_display: settings::AccountUsageDisplay,
@@ -4125,6 +4150,8 @@ impl SettingsDraft {
             chat_enter_sends: settings.chat_enter_sends,
             chat_expand_tool_groups: settings.chat_expand_tool_groups,
             chat_content_fraction: settings.chat_content_fraction.to_string(),
+            dictation_model: settings.dictation_model.clone().unwrap_or_default(),
+            dictation_sends: settings.dictation_sends,
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
             account_usage_display: settings.account_usage_display,
@@ -4200,6 +4227,8 @@ impl SettingsDraft {
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = value == "true",
             SettingsField::ChatContentFraction => self.chat_content_fraction = value,
+            SettingsField::DictationModel => self.dictation_model = value,
+            SettingsField::DictationSends => self.dictation_sends = value == "true",
             SettingsField::DefaultNativePaneFraction => self.default_native_pane_fraction = value,
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
             SettingsField::AccountUsageDisplay => {
@@ -4258,10 +4287,12 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutChatModel => self.keyboard_shortcuts.chat_model = value,
             SettingsField::ShortcutChatAccount => self.keyboard_shortcuts.chat_account = value,
+            SettingsField::ShortcutDictate => self.keyboard_shortcuts.dictate = value,
             SettingsField::ShortcutToggleInspector => {
                 self.keyboard_shortcuts.toggle_inspector = value
             }
             SettingsField::ShortcutOpenSettings => self.keyboard_shortcuts.open_settings = value,
+            SettingsField::ShortcutOpenWorktrees => self.keyboard_shortcuts.open_worktrees = value,
             SettingsField::ShortcutMovePaneLeft => self.keyboard_shortcuts.move_pane_left = value,
             SettingsField::ShortcutMovePaneRight => self.keyboard_shortcuts.move_pane_right = value,
             SettingsField::ShortcutReopenPane => self.keyboard_shortcuts.reopen_pane = value,
@@ -4360,6 +4391,10 @@ fn settings_update(
             next.keyboard_shortcuts.chat_account = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutDictate => {
+            next.keyboard_shortcuts.dictate = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::ShortcutChatModel => {
             next.keyboard_shortcuts.chat_model = settings::parse_chords(value);
             Ok(())
@@ -4378,6 +4413,10 @@ fn settings_update(
         }
         SettingsField::ShortcutOpenSettings => {
             next.keyboard_shortcuts.open_settings = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenWorktrees => {
+            next.keyboard_shortcuts.open_worktrees = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutMovePaneLeft => {
@@ -4468,6 +4507,16 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.chat_enter_sends = enabled)
             .map_err(|_| "Choose which key sends a chat message.".to_owned()),
+        SettingsField::DictationModel => cagents_dictate::catalog::find(value)
+            .map(|model| {
+                next.dictation_model =
+                    (model.id != cagents_dictate::catalog::DEFAULT).then(|| model.id.to_owned());
+            })
+            .ok_or_else(|| "Choose one of the speech models.".to_owned()),
+        SettingsField::DictationSends => value
+            .parse::<bool>()
+            .map(|enabled| next.dictation_sends = enabled)
+            .map_err(|_| "Choose whether dictation sends the message.".to_owned()),
         SettingsField::ShowStatusBar => value
             .parse::<bool>()
             .map(|enabled| next.show_status_bar = enabled)
@@ -5414,6 +5463,7 @@ pub enum Message {
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
+    WorktreesUi(crate::worktrees_ui::Action),
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -6071,6 +6121,7 @@ pub struct Cagents {
     sign_ins: account_ui::SignIns,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
+    worktrees_ui: crate::worktrees_ui::State,
     automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -9432,6 +9483,7 @@ impl Cagents {
             projection_stage!("row_selection", self.prune_sidebar_row_selection());
         }
         projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
+        projection_stage!("worktrees_pane", self.refresh_worktrees_pane());
         // Ahead of the rebind, which pins what the inspector drawing source
         // control chose: a pane that has just arrived, closed or taken focus
         // must not show the last binding for a frame.
@@ -9608,7 +9660,7 @@ impl Cagents {
                 .chrome_cards_visited
                 .set(self.shared_views.chrome_cards_visited.get() + 1);
         }
-        let type_label = card_kind_labels(Some(&card.kind)).type_label;
+        let type_label = self.card_labels(Some(&card.kind)).type_label;
         let title = self.repository_chrome_with(card, || {
             self.card_display_title_with_chat_title(card, || self.chat_channel_title(card, channel))
         });
@@ -9903,6 +9955,10 @@ impl Cagents {
     ) -> &'a str {
         if let Some(title) = self.chrome_ui.user_titles.get(&card.id) {
             return title;
+        }
+        // The Work pane is named for the view it shows.
+        if card.kind == CardKind::Work && self.work_ui.shows_worktrees() {
+            return "Worktrees";
         }
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
@@ -10567,6 +10623,13 @@ impl Cagents {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.keyboard_modifiers = *modifiers;
         }
+        // Letting go of a dictation shortcut held down ends push-to-talk,
+        // whatever has the keyboard now.
+        if let keyboard::Event::KeyReleased { physical_key, .. } = &event
+            && let Some(task) = self.dictation_key_released(*physical_key)
+        {
+            return (task, Projection::Full);
+        }
         // The viewer dialog, a modal, takes every key. Its own Escape and an
         // open context menu's are answered in `Gallery::dialog_view`.
         if self.chat_ui.image_dialog.is_some() {
@@ -10895,11 +10958,22 @@ impl Cagents {
                 Projection::Full,
             );
         }
-        match workspace_widget::global_shortcut(
-            &event,
-            &self.settings.keyboard_shortcuts,
-            self.focused_pane(),
-        ) {
+        let focused = self.focused_pane();
+        match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts, focused)
+            .filter(|_| !workspace_widget::deferred_shortcut_taken(&event, captured, focused))
+        {
+            Some(workspace_widget::GlobalShortcut::Dictate) => {
+                let held = match event {
+                    keyboard::Event::KeyPressed { physical_key, .. } => Some(physical_key),
+                    _ => None,
+                };
+                let task = if self.workspace_inputs_blocked() {
+                    Task::none()
+                } else {
+                    self.dictate_focused(held)
+                };
+                (task, Projection::Full)
+            }
             Some(command) => {
                 let modifiers = match event {
                     keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
@@ -12154,7 +12228,7 @@ impl Cagents {
     ) -> Element<'a, Message> {
         let card = self.card_state(id);
         let attention = self.sidebar_state.has_card_update(id) && !focused;
-        let labels = card_kind_labels(card.map(|card| &card.kind));
+        let labels = self.card_labels(card.map(|card| &card.kind));
         // `sync_chrome` keeps an entry for every durable card the strip can
         // show; a miss can only be a card that is not durable, which renders
         // degenerate chrome.
@@ -12572,10 +12646,20 @@ impl Cagents {
                         .collect(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    dictation: self.dictation_settings(),
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
+            Some(CardRuntime::Work) if self.work_ui.shows_worktrees() => self
+                .worktrees_ui
+                .view(
+                    &self.sidebar_model.projects,
+                    &self.sidebar_model.external_editors,
+                    self.worktrees_current(),
+                    self.modal_is_open(),
+                )
+                .map(Message::WorktreesUi),
             Some(CardRuntime::Work) => self.work_ui.view().map(Message::WorkUi),
             Some(CardRuntime::Completed) => {
                 self.ended_terminal_placeholder(id, self.ended_terminal(id))
@@ -15993,7 +16077,7 @@ impl Cagents {
                     CardRuntime::Repository(runtime) => runtime,
                     CardRuntime::PullRequests(pane) => &mut pane.runtime,
                     CardRuntime::Chat(runtime) => {
-                        runtime.set_syntax_theme(syntax_theme);
+                        tasks.push(runtime.change_syntax_theme(syntax_theme));
                         continue;
                     }
                     _ => continue,
@@ -16004,7 +16088,7 @@ impl Cagents {
                 // again rather than left empty until the next refresh.
                 tasks.push(repository_task(runtime.refresh_diff_presentation(card)));
             }
-            self.chat_ui.set_parked_syntax_theme(syntax_theme);
+            tasks.push(self.chat_ui.set_parked_syntax_theme(syntax_theme));
         }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
             for runtime in self.cards.values_mut() {
@@ -16417,6 +16501,7 @@ impl Application for Cagents {
             sign_ins: account_ui::SignIns::default(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
+            worktrees_ui: crate::worktrees_ui::State::default(),
             automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
@@ -19651,6 +19736,7 @@ impl Cagents {
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
+            Message::WorktreesUi(action) => self.update_worktrees_ui(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
@@ -19941,15 +20027,17 @@ impl Cagents {
         }
         let projected = match &projection {
             Projection::Unchanged => self.reconcile_notice_popup(),
-            // A reported title reaches the tabs, the window title and the
-            // Attention list's pane rows; nothing else in the sidebar, nor
-            // worktree ownership or protections, reads it.
+            // A reported title reaches the tabs, the window title, the
+            // Attention list's pane rows and the Worktrees view's pane chips;
+            // nothing else in the sidebar, nor worktree ownership or
+            // protections, reads it.
             Projection::Chrome | Projection::ScopedChrome(_) => {
                 #[cfg(test)]
                 if model_update {
                     self.shared_views.chrome_tail_count += 1;
                 }
                 projection_stage!("attention_card_rows", self.refresh_attention_card_rows());
+                projection_stage!("worktrees_pane_titles", self.retitle_worktrees_pane());
                 let notices = self.reconcile_notice_popup();
                 let mut phase = WorkspaceProjectionTiming::new(timed);
                 let chrome = match &projection {

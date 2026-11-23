@@ -81,6 +81,17 @@ pub enum Layout {
     Board,
     /// Every card in one list, newest activity first.
     List,
+    /// Every checkout of every open project, to open, create and delete,
+    /// which [`crate::worktrees_ui`] draws from the window's own project
+    /// model rather than from the daemon's board.
+    Worktrees,
+}
+
+impl Layout {
+    /// Whether this is one of the daemon board's own layouts.
+    pub fn is_board(self) -> bool {
+        !matches!(self, Self::Worktrees)
+    }
 }
 
 /// What the board subscription reports.
@@ -172,6 +183,9 @@ pub struct State {
     scope_menu: bool,
     query: String,
     layout: Layout,
+    /// The board layout last shown, which the board returns to from
+    /// [`Layout::Worktrees`].
+    board_layout: Layout,
     menu: Option<CardRef>,
     refreshing: bool,
     /// The last refresh or pin that failed.
@@ -184,12 +198,33 @@ impl State {
     /// shows a board from before it was closed.
     pub fn reset(&mut self) {
         let scope = self.scope.take();
-        let layout = self.layout;
+        let (layout, board_layout) = (self.layout, self.board_layout);
         *self = Self {
             scope,
             layout,
+            board_layout,
             ..Self::default()
         };
+    }
+
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// Whether the pane shows the project checkouts rather than the board.
+    pub fn shows_worktrees(&self) -> bool {
+        self.layout == Layout::Worktrees
+    }
+
+    /// Shows the checkouts, or the board in the layout it last had.
+    pub fn show(&mut self, worktrees: bool) {
+        self.layout = if worktrees {
+            Layout::Worktrees
+        } else {
+            self.board_layout
+        };
+        self.menu = None;
+        self.scope_menu = false;
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
@@ -249,6 +284,11 @@ impl State {
             }
             Action::Layout(layout) => {
                 self.layout = layout;
+                if layout.is_board() {
+                    self.board_layout = layout;
+                }
+                self.menu = None;
+                self.scope_menu = false;
                 None
             }
             Action::Refresh => {
@@ -369,7 +409,8 @@ impl State {
                 .into(),
             Some(_) => match self.layout {
                 Layout::Board => self.board_view(width),
-                Layout::List => self.list_view(),
+                // The application draws the checkouts in this pane's place.
+                Layout::List | Layout::Worktrees => self.list_view(),
             },
         };
         widget::column::with_children(vec![header, design::horizontal_rule(), body])
@@ -400,16 +441,7 @@ impl State {
     }
 
     fn header(&self) -> Element<'_, Action> {
-        let layout = crate::ui_controls::segmented_controls(vec![
-            icon_button(Icon::Board, "Board")
-                .selected(self.layout == Layout::Board)
-                .on_press(Action::Layout(Layout::Board))
-                .into(),
-            icon_button(Icon::List, "List, newest first")
-                .selected(self.layout == Layout::List)
-                .on_press(Action::Layout(Layout::List))
-                .into(),
-        ]);
+        let layout = layout_switch(self.layout);
         let refresh: Element<'_, Action> = if self.refreshing {
             crate::interaction::tooltip(
                 widget::container(crate::ui_controls::activity_spinner(
@@ -1069,7 +1101,7 @@ impl State {
             {
                 items.push(
                     popover_item(
-                        Icon::WebBrowser.handle(),
+                        Icon::Browser.handle(),
                         "Open Linear issue",
                         ticket.identifier.clone().unwrap_or_default(),
                         Action::OpenUrl(url.clone()),
@@ -1140,6 +1172,24 @@ impl State {
             Action::Menu(None),
         )
     }
+}
+
+/// The pane's views: the board's two layouts and the project checkouts.
+pub fn layout_switch<'a>(current: Layout) -> Element<'a, Action> {
+    crate::ui_controls::segmented_controls(vec![
+        icon_button(Icon::Board, "Board")
+            .selected(current == Layout::Board)
+            .on_press(Action::Layout(Layout::Board))
+            .into(),
+        icon_button(Icon::List, "List, newest first")
+            .selected(current == Layout::List)
+            .on_press(Action::Layout(Layout::List))
+            .into(),
+        icon_button(Icon::Worktree, "Worktrees")
+            .selected(current == Layout::Worktrees)
+            .on_press(Action::Layout(Layout::Worktrees))
+            .into(),
+    ])
 }
 
 /// Clipboard text cannot preserve an invalid branch name's raw bytes.
@@ -1329,7 +1379,7 @@ fn warning<'a>(text: String) -> Element<'a, Action> {
 }
 
 /// A raised card that lifts on hover and stays lifted while its menu is open.
-fn card_style(selected: bool) -> cosmic::theme::Button {
+pub(crate) fn card_style(selected: bool) -> cosmic::theme::Button {
     fn appearance(theme: &Theme, lifted: bool, selected: bool) -> widget::button::Style {
         let mut fill = design::raised(theme);
         if lifted || selected {

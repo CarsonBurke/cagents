@@ -962,7 +962,7 @@ impl Cagents {
                     let device = crate::device::selected().map(|device| device.name.clone());
                     let mut gallery = Gallery::file(path, device.as_deref(), handle);
                     gallery.transcript = runtime.selected_subagent.clone();
-                    runtime.image_viewer = Some(gallery);
+                    runtime.show_image(gallery);
                     self.focus_image_viewer(target)
                 }
                 None => self.figure_command(target, id, Command::OpenSource),

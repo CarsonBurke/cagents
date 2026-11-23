@@ -2793,10 +2793,11 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
         retransmit(&actor).is_none(),
         "an older helper is not asked again"
     );
-    // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
+    // Refused at once, for the conversation: waiting on the fence would end
+    // in UNSETTLED_INPUT, and trying later changes nothing.
     assert_eq!(
         actor.enqueue(None, Command::Refresh).unwrap_err(),
-        UNSETTLEABLE_INPUT
+        UNRESOLVABLE_INPUT
     );
     // A receipt the helper reports on its own still lifts the fence.
     actor.apply_receipts(&[InputReceipt {
@@ -2809,40 +2810,66 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
     let expected = actor.pending_inputs().pop().unwrap();
     assert_eq!(expected.sequence, 4);
 
-    // A helper that keeps failing to settle an input, such as one that
-    // already retired it, is asked a bounded number of times.
+    // A helper that refuses to settle an input for now, as a full or busy
+    // journal does, stops new input waiting on it after `SETTLE_ATTEMPTS`
+    // refusals, but is still asked: one that recovers settles it. A refusal
+    // its journal gives for good, as for an input it retired, ends the
+    // asking at once, and new input is refused for the conversation.
     std::fs::remove_file(&socket).unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
-    for attempt in 1..=SETTLE_ATTEMPTS {
-        assert!(retransmit(&actor).is_some(), "still asking at {attempt}");
-        backdate(&actor);
+    let refuse = |actor: &RemoteActor, refusal: &str| {
+        backdate(actor);
+        {
+            let mut uncertain = actor.0.uncertain_input.lock().unwrap();
+            let uncertain = uncertain.as_mut().unwrap();
+            uncertain.acknowledgement_deadline = Instant::now();
+            uncertain.retransmit.as_mut().unwrap().next = Instant::now();
+        }
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| settle(&listener, &expected, Err(refusal.into())));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+    };
+    let unsettleable = |actor: &RemoteActor| {
         actor
             .0
             .uncertain_input
             .lock()
             .unwrap()
-            .as_mut()
+            .as_ref()
             .unwrap()
-            .acknowledgement_deadline = Instant::now();
-        thread::scope(|scope| {
-            let helper = scope.spawn(|| {
-                settle(
-                    &listener,
-                    &expected,
-                    Err(
-                        "Input receipt is retired or unavailable; never replay this command".into(),
-                    ),
-                )
-            });
-            actor.resolve_uncertain_input();
-            helper.join().unwrap();
-        });
+            .unsettleable
+    };
+    let busy =
+        "Actor input receipt capacity reached; commit completed receipts before sending more";
+    for attempt in 1..=SETTLE_ATTEMPTS {
+        assert!(!unsettleable(&actor), "new input still waits at {attempt}");
+        refuse(&actor, busy);
+        assert!(retransmit(&actor).is_some(), "still asking at {attempt}");
     }
-    assert!(retransmit(&actor).is_none(), "the proxy stops asking");
+    assert!(unsettleable(&actor), "new input no longer waits");
     assert_eq!(
         actor.enqueue(None, Command::Refresh).unwrap_err(),
         UNSETTLEABLE_INPUT
     );
+    refuse(&actor, super::super::journal::RETIRED_RECEIPT);
+    assert!(
+        retransmit(&actor).is_none(),
+        "a final refusal ends the asking"
+    );
+    assert_eq!(
+        actor.enqueue(None, Command::Refresh).unwrap_err(),
+        UNRESOLVABLE_INPUT
+    );
+    drop(listener);
+    // A receipt the helper reports on its own still lifts the fence.
+    actor.apply_receipts(&[InputReceipt {
+        identity: expected,
+        state: InputState::Acknowledged(Err(UNCONFIRMED_INPUT.into())),
+    }]);
+    assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+    actor.enqueue_now(Command::Refresh).unwrap();
 }
 /// An admitted input the actor's queue will not take is refused as its
 /// cause: a closing actor's for good, a full queue's as crowded.

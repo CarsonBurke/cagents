@@ -532,6 +532,31 @@ fn managed_with_request(
         )),
     }
 }
+/// A draft attachment's full-size pixels, for the viewer the composer's
+/// tray opens: a managed image from its receipt, wherever it was staged; any
+/// other image only from this device's own file. Decoding shares the
+/// transcript's image budget.
+pub(super) fn attachment_preview(attachment: &chat::Attachment) -> Loaded {
+    if let Some(reference) = &attachment.reference {
+        return managed_with_request(
+            reference,
+            crate::device::is_remote(),
+            None,
+            crate::device_service::request,
+        );
+    }
+    if crate::device::is_remote() {
+        return Loaded::Failed(
+            "The image belongs to another device; local transfer is unavailable.".into(),
+        );
+    }
+    if let Err(error) = chat::attachment_assets::validate(attachment) {
+        return Loaded::Failed(error);
+    }
+    read_file(&attachment.path).map_or(Loaded::Unavailable, |bytes| {
+        bounded_handle_size(bytes, budget(), None)
+    })
+}
 pub(super) fn managed_thumbnail(reference: &chat::ImageReference) -> Loaded {
     managed_with_request(
         reference,
@@ -717,6 +742,16 @@ fn retire(cached: &mut CachedItem, evicted: bool) {
     cached.image_evicted = evicted;
     cached.image_attempt = cached.image_attempt.wrapping_add(1);
 }
+impl Runtime {
+    /// Opens `gallery` in this pane's viewer. It is what the reader asked
+    /// for last, so a draft image still loading from an earlier press on
+    /// its tile stays closed when it arrives.
+    pub(super) fn show_image(&mut self, gallery: Gallery) {
+        self.opening_attachment = None;
+        self.image_viewer = Some(gallery);
+    }
+}
+
 /// The pane viewer covers the transcript its images came from, and keeps up
 /// with the images that arrive or finish decoding in it. Once the pane shows
 /// another transcript, such as a subagent's, the viewer no longer belongs
@@ -1108,6 +1143,35 @@ impl Gallery {
             remote: device.is_some(),
             reset: 0,
             transcript: None,
+            from_transcript: false,
+            origin: None,
+            serial: 0,
+            reading: None,
+        }
+    }
+    /// An image the draft holds, opened from the composer's tray over the
+    /// transcript the pane shows (`transcript`, as [`Self::new`] records it).
+    /// Its path is the draft's, never handed to another application.
+    pub(in crate::app) fn attachment(
+        transcript: Option<String>,
+        label: String,
+        handle: iced::widget::image::Handle,
+    ) -> Self {
+        Self {
+            entries: vec![Entry {
+                id: "attachment".into(),
+                managed: true,
+                path: String::new(),
+                label,
+                preview: None,
+                full: Some(handle),
+                error: None,
+                source: None,
+            }],
+            selected: 0,
+            remote: crate::device::is_remote(),
+            reset: 0,
+            transcript,
             from_transcript: false,
             origin: None,
             serial: 0,
@@ -1608,7 +1672,7 @@ impl Cagents {
                     return Some(Task::none());
                 };
                 let read = gallery.read(ViewerHost::Pane(target));
-                runtime.image_viewer = Some(gallery);
+                runtime.show_image(gallery);
                 // The keyboard moves to the viewer, as a press on the image
                 // would leave it, unless the pane doesn't hold it.
                 Some(Task::batch([read, self.focus_image_viewer(target)]))

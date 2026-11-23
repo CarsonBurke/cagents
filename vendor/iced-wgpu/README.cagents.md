@@ -17,7 +17,17 @@ Run the regression as a standalone package:
 scripts/cargo-gate test --manifest-path vendor/iced-wgpu/Cargo.toml --features svg an_upright_vector
 ```
 
-Cargo cannot run it with `-p iced_wgpu` from the parent workspace because this vendored package is not a workspace member. Its standalone lockfile and build artifacts are local test output.
+Cargo cannot run it with `-p iced_wgpu` from the parent workspace because this vendored package is not a workspace member. Its standalone lockfile and build artifacts are local test output. The standalone manifest patches iced_core, iced_graphics, cryoglyph, cosmic-text and harfrust to their vendored copies, so the tests build against the same renderer crates as the application.
+
+# SVGs keep their whole drawing in the raster
+
+Upstream scaled an SVG to its raster's longer side, or to its height when the raster is square, and truncated the drawing's size to whole units first. A drawing wider than tall in a square icon box, such as the 17x16 `utilities-terminal-symbolic` in the COSMIC theme, came out wider than its raster and lost its right edge, and the truncation could stretch one axis. `vector::fit` now draws the tree at the largest uniform scale that keeps all of it inside the raster, centred on whole pixels so grid-aligned edges stay crisp. A square drawing in a square raster is unchanged. `a_tree_stays_inside_its_raster_at_one_scale` covers it:
+
+```sh
+scripts/cargo-gate test --manifest-path vendor/iced-wgpu/Cargo.toml --features svg image::
+```
+
+iced_tiny_skia is not vendored, so the software fallback keeps upstream's scaling.
 
 # Editor overscan (#2824)
 
@@ -74,3 +84,11 @@ texture, and `Renderer::render` reports how many layers it draws
 (vendor/iced-graphics/README.cagents.md). Outside a timed
 presentation a lap touches one thread-local cell and nothing else. Remove it with
 the iced-graphics timing.
+
+# Skipped meshes keep the index offset
+
+`Layer::render` skips a mesh whose clip misses the layer's bounds, and
+advanced its vertex and uniform offsets past it but not its index offset, so
+every later mesh in that group drew with the indices of the mesh before it.
+Skipping a mesh now advances the index offset as well. The pinned upstream
+renderer has the same omission; drop this when it is fixed there.

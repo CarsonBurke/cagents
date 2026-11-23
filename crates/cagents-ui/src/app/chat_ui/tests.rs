@@ -406,7 +406,7 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
         .unwrap()
         .visible
         .store(true, Ordering::Relaxed);
-    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
     let runtime = app.chat_runtime_mut(target).unwrap();
     assert!(runtime.attachments.is_empty());
     assert!(runtime.thumbnails.subscriptions(target).is_empty());
@@ -3856,6 +3856,7 @@ fn find_matches_displayed_command_labels_directories_and_changed_paths() {
     assert!(contains_text(&command, "workspace"));
     let change = ItemContent::Changes {
         changes: vec![chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "src/Über.rs".into(),
             kind: chat::ChangeKind::Updated,
             diff: "+line".into(),
@@ -7598,7 +7599,7 @@ fn ambiguous_native_word_selection_refuses_image_removal_without_losing_metadata
             "native boundary-expanded selection is the ambiguity fixture"
         );
         assert!(!attachment_draft::Bookmark::capture(&runtime.composer).valid);
-        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.attachments, [image.clone()]);
         assert_eq!(runtime.composer.text(), text);
@@ -7745,7 +7746,7 @@ fn managed_images_keep_caret_identity_through_out_of_order_pastes_remove_and_dra
             chat_runtime(&app, card).attachments,
             [second.clone(), first.clone()]
         );
-        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 1)));
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 1, Removal::Key)));
         let runtime = chat_runtime(&app, card);
         assert!(!runtime.composer.text().contains(&first_ref.token()));
         assert!(runtime.composer.text().contains(&second_ref.token()));
@@ -10409,7 +10410,8 @@ fn a_declined_send_is_a_notice_unless_the_conversation_cannot_go_on() {
         (delivery::OVERSIZED_INPUT, false),
         (delivery::HANDOVER_INPUT, false),
         (delivery::DAMAGED_INPUT, false),
-        (delivery::UNSETTLEABLE_INPUT, true),
+        (delivery::UNSETTLEABLE_INPUT, false),
+        (delivery::UNRESOLVABLE_INPUT, true),
         (delivery::STOPPED_INPUT, true),
         (delivery::CLOSING_INPUT, true),
         (delivery::DISCONTINUOUS_INPUT, true),
@@ -12282,7 +12284,7 @@ fn the_restored_notice_leaves_with_the_draft_it_describes() {
     runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Backspace));
     // The file is still there, and so is what the notice says about it.
     assert!(runtime.restored_waiting.is_some());
-    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
     assert_eq!(chat_runtime(&app, card).restored_waiting, None);
 }
 
@@ -20827,6 +20829,7 @@ fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
     );
     let changes = ItemContent::Changes {
         changes: vec![chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "src/app.rs".to_owned(),
             diff: "@@\n-old\n+new\n".to_owned(),
             kind: chat::ChangeKind::Updated,
@@ -20843,10 +20846,9 @@ fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
         output: "done".to_owned(),
         status: chat::ToolStatus::Succeeded,
     };
-    assert_eq!(
-        copy_text(CopyPart::Text, &tool).as_deref(),
-        Some("{}\n\ndone")
-    );
+    // A call made without arguments copies its result alone.
+    assert_eq!(copy_text(CopyPart::Text, &tool).as_deref(), Some("done"));
+    assert_eq!(copy_text(CopyPart::Input, &tool), None);
     assert_eq!(
         copy_text(
             CopyPart::Text,
@@ -20870,6 +20872,7 @@ fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
 fn change_token_separates_renames_that_differ_only_in_their_source() {
     let renamed = |from: &str| ItemContent::Changes {
         changes: vec![chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "src/new.rs".to_owned(),
             diff: String::new(),
             kind: chat::ChangeKind::Renamed {
@@ -20980,7 +20983,16 @@ fn file_review_replies_finish_while_modal_input_is_blocked() {
         card: CardId::new(),
         generation: 1,
     };
-    assert!(Action::ChangesLoaded(target, 1, Err("reply".into())).allowed_while_modal());
+    assert!(
+        Action::ChangesLoaded(
+            target,
+            1,
+            Err("reply".into()),
+            Arc::from([]),
+            crate::settings::EditorSyntaxTheme::default(),
+        )
+        .allowed_while_modal()
+    );
     assert!(
         Action::ChangedFileResolved(target, 1, "/reported".into(), Err("reply".into()))
             .allowed_while_modal()
@@ -22083,7 +22095,7 @@ fn an_excerpted_output_copies_whole_from_its_source() {
     };
     assert_eq!(
         super::step_copy_prefix(&CopyPart::Text, &tool).as_deref(),
-        Some("{\"cmd\":\"ls\"}")
+        Some("ls")
     );
     assert_eq!(super::step_copy_prefix(&CopyPart::Input, &tool), None);
     let request = text_copy::Request::for_test(handle.clone(), excerpted.clone());

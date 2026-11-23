@@ -290,7 +290,20 @@ use crate::{
 /// reply, which name every terminal the daemon holds or is starting, and the
 /// transcripts they write, so a window never prunes a transcript whose writer
 /// may still append. An older client never sends it.
-pub const PROTOCOL_VERSION: u16 = 194;
+///
+/// Version 195 adds `lines` to `FileChange` and `FileChangePatch`: whether a
+/// patch's line numbers are positions in the file, or count from an excerpt
+/// such as the text a Claude `Edit` replaces. An older client is sent both
+/// without it; one read from an older update source is taken as an excerpt.
+///
+/// Version 196 appends `ChatDeliver`, a chat command sent under a key, so that
+/// sending a message again after an unknown outcome waits on the first send
+/// instead of delivering it twice. An older client cannot send it.
+///
+/// Version 197 appends `MovePane` and its `PaneMoved` reply, which move a
+/// pane into an existing or new channel of its project, and let an agent
+/// session move its own pane. An older client never sends it.
+pub const PROTOCOL_VERSION: u16 = 197;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -321,8 +334,8 @@ mod older_clients;
 #[cfg(test)]
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS,
-    encoding_before,
+    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS,
+    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -775,6 +788,26 @@ pub enum ClientRequest {
     /// it includes terminals still being spawned, whose transcript writers
     /// may already have created their files.
     ListResidentTerminals,
+    /// [`Self::ChatCommand`], sent once under `delivery`: asked again with
+    /// the same key, the daemon reports what became of the first send rather
+    /// than sending it twice, so a message whose outcome was unknown can be
+    /// sent again safely.
+    ChatDeliver {
+        chat_id: TerminalId,
+        command: crate::chat::Command,
+        delivery: crate::chat::DeliveryKey,
+    },
+    /// Moves a pane into a channel of its own project, or into a new channel
+    /// made there for it, and answers with where it now is. `pane: None` is
+    /// the caller's own pane: the one showing the live session its agent
+    /// authority was issued to. A connection acting for an agent moves only
+    /// a session pane its lineage controls, so this is also the only way an
+    /// agent creates a channel. `operation` makes a resent request one move.
+    MovePane {
+        pane: Option<crate::model::CardId>,
+        destination: crate::workspace_model::PaneDestination,
+        operation: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1248,6 +1281,8 @@ pub enum ServerResponse {
         terminals: Vec<TerminalId>,
         transcripts: Vec<PathBuf>,
     },
+    /// The reply to `MovePane`.
+    PaneMoved(crate::workspace_model::PaneMove),
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
@@ -3045,6 +3080,7 @@ mod tests {
                     },
                     revision: 5,
                     patches: vec![FileChangePatch {
+                        lines: crate::chat::LineOrigin::File,
                         ownership_unverified: false,
                         item_id: "edit".into(),
                         kind: ChangeKind::Updated,
@@ -3452,6 +3488,7 @@ mod tests {
                     key,
                     revision: 5,
                     patches: vec![FileChangePatch {
+                        lines: crate::chat::LineOrigin::File,
                         ownership_unverified: true,
                         item_id: "edit".into(),
                         kind: ChangeKind::Updated,

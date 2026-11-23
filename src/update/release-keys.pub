@@ -1,0 +1,4 @@
+# OpenSSH public keys that sign cagents releases (`ssh-keygen -Y sign -n
+# cagents-release`), one per line. A build trusts only the releases these keys
+# signed; until a key is listed here, this build offers no release update.
+# See docs/releasing.md#signing for how the key is made and kept.

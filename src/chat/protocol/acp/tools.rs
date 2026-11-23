@@ -267,6 +267,7 @@ fn diff(block: &Value) -> Option<FileChange> {
         Some(_) => ChangeKind::Updated,
     };
     Some(FileChange {
+        lines: crate::chat::LineOrigin::File,
         path: path.to_owned(),
         kind,
         diff: super::super::claude_edits::unified(before.unwrap_or_default(), after, ""),

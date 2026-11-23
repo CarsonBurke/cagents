@@ -353,6 +353,20 @@ impl Handle {
             Owner::Remote(remote) => remote.submit(None, command),
         }
     }
+    /// Sends `command` once under `key`: asked again with the same key, it
+    /// reports what became of the first send instead of sending it twice. A
+    /// command that gives no work, such as a stop or a read, changes nothing
+    /// when it is repeated, so it goes as it is.
+    pub fn deliver(&self, command: Command, key: chat::DeliveryKey) -> Result<(), String> {
+        if !command.gives_work() {
+            return self.command(command);
+        }
+        match &self.0 {
+            Owner::Local(local) => local.deliver(command, key),
+            Owner::Remote(remote) => remote.deliver(command, key),
+        }
+        .map_err(String::from)
+    }
     pub(crate) fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
         match &self.0 {
             Owner::Local(local) => local.try_idle_prompt(text),

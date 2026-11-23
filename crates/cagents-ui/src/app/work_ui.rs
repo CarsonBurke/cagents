@@ -15,7 +15,8 @@ impl Cagents {
                 && card.existence.is_open()
                 && self.workspace.visibility(card.id) == Some(VisibilityClass::Visible)
         });
-        if !self.refresh_ui.focused || !visible {
+        // The checkouts come from the window's own project model.
+        if !self.refresh_ui.focused || !visible || self.work_ui.shows_worktrees() {
             return Subscription::none();
         }
         let watch = Subscription::run(watch_board).map(Message::WorkUi);

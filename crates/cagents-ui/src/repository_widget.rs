@@ -36,9 +36,10 @@ use cosmic::{
 use crate::{
     design::space,
     diff_view::{
-        DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
-        InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan, build_document_diff,
-        load_repository_diff,
+        DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffPalette, DiffRowKind,
+        DiffSyntax, InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan, build_document_diff,
+        diff_fold_background, diff_gutter_text, diff_row_background, load_repository_diff,
+        styled_line_spans,
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
@@ -11100,7 +11101,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
                 basis: DiffBasis::IndexToWorktree,
             }))
             .into(),
-        icon_button(Icon::Select, "Staged changes")
+        icon_button(Icon::Check, "Staged changes")
             .selected(staged && selected == Some(BasisChoice::Staged))
             .on_press_maybe(staged.then(|| RepositoryAction::ApplyDiffBasis {
                 card,
@@ -11876,17 +11877,8 @@ fn diff_fold_row<'a>(
         .align_y(Alignment::Center),
     )
     .class(cosmic::theme::Container::custom(|theme| {
-        let mut accent = crate::design::accent_color(theme);
-        accent.a = if theme.theme_type.is_dark() {
-            0.10
-        } else {
-            0.07
-        };
         iced::widget::container::Style {
-            background: Some(iced::Background::Color(diff_tint(
-                accent,
-                theme.cosmic().bg_color().into(),
-            ))),
+            background: Some(iced::Background::Color(diff_fold_background(theme))),
             ..Default::default()
         }
     }))
@@ -12201,98 +12193,11 @@ fn diff_gutter(
             .size(typography.gutter_size())
             .align_x(Alignment::End)
             .width(Length::Fill)
-            .class(cosmic::theme::Text::Custom(|theme| {
-                let mut color: iced::Color = theme.current_container().on.into();
-                color.a = crate::design::DIFF_GUTTER_ALPHA;
-                iced::widget::text::Style {
-                    color: Some(color),
-                    ..Default::default()
-                }
-            })),
+            .class(cosmic::theme::Text::Custom(diff_gutter_text)),
     )
     .padding([0.0, space::S])
     .width(width)
     .into()
-}
-
-fn diff_highlight_color(theme: &cosmic::Theme, kind: DiffRowKind, alpha: f32) -> iced::Color {
-    // Keep additions and deletions distinct without obscuring their text.
-    let mut color = match kind {
-        DiffRowKind::Addition => crate::design::success_color(theme),
-        DiffRowKind::Deletion => crate::design::destructive_color(theme),
-        DiffRowKind::Context | DiffRowKind::Modification => return iced::Color::TRANSPARENT,
-    };
-    color.a = alpha;
-    color
-}
-
-fn color_over(foreground: iced::Color, background: iced::Color) -> iced::Color {
-    if foreground.a == 1.0 {
-        return foreground;
-    }
-    if foreground.a == 0.0 {
-        return background;
-    }
-    let foreground = foreground.into_linear();
-    let background = background.into_linear();
-    let alpha = foreground[3];
-    iced::Color::from_linear_rgba(
-        foreground[0] * alpha + background[0] * (1.0 - alpha),
-        foreground[1] * alpha + background[1] * (1.0 - alpha),
-        foreground[2] * alpha + background[2] * (1.0 - alpha),
-        1.0,
-    )
-}
-
-fn readable_diff_color(foreground: iced::Color, background: iced::Color) -> iced::Color {
-    let foreground = color_over(foreground, background);
-    if foreground.relative_contrast(background) >= 4.5 {
-        return foreground;
-    }
-    let target = if iced::Color::BLACK.relative_contrast(background)
-        >= iced::Color::WHITE.relative_contrast(background)
-    {
-        iced::Color::BLACK
-    } else {
-        iced::Color::WHITE
-    };
-    // Correct only as much luminance as necessary. Replacing a syntax color
-    // outright with black/white erased the distinction between token kinds.
-    let mix = |amount: f32| {
-        iced::Color::from_rgb(
-            foreground.r + (target.r - foreground.r) * amount,
-            foreground.g + (target.g - foreground.g) * amount,
-            foreground.b + (target.b - foreground.b) * amount,
-        )
-    };
-    let (mut low, mut high) = (0.0, 1.0);
-    for _ in 0..12 {
-        let mid = (low + high) * 0.5;
-        if mix(mid).relative_contrast(background) >= 4.5 {
-            high = mid;
-        } else {
-            low = mid;
-        }
-    }
-    mix(high)
-}
-
-/// Mix diff tints in display color space, then draw an opaque background.
-/// Linear-light mixing made small alpha values much brighter than expected.
-fn diff_tint(tint: iced::Color, background: iced::Color) -> iced::Color {
-    iced::Color::from_rgb(
-        background.r + (tint.r - background.r) * tint.a,
-        background.g + (tint.g - background.g) * tint.a,
-        background.b + (tint.b - background.b) * tint.a,
-    )
-}
-
-fn diff_row_background(theme: &cosmic::Theme, kind: DiffRowKind) -> iced::Color {
-    match kind {
-        DiffRowKind::Addition => crate::design::diff_added_color(theme),
-        DiffRowKind::Deletion => crate::design::diff_removed_color(theme),
-        _ => theme.cosmic().bg_color().into(),
-    }
 }
 
 fn diff_text<'a>(
@@ -12305,47 +12210,15 @@ fn diff_text<'a>(
     lines: (Option<u32>, Option<u32>),
     typography: DiffTypography,
 ) -> Element<'a, RepositoryAction> {
-    let theme = cosmic::theme::active();
-    let row_background = diff_row_background(&theme, kind);
-    // A wholly added/deleted line already has a line tint. Word emphasis is
-    // useful only when it distinguishes an edit within otherwise shared text.
-    let changed = if changed == [0..text.len()] {
-        &[]
-    } else {
-        changed
-    };
-    let mut spans = crate::diff_view::line_spans(
+    let palette = DiffPalette::new(&cosmic::theme::active());
+    let spans = styled_line_spans::<()>(
         text,
         changed,
         syntax,
-        diff_highlight_color(
-            &theme,
-            kind,
-            if cosmic::theme::is_dark() { 0.24 } else { 0.18 },
-        ),
+        kind,
+        &palette,
+        Some(typography.font.family),
     );
-    for span in &mut spans {
-        // Syntax keeps its weight and style in the editor's family, as the
-        // model measured it.
-        if let Some(font) = &mut span.font {
-            font.family = typography.font.family;
-        }
-        let background = match span
-            .highlight
-            .as_mut()
-            .map(|highlight| &mut highlight.background)
-        {
-            Some(iced::Background::Color(color)) => {
-                *color = diff_tint(*color, row_background);
-                *color
-            }
-            _ => row_background,
-        };
-        let foreground = span
-            .color
-            .unwrap_or_else(|| theme.cosmic().on_bg_color().into());
-        span.color = Some(readable_diff_color(foreground, background));
-    }
     Element::new(DiffHorizontalContent {
         content: widget::container(
             iced::widget::rich_text(spans)

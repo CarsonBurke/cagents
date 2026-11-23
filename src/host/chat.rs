@@ -3913,6 +3913,52 @@ pub(super) fn read_presentation(
     Ok(response)
 }
 
+/// Runs `command` in the chat `chat_id`, once under `delivery` where it has
+/// one.
+fn chat_command(
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: crate::model::TerminalId,
+    command: crate::chat::Command,
+    delivery: Option<crate::chat::DeliveryKey>,
+) -> Result<ServerResponse, ProtocolError> {
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down {
+            return Err(unavailable("Daemon is shutting down"));
+        }
+        attached(&state, client, chat_id)?.handle.clone()
+    };
+    if let crate::chat::Command::ReadTextCopy { source, offset } = &command {
+        let page = handle.text_copy(source, *offset).map_err(unavailable)?;
+        return Ok(ServerResponse::ChatTextCopy { chat_id, page });
+    }
+    // Only the changed files panel's queries go to the cache: asking
+    // the helper about any other command would hold a message or a
+    // stop behind a round trip it could fail. The panel shows a query
+    // that fails; the transcript does not.
+    if command.queries_file_changes() {
+        let reply = handle.file_query(&command).map_err(read_failure)?;
+        return Ok(match reply {
+            crate::chat::FileChangeReply::Files(summary) => {
+                ServerResponse::ChatFileChanges { chat_id, summary }
+            }
+            crate::chat::FileChangeReply::Patches(page) => {
+                ServerResponse::ChatFileChangePatches { chat_id, page }
+            }
+        });
+    }
+    if command.gives_work() {
+        super::agent_execution::given_work(host, chat_id);
+    }
+    match delivery {
+        Some(key) => handle.deliver(command, key),
+        None => handle.command(command),
+    }
+    .map_err(unavailable)?;
+    Ok(ServerResponse::Accepted)
+}
+
 fn process_inner(
     host: &SharedHost,
     client: ClientId,
@@ -4373,38 +4419,13 @@ fn process_inner(
             Ok(ServerResponse::Detached)
         }
         ClientRequest::ChatCommand { chat_id, command } => {
-            let handle = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if state.shutting_down {
-                    return Err(unavailable("Daemon is shutting down"));
-                }
-                attached(&state, client, chat_id)?.handle.clone()
-            };
-            if let crate::chat::Command::ReadTextCopy { source, offset } = &command {
-                let page = handle.text_copy(source, *offset).map_err(unavailable)?;
-                return Ok(ServerResponse::ChatTextCopy { chat_id, page });
-            }
-            // Only the changed files panel's queries go to the cache: asking
-            // the helper about any other command would hold a message or a
-            // stop behind a round trip it could fail. The panel shows a query
-            // that fails; the transcript does not.
-            if command.queries_file_changes() {
-                let reply = handle.file_query(&command).map_err(read_failure)?;
-                return Ok(match reply {
-                    crate::chat::FileChangeReply::Files(summary) => {
-                        ServerResponse::ChatFileChanges { chat_id, summary }
-                    }
-                    crate::chat::FileChangeReply::Patches(page) => {
-                        ServerResponse::ChatFileChangePatches { chat_id, page }
-                    }
-                });
-            }
-            if command.gives_work() {
-                super::agent_execution::given_work(host, chat_id);
-            }
-            handle.command(command).map_err(unavailable)?;
-            Ok(ServerResponse::Accepted)
+            chat_command(host, client, chat_id, command, None)
         }
+        ClientRequest::ChatDeliver {
+            chat_id,
+            command,
+            delivery,
+        } => chat_command(host, client, chat_id, command, Some(delivery)),
         ClientRequest::ChatAcknowledge { chat_id, epoch } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(receipt) = state.chat_handoffs.get(&chat_id) {

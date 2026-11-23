@@ -155,9 +155,9 @@ impl Client {
         let mut changed = false;
         for _ in 0..256 {
             let envelope = if bootstrap_chat.is_some() {
-                read_chat_envelope(&mut stream)?
+                read_chat_envelope(self.protocol, &mut stream)?
             } else {
-                read_response(&mut stream)?
+                read_response(self.protocol, &mut stream)?
             };
             if envelope.version != self.protocol || envelope.proof != self.proof {
                 return Err("Source inspection ownership or protocol changed".into());
@@ -191,10 +191,13 @@ impl Client {
                     "Source migration inspection timed out".into()
                 });
             }
-            let envelope = read_chat_envelope(&mut DeadlineStream {
-                stream: &mut self.stream,
-                deadline: self.deadline,
-            })?;
+            let envelope = read_chat_envelope(
+                self.protocol,
+                &mut DeadlineStream {
+                    stream: &mut self.stream,
+                    deadline: self.deadline,
+                },
+            )?;
             if envelope.version != self.protocol || envelope.proof != self.proof {
                 return Err("Source inspection ownership or protocol changed".into());
             }
@@ -421,11 +424,14 @@ fn unsettled_reader() -> String {
     )
 }
 
-/// Read one frame of the chat bootstrap subset: a response or an event.
-fn read_chat_envelope(reader: &mut impl Read) -> Result<ServerEnvelope, String> {
+/// Read one frame of the chat bootstrap subset: a response or an event, as
+/// a source at `protocol` encoded it.
+fn read_chat_envelope(protocol: u16, reader: &mut impl Read) -> Result<ServerEnvelope, String> {
     let payload = read_payload_with_limit(reader, ipc::MAX_FRAME_BYTES)?;
-    postcard::from_bytes::<ServerEnvelope>(&payload)
-        .map_err(|_| "Unsupported legacy retained-owner response".into())
+    ipc::decoding_from(protocol, || {
+        postcard::from_bytes::<ServerEnvelope>(&payload)
+    })
+    .map_err(|_| "Unsupported legacy retained-owner response".into())
 }
 
 /// Accept only an unsolicited qualified event for `chat_id`, reporting whether
@@ -491,10 +497,12 @@ fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u
     Ok(payload)
 }
 
-fn read_response(reader: &mut impl Read) -> Result<ServerEnvelope, String> {
+fn read_response(protocol: u16, reader: &mut impl Read) -> Result<ServerEnvelope, String> {
     let payload = read_payload_with_limit(reader, MAX_FRAME)?;
-    let (envelope, remaining) = postcard::take_from_bytes::<InspectionEnvelope>(&payload)
-        .map_err(|_| "Unsupported source response")?;
+    let (envelope, remaining) = ipc::decoding_from(protocol, || {
+        postcard::take_from_bytes::<InspectionEnvelope>(&payload)
+    })
+    .map_err(|_| "Unsupported source response")?;
     if !remaining.is_empty() {
         return Err("Source response has an unknown layout".into());
     }
@@ -845,7 +853,7 @@ mod tests {
                 _ => unreachable!(),
             };
             assert_eq!(bytes.as_slice(), frozen);
-            assert_eq!(read_response(&mut &frozen[..]).unwrap(), envelope);
+            assert_eq!(read_response(100, &mut &frozen[..]).unwrap(), envelope);
             for protocol in source_protocols() {
                 let historical = source_frame_version(frozen, protocol);
                 let mut expected = envelope.clone();
@@ -853,7 +861,10 @@ mod tests {
                 let mut current = Vec::new();
                 ipc::write_frame(&mut current, &expected).unwrap();
                 assert_eq!(current, historical);
-                assert_eq!(read_response(&mut historical.as_slice()).unwrap(), expected);
+                assert_eq!(
+                    read_response(protocol, &mut historical.as_slice()).unwrap(),
+                    expected
+                );
             }
         }
     }
@@ -905,7 +916,7 @@ mod tests {
             payload.extend([1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0]);
             let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
             frame.extend(payload);
-            let envelope = read_response(&mut frame.as_slice()).unwrap();
+            let envelope = read_response(protocol, &mut frame.as_slice()).unwrap();
             assert_eq!(envelope.version, protocol);
             assert_eq!(envelope.request_id, Some(7));
             assert_eq!(
@@ -947,7 +958,10 @@ mod tests {
                 };
                 let mut frame = Vec::new();
                 ipc::write_frame(&mut frame, &envelope).unwrap();
-                assert_eq!(read_response(&mut frame.as_slice()).unwrap(), envelope);
+                assert_eq!(
+                    read_response(protocol, &mut frame.as_slice()).unwrap(),
+                    envelope
+                );
             }
         }
     }
@@ -985,6 +999,22 @@ mod tests {
                         snapshot: Some(crate::chat::Snapshot {
                             session_id: expected.launch.session_id.clone(), exited: true,
                             read_only_reason: Some("Saved conversation history is read-only; no provider was started.".into()),
+                            // A saved edit, which the source encodes in its own layout.
+                            items: vec![std::sync::Arc::new(crate::chat::Item {
+                                started_at: None,
+                                id: "edit".into(),
+                                role: crate::chat::Role::Assistant,
+                                content: crate::chat::ItemContent::Changes {
+                                    changes: vec![crate::chat::FileChange {
+                                        path: "src/lib.rs".into(),
+                                        kind: crate::chat::ChangeKind::Updated,
+                                        diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                                        lines: crate::chat::LineOrigin::File,
+                                    }],
+                                    status: crate::chat::ToolStatus::Succeeded,
+                                },
+                                at: None,
+                            })],
                             ..Default::default()
                         }),
                     },
@@ -1004,15 +1034,17 @@ mod tests {
                     },
                 )
                 .unwrap();
-                ipc::write_frame(
-                    &mut peer,
-                    &ServerEnvelope {
-                        version: protocol,
-                        request_id: Some(request.request_id),
-                        proof: proof(),
-                        message: ServerMessage::Response { response },
-                    },
-                )
+                ipc::encoding_for(protocol, || {
+                    ipc::write_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: protocol,
+                            request_id: Some(request.request_id),
+                            proof: proof(),
+                            message: ServerMessage::Response { response },
+                        },
+                    )
+                })
                 .unwrap();
             }
         });
@@ -1046,12 +1078,14 @@ mod tests {
             let mut frame = (body.len() as u32).to_be_bytes().to_vec();
             frame.extend(body);
             assert!(
-                read_response(&mut frame.as_slice()).is_err(),
+                read_response(100, &mut frame.as_slice()).is_err(),
                 "mutation {mutation}"
             );
         }
-        assert!(read_response(&mut ((MAX_FRAME as u32 + 1).to_be_bytes()).as_slice()).is_err());
-        assert!(read_response(&mut [0, 0].as_slice()).is_err());
+        assert!(
+            read_response(100, &mut ((MAX_FRAME as u32 + 1).to_be_bytes()).as_slice()).is_err()
+        );
+        assert!(read_response(100, &mut [0, 0].as_slice()).is_err());
     }
 
     #[test]

@@ -161,11 +161,23 @@ A debug build holds the next request to Claude that long before admitting it,
 then removes the file. With `.cagents-fixture-refuse-input` as well, the
 request is held and then refused, as a send that fails after a wait is.
 
+To see a send whose outcome is unknown though it went through, as on a
+heavily loaded computer, write a number of seconds, up to 60, to
+`.cagents-fixture-late-acknowledgement` in the fixture `HOME`:
+`scripts/native-evidence env sh -c 'echo 25 >"$HOME/.cagents-fixture-late-acknowledgement"'`.
+A debug build runs the next request to Claude as usual, but confirms it only
+that long after taking it, then removes the file. Past the ten seconds the
+application waits, the send reads as not confirmed while the message is
+already in the conversation. Combine it with
+`.cagents-fixture-unanswered-reads` below to keep the conversation from
+showing the message meanwhile, as a loaded helper also does.
+
 To see how a conversation reads when Claude stops answering for a while, as
 it can on a heavily loaded computer, write a number of seconds, up to 120, to
 `.cagents-fixture-unanswered-reads` in the fixture `HOME`:
 `scripts/native-evidence env sh -c 'echo 40 >"$HOME/.cagents-fixture-unanswered-reads"'`.
-A debug build then leaves every transcript read unanswered for that long, and
+A debug build then leaves every transcript read, and every request for the
+conversation's state, unanswered for that long, and
 removes the file. A read made during that time waits until the time is up,
 then goes through, or fails like a read Claude never answered if its deadline
 comes first. Showing the chat again, or anything new in it, makes a read.

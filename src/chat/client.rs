@@ -3505,6 +3505,9 @@ impl ClientHandle {
                         ClientRequest::ChatCommand {
                             command: Command::Prompt { .. },
                             ..
+                        } | ClientRequest::ChatDeliver {
+                            command: Command::Prompt { .. },
+                            ..
                         }
                     ),
                     reply,
@@ -3665,6 +3668,16 @@ impl ClientHandle {
         self.request(ClientRequest::ChatCommand {
             chat_id: self.inner.id,
             command,
+        })
+    }
+    /// Sends `command` once under `key`, as [`ClientRequest::ChatDeliver`]
+    /// describes, so that sending it again after an unknown outcome cannot
+    /// deliver it twice.
+    pub fn send_once(&self, command: Command, key: super::DeliveryKey) -> Result<(), String> {
+        self.request(ClientRequest::ChatDeliver {
+            chat_id: self.inner.id,
+            command,
+            delivery: key,
         })
     }
     pub fn known_append(&self, previous: &Arc<super::Item>, current: &Arc<super::Item>) -> bool {

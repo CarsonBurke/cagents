@@ -33,6 +33,23 @@ impl Language {
     }
 }
 
+/// A tool call's input as its detail shows, finds and copies it: readable
+/// lines in place of the JSON a provider sent ([`super::tool_input`]), or
+/// the input as it came when it is not one whole JSON value.
+pub(super) fn tool_input(input: &str) -> (Cow<'_, str>, Language) {
+    match super::tool_input::readable(input) {
+        Some(readable) => (
+            Cow::Owned(readable.text),
+            if readable.command {
+                Language::Shell
+            } else {
+                Language::Plain
+            },
+        ),
+        None => (Cow::Borrowed(input), Language::structured(input)),
+    }
+}
+
 /// Immutable reader allocations can be built by a worker and shared through
 /// disclosure changes. Native interaction state remains on the event thread.
 #[derive(Clone)]
@@ -74,7 +91,10 @@ impl PreparedSources {
                 ..Self::default()
             },
             ItemContent::Tool { input, output, .. } => Self {
-                input: Some(PreparedText::new(input, Language::structured(input))),
+                input: Some({
+                    let (input, language) = tool_input(input);
+                    PreparedText::new(&input, language)
+                }),
                 output: Some(PreparedText::new(output, Language::structured(output))),
                 ..Self::default()
             },
@@ -1216,6 +1236,7 @@ mod tests {
             .collect::<String>();
         let item = ItemContent::Changes {
             changes: vec![chat::FileChange {
+                lines: crate::chat::LineOrigin::File,
                 path: "src/example.rs".into(),
                 kind: chat::ChangeKind::Updated,
                 diff: diff.clone(),
@@ -1492,6 +1513,12 @@ mod tests {
             "prompt": "Internal framing\n".repeat(600),
         })
         .to_string();
+        // The detail reads the prompt as its lines rather than one escaped
+        // JSON string.
+        let shown = format!(
+            "path: src/app.rs\nprompt:\n{}",
+            ["  Internal framing"; 600].join("\n")
+        );
         let output = "Complete document\nInternal protocol framing";
         let mut content = tool(&input);
         for status in [chat::ToolStatus::Running, chat::ToolStatus::Succeeded] {
@@ -1510,11 +1537,11 @@ mod tests {
             let closed = CachedItem::updated(&content, theme, None, false, false, None);
             assert!(closed.tool_input.is_none());
             let open = CachedItem::updated(&content, theme, Some(closed), true, false, None);
-            assert_eq!(open.tool_input.as_ref().unwrap().text.as_ref(), input);
+            assert_eq!(open.tool_input.as_ref().unwrap().text.as_ref(), shown);
             assert_eq!(open.tool_output.as_ref().unwrap().text.as_ref(), output);
             assert_eq!(
                 copy_text(CopyPart::Input, &content).as_deref(),
-                Some(input.as_str())
+                Some(shown.as_str())
             );
             assert_eq!(
                 copy_text(CopyPart::Output, &content).as_deref(),
@@ -1631,6 +1658,7 @@ mod tests {
     #[test]
     fn collapsed_cache_is_lazy_and_metadata_updates_reuse_expanded_source() {
         let source = format!("{{\"text\":\"{}\"}}", "λ".repeat(700));
+        let shown = format!("text: {}", "λ".repeat(700));
         let mut item = tool(&source);
         let theme = crate::settings::EditorSyntaxTheme::Auto;
         let cached = CachedItem::updated(&item, theme, None, false, false, None);
@@ -1639,7 +1667,7 @@ mod tests {
         assert!(cached.preview.text.len() < source.len());
         assert_eq!(
             copy_text(CopyPart::Input, &item).as_deref(),
-            Some(source.as_str())
+            Some(shown.as_str())
         );
         let cached = CachedItem::updated(&item, theme, Some(cached), true, false, None);
         let source_cache = cached.tool_input.as_ref().unwrap().text.clone();
@@ -1656,7 +1684,7 @@ mod tests {
         assert!(cached.tool_output.is_none());
         assert_eq!(
             copy_text(CopyPart::Input, &item).as_deref(),
-            Some(source.as_str())
+            Some(shown.as_str())
         );
     }
 

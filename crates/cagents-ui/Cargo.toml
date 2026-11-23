@@ -52,6 +52,7 @@ required-features = ["hot-reload"]
 
 [dependencies]
 cagents = { path = "../..", default-features = false, features = ["ui"] }
+cagents-dictate = { path = "../cagents-dictate" }
 cagents-browser-import = { path = "../browser-import", features = ["desktop-keyring"], optional = true }
 cookie = { version = "0.18", optional = true }
 net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }

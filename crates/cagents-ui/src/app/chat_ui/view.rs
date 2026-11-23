@@ -95,6 +95,71 @@ const COMPOSER_INSET_Y: f32 =
 /// How far a scrolled draft runs on into the editor's vertical inset (#2824):
 /// up to the composer's border, never over it.
 const COMPOSER_TEXT_REACH: f32 = COMPOSER_INSET_Y - design::BORDER_WIDTH;
+/// The side of an image's square tile in the composer's tray.
+const ATTACHMENT_TILE: f32 = 56.0;
+/// The height of a file's chip in the tray, centred against the tiles.
+const ATTACHMENT_CHIP: f32 = 40.0;
+/// The × in a tile's corner.
+const ATTACHMENT_CLOSE: f32 = 18.0;
+
+/// The keyboard's stop on the tray's `index`th attachment.
+pub(super) fn attachment_tile_id(card: CardId, index: usize) -> iced::widget::Id {
+    card_control_id(card, &format!("chat-attachment-{index}"))
+}
+
+/// Whether the tray shows `attachment` as a picture that opens, rather than
+/// a file's chip.
+pub(super) fn is_image_attachment(attachment: &Attachment) -> bool {
+    attachment.reference.is_some()
+        || attachment
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                chat::IMAGE_EXTENSIONS
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
+}
+
+/// The tray's small remove button, which sits inside its tile's corner. A
+/// fixed draft's tile has none to show, rather than one that does nothing.
+fn attachment_close<'a>(remove: Option<Message>) -> Element<'a, Message> {
+    let Some(remove) = remove else {
+        return widget::Space::new()
+            .width(Length::Fixed(ATTACHMENT_CLOSE))
+            .height(Length::Fixed(ATTACHMENT_CLOSE))
+            .into();
+    };
+    let style = |hovered: bool| {
+        move |_focused: bool, _theme: &cosmic::Theme| widget::button::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                a: if hovered { 0.9 } else { 0.7 },
+                ..iced::Color::BLACK
+            })),
+            icon_color: Some(iced::Color::WHITE),
+            text_color: Some(iced::Color::WHITE),
+            border_radius: (ATTACHMENT_CLOSE / 2.0).into(),
+            ..design::button_style()
+        }
+    };
+    widget::button::custom(
+        widget::container(widget::icon(Icon::Close.handle()).size(10))
+            .center(Length::Fixed(ATTACHMENT_CLOSE)),
+    )
+    .padding(0)
+    .width(Length::Fixed(ATTACHMENT_CLOSE))
+    .height(Length::Fixed(ATTACHMENT_CLOSE))
+    .on_press(remove)
+    .class(cosmic::theme::Button::Custom {
+        active: Box::new(style(false)),
+        disabled: Box::new(move |theme| style(false)(false, theme)),
+        hovered: Box::new(style(true)),
+        pressed: Box::new(style(true)),
+    })
+    .into()
+}
+
 /// The composer editor's padding: its vertical inset, and its sides with the
 /// rail for the vertical scrollbar.
 fn composer_editor_padding() -> iced::Padding {
@@ -3909,50 +3974,7 @@ impl Runtime {
                     .into(),
             );
         }
-        let mut attachment_chips = Vec::new();
-        for (index, attachment) in self.attachments.iter().enumerate() {
-            let chip = widget::row::with_children(vec![
-                if let Some(handle) = self.thumbnails.handle(&attachment.path) {
-                    iced::widget::image(handle.clone())
-                        .width(design::DENSE_ROW_HEIGHT)
-                        .height(design::DENSE_ROW_HEIGHT)
-                        .content_fit(iced::ContentFit::Cover)
-                        .into()
-                } else {
-                    crate::ui_controls::passive_icon(Icon::Attachment, design::ROW_ICON_SIZE)
-                },
-                crate::design::caption(
-                    if attachment.reference.is_none()
-                        && clipboard_image::is_pasted(&attachment.path)
-                    {
-                        "Pasted image".into()
-                    } else {
-                        attachment.label()
-                    },
-                )
-                .width(Length::Fill)
-                .into(),
-                icon(
-                    Icon::Delete,
-                    "Remove attachment",
-                    !transitioning,
-                    Action::RemoveAttachment(target, index),
-                ),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(step::GAP_XS);
-            attachment_chips.push(
-                widget::tooltip(
-                    chip,
-                    design::caption(attachment.reference.as_ref().map_or_else(
-                        || attachment.path.display().to_string(),
-                        |reference| reference.name.clone(),
-                    )),
-                    widget::tooltip::Position::Top,
-                )
-                .into(),
-            );
-        }
+        let attachment_tray = self.attachment_tray(target, transitioning);
         if self.pastes_pending > 0 {
             content.push(
                 design::caption("Pasting…")
@@ -4004,24 +4026,7 @@ impl Runtime {
             .lines()
             .any(|line| !line.text.trim().is_empty());
         let has_draft = has_text || !self.attachments.is_empty();
-        // The submit modes the send controls expose, in the order the keyboard
-        // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
-        // A message just sent is about to start a turn, so what is written
-        // after it steers or waits as it would once the turn shows.
-        let under_way = self.turn_under_way();
-        let modes: &[PromptMode] = if under_way {
-            match snapshot.capabilities.steer {
-                // A message taken back from the queue goes back the way it
-                // was queued unless the other chord says otherwise.
-                true if self.resend == Some(PromptMode::Queue) => {
-                    &[PromptMode::Queue, PromptMode::Steer]
-                }
-                true => &[PromptMode::Steer, PromptMode::Queue],
-                false => &[PromptMode::Queue],
-            }
-        } else {
-            &[PromptMode::Send]
-        };
+        let modes = self.submit_modes();
         // The placeholder names what the field is for. Spelling out both
         // chords on it meant the one piece of text in an empty composer was
         // keyboard documentation, repeated on every pane, and it went stale
@@ -4082,16 +4087,7 @@ impl Runtime {
         } else {
             design::raised
         };
-        // A saved conversation the update refused takes no message in this
-        // pane until it reopens (#2905): the box would take typing with
-        // nowhere to send it. What it holds stays readable and copyable. A
-        // pane that can start a new conversation in its place, which takes
-        // the message along, and a refused first message stay editable.
-        let read_only = transitioning
-            || (self
-                .start_blocked
-                .is_some_and(|reopen| !reopen.offers_fresh())
-                && !self.is_draft());
+        let read_only = self.composer_read_only(transitioning);
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
             .placeholder(placeholder)
@@ -4125,6 +4121,12 @@ impl Runtime {
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
             let viewing = self.image_viewer.is_some() && self.child_picker.is_none();
+            // Finishing counts too: an Escape pressed again while the last
+            // words arrive must not fall through and interrupt the turn.
+            let dictating = self
+                .dictation
+                .as_ref()
+                .is_some_and(dictation::Pane::is_session);
             editor
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
@@ -4136,6 +4138,20 @@ impl Runtime {
                         && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
                     {
                         return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
+                    }
+                    // The message has its own undo history, which takes these
+                    // chords ahead of the workspace's while it has a step that
+                    // way. Without one the chord falls through, so Ctrl+Shift+Z
+                    // still reopens a closed pane from a message with nothing
+                    // to redo.
+                    if let Some(command) =
+                        crate::repository_widget::text_editor::history_command(&press)
+                    {
+                        let redo =
+                            command == crate::repository_widget::text_editor::HistoryCommand::Redo;
+                        return self
+                            .composer_history(target, redo)
+                            .map(text_editor::Binding::Custom);
                     }
                     if !press.modifiers.shift()
                         && !press.modifiers.control()
@@ -4179,6 +4195,18 @@ impl Runtime {
                     let picking = self.model_picker.is_some()
                         || self.account_picker
                         || self.permission_picker;
+                    // While dictating, Escape stops listening and keeps what
+                    // was said, ahead of closing an image or interrupting
+                    // the turn; once it has stopped, Escape does nothing
+                    // until the last words are in. Sending waits for them.
+                    if dictating
+                        && !picking
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::DictationStop(
+                            target,
+                        ))));
+                    }
                     // Escape closes the topmost layer first: an open image
                     // above the draft goes before a running turn, which the
                     // next Escape interrupts.
@@ -4231,10 +4259,22 @@ impl Runtime {
                     }
                     let binding =
                         word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press));
-                    if matches!(binding, Some(text_editor::Binding::Paste)) {
-                        Some(text_editor::Binding::Custom(action(Action::Paste(target))))
-                    } else {
-                        binding
+                    match binding {
+                        Some(text_editor::Binding::Paste) => {
+                            Some(text_editor::Binding::Custom(action(Action::Paste(target))))
+                        }
+                        // What is copied is noted first, with the images its
+                        // references name, so a paste into another draft
+                        // brings them along.
+                        Some(copy @ (text_editor::Binding::Copy | text_editor::Binding::Cut)) => {
+                            Some(text_editor::Binding::Sequence(vec![
+                                text_editor::Binding::Custom(action(Action::ComposerCopied(
+                                    target,
+                                ))),
+                                copy,
+                            ]))
+                        }
+                        binding => binding,
                     }
                 })
                 .into()
@@ -4288,6 +4328,7 @@ impl Runtime {
         };
         let mut row: Vec<Element<'_, Message>> = Vec::new();
         row.extend(plus.map(control));
+        row.extend(self.dictation_control(shortcuts, !read_only).map(control));
         row.push(editor);
         row.extend(submissions.into_iter().map(control));
         // The editor and its controls are one object: a single raised
@@ -4301,16 +4342,12 @@ impl Runtime {
                         self.queue_view()
                             .into_iter()
                             .chain(self.restored_waiting_notice())
+                            .chain(self.dictation_view())
                             .chain(self.composer_note_view())
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.
                             .chain(self.stop_confirmation())
-                            .chain((!attachment_chips.is_empty()).then(|| {
-                                widget::column::with_children(attachment_chips)
-                                    .spacing(step::GAP_XS)
-                                    .padding([0, step::GAP_M as u16])
-                                    .into()
-                            })),
+                            .chain(attachment_tray),
                     )
                     .spacing(step::GAP_XS)
                     .into(),
@@ -4671,6 +4708,26 @@ impl Runtime {
         )
     }
 
+    /// The submit modes the send controls expose, in the order the keyboard
+    /// reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
+    /// A message just sent is about to start a turn, so what is written
+    /// after it steers or waits as it would once the turn shows.
+    pub(super) fn submit_modes(&self) -> &'static [PromptMode] {
+        if self.turn_under_way() {
+            match self.snapshot.capabilities.steer {
+                // A message taken back from the queue goes back the way it
+                // was queued unless the other chord says otherwise.
+                true if self.resend == Some(PromptMode::Queue) => {
+                    &[PromptMode::Queue, PromptMode::Steer]
+                }
+                true => &[PromptMode::Steer, PromptMode::Queue],
+                false => &[PromptMode::Queue],
+            }
+        } else {
+            &[PromptMode::Send]
+        }
+    }
+
     /// The control that cancels the active turn.
     ///
     /// A provider whose interrupt does not spare background subagents takes
@@ -4735,6 +4792,193 @@ impl Runtime {
             .padding(iced::Padding::from([space::XS, COMPOSER_PADDING]))
             .into()
         })
+    }
+
+    /// The draft's attachments as one compact strip above the message: a
+    /// square thumbnail per image and a chip per file, wrapping onto more
+    /// rows in a narrow pane rather than hiding any off its edge.
+    fn attachment_tray(&self, target: Target, transitioning: bool) -> Option<Element<'_, Message>> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let tiles = self
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                self.attachment_tile(target, index, attachment, transitioning)
+            });
+        Some(
+            widget::row::with_children(tiles.collect::<Vec<_>>())
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .padding([step::GAP_XS, step::GAP_M])
+                .wrap()
+                .vertical_spacing(step::GAP_S)
+                .into(),
+        )
+    }
+
+    /// Whether the draft is fixed: while the provider starts or changes
+    /// session, and in a saved conversation the update refused, which takes
+    /// no message in this pane until it reopens (#2905), so the box would
+    /// take typing with nowhere to send it. What it holds stays readable and
+    /// copyable. A pane that can start a new conversation in its place,
+    /// which takes the message along, and a refused first message stay
+    /// editable.
+    pub(super) fn composer_read_only(&self, transitioning: bool) -> bool {
+        transitioning
+            || (self
+                .start_blocked
+                .is_some_and(|reopen| !reopen.offers_fresh())
+                && !self.is_draft())
+    }
+
+    /// The message's undo, or redo with `redo`, when its history has a step
+    /// that way; a chord with none is left to the workspace.
+    fn composer_history(&self, target: Target, redo: bool) -> Option<Message> {
+        let step = if redo {
+            self.composer_undo.can_redo()
+        } else {
+            self.composer_undo.can_undo()
+        };
+        step.then(|| action(Action::ComposerUndo(target, redo)))
+    }
+
+    fn attachment_tile<'a>(
+        &'a self,
+        target: Target,
+        index: usize,
+        attachment: &'a Attachment,
+        transitioning: bool,
+    ) -> Element<'a, Message> {
+        let label =
+            if attachment.reference.is_none() && clipboard_image::is_pasted(&attachment.path) {
+                "Pasted image".to_owned()
+            } else {
+                attachment.label()
+            };
+        // While the draft is fixed, so are its attachments, for the keyboard
+        // as for the ×, and the message's history.
+        let fixed = self.composer_read_only(transitioning);
+        let (undo, redo) = if fixed {
+            (None, None)
+        } else {
+            (
+                self.composer_history(target, false),
+                self.composer_history(target, true),
+            )
+        };
+        let removal =
+            |removal| (!fixed).then(|| action(Action::RemoveAttachment(target, index, removal)));
+        let remove = removal(Removal::Key);
+        let close = attachment_close(removal(Removal::Pointer));
+        let id = attachment_tile_id(target.card, index);
+        // The file's own name, which the tile's short label leaves out, as
+        // the attachment rows showed it.
+        let named = |tile: Element<'a, Message>| -> Element<'a, Message> {
+            widget::tooltip(
+                tile,
+                design::caption(attachment.reference.as_ref().map_or_else(
+                    || attachment.path.display().to_string(),
+                    |reference| reference.name.clone(),
+                )),
+                widget::tooltip::Position::Top,
+            )
+            .into()
+        };
+        if !is_image_attachment(attachment) {
+            let face = widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::TextFile, design::ROW_ICON_SIZE),
+                    crate::ui_controls::FadeText::caption(label.clone())
+                        .limit(32)
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center),
+            )
+            // Room at the trailing end for the × it reveals.
+            .padding(iced::Padding::from([0.0, step::GAP_S]).right(ATTACHMENT_CLOSE + 6.0))
+            .height(Length::Fixed(ATTACHMENT_CHIP))
+            .align_y(iced::alignment::Vertical::Center)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_S; 4],
+                true,
+            ));
+            return named(
+                attachment_tile::tile(
+                    id,
+                    face,
+                    widget::Space::new(),
+                    widget::container(close).center_y(Length::Fixed(ATTACHMENT_CHIP - 6.0)),
+                    label,
+                    remove,
+                )
+                .on_history(undo.clone(), redo.clone())
+                .into(),
+            );
+        }
+        let size = Length::Fixed(ATTACHMENT_TILE);
+        let face: Element<'_, Message> = match self.thumbnails.handle(&attachment.path) {
+            Some(handle) => iced::widget::image(handle.clone())
+                .width(size)
+                .height(size)
+                .content_fit(iced::ContentFit::Cover)
+                .border_radius([design::RADIUS_S; 4])
+                .into(),
+            None => widget::container(crate::ui_controls::passive_icon(
+                Icon::Image,
+                design::ROW_ICON_SIZE,
+            ))
+            .center(size)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_S; 4],
+                true,
+            ))
+            .into(),
+        };
+        let caption = widget::container(
+            design::caption(label.clone()).class(cosmic::theme::Text::Color(iced::Color::WHITE)),
+        )
+        .center_x(Length::Fill)
+        .padding([1, 2])
+        .class(cosmic::theme::Container::custom(|_theme| {
+            widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    a: 0.62,
+                    ..iced::Color::BLACK
+                })),
+                border: iced::Border {
+                    radius: [0.0, 0.0, design::RADIUS_S, design::RADIUS_S].into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }));
+        let marked = attachment
+            .reference
+            .as_ref()
+            .is_some_and(|reference| self.caret_reference == Some(reference.id));
+        named(
+            attachment_tile::tile(
+                id,
+                face,
+                widget::container(caption)
+                    .width(size)
+                    .height(size)
+                    .align_y(iced::alignment::Vertical::Bottom),
+                close,
+                label,
+                remove,
+            )
+            .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
+            .on_history(undo, redo)
+            .marked(marked)
+            .into(),
+        )
     }
 
     /// The `+` at the composer's leading edge, and the menu it opens while it
@@ -5056,7 +5300,7 @@ impl Runtime {
                                 permission_mode_label(self.session.launch.provider, &modes[index])
                             },
                         )),
-                        widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
+                        widget::icon(Icon::ChevronDown.handle()).size(design::COMPACT_ICON_SIZE),
                         step::GAP_XS,
                     ),
                 )
@@ -5094,26 +5338,59 @@ impl Runtime {
         let label = || -> Element<'a, Message> {
             crate::ui_controls::FadeText::caption(accounts.current).into()
         };
-        let icon = Icon::Avatar.handle();
-        if transitioning || !self.choosing() {
+        // The account's usage stands where its avatar would: the allowance
+        // it has least of, a figure a reader acts on before sending, where an
+        // avatar only repeats the name beside it. An account with no current
+        // figure keeps the avatar.
+        let gauge = accounts.gauge;
+        let glyph = |passive: bool| -> Element<'a, Message> {
+            match gauge {
+                Some(gauge) => {
+                    crate::ui_controls::budget_radial_toned(gauge.fraction, gauge.tone.ring_tone())
+                }
+                None if passive => crate::ui_controls::passive_icon(
+                    Icon::Avatar.handle(),
+                    design::COMPACT_ICON_SIZE,
+                ),
+                None => widget::icon(Icon::Avatar.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
+            }
+        };
+        let usage = |tooltip: String| match gauge {
+            Some(gauge) => format!("{tooltip}\n\n{}", gauge.detail),
+            None => tooltip,
+        };
+        if transitioning || !self.choosing() || !accounts.choosable {
             // Manual choices are made before the first message. Automatic
             // routing can hand off later at a safe idle boundary.
-            let avatar = crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE);
-            // Without its caption the avatar alone says nothing to a screen
-            // reader, so it carries the account's name.
-            let avatar = if named {
-                avatar
-            } else {
-                crate::ui_controls::labelled(avatar, format!("Account: {}", accounts.current))
+            //
+            // The glyph alone says nothing to a screen reader, so it carries
+            // the figure, and without its caption the account's name too.
+            let avatar = match (named, gauge) {
+                (true, None) => glyph(true),
+                (true, Some(gauge)) => {
+                    crate::ui_controls::labelled(glyph(true), gauge.label.clone())
+                }
+                (false, None) => crate::ui_controls::labelled(
+                    glyph(true),
+                    format!("Account: {}", accounts.current),
+                ),
+                (false, Some(gauge)) => crate::ui_controls::labelled(
+                    glyph(true),
+                    format!("Account: {}, {}", accounts.current, gauge.label),
+                ),
             };
             return crate::interaction::tooltip_above(
                 widget::row::with_children(std::iter::once(avatar).chain(named.then(label)))
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center),
-                format!(
+                usage(format!(
                     "This conversation runs on {}. {}",
                     accounts.current,
-                    if self
+                    if !accounts.choosable {
+                        "It is the only account signed in for this agent."
+                    } else if self
                         .session
                         .launch
                         .recipe
@@ -5125,15 +5402,15 @@ impl Runtime {
                     } else {
                         "This account is pinned. Start a new conversation to use another account."
                     }
-                ),
+                )),
             );
         }
         let anchor = widget::button::custom(
             widget::row::with_children(
-                std::iter::once(widget::icon(icon).size(design::COMPACT_ICON_SIZE).into())
+                std::iter::once(glyph(false))
                     .chain(named.then(label))
                     .chain(std::iter::once(
-                        widget::icon(Icon::PanDown.handle())
+                        widget::icon(Icon::ChevronDown.handle())
                             .size(design::COMPACT_ICON_SIZE)
                             .into(),
                     )),
@@ -5141,10 +5418,14 @@ impl Runtime {
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center),
         )
-        .name(if named {
-            Cow::Borrowed("Choose an account")
-        } else {
-            Cow::Owned(format!("Choose an account, now {}", accounts.current))
+        .name(match (named, gauge) {
+            (true, None) => Cow::Borrowed("Choose an account"),
+            (true, Some(gauge)) => Cow::Owned(format!("Choose an account, {}", gauge.label)),
+            (false, None) => Cow::Owned(format!("Choose an account, now {}", accounts.current)),
+            (false, Some(gauge)) => Cow::Owned(format!(
+                "Choose an account, now {}, {}",
+                accounts.current, gauge.label
+            )),
         })
         .id(card_control_id(target.card, "chat-account-picker"))
         .class(crate::ui_controls::control_style(open, None))
@@ -5156,11 +5437,11 @@ impl Runtime {
         );
         let anchor = crate::interaction::tooltip_above(
             anchor,
-            if named {
+            usage(if named {
                 shortcut
             } else {
                 format!("Account: {} · {shortcut}", accounts.current)
-            },
+            }),
         );
         let choices = open.then(|| {
             widget::column::with_children(
@@ -5308,7 +5589,7 @@ impl Runtime {
                         .into()
                 }))
                 .chain(std::iter::once(
-                    widget::icon(Icon::PanDown.handle())
+                    widget::icon(Icon::ChevronDown.handle())
                         .size(design::COMPACT_ICON_SIZE)
                         .into(),
                 )),
@@ -6160,7 +6441,17 @@ impl Runtime {
                         let revision = cached.revision;
                         // Header elements are cheap owned metadata; only a
                         // mounted row creates their widget tree and geometry.
-                        let row = self.step_view(item, cached, settings);
+                        // A message keeps the row it has alone, its
+                        // recipient and how it stands.
+                        let row = match cached.coordination.as_deref() {
+                            Some(coordinated) if turn.messages => {
+                                let raw = self
+                                    .item_expanded(&item.id)
+                                    .then(|| self.step_detail(item, cached, settings));
+                                self.coordination_card(item, coordinated, raw)
+                            }
+                            _ => self.step_view(item, cached, settings),
+                        };
                         let id = item.id.clone();
                         let mut row = virtualized::Row::once(
                             key,

@@ -15,7 +15,7 @@ pub(super) const SCHEMA: &str = "
 CREATE TABLE file_edits(source TEXT NOT NULL,item_id TEXT NOT NULL,file_index INTEGER NOT NULL,
  ordinal INTEGER NOT NULL,path TEXT NOT NULL,kind BLOB NOT NULL,status BLOB NOT NULL,
  imported INTEGER NOT NULL,additions INTEGER,deletions INTEGER,start INTEGER NOT NULL,len INTEGER NOT NULL,
- PRIMARY KEY(source,item_id,file_index));
+ placed INTEGER NOT NULL,PRIMARY KEY(source,item_id,file_index));
 CREATE INDEX file_edits_path ON file_edits(source,path,ordinal,file_index);
 CREATE INDEX file_edits_status ON file_edits(source,path,status,ordinal,file_index);
 CREATE TABLE file_totals(source TEXT NOT NULL,path TEXT NOT NULL,succeeded INTEGER NOT NULL,
@@ -320,7 +320,7 @@ impl Store {
                 };
                 let count = counts(patch);
                 self.db.execute(
-                    "INSERT INTO file_edits VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    "INSERT INTO file_edits VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                     params![
                         source,
                         item.id,
@@ -333,7 +333,8 @@ impl Store {
                         count.map(|v| v.0),
                         count.map(|v| v.1),
                         start as i64,
-                        length as i64
+                        length as i64,
+                        change.lines == crate::chat::LineOrigin::File
                     ],
                 )?;
                 self.adjust_file_total(source, &change.path, *status, imported, count, 1)?;
@@ -598,7 +599,7 @@ impl Store {
             }
         }
 
-        let mut statement=self.db.prepare_cached("SELECT item_id,file_index,ordinal,kind,status,imported,start,len FROM file_edits WHERE source=?1 AND path=?2 AND (ordinal,file_index)>=(?3,?4) ORDER BY ordinal,file_index LIMIT ?5").map_err(|e|e.to_string())?;
+        let mut statement=self.db.prepare_cached("SELECT item_id,file_index,ordinal,kind,status,imported,start,len,placed FROM file_edits WHERE source=?1 AND path=?2 AND (ordinal,file_index)>=(?3,?4) ORDER BY ordinal,file_index LIMIT ?5").map_err(|e|e.to_string())?;
         let records = statement
             .query_map(
                 params![
@@ -618,6 +619,7 @@ impl Store {
                         r.get::<_, bool>(5)?,
                         r.get::<_, usize>(6)?,
                         r.get::<_, usize>(7)?,
+                        r.get::<_, bool>(8)?,
                     ))
                 },
             )
@@ -625,7 +627,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         let mut remaining = PATCH_BYTES.saturating_sub(key.len() + page.key.path.len() + 256);
-        for (id, index, ordinal, kind, status, imported, start, length) in records {
+        for (id, index, ordinal, kind, status, imported, start, length, placed) in records {
             let offset = cursor
                 .filter(|c| c.ordinal == ordinal && c.file_index == index)
                 .map_or(0, |c| c.offset);
@@ -688,6 +690,11 @@ impl Store {
                 offset,
                 total_bytes: length,
                 diff: String::from_utf8(bytes).map_err(|e| e.to_string())?,
+                lines: if placed {
+                    crate::chat::LineOrigin::File
+                } else {
+                    crate::chat::LineOrigin::Excerpt
+                },
             });
             if offset + valid < length {
                 page.next = Some(FilePatchCursor {
@@ -714,6 +721,7 @@ mod tests {
             at: None,
             content: ItemContent::Changes {
                 changes: vec![FileChange {
+                    lines: crate::chat::LineOrigin::File,
                     path: path.into(),
                     diff: diff.into(),
                     kind,
@@ -964,6 +972,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(summary(&mut store).total_files, 0);
+    }
+    /// Where a patch's line numbers count from is kept with it, for the
+    /// conversation and for a subagent whose patch is stored apart.
+    #[test]
+    fn file_changes_keep_what_each_patch_numbers_from() {
+        let mut store = Store::new().unwrap();
+        let mut excerpt = item(
+            "pending",
+            "a.rs",
+            DIFF,
+            ToolStatus::Running,
+            ChangeKind::Updated,
+        );
+        let ItemContent::Changes { changes, .. } = &mut excerpt.content else {
+            unreachable!()
+        };
+        changes[0].lines = crate::chat::LineOrigin::Excerpt;
+        store.apply(Event::Item(excerpt.clone())).unwrap();
+        store
+            .apply(Event::Item(item(
+                "applied",
+                "a.rs",
+                DIFF,
+                ToolStatus::Succeeded,
+                ChangeKind::Updated,
+            )))
+            .unwrap();
+        store
+            .apply(Event::SubagentItem {
+                id: "delegate".into(),
+                item: excerpt,
+            })
+            .unwrap();
+        let origins = |page: FileChangePage| {
+            page.patches
+                .into_iter()
+                .map(|patch| (patch.item_id, patch.lines))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            origins(page(&mut store, key("a.rs"), None, 0)),
+            [
+                ("pending".into(), crate::chat::LineOrigin::Excerpt),
+                ("applied".into(), crate::chat::LineOrigin::File),
+            ]
+        );
+        let delegated = FileChangeKey {
+            source: FileChangeSource::Subagent {
+                id: "delegate".into(),
+            },
+            path: "a.rs".into(),
+        };
+        assert_eq!(
+            origins(page(&mut store, delegated, None, 0)),
+            [("pending".into(), crate::chat::LineOrigin::Excerpt)]
+        );
     }
     #[test]
     fn file_changes_survive_transcript_eviction_and_preserve_history_and_delegate_scope() {

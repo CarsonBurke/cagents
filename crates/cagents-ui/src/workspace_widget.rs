@@ -59,8 +59,10 @@ pub enum GlobalShortcut {
     ChatAccount,
     ChatModel,
     ChatPermissions,
+    Dictate,
     ToggleInspector,
     OpenSettings,
+    OpenWorktrees,
     MovePaneLeft,
     MovePaneRight,
     ReopenPane,
@@ -181,6 +183,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Chat,
     },
     ShortcutDescriptor {
+        action: GlobalShortcut::Dictate,
+        label: "Dictate",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
         action: GlobalShortcut::ToggleProjects,
         label: "Toggle Projects sidebar",
         repeatable: false,
@@ -213,6 +221,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::OpenSettings,
         label: "Open settings",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenWorktrees,
+        label: "Open worktrees",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
@@ -409,8 +423,10 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::ChatPermissions => &shortcuts.chat_permissions,
         GlobalShortcut::ChatModel => &shortcuts.chat_model,
         GlobalShortcut::ChatAccount => &shortcuts.chat_account,
+        GlobalShortcut::Dictate => &shortcuts.dictate,
         GlobalShortcut::ToggleInspector => &shortcuts.toggle_inspector,
         GlobalShortcut::OpenSettings => &shortcuts.open_settings,
+        GlobalShortcut::OpenWorktrees => &shortcuts.open_worktrees,
         GlobalShortcut::MovePaneLeft => &shortcuts.move_pane_left,
         GlobalShortcut::MovePaneRight => &shortcuts.move_pane_right,
         GlobalShortcut::ReopenPane => &shortcuts.reopen_pane,
@@ -464,6 +480,7 @@ pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
         ShortcutKey::ArrowUp => Key::Named(Named::ArrowUp),
         ShortcutKey::ArrowDown => Key::Named(Named::ArrowDown),
         ShortcutKey::Tab => Key::Named(Named::Tab),
+        ShortcutKey::Space => Key::Character(" ".into()),
         ShortcutKey::PageUp => Key::Named(Named::PageUp),
         ShortcutKey::PageDown => Key::Named(Named::PageDown),
         ShortcutKey::Function(number) => Key::Named(match number {
@@ -975,6 +992,8 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::Tab)
             ),
+            // The space bar arrives as the character it types.
+            ShortcutKey::Space => key.as_ref() == keyboard::Key::Character(" "),
             ShortcutKey::PageUp => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageUp)
@@ -1015,6 +1034,49 @@ pub(crate) fn recordable_shortcut_character(
         // A logical numpad digit cannot trigger a number-row binding.
         latin_key(key, physical_key).filter(|character| !character.is_ascii_digit())
     })
+}
+
+/// Whether a chord is undo or redo (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y) pressed in
+/// a chat pane, whose message editor has an undo history of its own.
+///
+/// The pane's content sees such a chord before the workspace does: the
+/// focused editor takes it, and the workspace's action bound to the same
+/// chord, such as reopening a closed pane on Ctrl+Shift+Z, runs only when
+/// nothing there took it ([`deferred_shortcut_taken`]).
+pub(crate) fn defers_to_focused_editor(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+    focused: FocusedPane,
+) -> bool {
+    focused == FocusedPane::Chat
+        && modifiers.command()
+        && !modifiers.alt()
+        && !modifiers.logo()
+        && match latin_key(key, physical_key) {
+            Some('z') => true,
+            Some('y') => !modifiers.shift(),
+            _ => false,
+        }
+}
+
+/// Whether the pane's content took a chord the workspace left to it first
+/// ([`defers_to_focused_editor`]), so the workspace's own action for that
+/// chord does not also run.
+pub(crate) fn deferred_shortcut_taken(
+    event: &keyboard::Event,
+    captured: bool,
+    focused: FocusedPane,
+) -> bool {
+    match event {
+        keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        } => captured && defers_to_focused_editor(key, *physical_key, *modifiers, focused),
+        _ => false,
+    }
 }
 
 fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
@@ -2273,8 +2335,15 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         let content_layout = Self::child_layout(layout);
 
         match event {
-            Event::Keyboard(press @ keyboard::Event::KeyPressed { .. })
-                if is_global_shortcut_press(press, self.shortcuts, self.focused_pane) =>
+            Event::Keyboard(
+                press @ keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                },
+            ) if is_global_shortcut_press(press, self.shortcuts, self.focused_pane)
+                && !defers_to_focused_editor(key, *physical_key, *modifiers, self.focused_pane) =>
             {
                 shell.capture_event();
                 return;
@@ -2289,6 +2358,11 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
                 *physical_key,
                 *modifiers,
                 self.shortcuts,
+                self.focused_pane,
+            ) && !defers_to_focused_editor(
+                key,
+                *physical_key,
+                *modifiers,
                 self.focused_pane,
             ) =>
             {
