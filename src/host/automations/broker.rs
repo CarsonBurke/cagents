@@ -420,22 +420,6 @@ impl Handle {
         self.run_with(|host| self.tick(host));
     }
 
-    // Retain the former maintenance seam for its fault-isolation tests. The
-    // production runner above no longer calls it: deleted history now has an
-    // explicit retained-state deadline instead of this one-minute probe.
-    #[cfg(test)]
-    fn tick_with_history_maintenance(
-        &self,
-        host: &SharedHost,
-        maintained: &mut Instant,
-    ) -> Result<Option<Duration>, String> {
-        let result = self.tick(host);
-        if maintained.elapsed() >= Duration::from_secs(60) {
-            *maintained = Instant::now();
-        }
-        result
-    }
-
     fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Option<Duration>, String>) {
         loop {
             let observed = {
@@ -558,14 +542,20 @@ impl Handle {
             return Ok(Some(Duration::from_millis(250)));
         }
         let now = service::now()?;
-        let history_retry = self.history_retry_remaining();
-        if history_retry.is_none() {
+        // Optional history maintenance never gates the real work below: a
+        // failure is logged and retried after a finite backoff.
+        if self.history_retry_remaining().is_none() {
             let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
-            if registry
-                .next_removed_automation_history_deadline()?
-                .is_some_and(|deadline| deadline <= now)
-                && let Err(error) = registry.maintain_removed_automation_history(now)
-            {
+            let maintained = registry
+                .next_removed_automation_history_deadline()
+                .and_then(|deadline| match deadline {
+                    Some(deadline) if deadline <= now => {
+                        registry.maintain_removed_automation_history(now)
+                    }
+                    _ => Ok(()),
+                });
+            drop(registry);
+            if let Err(error) = maintained {
                 self.defer_history_maintenance();
                 warn_history_maintenance(&error);
             }
@@ -687,23 +677,31 @@ impl Handle {
             let registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
             (
                 registry.next_automation_deadline()?,
-                registry.next_removed_automation_history_deadline()?,
+                registry.next_removed_automation_history_deadline(),
             )
         };
-        let automation_delay =
-            automation_deadline.map(|due| Duration::from_millis(due.saturating_sub(now).max(50)));
-        // A real calendar schedule needs bounded wall-clock recalibration.
-        // Empty or disabled automation sets retain no clock wake at all.
-        let automation_delay = match (automation_deadline, automation_delay) {
-            (Some(_), Some(delay)) => Some(delay.min(Duration::from_secs(60))),
-            (_, delay) => delay,
-        };
-        let history_delay = match (history_deadline, self.history_retry_remaining()) {
-            (Some(deadline), Some(retry)) if deadline <= now => Some(retry),
-            (Some(deadline), _) => {
-                Some(Duration::from_millis(deadline.saturating_sub(now).max(50)))
+        // A real calendar schedule is rechecked at least once a minute, so a
+        // wall-clock change or a suspend is noticed. With nothing scheduled
+        // there is no clock wake at all.
+        let automation_delay = automation_deadline.map(|due| {
+            Duration::from_millis(due.saturating_sub(now).max(50)).min(Duration::from_secs(60))
+        });
+        let history_delay = match history_deadline {
+            Ok(None) => None,
+            Ok(Some(deadline)) if deadline > now => {
+                Some(Duration::from_millis((deadline - now).max(50)))
             }
-            (None, _) => None,
+            // Due: wait out a failed attempt's backoff, or continue a
+            // bounded batch that left eligible history behind.
+            Ok(Some(_)) => Some(
+                self.history_retry_remaining()
+                    .unwrap_or(Duration::from_millis(50)),
+            ),
+            Err(error) => {
+                self.defer_history_maintenance();
+                warn_history_maintenance(&error);
+                self.history_retry_remaining()
+            }
         };
         let delay = [automation_delay, history_delay]
             .into_iter()
