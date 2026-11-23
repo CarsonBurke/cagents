@@ -399,6 +399,91 @@ fn a_start_holding_the_allocation_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
 }
 
+/// A terminal about to run Codex's CLI on the conversation launches a writer
+/// of it, which the process scan cannot see before it exists. One already
+/// spawning holds the Close; while the Close holds its claim, none can
+/// spawn (see `settle_lost_execution`).
+#[test]
+fn a_terminal_spawning_codex_on_the_conversation_keeps_the_refusal() {
+    let Some(root) = isolated("a_terminal_spawning_codex_on_the_conversation_keeps_the_refusal")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let conversation = fixture.source.launch.session_id.clone().unwrap();
+    let terminal = crate::model::TerminalSession {
+        id: TerminalId::new(),
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: crate::model::LaunchRecipe {
+            program: "codex".into(),
+            arguments: vec!["resume".into(), conversation],
+            working_directory: root.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("lost-codex-owner"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        },
+    };
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .reserve_spawn_of(&terminal)
+        .unwrap();
+    let refusal = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(refusal.contains("elsewhere in Cagents"), "{refusal}");
+    assert!(fixture.socket().parent().unwrap().exists());
+    fixture.host.lock().unwrap().cancel_spawn(terminal.id);
+    // Under the Close's claim, the terminal cannot spawn.
+    let closing = {
+        let mut state = fixture.host.lock().unwrap();
+        capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap()
+    };
+    let refused = fixture
+        .host
+        .lock()
+        .unwrap()
+        .reserve_spawn_of(&terminal)
+        .unwrap_err();
+    assert!(refused.retryable, "{refused:?}");
+    drop(closing);
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+    // Once it closed, the terminal may resume the conversation.
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .reserve_spawn_of(&terminal)
+        .unwrap();
+}
+
+/// The evidence proves nothing of a Close that does not hold its claim on
+/// the conversation: a start could launch a writer while it is read.
+#[test]
+fn a_lost_execution_settles_only_under_its_close_claim() {
+    let Some(root) = isolated("a_lost_execution_settles_only_under_its_close_claim") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let proof = fixture.host.lock().unwrap().proof().clone();
+    let refusal = settle_lost_execution(&fixture.host, &fixture.source, &proof).unwrap_err();
+    assert!(refusal.contains("lost its claim"), "{refusal}");
+    let closing = {
+        let mut state = fixture.host.lock().unwrap();
+        capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap()
+    };
+    settle_lost_execution(&fixture.host, &fixture.source, &proof).unwrap();
+    drop(closing);
+}
+
 /// The state the report left: the same daemon, no record, no receipt, and the
 /// allocation itself already given back.
 #[test]

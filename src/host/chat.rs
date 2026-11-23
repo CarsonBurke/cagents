@@ -1222,11 +1222,34 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
 ///
 /// An open agent that still runs as this conversation ends with it, as it
 /// would have with a receipt: a person closing the pane closes the agent.
+///
+/// The evidence proves an absence only if nothing Cagents runs can launch a
+/// writer of this conversation while it is read: the process scan judges
+/// only processes that exist as it reads them. A writer is a provider
+/// process naming this pane's listener allocation or the conversation.
+/// - This pane's own helper is gone: [`what_holds`] reads its holder record
+///   and refuses for a launch, startup, handoff or cleanup of the pane.
+/// - The caller's claim on the pane, its `chat_spawning` entry, refuses every
+///   Start, Resume, restore or terminal view of the pane (admission in
+///   [`capacity::Reservation`], `start_publishing` and
+///   `reserve_spawn_for_view_reserved`), so none launches its provider.
+/// - A native chat of another pane runs its provider with only its own
+///   listener in its arguments (`codex app-server --listen`), which names
+///   neither, so it launches no writer of this one.
+/// - A terminal running Codex's CLI on the conversation does name it. The
+///   claim refuses such a terminal's spawn from any other pane, and one
+///   already spawning or running holds the Close ([`codex_terminal_owner`]).
+///
+/// A program started outside Cagents is no launch of it, and no fence can
+/// hold one back.
 fn settle_lost_execution(
     host: &SharedHost,
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<(), String> {
+    if !claimed_for_close(&host.lock().unwrap_or_else(|p| p.into_inner()), session) {
+        return Err("This conversation's Close lost its claim; it was not closed".into());
+    }
     refuse_scheduled_agent(host, session)?;
     if let Some(holds) = what_holds(host, session, proof)? {
         return Err(lost_execution_refusal(session, holds));
@@ -1255,6 +1278,20 @@ fn settle_lost_execution(
             )?;
     }
     Ok(())
+}
+
+/// Whether `session`'s pane is claimed, so that no Start, Resume or startup
+/// of it can be admitted (see [`settle_lost_execution`]). A Codex claim must
+/// also name its conversation: admission compares conversations by the
+/// claim, and the process scan counts any process naming it as a writer. A
+/// retained Claude actor's claim is its issued descriptor, which may predate
+/// the conversation its resident confirmed; its evidence is its own roster.
+fn claimed_for_close(state: &HostState, session: &Session) -> bool {
+    state.chat_spawning.get(&session.id).is_some_and(|claim| {
+        session.launch.provider != Provider::Codex
+            || same_conversation(&claim.launch, &session.launch)
+            || session.launch.session_id.is_none()
+    })
 }
 
 /// A scheduled agent is its automation's to end, as when a changed boot
@@ -1625,27 +1662,39 @@ fn what_holds(
 }
 
 /// A recorded terminal conversation is writer evidence even without a pane
-/// marker (for example, a CLI resumed against the shared Codex daemon).
+/// marker (for example, a CLI resumed against the shared Codex daemon). A
+/// terminal still spawning counts: its CLI may start at any moment.
 fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<TerminalId> {
-    let id = session.launch.session_id.as_ref()?;
-    state.terminals.iter().find_map(|(terminal_id, record)| {
-        if record.handle.is_completed() {
-            return None;
-        }
-        let observed = record
-            .session
-            .resume_hint
-            .as_deref()
-            .and_then(crate::model::agent_recovery::observed_launch_from_hint);
-        let recipe = observed.as_ref().unwrap_or(&record.session.launch);
-        ((Provider::from_program(&recipe.program) == Some(Provider::Codex)
-            || Provider::recognize_launch(recipe) == Some(Provider::Codex))
-            && recipe
-                .arguments
-                .iter()
-                .any(|arg| arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id)))
-        .then_some(*terminal_id)
-    })
+    let id = session.launch.session_id.as_deref()?;
+    state
+        .terminals
+        .iter()
+        .filter(|(_, record)| !record.handle.is_completed())
+        .find_map(|(terminal_id, record)| {
+            terminal_runs_codex_conversation(&record.session, id).then_some(*terminal_id)
+        })
+        .or_else(|| state.spawning_codex_conversation(id))
+}
+
+/// Whether `terminal` runs Codex's CLI on `conversation`, by its observed
+/// launch or, before one is observed, its recipe.
+pub(super) fn terminal_runs_codex_conversation(
+    terminal: &crate::model::TerminalSession,
+    conversation: &str,
+) -> bool {
+    let observed = terminal
+        .resume_hint
+        .as_deref()
+        .and_then(crate::model::agent_recovery::observed_launch_from_hint);
+    let recipe = observed.as_ref().unwrap_or(&terminal.launch);
+    (Provider::from_program(&recipe.program) == Some(Provider::Codex)
+        || Provider::recognize_launch(recipe) == Some(Provider::Codex))
+        && recipe.arguments.iter().any(|arg| {
+            arg == conversation
+                || arg
+                    .split_once('=')
+                    .is_some_and(|(_, value)| value == conversation)
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4559,7 +4608,22 @@ fn process_inner(
                 record.completion_observed = false;
                 state.inventory_generation += 1;
                 state.recovery_independence.extend(chat_id, terminal_id);
+                // The terminal resumes this chat's conversation under its
+                // claim, which refuses any other's (see
+                // `reserve_spawn_for_view_reserved`).
+                state.handoff_terminals.insert(terminal_id, chat_id);
             }
+            struct HandingOff<'a>(&'a SharedHost, TerminalId);
+            impl Drop for HandingOff<'_> {
+                fn drop(&mut self) {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .handoff_terminals
+                        .remove(&self.1);
+                }
+            }
+            let _handing_off = HandingOff(host, terminal_id);
             // Closing interrupts active work and waits for confirmed teardown.
             // Never start a second writer before teardown has been proved.
             owners.close(host, &closing)?;
