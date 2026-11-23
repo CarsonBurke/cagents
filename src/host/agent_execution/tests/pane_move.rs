@@ -508,3 +508,175 @@ fn a_chat_agent_moves_its_own_pane_and_its_delegates_but_a_delegate_not_its_pare
     assert_eq!(moved.pane.id, parents.id);
     assert_eq!(placed(parents.id), Some(Scope::Channel(other)));
 }
+
+/// #2073: a live conversation whose every pane is gone gets a new pane in
+/// the channel the person names, with no provider started, and only when
+/// no window still shows it and no agent owns it.
+#[test]
+fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
+    if isolated("host::agent_execution::tests::pane_move::a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let project = path.parent().unwrap().join("project");
+    let elsewhere = path.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    const USER: u64 = 1;
+    host.lock().unwrap().register_client(USER);
+    let request_as = |request: ClientRequest| {
+        process_request(&host, USER, request).map(|(response, _, _)| response)
+    };
+    let edit = |edit: ModelEdit| {
+        request_as(ClientRequest::EditWorkspaceModel { edit }).unwrap();
+    };
+    let model = || -> WorkspaceModel {
+        match request_as(ClientRequest::ReadWorkspaceModel).unwrap() {
+            ServerResponse::WorkspaceModel { model } => model,
+            response => panic!("unexpected read reply {response:?}"),
+        }
+    };
+    let move_to = |session: TerminalId, channel: ChannelId| {
+        request_as(ClientRequest::MovePane {
+            pane: Some(CardId::from_uuid(session.as_uuid())),
+            destination: PaneDestination::Channel(channel),
+            operation: uuid::Uuid::new_v4(),
+        })
+        .map(|response| match response {
+            ServerResponse::PaneMoved(moved) => moved,
+            response => panic!("unexpected move reply {response:?}"),
+        })
+    };
+    let refusal = |session: TerminalId, channel: ChannelId| {
+        let error = move_to(session, channel).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest, "{error:?}");
+        error.message
+    };
+    let showing = |session: TerminalId| -> Vec<(Scope, Pane)> {
+        model()
+            .views
+            .into_iter()
+            .flat_map(|view| {
+                let scope = view.scope;
+                view.panes
+                    .into_iter()
+                    .filter(move |pane| {
+                        matches!(&pane.kind, CardKind::Chat(chat) if chat.id == session)
+                    })
+                    .map(move |pane| (scope.clone(), pane))
+            })
+            .collect()
+    };
+
+    // The agent's conversation, and two plain ones on the same actor that
+    // no pane shows: one a window holds, as a pane it has not saved would.
+    let agent_chat = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let (plain, held) = (TerminalId::new(), TerminalId::new());
+    {
+        let mut state = host.lock().unwrap();
+        let record = &state.chats[&agent_chat];
+        let (source, handle) = (record.session.clone(), record.handle.clone());
+        for (id, holder) in [(plain, None), (held, Some(USER))] {
+            let mut session = source.clone();
+            session.id = id;
+            state.chats.insert(
+                id,
+                crate::host::chat::Record {
+                    execution_instance: uuid::Uuid::new_v4(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session,
+                    handle: handle.clone(),
+                    source_process: None,
+                    subscribers: holder.into_iter().map(|client| (client, true)).collect(),
+                    observations: Default::default(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+    }
+    edit(ModelEdit::OpenProject {
+        repository: elsewhere.clone(),
+        name: "Elsewhere".into(),
+        kind: ProjectKind::Folder,
+    });
+    let (other, foreign) = (ChannelId::new(), ChannelId::new());
+    for (id, repository) in [(other, &project), (foreign, &elsewhere)] {
+        edit(ModelEdit::CreateChannel {
+            id,
+            repository: repository.clone(),
+            title: "Channel".into(),
+            title_source: Default::default(),
+        });
+    }
+
+    // Not into another project's channel.
+    let message = refusal(plain, foreign);
+    assert!(
+        message.contains("only between channels of its own project"),
+        "{message}"
+    );
+    assert!(showing(plain).is_empty());
+
+    // Into its own project's: a new pane showing the same conversation.
+    let canonical = std::fs::canonicalize(&project).unwrap();
+    let opened = move_to(plain, other).unwrap();
+    assert_eq!(
+        opened.from,
+        Scope::Worktree {
+            repository: canonical.clone(),
+            path: canonical.clone(),
+        }
+    );
+    assert_eq!(opened.channel.id, other);
+    assert!(!opened.created);
+    let CardKind::Chat(shown) = &opened.pane.kind else {
+        panic!("not a chat pane: {:?}", opened.pane)
+    };
+    assert_eq!(shown.id, plain);
+    // The conversation's own title, or the provider's default without one.
+    let title = host.lock().unwrap().chats[&plain]
+        .handle
+        .title()
+        .filter(|title| !title.trim().is_empty());
+    assert_eq!(opened.pane.title, title.as_deref().unwrap_or("Claude chat"));
+    assert_eq!(opened.pane.scope.as_deref(), Some(canonical.as_path()));
+    assert_eq!(
+        showing(plain),
+        vec![(Scope::Channel(other), opened.pane.clone())]
+    );
+    assert!(
+        !host.lock().unwrap().chats[&plain].handle.is_completed(),
+        "the conversation keeps running"
+    );
+    // Named again, it is the saved pane, already there.
+    let again = move_to(plain, other).unwrap();
+    assert_eq!(again.pane.id, opened.pane.id);
+    assert_eq!(again.from, Scope::Channel(other));
+    assert_eq!(showing(plain).len(), 1);
+
+    // Never a conversation a window still shows, nor an agent's.
+    let message = refusal(held, other);
+    assert!(message.contains("Another client is showing"), "{message}");
+    let message = refusal(agent_chat, other);
+    assert!(message.contains("is agent"), "{message}");
+    for session in [held, agent_chat] {
+        assert!(showing(session).is_empty());
+    }
+    let message = refusal(TerminalId::new(), other);
+    assert!(
+        message.contains("No saved pane or live session"),
+        "{message}"
+    );
+}

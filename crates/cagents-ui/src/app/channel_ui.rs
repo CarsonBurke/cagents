@@ -3456,8 +3456,7 @@ pub(in crate::app) mod tests {
         let named = ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
         let session = chat_session();
-        durable.cards[0].title =
-            super::super::chat_ui::chat_card_title(session.launch.provider).into();
+        durable.cards[0].title = session.launch.provider.chat_title().into();
         durable.cards[0].kind = crate::model::CardKind::Chat(session);
         let project = ProjectId::new();
         // An untitled channel first: the first *titled* channel names the chat.

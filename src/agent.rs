@@ -384,6 +384,19 @@ impl Provider {
         self.adapter().label
     }
 
+    /// The tab title a native chat starts with. It names the provider, as
+    /// a bare "Native chat" left the reader unable to tell which agent a tab
+    /// was talking to.
+    pub fn chat_title(self) -> &'static str {
+        match self {
+            Self::Omp => "OMP chat",
+            Self::Claude => "Claude chat",
+            Self::Codex => "Codex chat",
+            Self::Antigravity => "Antigravity chat",
+            Self::Muse => "Muse chat",
+        }
+    }
+
     /// Every executable name this provider is recognised by, its own first.
     pub fn programs(self) -> impl Iterator<Item = &'static str> {
         let adapter = self.adapter();

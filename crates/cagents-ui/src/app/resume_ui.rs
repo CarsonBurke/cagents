@@ -246,7 +246,7 @@ impl Row {
             title: listed
                 .title
                 .clone()
-                .unwrap_or_else(|| chat_ui::chat_card_title(provider).into()),
+                .unwrap_or_else(|| provider.chat_title().into()),
             provider,
             directory: listed.directory.clone(),
             account,
@@ -603,7 +603,7 @@ fn list(
                 launch.session_id.as_deref(),
                 &launch.recipe,
             );
-            let untitled = entry.title == chat_ui::chat_card_title(launch.provider);
+            let untitled = entry.title == launch.provider.chat_title();
             seen.insert(key.clone(), Some((entry.card, untitled)))
                 .is_none()
                 .then_some((entry, key))
@@ -3941,7 +3941,7 @@ mod tests {
         let mut entry = saved(root.path());
         entry.session = seed.clone();
         entry.session.launch.session_id = Some(ids[1].clone());
-        entry.title = chat_ui::chat_card_title(Provider::Claude).into();
+        entry.title = Provider::Claude.chat_title().into();
         // One cagents already named keeps its name over a first message.
         let mut named = saved(root.path());
         named.session = seed.clone();
@@ -4079,7 +4079,7 @@ mod tests {
         let seed = antigravity_seed(directory.path());
         let mut known = SavedConversation {
             card: CardId::new(),
-            title: chat_ui::chat_card_title(Provider::Antigravity).into(),
+            title: Provider::Antigravity.chat_title().into(),
             session: seed.clone(),
             open: false,
             updated_at_unix_ms: 1_000,

@@ -114,16 +114,38 @@ pub(super) fn move_pane(
     target: Option<&str>,
     to: PaneDestination,
 ) -> Result<CommandOutput, AppError> {
-    let pane = match target {
+    let (pane, opened) = match target {
         Some(target) => {
             let model = client.read_workspace_model().map_err(protocol_error)?;
-            Some(find_pane(&model, target)?.1.id)
+            match find_pane(&model, target) {
+                Ok((_, pane)) => (Some(pane.id), None),
+                // A session no saved pane shows, or one named by the prefix
+                // `sessions` prints: the daemon moves its pane or gives it one.
+                Err(error) if error.kind == "not_found" && !target.trim().is_empty() => {
+                    let session = live_chat(client, target)?.ok_or(error)?;
+                    let shown = model
+                        .views
+                        .iter()
+                        .flat_map(|view| &view.panes)
+                        .any(|pane| session_id(pane) == Some(session));
+                    (
+                        Some(CardId::from_uuid(session.as_uuid())),
+                        (!shown).then_some(session),
+                    )
+                }
+                Err(error) => return Err(error),
+            }
         }
-        None => None,
+        None => (None, None),
     };
     let moved = client.move_pane(pane, to).map_err(refusal)?;
-    let human = moved_line(&moved, pane.is_none());
     let placement = Scope::Channel(moved.channel.id);
+    // A conversation given a pane was in no channel before.
+    let opened = opened.filter(|_| matches!(moved.from, Scope::Worktree { .. }));
+    let human = match opened {
+        Some(session) => opened_line(&moved, session),
+        None => moved_line(&moved, pane.is_none()),
+    };
     let unchanged = moved.from == placement;
     Ok(CommandOutput {
         command: "channel.move",
@@ -134,10 +156,53 @@ pub(super) fn move_pane(
             "channel": moved.channel,
             "created": moved.created,
             "moved": !unchanged,
+            "opened": opened.is_some(),
             "sequence": moved.sequence,
         }),
         human,
     })
+}
+
+/// The live conversation `target` names by its full ID or by a prefix
+/// shared with no other, as `sessions` prints it.
+fn live_chat(client: &mut ControlClient, target: &str) -> Result<Option<TerminalId>, AppError> {
+    let target = target.trim().to_ascii_lowercase();
+    let directory =
+        super::sessions::read_with(client, crate::agent_execution::directory::Scope::All)?;
+    let mut found = directory
+        .caller
+        .iter()
+        .chain(&directory.sessions)
+        .map(|member| &member.session)
+        .filter(|entry| {
+            entry.surface == crate::agent_execution::directory::Surface::Chat
+                && entry.id.to_string().starts_with(&target)
+        })
+        .map(|entry| entry.id);
+    let session = found.next();
+    if found.next().is_some() {
+        return Err(AppError::new(
+            "ambiguous",
+            "More than one session starts with that; use more of its ID",
+        ));
+    }
+    Ok(session)
+}
+
+/// One line saying where a conversation that had no pane now shows.
+fn opened_line(moved: &PaneMove, session: TerminalId) -> String {
+    let channel = &moved.channel;
+    let title = if channel.title.is_empty() {
+        "New channel"
+    } else {
+        channel.title.as_str()
+    };
+    let made = if moved.created { "new " } else { "" };
+    format!(
+        "Session {session} had no pane. It now shows in {made}channel \"{title}\" ({}) in {}; open that channel to see it.",
+        channel.id,
+        channel.repository.display()
+    )
 }
 
 /// The daemon's refusal says what to do instead; keep it as its sentence.
@@ -698,17 +763,20 @@ mod tests {
         assert_eq!(error.kind, "protocol");
         assert_eq!(error.details.unwrap()["retryable"], true);
 
+        // Neither a pane nor a live session: the model and the session list
+        // are read, and nothing moves.
         let (model, _, to) = fixture();
         let (mut client, server) = serve(
-            move |request| {
-                assert!(matches!(request, ClientRequest::ReadWorkspaceModel));
-                ServerMessage::Response {
+            move |request| match request {
+                ClientRequest::ReadWorkspaceModel => ServerMessage::Response {
                     response: ServerResponse::WorkspaceModel {
                         model: model.clone(),
                     },
-                }
+                },
+                ClientRequest::Agent { .. } => sessions_reply(vec![]),
+                other => panic!("an unknown handle sends no move: {other:?}"),
             },
-            1,
+            2,
         );
         let error = move_pane(&mut client, Some("absent"), PaneDestination::Channel(to))
             .err()
@@ -716,5 +784,78 @@ mod tests {
         drop(client);
         server.join().unwrap();
         assert_eq!(error.kind, "not_found");
+    }
+
+    fn sessions_reply(sessions: Vec<crate::agent_execution::directory::Member>) -> ServerMessage {
+        use crate::agent_execution::directory::{Context, Sessions};
+        ServerMessage::Response {
+            response: ServerResponse::Agent(crate::agent_execution::Reply::Context(Context {
+                sessions: Sessions {
+                    caller: None,
+                    scope: crate::agent_execution::directory::Scope::All,
+                    sessions,
+                },
+                lineage_channel: None,
+            })),
+        }
+    }
+
+    /// #2073: a live conversation no saved pane shows, named by the prefix
+    /// `sessions` prints, is sent to the daemon by its session ID, and the
+    /// reply says where it now shows.
+    #[test]
+    fn a_session_no_pane_shows_is_named_to_the_daemon_and_said_to_show_in_the_channel() {
+        let (model, _, to) = fixture();
+        let mut entry = super::super::sessions::tests::entry();
+        entry.delegation = None;
+        entry.view_scope = None;
+        let session = entry.id;
+        let target = session.to_string()[..8].to_owned();
+        let served = model.clone();
+        let (mut client, server) = serve(
+            move |request| match request {
+                ClientRequest::ReadWorkspaceModel => ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: served.clone(),
+                    },
+                },
+                ClientRequest::Agent { .. } => {
+                    sessions_reply(vec![super::super::sessions::tests::live(entry.clone())])
+                }
+                ClientRequest::MovePane {
+                    pane, destination, ..
+                } => {
+                    assert_eq!(pane, Some(CardId::from_uuid(session.as_uuid())));
+                    assert_eq!(destination, PaneDestination::Channel(to));
+                    let mut pane = served.views[0].panes[0].clone();
+                    pane.id = CardId::new();
+                    ServerMessage::Response {
+                        response: ServerResponse::PaneMoved(PaneMove {
+                            pane,
+                            from: Scope::Worktree {
+                                repository: "/repo".into(),
+                                path: "/repo".into(),
+                            },
+                            channel: served.channel(to).unwrap().clone(),
+                            created: false,
+                            sequence: served.sequence + 1,
+                        }),
+                    }
+                }
+                other => panic!("unexpected request {other:?}"),
+            },
+            3,
+        );
+        let output = move_pane(&mut client, Some(&target), PaneDestination::Channel(to)).unwrap();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(output.data["opened"], json!(true));
+        assert_eq!(output.data["moved"], json!(true));
+        assert_eq!(
+            output.human,
+            format!(
+                "Session {session} had no pane. It now shows in channel \"channel\" ({to}) in /repo; open that channel to see it."
+            )
+        );
     }
 }

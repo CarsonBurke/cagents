@@ -7555,7 +7555,7 @@ impl Cagents {
                 session.launch.session_id = None;
                 session.proof = None;
                 session.terminal = None;
-                card.title = crate::app::chat_ui::chat_card_title(session.launch.provider).into();
+                card.title = session.launch.provider.chat_title().into();
             }
             CardKind::Browser(session) => {
                 session.id = crate::model::BrowserId::new();
@@ -8993,10 +8993,9 @@ impl Cagents {
             // opened with; a provider switch on a fresh chat renames it so the
             // tab does not keep naming an agent it no longer talks to.
             if let CardKind::Chat(current) = &state.kind {
-                let old = crate::app::chat_ui::chat_card_title(current.launch.provider);
+                let old = current.launch.provider.chat_title();
                 if current.launch.provider != session.launch.provider && state.title == old {
-                    state.title =
-                        crate::app::chat_ui::chat_card_title(session.launch.provider).into();
+                    state.title = session.launch.provider.chat_title().into();
                 }
             }
             state.kind = CardKind::Chat(session);
@@ -10035,7 +10034,7 @@ impl Cagents {
             return None;
         };
         let channel = channel?;
-        ((card.title == chat_ui::chat_card_title(session.launch.provider)
+        ((card.title == session.launch.provider.chat_title()
             && self.managed_agent_title(card).is_none())
             || (channel.title_source == crate::model::ChannelTitleSource::Manual
                 && self.channel_primary_chat(channel) == Some(card.id)))

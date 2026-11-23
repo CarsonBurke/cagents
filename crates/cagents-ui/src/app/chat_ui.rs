@@ -7613,21 +7613,6 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = (Target, 
     ))
 }
 
-/// The tab title a native chat starts with.
-///
-/// It names the provider because three providers now front a native chat and
-/// a bare "Native chat" left the reader unable to tell which agent a tab was
-/// talking to.
-pub(super) fn chat_card_title(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Omp => "OMP chat",
-        Provider::Claude => "Claude chat",
-        Provider::Codex => "Codex chat",
-        Provider::Antigravity => "Antigravity chat",
-        Provider::Muse => "Muse chat",
-    }
-}
-
 fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
     session
         .resume_hint
@@ -10203,7 +10188,7 @@ impl Cagents {
             generation: self.durable.generation,
             title: user_title
                 .as_deref()
-                .unwrap_or_else(|| chat_card_title(session.launch.provider))
+                .unwrap_or_else(|| session.launch.provider.chat_title())
                 .into(),
             width_fraction: self.new_pane_fraction(
                 beside
