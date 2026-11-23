@@ -4,6 +4,10 @@
       <stop offset="0" stop-color="#FF8A55"/>
       <stop offset="1" stop-color="#EE5A24"/>
     </linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#74CCBC"/>
+      <stop offset="1" stop-color="#46988A"/>
+    </linearGradient>
     <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#2A3043"/>
       <stop offset="1" stop-color="#181C28"/>
@@ -33,29 +37,30 @@
       <stop offset="1" stop-color="#1C2230"/>
     </linearGradient>
   </defs>
-  <!-- Square panes scaled to the 120 px live area COSMIC icons use, shadows included -->
+  <!-- Square panes scaled to the 120 px live area COSMIC icons use, shadows included.
+       Top edges and corners are sized to match ceditor's pages once rendered. -->
   <g transform="translate(64 64) scale(1.111) translate(-53.0 -53.0)">
     <!-- Background session pane -->
-    <clipPath id="clip-back"><rect x="24" y="0" width="80" height="80" rx="10"/></clipPath>
+    <clipPath id="clip-back"><rect x="24" y="0" width="80" height="80" rx="7.5"/></clipPath>
     <g filter="url(#sh)">
-      <rect x="24" y="5" width="80" height="80" rx="10" fill="#11151F"/>
-      <rect x="24" y="0" width="80" height="80" rx="10" fill="url(#obs-back)"/>
-      <rect x="24" y="0" width="80" height="8" fill="#6CC2B3" clip-path="url(#clip-back)"/>
-      <rect x="24" y="0" width="80" height="8" fill="url(#gloss)" clip-path="url(#clip-back)"/>
-      <rect x="24.8" y="0.8" width="78.4" height="78.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
-      <rect x="78" y="18" width="18" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
-      <rect x="78" y="27" width="12" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.5"/>
-      <rect x="78" y="36" width="15" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+      <rect x="24" y="5" width="80" height="80" rx="7.5" fill="#11151F"/>
+      <rect x="24" y="0" width="80" height="80" rx="7.5" fill="url(#obs-back)"/>
+      <rect x="24" y="0" width="80" height="14" fill="url(#teal)" clip-path="url(#clip-back)"/>
+      <rect x="24" y="0" width="80" height="14" fill="url(#gloss)" clip-path="url(#clip-back)"/>
+      <rect x="24.8" y="0.8" width="78.4" height="78.4" rx="6.7" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+      <rect x="78" y="24" width="18" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+      <rect x="78" y="33" width="12" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.5"/>
+      <rect x="78" y="42" width="15" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
     </g>
     <!-- Active session pane with its agent -->
-    <clipPath id="clip-front"><rect x="0" y="16" width="80" height="80" rx="10"/></clipPath>
+    <clipPath id="clip-front"><rect x="0" y="16" width="80" height="80" rx="7.5"/></clipPath>
     <g filter="url(#sh-r)">
-      <rect x="0" y="21" width="80" height="80" rx="10" fill="#11151F"/>
-      <rect x="0" y="16" width="80" height="80" rx="10" fill="url(#obs)"/>
-      <rect x="0" y="16" width="80" height="8" fill="#FF7A48" clip-path="url(#clip-front)"/>
-      <rect x="0" y="16" width="80" height="8" fill="url(#gloss)" clip-path="url(#clip-front)"/>
-      <rect x="0.8" y="16.8" width="78.4" height="78.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
-      <g transform="translate(38.0 70.2) scale(1.15)">
+      <rect x="0" y="21" width="80" height="80" rx="7.5" fill="#11151F"/>
+      <rect x="0" y="16" width="80" height="80" rx="7.5" fill="url(#obs)"/>
+      <rect x="0" y="16" width="80" height="14" fill="url(#coral)" clip-path="url(#clip-front)"/>
+      <rect x="0" y="16" width="80" height="14" fill="url(#gloss)" clip-path="url(#clip-front)"/>
+      <rect x="0.8" y="16.8" width="78.4" height="78.4" rx="6.7" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+      <g transform="translate(38.0 73.2) scale(1.15)">
         <rect x="-1.5" y="-27" width="3" height="10" rx="1.5" fill="#8EA4C8"/>
         <circle cx="0" cy="-27" r="4" fill="#B83D16"/>
         <circle cx="0" cy="-27.6" r="3.4" fill="url(#coral)"/>

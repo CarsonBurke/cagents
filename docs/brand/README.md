@@ -25,7 +25,9 @@ mark on a dark pane against a dark page with a teal top.
 
 - Panes and pages: obsidian face (`#3B4660` → `#2A3245` → `#222939`, back pane
   `#303A50` → `#1C2230`) over a 4-5 px darker edge (`#11151F`), with a white rim
-  light and a coloured top edge (8 px on panes, 15 px on pages; `rx = 8-10`).
+  light and a glossy gradient top edge. Panes and pages share one top edge and
+  corner radius as rendered at 128 px, about 15.5 px tall with an 8 px radius,
+  so the two icons read as a set.
   Everything casts a soft shadow; the cagents front pane casts it to the right
   onto the pane behind.
 - Robot: coral head (`#FF8A55` → `#EE5A24`, side `#B83D16`) with a dark visor,
