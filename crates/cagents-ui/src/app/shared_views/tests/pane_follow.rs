@@ -162,9 +162,53 @@ fn the_notice_belongs_to_the_channel_it_describes() {
     drop(app.update(Message::WorkspaceModelObserved(edge)));
     assert!(notice(&app).is_some());
 
-    // Going to the pane some other way leaves nothing for the notice to do.
-    drop(app.navigate_to_channel(destination));
+    // Going to the pane some other way leaves nothing for the notice to do,
+    // and coming back doesn't bring it back.
+    let open = |channel_id| Message::Sidebar(SidebarAction::OpenChannel { channel_id });
+    drop(app.update(open(destination)));
+    assert_eq!(app.durable.active_channel, Some(destination));
     assert_eq!(notice(&app), None);
+    drop(app.update(open(source)));
+    assert_eq!(app.durable.active_channel, Some(source));
+    assert_eq!(notice(&app), None);
+}
+
+#[test]
+fn the_notice_goes_once_the_pane_it_offers_moves_on() {
+    let (mut app, source, destination, [moved, _]) = two_panes(1);
+    let edge = transfer_edge(&app, moved.id, source, destination, uuid::Uuid::new_v4());
+    drop(app.update(Message::WorkspaceModelObserved(edge)));
+    assert!(notice(&app).is_some());
+
+    // Moved back here, the pane is in sight and Open has nowhere to go.
+    let edge = transfer_edge(&app, moved.id, destination, source, uuid::Uuid::new_v4());
+    drop(app.update(Message::WorkspaceModelObserved(edge)));
+    assert!(holds(&app, source, moved.id));
+    assert_eq!(app.durable.active_channel, Some(source));
+    assert_eq!(notice(&app), None);
+}
+
+#[test]
+fn coming_back_to_the_window_restarts_the_notice() {
+    let (mut app, source, destination, [moved, _]) = two_panes(0);
+    let main = cosmic::iced::window::Id::RESERVED;
+    app.core.set_main_window_id(Some(main));
+    drop(
+        app.update(Message::RefreshUi(crate::app::refresh_ui::Action::Focused(
+            main, false,
+        ))),
+    );
+    let edge = transfer_edge(&app, moved.id, source, destination, uuid::Uuid::new_v4());
+    drop(app.update(Message::WorkspaceModelObserved(edge)));
+    let shown = app.pane_follow.as_ref().unwrap().deadline();
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    drop(
+        app.update(Message::RefreshUi(crate::app::refresh_ui::Action::Focused(
+            main, true,
+        ))),
+    );
+    assert!(app.pane_follow.as_ref().unwrap().deadline() > shown);
 }
 
 #[test]

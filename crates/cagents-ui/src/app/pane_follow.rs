@@ -40,6 +40,11 @@ impl Notice {
     pub(super) fn text(&self) -> &str {
         &self.text
     }
+
+    #[cfg(test)]
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +125,10 @@ impl Cagents {
 
     /// After the transfer is applied: follows the pane when this window was
     /// showing it, and says where it went either way.
-    pub(super) fn pane_departed(&mut self, departure: Departure) -> Task<Message> {
+    pub(super) fn pane_departed(&mut self, mut departure: Departure) -> Task<Message> {
+        // A channel this window cannot show is not followed: it stays here
+        // and offers the pane instead, without touching the sidebar first.
+        departure.follow &= self.channel_directory(departure.to).is_some();
         let Some(destination) = self
             .durable
             .channels
@@ -148,10 +156,6 @@ impl Cagents {
         } else {
             Task::none()
         };
-        if departure.follow && self.durable.active_channel != Some(departure.to) {
-            // The window could not show the channel; leave it where it is.
-            return task;
-        }
         let text = if departure.follow {
             format!("Moved to {place}")
         } else {
@@ -234,15 +238,39 @@ impl Cagents {
         }
     }
 
-    /// The notice while it still describes where this window is: once the
-    /// person goes elsewhere it has nothing left to offer.
     pub(super) fn pane_follow_notice(&self) -> Option<&Notice> {
-        let notice = self.pane_follow.as_ref()?;
+        self.pane_follow.as_ref()
+    }
+
+    /// Run after every update: the notice goes once it no longer describes
+    /// this window. That is when the person goes to another channel, or,
+    /// for a pane left elsewhere, when that pane leaves the channel the
+    /// notice names and Open would have nowhere true to go.
+    pub(super) fn retire_pane_follow_notice(&mut self) {
+        let Some(notice) = &self.pane_follow else {
+            return;
+        };
         let Departure {
-            from, to, follow, ..
+            card,
+            from,
+            to,
+            follow,
         } = notice.departure;
         let here = if follow { to } else { from };
-        (self.durable.active_channel == Some(here)).then_some(notice)
+        let current = self.durable.active_channel == Some(here)
+            && (follow
+                || channels_holding(&self.durable.channels, card).any(|channel| channel.id == to));
+        if !current {
+            self.pane_follow = None;
+        }
+    }
+
+    /// The countdown runs only while the person can see the notice, so
+    /// coming back to the window gives them the whole of it.
+    pub(super) fn pane_follow_focus_regained(&mut self) {
+        if let Some(notice) = &mut self.pane_follow {
+            notice.deadline = Instant::now() + LIFETIME;
+        }
     }
 
     pub(super) fn pane_follow_subscription(&self) -> Subscription<Message> {

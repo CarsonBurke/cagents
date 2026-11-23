@@ -225,6 +225,7 @@ impl Cagents {
         if !regained {
             return Task::batch([dictation, self.accounts_focus_changed(focused, false)]);
         }
+        self.pane_follow_focus_regained();
         Task::batch([
             // A request that arrived while away is offered on return.
             self.read_owed_automation_requests(),

@@ -20091,6 +20091,7 @@ impl Cagents {
             self.report_notice(notice);
         }
         self.resolve_card_notices();
+        self.retire_pane_follow_notice();
         // A canonical save can arrive before the retry reply. Restore input
         // after either path retires the focused Retry save control.
         let task = Task::batch([task, self.refocus_saved_terminal()]);
