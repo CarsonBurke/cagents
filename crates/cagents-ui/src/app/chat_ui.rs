@@ -565,6 +565,9 @@ pub enum Action {
     DictationUpdate(crate::dictation::Update),
     /// Let the dictation helper go if nothing has used it since.
     DictationIdle(u64),
+    /// A session told to stop is still waiting, and the helper had sent
+    /// this many results when the wait began.
+    DictationOverdue(cagents_dictate::protocol::SessionId, u64),
     ComposerActions(Target, bool),
     /// What the reader has typed into the `+` menu's search.
     ComposerActionsQuery(Target, String),
@@ -925,6 +928,7 @@ impl Action {
             Self::DictationRemove(..) => "DictationRemove",
             Self::DictationUpdate(..) => "DictationUpdate",
             Self::DictationIdle(..) => "DictationIdle",
+            Self::DictationOverdue(..) => "DictationOverdue",
             Self::UpdateRecoveryAnswered(..) => "UpdateRecoveryAnswered",
             Self::UpdateRecoveryDue => "UpdateRecoveryDue",
             Self::UpdateRecoveryReady => "UpdateRecoveryReady",
@@ -1159,6 +1163,7 @@ impl Action {
                 | Self::PasteRefused(..)
                 | Self::DictationUpdate(..)
                 | Self::DictationIdle(..)
+                | Self::DictationOverdue(..)
                 | Self::ImageSaved(..)
                 | Self::AttachmentsPrepared(..)
                 | Self::ImageLoaded(..)
@@ -15722,6 +15727,7 @@ impl Cagents {
             Action::DictationRemove(model) => self.dictation_remove(model),
             Action::DictationUpdate(update) => return self.dictation_update(update),
             Action::DictationIdle(uses) => self.dictation_idle(uses),
+            Action::DictationOverdue(id, answers) => return self.dictation_overdue(id, answers),
             Action::Interrupt(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();

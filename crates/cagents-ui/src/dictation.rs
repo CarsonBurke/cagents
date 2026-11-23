@@ -69,6 +69,8 @@ impl Level {
 struct Helper {
     generation: u64,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
+    /// Stops the process at once, rather than letting it finish.
+    kill: tokio::sync::oneshot::Sender<()>,
 }
 
 /// The app's side of dictation.
@@ -150,6 +152,14 @@ impl Client {
         self.helper = None;
     }
 
+    /// Stops a helper that no longer answers, without waiting for it to
+    /// finish anything. Its exit is not reported: it is no longer current.
+    pub fn abandon(&mut self) {
+        if let Some(helper) = self.helper.take() {
+            let _ = helper.kill.send(());
+        }
+    }
+
     fn send(&mut self, command: Command) -> Result<(), String> {
         if let Some(helper) = &self.helper
             && helper.commands.send(command.clone()).is_ok()
@@ -180,6 +190,7 @@ impl Client {
         let stdout = child.stdout.take().expect("stdout is piped");
         let sender = self.sender.clone();
         let level = self.level.clone();
+        let (kill, killed) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             // Commands go out in order until the app lets the helper go;
             // closing its input then lets it finish and exit.
@@ -191,7 +202,17 @@ impl Client {
                     }
                 }
             });
-            let problem = read_events(generation, stdout, &sender, &level).await;
+            // Releasing the helper drops `kill` unsent, and it goes on to
+            // finish; only abandoning it stops it early.
+            let read = std::pin::pin!(read_events(generation, stdout, &sender, &level));
+            let problem = match cosmic::iced::futures::future::select(read, killed).await {
+                cosmic::iced::futures::future::Either::Left((problem, _)) => problem,
+                cosmic::iced::futures::future::Either::Right((Ok(()), _)) => {
+                    let _ = child.kill().await;
+                    None
+                }
+                cosmic::iced::futures::future::Either::Right((Err(_), read)) => read.await,
+            };
             // Its output has ended, or it is one this app cannot read: its
             // input closes too, so that it is not left waiting for commands.
             writer.abort();
@@ -218,6 +239,7 @@ impl Client {
         Ok(Helper {
             generation,
             commands,
+            kill,
         })
     }
 
