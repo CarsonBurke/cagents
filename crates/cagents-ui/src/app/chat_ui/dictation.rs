@@ -131,6 +131,9 @@ pub(super) struct Session {
     /// Send the draft this way once the last words are in.
     send: Option<PromptMode>,
     level: Level,
+    /// Words heard with a capital in the middle of a sentence: names,
+    /// which keep it at the start of an utterance too.
+    names: HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,6 +211,9 @@ impl Runtime {
         if text.is_empty() {
             return;
         }
+        // Names said in the middle of a sentence keep their capital when an
+        // utterance starts with one.
+        remember_names(&mut session.names, text);
         let mut end = session.end;
         if !end.valid {
             // The place was edited away: the text goes at the end.
@@ -218,14 +224,18 @@ impl Runtime {
         }
         let caret = attachment_draft::Bookmark::capture(&self.composer);
         attachment_draft::move_to(&mut self.composer, end.cursor);
-        let before = self
+        // What the line holds before the words: whether they need a space,
+        // and whether they start a sentence.
+        let left = self
             .composer
             .line(end.cursor.position.line)
             .and_then(|line| {
                 line.text
                     .get(..end.cursor.position.column)
-                    .and_then(|left| left.chars().next_back())
-            });
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let before = left.chars().next_back();
         let after = self
             .composer
             .line(end.cursor.position.line)
@@ -234,11 +244,21 @@ impl Runtime {
                     .get(end.cursor.position.column..)
                     .and_then(|right| right.chars().next())
             });
+        // The recognizer starts every utterance with a capital, which only
+        // belongs where a sentence starts. A name keeps it: a word heard or
+        // written with a capital in the middle of a sentence.
+        let composer = &self.composer;
+        let text = fit_case(text, &left, |word| {
+            matches!(&self.dictation, Some(Pane::Session(session)) if session.names.contains(word))
+                || (0..composer.line_count())
+                    .filter_map(|line| composer.line(line))
+                    .any(|line| mid_sentence_capitals(&line.text).any(|name| name == word))
+        });
         let mut insertion = String::new();
         if before.is_some_and(|before| !before.is_whitespace()) {
             insertion.push(' ');
         }
-        insertion.push_str(text);
+        insertion.push_str(&text);
         // A space keeps the words apart from what follows; the next words go
         // before it, after these.
         let spaced = after.is_some_and(|after| !after.is_whitespace());
@@ -527,6 +547,118 @@ impl Runtime {
     }
 }
 
+/// `line` without the indentation and Markdown marker that begin it: a
+/// bullet, a task box, a number, a heading or a quote.
+fn content(line: &str) -> &str {
+    let line = line.trim_start();
+    let Some((marker, rest)) = line.split_once(char::is_whitespace) else {
+        return if is_marker(line) { "" } else { line };
+    };
+    if !is_marker(marker) {
+        return line;
+    }
+    let rest = rest.trim_start();
+    // A task box after its bullet.
+    ["[ ]", "[x]", "[X]"]
+        .iter()
+        .find_map(|task| rest.strip_prefix(task))
+        .unwrap_or(rest)
+        .trim_start()
+}
+
+/// Whether `word` begins a Markdown block rather than its text.
+fn is_marker(word: &str) -> bool {
+    matches!(word, "-" | "*" | "+" | ">")
+        || (word.len() <= 6 && !word.is_empty() && word.chars().all(|c| c == '#'))
+        || word
+            .strip_suffix(['.', ')'])
+            .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether text after `left` starts a sentence: nothing but a line's
+/// indentation or Markdown marker before it, or the end of a sentence or a
+/// colon, perhaps followed by a closing quote or bracket.
+fn starts_sentence(left: &str) -> bool {
+    let left = content(left).trim_end().trim_end_matches([
+        '"', '\'', ')', ']', '}', '\u{201d}', '\u{2019}', '\u{bb}', '*', '_',
+    ]);
+    left.is_empty() || left.ends_with(['.', '!', '?', ':', '\u{2026}'])
+}
+
+/// Abbreviations whose period does not end a sentence.
+const ABBREVIATIONS: [&str; 8] = ["Mr.", "Mrs.", "Ms.", "Dr.", "St.", "e.g.", "i.e.", "vs."];
+
+/// A word without the punctuation around it or a possessive "'s".
+fn bare(word: &str) -> &str {
+    let word = word
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '\u{2019}')
+        .trim_start_matches(['\'', '\u{2019}']);
+    word.strip_suffix("'s")
+        .or_else(|| word.strip_suffix("\u{2019}s"))
+        .unwrap_or(word)
+        .trim_end_matches(['\'', '\u{2019}'])
+}
+
+/// "I" and its contractions, which are written with a capital anywhere.
+fn is_i(word: &str) -> bool {
+    word == "I"
+        || ["I'", "I\u{2019}"]
+            .iter()
+            .any(|prefix| word.starts_with(prefix))
+}
+
+/// The words `text` capitalizes in the middle of a sentence, "I" aside.
+/// Each line starts afresh, after its Markdown marker.
+fn mid_sentence_capitals(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().flat_map(|line| {
+        let mut sentence_start = true;
+        content(line).split_whitespace().filter_map(move |word| {
+            let ends = starts_sentence(word) && !ABBREVIATIONS.contains(&word);
+            let starts = std::mem::replace(&mut sentence_start, ends);
+            let core = bare(word);
+            (!starts && !is_i(core) && core.chars().next().is_some_and(char::is_uppercase))
+                .then_some(core)
+        })
+    })
+}
+
+/// Adds to `names` the words `text` capitalizes in the middle of a sentence.
+fn remember_names(names: &mut HashSet<String>, text: &str) {
+    names.extend(mid_sentence_capitals(text).map(str::to_owned));
+}
+
+/// `text`, an utterance as recognized, as it reads after `left`, what its
+/// line holds before it: its first letter lowercased unless a sentence
+/// starts there. "I", words with capitals past their first letter, such as
+/// "API" or "GitHub", and names keep theirs.
+fn fit_case<'a>(text: &'a str, left: &str, is_name: impl FnOnce(&str) -> bool) -> Cow<'a, str> {
+    if starts_sentence(left) {
+        return Cow::Borrowed(text);
+    }
+    let Some(first) = text.split_whitespace().next() else {
+        return Cow::Borrowed(text);
+    };
+    let core = bare(first);
+    let mut letters = core.chars();
+    if !letters.next().is_some_and(char::is_uppercase)
+        || letters.any(char::is_uppercase)
+        || is_i(core)
+        || is_name(core)
+    {
+        return Cow::Borrowed(text);
+    }
+    // The capital is the first letter: only spaces and punctuation, such
+    // as an opening quote, come before it.
+    let Some((offset, capital)) = text.char_indices().find(|(_, c)| c.is_alphanumeric()) else {
+        return Cow::Borrowed(text);
+    };
+    let mut cased = String::with_capacity(text.len());
+    cased.push_str(&text[..offset]);
+    cased.extend(capital.to_lowercase());
+    cased.push_str(&text[offset + capital.len_utf8()..]);
+    Cow::Owned(cased)
+}
+
 /// The end of the draft.
 fn last_position(content: &text_editor::Content<cosmic::Renderer>) -> text_editor::Position {
     let line = content.line_count().saturating_sub(1);
@@ -631,6 +763,7 @@ impl Cagents {
                     end: here,
                     send: None,
                     level,
+                    names: HashSet::new(),
                 }));
                 self.chat_ui.dictation.active = Some((target, id));
                 self.chat_ui.dictation.sessions.insert(id, target);
@@ -1447,6 +1580,7 @@ mod tests {
             end: attachment_draft::Bookmark::new(here),
             send: None,
             level: Level::default(),
+            names: HashSet::new(),
         }));
         app.chat_ui.dictation.active = Some((target, id));
         app.chat_ui.dictation.sessions.insert(id, target);
@@ -1497,6 +1631,93 @@ mod tests {
         assert_eq!(runtime.composer.cursor().position.column, 11);
         hear(&mut app, final_text("again."));
         assert_eq!(draft(&app, card), "Hello there again. world");
+    }
+
+    /// An utterance continuing a sentence starts in lowercase; one starting
+    /// a sentence, "I", acronyms and names heard mid-sentence keep their
+    /// capital.
+    #[test]
+    fn dictated_text_takes_the_case_of_where_it_lands() {
+        let case = |text, left| fit_case(text, left, |_| false).into_owned();
+        assert_eq!(case("Ask not.", "Please draft the notes, and "), "ask not.");
+        assert_eq!(case("Ask not.", ""), "Ask not.");
+        assert_eq!(case("Ask not.", "   "), "Ask not.");
+        for end in [
+            "Done. ",
+            "Done!",
+            "Why?",
+            "Note:",
+            "He said \"go.\" ",
+            "(See above.) ",
+        ] {
+            assert_eq!(case("Ask not.", end), "Ask not.", "after {end:?}");
+        }
+        assert_eq!(case("\"Ask not\"", "and "), "\"ask not\"");
+        for kept in [
+            "I think so.",
+            "I'm sure.",
+            "I\u{2019}ll go.",
+            "API keys.",
+            "GitHub is down.",
+        ] {
+            assert_eq!(case(kept, "and "), kept);
+        }
+        assert_eq!(case("\u{c9}t\u{e9} came.", "and "), "\u{e9}t\u{e9} came.");
+
+        let mut names = HashSet::new();
+        remember_names(&mut names, "Ask Carson. Then ask again, as I said");
+        assert!(names.contains("Carson"));
+        assert!(!names.contains("Ask") && !names.contains("Then") && !names.contains("I"));
+        assert_eq!(
+            fit_case("Carson agreed.", "and ", |word| names.contains(word)),
+            "Carson agreed."
+        );
+        let capitals = |text| mid_sentence_capitals(text).collect::<Vec<_>>();
+        assert_eq!(capitals("We asked Maria. Then left"), ["Maria"]);
+        // Lines, and the Markdown that starts them, start afresh.
+        assert!(capitals("- Update docs\n- Review the plan\n## Notes").is_empty());
+        assert_eq!(capitals("ask Carson's team"), ["Carson"]);
+        // "Dr." itself reads as a name, which keeps its capital too.
+        assert_eq!(capitals("We met Dr. Lee, e.g. Rust"), ["Dr", "Lee", "Rust"]);
+
+        for marker in [
+            "- ", "  * ", "+ ", "> ", "# ", "### ", "1. ", "12) ", "- [ ] ", "- [x] ",
+        ] {
+            assert_eq!(
+                case("Update the tests.", marker),
+                "Update the tests.",
+                "after {marker:?}"
+            );
+        }
+        assert_eq!(
+            case("Update the tests.", "- Fix the parser and "),
+            "update the tests."
+        );
+        assert_eq!(case("A plan.", "and "), "a plan.");
+        assert_eq!(case("'Ask not'", "and "), "'ask not'");
+    }
+
+    /// In the draft, a continuation lands lowercased, and a name the
+    /// draft already writes mid-sentence keeps its capital.
+    #[test]
+    fn a_continuation_lands_in_lowercase_and_names_keep_their_capital() {
+        let (mut app, card, _) = dictating("Please draft the release notes, and ", 36);
+        hear(&mut app, final_text("Ask not what your country can do."));
+        assert_eq!(
+            draft(&app, card),
+            "Please draft the release notes, and ask not what your country can do."
+        );
+        hear(&mut app, final_text("Ask what you can do."));
+        assert_eq!(
+            draft(&app, card),
+            "Please draft the release notes, and ask not what your country can do. Ask what you can do."
+        );
+        let (mut app, card, _) = dictating("Send it to Maria and ", 21);
+        hear(&mut app, final_text("Maria will review it."));
+        assert_eq!(
+            draft(&app, card),
+            "Send it to Maria and Maria will review it."
+        );
     }
 
     #[test]
