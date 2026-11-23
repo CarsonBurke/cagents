@@ -1235,7 +1235,7 @@ fn codex_listener_survives(
     // within the same settle bound as exec, then exclude only processes with
     // neither argv nor an executable. A readable exe with unpublished argv
     // can still be a starting writer and must remain explicit uncertainty.
-    let settle = |path: &Path| {
+    let arguments = |path: &Path| {
         let remaining = inspection_deadline.map_or(settle, |deadline| {
             deadline
                 .saturating_duration_since(Instant::now())
@@ -1268,46 +1268,55 @@ fn codex_listener_survives(
             continue;
         };
         let path = entry.path();
-        match process.judge(&path, settle) {
+        match process.judge(&path, arguments) {
             Ok(Judgement::Unrelated) => {}
             Ok(Judgement::Writer) => return running(pid),
-            Ok(Judgement::Starting) => match process_start(&path) {
-                Ok(Some(start)) => starting.push((pid, path, start)),
-                Ok(None) => {}
-                Err(reason) => {
-                    unreadable.get_or_insert(reason);
-                }
-            },
+            Ok(Judgement::Starting) => {
+                // An identity it cannot read only stops it settling by
+                // being replaced.
+                let start = match process_start(&path) {
+                    Started::At(start) => Some(start),
+                    Started::Gone => continue,
+                    Started::Unknown => None,
+                };
+                starting.push(StartingProcess { pid, path, start });
+            }
             Err(reason) => {
                 unreadable.get_or_insert(reason);
             }
         }
     }
-    if let Some(socket) = bound_socket(processes, sockets).map_err(|error| {
-        unreadable
-            .clone()
-            .unwrap_or_else(|| format!("Cannot inspect bound sockets: {error}"))
-    })? {
-        return Ok(CodexExecution::Running { pid: None, socket });
-    }
+    let bound = || {
+        bound_socket(processes, sockets)
+            .map(|socket| socket.map(|socket| CodexExecution::Running { pid: None, socket }))
+            .map_err(|error| format!("Cannot inspect bound sockets: {error}"))
+    };
     if starting.is_empty() {
-        return unreadable.map_or(Ok(CodexExecution::Ended), Err);
+        return match bound() {
+            Ok(Some(running)) => Ok(running),
+            Ok(None) => unreadable.map_or(Ok(CodexExecution::Ended), Err),
+            Err(reason) => Err(unreadable.unwrap_or(reason)),
+        };
     }
-    if let Some(pid) =
-        process.look_again(starting, patience, inspection_deadline, &mut unreadable)?
+    // A process still starting outranks a socket table that cannot be read,
+    // which is read again below.
+    if let Ok(Some(running)) = bound() {
+        return Ok(running);
+    }
+    let settled = match process.look_again(starting, patience, inspection_deadline, &mut unreadable)
     {
-        return running(pid);
-    }
+        LookedAgain::Writer(pid) => return running(pid),
+        LookedAgain::Settled => true,
+        LookedAgain::Starting => false,
+    };
     // A process that finished starting may have bound a listener since the
     // table was read.
-    if let Some(socket) = bound_socket(processes, sockets).map_err(|error| {
-        unreadable
-            .clone()
-            .unwrap_or_else(|| format!("Cannot inspect bound sockets: {error}"))
-    })? {
-        return Ok(CodexExecution::Running { pid: None, socket });
+    match bound() {
+        Ok(Some(running)) => Ok(running),
+        _ if !settled => Err(CODEX_PROCESS_STARTING.into()),
+        Ok(None) => unreadable.map_or(Ok(CodexExecution::Ended), Err),
+        Err(reason) => Err(unreadable.unwrap_or(reason)),
     }
-    unreadable.map_or(Ok(CodexExecution::Ended), Err)
 }
 
 /// What one process of the table says of a Codex pane's execution.
@@ -1320,8 +1329,26 @@ enum Judgement {
     Starting,
 }
 
-/// A process found starting, by its ID, `/proc` entry and start time.
-type StartingProcess = (u32, PathBuf, u64);
+/// A process found starting.
+struct StartingProcess {
+    pid: u32,
+    /// Its `/proc` entry.
+    path: PathBuf,
+    /// When it started, unless that could not be read.
+    start: Option<u64>,
+}
+
+/// What looking again at the processes found starting told.
+#[derive(Debug, PartialEq, Eq)]
+enum LookedAgain {
+    /// This one of them is a writer of the pane.
+    Writer(u32),
+    /// None of them is; each published other arguments, exited or was
+    /// replaced by a later process.
+    Settled,
+    /// One was still starting when patience ran out.
+    Starting,
+}
 
 /// Judges processes for [`codex_listener_survives`].
 struct CodexProcessJudge<'a> {
@@ -1372,55 +1399,68 @@ impl CodexProcessJudge<'_> {
     }
 
     /// Looks again at only the processes found `starting` until each has
-    /// settled, for up to `patience`. The ID of a writer found among them,
-    /// or `None` once they have all settled otherwise; a reason another one
-    /// could not be read goes to `unreadable`. One that has exited, or whose
-    /// ID names a later process, is settled.
+    /// settled, for up to `patience`. One that has exited, or whose ID now
+    /// names a later process, is settled. A reason one could not be read
+    /// goes to `unreadable`, and settles it as a full read of the table would.
     fn look_again(
         &self,
         mut starting: Vec<StartingProcess>,
         patience: Instant,
         inspection_deadline: Option<Instant>,
         unreadable: &mut Option<String>,
-    ) -> Result<Option<u32>, String> {
+    ) -> LookedAgain {
         while !starting.is_empty() {
             let now = Instant::now();
             if now >= patience || inspection_deadline.is_some_and(|deadline| now >= deadline) {
-                return Err(CODEX_PROCESS_STARTING.into());
+                return LookedAgain::Starting;
             }
             std::thread::sleep(STARTING_RETRY);
             let mut still = Vec::with_capacity(starting.len());
-            for (pid, path, start) in starting {
+            for process in starting {
                 // One look each: the table's read already waited out a settle.
-                let judgement = self.judge(&path, |path| settled_arguments(path, Duration::ZERO));
-                // Read after the judgement: what was judged under a changed
-                // identity was a later process, which did not exist when the
-                // table was read.
-                let same = process_start(&path).map(|now| now == Some(start));
-                match (judgement, same) {
-                    (Ok(Judgement::Writer), _) => return Ok(Some(pid)),
-                    (_, Ok(false)) | (Ok(Judgement::Unrelated), _) => {}
-                    (Ok(Judgement::Starting), Ok(true)) => still.push((pid, path, start)),
-                    (Err(reason), _) | (_, Err(reason)) => {
+                match self.judge(&process.path, |path| {
+                    settled_arguments(path, Duration::ZERO)
+                }) {
+                    Ok(Judgement::Writer) => return LookedAgain::Writer(process.pid),
+                    Ok(Judgement::Unrelated) => {}
+                    Ok(Judgement::Starting) => {
+                        // Read after the judgement: what was judged under a
+                        // changed identity was a later process, which did not
+                        // exist when the table was read.
+                        let replaced = match process_start(&process.path) {
+                            Started::At(now) => process.start.is_some_and(|start| start != now),
+                            Started::Gone => true,
+                            Started::Unknown => false,
+                        };
+                        if !replaced {
+                            still.push(process);
+                        }
+                    }
+                    Err(reason) => {
                         unreadable.get_or_insert(reason);
                     }
                 }
             }
             starting = still;
         }
-        Ok(None)
+        LookedAgain::Settled
     }
 }
 
 /// When a process started, which names it across `execve` and tells it
-/// from a later process given the same ID. `None` once it has gone.
-fn process_start(path: &Path) -> Result<Option<u64>, String> {
+/// from a later process given the same ID.
+enum Started {
+    At(u64),
+    Gone,
+    Unknown,
+}
+
+fn process_start(path: &Path) -> Started {
     match std::fs::read(path.join("stat")) {
         Ok(stat) => crate::model::agent_recovery::process_identity(&stat)
-            .map(|(_, start)| Some(start))
-            .ok_or_else(|| "A process has an unreadable identity".into()),
-        Err(error) if gone(&error) => Ok(None),
-        Err(error) => Err(format!("Cannot inspect a process: {error}")),
+            .map_or(Started::Unknown, |(_, start)| Started::At(start)),
+        Err(error) if gone(&error) => Started::Gone,
+        Err(_) => Started::Unknown,
     }
 }
 
@@ -3641,23 +3681,40 @@ mod tests {
         assert!(churn.join().unwrap() >= 5);
     }
 
+    fn starting_in(processes: &Path, pids: &[u32]) -> Vec<StartingProcess> {
+        pids.iter()
+            .map(|&pid| StartingProcess {
+                pid,
+                path: processes.join(pid.to_string()),
+                start: Some(u64::from(pid)),
+            })
+            .collect()
+    }
+
+    fn unrelated_judge() -> CodexProcessJudge<'static> {
+        CodexProcessJudge {
+            marker: b"cagents-codex-pane",
+            conversation: None,
+            uid: crate::daemon::current_uid().to_string(),
+        }
+    }
+
     #[test]
     fn codex_proof_settles_a_starting_process_that_exits_or_is_replaced() {
         let processes = fake_table();
         starting_process(processes.path(), 4242);
         starting_process(processes.path(), 4243);
-        let judge = CodexProcessJudge {
-            marker: b"cagents-codex-unrelated",
-            conversation: None,
-            uid: crate::daemon::current_uid().to_string(),
-        };
-        let found = || {
-            [4242, 4243].map(|pid| (pid, processes.path().join(pid.to_string()), u64::from(pid)))
-        };
+        let judge = unrelated_judge();
         let mut unreadable = None;
+        // Looked at again for a moment, they are still starting.
         assert_eq!(
-            judge.look_again(found().to_vec(), Instant::now(), None, &mut unreadable),
-            Err(CODEX_PROCESS_STARTING.into())
+            judge.look_again(
+                starting_in(processes.path(), &[4242, 4243]),
+                Instant::now() + 3 * STARTING_RETRY,
+                None,
+                &mut unreadable
+            ),
+            LookedAgain::Starting
         );
         // 4242 exits, and a later process, itself starting, takes 4243's ID.
         std::fs::remove_dir_all(processes.path().join("4242")).unwrap();
@@ -3665,14 +3722,86 @@ mod tests {
         std::fs::write(replaced.join("stat"), fake_stat(4243, 9_999)).unwrap();
         assert_eq!(
             judge.look_again(
-                found().to_vec(),
+                starting_in(processes.path(), &[4242, 4243]),
                 Instant::now() + crate::test_timing::EVENTUALLY,
                 None,
                 &mut unreadable
             ),
-            Ok(None)
+            LookedAgain::Settled
         );
         assert_eq!(unreadable, None);
+        // One whose identity cannot be read can't be told replaced, so it
+        // stays starting.
+        std::fs::write(replaced.join("stat"), "unreadable").unwrap();
+        assert_eq!(
+            judge.look_again(
+                starting_in(processes.path(), &[4243]),
+                Instant::now() + 3 * STARTING_RETRY,
+                None,
+                &mut unreadable
+            ),
+            LookedAgain::Starting
+        );
+    }
+
+    #[test]
+    fn codex_proof_finds_a_writer_among_the_processes_it_found_starting() {
+        let processes = fake_table();
+        starting_process(processes.path(), 4242);
+        starting_process(processes.path(), 4243);
+        let writer = processes.path().join("4243");
+        std::fs::remove_file(writer.join("exe")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/codex", writer.join("exe")).unwrap();
+        std::fs::write(
+            writer.join(".cmdline"),
+            b"codex\0--profile\0cagents-codex-pane\0",
+        )
+        .unwrap();
+        std::fs::rename(writer.join(".cmdline"), writer.join("cmdline")).unwrap();
+        let mut unreadable = None;
+        assert_eq!(
+            unrelated_judge().look_again(
+                starting_in(processes.path(), &[4242, 4243]),
+                Instant::now() + crate::test_timing::EVENTUALLY,
+                None,
+                &mut unreadable
+            ),
+            LookedAgain::Writer(4243)
+        );
+    }
+
+    /// A process still starting outranks a reason the table could not be
+    /// read; once it settles, that reason is the answer.
+    #[test]
+    fn codex_proof_reports_a_process_starting_before_other_unreadable_state() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let processes = fake_table();
+        starting_process(processes.path(), 4242);
+        // A process whose user cannot be read.
+        let unreadable = processes.path().join("4243");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::write(unreadable.join("status"), "Name:\tx\n").unwrap();
+        std::fs::remove_file(processes.path().join("net/unix")).unwrap();
+        let impatient = ExecutionEvidence {
+            processes: processes.path().into(),
+            exec_settle: Duration::ZERO,
+            ..evidence(holders.path(), Vec::new())
+        };
+        assert_eq!(
+            impatient.codex_execution(&card),
+            CodexExecution::Unproved {
+                reason: CODEX_PROCESS_STARTING.into()
+            }
+        );
+        publish(processes.path(), 4242);
+        assert_eq!(
+            impatient.codex_execution(&card),
+            CodexExecution::Unproved {
+                reason: "Cannot read a process's user".into()
+            }
+        );
     }
 
     #[test]
