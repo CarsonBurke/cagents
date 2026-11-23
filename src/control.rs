@@ -9177,18 +9177,34 @@ mod tests {
                     }
                     let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
                     assert_eq!(list.version, source);
+                    // A source from protocol 190 on lists in pages.
+                    let paged = source >= crate::terminal_ipc::LIST_PAGES_PROTOCOL;
+                    assert_eq!(
+                        list.request,
+                        if paged {
+                            ClientRequest::ListPage { after: None }
+                        } else {
+                            ClientRequest::List
+                        }
+                    );
                     for version in [source, PROTOCOL_VERSION] {
+                        let response = if paged {
+                            ServerResponse::ListedPage {
+                                terminals: Vec::new(),
+                                complete: true,
+                            }
+                        } else {
+                            ServerResponse::Listed {
+                                terminals: Vec::new(),
+                            }
+                        };
                         write_frame(
                             &mut server_stream,
                             &ServerEnvelope {
                                 version,
                                 request_id: Some(list.request_id),
                                 proof: server_proof.clone(),
-                                message: ServerMessage::Response {
-                                    response: ServerResponse::Listed {
-                                        terminals: Vec::new(),
-                                    },
-                                },
+                                message: ServerMessage::Response { response },
                             },
                         )
                         .unwrap();

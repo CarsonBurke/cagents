@@ -741,6 +741,11 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
         protocol: 187,
         release: "0.1.3+local.ccd4134c6",
     },
+    ReleasedSource {
+        protocol: 191,
+        // The maintainer's install before the first signed release, 0.2.0.
+        release: "0.1.3+local.e8bbb84f2",
+    },
 ];
 
 /// Protocols main served since the oldest pinned source that live updates
@@ -792,10 +797,6 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (
         190,
         "intermediate #3209 protocol; superseded by 191 without a qualified installed update source",
-    ),
-    (
-        191,
-        "intermediate #3241 protocol; superseded by 193 without a qualified installed update source",
     ),
     (
         193,
@@ -1484,6 +1485,7 @@ mod admission_message_tests {
                 178,
                 179,
                 187,
+                191,
                 crate::terminal_ipc::PROTOCOL_VERSION
             ]
         );
@@ -1502,8 +1504,8 @@ mod admission_message_tests {
                 "live updates support only protocol 156 (desktop 0.1.3+local.991daa43e), \
                  protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744), \
                  protocol 177 (0.1.3+local.374370965), protocol 178 (0.1.3+local.3b1e81a4d), \
-                 protocol 179 (0.1.3+local.43f253ef8), protocol 187 (0.1.3+local.ccd4134c6) \
-                 and protocol {}.",
+                 protocol 179 (0.1.3+local.43f253ef8), protocol 187 (0.1.3+local.ccd4134c6), \
+                 protocol 191 (0.1.3+local.e8bbb84f2) and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));
             assert!(message.contains("did not request preparation or shutdown"));
