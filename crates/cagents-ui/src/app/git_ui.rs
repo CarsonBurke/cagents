@@ -8,7 +8,19 @@ use crate::{
 };
 
 const LOCAL_WORKERS: usize = 2;
+/// How often a checkout someone works in is read while the watcher cannot
+/// see edits to its files, and how often a project whose Git metadata it
+/// cannot see has its worktree list read.
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
+/// How old the status of a checkout on show, but which nobody works in and
+/// whose files are not watched, may grow before it is read again. Git's own
+/// bookkeeping is watched for every checkout, so this only bounds how long
+/// an edit made outside the application, without staging or committing, goes
+/// unseen there. A checkout that is neither shown nor worked in is not read
+/// on a timer at all: with hundreds of worktrees, reading each in turn kept
+/// a Git process running and the disk busy for as long as the window had
+/// focus.
+const SHOWN_STALE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -70,6 +82,66 @@ struct Entry {
     /// rather than from any read, since the edits a partial watch still
     /// reports would otherwise postpone the scan it stands in for.
     last_full_scan: Instant,
+    /// While the watcher covers the project's metadata (`fallback` is
+    /// `None`), the worktrees whose own files it does not watch.
+    unwatched: BTreeSet<WorktreeId>,
+    /// When each worktree's status was last read.
+    read_at: HashMap<WorktreeId, Instant>,
+}
+
+impl Entry {
+    fn new(snapshot: Snapshot, generation: u64, fallback: Option<String>) -> Self {
+        let now = Instant::now();
+        let read_at = snapshot
+            .worktrees
+            .iter()
+            .filter(|(_, status)| status.is_some())
+            .map(|(record, _)| (record.id, now))
+            .collect();
+        Self {
+            snapshot,
+            generation,
+            plan: None,
+            remote_started: false,
+            cancellation: None,
+            pending: git_watch::Change::default(),
+            fallback,
+            read_failure: None,
+            read_full_scan: false,
+            catalog_requested: false,
+            last_full_scan: now,
+            unwatched: BTreeSet::new(),
+            read_at,
+        }
+    }
+
+    /// How much each of this project's checkouts is worth watching, given
+    /// the ones someone works in. The project's own checkout is shown, as
+    /// the one its row stands for; the rest are watched for Git's
+    /// bookkeeping alone.
+    fn interest(
+        &self,
+        project: ProjectId,
+        work: &BTreeMap<(ProjectId, WorktreeId), git_watch::Interest>,
+    ) -> HashMap<WorktreeId, git_watch::Interest> {
+        self.snapshot
+            .worktrees
+            .iter()
+            .map(|(record, _)| {
+                let interest = if let Some(interest) = work.get(&(project, record.id)) {
+                    *interest
+                } else if sidebar::is_primary_worktree(
+                    &self.snapshot.repository.common_dir,
+                    &record.path,
+                ) {
+                    git_watch::Interest::Shown
+                } else {
+                    git_watch::Interest::Metadata
+                };
+                (record.id, interest)
+            })
+            .collect()
+    }
 }
 
 /// The window's watcher and the channel its wakes arrive on.
@@ -93,6 +165,14 @@ pub(super) struct State {
     watch: Option<Watch>,
     entries: HashMap<ProjectId, Entry>,
     queue: VecDeque<ProjectId>,
+    /// The checkouts someone works in. [`Interest::Active`] for a pane on
+    /// screen and the selected row: their files are watched first, and read
+    /// every [`FALLBACK_INTERVAL`] when the watch budget cannot cover them.
+    /// [`Interest::Shown`] for one whose panes are all out of sight.
+    ///
+    /// [`Interest::Active`]: git_watch::Interest::Active
+    /// [`Interest::Shown`]: git_watch::Interest::Shown
+    work: BTreeMap<(ProjectId, WorktreeId), git_watch::Interest>,
 }
 
 impl State {
@@ -178,14 +258,109 @@ impl State {
         }
     }
 
+    /// Records which checkouts someone works in. A project whose set moved
+    /// is planned again, which gives a newly worked checkout its file
+    /// watches; the watcher asks for its read once they are in place.
+    pub(super) fn set_work(
+        &mut self,
+        work: BTreeMap<(ProjectId, WorktreeId), git_watch::Interest>,
+    ) {
+        if work == self.work {
+            return;
+        }
+        let moved = self
+            .work
+            .iter()
+            .filter(|(key, interest)| work.get(key) != Some(interest))
+            .chain(
+                work.iter()
+                    .filter(|(key, interest)| self.work.get(key) != Some(interest)),
+            )
+            .map(|((project, _), _)| *project)
+            .collect::<BTreeSet<_>>();
+        self.work = work;
+        for project in moved {
+            self.changed(
+                project,
+                git_watch::Change {
+                    membership: true,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// What a periodic check reads, for the checkouts `shown` lists:
+    ///
+    /// - A project whose metadata the watcher cannot see has its worktree
+    ///   list read every [`FALLBACK_INTERVAL`]. That read also notices a
+    ///   checkout whose `HEAD` moved.
+    /// - A checkout someone works in on screen, or selected, whose files are
+    ///   not watched is read every [`FALLBACK_INTERVAL`].
+    /// - One that is shown, or worked in out of sight, is read once its
+    ///   status is [`SHOWN_STALE`].
+    /// - Every other checkout waits for a Git event, or for being shown.
+    fn due(
+        &self,
+        shown: &HashSet<(ProjectId, WorktreeId)>,
+        now: Instant,
+    ) -> Vec<(ProjectId, git_watch::Change)> {
+        let mut due = Vec::new();
+        for (&project, entry) in &self.entries {
+            let blind = entry.fallback.is_some() || entry.read_failure.is_some();
+            let mut change = git_watch::Change::default();
+            if blind && now.saturating_duration_since(entry.last_full_scan) >= FALLBACK_INTERVAL {
+                change.topology = true;
+                change.membership = true;
+            }
+            for (record, _) in &entry.snapshot.worktrees {
+                if record.bare || !(blind || entry.unwatched.contains(&record.id)) {
+                    continue;
+                }
+                let key = (project, record.id);
+                let interval = if self.work.get(&key) == Some(&git_watch::Interest::Active) {
+                    FALLBACK_INTERVAL
+                } else if self.work.contains_key(&key) || shown.contains(&key) {
+                    SHOWN_STALE
+                } else {
+                    continue;
+                };
+                if entry
+                    .read_at
+                    .get(&record.id)
+                    .is_none_or(|read| now.saturating_duration_since(*read) >= interval)
+                {
+                    change.worktrees.insert(record.id);
+                }
+            }
+            if change.topology || !change.worktrees.is_empty() {
+                due.push((project, change));
+            }
+        }
+        due
+    }
+
     fn changed(&mut self, project: ProjectId, change: git_watch::Change) {
         let Some(entry) = self.entries.get_mut(&project) else {
             return;
         };
-        if change.coverage == Some(true) {
-            entry.fallback = None;
-        }
-        if let Some(error) = &change.error {
+        if let Some(covered) = change.coverage {
+            match &change.unwatched {
+                Some(unwatched) => {
+                    entry.fallback = None;
+                    entry.unwatched.clone_from(unwatched);
+                }
+                None if covered => entry.fallback = None,
+                None => {
+                    entry.fallback = Some(
+                        change
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "file watching unavailable".to_owned()),
+                    );
+                }
+            }
+        } else if let Some(error) = &change.error {
             entry.fallback = Some(error.clone());
         }
         if change.worktrees.is_empty()
@@ -265,8 +440,8 @@ impl Cagents {
         };
         state.entries.insert(
             project,
-            Entry {
-                snapshot: Snapshot {
+            Entry::new(
+                Snapshot {
                     repository: repository.clone(),
                     worktrees: loaded.worktrees.clone(),
                     heads: loaded.head_repositories.clone(),
@@ -274,16 +449,8 @@ impl Cagents {
                     archived: Arc::default(),
                 },
                 generation,
-                plan: None,
-                remote_started: false,
-                cancellation: None,
-                read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: git_watch::Change::default(),
-                fallback: failure,
-                last_full_scan: Instant::now(),
-            },
+                failure,
+            ),
         );
         state.changed(
             project,
@@ -304,6 +471,64 @@ impl Cagents {
                 Subscription::run_with(Source(watch.receiver.clone()), stream)
                     .map(|()| Message::GitUi(Action::Changed))
             })
+    }
+
+    /// Tells local Git which checkouts someone works in: those holding an
+    /// open pane, in a channel or not, and the selected row. Cheap when
+    /// nothing moved, as after most projections.
+    pub(super) fn refresh_git_interest(&mut self) -> Task<Message> {
+        let index = &self.worktree_paths;
+        let mut work = BTreeMap::new();
+        for card in self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+        {
+            let Some(directory) = self.unchanneled_card_worktree_indexed(card, &index) else {
+                continue;
+            };
+            let interest = if self.workspace.visibility(card.id) == Some(VisibilityClass::Visible) {
+                git_watch::Interest::Active
+            } else {
+                git_watch::Interest::Shown
+            };
+            for row in index.rows(directory) {
+                // The closest wins: a checkout in view and also out of view
+                // is in view.
+                let slot = work.entry(*row).or_insert(interest);
+                *slot = (*slot).min(interest);
+            }
+        }
+        if let Some(selected) = self.sidebar_state.selected_checkout() {
+            work.insert(selected, git_watch::Interest::Active);
+        }
+        self.refresh_ui.git.set_work(work);
+        self.start_git_reads()
+    }
+
+    /// The checkouts whose rows are drawn: in the sidebar, and every one
+    /// while a Worktrees pane is on screen.
+    fn shown_worktrees(&self) -> HashSet<(ProjectId, WorktreeId)> {
+        let pane = self.work_ui.shows_worktrees()
+            && self.durable.cards.iter().any(|card| {
+                card.kind == CardKind::Work
+                    && card.existence.is_open()
+                    && self.workspace.visibility(card.id) == Some(VisibilityClass::Visible)
+            });
+        self.sidebar_model
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .filter(move |worktree| {
+                        pane || self.sidebar_state.draws_worktree_row(project, worktree)
+                    })
+                    .map(move |worktree| (project.id, worktree.id))
+            })
+            .collect()
     }
 
     pub(super) fn git_fallback_tick(&mut self) -> Task<Message> {
@@ -331,33 +556,9 @@ impl Cagents {
         for project in removed {
             self.refresh_ui.git.forget(project);
         }
-        let due = self
-            .refresh_ui
-            .git
-            .entries
-            .iter()
-            .filter(|(_, entry)| {
-                (entry.fallback.is_some() || entry.read_failure.is_some())
-                    && entry.last_full_scan.elapsed() >= FALLBACK_INTERVAL
-            })
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
-        for project in due {
-            let worktrees = self.refresh_ui.git.entries[&project]
-                .snapshot
-                .worktrees
-                .iter()
-                .map(|(record, _)| record.id)
-                .collect();
-            self.refresh_ui.git.changed(
-                project,
-                git_watch::Change {
-                    worktrees,
-                    topology: true,
-                    membership: true,
-                    ..Default::default()
-                },
-            );
+        let shown = self.shown_worktrees();
+        for (project, change) in self.refresh_ui.git.due(&shown, Instant::now()) {
+            self.refresh_ui.git.changed(project, change);
         }
         self.start_git_reads()
     }
@@ -444,7 +645,10 @@ impl Cagents {
                     .map(|watch| watch.monitor.drain())
                     .unwrap_or_default();
                 for (project, change) in changes {
+                    // Unwatched files alone are routine with many worktrees;
+                    // only metadata the watcher cannot see is worth saying.
                     if let Some(error) = &change.error
+                        && change.unwatched.is_none()
                         && self
                             .refresh_ui
                             .git
@@ -491,6 +695,17 @@ impl Cagents {
                             // a removed PR or overwrite its newer state.
                             snapshot.archived = entry.snapshot.archived.clone();
                         }
+                        // A checkout first listed by this read was read by it.
+                        let now = Instant::now();
+                        let mut read_at = HashMap::with_capacity(snapshot.worktrees.len());
+                        for (record, status) in &snapshot.worktrees {
+                            if let Some(read) = entry.read_at.get(&record.id) {
+                                read_at.insert(record.id, *read);
+                            } else if status.is_some() {
+                                read_at.insert(record.id, now);
+                            }
+                        }
+                        entry.read_at = read_at;
                         let previous = std::mem::replace(&mut entry.snapshot, snapshot.clone());
                         let removed =
                             records_removed_outside(project, &previous, &snapshot.worktrees);
@@ -622,16 +837,28 @@ impl Cagents {
             entry.read_full_scan = change.topology;
             let snapshot = entry.snapshot.clone();
             let plan = entry.plan.clone();
+            let interest = entry.interest(project, &state.work);
             let generation = entry.generation;
             let cancellation = CancellationToken::default();
             entry.cancellation = Some(cancellation.clone());
+            let now = Instant::now();
             if change.topology {
-                entry.last_full_scan = Instant::now();
+                entry.last_full_scan = now;
+            }
+            for worktree in &change.worktrees {
+                entry.read_at.insert(*worktree, now);
             }
             running += 1;
             tasks.push(cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    read_local_with_plan(project, snapshot, change, cancellation, plan.as_deref())
+                    read_local_with_plan(
+                        project,
+                        snapshot,
+                        change,
+                        cancellation,
+                        plan.as_deref(),
+                        &interest,
+                    )
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -654,24 +881,53 @@ fn read_local(
     change: git_watch::Change,
     cancellation: CancellationToken,
 ) -> Result<(Snapshot, Option<git_watch::Project>), String> {
-    read_local_with_plan(project, snapshot, change, cancellation, None)
+    read_local_with_plan(
+        project,
+        snapshot,
+        change,
+        cancellation,
+        None,
+        &HashMap::new(),
+    )
 }
 
+/// Reads what `change` names. `interest` says how much each checkout's
+/// files are worth watching; one it does not name is watched for its Git
+/// metadata alone.
 fn read_local_with_plan(
     project: ProjectId,
     mut snapshot: Snapshot,
     change: git_watch::Change,
     cancellation: CancellationToken,
     previous_plan: Option<&git_watch::Project>,
+    interest: &HashMap<WorktreeId, git_watch::Interest>,
 ) -> Result<(Snapshot, Option<git_watch::Project>), String> {
     let git = RepositoryService::system("git");
     if change.topology {
+        // The listing names each checkout's branch and HEAD. One where
+        // neither moved keeps the status it had: adding or removing one
+        // worktree must not read every other one again.
+        let mut previous = std::mem::take(&mut snapshot.worktrees)
+            .into_iter()
+            .map(|(record, status)| (record.id, (record, status)))
+            .collect::<HashMap<_, _>>();
         snapshot.worktrees = git
             .list_worktrees(&snapshot.repository.common_dir, &cancellation)
             .map_err(|error| error.to_string())?
             .into_iter()
             .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
-            .map(|record| (record, None))
+            .map(|record| {
+                let status = previous
+                    .remove(&record.id)
+                    .filter(|(old, _)| {
+                        old.path == record.path
+                            && old.head_oid == record.head_oid
+                            && old.branch == record.branch
+                            && old.detached == record.detached
+                    })
+                    .and_then(|(_, status)| status);
+                (record, status)
+            })
             .collect();
     }
     // A shared-ref change can only move a worktree's head or its upstream
@@ -680,7 +936,7 @@ fn read_local_with_plan(
     // worktree keeps its recorded changes and recounts at most the one
     // comparison that moved. Failing to read the refs falls back to the
     // status reads, which stay authoritative.
-    let refs = if !change.topology && change.references {
+    let refs = if change.references {
         snapshot
             .worktrees
             .iter()
@@ -693,13 +949,15 @@ fn read_local_with_plan(
     let mut recounted: HashMap<(String, String), (u64, u64)> = HashMap::new();
     let mut vanished = HashSet::new();
     for (record, status) in &mut snapshot.worktrees {
+        // A checkout the listing just found, or found moved, has no status.
+        let listed = change.topology && status.is_none();
         // Shared refs move every worktree's upstream comparison.
-        if record.bare
-            || (!change.topology && !change.references && !change.worktrees.contains(&record.id))
+        if record.bare || (!listed && !change.references && !change.worktrees.contains(&record.id))
         {
             continue;
         }
-        if !change.worktrees.contains(&record.id)
+        if !listed
+            && !change.worktrees.contains(&record.id)
             && let Some(refs) = &refs
             && recount_from_refs(
                 &git,
@@ -822,7 +1080,7 @@ fn read_local_with_plan(
     });
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
-            git_watch::Project::read_changed(
+            git_watch::Project::read_changed_with_interest(
                 project,
                 snapshot.repository.common_dir.clone(),
                 &snapshot
@@ -833,6 +1091,12 @@ fn read_local_with_plan(
                 &cancellation,
                 previous_plan,
                 &change.worktrees,
+                &|worktree| {
+                    interest
+                        .get(&worktree)
+                        .copied()
+                        .unwrap_or(git_watch::Interest::Metadata)
+                },
             )
         })
         .transpose()?;
@@ -1274,6 +1538,7 @@ mod tests {
             Default::default(),
             CancellationToken::default(),
             None,
+            &HashMap::new(),
         )
         .unwrap();
         assert!(plan.is_none());
@@ -1523,6 +1788,7 @@ mod tests {
                 },
                 CancellationToken::default(),
                 None,
+                &HashMap::new(),
             )
             .unwrap()
             .0
@@ -1588,6 +1854,7 @@ mod tests {
             },
             CancellationToken::default(),
             None,
+            &HashMap::new(),
         )
         .unwrap();
         // Only a status read can report the new head, so it must have run.
@@ -1630,6 +1897,7 @@ mod tests {
             },
             CancellationToken::default(),
             None,
+            &HashMap::new(),
         )
         .unwrap();
         // No status re-ran — the recorded statuses are untouched — but the
@@ -1707,22 +1975,9 @@ mod tests {
             .0
             .id;
         let mut state = State::default();
-        state.entries.insert(
-            project,
-            Entry {
-                snapshot: previous.clone(),
-                generation: 1,
-                plan: None,
-                remote_started: false,
-                cancellation: None,
-                read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: None,
-                last_full_scan: Instant::now(),
-            },
-        );
+        state
+            .entries
+            .insert(project, Entry::new(previous.clone(), 1, None));
         for name in ["outside", "inside"] {
             git(&first, &["worktree", "remove", "--force", name]);
         }
@@ -1743,22 +1998,10 @@ mod tests {
         let snapshot = fixture(&directory.path().join("repo"));
         let mut app = super::super::tests::context_inspector_test_app(false);
         let project = ProjectId::new();
-        app.refresh_ui.git.entries.insert(
-            project,
-            Entry {
-                snapshot: snapshot.clone(),
-                generation: 2,
-                plan: None,
-                remote_started: false,
-                cancellation: None,
-                read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: None,
-                last_full_scan: Instant::now(),
-            },
-        );
+        app.refresh_ui
+            .git
+            .entries
+            .insert(project, Entry::new(snapshot.clone(), 2, None));
         app.repository_generations.insert(project, 2);
         app.refresh_ui.git.forget(project);
         drop(app.update_git(Action::Read {
@@ -1789,17 +2032,8 @@ mod tests {
             app.refresh_ui.git.entries.insert(
                 project,
                 Entry {
-                    snapshot: snapshot.clone(),
-                    generation: 1,
-                    plan: None,
-                    remote_started: false,
-                    cancellation: None,
-                    read_failure: None,
-                    read_full_scan: false,
-                    catalog_requested: false,
-                    pending: Default::default(),
-                    fallback: Some("watch limit".into()),
                     last_full_scan: Instant::now() - FALLBACK_INTERVAL,
+                    ..Entry::new(snapshot.clone(), 1, Some("watch limit".into()))
                 },
             );
         }
@@ -1840,17 +2074,12 @@ mod tests {
         app.refresh_ui.git.entries.insert(
             project,
             Entry {
-                snapshot: snapshot.clone(),
-                generation: 1,
-                plan: None,
-                remote_started: false,
-                cancellation: None,
-                read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: Some("directory watch limit reached".into()),
                 last_full_scan: Instant::now() - FALLBACK_INTERVAL,
+                ..Entry::new(
+                    snapshot.clone(),
+                    1,
+                    Some("directory watch limit reached".into()),
+                )
             },
         );
         // An edit in a directory that is still watched is read on its own.
@@ -1875,6 +2104,129 @@ mod tests {
             "a targeted read must not stand in for the overdue worktree scan"
         );
         assert!(entry.last_full_scan.elapsed() < FALLBACK_INTERVAL);
+    }
+
+    /// Hundreds of worktrees cost nothing while idle: the metadata watch
+    /// stands in for a timer everywhere but where someone works or looks.
+    #[test]
+    fn periodic_reads_follow_interest_not_the_worktree_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture(&directory.path().join("repo"));
+        let template = snapshot.worktrees[0].clone();
+        for index in 0..800 {
+            let mut record = template.0.clone();
+            record.id = WorktreeId::new();
+            record.path = directory.path().join(format!("worktree-{index}"));
+            snapshot.worktrees.push((record, template.1.clone()));
+        }
+        let ids = snapshot
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.id)
+            .collect::<Vec<_>>();
+        let (own, worked, looked_at, idle, out_of_sight) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        let project = ProjectId::new();
+        let mut state = State::default();
+        let mut entry = Entry::new(snapshot, 1, None);
+        let start = entry.last_full_scan;
+        entry.read_at = ids.iter().map(|id| (*id, start)).collect();
+        state.entries.insert(project, entry);
+        state.set_work(
+            [
+                ((project, worked), git_watch::Interest::Active),
+                ((project, out_of_sight), git_watch::Interest::Shown),
+            ]
+            .into(),
+        );
+        let interest = state.entries[&project].interest(project, &state.work);
+        assert_eq!(interest[&worked], git_watch::Interest::Active);
+        assert_eq!(interest[&own], git_watch::Interest::Shown);
+        assert_eq!(interest[&out_of_sight], git_watch::Interest::Shown);
+        assert_eq!(interest[&idle], git_watch::Interest::Metadata);
+
+        // The budget covered the project's own checkout alone.
+        state.changed(
+            project,
+            git_watch::Change {
+                coverage: Some(false),
+                error: Some("directory watch limit reached".into()),
+                unwatched: Some(ids[1..].iter().copied().collect()),
+                ..Default::default()
+            },
+        );
+        let entry = &state.entries[&project];
+        assert!(entry.fallback.is_none(), "the metadata is still watched");
+        let shown = HashSet::from([(project, own), (project, looked_at)]);
+        let reads = |state: &State, after: Duration| {
+            state
+                .due(&shown, start + after)
+                .into_iter()
+                .map(|(id, change)| {
+                    assert_eq!(id, project);
+                    (change.topology, change.worktrees)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(reads(&state, FALLBACK_INTERVAL - Duration::from_secs(1)).is_empty());
+        assert_eq!(
+            reads(&state, FALLBACK_INTERVAL),
+            [(false, BTreeSet::from([worked]))],
+            "only the checkout someone works in on screen is polled"
+        );
+        assert_eq!(
+            reads(&state, SHOWN_STALE),
+            [(false, BTreeSet::from([worked, looked_at, out_of_sight]))],
+            "a shown checkout, or one worked in out of sight, is read once its \
+             status is old; the watched one and the 797 neither shown nor \
+             worked in never are"
+        );
+
+        // Metadata the watcher cannot see brings back the worktree list,
+        // still without reading every checkout.
+        state.changed(
+            project,
+            git_watch::Change {
+                coverage: Some(false),
+                error: Some("network filesystem".into()),
+                ..Default::default()
+            },
+        );
+        assert!(state.entries[&project].fallback.is_some());
+        assert_eq!(
+            reads(&state, FALLBACK_INTERVAL),
+            [(true, BTreeSet::from([worked]))]
+        );
+    }
+
+    #[test]
+    fn a_new_worktree_reads_only_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let snapshot = fixture(&first);
+        // Edited outside any watch: only a read of this checkout would see it.
+        fs::write(first.join("tracked.txt"), "edited\n").unwrap();
+        let second = directory.path().join("second");
+        git(
+            &first,
+            &["worktree", "add", "-b", "second", second.to_str().unwrap()],
+        );
+        let (updated, _) = read_local(
+            ProjectId::new(),
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                membership: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(updated.worktrees.len(), 2);
+        assert!(
+            !status_of(&updated, "refs/heads/main").dirty.is_dirty(),
+            "the existing checkout keeps the status it had"
+        );
+        assert!(updated.worktrees[1].1.is_some(), "the new one is read");
     }
 
     #[test]
@@ -2000,22 +2352,10 @@ mod tests {
             }],
             revision: 0,
         });
-        app.refresh_ui.git.entries.insert(
-            project,
-            Entry {
-                snapshot: snapshot.clone(),
-                generation: 2,
-                plan: None,
-                remote_started: false,
-                cancellation: None,
-                read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: None,
-                last_full_scan: Instant::now(),
-            },
-        );
+        app.refresh_ui
+            .git
+            .entries
+            .insert(project, Entry::new(snapshot.clone(), 2, None));
         snapshot.worktrees[0].1.as_mut().unwrap().dirty.unstaged = 1;
         drop(app.update_git(Action::Read {
             project,
@@ -2050,22 +2390,9 @@ mod tests {
         let snapshot = fixture(&directory.path().join("repo"));
         let project = ProjectId::new();
         let mut state = State::default();
-        state.entries.insert(
-            project,
-            Entry {
-                snapshot,
-                generation: 1,
-                plan: None,
-                remote_started: false,
-                cancellation: None,
-                read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                pending: Default::default(),
-                fallback: Some("watch limit".into()),
-                last_full_scan: Instant::now(),
-            },
-        );
+        state
+            .entries
+            .insert(project, Entry::new(snapshot, 1, Some("watch limit".into())));
         state.changed(
             project,
             git_watch::Change {
@@ -2112,22 +2439,10 @@ mod tests {
             Vec::new(),
         ));
         app.repository_generations.insert(project.id, 1);
-        app.refresh_ui.git.entries.insert(
-            project.id,
-            Entry {
-                snapshot: snapshot.clone(),
-                generation: 1,
-                plan: None,
-                remote_started: false,
-                cancellation: None,
-                pending: Default::default(),
-                fallback: None,
-                read_failure: None,
-                read_full_scan: false,
-                catalog_requested: false,
-                last_full_scan: Instant::now(),
-            },
-        );
+        app.refresh_ui
+            .git
+            .entries
+            .insert(project.id, Entry::new(snapshot.clone(), 1, None));
         (app, project)
     }
 
@@ -2859,6 +3174,7 @@ mod tests {
             },
             CancellationToken::default(),
             Some(&plan),
+            &HashMap::new(),
         )
         .unwrap();
         assert!(next_plan.is_none());
@@ -2904,6 +3220,7 @@ mod tests {
             },
             CancellationToken::default(),
             Some(&plan),
+            &HashMap::new(),
         )
         .unwrap();
         assert!(next_plan.is_none());
@@ -2991,6 +3308,7 @@ mod tests {
             },
             CancellationToken::default(),
             Some(&plan),
+            &HashMap::new(),
         )
         .unwrap();
         let next_plan = next_plan.expect("a membership read must return a watch plan");
