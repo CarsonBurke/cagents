@@ -385,7 +385,7 @@ pub mod test_support {
     /// A repository whose `existing` worktree already holds pull request
     /// #7's branch, `feature`, at the reviewed head but tracks nothing: the
     /// checkout a review of #7 offers to reconcile by setting its upstream.
-    /// Its plan runs Git, so its test runs under [`isolated_fixture_case`].
+    /// Its plan runs Git, so its test runs under [`isolated_fixture_case`](crate::repository::test_fixture::isolated_fixture_case).
     pub struct ExistingCheckout {
         /// Holds the repositories until the fixture is dropped.
         pub _directory: tempfile::TempDir,
