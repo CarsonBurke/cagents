@@ -63,6 +63,9 @@ pub(in crate::app) struct Shared {
     /// so a session waiting for its last words can tell a busy helper from
     /// a stuck one.
     answers: u64,
+    /// Sessions cancelled because their chat closed, which the helper still
+    /// holds until it confirms.
+    forgotten: HashSet<SessionId>,
     /// The model download under way and how far it has got.
     progress: Option<(&'static str, u64, u64)>,
     /// Why the last download or removal failed, for Settings.
@@ -81,6 +84,7 @@ impl Default for Shared {
             held: None,
             uses: 0,
             answers: 0,
+            forgotten: HashSet::new(),
             progress: None,
             problem: None,
             installed: installed_models(),
@@ -724,15 +728,12 @@ impl Cagents {
         }
         // One microphone: dictation elsewhere stops, keeping its words,
         // which still reach it by its session.
-        let mut overdue = Task::none();
-        let answers = self.chat_ui.dictation.answers;
         if let Some((other, id)) = self.chat_ui.dictation.active.take() {
             if let Some(session) = self
                 .chat_runtime_mut(other)
                 .and_then(|runtime| runtime.session_mut(id))
             {
                 session.phase = Phase::Finishing;
-                overdue = overdue_later(id, answers, session.loaded);
             }
             self.chat_ui.dictation.client.stop(id);
         }
@@ -775,7 +776,7 @@ impl Cagents {
                 runtime.composer_note = Some(message);
             }
         }
-        Task::batch([overdue, focus(target, "chat-composer")])
+        focus(target, "chat-composer")
     }
 
     /// The shortcut or the palette: dictation in the focused chat. `held` is
@@ -811,7 +812,6 @@ impl Cagents {
         id: SessionId,
         send: Option<PromptMode>,
     ) -> Task<Message> {
-        let answers = self.chat_ui.dictation.answers;
         let Some(session) = self
             .chat_runtime_mut(target)
             .and_then(|runtime| runtime.session_mut(id))
@@ -820,7 +820,6 @@ impl Cagents {
         };
         session.phase = Phase::Finishing;
         session.send = send.or(session.send);
-        let overdue = overdue_later(id, answers, session.loaded);
         if self
             .chat_ui
             .dictation
@@ -831,36 +830,59 @@ impl Cagents {
         }
         self.chat_ui.dictation.held = None;
         self.chat_ui.dictation.client.stop(id);
-        Task::batch([overdue, focus(target, "chat-composer")])
+        focus(target, "chat-composer")
     }
 
-    /// Session `id` was told to stop, and the helper's recognizer has said
-    /// nothing since its `answers`th result. A helper that is still at work,
-    /// on this session or one ahead of it, is given longer; one that has been
+    /// Whether a session waits for the helper to end it: one told to stop,
+    /// one whose chat closed, or one whose pane is gone. `Some(loaded)`
+    /// while one does, `loaded` being whether every such session's model
+    /// has loaded. Waiting sessions share one watch on the helper's
+    /// silence: one that joins inherits the silence so far, as the helper
+    /// serves them in turn and is stuck for all of them alike.
+    fn dictation_waiting(&self) -> Option<bool> {
+        let shared = &self.chat_ui.dictation;
+        shared
+            .sessions
+            .iter()
+            .fold(None, |waiting, (&id, &target)| {
+                let session = self.dictation_session(target, id);
+                let waits = shared.forgotten.contains(&id)
+                    || session.is_none_or(|session| session.phase == Phase::Finishing);
+                if !waits {
+                    return waiting;
+                }
+                let loaded = session.is_none_or(|session| session.loaded);
+                Some(waiting.unwrap_or(true) && loaded)
+            })
+    }
+
+    fn dictation_session(&self, target: Target, id: SessionId) -> Option<&Session> {
+        let runtime = match self.cards.get(&target.card) {
+            Some(CardRuntime::Chat(runtime)) if runtime.target == target => runtime,
+            _ => self
+                .chat_ui
+                .parked
+                .get(&target.card)
+                .filter(|runtime| runtime.target == target)?,
+        };
+        match &runtime.dictation {
+            Some(Pane::Session(session)) if session.id == id => Some(session),
+            _ => None,
+        }
+    }
+
+    /// The helper's recognizer has said nothing since its `answers`th result
+    /// while a session waited for it. A helper still at work, on that
+    /// session or one ahead of it, has moved on since; one that has been
     /// silent all along is stuck, so it is stopped and every session it held
     /// ends, keeping what was written and saying the rest may be missing. A
     /// send that was waiting does not go: the draft may be cut short.
-    pub(super) fn dictation_overdue(&mut self, id: SessionId, answers: u64) -> Task<Message> {
-        let Some(&target) = self.chat_ui.dictation.sessions.get(&id) else {
-            return Task::none();
-        };
-        // A session whose pane has closed still holds the helper.
-        let session = self
-            .chat_runtime_mut(target)
-            .and_then(|runtime| runtime.session_mut(id));
-        if session
-            .as_ref()
-            .is_some_and(|session| session.phase != Phase::Finishing)
-        {
-            return Task::none();
-        }
-        let loaded = session.is_none_or(|session| session.loaded);
-        if self.chat_ui.dictation.answers != answers {
-            return overdue_later(id, self.chat_ui.dictation.answers, loaded);
+    pub(super) fn dictation_overdue(&mut self, answers: u64) {
+        if self.chat_ui.dictation.answers != answers || self.dictation_waiting().is_none() {
+            return;
         }
         self.chat_ui.dictation.client.abandon();
         self.dictation_lost(STUCK);
-        Task::none()
     }
 
     /// Sending `target`'s draft while it dictates: it stops listening if it
@@ -980,16 +1002,7 @@ impl Cagents {
         let id = session.id;
         runtime.dictation_take_back();
         runtime.dictation = None;
-        if self
-            .chat_ui
-            .dictation
-            .active
-            .is_some_and(|(_, active)| active == id)
-        {
-            self.chat_ui.dictation.active = None;
-        }
-        self.chat_ui.dictation.sessions.remove(&id);
-        self.chat_ui.dictation.held = None;
+        self.dictation_ended(id);
         self.chat_ui.dictation.client.cancel(id);
         Task::batch([self.dictation_idle_later(), focus(target, "chat-composer")])
     }
@@ -1128,12 +1141,14 @@ impl Cagents {
 
     /// Chat `card` is closing or giving way to its terminal: it stops
     /// listening at once, so the microphone never stays open for a draft
-    /// nobody can see. Each session ends when the helper confirms.
+    /// nobody can see. Each session ends when the helper confirms, or when
+    /// it is given up on as stuck.
     pub(super) fn dictation_forget(&mut self, card: CardId) {
         let shared = &mut self.chat_ui.dictation;
         for (&id, target) in &shared.sessions {
             if target.card == card {
                 shared.client.cancel(id);
+                shared.forgotten.insert(id);
             }
         }
         if shared.active.is_some_and(|(target, _)| target.card == card) {
@@ -1244,10 +1259,20 @@ impl Cagents {
             return Task::none();
         };
         let Some(runtime) = self.chat_runtime_mut(target) else {
-            // Its pane has closed.
-            self.dictation_ended(id);
-            self.chat_ui.dictation.client.cancel(id);
-            return self.dictation_idle_later();
+            // Its pane has closed. It ends when the helper says so; until
+            // then it waits, as a cancelled session, for a stuck helper to
+            // be given up on.
+            if matches!(
+                event,
+                Event::Stopped { .. } | Event::Cancelled { .. } | Event::Error { .. }
+            ) {
+                self.dictation_ended(id);
+                return self.dictation_idle_later();
+            }
+            if self.chat_ui.dictation.forgotten.insert(id) {
+                self.chat_ui.dictation.client.cancel(id);
+            }
+            return Task::none();
         };
         match event {
             Event::Listening { .. } => {
@@ -1300,6 +1325,7 @@ impl Cagents {
     fn dictation_lost(&mut self, problem: &str) {
         self.chat_ui.dictation.active = None;
         self.chat_ui.dictation.held = None;
+        self.chat_ui.dictation.forgotten.clear();
         for (id, target) in std::mem::take(&mut self.chat_ui.dictation.sessions) {
             if let Some(runtime) = self.chat_runtime_mut(target)
                 && let Some(session) = runtime.session_mut(id)
@@ -1321,29 +1347,56 @@ impl Cagents {
     fn dictation_ended(&mut self, id: SessionId) {
         let shared = &mut self.chat_ui.dictation;
         shared.sessions.remove(&id);
+        shared.forgotten.remove(&id);
         if shared.active.is_some_and(|(_, active)| active == id) {
             shared.active = None;
             shared.held = None;
         }
     }
 
+    /// The helper's events, and while a session waits for the helper to end
+    /// it, a watch on the helper's silence: it restarts with each result,
+    /// so it fires only once the helper has said nothing for its patience.
     pub(super) fn dictation_subscription(&self) -> Subscription<Message> {
-        Subscription::run_with(
+        let updates = Subscription::run_with(
             UpdateSource(self.chat_ui.dictation.client.events()),
             updates,
         )
-        .map(|update| Message::ChatUi(Action::DictationUpdate(update)))
+        .map(|update| Message::ChatUi(Action::DictationUpdate(update)));
+        let Some(loaded) = self.dictation_waiting() else {
+            return updates;
+        };
+        let silence = Subscription::run_with(
+            Silence {
+                answers: self.chat_ui.dictation.answers,
+                loaded,
+            },
+            silence,
+        )
+        .map(|answers| Message::ChatUi(Action::DictationOverdue(answers)));
+        Subscription::batch([updates, silence])
     }
 }
 
-/// Checks on stopping session `id` once the helper has had time to answer:
-/// [`STOP_PATIENCE`], or [`LOAD_PATIENCE`] while its model is not `loaded`.
-fn overdue_later(id: SessionId, answers: u64, loaded: bool) -> Task<Message> {
+/// A wait for the helper's next result after its `answers`th.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Silence {
+    answers: u64,
+    /// Whether every waiting session's model has loaded.
+    loaded: bool,
+}
+
+/// `answers` once the helper has been silent for [`STOP_PATIENCE`], or
+/// [`LOAD_PATIENCE`] while a model is still loading.
+fn silence(silence: &Silence) -> Pin<Box<dyn iced::futures::Stream<Item = u64> + Send>> {
+    let Silence { answers, loaded } = *silence;
     let patience = if loaded { STOP_PATIENCE } else { LOAD_PATIENCE };
-    cosmic::task::future(async move {
+    // It keeps firing rather than ending, so a watch whose key outlives
+    // a wait never sits idle when another wait begins under the same key.
+    Box::pin(iced::futures::stream::unfold((), move |()| async move {
         tokio::time::sleep(patience).await;
-        Message::ChatUi(Action::DictationOverdue(id, answers))
-    })
+        Some((answers, ()))
+    }))
 }
 
 fn focus(target: Target, control: &str) -> Task<Message> {
@@ -1916,25 +1969,29 @@ mod tests {
     #[test]
     fn a_stop_the_helper_never_confirms_ends_after_a_silence() {
         let (mut app, card, target) = dictating("Hello", 5);
+        // Listening waits for nobody: no watch on the helper's silence.
+        assert_eq!(app.dictation_waiting(), None);
         drop(app.handle_chat_ui(Action::DictationStop(target)));
+        assert_eq!(app.dictation_waiting(), Some(true));
         let (other, other_target) = listen(&mut app, "other", 8, "Hi", 2);
+        app.chat_runtime_mut(other_target)
+            .and_then(|runtime| runtime.session_mut(8))
+            .unwrap()
+            .loaded = false;
         drop(app.handle_chat_ui(Action::DictationStop(other_target)));
+        // A model still loading is given longer.
+        assert_eq!(app.dictation_waiting(), Some(false));
         hear(&mut app, final_text("world"));
-        // Scheduled before the last words arrived: not yet.
-        drop(app.dictation_overdue(SESSION, 0));
-        assert!(
-            super::super::tests::chat_runtime(&app, card)
-                .dictation
-                .is_some()
-        );
-        // The other session's words count too: the helper is at work.
-        drop(app.dictation_overdue(8, 0));
-        assert!(
-            super::super::tests::chat_runtime(&app, other)
-                .dictation
-                .is_some()
-        );
-        drop(app.dictation_overdue(SESSION, 1));
+        // A watch begun before the last words arrived: not yet.
+        app.dictation_overdue(0);
+        for card in [card, other] {
+            assert!(
+                super::super::tests::chat_runtime(&app, card)
+                    .dictation
+                    .is_some()
+            );
+        }
+        app.dictation_overdue(1);
         for card in [card, other] {
             let runtime = super::super::tests::chat_runtime(&app, card);
             assert!(runtime.dictation.is_none());
@@ -1942,6 +1999,7 @@ mod tests {
         }
         assert_eq!(draft(&app, card), "Hello world");
         assert!(app.chat_ui.dictation.sessions.is_empty());
+        assert_eq!(app.dictation_waiting(), None);
         // Its late word, if it ever comes, changes nothing.
         hear(&mut app, stopped(SESSION));
         assert_eq!(draft(&app, card), "Hello world");
@@ -1949,7 +2007,7 @@ mod tests {
         // A send that was waiting stays a draft, and the note says so.
         let (mut app, card, target) = dictating("Hello", 5);
         drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
-        drop(app.dictation_overdue(SESSION, 0));
+        app.dictation_overdue(0);
         assert_eq!(draft(&app, card), "Hello");
         let note = super::super::tests::chat_runtime(&app, card)
             .composer_note
@@ -1957,14 +2015,45 @@ mod tests {
         assert!(note.is_some_and(
             |note| note.starts_with(STUCK) && note.ends_with("Your message wasn't sent.")
         ));
+    }
 
-        // A session whose chat closed still holds the helper until it
-        // answers or is given up on.
-        let (mut app, card, target) = dictating("Hello", 5);
-        drop(app.handle_chat_ui(Action::DictationStop(target)));
+    /// A chat that closes while it listens cancels its session, which the
+    /// helper holds until it confirms. A helper that never does is given up
+    /// on like one that never confirms a stop, rather than kept loaded.
+    #[test]
+    fn a_chat_closed_while_listening_lets_a_stuck_helper_go() {
+        let (mut app, card, _) = dictating("Hello", 5);
         app.chat_forget(card);
+        assert!(app.chat_ui.dictation.active.is_none());
         assert!(!app.chat_ui.dictation.sessions.is_empty());
-        drop(app.dictation_overdue(SESSION, 0));
+        assert_eq!(app.dictation_waiting(), Some(true));
+        app.dictation_overdue(0);
+        assert!(app.chat_ui.dictation.sessions.is_empty());
+        assert!(app.chat_ui.dictation.forgotten.is_empty());
+        assert_eq!(app.dictation_waiting(), None);
+
+        // A helper that confirms ends the wait itself.
+        let (mut app, card, _) = dictating("Hello", 5);
+        app.chat_forget(card);
+        hear(&mut app, Event::Cancelled { session: SESSION });
+        assert!(app.chat_ui.dictation.forgotten.is_empty());
+        assert_eq!(app.dictation_waiting(), None);
+
+        // Once its pane is gone, only the helper's word that it ended ends
+        // it: the microphone's news of speech is no such word, and it goes
+        // on waiting until the helper is given up on.
+        let (mut app, card, _) = dictating("Hello", 5);
+        app.chat_forget(card);
+        app.cards.remove(&card);
+        hear(
+            &mut app,
+            Event::Signal {
+                session: SESSION,
+                present: true,
+            },
+        );
+        assert_eq!(app.dictation_waiting(), Some(true));
+        app.dictation_overdue(0);
         assert!(app.chat_ui.dictation.sessions.is_empty());
     }
 
