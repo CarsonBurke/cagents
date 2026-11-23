@@ -22,6 +22,10 @@ HANG_GUARD = 60
 PACKAGED = ("cagents", "cagents-ui", "cagentsd", "cagents-dictate")
 
 
+# Runtime-image packages that provide a dependency under another name.
+RUNTIME_PROVIDERS = {"libasound2": "libasound2t64"}
+
+
 def provisioned_runtime_packages():
     source = (ROOT / "scripts/prepare-release-smoke-rootfs").read_text()
     parts = source.split("<<'PROVISION'\n")
@@ -273,6 +277,11 @@ class PackageDependencies(unittest.TestCase):
                     )
                     self.assertIsNotNone(match, f"unsupported Debian dependency: {dependency}")
                     required_packages.add(match.group(1))
+                # Ubuntu 24.04's 64-bit time_t transition renamed ALSA's
+                # library; the renamed package provides the old name.
+                required_packages = {
+                    RUNTIME_PROVIDERS.get(package, package) for package in required_packages
+                }
                 self.assertEqual(
                     required_packages - runtime_packages, set(),
                     f"{variant} runtime dependencies missing from rootfs provisioning",

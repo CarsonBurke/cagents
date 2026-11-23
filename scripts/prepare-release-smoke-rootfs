@@ -102,9 +102,11 @@ FAKEROOTDONTTRYCHOWN=1 /usr/bin/fakeroot-sysv -- /bin/sh -ec '
     chown 0:50 /tmp/ownership-probe
     test "$(stat -c %u:%g /tmp/ownership-probe)" = 0:50
 '
+# Ubuntu 24.04 ships ALSA as libasound2t64, which provides the packages'
+# libasound2 dependency; libasound2 itself is only a virtual package there.
 apt-get -o Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg install --yes --no-install-recommends \
     ca-certificates tzdata curl git libsecret-tools libc6 libegl1 libfontconfig1 libfreetype6 libgcc-s1 libstdc++6 \
-    libwayland-client0 libxkbcommon0 libasound2 zlib1g xdg-utils jq fakeroot libfakeroot
+    libwayland-client0 libxkbcommon0 libasound2t64 zlib1g xdg-utils jq fakeroot libfakeroot
 dpkg --compare-versions "$(dpkg-query -W -f='${Version}' git)" ge 2.36
 audit=$(dpkg --audit)
 [[ -z $audit ]] || { printf '%s\n' "$audit" >&2; exit 1; }
