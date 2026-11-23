@@ -15335,17 +15335,12 @@ mod row_interaction {
     }
 }
 
+/// Fixtures the application's tests share with this module's.
 #[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
-    )
-)]
 #[doc(hidden)]
-pub mod tests;
+pub mod test_support;
+#[cfg(test)]
+pub(crate) mod tests;
 
 /// Focus a navigation row and reveal it within the Projects scroll viewport.
 pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {

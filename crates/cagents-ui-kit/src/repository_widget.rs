@@ -17,17 +17,12 @@ mod document_watch;
 mod live_tests;
 use document_watch::DocumentWatch;
 mod preview;
+#[cfg(test)]
+pub(crate) mod retained_save_tests;
+/// Fixtures the application's tests share with this module's.
 #[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
-    )
-)]
 #[doc(hidden)]
-pub mod retained_save_tests;
+pub mod test_support;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
@@ -3546,7 +3541,7 @@ impl RepositoryRuntime {
     /// the real file worker answered. Other follow-up tasks are dropped.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn settle_document_read(&mut self, task: Task<RepositoryAction>) -> bool {
-        retained_save_tests::finish(self, task).await.answered()
+        test_support::finish(self, task).await.answered()
     }
 
     /// Whether `action` is a file-read completion for the selected document.

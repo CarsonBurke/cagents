@@ -751,7 +751,8 @@ mod tests {
             drop(app.update(Message::CancelDialog));
             let (card, task) = app.add_pull_requests_card("/repo".into());
             drop(task);
-            let mut loaded = crate::pull_request_review::tests::loaded(Vec::new(), Vec::new());
+            let mut loaded =
+                crate::pull_request_review::test_support::loaded(Vec::new(), Vec::new());
             loaded.pull_request.head_repository =
                 Some(crate::github::GitHubHeadRepository { name: "r".into() });
             loaded.pull_request.head_repository_owner = Some(crate::github::GitHubActor {
@@ -759,7 +760,7 @@ mod tests {
                 name: None,
                 is_bot: false,
             });
-            let mut target = crate::pull_request_review::tests::target(1);
+            let mut target = crate::pull_request_review::test_support::target(1);
             target.pull_request = Arc::new(loaded.pull_request.clone());
             let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
                 panic!("review");
