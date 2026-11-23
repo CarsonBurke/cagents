@@ -683,7 +683,7 @@ mod tests {
     use super::*;
 
     fn referenced_package(reference: &str) -> (tempfile::TempDir, PathBuf) {
-        let root = super::super::tests::canonical_tempdir();
+        let root = super::super::test_support::canonical_tempdir();
         let package = root.path().join("packages/a");
         std::fs::create_dir_all(package.join("src")).unwrap();
         std::fs::write(package.join("package.json"), "{}").unwrap();

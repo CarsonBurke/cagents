@@ -1827,7 +1827,7 @@ impl ChildProcess {
             tracing::warn!(%error, "language-server final reap is unconfirmed");
             return ChildStop::Unconfirmed;
         }
-        #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+        #[cfg(all(test, target_os = "linux"))]
         tests::LSP_AFTER_REAP.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
@@ -5504,14 +5504,9 @@ impl std::fmt::Debug for LspManager {
     }
 }
 
+/// Fixtures the application's tests share with this module's.
 #[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
-    )
-)]
 #[doc(hidden)]
-pub mod tests;
+pub mod test_support;
+#[cfg(test)]
+pub(crate) mod tests;

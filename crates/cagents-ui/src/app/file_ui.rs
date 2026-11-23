@@ -362,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error() {
-        if crate::repository_widget::retained_save_tests::isolated_test(
+        if crate::repository_widget::test_support::isolated_test(
             "app::file_ui::tests::missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error",
         ) {
             return;

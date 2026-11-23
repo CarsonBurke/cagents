@@ -278,7 +278,7 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{entry, finish_load, loaded, remote_file, state, target};
+    use super::super::test_support::{entry, finish_load, loaded, remote_file, state, target};
     use super::*;
     use crate::repository::ChangeKind;
 
