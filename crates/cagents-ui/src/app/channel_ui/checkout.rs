@@ -157,6 +157,91 @@ impl Cagents {
         Some((project.id, checkout))
     }
 
+    /// Moves the panes this window alone kept in a worktree strip into their
+    /// checkout's channel, once it holds the daemon's model.
+    ///
+    /// The daemon moved every strip pane it knew into a channel when it
+    /// started. A pane only this window had, never published, is still in
+    /// its strip here; left there, it would keep the strip alive and the
+    /// daemon refuses it. It joins the channel the daemon would have chosen:
+    /// a worktree's oldest channel, or a new one named after the branch, and
+    /// for the main checkout a channel of its own.
+    pub(in crate::app) fn adopt_strip_cards(&mut self) {
+        if !std::mem::take(&mut self.channel_ui.strip_adoption_pending)
+            || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+        {
+            return;
+        }
+        let shared: HashSet<CardId> = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+            .collect();
+        let channeled: HashSet<CardId> = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect();
+        let roots = &self.worktree_paths;
+        let mut strips: std::collections::BTreeMap<PathBuf, Vec<CardId>> = Default::default();
+        for card in self.durable.cards.iter() {
+            if !card.existence.is_open()
+                || card.kind.is_utility()
+                || channeled.contains(&card.id)
+                || shared.contains(&card.id)
+                || self.shared_views.quarantined.contains(&card.id)
+            {
+                continue;
+            }
+            if let Some(root) = self.unchanneled_card_worktree_indexed(card, &roots) {
+                strips.entry(root.to_path_buf()).or_default().push(card.id);
+            }
+        }
+        let mut adopted = false;
+        for (root, cards) in strips {
+            let Some((project_id, checkout)) = self.checkout_at(&root) else {
+                // A project whose rows have not loaded yet is tried again when
+                // they do.
+                self.channel_ui.strip_adoption_pending = true;
+                continue;
+            };
+            let existing = checkout
+                .as_deref()
+                .and_then(|checkout| self.channel_for_checkout(project_id, Some(checkout)));
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let title = self.checkout_title(project_id, &root);
+                    match self.create_channel(
+                        project_id,
+                        title,
+                        crate::model::ChannelTitleSource::Manual,
+                        checkout,
+                    ) {
+                        Some(id) => id,
+                        None => continue,
+                    }
+                }
+            };
+            tracing::info!(?root, panes = cards.len(), %id, "moved a strip's panes into its channel");
+            if let Some(channel) = Arc::make_mut(&mut self.durable)
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == id)
+            {
+                channel.cards.extend(cards);
+                adopted = true;
+            }
+        }
+        if adopted {
+            self.refresh_sidebar_channels();
+            self.persist();
+            self.publish_view_changes();
+        }
+    }
+
     /// A new channel's name for the checkout at `root`: its branch, or the
     /// directory's name for a detached checkout or a folder.
     fn checkout_title(&self, project_id: ProjectId, root: &Path) -> String {
@@ -539,5 +624,133 @@ mod tests {
 
         drop(app.update(open()));
         assert_eq!(app.durable.channels.len(), 1, "opening again reuses it");
+    }
+
+    /// A pane in the worktree's strip, as an older window filed it there.
+    fn strip_pane(directory: &Path) -> CardState {
+        let mut pane = super::super::super::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut pane.kind else {
+            unreachable!();
+        };
+        session.launch.working_directory = directory.to_path_buf();
+        pane
+    }
+
+    impl Fixture {
+        /// The window holds the daemon's model, so adoption may run.
+        fn connect(&mut self) {
+            self.app.workspace_model.identity = uuid::Uuid::new_v4();
+            self.app.channel_ui.strip_adoption_pending = true;
+        }
+
+        fn cards(&self, id: ChannelId) -> Vec<CardId> {
+            self.app
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .unwrap()
+                .cards
+                .clone()
+        }
+    }
+
+    /// A strip pane only this window had joins its worktree's oldest channel,
+    /// so the strip no longer holds panes and the worktree opens there.
+    #[test]
+    fn a_strip_pane_only_this_window_has_joins_its_worktrees_channel() {
+        let mut fixture = fixture();
+        let linked = fixture.linked.path().to_path_buf();
+        let pane = strip_pane(&linked);
+        Arc::make_mut(&mut fixture.app.durable).cards = vec![pane.clone()].into();
+        let older = fixture.channel(1, Some(&linked));
+        let newer = fixture.channel(2, Some(&linked));
+        fixture.connect();
+
+        fixture.app.adopt_strip_cards();
+
+        assert_eq!(fixture.cards(older), vec![pane.id]);
+        assert!(fixture.cards(newer).is_empty());
+        assert!(!fixture.app.legacy_strip_holds_panes(&linked));
+        fixture.open_worktree();
+        assert_eq!(fixture.app.durable.active_channel, Some(older));
+    }
+
+    /// A worktree with no channel gets one named after its branch.
+    #[test]
+    fn a_strip_pane_without_a_channel_gets_one_named_for_its_branch() {
+        let mut fixture = fixture();
+        let linked = fixture.linked.path().to_path_buf();
+        let pane = strip_pane(&linked);
+        Arc::make_mut(&mut fixture.app.durable).cards = vec![pane.clone()].into();
+        fixture.connect();
+
+        fixture.app.adopt_strip_cards();
+
+        let channel = &fixture.app.durable.channels[0];
+        assert_eq!(channel.title, "feature");
+        assert_eq!(channel.cards, vec![pane.id]);
+        assert!(channel.checkout.is_some());
+    }
+
+    /// Before the window holds the daemon's model it cannot tell its own
+    /// panes from the daemon's, so it moves nothing; a pane the daemon holds
+    /// is the daemon's to move.
+    #[test]
+    fn strip_panes_wait_for_the_model_and_leave_the_daemons_panes_alone() {
+        let mut fixture = fixture();
+        let linked = fixture.linked.path().to_path_buf();
+        let pane = strip_pane(&linked);
+        Arc::make_mut(&mut fixture.app.durable).cards = vec![pane.clone()].into();
+        let channel = fixture.channel(1, Some(&linked));
+        fixture.app.channel_ui.strip_adoption_pending = true;
+
+        fixture.app.adopt_strip_cards();
+        assert!(fixture.cards(channel).is_empty(), "no model yet");
+
+        fixture.connect();
+        fixture
+            .app
+            .workspace_model
+            .views
+            .push(crate::workspace_model::views::View {
+                scope: crate::workspace_model::views::Scope::Channel(ChannelId::new()),
+                revision: 1,
+                panes: vec![
+                    crate::workspace_model::views::Pane::from_card(&pane, None).unwrap(),
+                ],
+                retired: vec![],
+            });
+        fixture.app.adopt_strip_cards();
+        assert!(fixture.cards(channel).is_empty(), "the daemon holds it");
+    }
+
+    /// A channel whose worktree is no longer listed says so and offers to
+    /// make it again on its branch, where it was.
+    #[test]
+    fn a_channel_whose_worktree_is_gone_offers_to_recreate_it() {
+        let mut fixture = fixture();
+        let linked = fixture.linked.path().to_path_buf();
+        let present = fixture.channel(1, Some(&linked));
+        let gone = std::path::PathBuf::from("/nonexistent/feature-two");
+        let missing = fixture.channel(2, Some(&gone));
+        let main = fixture.channel(3, None);
+
+        assert_eq!(fixture.app.missing_checkout(present), None);
+        assert_eq!(fixture.app.missing_checkout(main), None);
+        let found = fixture.app.missing_checkout(missing).expect("missing");
+        assert_eq!(found.path, gone);
+        assert_eq!(found.branch, "Channel 2");
+
+        drop(
+            fixture
+                .app
+                .update(Message::MissingCheckout(super::super::missing_checkout::Action::Recreate(
+                    missing,
+                ))),
+        );
+        let dialog = fixture.app.worktree_dialog.as_ref().expect("the dialog");
+        assert_eq!(dialog.draft.branch, "Channel 2");
+        assert_eq!(dialog.draft.destination, gone.display().to_string());
     }
 }

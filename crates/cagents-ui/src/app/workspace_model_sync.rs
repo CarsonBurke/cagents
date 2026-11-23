@@ -1089,6 +1089,7 @@ impl Cagents {
             super::shared_views::quarantined_managed_panes(&model, &model.views, &display_index);
         self.shared_views.quarantined.extend(fenced);
         self.workspace_model = model;
+        self.channel_ui.strip_adoption_pending = true;
         true
     }
 
@@ -1606,7 +1607,9 @@ impl Cagents {
         if matches!(update, ModelUpdate::Unavailable(_)) && self.shared_views.registry_unavailable {
             return (Task::none(), false);
         }
-        (self.apply_workspace_model_update_inner(update), true)
+        let task = self.apply_workspace_model_update_inner(update);
+        self.adopt_strip_cards();
+        (task, true)
     }
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {

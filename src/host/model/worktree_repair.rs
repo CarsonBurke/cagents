@@ -306,3 +306,318 @@ fn place_in_navigation(
         .map_err(|error| error.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BrowserId, BrowserSession, CardId, CardKind, ProjectKind};
+    use crate::workspace_model::CheckoutFixture;
+    use crate::workspace_model::views::Pane;
+
+    fn pane(width: f32, filing: &Path) -> Pane {
+        Pane {
+            id: CardId::new(),
+            title: "browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: width,
+            scope: Some(filing.to_path_buf()),
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        }
+    }
+
+    struct Store {
+        registry: Registry,
+        checkout: CheckoutFixture,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Store {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+            let checkout = CheckoutFixture::new();
+            registry
+                .apply(&ModelEdit::OpenProject {
+                    repository: checkout.repository.clone(),
+                    name: "repo".into(),
+                    kind: ProjectKind::Git,
+                })
+                .unwrap();
+            Self {
+                registry,
+                checkout,
+                _directory: directory,
+            }
+        }
+
+        fn strip(&self, path: &Path) -> Scope {
+            Scope::Worktree {
+                repository: self.checkout.repository.clone(),
+                path: path.to_path_buf(),
+            }
+        }
+
+        fn seed(&mut self, scope: &Scope, panes: Vec<Pane>) {
+            self.registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes,
+                    closed: vec![],
+                })
+                .unwrap();
+        }
+
+        fn view(&self, scope: &Scope) -> Vec<Pane> {
+            self.registry
+                .model()
+                .unwrap()
+                .views
+                .into_iter()
+                .find(|view| &view.scope == scope)
+                .map(|view| view.panes)
+                .unwrap_or_default()
+        }
+
+        fn channels(&self) -> Vec<crate::workspace_model::ModelChannel> {
+            self.registry.model().unwrap().channels
+        }
+    }
+
+    /// A worktree strip's panes move, in order and unchanged, into a channel
+    /// named after the branch that records the worktree; a second start
+    /// changes nothing.
+    #[test]
+    fn a_worktree_strip_moves_into_its_checkouts_channel_once() {
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let strip = store.strip(&linked);
+        let panes = vec![pane(0.25, &linked), pane(0.75, &linked)];
+        store.seed(&strip, panes.clone());
+
+        let adopted = store.registry.adopt_worktree_views().unwrap();
+        assert_eq!(
+            adopted,
+            Adopted {
+                strips: 1,
+                panes: 2,
+                created_channels: 1,
+                kept: 0
+            }
+        );
+        let channel = store
+            .channels()
+            .into_iter()
+            .find(|channel| channel.checkout.as_deref() == Some(linked.as_path()))
+            .expect("the worktree's channel");
+        assert_eq!(channel.title, "feature");
+        assert_eq!(channel.title_source, ChannelTitleSource::Manual);
+        assert_eq!(store.view(&Scope::Channel(channel.id)), panes);
+        assert!(store.view(&strip).is_empty());
+
+        let sequence = store.registry.model().unwrap().sequence;
+        assert_eq!(
+            store.registry.adopt_worktree_views().unwrap(),
+            Adopted::default()
+        );
+        assert_eq!(store.registry.model().unwrap().sequence, sequence);
+    }
+
+    /// A worktree that already has a channel keeps it: the strip's panes join
+    /// its oldest one after the panes it holds.
+    #[test]
+    fn a_strip_joins_the_oldest_channel_already_in_its_worktree() {
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let (older, newer) = (ChannelId::new(), ChannelId::new());
+        for id in [older, newer] {
+            store
+                .registry
+                .apply(&ModelEdit::CreateChannel {
+                    id,
+                    repository: store.checkout.repository.clone(),
+                    title: "work".into(),
+                    title_source: ChannelTitleSource::Manual,
+                    checkout: Some(linked.clone()),
+                })
+                .unwrap();
+        }
+        let held = pane(0.5, &linked);
+        let channel = Scope::Channel(older);
+        store.seed(&channel, vec![held.clone()]);
+        let strip = store.strip(&linked);
+        let moved = pane(0.5, &linked);
+        store.seed(&strip, vec![moved.clone()]);
+
+        let adopted = store.registry.adopt_worktree_views().unwrap();
+        assert_eq!(adopted.created_channels, 0);
+        assert_eq!(store.view(&channel), vec![held, moved]);
+        assert!(store.view(&Scope::Channel(newer)).is_empty());
+    }
+
+    /// A strip whose worktree was removed keeps its panes. Its channel records
+    /// the missing worktree, so they start in the main checkout until it is
+    /// made again, and is named after the branch Git still remembers.
+    #[test]
+    fn a_removed_worktrees_strip_keeps_its_panes_in_a_channel_that_records_it() {
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let strip = store.strip(&linked);
+        let panes = vec![pane(1.0, &linked)];
+        store.seed(&strip, panes.clone());
+        std::fs::remove_dir_all(&linked).unwrap();
+
+        store.registry.adopt_worktree_views().unwrap();
+        let channel = store
+            .channels()
+            .into_iter()
+            .find(|channel| channel.checkout.as_deref() == Some(linked.as_path()))
+            .expect("a channel that records the missing worktree");
+        assert_eq!(channel.title, "feature");
+        assert_eq!(store.view(&Scope::Channel(channel.id)), panes);
+    }
+
+    /// The main checkout's strip becomes a channel of its own in the main
+    /// checkout rather than joining an unrelated conversation.
+    #[test]
+    fn the_main_checkouts_strip_becomes_its_own_channel() {
+        let mut store = Store::new();
+        let existing = ChannelId::new();
+        store
+            .registry
+            .apply(&ModelEdit::CreateChannel {
+                id: existing,
+                repository: store.checkout.repository.clone(),
+                title: "conversation".into(),
+                title_source: ChannelTitleSource::Prompt,
+                checkout: None,
+            })
+            .unwrap();
+        let main = store.checkout.main.clone();
+        let strip = store.strip(&main);
+        let panes = vec![pane(1.0, &main)];
+        store.seed(&strip, panes.clone());
+
+        store.registry.adopt_worktree_views().unwrap();
+        let channel = store
+            .channels()
+            .into_iter()
+            .find(|channel| channel.id != existing)
+            .expect("the main checkout's channel");
+        assert_eq!(channel.checkout, None);
+        assert_eq!(store.view(&Scope::Channel(channel.id)), panes);
+        assert!(store.view(&Scope::Channel(existing)).is_empty());
+    }
+
+    /// A project arranged by hand lists the new channel where its worktree is.
+    #[test]
+    fn a_hand_arranged_project_lists_the_channel_beside_its_worktree() {
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let main = store.checkout.main.clone();
+        let items = vec![
+            NavigationItem::Worktree(main.clone()),
+            NavigationItem::Worktree(linked.clone()),
+        ];
+        store
+            .registry
+            .apply(&ModelEdit::ReorderNavigation {
+                repository: store.checkout.repository.clone(),
+                source: items[1].clone(),
+                before: None,
+                fallback: items.clone(),
+            })
+            .unwrap();
+        let strip = store.strip(&linked);
+        store.seed(&strip, vec![pane(1.0, &linked)]);
+
+        store.registry.adopt_worktree_views().unwrap();
+        let channel = store.channels()[0].id;
+        let order = store
+            .registry
+            .model()
+            .unwrap()
+            .navigation_orders
+            .into_iter()
+            .find(|order| order.repository == store.checkout.repository)
+            .unwrap()
+            .items;
+        assert_eq!(
+            order,
+            vec![
+                NavigationItem::Worktree(main),
+                NavigationItem::Channel(channel),
+                NavigationItem::Worktree(linked),
+            ]
+        );
+    }
+
+    /// A worktree strip takes no new pane, by insertion or by transfer.
+    #[test]
+    fn a_worktree_strip_refuses_new_panes() {
+        use crate::workspace_model::views::Change;
+        let mut store = Store::new();
+        let linked = store.checkout.linked.clone();
+        let strip = store.strip(&linked);
+        let held = pane(1.0, &linked);
+        store.seed(&strip, vec![held.clone()]);
+        let revision = store
+            .registry
+            .model()
+            .unwrap()
+            .views
+            .into_iter()
+            .find(|view| view.scope == strip)
+            .unwrap()
+            .revision;
+        let insert = ModelEdit::ChangeView {
+            scope: strip.clone(),
+            expected_revision: revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Insert {
+                pane: pane(1.0, &linked),
+                before: None,
+            },
+        };
+        assert_eq!(
+            store.registry.apply(&insert).unwrap_err(),
+            views::WORKTREE_VIEW_CLOSED
+        );
+
+        let channel = ChannelId::new();
+        store
+            .registry
+            .apply(&ModelEdit::CreateChannel {
+                id: channel,
+                repository: store.checkout.repository.clone(),
+                title: "work".into(),
+                title_source: ChannelTitleSource::Manual,
+                checkout: None,
+            })
+            .unwrap();
+        let elsewhere = pane(1.0, &linked);
+        store.seed(&Scope::Channel(channel), vec![elsewhere.clone()]);
+        let transfer = Change::Transfer {
+            id: elsewhere.id,
+            destination: strip.clone(),
+            before: None,
+        };
+        assert_eq!(
+            store
+                .registry
+                .view_change_refusal(&Scope::Channel(channel), &transfer)
+                .unwrap()
+                .as_deref(),
+            Some(views::WORKTREE_VIEW_CLOSED)
+        );
+        assert_eq!(store.view(&strip), vec![held]);
+    }
+}

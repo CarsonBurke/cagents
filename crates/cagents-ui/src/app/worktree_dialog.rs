@@ -187,7 +187,7 @@ struct Resolution {
 pub struct WorktreeDialog {
     project_id: ProjectId,
     repository: PathBuf,
-    draft: WorktreeDraft,
+    pub(super) draft: WorktreeDraft,
     advanced: bool,
     checkout_notice: Option<String>,
     resolving: Option<Resolution>,

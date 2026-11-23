@@ -5,6 +5,7 @@ use crate::workspace_model::ModelEdit;
 use std::collections::BTreeMap;
 
 mod checkout;
+pub(in crate::app) mod missing_checkout;
 
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
 /// daemon itself reports rather than the saved descriptors, together with the
@@ -476,6 +477,9 @@ pub struct State {
     pub(super) retiring: HashMap<ChannelId, (u64, std::time::Instant)>,
     /// Where the one sweep for channels emptied while nobody watched stands.
     pub(super) sweep: Sweep,
+    /// Whether a complete model or a worktree listing arrived since this
+    /// window last moved its strip-only panes into channels.
+    pub(in crate::app) strip_adoption_pending: bool,
 }
 
 /// The startup sweep waits for this window's restore to verify what it saved,
