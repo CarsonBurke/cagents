@@ -2425,10 +2425,16 @@ fn shared_preferences_stream_inner(
         // signal coalesces a burst of write, rename, and close events into one
         // off-thread read. This stream used to stat the file every second in
         // every open UI process even when no other window had changed it.
-        let Some(parent) = path.parent().map(Path::to_path_buf) else {
+        let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+        else {
             return;
         };
         let mut previous = None;
+        // Exhausted watch resources would otherwise log every retry.
+        let mut warned = false;
         macro_rules! load_and_emit {
             () => {
                 #[cfg(test)]
@@ -2476,13 +2482,17 @@ fn shared_preferences_stream_inner(
                     match watcher.watch(&parent, notify::RecursiveMode::NonRecursive) {
                         Ok(()) => Some(watcher),
                         Err(error) => {
-                            tracing::warn!(%error, path = %parent.display(), "could not watch shared preferences directory");
+                            if !std::mem::replace(&mut warned, true) {
+                                tracing::warn!(%error, path = %parent.display(), "could not watch shared preferences directory");
+                            }
                             None
                         }
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "could not watch shared preferences");
+                    if !std::mem::replace(&mut warned, true) {
+                        tracing::warn!(%error, path = %path.display(), "could not watch shared preferences");
+                    }
                     None
                 }
             };
@@ -2587,7 +2597,6 @@ mod tests {
         let settings = AppSettings::default();
         settings::save(&path, &settings).unwrap();
         // `read_private_file` restores this to 0600 after the watch is armed.
-        // Its ATTRIB event must not cause a second settings load.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let load_count = Arc::new(AtomicUsize::new(0));
         let stream =
@@ -2608,11 +2617,18 @@ mod tests {
             None,
             "reading settings chmods the file; that must not schedule another load"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Change the mode again, and drive the stream meanwhile: it runs only
+        // while polled, and a reload would emit nothing new to wait for.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), stream.next())
+                .await
+                .is_err()
+        );
         assert_eq!(
             load_count.load(Ordering::Relaxed),
             1,
-            "the chmod performed by the initial settings load does not schedule a reload"
+            "a mode change, such as the one each settings read makes, schedules no reload"
         );
     }
 
