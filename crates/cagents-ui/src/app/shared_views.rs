@@ -457,6 +457,47 @@ impl State {
                 && !self.blocked.contains(scope))
     }
 
+    /// What a reconciliation decides for this window's views, as text that
+    /// reads the same whatever order its sets iterate in.
+    #[cfg(test)]
+    pub(super) fn reconciled_view(&self) -> String {
+        use super::projection_oracle::sorted_entries;
+        let set = |items: &mut dyn Iterator<Item = String>| {
+            let mut items = items.collect::<Vec<_>>();
+            items.sort_unstable();
+            items.join(", ")
+        };
+        format!(
+            "pending: {:?}\nblocked: {}\nquarantined: {}\nclosed: {}\nattached: {}\n\
+             retained: {}\nseeding: {}\nseed attempts: {}\nseed failures: {}\n\
+             requested transfers: {}\ndefaults: {}\nstrip detached: {}\n\
+             closed chats: {}\nobserved chats: {}\nobserved terminals: {}\n\
+             adoptions: {:?}\nchat adoptions: {}\nrestorations: {:?}\n\
+             restoration requests: {}\ndeferred default: {:?}\nfenced closes: {}",
+            self.pending,
+            set(&mut self.blocked.iter().map(|scope| format!("{scope:?}"))),
+            set(&mut self.quarantined.iter().map(|id| format!("{id:?}"))),
+            set(&mut self.closed.iter().map(|id| format!("{id:?}"))),
+            set(&mut self.attached.iter().map(|id| format!("{id:?}"))),
+            set(&mut self.retained.iter().map(|id| format!("{id:?}"))),
+            set(&mut self.seeding.iter().map(|scope| format!("{scope:?}"))),
+            set(&mut self.seed_attempts.keys().map(|scope| format!("{scope:?}"))),
+            sorted_entries(&self.seed_failures),
+            sorted_entries(&self.requested_transfers),
+            set(&mut self.defaults.keys().map(|id| format!("{id:?}"))),
+            set(&mut self.strip_detached.iter().map(|id| format!("{id:?}"))),
+            sorted_entries(&self.closed_chats),
+            sorted_entries(&self.observed_chats),
+            sorted_entries(&self.observed_terminals),
+            self.adoptions,
+            sorted_entries(&self.chat_adoptions),
+            self.restorations,
+            sorted_entries(&self.restoration_requests),
+            self.deferred_default,
+            set(&mut self.fenced_closes.iter().map(|id| format!("{id:?}"))),
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn seeding_scopes(&self) -> Vec<Scope> {
         self.seeding.iter().cloned().collect()
@@ -1856,14 +1897,7 @@ impl Cagents {
         }
         // These local chats still need membership published. An unrelated
         // draft explicitly retained by this window is not such an obligation.
-        if self.durable.cards.iter().any(|card| {
-            card.existence.is_open()
-                && matches!(card.kind, CardKind::Chat(_))
-                && !self.shared_views.attached.contains(&card.id)
-                && !self.shared_views.retained.contains(&card.id)
-                && !self.chat_is_unused_default(card.id)
-                && !self.reopen_pending(card.id)
-        }) {
+        if self.holds_unpublished_local_chat() {
             return Err("an unpublished local conversation needs reconciliation");
         }
         match pending_operation {
@@ -2330,6 +2364,19 @@ impl Cagents {
             return FirstSendAdmission::Waiting;
         }
         FirstSendAdmission::Admitted
+    }
+
+    /// Whether an open chat has work but no shared descriptor yet, which the
+    /// next complete reconciliation publishes.
+    pub(super) fn holds_unpublished_local_chat(&self) -> bool {
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(card.kind, CardKind::Chat(_))
+                && !self.shared_views.attached.contains(&card.id)
+                && !self.shared_views.retained.contains(&card.id)
+                && !self.chat_is_unused_default(card.id)
+                && !self.reopen_pending(card.id)
+        })
     }
 
     /// An automatic empty composer has no shared descriptor yet. Once it has

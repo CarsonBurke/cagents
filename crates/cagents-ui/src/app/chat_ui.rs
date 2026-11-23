@@ -11968,6 +11968,15 @@ impl Cagents {
 
     /// A title may precede its pane's first shared-view acknowledgement. Retry
     /// the retained candidate after projection, with the newly accepted proof.
+    /// Whether a channel name observed from a conversation still waits to be
+    /// published, which each complete reconciliation retries.
+    pub(super) fn channel_title_suggestion_pending(&self) -> bool {
+        self.chat_ui
+            .channel_names
+            .values()
+            .any(|observation| observation.pending && observation.title.is_some())
+    }
+
     pub(super) fn refresh_channel_title_suggestions(&mut self) -> Task<Message> {
         for target in self
             .chat_ui
