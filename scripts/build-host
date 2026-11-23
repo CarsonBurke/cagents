@@ -1063,7 +1063,7 @@ class Build:
                 # under `cargo-gate exec`, runs in its scope, with its
                 # jobserver, which its environment names.
                 self.nested = within_build()
-                self.scoped = not self.nested and prepare_slice(IDLE_SLICE if idle() else BUILD_SLICE)
+                self.scoped = not self.nested and (prepare_slice(IDLE_SLICE) if idle() else prepare_slice())
                 self.jobserver = None
                 if (self.scoped or self.nested and lost_jobserver()) and not idle():
                     try:

@@ -1108,7 +1108,7 @@ class IdleBuilds(unittest.TestCase):
             with self.subTest(setting=setting), \
                     unittest.mock.patch.dict(os.environ, {build_host.IDLE_SETTING: setting}), \
                     unittest.mock.patch.object(build_host, "prepare_slice",
-                                               lambda name: prepared.append(name) or True), \
+                                               lambda name=build_host.BUILD_SLICE: prepared.append(name) or True), \
                     unittest.mock.patch.object(build_host, "within_build", lambda: False), \
                     unittest.mock.patch.object(build_host, "slice_directory", lambda: None), \
                     unittest.mock.patch.object(build_host, "Jobserver",
