@@ -1938,8 +1938,13 @@ impl Snapshot {
             ActivityState::Unknown
         } else if let Some(state) = self.requests.iter().map(Request::wait).max_by_key(|state| {
             // A permission holds the agent up mid-action, so it outranks a
-            // question asked between them.
-            matches!(state, ActivityState::Approval)
+            // question asked between them, which says more than a wait
+            // that is neither.
+            match state {
+                ActivityState::Approval => 2,
+                ActivityState::Question => 1,
+                _ => 0,
+            }
         }) {
             state
         } else if self.waiting
@@ -3028,8 +3033,11 @@ impl Request {
     /// What the agent waits on the user for while this request is open.
     pub fn wait(&self) -> ActivityState {
         match self.kind {
-            RequestKind::Approval | RequestKind::Consent => ActivityState::Approval,
+            RequestKind::Approval => ActivityState::Approval,
             RequestKind::Question => ActivityState::Question,
+            // Mostly a server's form to fill in (an MCP elicitation): input,
+            // not a permission, so it is not named as either.
+            RequestKind::Consent => ActivityState::Waiting,
         }
     }
 }
@@ -3849,7 +3857,15 @@ mod tests {
         for (kinds, expected) in [
             (vec![RequestKind::Question], ActivityState::Question),
             (vec![RequestKind::Approval], ActivityState::Approval),
-            (vec![RequestKind::Consent], ActivityState::Approval),
+            (vec![RequestKind::Consent], ActivityState::Waiting),
+            (
+                vec![RequestKind::Question, RequestKind::Consent],
+                ActivityState::Question,
+            ),
+            (
+                vec![RequestKind::Consent, RequestKind::Question],
+                ActivityState::Question,
+            ),
             (
                 vec![RequestKind::Question, RequestKind::Approval],
                 ActivityState::Approval,

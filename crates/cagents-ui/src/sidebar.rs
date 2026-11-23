@@ -7904,7 +7904,12 @@ fn compact_project_identity(
         );
         let mut worktree_attention = state.worktree_attention(project.id, worktree.id);
         if attention.waiting_worktrees.contains(&worktree.id) {
-            description.push_str(", agent needs input");
+            description.push_str(", agent ");
+            description.push_str(agent_wait_name(
+                worktree_attention
+                    .activity()
+                    .unwrap_or(crate::agent::ActivityState::Waiting),
+            ));
             worktree_attention.waiting = 0;
             worktree_attention.approval = 0;
             worktree_attention.question = 0;

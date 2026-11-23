@@ -239,8 +239,13 @@ impl Summary {
         self.working = self.working.max(other.working);
         self.failed = self.failed.max(other.failed);
         self.waiting = self.waiting.max(other.waiting);
-        self.approval = self.approval.max(other.approval);
-        self.question = self.question.max(other.question);
+        // The kinds stay a part of the waits, even where two summaries of
+        // one agent disagree on its kind.
+        self.approval = self.approval.max(other.approval).min(self.waiting);
+        self.question = self
+            .question
+            .max(other.question)
+            .min(self.waiting - self.approval);
         self.limited = self.limited.max(other.limited);
     }
 
@@ -255,10 +260,9 @@ impl Summary {
     }
 
     /// What `self` counts beyond `other`: the news of a total that rows
-    /// drawn on their own do not show. Never below nothing.
-    /// What this summary says that `other` does not. The kinds of wait
-    /// stay a part of the waits left, so a wait `other` names without its
-    /// kind is not said again by its kind.
+    /// drawn on their own do not show. Never below nothing. The kinds of
+    /// wait stay a part of the waits left, so a wait `other` names without
+    /// its kind is not said again by its kind.
     pub(super) fn without(self, other: Self) -> Self {
         let waiting = self.waiting.saturating_sub(other.waiting);
         let approval = self.approval.saturating_sub(other.approval).min(waiting);
