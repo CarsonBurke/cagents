@@ -9,15 +9,16 @@ zig = "0.15.2"
 
 # Each implementation graph is its own Cargo invocation. Cargo features are
 # package-wide, so no task combines `host` with `ui`. The UI lanes select the
-# cagents-ui package, which holds the application; `ui` also selects the shared
-# library, so one invocation covers both packages' targets in that graph.
+# cagents-ui package, which holds the application, and cagents-ui-kit, its
+# widgets and views; `ui` also selects the shared library, so one invocation
+# covers every package's targets in that graph.
 [vars]
 cli = "--locked --no-default-features"
 host = "--locked --no-default-features --features host"
-ui = "--locked --no-default-features --package cagents --package cagents-ui --features cagents/ui"
+ui = "--locked --no-default-features --package cagents --package cagents-ui --package cagents-ui-kit --features cagents/ui"
 # The integrated browser with its Wayland registry test server, which the
 # browser tests use, as main's build check selects it.
-browser = "--locked --no-default-features --package cagents-ui --features browser-protocol-fixture"
+browser = "--locked --no-default-features --package cagents-ui --package cagents-ui-kit --features cagents-ui/browser-protocol-fixture"
 editor = "--locked --package ceditor"
 # The dictation helper with its speech engine: onnxruntime, audio capture and
 # model downloads, which no other lane resolves.
@@ -108,6 +109,10 @@ run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.di
 description = "Type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
 usage = 'arg "[unexpected]..." var=#true hide=#true'
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["check:cli", "check:host", "check:ui"] }]
+
+[tasks."check:isolation"]
+description = "Check without compiling that each lane resolves only its own dependency graph"
+run = "scripts/check-lane-isolation"
 
 [tasks."check:protocol"]
 description = "Check the IPC source contract, older-client proofs and live-update sources against a base"

@@ -1,0 +1,92 @@
+[package]
+name = "cagents-ui-kit"
+# Not a product: the release version lives on the packages that ship executables.
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+# The UI's widgets and views below the application: the sidebar, editor,
+# repository and review views, controls and the session runtime. A crate of its
+# own so that editing the application (`cagents-ui`) does not recompile them,
+# and so ceditor builds without the application. Never Ghostty or Servo.
+[features]
+default = []
+# Reports the embedded browser as compiled in; Servo itself stays in cagents-ui.
+integrated-browser = ["cagents/integrated-browser"]
+# Opt-in local redraw-scheduling fixture; ordinary builds use a zero-state recorder.
+latency-harness = ["cagents/latency-harness"]
+# Test helpers the application's tests also use.
+test-support = ["cagents/test-support"]
+
+[lib]
+bench = false
+
+[dependencies]
+cagents = { path = "../..", default-features = false, features = ["ui"] }
+cagents-dictate = { path = "../cagents-dictate" }
+yaml-rust = "0.4.5"
+regex = "1.13"
+unicode-casefold = "0.2"
+unicode-linebreak = "0.1"
+unicode-segmentation = "1.13.3"
+async-channel = "2.5"
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio"] }
+async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tracing"] }
+blake3 = "1.8"
+directories = "6.0"
+# Fast fixed-seed hashing of what the views draw (see `src/fingerprint.rs`);
+# already in the resolved graph through hashbrown.
+foldhash = "0.2"
+glob = "0.3.4"
+# Pure-Rust PDF rendering. The editor previews a PDF the same way it previews
+# an SVG, by rasterizing to RGBA off the UI thread, so a document in a
+# worktree opens in place instead of handing the reader to an external viewer.
+# Only the UI resolves it; the CLI and the daemon never parse a PDF.
+hayro = "0.7.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+# The shell libcosmic runs on; named only to tell a lost display connection
+# apart from other event loop errors when the UI stops.
+iced_winit = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false }
+# `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
+# default set and the editor is the only consumer.
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wgpu", "winit", "xdg-portal"] }
+imara-diff = "0.2.0"
+libc = "0.2.189"
+# Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
+lsp-types = "0.95"
+notify = "=9.0.0-rc.8"
+pulldown-cmark = { version = "0.12.2", default-features = false }
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+resvg = { version = "0.45.1", default-features = false, features = ["text"] }
+roxmltree = "0.20"
+rusqlite = { version = "0.37", features = ["bundled"] }
+jiff = "0.2.35"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tempfile = "3.21"
+tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+toml = { version = "1.1.4", features = ["preserve_order"] }
+two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+# Platform backends are explicit rather than inherited from iced/winit defaults.
+# Match the common package identities so Cargo unifies widget/runtime features.
+[target.'cfg(target_os = "linux")'.dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["wayland", "x11"] }
+# Only Linux enables the portal's Wayland handle integration.
+ashpd = { version = "0.12.3", default-features = false, features = ["wayland"] }
+
+[dev-dependencies]
+# The shared library's test fixtures, which these tests also use.
+cagents = { path = "../..", default-features = false, features = ["ui", "test-support"] }
+tokio = { version = "1.47", features = ["test-util"] }

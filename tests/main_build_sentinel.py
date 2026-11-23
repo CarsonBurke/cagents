@@ -114,9 +114,15 @@ if Path('broken-' + lane).exists():
         application = self.origin / "crates/cagents-ui/Cargo.toml"
         application.parent.mkdir(parents=True)
         application.write_text('[package]\nname = "cagents-ui"\n')
+        kit = self.origin / "crates/cagents-ui-kit/Cargo.toml"
+        kit.parent.mkdir(parents=True)
+        kit.write_text('[package]\nname = "cagents-ui-kit"\n')
         dictation = self.origin / "crates/cagents-dictate/Cargo.toml"
         dictation.parent.mkdir(parents=True)
         dictation.write_text('[package]\nname = "cagents-dictate"\n')
+        editor = self.origin / "crates/ceditor/Cargo.toml"
+        editor.parent.mkdir(parents=True)
+        editor.write_text('[package]\nname = "ceditor"\n')
         self.first = self.commit("baseline")
         self.command("git", "clone", "-q", str(self.origin), str(self.repo))
         gh = self.bin / "gh"
@@ -200,7 +206,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.now += 120
         self.tick()
         self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
-                         ["cli", "host", "ui", "dictate"])
+                         ["cli", "host", "ui", "dictate", "editor"])
 
     def test_commit_before_the_dictation_helper_skips_only_its_lane(self):
         self.tick()
@@ -209,7 +215,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.now += 120
         self.tick()
         self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
-                         ["cli", "host", "ui", "app", "browser"])
+                         ["cli", "host", "ui", "app", "browser", "editor"])
 
     def test_failure_is_reported_and_closed_issue_reopened_then_recovery_reported(self):
         self.tick()
@@ -452,12 +458,10 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.tick()
         self.now += 120
         self.tick()
-        # Lanes whose package the fixture lacks are skipped, as for the checks.
-        lanes = [lane for lane in sentinel.TEST_LANES if lane != "editor"]
-        self.assertEqual(self.tested(), [[sha, lane] for sha in (self.first, tip) for lane in lanes])
+        self.assertEqual(self.tested(), [[sha, lane] for sha in (self.first, tip) for lane in sentinel.TEST_LANES])
         verdict = json.loads((self.state / "verdicts" / f"{tip}.json").read_text())
         self.assertTrue(verdict["passed"])
-        self.assertEqual(list(verdict["lanes"]), lanes)
+        self.assertEqual(list(verdict["lanes"]), list(sentinel.TEST_LANES))
         self.assertEqual(json.loads((self.state / "state.json").read_text())["tested"], tip)
         self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
 
@@ -538,7 +542,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         # The watcher then reports the tip without testing it again.
         self.now += 120
         self.tick()
-        self.assertEqual(sum(sha == failing for sha, _ in self.tested()), len(sentinel.TEST_LANES) - 1)
+        self.assertEqual(sum(sha == failing for sha, _ in self.tested()), len(sentinel.TEST_LANES))
 
     def test_the_issue_shows_each_failure_and_the_lane_command_without_passing_tests(self):
         self.tick()
@@ -709,6 +713,23 @@ for name in BINS:
         (self.state / "builds" / ".abandoned.new").mkdir(parents=True)
         self.tick()
         self.assertFalse((self.state / "builds" / ".abandoned.new").exists())
+
+
+class LaneSelectionTests(unittest.TestCase):
+    def test_a_commit_from_before_a_package_was_split_out_checks_without_it(self):
+        lane = sentinel.LANES["browser"]
+        self.assertEqual(sentinel.present(lane, {"cagents", "cagents-ui"}),
+                         ["-p", "cagents-ui", "--features", "cagents-ui/browser-protocol-fixture"])
+        self.assertEqual(sentinel.present(lane, {"cagents", "cagents-ui", "cagents-ui-kit"}), lane)
+        # Members the manifests could not name: Cargo reports what is missing.
+        self.assertEqual(sentinel.present(lane, None), lane)
+
+    def test_a_commit_from_before_the_kit_was_split_out_tests_without_it(self):
+        command = sentinel.test_command("ui", {"cagents", "cagents-ui"})
+        self.assertNotIn("cagents-ui-kit", command)
+        self.assertEqual(command[command.index("--no-fail-fast") + 1:],
+                         ["--no-default-features", "-p", "cagents", "-p", "cagents-ui", "--features", "cagents/ui"])
+        self.assertIn("cagents-ui-kit", sentinel.test_command("ui", {"cagents", "cagents-ui", "cagents-ui-kit"}))
 
 
 if __name__ == "__main__":

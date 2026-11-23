@@ -463,7 +463,7 @@ def main():
         ) == 1, source
     for source in (
         "build.rs", "src/modules.rs", "crates/cagents-ui/build.rs", "crates/cagents-ui/src/modules.rs",
-        "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
+        "crates/cagents-ui-kit/src/lib.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
         "crates/iced-contracts/src/lib.rs",
         "crates/cosmic-text-contracts/src/lib.rs",
         "crates/mobile-api/src/lib.rs",

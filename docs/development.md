@@ -47,6 +47,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `check:editor` | Type-check and lint ceditor |
 | `check:dictate`, `test:dictate` | Type-check and lint, or test, the [dictation helper](#feature-boundaries) |
 | `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
+| `check:isolation` | Check, without compiling, that each lane resolves only its own dependency graph ([feature boundaries](#feature-boundaries)) |
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
 | `test:contracts` | Test the focused vendored-crate contract packages |
@@ -180,11 +181,16 @@ enabled. See [Daemon and upgrades](daemon.md#development-instance).
 
 The CLI, UI client, and terminal host have separate Cargo feature boundaries.
 The root `cagents` package is the shared library with the `cagents` and
-`cagentsd` binaries. The application (`crates/cagents-ui/src/app` and the other UI-only modules)
-and the `cagents-ui` binary are the `cagents-ui` package in `crates/cagents-ui`,
-which depends on the shared library's `ui` feature. Editing the application
-recompiles only that package; editing the shared library recompiles both.
-Start with the boundary that owns your change:
+`cagentsd` binaries. The UI's widgets and views (sessions, sidebar, editor,
+settings, diff and document rendering, and the rest outside `app`) are the
+`cagents-ui-kit` package in `crates/cagents-ui-kit`, which depends on the shared
+library's `ui` feature. The application (`crates/cagents-ui/src/app`, the
+integrated browser) and the `cagents-ui` binary are the `cagents-ui` package in
+`crates/cagents-ui`, on top of the kit; its `crate::settings_widgets` and the
+like are re-exports of the kit's modules. ceditor depends on the kit alone.
+Editing the application recompiles only that package; editing the kit
+recompiles the kit, the application and ceditor; editing the shared library
+recompiles all of them. Start with the boundary that owns your change:
 
 ```sh
 # Control CLI: no UI, Ghostty, SQLite, or Servo graph.
@@ -205,6 +211,15 @@ mise run check:editor
 # Dictation helper: speech recognition and microphone capture, no UI graph.
 mise run check:dictate
 ```
+
+`mise run check:isolation` checks the rule these comments state without
+compiling anything: it resolves each lane's selection from `mise.toml` with
+`cargo tree` and fails, naming the dependency path, when a lane resolves
+another's graph, such as Ghostty in a UI lane or libcosmic or Servo in the
+daemon's, or the application in ceditor. It runs offline and takes seconds
+once the dependencies are fetched, though Cargo first waits for its package
+cache while another build on the host holds it; run it after adding a
+dependency or moving code between crates.
 
 The dictation helper, `crates/cagents-dictate`, is a separate executable the UI
 starts when someone dictates and stops when they have finished. Its `engine`
@@ -232,8 +247,8 @@ gated like that fixture.
 Each task runs one `scripts/cargo-gate clippy --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
-`--package cagents --package cagents-ui --features cagents/ui`, and `browser`
-selects `--package cagents-ui --features browser-protocol-fixture`: the
+`--package cagents --package cagents-ui --package cagents-ui-kit --features cagents/ui`,
+and `browser` selects `--package cagents-ui --package cagents-ui-kit --features cagents-ui/browser-protocol-fixture`: the
 integrated browser with the Wayland registry test server its tests use, as main's
 build check selects it. Clippy type-checks exactly as `cargo check` does and
 adds its lints; `[workspace.lints]` in the root `Cargo.toml` configures them for
@@ -277,10 +292,14 @@ of about 3 minutes, and it waits for its own build slot. It does not check the
 test targets the narrowed run skipped, so before review still run the lane's
 check, or its tests with every target. `scripts/cargo-gate check --features ui`
 without `--package cagents-ui` checks only the shared library, not the
-application; `mise run check:ui` checks both.
+application; `mise run check:ui` checks the shared library, the kit and the
+application.
 
-Changes to ceditor or shared UI, editor, or notification public contracts also
-require the standalone editor check above. The workspace's
+Changes to ceditor, to the kit, or to shared UI, editor, or notification public
+contracts also require the standalone editor check above. It is the lane that
+lints the kit as it ships: the application's tests enable the kit's
+`test-support` feature, and Cargo unifies it into every build `check:ui`
+makes. The workspace's
 `default-members = ["."]` selects only cagents: a command without `-p` builds
 neither the application nor the downstream ceditor binary. Select the
 application with `-p cagents-ui`, and run the ceditor check separately from the
@@ -617,11 +636,11 @@ the system browser instead of compiling Servo.
 
 The opt-in lane uses the same application modules and startup entry in a separate
 `cagents-ui-hot` binary. This matters because cargo-hot patches its selected
-binary only: the normal UI's views live in the `cagents_ui` library. Its source
-watcher covers `crates/cagents-ui/src/`, including those actual views, without
-maintaining another module list: both roots include
-`crates/cagents-ui/src/modules.rs`. The shared `cagents` library is an ordinary
-dependency that is never patched. Normal and release defaults do not enable
+binary only: the normal UI's application lives in the `cagents_ui` library. Its
+source watcher covers `crates/cagents-ui/src/` without maintaining another
+module list: both roots include `crates/cagents-ui/src/modules.rs`. The widgets
+and views in `cagents-ui-kit` and the shared `cagents` library are ordinary
+dependencies that are never patched; an edit to them needs a restart. Normal and release defaults do not enable
 `hot-reload`.
 
 Thread-local storage for panic recovery, the inspector Markdown cache and browser
@@ -856,11 +875,14 @@ each lane the tip fails, checking only that lane, and comments on the issue
 the earliest commit at which each fails. It does not fetch again until it has,
 so a bisection that cannot finish, such as on a dirty checkout or a comment
 GitHub keeps refusing, holds the sentinel until it is fixed. Each tip it checks
-gets five separate
+gets separate
 `scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
-CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
-`-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
-graph with its Wayland registry test server. These use the ordinary shared queue
+CLI, `--features host`, `--features ui`, `-p cagents-ui -p cagents-ui-kit`,
+the same two packages with `--features cagents-ui/browser-protocol-fixture`, the integrated-browser
+graph with its Wayland registry test server, the dictation helper with its
+engine, and `-p ceditor`, which also lints the kit as it ships: the
+application's tests enable the kit's `test-support` feature, so the two
+application lanes lint the kit with it. These use the ordinary shared queue
 and the persistent sentinel worktree cache, without a held slot between lanes.
 The sentinel neither merges nor modifies another checkout or native session.
 A lane fails when it does not compile or when a workspace crate prints a
@@ -1418,7 +1440,8 @@ start with the narrow feature lane and `--lib` or `--test NAME` rather than
 `--all-features`.
 
 Product tests live in the libraries, so select them with `--lib`, not `--bin`:
-the application's are in `-p cagents-ui --lib`.
+the application's are in `-p cagents-ui --lib` and its widgets' and views' in
+`-p cagents-ui-kit --lib`.
 `--bin cagents` and `--bin cagents-ui` have no tests and refuse a filter rather
 than pass by running none, except that `--bin cagents-ui` does not refuse with the
 `hot-reload` feature. `--bin cagentsd` has only a few of its own and does
@@ -1598,9 +1621,10 @@ mise run test         # all three, in order
 ```
 
 `test:ui` tests the shared library compiled for the UI and the application
-together. The lane already names both packages, so arguments narrow targets,
-not packages; for the application's tests alone, run
-`scripts/cargo-gate test --locked -p cagents-ui --all-targets`.
+together with the widgets and views. The lane already names the packages, so
+arguments narrow targets, not packages; for the application's tests alone, run
+`scripts/cargo-gate test --locked -p cagents-ui --all-targets`, and for the kit's,
+`-p cagents-ui-kit`.
 
 An SSH login has a soft limit of 1024 open files, and whatever it starts, with
 `nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
@@ -1691,7 +1715,8 @@ mise run test:ui -- --test session_restore_contract
 
 For focused library tests, `scripts/test-lib` builds one lane's library test
 harness and runs exactly the tests you name, through one `scripts/cargo-gate test`
-command. The `ui` lane runs the application's tests (`-p cagents-ui`);
+command. The `ui` lane runs the application's tests (`-p cagents-ui`), `ui-kit`
+the widgets' and views' tests (`-p cagents-ui-kit`);
 `shared-ui` runs the shared library's tests under `--features ui`, and `browser`
 runs the application's tests with the integrated browser, which is the only
 lane that compiles its `browser::` modules:
@@ -1700,6 +1725,7 @@ lane that compiles its `browser::` modules:
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
 scripts/test-lib host --prefix terminal:: --test-threads 1
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
+scripts/test-lib ui-kit --prefix editor::
 scripts/test-lib shared-ui --prefix settings::
 scripts/test-lib browser --prefix browser::
 ```

@@ -10,8 +10,8 @@ use cagents::{
     settings::{self, AppSettings, AppTheme},
     splitter::{self, Splitter},
 };
-use cagents_ui::settings_widgets::{Setting, field as settings_field, group as settings_group};
-use cagents_ui::{
+use cagents_ui_kit::settings_widgets::{Setting, field as settings_field, group as settings_group};
+use cagents_ui_kit::{
     editor::language::DocumentLanguage,
     lsp::{
         LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition, LspRequestId, LspStatus,
@@ -226,9 +226,9 @@ pub enum Message {
     Theme(AppTheme),
     Scale(f32),
     SettingsSaved(Result<(), String>),
-    FileRevealed(Result<cagents_ui::file_manager::RevealOutcome, String>),
+    FileRevealed(Result<cagents_ui_kit::file_manager::RevealOutcome, String>),
     Lsp(u64, Option<LspEvent>),
-    OperationRecovery(cagents_ui::operation_recovery::Action),
+    OperationRecovery(cagents_ui_kit::operation_recovery::Action),
     Complete,
     Hover,
     Completion(CardId, usize, CompletionTarget),
@@ -531,7 +531,7 @@ pub struct Editor {
     settings_search: String,
     line_height_draft: String,
     window_size: iced::Size,
-    tab_history: cagents_ui::tab_history::TabHistory<CardId>,
+    tab_history: cagents_ui_kit::tab_history::TabHistory<CardId>,
     settings_reset_confirm: bool,
     settings_path: PathBuf,
     settings_open: bool,
@@ -557,7 +557,7 @@ pub struct Editor {
     lsp: LspManager,
     language_server_assistance: bool,
     next_document: u64,
-    operation_recovery: cagents_ui::operation_recovery::Shared,
+    operation_recovery: cagents_ui_kit::operation_recovery::Shared,
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
@@ -1021,7 +1021,7 @@ fn dialog_surface<'a>(
     content: impl Into<Element<'a, Message>>,
     max_width: f32,
 ) -> Element<'a, Message> {
-    cagents_ui::interaction::opaque(
+    cagents_ui_kit::interaction::opaque(
         widget::container(content)
             .class(cosmic::theme::Container::Dialog(false))
             .padding(16)
@@ -1035,7 +1035,7 @@ fn connected_dialog_surface<'a>(
     content: impl Into<Element<'a, Message>>,
     max_width: f32,
 ) -> Element<'a, Message> {
-    cagents_ui::interaction::opaque(
+    cagents_ui_kit::interaction::opaque(
         widget::container(content)
             .class(cosmic::theme::Container::Dialog(false))
             .width(Length::Fill)
@@ -1056,13 +1056,13 @@ fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_
         .width(Length::Fill)
         .height(Length::Fill);
     let backdrop =
-        cagents_ui::interaction::opaque(widget::mouse_area(background).on_press(dismiss));
+        cagents_ui_kit::interaction::opaque(widget::mouse_area(background).on_press(dismiss));
     let centered = widget::container(surface)
         .center(Length::Fill)
         .padding(16)
         .width(Length::Fill)
         .height(Length::Fill);
-    cagents_ui::interaction::layer(backdrop, centered.into())
+    cagents_ui_kit::interaction::layer(backdrop, centered.into())
 }
 
 fn tab_title_style() -> cosmic::theme::Button {
@@ -1200,9 +1200,9 @@ impl Editor {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let operation = if duplicate {
-                    cagents_ui::editor::copy_file
+                    cagents_ui_kit::editor::copy_file
                 } else {
-                    cagents_ui::editor::rename_file
+                    cagents_ui_kit::editor::rename_file
                 };
                 operation(&root, &source, &destination)
                     .map(|()| destination)
@@ -2156,10 +2156,10 @@ impl Editor {
                         .and_then(|doc| self.lsp.document_version(doc));
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
                         match text {
-                            cagents_ui::repository_widget::LspChangeText::Text(text) => {
+                            cagents_ui_kit::repository_widget::LspChangeText::Text(text) => {
                                 self.lsp.change(doc, version, &edits, &text)
                             }
-                            cagents_ui::repository_widget::LspChangeText::Snapshot(source) => {
+                            cagents_ui_kit::repository_widget::LspChangeText::Snapshot(source) => {
                                 self.lsp.change_snapshot(doc, version, &edits, source)
                             }
                         }
@@ -2175,7 +2175,7 @@ impl Editor {
                             && previous_version.is_some()
                             && tab.diagnostics_version == previous_version
                         {
-                            cagents_ui::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
+                            cagents_ui_kit::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
                             tab.set_diagnostics(tab.diagnostics.clone(), synchronized_version);
                         } else {
                             // Unknown ranges cannot preserve either current diagnostics
@@ -2851,7 +2851,7 @@ impl Editor {
     }
 
     fn reveal_quick_open_selection(&self, total: usize) -> Task<Message> {
-        cagents_ui::interaction::reveal_list_selection(
+        cagents_ui_kit::interaction::reveal_list_selection(
             widget::Id::new("ceditor.quick-open.results"),
             self.quick_open_selection(total),
             QUICK_OPEN_ROW_HEIGHT,
@@ -3042,14 +3042,14 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
                     .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
                     .or(tab.owned_file.as_ref())
                     .map_or_else(
-                        || cagents_ui::file_icon::folder(true),
-                        |path| cagents_ui::file_icon::icon(path),
+                        || cagents_ui_kit::file_icon::folder(true),
+                        |path| cagents_ui_kit::file_icon::icon(path),
                     );
-                cagents_ui::interaction::hover(cagents_ui::tab_strip::middle_click_close(
+                cagents_ui_kit::interaction::hover(cagents_ui_kit::tab_strip::middle_click_close(
                     widget::container(
                         widget::row::with_children(vec![
-                            cagents_ui::interaction::tooltip(
-                                cagents_ui::reorder::handle(
+                            cagents_ui_kit::interaction::tooltip(
+                                cagents_ui_kit::reorder::handle(
                                     widget::button::custom(
                                         widget::row::with_children(vec![
                                     widget::container(icon).center_y(Length::Fill).into(),
@@ -3120,13 +3120,13 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
             .id(widget::Id::new("ceditor.tabs.new"))
             .into(),
     );
-    cagents_ui::tab_strip::reorderable(
+    cagents_ui_kit::tab_strip::reorderable(
         widget::Id::new("ceditor.tabs"),
         tab_row,
         design::PRIMARY_CONTROL_SIZE,
         design::HEADER_HEIGHT,
         None,
-        cagents_ui::tab_strip::Reordering {
+        cagents_ui_kit::tab_strip::Reordering {
             order: editor.tabs.iter().map(|tab| tab.id).collect(),
             tab_width: 184.0,
             enabled: !editor.modal_open(),
@@ -3218,7 +3218,7 @@ impl Application for Editor {
             settings_search: String::new(),
             line_height_draft,
             window_size: iced::Size::new(1200.0, 900.0),
-            tab_history: cagents_ui::tab_history::TabHistory::default(),
+            tab_history: cagents_ui_kit::tab_history::TabHistory::default(),
             settings_reset_confirm: false,
             settings_path: flags.settings_path,
             settings_open: false,
@@ -3362,7 +3362,7 @@ impl Application for Editor {
                 && !modifiers.logo()
                 && matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case("f"))
             {
-                return iced::widget::operation::focus(cagents_ui::settings_widgets::search_id())
+                return iced::widget::operation::focus(cagents_ui_kit::settings_widgets::search_id())
                     .map(cosmic::Action::App);
             }
             if let Message::Key(
@@ -3451,7 +3451,7 @@ impl Application for Editor {
                     if self.core.main_window_id() == Some(window) {
                         let regained = focused && !self.window_focused;
                         self.window_focused = focused;
-                        cagents_ui::ui_controls::animate_activity(focused);
+                        cagents_ui_kit::ui_controls::animate_activity(focused);
                         if !focused {
                             self.tab_history.finish(self.active);
                         }
@@ -3590,7 +3590,7 @@ impl Application for Editor {
                 Message::Select(id) => self.select_tab(id),
                 Message::ReorderTab { card, before } => {
                     let order: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
-                    let Some(destination) = cagents_ui::reorder::destination(&order, card, before)
+                    let Some(destination) = cagents_ui_kit::reorder::destination(&order, card, before)
                     else {
                         return Task::none();
                     };
@@ -3928,7 +3928,7 @@ impl Application for Editor {
                         if restoring_reload {
                             if let Some(target) = tab.runtime.loaded_focus_target(id) {
                                 tasks.push(workspace_widget::focus_after_loading(
-                                    cagents_ui::repository_widget::editor_focus_id(id),
+                                    cagents_ui_kit::repository_widget::editor_focus_id(id),
                                     target,
                                 ));
                             }
@@ -4147,7 +4147,7 @@ impl Application for Editor {
                                     let path = tab.runtime.descriptor.worktree.join(path.as_path());
                                     cosmic::task::future(async move {
                                         Message::FileRevealed(
-                                            cagents_ui::file_manager::reveal(&path).await,
+                                            cagents_ui_kit::file_manager::reveal(&path).await,
                                         )
                                     })
                                 }
@@ -4392,11 +4392,11 @@ impl Application for Editor {
                     self.settings_search.clear();
                     self.settings_reset_confirm = false;
                     self.settings_category = category;
-                    cagents_ui::settings_widgets::reveal_content_start()
+                    cagents_ui_kit::settings_widgets::reveal_content_start()
                 }
                 Message::SettingsSearchChanged(query) => {
                     self.settings_search = query;
-                    cagents_ui::settings_widgets::reveal_content_start()
+                    cagents_ui_kit::settings_widgets::reveal_content_start()
                 }
                 Message::ResetSettings => {
                     if !self.settings_writable {
@@ -4632,10 +4632,10 @@ impl Application for Editor {
                 }
                 Message::FileRevealed(result) => {
                     self.notice = match result {
-                        Ok(cagents_ui::file_manager::RevealOutcome::Selected) => {
+                        Ok(cagents_ui_kit::file_manager::RevealOutcome::Selected) => {
                             Some("Revealed in file manager".into())
                         }
-                        Ok(cagents_ui::file_manager::RevealOutcome::OpenedContainingFolder) => {
+                        Ok(cagents_ui_kit::file_manager::RevealOutcome::OpenedContainingFolder) => {
                             Some("Opened containing folder in file manager".into())
                         }
                         Err(error) => Some(error),
@@ -4739,7 +4739,7 @@ impl Application for Editor {
                                     }
                                 }
                                 LspEvent::RequestFailed { error, .. }
-                                    if !matches!(error, cagents_ui::lsp::LspError::Cancelled) =>
+                                    if !matches!(error, cagents_ui_kit::lsp::LspError::Cancelled) =>
                                 {
                                     tab.lsp_error = Some(error.to_string())
                                 }
@@ -4816,11 +4816,11 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Key(event, captured) => {
-                    if cagents_ui::tab_history::released(&event) {
+                    if cagents_ui_kit::tab_history::released(&event) {
                         self.tab_history.finish(self.active);
                     }
                     if !self.modal_open()
-                        && let Some(backwards) = cagents_ui::tab_history::step_direction(&event)
+                        && let Some(backwards) = cagents_ui_kit::tab_history::step_direction(&event)
                     {
                         let available: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
                         self.tab_history.retain(|id| available.contains(&id));
@@ -5056,9 +5056,9 @@ impl Application for Editor {
                 if let Some(hover) = &tab.hover {
                     results.push(widget::text::body(hover).into());
                 }
-                let presented = cagents_ui::inspector::diagnostic_rows(
+                let presented = cagents_ui_kit::inspector::diagnostic_rows(
                     &tab.diagnostics,
-                    cagents_ui::inspector::LSP_ROW_LIMIT,
+                    cagents_ui_kit::inspector::LSP_ROW_LIMIT,
                 );
                 let stale = !presented.rows.is_empty() && !self.diagnostics_are_current(tab.id);
                 let withheld = presented.withheld;
@@ -5089,7 +5089,7 @@ impl Application for Editor {
                 }
                 if withheld > 0 {
                     results.push(
-                        design::caption(cagents_ui::inspector::withheld_diagnostics_label(
+                        design::caption(cagents_ui_kit::inspector::withheld_diagnostics_label(
                             withheld,
                         ))
                         .into(),
@@ -5155,7 +5155,7 @@ impl Application for Editor {
                         Message::Sidebar,
                     )
                 };
-                workspace.push(cagents_ui::interaction::reveal_leading_width(
+                workspace.push(cagents_ui_kit::interaction::reveal_leading_width(
                     sidebar, width, progress,
                 ));
                 // The files panel carries no trailing rule of its own: the
@@ -5182,7 +5182,7 @@ impl Application for Editor {
                     .height(Length::Fill)
                     .into(),
             );
-            body.push(cagents_ui::interaction::drive_animation(
+            body.push(cagents_ui_kit::interaction::drive_animation(
                 widget::row::with_children(workspace).height(Length::Fill),
                 self.sidebar_transition.is_some(),
             ));
@@ -5209,7 +5209,7 @@ impl Application for Editor {
                 .into(),
             );
         }
-        cagents_ui::interaction::reserve_tab_history(
+        cagents_ui_kit::interaction::reserve_tab_history(
             widget::column::with_children(body).height(Length::Fill),
             !self.modal_open(),
         )
@@ -5437,7 +5437,7 @@ impl Editor {
                     ],
                 )],
                 SettingsCategory::Editing => {
-                    let mut controls = cagents_ui::settings_widgets::editor_options(
+                    let mut controls = cagents_ui_kit::settings_widgets::editor_options(
                         self.settings.editor_auto_save,
                         self.settings.editor_wrap(),
                         self.settings.editor_syntax_theme,
@@ -5625,7 +5625,7 @@ impl Editor {
                 )],
             };
             let query =
-                if cagents_ui::settings_widgets::matches(category.label(), &self.settings_search) {
+                if cagents_ui_kit::settings_widgets::matches(category.label(), &self.settings_search) {
                     ""
                 } else {
                     &self.settings_search
@@ -5641,9 +5641,9 @@ impl Editor {
         }
         let navigation =
             widget::column::with_children(SettingsCategory::ALL.into_iter().map(|category| {
-                cagents_ui::interaction::hover(
+                cagents_ui_kit::interaction::hover(
                     widget::button::custom(design::body(category.label()))
-                        .class(cagents_ui::sidebar::sidebar_button_style(
+                        .class(cagents_ui_kit::sidebar::sidebar_button_style(
                             category == self.settings_category,
                         ))
                         .selected(category == self.settings_category)
@@ -5658,7 +5658,7 @@ impl Editor {
             .height(Length::Fill);
         let navigation = widget::column::with_children(vec![
             widget::text_input("Search", &self.settings_search)
-                .id(cagents_ui::settings_widgets::search_id())
+                .id(cagents_ui_kit::settings_widgets::search_id())
                 .on_input(Message::SettingsSearchChanged)
                 .into(),
             navigation.into(),
@@ -5678,7 +5678,7 @@ impl Editor {
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
-            .id(cagents_ui::settings_widgets::content_id())
+            .id(cagents_ui_kit::settings_widgets::content_id())
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
@@ -5721,7 +5721,7 @@ fn completion_row(tab: &Tab, index: usize) -> Option<Element<'_, Message>> {
         target.clone(),
     ));
     Some(
-        widget::container(cagents_ui::ui_controls::owned(target.native_key(), row))
+        widget::container(cagents_ui_kit::ui_controls::owned(target.native_key(), row))
             .width(Length::Fill)
             .into(),
     )
@@ -5730,7 +5730,7 @@ fn completion_row(tab: &Tab, index: usize) -> Option<Element<'_, Message>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cagents_ui::repository_widget::AsyncIdentity;
+    use cagents_ui_kit::repository_widget::AsyncIdentity;
 
     // Kept byte-identical to the separately pinned native Find fixture by its
     // offline preflight. This is tracked test data, never an external include.
@@ -5792,7 +5792,7 @@ mod tests {
 
     #[test]
     fn standalone_completion_press_and_held_intent_cannot_cross_a_response() {
-        use cagents_ui::lsp::LspCompletionItem;
+        use cagents_ui_kit::lsp::LspCompletionItem;
         use iced::advanced::{renderer::Headless, widget::Tree};
         use iced::mouse::{Button, Event};
         let renderer = tokio::runtime::Builder::new_current_thread()
@@ -5828,8 +5828,8 @@ mod tests {
                 filter_text: None,
                 preselect: false,
                 deprecated: false,
-                edit: cagents_ui::lsp::LspCompletionEdit {
-                    range: cagents_ui::lsp::LspRange {
+                edit: cagents_ui_kit::lsp::LspCompletionEdit {
+                    range: cagents_ui_kit::lsp::LspRange {
                         start: LspPosition::new(0, 0),
                         end: LspPosition::new(0, 3),
                     },
@@ -6003,7 +6003,7 @@ mod tests {
 
     #[test]
     fn pr_checkout_confirms_a_pinned_commit_and_keeps_the_original_worktree() {
-        use cagents_ui::pull_request_review::CheckoutTarget;
+        use cagents_ui_kit::pull_request_review::CheckoutTarget;
         let repository = git_fixture();
         let root = repository.path();
         let data = tempfile::tempdir().unwrap();
@@ -6408,7 +6408,7 @@ mod tests {
                 "journal path is not writable".into(),
             )))),
         );
-        app.begin_checkout(cagents_ui::pull_request_review::CheckoutTarget::read_only(
+        app.begin_checkout(cagents_ui_kit::pull_request_review::CheckoutTarget::read_only(
             PathBuf::from("/review"),
             1,
             cagents::repository::Oid::parse("a".repeat(40)).unwrap(),
@@ -6902,7 +6902,7 @@ mod tests {
             settings_search: String::new(),
             line_height_draft: AppSettings::default().terminal_line_height.to_string(),
             window_size: iced::Size::new(1200.0, 900.0),
-            tab_history: cagents_ui::tab_history::TabHistory::default(),
+            tab_history: cagents_ui_kit::tab_history::TabHistory::default(),
             settings_reset_confirm: false,
             settings_path: PathBuf::new(),
             settings_open: false,
@@ -6985,10 +6985,10 @@ mod tests {
                     path: file.into(),
                     generation: 1,
                 },
-                result: cagents_ui::editor::load_file(
+                result: cagents_ui_kit::editor::load_file(
                     root,
                     Path::new(file),
-                    cagents_ui::editor::PdfTone::Original,
+                    cagents_ui_kit::editor::PdfTone::Original,
                 ),
             })),
         );
@@ -7523,7 +7523,7 @@ mod tests {
         app.settings_open = true;
         app.settings_category = SettingsCategory::Keyboard;
         let mut tree = Tree::new(app.dialog().unwrap().as_widget());
-        let id = cagents_ui::settings_widgets::content_id();
+        let id = cagents_ui_kit::settings_widgets::content_id();
         let scroll = || {
             iced::widget::operation::scroll_to(
                 id.clone(),
@@ -7614,8 +7614,8 @@ mod tests {
         (app, directory, card, doc)
     }
 
-    fn completion_item_for_find(label: &str) -> cagents_ui::lsp::LspCompletionItem {
-        cagents_ui::lsp::LspCompletionItem {
+    fn completion_item_for_find(label: &str) -> cagents_ui_kit::lsp::LspCompletionItem {
+        cagents_ui_kit::lsp::LspCompletionItem {
             label: label.into(),
             kind: None,
             detail: None,
@@ -7624,8 +7624,8 @@ mod tests {
             filter_text: None,
             preselect: false,
             deprecated: false,
-            edit: cagents_ui::lsp::LspCompletionEdit {
-                range: cagents_ui::lsp::LspRange::new(
+            edit: cagents_ui_kit::lsp::LspCompletionEdit {
+                range: cagents_ui_kit::lsp::LspRange::new(
                     LspPosition::new(0, 0),
                     LspPosition::new(0, 0),
                 ),
@@ -7889,7 +7889,7 @@ mod tests {
             drop(
                 app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
                     card,
-                    option: cagents_ui::ui_controls::FindOption::Regex,
+                    option: cagents_ui_kit::ui_controls::FindOption::Regex,
                     enabled: true,
                 })),
             );
@@ -8054,10 +8054,10 @@ mod tests {
                     path: PathBuf::from("target.md"),
                     generation: 999,
                 },
-                result: cagents_ui::editor::load_file(
+                result: cagents_ui_kit::editor::load_file(
                     directory.path(),
                     Path::new("target.md"),
-                    cagents_ui::editor::PdfTone::Original,
+                    cagents_ui_kit::editor::PdfTone::Original,
                 ),
             })),
         );
@@ -8419,8 +8419,8 @@ mod tests {
 
     #[test]
     fn lsp_diagnostics_reach_standalone_editor_navigation_and_follow_edits() {
-        use cagents_ui::lsp::{LspError, LspRange, LspSeverity};
-        use cagents_ui::repository_widget::EditorLspAction;
+        use cagents_ui_kit::lsp::{LspError, LspRange, LspSeverity};
+        use cagents_ui_kit::repository_widget::EditorLspAction;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8546,7 +8546,7 @@ mod tests {
 
     #[test]
     fn inexact_editor_changes_invalidate_standalone_diagnostics_through_the_real_drain() {
-        use cagents_ui::lsp::{LspRange, LspSeverity};
+        use cagents_ui_kit::lsp::{LspRange, LspSeverity};
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8649,7 +8649,7 @@ mod tests {
 
     #[test]
     fn find_preferences_load_share_persist_and_reset_across_standalone_tabs() {
-        use cagents_ui::ui_controls::FindOption;
+        use cagents_ui_kit::ui_controls::FindOption;
 
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -8766,10 +8766,10 @@ mod tests {
                     path: "a.rs".into(),
                     generation: 1,
                 },
-                result: cagents_ui::editor::load_file(
+                result: cagents_ui_kit::editor::load_file(
                     directory.path(),
                     Path::new("a.rs"),
-                    cagents_ui::editor::PdfTone::Original,
+                    cagents_ui_kit::editor::PdfTone::Original,
                 ),
             })),
         );
@@ -9366,10 +9366,10 @@ mod tests {
                     path: "a.txt".into(),
                     generation: 1,
                 },
-                result: cagents_ui::editor::load_file(
+                result: cagents_ui_kit::editor::load_file(
                     directory.path(),
                     Path::new("a.txt"),
-                    cagents_ui::editor::PdfTone::Original,
+                    cagents_ui_kit::editor::PdfTone::Original,
                 ),
             })),
         );
@@ -9639,10 +9639,10 @@ mod tests {
                     path: path.clone(),
                     generation: 1,
                 },
-                result: cagents_ui::editor::load_file(
+                result: cagents_ui_kit::editor::load_file(
                     &worktree,
                     &path,
-                    cagents_ui::editor::PdfTone::Original,
+                    cagents_ui_kit::editor::PdfTone::Original,
                 ),
             })),
         );

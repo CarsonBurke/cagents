@@ -125,7 +125,7 @@ if phase == "cargo-run":
     key = "target.'cfg(all())'.runner="
     runners = [json.loads(value[len(key):]) for value in settings if value.startswith(key)]
     package = options[options.index("--package") + 1]
-    manifest = root / "crates/cagents-ui" if package == "cagents-ui" else root
+    manifest = root / "crates" / package if package.startswith("cagents-ui") else root
     variant = config.get("artifact", "valid")
     environment = dict(os.environ, CARGO_PKG_NAME=package, CARGO_MANIFEST_DIR=str(manifest))
     environment.update(config.get("cargo_environment", {}))
@@ -202,6 +202,7 @@ class TestLib(unittest.TestCase):
         for name in ("private-home", "private-codex", "caller", "tmp"):
             (self.root / name).mkdir(mode=0o700)
         (self.root / "crates/cagents-ui").mkdir(parents=True)
+        (self.root / "crates/cagents-ui-kit").mkdir(parents=True)
         self.lock = self.root / "slot.lock"
         self.env = {
             "PATH": str(self.root / "bin") + ":/usr/bin:/bin",
@@ -330,14 +331,15 @@ class TestLib(unittest.TestCase):
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
         for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
-                              ("ui", None), ("browser", None)):
+                              ("ui", None), ("ui-kit", None), ("browser", None)):
             with self.subTest(lane=lane):
                 self.clear()
                 extra = [] if profile is None else ["--profile", profile]
                 result = self.invoke(lane, "module::one", "--test-threads", "2", *extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 events = self.events()
-                package = "cagents-ui" if lane in ("ui", "browser") else "cagents"
+                package = {"ui": "cagents-ui", "ui-kit": "cagents-ui-kit",
+                           "browser": "cagents-ui"}.get(lane, "cagents")
                 options = ["--locked", "--no-default-features", "--manifest-path",
                            str(self.root / "Cargo.toml"), "--package", package, "--lib"]
                 options += {"host": ["--features", "host"],
@@ -356,8 +358,9 @@ class TestLib(unittest.TestCase):
                 metadata = self.events("metadata")[0]
                 self.assertEqual(metadata["arguments"], ["metadata", "--format-version", "1", "--no-deps"])
                 self.assertEqual(events[:2], [metadata, compiler])
-                manifest = (self.root / "crates/cagents-ui" if lane in ("ui", "browser")
-                            else self.root)
+                manifest = {"ui": self.root / "crates/cagents-ui",
+                            "ui-kit": self.root / "crates/cagents-ui-kit",
+                            "browser": self.root / "crates/cagents-ui"}.get(lane, self.root)
                 for event in events:
                     # Cargo runs from the checkout; the tests from their package.
                     self.assertEqual(event["cwd"], str(manifest if event["program"] == "libtest"
@@ -584,10 +587,12 @@ class TestLib(unittest.TestCase):
         lanes = {"cli": ["--locked", "--no-default-features"],
                  "host": ["--locked", "--no-default-features", "--features", "host"],
                  "shared-ui": ["--locked", "--no-default-features", "--package", "cagents",
-                               "--package", "cagents-ui", "--features", "cagents/ui"]}
-        lanes["ui"] = lanes["shared-ui"]
+                               "--package", "cagents-ui", "--package", "cagents-ui-kit",
+                               "--features", "cagents/ui"]}
+        lanes["ui"] = lanes["ui-kit"] = lanes["shared-ui"]
         lanes["browser"] = ["--locked", "--no-default-features", "--package", "cagents-ui",
-                            "--features", "browser-protocol-fixture"]
+                            "--package", "cagents-ui-kit", "--features",
+                            "cagents-ui/browser-protocol-fixture"]
         for lane, selection in lanes.items():
             with self.subTest(lane=lane):
                 (self.root / "checked.jsonl").unlink(missing_ok=True)

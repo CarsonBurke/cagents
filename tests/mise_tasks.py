@@ -23,9 +23,11 @@ CONFIG = ROOT / "mise.toml"
 SCRIPT = re.compile(r"\bscripts/[A-Za-z0-9_.-]+")
 LANES = {"cli": set(), "host": {"host"}, "ui": {"ui"}, "browser": {"browser-protocol-fixture"}, "editor": set(),
          "dictate": {"engine"}}
-# The application is its own package; the UI lanes select it, and `ui` the
-# shared library with it. No packages means the root's default member.
-PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui"}, "browser": {"cagents-ui"},
+# The application and its widget kit are packages of their own; the UI lanes
+# select both, and `ui` the shared library with them. No packages means the
+# root's default member.
+PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui", "cagents-ui-kit"},
+            "browser": {"cagents-ui", "cagents-ui-kit"},
             "editor": {"ceditor"}, "dictate": {"cagents-dictate"}}
 
 
@@ -35,7 +37,7 @@ ALL_TARGETS = ('arg "[cargo_args]..." var=#true double_dash="required" default="
                'help="Cargo arguments, after --; they replace the default --all-targets"')
 NO_ARGUMENTS = 'arg "[unexpected]..." var=#true hide=#true'
 SENTINEL_LANES = {"cli": "cli", "host": "host", "ui": "ui", "app": "ui", "browser": "browser",
-                  "dictate": "dictate"}
+                  "dictate": "dictate", "editor": "editor"}
 
 
 def sentinel_lanes():
@@ -111,7 +113,10 @@ class Structure(unittest.TestCase):
         for sentinel, lane in SENTINEL_LANES.items():
             with self.subTest(sentinel=sentinel, lane=lane):
                 arguments = variables[lane].split()
-                self.assertIn("--no-default-features", arguments)
+                # ceditor has no default features, so its lane may keep them,
+                # as main's editor test lane does.
+                if lane != "editor":
+                    self.assertIn("--no-default-features", arguments)
                 self.assertLessEqual(packages(lanes[sentinel]) or {"cagents"}, packages(arguments) or {"cagents"})
                 self.assertLessEqual(features(lanes[sentinel]), features(arguments))
                 task = self.tasks[f"check:{lane}"]
@@ -295,7 +300,7 @@ class Behavior(unittest.TestCase):
         result = self.mise_run("test:ui", "--", "--lib", "app::chat ui", "--", "--exact")
         self.assertEqual(result.returncode, 0, result.stderr)
         lane = ["--locked", "--no-default-features", "--package", "cagents", "--package", "cagents-ui",
-                "--features", "cagents/ui"]
+                "--package", "cagents-ui-kit", "--features", "cagents/ui"]
         self.assertEqual(self.calls(), [
             ["cargo-lane", "test", *lane, "--lib", "app::chat ui", "--", "--exact"],
             # Narrowed, it then lints what its tests' build may have hidden.
@@ -333,7 +338,8 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("check:editor").returncode, 0)
         self.assertEqual(self.calls(), [
             ["cargo-lane", "clippy", "--locked", "--no-default-features", "--package", "cagents-ui",
-             "--features", "browser-protocol-fixture", "--all-targets"],
+             "--package", "cagents-ui-kit", "--features", "cagents-ui/browser-protocol-fixture",
+             "--all-targets"],
             ["cargo-lane", "clippy", "--locked", "--package", "ceditor", "--bin=ceditor"],
         ])
 

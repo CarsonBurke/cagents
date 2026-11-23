@@ -205,8 +205,9 @@ use crate::{
     model::{BrowserId, BrowserRestoreFidelity, BrowserSession},
 };
 
-const APPLICATION_ICON_PNG: &[u8] = include_bytes!("../../../packaging/dev.cagents.Cagents.png");
-const APPLICATION_ICON_SIZE: u32 = 128;
+#[cfg(test)]
+use crate::ui_controls::APPLICATION_ICON_SIZE;
+pub use crate::ui_controls::application_window_icon;
 
 /// The name shown to a person, as opposed to `APP_ID`, which only matches the
 /// window to its desktop entry.
@@ -215,19 +216,6 @@ const APPLICATION_NAME: &str = instance::APPLICATION_NAME;
 /// Separates what the window is showing from the application name, following
 /// the desktop convention of "<document> — <application>".
 const WINDOW_TITLE_SEPARATOR: &str = " — ";
-
-/// Embedded artwork for initial window creation, independent of icon themes.
-pub fn application_window_icon() -> window::Icon {
-    let rgba = image::load_from_memory_with_format(APPLICATION_ICON_PNG, image::ImageFormat::Png)
-        .expect("embedded application icon must be a valid PNG")
-        .into_rgba8();
-    window::icon::from_rgba(
-        rgba.into_raw(),
-        APPLICATION_ICON_SIZE,
-        APPLICATION_ICON_SIZE,
-    )
-    .expect("embedded application icon dimensions must match its RGBA pixels")
-}
 
 #[cfg(feature = "integrated-browser")]
 const INITIAL_HYDRATION_EPOCH: u64 = 1;
@@ -2093,23 +2081,7 @@ impl<'a> CaptionSource<'a> {
     }
 }
 
-/// A path as a person would write it, with the home directory as `~`.
-///
-/// Every path this application shows lives under the user's home, so the
-/// absolute prefix is noise that costs the readable tail its space when the
-/// label has to ellipsize.
-pub(crate) fn display_path(path: &Path) -> Cow<'_, str> {
-    static HOME: LazyLock<Option<PathBuf>> =
-        LazyLock::new(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().to_owned()));
-    let relative = HOME
-        .as_deref()
-        .and_then(|home| path.strip_prefix(home).ok())
-        .filter(|relative| !relative.as_os_str().is_empty());
-    match relative {
-        Some(relative) => Cow::Owned(format!("~/{}", relative.display())),
-        None => path.to_string_lossy(),
-    }
-}
+pub(crate) use crate::ui_controls::display_path;
 
 /// The process's starting directory, resolved once.
 ///

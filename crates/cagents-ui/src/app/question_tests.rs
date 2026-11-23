@@ -11,8 +11,8 @@
 //! [`confirmation_surface`]: super::dialog_ui::confirmation_surface
 //! [`inline_question`]: super::dialog_ui::inline_question
 
-use super::dialog_ui::{Consequence, Placement, Question};
 use super::*;
+use crate::question::{Consequence, Placement, Question};
 use crate::repository::test_fixture::isolated_fixture_case;
 use cosmic::iced::advanced::widget::{Operation, Tree};
 use cosmic::iced::advanced::{Layout, layout};
