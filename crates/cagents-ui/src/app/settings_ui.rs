@@ -1,5 +1,6 @@
 use super::*;
 use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
+use notify::Watcher as _;
 
 fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a, Message> {
     static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
@@ -2369,6 +2370,157 @@ mod keyboard_table_tests {
     }
 }
 
+const SHARED_PREFERENCES_EVENT_KINDS: notify::EventKindMask = notify::EventKindMask::CREATE
+    .union(notify::EventKindMask::REMOVE)
+    .union(notify::EventKindMask::MODIFY_DATA)
+    .union(notify::EventKindMask::MODIFY_NAME);
+const SHARED_PREFERENCES_WATCH_RETRY: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedPreferencesWake {
+    Reload,
+    Rearm,
+}
+
+fn shared_preferences_wake(
+    event: &notify::Result<notify::Event>,
+    watched: &Path,
+    parent: &Path,
+) -> Option<SharedPreferencesWake> {
+    let event = match event {
+        Ok(event) => event,
+        Err(_) => return Some(SharedPreferencesWake::Rearm),
+    };
+    if event.need_rescan() || event.paths.iter().any(|changed| changed == parent) {
+        return Some(SharedPreferencesWake::Rearm);
+    }
+    (SHARED_PREFERENCES_EVENT_KINDS.matches(&event.kind)
+        && event.paths.iter().any(|changed| changed == watched))
+    .then_some(SharedPreferencesWake::Reload)
+}
+
+async fn load_shared_preferences(path: PathBuf) -> Option<AppSettings> {
+    tokio::task::spawn_blocking(move || settings::load(path).ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+fn shared_preferences_stream_inner(
+    path: Option<PathBuf>,
+    #[cfg(test)] load_count: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) -> impl cosmic::iced::futures::Stream<Item = AppSettings> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use cosmic::iced::futures::SinkExt;
+    cosmic::iced::stream::channel(1, async move |mut output| {
+        let Some(path) = path else {
+            return;
+        };
+        // Watch the parent rather than the file: settings saves replace the
+        // file atomically, which otherwise drops an inotify watch. One bounded
+        // signal coalesces a burst of write, rename, and close events into one
+        // off-thread read. This stream used to stat the file every second in
+        // every open UI process even when no other window had changed it.
+        let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let mut previous = None;
+        // Exhausted watch resources would otherwise log every retry.
+        let mut warned = false;
+        macro_rules! load_and_emit {
+            () => {
+                #[cfg(test)]
+                if let Some(load_count) = &load_count {
+                    load_count.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(settings) = load_shared_preferences(path.clone()).await {
+                    let current = (
+                        settings.sidebar_worktrees,
+                        settings.sidebar_worktree_overrides.clone(),
+                        settings.account_usage_display,
+                        settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
+                        settings.sidebar_worktrees_when_shown,
+                    );
+                    if previous.as_ref() != Some(&current) {
+                        previous = Some(current);
+                        if output.send(settings).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            };
+        }
+        loop {
+            let (changed, receiver) = async_channel::bounded(1);
+            let rearm_requested = Arc::new(AtomicBool::new(false));
+            let watched = path.clone();
+            let watch_parent = parent.clone();
+            let rearm_signal = Arc::clone(&rearm_requested);
+            let watcher = notify::RecommendedWatcher::new(
+                move |event: notify::Result<notify::Event>| {
+                    if let Some(wake) = shared_preferences_wake(&event, &watched, &watch_parent) {
+                        if wake == SharedPreferencesWake::Rearm {
+                            // A directory replacement must not be lost behind
+                            // an already queued reload in this one-slot channel.
+                            rearm_signal.store(true, Ordering::Release);
+                        }
+                        let _ = changed.try_send(wake);
+                    }
+                },
+                notify::Config::default().with_event_kinds(SHARED_PREFERENCES_EVENT_KINDS),
+            );
+            let watcher = match watcher {
+                Ok(mut watcher) => {
+                    match watcher.watch(&parent, notify::RecursiveMode::NonRecursive) {
+                        Ok(()) => Some(watcher),
+                        Err(error) => {
+                            if !std::mem::replace(&mut warned, true) {
+                                tracing::warn!(%error, path = %parent.display(), "could not watch shared preferences directory");
+                            }
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    if !std::mem::replace(&mut warned, true) {
+                        tracing::warn!(%error, path = %path.display(), "could not watch shared preferences");
+                    }
+                    None
+                }
+            };
+
+            load_and_emit!();
+
+            let Some(_watcher) = watcher else {
+                // Watching can fail when native watch resources are exhausted.
+                // Poll slowly until a fresh watcher can be armed.
+                tokio::time::sleep(SHARED_PREFERENCES_WATCH_RETRY).await;
+                continue;
+            };
+            // `recv` sleeps until the kernel reports the one file we care
+            // about. The watcher lives across the await, so it also covers a
+            // save which races the initial read above. A parent-directory
+            // replacement or callback failure ends the loop to re-arm it.
+            while let Ok(wake) = receiver.recv().await {
+                if rearm_requested.swap(false, Ordering::AcqRel)
+                    || wake == SharedPreferencesWake::Rearm
+                {
+                    break;
+                }
+                load_and_emit!();
+            }
+        }
+    })
+}
+
 /// Observe preferences another window may change while this one is open - the
 /// sidebar's worktree display, the account usage display and which routine
 /// questions are asked - off the UI thread. The subscription restarts after a
@@ -2376,52 +2528,19 @@ mod keyboard_table_tests {
 pub(super) fn shared_preferences_stream(
     path: Option<PathBuf>,
 ) -> impl cosmic::iced::futures::Stream<Item = AppSettings> {
-    use cosmic::iced::futures::SinkExt;
-    cosmic::iced::stream::channel(1, async move |mut output| {
-        let Some(path) = path else {
-            return;
-        };
-        let mut previous = None;
-        let mut stamp = None;
-        loop {
-            let path = path.clone();
-            let old_stamp = stamp;
-            let loaded = tokio::task::spawn_blocking(move || {
-                use std::os::unix::fs::MetadataExt;
-                let metadata = std::fs::metadata(&path).ok()?;
-                let next_stamp = (
-                    metadata.ino(),
-                    metadata.mtime(),
-                    metadata.mtime_nsec(),
-                    metadata.len(),
-                );
-                if old_stamp == Some(next_stamp) {
-                    return None;
-                }
-                settings::load(path)
-                    .ok()
-                    .map(|settings| (next_stamp, settings))
-            })
-            .await;
-            if let Ok(Some((next_stamp, settings))) = loaded {
-                stamp = Some(next_stamp);
-                let current = (
-                    settings.sidebar_worktrees,
-                    settings.sidebar_worktree_overrides.clone(),
-                    settings.account_usage_display,
-                    settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
-                    settings.sidebar_worktrees_when_shown,
-                );
-                if previous.as_ref() != Some(&current) {
-                    previous = Some(current);
-                    if output.send(settings).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    })
+    shared_preferences_stream_inner(
+        path,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+fn shared_preferences_stream_counting_loads(
+    path: Option<PathBuf>,
+    load_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl cosmic::iced::futures::Stream<Item = AppSettings> {
+    shared_preferences_stream_inner(path, Some(load_count))
 }
 
 #[cfg(test)]
@@ -2459,6 +2578,169 @@ mod tests {
         assert_eq!(
             observed.sidebar_worktree_overrides,
             initial.sidebar_worktree_overrides
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_preferences_ignores_metadata_changes_after_initial_load() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let settings = AppSettings::default();
+        settings::save(&path, &settings).unwrap();
+        // `read_private_file` restores this to 0600 after the watch is armed.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let stream =
+            shared_preferences_stream_counting_loads(Some(path.clone()), load_count.clone());
+        pin_mut!(stream);
+        let initial = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial, settings);
+
+        let metadata = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Permissions),
+        ))
+        .add_path(path.clone());
+        assert_eq!(
+            shared_preferences_wake(&Ok(metadata), &path, directory.path()),
+            None,
+            "reading settings chmods the file; that must not schedule another load"
+        );
+        // Change the mode again, and drive the stream meanwhile: it runs only
+        // while polled, and a reload would emit nothing new to wait for.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), stream.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            load_count.load(Ordering::Relaxed),
+            1,
+            "a mode change, such as the one each settings read makes, schedules no reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_preferences_rearms_after_parent_directory_replacement() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let initial = AppSettings::default();
+        settings::save(&path, &initial).unwrap();
+        let stream = shared_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+
+        let removed_parent =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder))
+                .add_path(directory.path().to_path_buf());
+        assert_eq!(
+            shared_preferences_wake(&Ok(removed_parent), &path, directory.path()),
+            Some(SharedPreferencesWake::Rearm)
+        );
+
+        std::fs::remove_dir_all(directory.path()).unwrap();
+        std::fs::create_dir(directory.path()).unwrap();
+        let mut after_replacement = initial;
+        after_replacement.account_usage_display = settings::AccountUsageDisplay::Used;
+        settings::save(&path, &after_replacement).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.account_usage_display,
+            settings::AccountUsageDisplay::Used
+        );
+
+        let mut later_edit = after_replacement;
+        later_edit.account_usage_display = settings::AccountUsageDisplay::Left;
+        settings::save(&path, &later_edit).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.account_usage_display,
+            settings::AccountUsageDisplay::Left,
+            "the re-armed watcher observes edits after the directory was replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_preferences_observes_in_place_settings_writes() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let initial = AppSettings::default();
+        settings::save(&path, &initial).unwrap();
+        let stream = shared_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+
+        let mut changed = initial;
+        changed.account_usage_display = settings::AccountUsageDisplay::Used;
+        std::fs::write(&path, toml::to_string(&changed).unwrap()).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.account_usage_display,
+            settings::AccountUsageDisplay::Used
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_preferences_observes_delete_then_recreate() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let initial = AppSettings::default();
+        settings::save(&path, &initial).unwrap();
+        let stream = shared_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let mut changed = initial;
+        changed.account_usage_display = settings::AccountUsageDisplay::Used;
+        settings::save(&path, &changed).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.account_usage_display,
+            settings::AccountUsageDisplay::Used
         );
     }
 
