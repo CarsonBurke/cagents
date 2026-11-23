@@ -3450,6 +3450,23 @@ impl SidebarState {
         }
     }
 
+    /// Whether the list draws `worktree`'s row, scrolled into view or not:
+    /// its project is expanded and the project's checkout display shows it.
+    pub fn draws_worktree_row(&self, project: &SidebarProject, worktree: &SidebarWorktree) -> bool {
+        self.project_expanded(project.id) && self.shows_worktree(project, worktree)
+    }
+
+    /// The checkout row marked as the one in use, if any.
+    pub fn selected_checkout(&self) -> Option<(ProjectId, WorktreeId)> {
+        match self.drawn_selection() {
+            Some(SidebarSelection::Worktree {
+                project_id,
+                worktree_id,
+            }) => Some((project_id, worktree_id)),
+            _ => None,
+        }
+    }
+
     fn grouped_attention(&self, project: &SidebarProject) -> AttentionSummary {
         let mut summary = AttentionSummary::default();
         for worktree in &project.worktrees {

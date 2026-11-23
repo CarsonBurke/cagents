@@ -9510,6 +9510,7 @@ impl Cagents {
             projection_stage!("row_selection", self.prune_sidebar_row_selection());
         }
         projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
+        let git = projection_stage!("git_interest", self.refresh_git_interest());
         projection_stage!("worktrees_pane", self.refresh_worktrees_pane());
         // Ahead of the rebind, which pins what the inspector drawing source
         // control chose: a pane that has just arrived, closed or taken focus
@@ -9538,7 +9539,7 @@ impl Cagents {
         // Another project shown, or a review or the workspace switcher closed.
         let approval =
             projection_stage!("automation_requests", self.read_owed_automation_requests());
-        Task::batch([binding, chrome, terminal_probes, approval])
+        Task::batch([binding, chrome, terminal_probes, approval, git])
     }
 
     /// Builds chrome for cards that appeared or were renamed, drops entries for
