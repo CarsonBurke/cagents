@@ -1802,6 +1802,28 @@ pub(super) fn outcome_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.recovery.json"))
 }
 
+/// The daemon `job`'s recovery receipt, matched to its saved census, found
+/// serving every recorded session with none paused.
+#[cfg(any(feature = "ui", test))]
+pub(super) fn verified_complete(
+    state: &Path,
+    job: &str,
+) -> Result<Option<HostSessionProof>, UpdateError> {
+    let census = Census::load(&census_path(state, job))?;
+    let receipt: Receipt =
+        serde_json::from_slice(&read_private(&outcome_path(state, job), JOB_STATE_LIMIT)?)?;
+    receipt.matches(&census)?;
+    Ok(match receipt.outcome {
+        Outcome::Usable {
+            serving,
+            paused_terminals,
+            paused_chats,
+            ..
+        } if paused_terminals.is_empty() && paused_chats.is_empty() => Some(serving),
+        _ => None,
+    })
+}
+
 pub(super) fn checkpoint_status()
 -> Result<Option<crate::upgrade::handoff::CheckpointStatus>, UpdateError> {
     crate::upgrade::handoff::Store::existing()
@@ -2596,5 +2618,65 @@ mod tests {
                 .contains("--no-start terminal list")
         );
         assert!(!error.failure().to_string().contains("daemon start"));
+    }
+
+    /// The census and receipt an e8bbb84f2 worker wrote after its successor
+    /// check failed against a newer protocol: the target's verifier had found
+    /// every session usable. Paths and user names are anonymized; the digest is
+    /// recomputed, so loading it also proves the old census still digests alike.
+    #[test]
+    fn an_older_workers_usable_receipt_proves_the_update_complete() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/update-e8bbb84f2-reached-target");
+        let job = "467204f6-b633-4600-b92d-afd4a95547f8";
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path();
+        let write = |path: PathBuf, bytes: &[u8]| {
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let census = fs::read(fixture.join("census.json")).unwrap();
+        let receipt = fs::read_to_string(fixture.join("recovery.json")).unwrap();
+        write(census_path(state, job), &census);
+        write(outcome_path(state, job), receipt.as_bytes());
+        let serving = verified_complete(state, job).unwrap().unwrap();
+        assert_eq!(
+            serving.host_incarnation,
+            crate::model::HostIncarnation::new("af2d02a9-f1dc-4bd8-9bae-9c549c9b640f")
+        );
+
+        let paused = receipt.replace(
+            r#""paused_chats":[]"#,
+            r#""paused_chats":["ad403961-e15a-4778-a26a-303008c4930f"]"#,
+        );
+        assert_ne!(paused, receipt);
+        write(outcome_path(state, job), paused.as_bytes());
+        assert_eq!(
+            verified_complete(state, job).unwrap(),
+            None,
+            "a paused session still needs the user's attention"
+        );
+
+        let unverified = Census::load(&census_path(state, job))
+            .unwrap()
+            .receipt(Outcome::RestartPermitted)
+            .unwrap();
+        write(
+            outcome_path(state, job),
+            &serde_json::to_vec(&unverified).unwrap(),
+        );
+        assert_eq!(verified_complete(state, job).unwrap(), None);
+
+        write(outcome_path(state, job), receipt.as_bytes());
+        let mut changed: serde_json::Value = serde_json::from_slice(&census).unwrap();
+        changed["checkpoint_before"] = "another".into();
+        write(
+            census_path(state, job),
+            &serde_json::to_vec(&changed).unwrap(),
+        );
+        assert!(
+            verified_complete(state, job).is_err(),
+            "a receipt for another census proves nothing"
+        );
     }
 }
