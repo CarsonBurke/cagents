@@ -2683,73 +2683,228 @@ mod tests {
         }
     }
 
-    /// Keep whole-host kernel coverage alongside the controlled state fixture.
-    /// An unresolved exec is explicit uncertainty; every other error must stay
-    /// visible instead of being collapsed into SavedExecution::Unproved.
+    /// Real kernel coverage beside the controlled state fixtures: a process
+    /// read while it runs `execve`, exits, or is reaped is either absent or
+    /// explicit uncertainty. Every other error must stay visible instead of
+    /// being collapsed into SavedExecution::Unproved.
+    ///
+    /// The scan reads only this test's own processes, through
+    /// [`LiveProcesses`], so its cost does not grow with the host's process
+    /// count, and each pass meets the transitions instead of rarely finding
+    /// one among every other process on the host. A process of this user
+    /// that hides its executable, as `systemd --user` or ssh-agent do on a
+    /// real host, is among them.
     #[test]
     fn real_exec_churn_reports_only_explicit_argument_settlement_uncertainty() {
+        use std::os::unix::process::CommandExt;
         use std::sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         };
+        const NON_DUMPABLE: &str = "CAGENTS_TEST_NON_DUMPABLE_PROCESS";
+        if std::env::var_os(NON_DUMPABLE).is_some() {
+            // The rerun below: hide this process's executable from its own
+            // user, then live until the scanning test closes stdin.
+            // SAFETY: prctl touches no memory of this process.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+            let _ = io::Read::read(&mut io::stdin(), &mut [0]);
+            return;
+        }
+        // Each child dies with this test, however it ends, rather than
+        // outlive it as an orphan the shared host keeps running.
+        fn with_parent(command: &mut std::process::Command) -> &mut std::process::Command {
+            // SAFETY: prctl is async-signal-safe and touches no memory.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                })
+            }
+        }
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // At least this many passes, each with enough execs and process
+        // lifetimes overlapping them.
+        const SCANS: usize = 2_000;
+        const TRANSITIONS: u64 = 200;
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let [card, _] = codex_cards(root.path());
         let listener = &card.owned_codex_listener.as_ref().unwrap().socket;
         let control = crate::daemon::holder_registry::socket(holders.path(), card.id);
-        let stop = Arc::new(AtomicBool::new(false));
-        let (started, ready) = std::sync::mpsc::sync_channel(0);
+        let processes = Arc::new(LiveProcesses::new());
+        // Socket rows play no part here; the host's whole table would
+        // dominate every pass.
+        let sockets = processes.0.path().join("net/unix");
+        std::fs::remove_file(&sockets).unwrap();
+        std::fs::write(
+            &sockets,
+            "Num       RefCount Protocol Flags    Type St Inode Path\n",
+        )
+        .unwrap();
+        // One process that replaces its own image without pause, so its
+        // arguments and threads are read mid-`execve` under a stable pid.
+        // Its last argument counts the replacements still to come.
+        const REEXEC: &str = "n=$1; [ \"$n\" -gt 0 ] && exec /bin/sh -c \"$0\" \"$0\" $((n - 1)); exec /bin/sleep 60";
+        let reexec = Reaped(
+            with_parent(std::process::Command::new("/bin/sh").args([
+                "-c",
+                REEXEC,
+                REEXEC,
+                "1000000000",
+            ]))
+            .spawn()
+            .unwrap(),
+        );
+        processes.include(reexec.0.id());
+        let hidden = Reaped(
+            with_parent(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "host::upgrade_inspect::tests::real_exec_churn_reports_only_explicit_argument_settlement_uncertainty",
+                        "--test-threads=1",
+                    ])
+                    .env(NON_DUMPABLE, "1")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null()),
+            )
+            .spawn()
+            .unwrap(),
+        );
+        processes.include(hidden.0.id());
+        let remaining = || {
+            std::fs::read(format!("/proc/{}/cmdline", reexec.0.id()))
+                .ok()
+                .and_then(|argv| {
+                    let argv = String::from_utf8(argv).ok()?;
+                    argv.trim_end_matches('\0')
+                        .rsplit('\0')
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+        };
+        let published = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            if let Some(first) = remaining() {
+                break first;
+            }
+            assert!(
+                Instant::now() < published,
+                "the re-executing process never ran"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        // Its arguments stay readable; its executable does not.
+        if crate::daemon::current_uid() != 0 {
+            loop {
+                match std::fs::read_link(format!("/proc/{}/exe", hidden.0.id())) {
+                    Err(error) if error.raw_os_error() == Some(libc::EACCES) => break,
+                    result => assert!(
+                        Instant::now() < published,
+                        "the rerun never hid its executable: {result:?}"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // Stops the churn however the test ends, so a failed assertion
+        // cannot leave it starting processes.
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = Stop(Arc::new(AtomicBool::new(false)));
+        // Short-lived processes that start, exit, linger unreaped and are
+        // reaped while the scan reads them; then their entries go.
+        let spawned = Arc::new(AtomicUsize::new(0));
         let churn = {
-            let stop = stop.clone();
-            std::thread::spawn(move || -> io::Result<usize> {
-                let mut spawned = 0;
+            let stop = stop.0.clone();
+            let processes = processes.clone();
+            let spawned = spawned.clone();
+            std::thread::spawn(move || -> io::Result<()> {
                 while !stop.load(Ordering::Relaxed) {
-                    let status = std::process::Command::new("/usr/bin/true").status()?;
+                    let mut child = std::process::Command::new("/usr/bin/true").spawn()?;
+                    processes.include(child.id());
+                    let status = child.wait()?;
+                    processes.remove(child.id());
                     if !status.success() {
                         return Err(io::Error::other(format!("exec churn failed: {status}")));
                     }
-                    spawned += 1;
-                    if spawned == 1 {
-                        started.send(()).map_err(io::Error::other)?;
-                    }
+                    spawned.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(spawned)
+                Ok(())
             })
         };
-        if let Err(error) = ready.recv() {
-            let result = churn.join().unwrap();
-            panic!("exec churn did not start: {error}; {result:?}");
-        }
+        let mut scans = 0;
         let mut absent = 0;
         let mut unpublished = 0;
         let mut unexpected = std::collections::BTreeMap::<String, usize>::new();
-        for _ in 0..300 {
+        // A loaded host may run few transitions in the first passes: scan
+        // until enough of each have overlapped the scans, not for a fixed
+        // count that could pass without them.
+        let overlapped = Instant::now() + Duration::from_secs(60);
+        while scans < SCANS
+            || (spawned.load(Ordering::Relaxed) as u64) < TRANSITIONS
+            || remaining().is_none_or(|now| first - now < TRANSITIONS)
+        {
+            assert!(
+                Instant::now() < overlapped,
+                "too few execs and exits overlapped the scans"
+            );
+            scans += 1;
             match codex_listener_survives(
-                Path::new("/proc"),
+                processes.0.path(),
                 card.id,
                 card.launch.session_id.as_deref(),
                 &[listener.as_path(), control.as_path()],
-                Duration::from_secs(2),
+                EXEC_SETTLE,
                 None,
             ) {
                 Ok(CodexExecution::Ended) => absent += 1,
-                Err(error) if error == "A process has not published its arguments yet" => {
-                    unpublished += 1;
-                }
+                Err(error) if error == CODEX_PROCESS_STARTING => unpublished += 1,
                 result => *unexpected.entry(format!("{result:?}")).or_default() += 1,
             }
         }
-        stop.store(true, Ordering::Relaxed);
-        let spawned = churn.join().unwrap().unwrap();
+        drop(stop);
+        churn.join().unwrap().unwrap();
+        let spawned = spawned.load(Ordering::Relaxed);
+        let last = loop {
+            if let Some(last) = remaining() {
+                break last;
+            }
+            assert!(
+                Instant::now() < published + Duration::from_secs(60),
+                "the re-executing process ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        drop(reexec);
+        drop(hidden);
         eprintln!(
-            "CODEX_KERNEL_CENSUS scans=300 absent={absent} unpublished={unpublished} spawned={spawned} unexpected={unexpected:?}"
+            "CODEX_KERNEL_CENSUS scans={scans} absent={absent} unpublished={unpublished} spawned={spawned} reexecs={} unexpected={unexpected:?}",
+            first.saturating_sub(last)
         );
-        assert!(spawned > 0, "the kernel exec interleaving was exercised");
+        assert!(
+            spawned as u64 >= TRANSITIONS && first - last >= TRANSITIONS,
+            "execs and exits overlapped the scans"
+        );
         assert!(
             unexpected.is_empty(),
-            "a whole-host inspection may only report absence or the exact unpublished-arguments condition: {unexpected:?}"
+            "an inspection of exec churn may only report absence or the exact unpublished-arguments condition: {unexpected:?}"
         );
-        assert_eq!(absent + unpublished, 300);
+        assert_eq!(absent + unpublished, scans);
     }
 
     #[test]
