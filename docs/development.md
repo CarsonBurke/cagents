@@ -880,6 +880,26 @@ about 0.6 GiB each. Evidence of main then copies them instead of compiling. A
 build that fails is logged to `logs/SHA-evidence.log` and not retried; evidence
 of that commit compiles it as before.
 
+Then it runs every lane's tests on that same commit, once, in the ordinary
+test profile on the sentinel's warm build directory:
+`scripts/cargo-gate test --locked --all-targets --no-fail-fast` for the CLI,
+`--features host`, the shared library and application with `ui`, the same
+with the integrated browser (`cagents-ui/browser-protocol-fixture`, which
+gives the shared library its `full` identity and browser paths), `-p ceditor`
+and the dictation helper. These are the tests a release once ran itself;
+`verdicts/SHA.json` in the state directory records each lane's exit status and
+time, and `logs/SHA-test-LANE.log` its output. A release requires its commit's
+passing verdict. Main moves faster than the tests run, so only the newest
+commit that compiled when the previous run finished is tested. On failure the
+sentinel keeps one issue titled **Main test sentinel: test failure**, as for
+compilation, and comments when a later commit passes.
+
+`scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
+commit's verdict and exits 0 only if it passed; a commit without one, such as a
+version bump that main moved past before it was tested, is tested first, after
+any running check finishes. A verdict is never retested on its own: to test a
+commit again after a failure outside the code, remove its `verdicts/SHA.json`.
+
 After this change merges, install **one** user timer on fw16, from an updated
 main checkout. Put this in `~/.config/systemd/user/cagents-main-sentinel.service`,
 replacing `/absolute/path/to/cagents` in both places:

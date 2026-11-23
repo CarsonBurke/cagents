@@ -39,6 +39,19 @@ class SentinelTests(unittest.TestCase):
         gate.write_text('''#!/usr/bin/python3
 import json, os, subprocess, sys
 from pathlib import Path
+if sys.argv[1] == 'test':
+    assert sys.argv[2:5] == ['--locked', '--all-targets', '--no-fail-fast'], sys.argv
+    selection = sys.argv[5:]
+    lane = next(name for name, value in json.loads(os.environ['SENTINEL_TEST_LANES']).items()
+                if value == selection)
+    sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+    with open(os.environ['SENTINEL_TESTS'], 'a') as out:
+        out.write(json.dumps([sha, lane, os.environ.get('CAGENTS_BUILD_REMOTE')]) + '\\n')
+    print(f'test result for {lane}')
+    if Path('failing-' + lane).exists():
+        print('test lane_breaks ... FAILED')
+        sys.exit(101)
+    sys.exit(0)
 assert sys.argv[-1] == '--message-format=json', sys.argv
 selection = sys.argv[sys.argv.index('--all-targets') + 1:-1]
 lane = next(name for name, value in json.loads(os.environ['SENTINEL_LANES']).items()
@@ -96,7 +109,9 @@ if sys.argv[1:3] == ['issue', 'create']:
         gh.chmod(0o755)
         self.environment = patch.dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                                       SENTINEL_CALLS=str(self.calls),
-                                      SENTINEL_LANES=json.dumps(sentinel.LANES))
+                                      SENTINEL_LANES=json.dumps(sentinel.LANES),
+                                      SENTINEL_TESTS=str(self.root / "tests"),
+                                      SENTINEL_TEST_LANES=json.dumps(sentinel.TEST_LANES))
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.now = 2000
@@ -383,6 +398,92 @@ if sys.argv[1:3] == ['issue', 'create']:
             self.tick()
         self.assertEqual(len(self.recorded()), len(sentinel.LANES))
 
+
+    def tested(self):
+        path = self.root / "tests"
+        return [json.loads(line)[:2] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_the_newest_compiling_commit_is_tested_once_in_every_lane_and_its_verdict_kept(self):
+        self.tick()
+        self.commit("merge one")
+        tip = self.commit("merge two")
+        self.now += 120
+        self.tick()
+        self.now += 120
+        self.tick()
+        # Lanes whose package the fixture lacks are skipped, as for the checks.
+        lanes = [lane for lane in sentinel.TEST_LANES if lane != "editor"]
+        self.assertEqual(self.tested(), [[sha, lane] for sha in (self.first, tip) for lane in lanes])
+        verdict = json.loads((self.state / "verdicts" / f"{tip}.json").read_text())
+        self.assertTrue(verdict["passed"])
+        self.assertEqual(list(verdict["lanes"]), lanes)
+        self.assertEqual(json.loads((self.state / "state.json").read_text())["tested"], tip)
+        self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+
+    def test_a_commit_that_does_not_compile_is_not_tested(self):
+        self.tick()
+        broken = self.commit("incompatible merge", broken="host")
+        self.now += 120
+        self.tick()
+        self.assertNotIn(broken, [sha for sha, _ in self.tested()])
+        self.assertFalse((self.state / "verdicts" / f"{broken}.json").exists())
+
+    def test_failing_tests_are_reported_and_recovery_comments(self):
+        self.tick()
+        (self.origin / "failing-host").touch()
+        failing = self.commit("break a test")
+        self.now += 120
+        self.tick()
+        verdict = json.loads((self.state / "verdicts" / f"{failing}.json").read_text())
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["lanes"]["host"]["status"], 101)
+        self.assertEqual(verdict["lanes"]["cli"]["status"], 0)
+        [create] = [entry for entry in self.recorded() if entry[:2] == ["issue", "create"]]
+        self.assertEqual(create[3], sentinel.TEST_TITLE)
+        body = (self.state / "test-issue.md").read_text()
+        self.assertIn(failing, body)
+        self.assertIn("- host: exit 101", body)
+        self.assertIn("test lane_breaks ... FAILED", body)
+        self.assertEqual(json.loads((self.state / "state.json").read_text())["tests_last_good"], self.first)
+        (self.origin / "failing-host").unlink()
+        fixed = self.commit("fix the test")
+        self.now += 120
+        self.tick()
+        self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and fixed in str(entry)
+                            for entry in self.recorded()))
+
+    def test_a_failed_test_report_is_retried_without_testing_again(self):
+        self.tick()
+        (self.origin / "failing-cli").touch()
+        self.commit("break a test")
+        self.now += 120
+        with patch.object(sentinel, "report_tests", side_effect=RuntimeError("network unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "network"):
+                self.tick()
+        before = self.tested()
+        self.now += 120
+        self.tick()
+        self.assertEqual(self.tested(), before)
+        self.assertTrue(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+        self.assertNotIn("tests_pending", json.loads((self.state / "state.json").read_text()))
+
+    def test_a_required_commit_is_tested_once_and_its_verdict_returned(self):
+        self.tick()
+        untested = self.commit("version bump")
+        self.command("git", "-C", str(self.repo), "fetch", "-q", "origin", "main")
+        verdict = sentinel.require_tests(self.repo, self.state, untested)
+        self.assertTrue(verdict["passed"])
+        before = self.tested()
+        self.assertEqual(sentinel.require_tests(self.repo, self.state, untested), verdict)
+        self.assertEqual(self.tested(), before)
+        (self.origin / "failing-ui").touch()
+        failing = self.commit("break a test")
+        self.command("git", "-C", str(self.repo), "fetch", "-q", "origin", "main")
+        self.assertFalse(sentinel.require_tests(self.repo, self.state, failing)["passed"])
+        # The watcher then reports the tip without testing it again.
+        self.now += 120
+        self.tick()
+        self.assertEqual(sum(sha == failing for sha, _ in self.tested()), len(sentinel.TEST_LANES) - 1)
 
     def with_evidence_tool(self):
         """Gives main a native-evidence that builds stand-in executables."""

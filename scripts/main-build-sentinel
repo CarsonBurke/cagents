@@ -1,8 +1,12 @@
 #!/usr/bin/python3
 """Check main's newest commit through the fw16 gate whenever it moves, find
 the first-parent commit at which each failing lane first fails when it fails
-after passing, then build the newest checked commit that compiles for native
-evidence to start from."""
+after passing, build the newest checked commit that compiles for native
+evidence to start from, then run every lane's tests on it and record their
+verdict, which a release of that commit requires.
+
+With --require-tests SHA it records that commit's verdict, testing it first
+if it has none, and exits 0 only when its tests pass."""
 import argparse
 import fcntl
 import json
@@ -36,6 +40,25 @@ APPLICATION_LANES = {"app", "browser"}
 # says it does.
 LANE_MANIFESTS = {lane: "crates/cagents-ui/Cargo.toml" for lane in APPLICATION_LANES}
 LANE_MANIFESTS["dictate"] = "crates/cagents-dictate/Cargo.toml"
+# Each test lane's selection after `test --locked --all-targets --no-fail-fast`,
+# in the ordinary test profile. Together they run every test a release used to
+# run itself: the shared library without features and with `host` and `ui`,
+# the application without and with the integrated browser (the shared library
+# then has its `full` identity and browser paths), the editor and the
+# dictation helper. A missing package skips its lane, as for the checks.
+TEST_LANES = {
+    "cli": ["--no-default-features"],
+    "host": ["--no-default-features", "--features", "host"],
+    "ui": ["--no-default-features", "-p", "cagents", "-p", "cagents-ui", "--features", "cagents/ui"],
+    "browser": ["--no-default-features", "-p", "cagents", "-p", "cagents-ui",
+                "--features", "cagents-ui/browser-protocol-fixture"],
+    "editor": ["-p", "ceditor"],
+    "dictate": ["--no-default-features", "-p", "cagents-dictate", "--features", "engine"],
+}
+TEST_LANE_MANIFESTS = {"ui": "crates/cagents-ui/Cargo.toml", "browser": "crates/cagents-ui/Cargo.toml",
+                       "editor": "crates/ceditor/Cargo.toml",
+                       "dictate": "crates/cagents-dictate/Cargo.toml"}
+TEST_TITLE = "Main test sentinel: test failure"
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
 # native-evidence's task for these builds: its path must be short, for sockets.
@@ -107,9 +130,8 @@ def failed_lanes(result):
     return [lane for lane, status in result["lanes"].items() if status or warnings.get(lane)]
 
 
-def check_commit(repository, directory, sha, lanes):
-    """Checks out `sha` in the sentinel's worktree and checks each of `lanes`
-    the commit has; returns their exit statuses and warning counts."""
+def checkout_commit(repository, sha):
+    """Checks out `sha` in the sentinel's worktree and returns its path."""
     checkout = repository / ".worktrees" / "main-build-sentinel"
     if checkout.exists():
         if git(checkout, "status", "--porcelain"):
@@ -117,6 +139,13 @@ def check_commit(repository, directory, sha, lanes):
         git(checkout, "checkout", "--detach", sha)
     else:
         git(repository, "worktree", "add", "--detach", str(checkout), sha)
+    return checkout
+
+
+def check_commit(repository, directory, sha, lanes):
+    """Checks out `sha` in the sentinel's worktree and checks each of `lanes`
+    the commit has; returns their exit statuses and warning counts."""
+    checkout = checkout_commit(repository, sha)
     (directory / "logs").mkdir(exist_ok=True)
     statuses = {}
     warnings = {}
@@ -278,6 +307,123 @@ def keep_main_build(repository, directory, state):
             shutil.rmtree(old, ignore_errors=True)
 
 
+def verdict_path(directory, sha):
+    return directory / "verdicts" / f"{sha}.json"
+
+
+def read_verdict(directory, sha):
+    path = verdict_path(directory, sha)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def test_commit(repository, directory, sha):
+    """Runs each test lane the commit has, in the sentinel's worktree, and
+    records the verdict: passed only when every lane's tests ran and passed."""
+    checkout = checkout_commit(repository, sha)
+    (directory / "logs").mkdir(exist_ok=True)
+    lanes = {}
+    for lane, selection in TEST_LANES.items():
+        if lane in TEST_LANE_MANIFESTS and not (checkout / TEST_LANE_MANIFESTS[lane]).exists():
+            continue
+        print(f"main-build-sentinel: {sha} test {lane}", flush=True)
+        started = time.monotonic()
+        with (directory / "logs" / f"{sha}-test-{lane}.log").open("w") as log:
+            status = subprocess.run(
+                [str(checkout / "scripts/cargo-gate"), "test", "--locked", "--all-targets",
+                 "--no-fail-fast", *selection],
+                cwd=checkout, env=dict(os.environ, CAGENTS_BUILD_REMOTE="fw16"),
+                stdout=log, stderr=subprocess.STDOUT).returncode
+        lanes[lane] = {"status": status, "seconds": round(time.monotonic() - started)}
+    verdict = {"sha": sha, "passed": all(entry["status"] == 0 for entry in lanes.values()),
+               "lanes": lanes, "finished": time.time()}
+    verdict_path(directory, sha).parent.mkdir(exist_ok=True)
+    save(verdict_path(directory, sha), verdict)
+    return verdict
+
+
+def report_tests(directory, state, verdict):
+    """Keeps one issue on main's failing tests, as `report` does for checks."""
+    def gh(*args):
+        return github(directory, state, *args)
+
+    sha = verdict["sha"]
+    if verdict["passed"]:
+        if state.get("tests_failing"):
+            gh("issue", "comment", str(state["test_issue"]), "--body",
+               f"Recovered at `{sha}`: every test lane passed on fw16.")
+        state["tests_failing"] = False
+        return
+    if not state.get("test_issue"):
+        matches = json.loads(gh("issue", "list", "--state", "all", "--search",
+                                f'"{TEST_TITLE}" in:title', "--json", "number,title"))
+        matches = [item for item in matches if item["title"] == TEST_TITLE]
+        if matches:
+            state["test_issue"] = matches[0]["number"]
+            save(directory / "state.json", state)
+    body = (f"Main's tests fail at `{sha}` on fw16. No release can be cut from a commit "
+            "whose tests have not passed.\n\n"
+            f"Last passing commit: `{state.get('tests_last_good', 'none recorded')}`.\n\n"
+            "Each lane runs `scripts/cargo-gate test --locked --all-targets --no-fail-fast` "
+            "in the ordinary test profile.\n\n")
+    for lane, entry in verdict["lanes"].items():
+        body += f"- {lane}: exit {entry['status']} in {entry['seconds']} s\n"
+    for lane, entry in verdict["lanes"].items():
+        if entry["status"]:
+            log = directory / "logs" / f"{sha}-test-{lane}.log"
+            tail = log.read_text(errors="replace")[-5000:].replace("```", "'''")
+            body += f"\n{lane} output (tail; complete log on fw16 at `{log}`):\n```text\n{tail}\n```\n"
+    body_file = directory / "test-issue.md"
+    body_file.write_text(body)
+    if not state.get("test_issue"):
+        url = gh("issue", "create", "--title", TEST_TITLE, "--body-file", str(body_file))
+        state["test_issue"] = int(url.rsplit("/", 1)[1])
+        save(directory / "state.json", state)
+    else:
+        gh("issue", "edit", str(state["test_issue"]), "--body-file", str(body_file))
+        gh("issue", "reopen", str(state["test_issue"]))
+    state["tests_failing"] = True
+
+
+def test_main(repository, directory, state):
+    """Tests the newest checked commit once, if it compiled. A verdict to
+    report survives a failed notification and is retried without testing."""
+    path = directory / "state.json"
+    sha = state.get("checked")
+    if not state.get("tests_pending"):
+        if not sha or state.get("tested") == sha or state.get("compiled") != sha:
+            return
+        verdict = read_verdict(directory, sha) or test_commit(repository, directory, sha)
+        state["tests_pending"] = sha
+        save(path, state)
+    verdict = read_verdict(directory, state["tests_pending"])
+    if verdict is None:
+        # Removed by hand to have it tested again.
+        state.pop("tests_pending")
+        save(path, state)
+        return
+    state["retry_after"] = time.time() + 120
+    save(path, state)
+    report_tests(directory, state, verdict)
+    state.pop("retry_after", None)
+    if verdict["passed"]:
+        state["tests_last_good"] = verdict["sha"]
+    state["tested"] = state.pop("tests_pending")
+    save(path, state)
+
+
+def require_tests(repository, directory, sha):
+    """Blocks until no tick runs, then returns `sha`'s verdict, testing it
+    first if it has none."""
+    worktrees = repository / ".worktrees"
+    worktrees.mkdir(exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    with ((worktrees / ".main-build-sentinel.lock").open("a") as checkout_lock,
+          (directory / "lock").open("a") as lock):
+        fcntl.flock(checkout_lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return read_verdict(directory, sha) or test_commit(repository, directory, sha)
+
+
 def tick(repository, directory, github_repository):
     # The checkout is shared even when callers select different state directories.
     worktrees = repository / ".worktrees"
@@ -305,7 +451,7 @@ def tick_locked(repository, directory, github_repository):
         if time.time() < state.get("retry_after", 0):
             return
         # The timestamp also bounds restart/manual invocations and failed Git fetches.
-        busy = state.get("pending") or state.get("bisect")
+        busy = state.get("pending") or state.get("bisect") or state.get("tests_pending")
         if time.time() - state.get("last_fetch", 0) < 120 and not busy:
             return
         if not busy:
@@ -359,6 +505,7 @@ def tick_locked(repository, directory, github_repository):
             save(path, state)
         # Before bisecting moves the checkout off the commit it builds.
         keep_main_build(repository, directory, state)
+        test_main(repository, directory, state)
         if state.get("bisect"):
             bisect(repository, directory, state)
 
@@ -368,9 +515,17 @@ def main():
     parser.add_argument("--repository", type=Path, required=True)
     parser.add_argument("--state", type=Path, default=Path.home() / ".local/state/cagents-main-sentinel")
     parser.add_argument("--github-repository", default="CarsonBurke/cagents")
+    parser.add_argument("--require-tests", metavar="SHA",
+                        help="print SHA's test verdict, testing it first if it has none; "
+                             "exit 0 only if its tests passed")
     args = parser.parse_args()
     if socket.gethostname().split(".")[0] != "fw16":
         parser.error("run this watcher on fw16; builds still go through scripts/cargo-gate")
+    if args.require_tests:
+        sha = git(args.repository.resolve(), "rev-parse", "--verify", f"{args.require_tests}^{{commit}}")
+        verdict = require_tests(args.repository.resolve(), args.state.resolve(), sha)
+        print(json.dumps(verdict, indent=2))
+        sys.exit(0 if verdict["passed"] else 1)
     tick(args.repository.resolve(), args.state.resolve(), args.github_repository)
 
 
