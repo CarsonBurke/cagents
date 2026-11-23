@@ -2,6 +2,15 @@ use super::*;
 
 const CONFIRMATION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
+/// How long a waiting update pauses before it reads its decision and the
+/// conversations it would stop again. Half a second is too short for a
+/// person answering a prompt to notice; tests answer at once, and pausing a
+/// production half-second per prompt made the update tests slow.
+#[cfg(not(test))]
+pub(super) const DECISION_POLL: Duration = Duration::from_millis(500);
+#[cfg(test)]
+pub(super) const DECISION_POLL: Duration = Duration::from_millis(10);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
     pub nonce: String,
@@ -468,7 +477,7 @@ fn wait_for(
             // Ctrl-C still cancels while windows are saving and closing.
             return Ok(preview);
         }
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(DECISION_POLL);
     }
 }
 
@@ -639,7 +648,7 @@ pub(super) fn wait_stop(
         }
         preview = current;
         list = current_list;
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(DECISION_POLL);
     }
 }
 
