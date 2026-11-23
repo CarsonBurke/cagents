@@ -216,12 +216,15 @@ mise run check:dictate
 compiling anything: it resolves each lane's selection from `mise.toml` with
 `cargo tree` and fails, naming the dependency path, when a lane resolves
 another's graph, such as Ghostty in a UI lane or libcosmic or Servo in the
-daemon's, or the application in ceditor. It runs offline and takes seconds
-once the dependencies are fetched, though Cargo first waits for its package
-cache while another build on the host holds it. `mise run check` runs it
-before its lanes, and the [main build sentinel](#watching-main-after-merges)
-on every commit it checks, so a leak fails before anything compiles; run it on
-its own after adding a dependency or moving code between crates.
+daemon's, or the application in ceditor. It first fetches,
+without rewriting `Cargo.lock`, whatever this host's dependencies lack, since
+builds run on the build host and this one may never have downloaded a new
+crate; then it resolves offline in seconds, though Cargo first waits for its
+package cache while another build on the host holds it. `mise run check` runs
+it before its lanes, so a leak fails before anything compiles, and the
+[main build sentinel](#watching-main-after-merges) after its lanes on every
+commit it checks. Run it on its own after adding a dependency or moving code
+between crates.
 
 The dictation helper, `crates/cagents-dictate`, is a separate executable the UI
 starts when someone dictates and stops when they have finished. Its `engine`
@@ -885,9 +888,7 @@ graph with its Wayland registry test server, the dictation helper with its
 engine, and `-p ceditor`, which also lints the kit as it ships: the
 application's tests enable the kit's `test-support` feature, so the two
 application lanes lint the kit with it. After them an `isolation` lane runs the
-commit's `scripts/check-lane-isolation`, once `cargo fetch --locked --target
-host-tuple` has fetched what it resolves, which a commit bisected in that lane
-alone may not have had built; it fails like a lane and is bisected like one,
+commit's `scripts/check-lane-isolation`, which compiles nothing; it fails like a lane and is bisected like one,
 but a commit that fails only it still compiled, so it is built for evidence and
 tested. A commit from before the script skips it. The Cargo lanes use the ordinary shared queue
 and the persistent sentinel worktree cache, without a held slot between lanes.

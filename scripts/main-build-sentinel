@@ -156,20 +156,6 @@ def check_lane(command, checkout, environment, log_path, warnings_path, packages
     return status, len(warnings.own)
 
 
-def check_isolation(checkout, environment, log_path):
-    """Runs the commit's lane-isolation check, which never fetches, after
-    fetching this host's dependencies, which a commit checked only in this
-    lane while bisecting may not have had built here; returns its status."""
-    with log_path.open("w") as log:
-        fetched = subprocess.run(["cargo", "fetch", "--locked", "--target", "host-tuple"], cwd=checkout,
-                                 env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-        if fetched.returncode:
-            return fetched.returncode
-        log.flush()
-        return subprocess.run([str(checkout / ISOLATION_SCRIPT)], cwd=checkout, env=environment,
-                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT).returncode
-
-
 def github(directory, state, *args):
     result = subprocess.run(["gh", *args, "--repo", state["github_repository"]], text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -221,7 +207,13 @@ def check_commit(repository, directory, sha, lanes):
             if not (checkout / ISOLATION_SCRIPT).exists():
                 continue
             print(f"main-build-sentinel: {sha} {lane}", flush=True)
-            statuses[lane], warnings[lane] = check_isolation(checkout, environment, log), 0
+            # It fetches what it resolves, which a commit bisected in this
+            # lane alone may not have had built here.
+            with log.open("w") as output:
+                statuses[lane] = subprocess.run([str(checkout / ISOLATION_SCRIPT)], cwd=checkout, env=environment,
+                                                stdin=subprocess.DEVNULL, stdout=output,
+                                                stderr=subprocess.STDOUT).returncode
+            warnings[lane] = 0
             warnings_log.write_text("")
             continue
         if lane in LANE_MANIFESTS and not (checkout / LANE_MANIFESTS[lane]).exists():

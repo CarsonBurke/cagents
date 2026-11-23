@@ -4,9 +4,11 @@
 Every lane in mise.toml's [vars] is one Cargo selection. Splitting a crate, or a
 dependency added to the wrong one, can quietly pull another lane's graph into
 it: Ghostty into the UI, libcosmic or Servo into the daemon. Cargo resolves the
-whole graph for `cargo tree` without compiling, so this takes seconds where the
-dependencies have been fetched; it never fetches them itself. See
-docs/development.md#feature-boundaries.
+whole graph for `cargo tree` without compiling, so this takes seconds. It
+first fetches what Cargo.lock names for this host and has not been downloaded
+here, which is nothing on a host that has built or analyzed the checkout; the
+builds themselves run on the build host, so this one may lack a new dependency.
+See docs/development.md#feature-boundaries.
 """
 
 import argparse
@@ -45,8 +47,7 @@ def lanes(root):
 
 def cargo_tree(cargo, root, selection, *extra, stderr=subprocess.PIPE):
     # Normal, build and dev edges: a lane's check and tests compile all three.
-    # Offline, so a missing dependency fails here instead of fetching a graph
-    # as large as Servo's onto whichever host runs this.
+    # Offline: main fetched everything first.
     return subprocess.run([cargo, "tree", "--offline", *selection, "--edges", "normal,build,dev", *extra],
                           cwd=root, stdout=subprocess.PIPE, stderr=stderr, text=True)
 
@@ -57,7 +58,7 @@ def check(cargo, root, lane, selection):
     # the package cache another build holds.
     result = cargo_tree(cargo, root, selection, "--prefix", "none", "--format", "{p}", stderr=None)
     if result.returncode:
-        return ["cargo tree failed, above (run `cargo fetch --locked` if a dependency is missing)"]
+        return ["cargo tree failed, above"]
     # `name vVERSION`, one line per resolved package.
     resolved = {}
     for line in result.stdout.splitlines():
@@ -77,8 +78,16 @@ def main():
     parser.add_argument("--cargo", default="cargo", help="Cargo to run (default: cargo on PATH)")
     parser.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    variables = lanes(arguments.root)
+    # Only this host's target, which is all `cargo tree` resolves by default;
+    # locked, so it never rewrites Cargo.lock.
+    fetched = subprocess.run([arguments.cargo, "fetch", "--locked", "--target", "host-tuple"],
+                             cwd=arguments.root, stdout=subprocess.DEVNULL)
+    if fetched.returncode:
+        print("check-lane-isolation: could not fetch the dependencies Cargo.lock names, above", file=sys.stderr)
+        return 1
     failed = False
-    for lane, selection in lanes(arguments.root).items():
+    for lane, selection in variables.items():
         problems = check(arguments.cargo, arguments.root, lane, selection)
         for problem in problems:
             print(f"check-lane-isolation: the {lane} lane {problem}", file=sys.stderr)

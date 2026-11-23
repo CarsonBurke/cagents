@@ -630,9 +630,8 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
             self.assertTrue(sentinel.require_tests(self.repo, self.state, tip)["passed"])
 
     def with_isolation_check(self):
-        """Commits a lane-isolation check that resolves another lane's graph
-        where the checkout has `leaky`, and puts a Cargo that only fetches,
-        failing where it has `offline`, first on PATH; both record their runs."""
+        """Commits a lane-isolation check that records its runs and fails
+        where the checkout has `leaky`, as when a lane resolves another's graph."""
         script = self.origin / "scripts/check-lane-isolation"
         script.write_text('''#!/usr/bin/python3
 import json, os, subprocess, sys
@@ -646,36 +645,20 @@ if Path('leaky').exists():
 print('check-lane-isolation: 6 lanes resolve only their own graphs')
 ''')
         script.chmod(0o755)
-        cargo = self.bin / "cargo"
-        cargo.write_text('''#!/usr/bin/python3
-import json, os, subprocess, sys
-from pathlib import Path
-sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-with open(os.environ['SENTINEL_CALLS'], 'a') as out:
-    out.write(json.dumps(['cargo', sha, *sys.argv[1:]]) + '\\n')
-if Path('offline').exists():
-    print('error: failed to download from `https://index.crates.io`', file=sys.stderr)
-    sys.exit(101)
-''')
-        cargo.chmod(0o755)
         return self.commit("check lane isolation")
 
     def isolation_runs(self):
-        return [entry for entry in self.recorded() if entry[0] in {"cargo", "check-lane-isolation"}]
+        return [entry for entry in self.recorded() if entry[0] == "check-lane-isolation"]
 
-    def test_a_commit_with_the_isolation_check_runs_it_after_its_lanes_with_dependencies_fetched(self):
+    def test_a_commit_with_the_isolation_check_runs_it_after_its_lanes(self):
         self.tick()
         # One from before the check has nothing to run.
         self.assertEqual(self.isolation_runs(), [])
         tip = self.with_isolation_check()
         self.now += 120
         self.tick()
-        self.assertEqual(self.isolation_runs(), [
-            ["cargo", tip, "fetch", "--locked", "--target", "host-tuple"],
-            ["check-lane-isolation", tip],
-        ])
-        self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == tip and len(entry) == 4],
-                         list(sentinel.LANES))
+        runs = [entry[:2] for entry in self.recorded() if tip in entry[:2]]
+        self.assertEqual(runs, [[tip, lane] for lane in sentinel.LANES] + [["check-lane-isolation", tip]])
         state = json.loads((self.state / "state.json").read_text())
         self.assertEqual(state["last_good"], tip)
         self.assertIn("6 lanes resolve only their own graphs",
@@ -695,32 +678,31 @@ if Path('offline').exists():
         self.assertIn("the ui lane resolves Ghostty", body)
         # It compiled, so its tests still run.
         self.assertIn([leaky, "cli"], self.tested())
-
-    def test_a_failed_fetch_fails_the_isolation_check_without_running_it(self):
-        self.tick()
-        self.with_isolation_check()
-        (self.origin / "offline").touch()
-        tip = self.commit("unfetchable")
+        (self.origin / "leaky").unlink()
+        fixed = self.commit("ghostty back in the host")
         self.now += 120
         self.tick()
-        self.assertEqual([entry[0] for entry in self.isolation_runs() if entry[1] == tip], ["cargo"])
-        self.assertIn("- isolation: exit 101", (self.state / "issue.md").read_text())
+        self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and f"Recovered at `{fixed}`" in entry[4]
+                            for entry in self.recorded()))
 
     def test_a_leak_is_bisected_like_a_lane_to_the_commit_that_made_it(self):
-        self.with_isolation_check()
         self.tick()
-        self.commit("merge one")
+        # A commit from before the check, between the passing one and the tip.
+        before = self.commit("merge one")
+        self.with_isolation_check()
+        self.commit("merge three")
         (self.origin / "leaky").touch()
         leaky = self.commit("ghostty in the ui")
-        self.commit("merge three")
-        self.commit("merge four")
+        self.commit("merge five")
+        self.commit("merge six")
         self.now += 120
         self.tick()
         [comment] = [entry for entry in self.recorded() if entry[:3] == ["issue", "comment", "42"]]
         self.assertIn(f"- `{leaky}` (ghostty in the ui): isolation", comment[4])
-        bisected = [entry[1] for entry in self.recorded() if len(entry) == 4 and entry[0] != "cargo"]
-        # Bisecting checks only the isolation lane, never compiling again.
-        self.assertEqual(len(bisected), 2 * len(sentinel.LANES))
+        # Bisecting runs only the isolation check, compiling nothing again, and
+        # treats a commit without it as passing.
+        self.assertEqual(len([entry for entry in self.recorded() if len(entry) == 4]), 2 * len(sentinel.LANES))
+        self.assertNotIn(before, [entry[1] for entry in self.isolation_runs()])
 
     def with_evidence_tool(self):
         """Gives main a native-evidence that builds stand-in executables."""
