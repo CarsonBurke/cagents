@@ -1109,9 +1109,10 @@ fn short_transcript(turns: usize) -> Vec<chat::Item> {
 }
 
 /// What a frame of a transcript costs by how long it is, with nothing
-/// changed, after a wheel notch, and while its newest answer streams. The
-/// store's window holds 128 items, but a selected subagent's transcript is
-/// not windowed, and the slope is what each loaded row costs every frame.
+/// changed, after a wheel notch, and while its newest answer streams. A pane
+/// loads at most the store's window of 128 items (a subagent's transcript
+/// keeps 64), so the longer lengths are beyond what it holds: they show the
+/// slope, what each loaded row costs every frame.
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_frame_of_a_transcript_by_length() {
