@@ -90,6 +90,12 @@ pub(super) struct Turn {
     /// and its latest observation. An earlier item can finish after later
     /// items appeared; for a running group this is the last sign of life.
     span: Span,
+    /// The span before its latest message card, which the group returns to
+    /// when that message leaves it for the messages after it.
+    before_card: Span,
+    /// What the group took in since that card, such as hidden thinking,
+    /// which leaves with the message for the run it starts.
+    since_card: Span,
     /// The key the reader's disclosure choice is stored under, and the
     /// collapsed strip's own line. Both are formed here, once per snapshot,
     /// because the view draws them on every frame and they change only when
@@ -124,6 +130,8 @@ impl Turn {
             newest_running: false,
             outcome: None,
             span: item.map(Span::of).unwrap_or_default(),
+            before_card: Span::default(),
+            since_card: Span::default(),
             key: item.map(|item| item.id.clone()).unwrap_or_default(),
             summary: String::new(),
             messages: false,
@@ -251,6 +259,7 @@ impl Turn {
     /// history reaches the store unstamped, and a group that mixes it with live work should report
     /// the span it can account for rather than nothing at all.
     fn spans(&mut self, item: &Item) {
+        self.since_card.takes_in(Span::of(item));
         self.span.takes_in(Span::of(item));
     }
 
@@ -546,7 +555,12 @@ pub(super) fn group<'c, T: Borrow<Item>>(
             let first = turn.prose.pop().expect("the message drawn last");
             let lone = turn.prompt.is_empty() && turn.steps.is_empty() && turn.prose.is_empty();
             if !lone {
+                // The group's time ends where it did before the message;
+                // the message, and what came after it, start the run's.
+                let since = turn.since_card;
+                turn.span = turn.before_card;
                 turns.push(Turn::opened(items, first.index, false));
+                turns.last_mut().expect("the run").span.takes_in(since);
             }
             let run = turns.last_mut().expect("a group is open");
             run.messages = true;
@@ -626,9 +640,18 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                 turn.observe(status);
             }
         }
+        let before = turn.span;
         turn.spans(item);
-        if let Some(thought) = unplaced.take() {
+        let thought = unplaced.take();
+        if let Some(thought) = thought {
             turn.span.takes_in(thought);
+        }
+        if slot == Slot::Card && !joins_messages {
+            // A message drawn as a card may yet leave for a run of its own,
+            // taking its time and the thinking that led to it.
+            turn.before_card = before;
+            turn.since_card = Span::of(item);
+            turn.since_card.takes_in(thought.unwrap_or_default());
         }
         match slot {
             Slot::Step => turn.steps.push(Placed { index, slot }),
@@ -2942,5 +2965,95 @@ mod tests {
             "{}",
             turns[1].summary
         );
+    }
+
+    /// The first message of a run leaves the group it was drawn in, and
+    /// takes its time with it: the steps before it are measured as they
+    /// were.
+    #[test]
+    fn a_message_that_leaves_for_its_run_takes_its_time() {
+        let (first, second) = (sent("docs-review", "same"), sent("perf-audit", "same"));
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let mut tool = command("c1", ToolStatus::Succeeded);
+        tool.started_at = Some(1_000);
+        tool.at = Some(2_000);
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            tool,
+            stamped(command("m1", ToolStatus::Succeeded), 30_000),
+            stamped(command("m2", ToolStatus::Succeeded), 31_000),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].working_for(90_000), Some(1_000));
+        assert_eq!(turns[1].working_for(90_000), Some(1_000));
+        // Hidden thinking between the messages goes with them too.
+        let mut items = items;
+        items.insert(3, thought("t", "", 30_000, 40_000));
+        items[4].at = Some(41_000);
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].working_for(90_000), Some(1_000));
+        assert_eq!(turns[1].working_for(90_000), Some(11_000));
+    }
+
+    /// A message to every teammate reaches more agents than the run can
+    /// count, and one to several agents reaches each of them.
+    #[test]
+    fn a_run_counts_the_agents_its_messages_reached() {
+        let several = |message: Coordinated, agents: &[&str]| {
+            let mut reading = message.reading.clone();
+            reading.subagents = agents.iter().map(|agent| (*agent).to_owned()).collect();
+            Coordinated::new(reading)
+        };
+        let readings: std::collections::HashMap<&str, Coordinated> = [
+            ("m1", sent("*", "Main is green.")),
+            ("m2", sent("docs-review", "Main is green.")),
+            (
+                "m3",
+                several(sent("ui", "Rebase."), &["ui-tests", "packaging"]),
+            ),
+            ("m4", sent("triage", "Rebase.")),
+        ]
+        .into_iter()
+        .collect();
+        let coordinated = |item: &Item| readings.get(item.id.as_str());
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Succeeded),
+            command("m2", ToolStatus::Succeeded),
+            command("c1", ToolStatus::Succeeded),
+            command("m3", ToolStatus::Succeeded),
+            command("m4", ToolStatus::Failed),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(
+            turns[1].summary,
+            "Sent 2 messages to every teammate, docs-review: Main is green. · Queued"
+        );
+        assert!(
+            turns[3].summary.starts_with("Messaged 3 agents: Rebase."),
+            "{}",
+            turns[3].summary
+        );
+        // The tooltip says how each went.
+        let run = MessageRun::of(
+            turns[3].steps.iter().map(|placed| {
+                let item = &items[placed.index];
+                (item, coordinated(item).expect("a message"))
+            }),
+            &|_| None,
+        )
+        .expect("a run of messages");
+        let tip = run.tip();
+        assert!(tip.starts_with("Messaged 3 agents\n\n"), "{tip}");
+        assert!(tip.contains("\ntriage: Not sent"), "{tip}");
+        // A reason that opens with its state says it once.
+        assert!(tip.contains("\nui-tests, packaging: Queued for"), "{tip}");
+        assert!(tip.ends_with("\n\nRebase."), "{tip}");
     }
 }

@@ -53,11 +53,13 @@
 #           its tool call - opening and closing while the row keeps focus)
 #           and keyboard-enter (Enter on the started agent, which opens it)
 #
-#   runs    message-runs and message-runs-open: the conversation of
+#   runs    message-runs, message-runs-hover, message-runs-menu and
+#           message-runs-open: the conversation of
 #           message-card-scene/runs.jsonl instead, which tells seven agents
 #           the same thing in two runs, a Bash call between them, one
-#           refused; then two different messages, and one alone. The second
-#           shot opens the run with the refused message.
+#           refused; then two different messages, and one alone. The run
+#           with the refused message shows its tooltip and its menu, then
+#           opens.
 #
 # The cards, narrow, long and keys scenes open the four messages' group, which
 # they fold into, before reaching their rows.
@@ -150,7 +152,8 @@ for _ in $(seq 20); do
     sleep 4
     "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
-    row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|t3code repo moved|Tell the other' | head -1 |
+    # The screen reading splits the row's title at any space.
+    row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|t3code|Tell the other' | head -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
     [ -n "$row" ] || continue
@@ -185,6 +188,18 @@ if [ "$scene" = runs ]; then
     [ -n "$refused" ] || refused=$(locate 'Messaged')
     [ -n "$refused" ] || "$ne" drive observe 2>&1 | grep -iE 'agents|sent|queued' | sed 's/^/   observed: /'
     if [ -n "$refused" ]; then
+        # Its tooltip says how each message went, and its menu copies the
+        # words they share.
+        "$ne" drive hover "$refused" >/dev/null 2>&1 || log "hover failed"
+        sleep 3
+        "$ne" shot message-runs-hover >/dev/null && log "shot message-runs-hover" ||
+            log "shot failed: message-runs-hover"
+        "$ne" drive click --button right "$refused" >/dev/null 2>&1 || log "right click failed"
+        sleep 2
+        "$ne" shot message-runs-menu >/dev/null && log "shot message-runs-menu" ||
+            log "shot failed: message-runs-menu"
+        "$ne" drive key Escape >/dev/null 2>&1 || :
+        sleep 1
         "$ne" drive click "$refused" >/dev/null 2>&1 || log "click failed"
         sleep 2
     else
@@ -205,7 +220,7 @@ if [ "$scene" = keys ]; then
     # its terminal button.
     # The messages fold into one group, which a click opens; its row comes
     # between the started agent's and the messages' in the traversal.
-    click 'Sent 4 messages' || :
+    click '4 messages' || :
     # The first message's tooltip names the agent its row cuts short. The
     # screen reading may split its text into runs anywhere, so its status,
     # the topmost "Queued", stands in for it.
@@ -219,6 +234,8 @@ if [ "$scene" = keys ]; then
     else
         log "not found: the first message"
     fi
+    # The open group moved the reply down; click it where it is now.
+    transcript=$(locate "$reply")
     "$ne" drive click "$transcript" >/dev/null 2>&1
     sleep 1
     key shift+Tab
@@ -240,8 +257,9 @@ if [ "$scene" = keys ]; then
     exit 0
 fi
 scroll "$transcript" -6
-# The messages fold into one group, by its line's start.
-click 'Sent 4 messages' || :
+# The messages fold into one group, by its count, which the screen
+# reading keeps apart from the verb before it.
+click '4 messages' || :
 shot "${prefix}message-cards"
 if [ "$scene" = cards ]; then
     # The long message, by the start of its text.
