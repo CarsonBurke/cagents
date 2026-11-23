@@ -414,7 +414,11 @@ fn parse_window_slot(value: &str) -> Result<String, String> {
 pub enum DaemonCommand {
     /// Forward a framed daemon connection over stdin/stdout (used by SSH).
     #[command(hide = true)]
-    Bridge,
+    Bridge {
+        /// Serve the stable mobile API instead, as JSON lines (docs/mobile-api.md).
+        #[arg(long)]
+        mobile: bool,
+    },
     /// Start the daemon if it is not already running.
     Start,
     /// Report whether the daemon is running.
@@ -3456,7 +3460,7 @@ where
         }
         TopCommand::Daemon {
             command:
-                DaemonCommand::Bridge
+                DaemonCommand::Bridge { .. }
                 | DaemonCommand::Start
                 | DaemonCommand::Stop { .. }
                 | DaemonCommand::Preflight
@@ -3510,7 +3514,7 @@ where
         && matches!(
             &cli.command,
             TopCommand::Daemon {
-                command: DaemonCommand::Bridge
+                command: DaemonCommand::Bridge { .. }
                     | DaemonCommand::Upgrade { .. }
                     | DaemonCommand::RecoverUpdate { .. }
                     | DaemonCommand::InspectPendingUpdateRecovery { .. }
@@ -3722,13 +3726,16 @@ where
             }
         }
     }
-    if matches!(
-        cli.command,
-        TopCommand::Daemon {
-            command: DaemonCommand::Bridge
-        }
-    ) {
-        return match crate::device::serve_stdio() {
+    if let TopCommand::Daemon {
+        command: DaemonCommand::Bridge { mobile },
+    } = cli.command
+    {
+        let served = if mobile {
+            crate::mobile::serve_bridge()
+        } else {
+            crate::device::serve_stdio()
+        };
+        return match served {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) if crate::device::daemon_absent(&error) => {
                 crate::device::report_absent_bridge();
@@ -4389,7 +4396,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         ));
     }
     match command {
-        DaemonCommand::Bridge => Err(AppError::new(
+        DaemonCommand::Bridge { .. } => Err(AppError::new(
             "bridge",
             "stdio bridge must run before command output",
         )),

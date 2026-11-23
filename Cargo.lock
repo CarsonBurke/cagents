@@ -1257,6 +1257,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "bitflags 2.13.1",
+ "cagents-mobile-api",
  "clap",
  "clap_complete",
  "croner",
@@ -1352,6 +1353,14 @@ dependencies = [
  "iced_core",
  "iced_futures",
  "iced_graphics",
+]
+
+[[package]]
+name = "cagents-mobile-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

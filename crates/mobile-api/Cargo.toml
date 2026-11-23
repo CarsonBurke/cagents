@@ -1,0 +1,17 @@
+[package]
+name = "cagents-mobile-api"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+publish = false
+description = "The stable, versioned messages a phone exchanges with `cagents daemon bridge --mobile`."
+
+[lints]
+workspace = true
+
+# Only serde: the contract must not reach into cagents' internal types, which
+# change with every daemon protocol.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

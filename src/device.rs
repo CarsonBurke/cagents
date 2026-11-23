@@ -1136,9 +1136,11 @@ fn forward(transport: &Arc<Transport>, stream: UnixStream) -> io::Result<()> {
     let control = control_path(&transport.directory, slot.index).filter(|_| !paused);
     spawn_stream(transport, control.as_deref(), &starting, stream)?.finish(&transport.device)
 }
-/// Runs on the selected host through SSH. stdout contains only framed protocol
-/// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
-pub fn serve_stdio() -> io::Result<()> {
+/// What every daemon bridge does before it serves: refuse an agent's shell
+/// and a bridge to another device, give an SSH login the runtime directory
+/// it lacks, and find the daemon, starting it unless `--no-start` says not
+/// to. Returns the daemon's socket.
+pub(crate) fn bridge_socket() -> io::Result<PathBuf> {
     if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1170,11 +1172,17 @@ pub fn serve_stdio() -> io::Result<()> {
             "XDG_RUNTIME_DIR is missing; configure an owned private runtime directory for the remote daemon",
         ));
     }
-    let path = if crate::control::daemon_autostart_disabled() {
-        crate::terminal::ipc::daemon_socket_path()?
+    if crate::control::daemon_autostart_disabled() {
+        crate::terminal::ipc::daemon_socket_path()
     } else {
-        crate::terminal::ensure_daemon_ready().map_err(io::Error::other)?
-    };
+        crate::terminal::ensure_daemon_ready().map_err(io::Error::other)
+    }
+}
+
+/// Runs on the selected host through SSH. stdout contains only framed protocol
+/// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
+pub fn serve_stdio() -> io::Result<()> {
+    let path = bridge_socket()?;
     let stream = match UnixStream::connect(&path) {
         Ok(stream) => stream,
         Err(error)
