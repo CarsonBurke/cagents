@@ -123,7 +123,7 @@ fn named_glyph<'a, Message: 'a>(
 pub const fn check_state_look(state: CheckState) -> (Icon, fn(&cosmic::Theme) -> Color) {
     match state {
         CheckState::Failed => (Icon::Error, design::destructive_color),
-        CheckState::Pending => (Icon::CheckRunning, design::warning_color),
+        CheckState::Pending => (Icon::CheckRunning, design::muted_icon_color),
         CheckState::Passed => (Icon::Check, design::success_color),
         CheckState::Cancelled => (Icon::Cancel, design::muted_color),
         CheckState::Skipped => (Icon::Minus, design::muted_color),

@@ -239,12 +239,7 @@ fn heading(member: &Member, handle: &str, now: u64) -> String {
     let state = if member.exited {
         "exited"
     } else {
-        match session.state {
-            crate::agent::ActivityState::Unknown => "unknown",
-            crate::agent::ActivityState::Idle => "idle",
-            crate::agent::ActivityState::Working => "working",
-            crate::agent::ActivityState::Waiting => "waiting",
-        }
+        session.state.label()
     };
     let mut line = format!(
         "Session {} ({provider}, {state})",

@@ -226,7 +226,7 @@ fn merge(state: Option<ActivityState>, turn: ActivityState) -> ActivityState {
     let rank = |state| match state {
         ActivityState::Working => 3,
         ActivityState::Unknown => 2,
-        ActivityState::Waiting => 1,
+        ActivityState::Waiting | ActivityState::Approval | ActivityState::Question => 1,
         ActivityState::Idle => 0,
     };
     match state {

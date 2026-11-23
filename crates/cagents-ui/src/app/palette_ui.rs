@@ -895,6 +895,14 @@ impl Cagents {
         {
             Some(crate::agent::ActivityState::Working) if unread => "● Working · Unread",
             Some(crate::agent::ActivityState::Working) => "● Working",
+            Some(crate::agent::ActivityState::Approval) if unread => {
+                "◌ Waiting for permission · Unread"
+            }
+            Some(crate::agent::ActivityState::Approval) => "◌ Waiting for permission",
+            Some(crate::agent::ActivityState::Question) if unread => {
+                "◌ Waiting for an answer · Unread"
+            }
+            Some(crate::agent::ActivityState::Question) => "◌ Waiting for an answer",
             Some(crate::agent::ActivityState::Waiting) if unread => "◌ Waiting · Unread",
             Some(crate::agent::ActivityState::Waiting) => "◌ Waiting",
             _ if unread => "• Unread",

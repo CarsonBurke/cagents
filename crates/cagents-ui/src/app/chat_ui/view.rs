@@ -1123,8 +1123,8 @@ pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
     }
 }
 
-/// The row that closes a working transcript: a small muted spinner, or the
-/// waiting glyph, beside what the agent is doing. Without a glyph its place
+/// The row that closes a working transcript: the working spinner, or the
+/// glyph of what the agent waits for, beside what the agent is doing. Without a glyph its place
 /// stays empty, so the words keep their position.
 fn activity_row<'a>(
     glyph: Option<Icon>,
@@ -1132,11 +1132,7 @@ fn activity_row<'a>(
     failure: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let glyph = match glyph {
-        Some(Icon::AgentWorking) => crate::ui_controls::activity_spinner(
-            f32::from(design::COMPACT_ICON_SIZE),
-            design::muted_icon_color,
-        ),
-        Some(glyph) => crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE),
+        Some(glyph) => crate::sidebar::status_glyph(glyph, design::COMPACT_ICON_SIZE),
         None => widget::Space::new()
             .width(design::COMPACT_ICON_SIZE)
             .height(design::COMPACT_ICON_SIZE)
@@ -2239,10 +2235,24 @@ impl Runtime {
             return (
                 if working > 0 || snapshot.busy {
                     Some(Icon::AgentWorking)
+                } else if active
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
+                {
+                    // A usage limit waits on a reset or another account,
+                    // not on a fix: the limit's own mark, not a failure's.
+                    Some(Icon::UsageLimit)
                 } else if failure_label.is_some() || failed > 0 {
-                    Some(Icon::Warning)
+                    Some(Icon::Error)
                 } else if waiting > 0 {
-                    Some(Icon::AgentWaiting)
+                    // The conversation's own wait says what it waits for;
+                    // a subagent's alone is unnamed.
+                    glyph
+                        .filter(|glyph| {
+                            crate::sidebar::AttentionState::of_glyph(*glyph)
+                                .is_some_and(crate::sidebar::AttentionState::waits_on_user)
+                        })
+                        .or(Some(Icon::AgentWaiting))
                 } else {
                     None
                 },
@@ -2368,10 +2378,16 @@ impl Runtime {
         }
         let (glyph, label) = self.conversation_status(transitioning);
         match glyph {
-            Some(glyph @ (Icon::AgentWorking | Icon::AgentWaiting)) => Some((glyph, label)),
+            Some(glyph)
+                if glyph == Icon::AgentWorking
+                    || crate::sidebar::AttentionState::of_glyph(glyph)
+                        .is_some_and(crate::sidebar::AttentionState::waits_on_user) =>
+            {
+                Some((glyph, label))
+            }
             // A recent failed task stays actionable even after the lead finishes.
-            Some(Icon::Warning) if !snapshot.subagent_activity().failed.is_empty() => {
-                Some((Icon::Warning, label))
+            Some(Icon::Error) if !snapshot.subagent_activity().failed.is_empty() => {
+                Some((Icon::Error, label))
             }
             // Nothing is asked of the reader, but the finished stamp alone
             // would read as everything being done.
@@ -2630,7 +2646,17 @@ impl Runtime {
         } else if snapshot.exited {
             (Some(Icon::Warning), "Exited")
         } else if snapshot.waiting || !snapshot.requests.is_empty() {
-            (Some(Icon::AgentWaiting), "Waiting for you")
+            // What it waits for, where a request says: the same glyph the
+            // sidebar and tabs give that wait.
+            match snapshot.activity() {
+                crate::agent::ActivityState::Approval => {
+                    (Some(Icon::Permission), "Waiting for your permission")
+                }
+                crate::agent::ActivityState::Question => {
+                    (Some(Icon::Question), "Waiting for your answer")
+                }
+                _ => (Some(Icon::AgentWaiting), "Waiting for you"),
+            }
         } else if !snapshot.busy
             && snapshot
                 .subagents
@@ -2659,12 +2685,12 @@ impl Runtime {
                 Some(match label {
                     TURN_STOPPED => Icon::Ended,
                     "Finished" => Icon::Check,
-                    _ => Icon::Warning,
+                    _ => Icon::Error,
                 }),
                 label,
             )
         } else if self.reported_errors().next().is_some() {
-            (Some(Icon::Warning), "Error")
+            (Some(Icon::Error), "Error")
         } else if self.is_draft() {
             (None, "Draft")
         } else if snapshot.ready {
@@ -4451,13 +4477,23 @@ impl Runtime {
             status.extend(context);
             engine = controls;
         }
+        let approval_pending = snapshot
+            .requests
+            .iter()
+            .any(|request| request.kind == chat::RequestKind::Approval);
         let notice = permissions::notice(snapshot).map(|notice| {
             widget::button::custom(
                 widget::row::with_children(
-                    std::iter::once(crate::ui_controls::passive_icon(
-                        Icon::Warning,
-                        design::COMPACT_ICON_SIZE,
-                    ))
+                    // A pending approval is the permission wait every other
+                    // surface marks; a blocked tool stays a caution.
+                    std::iter::once(if approval_pending {
+                        crate::sidebar::attention_mark(
+                            crate::sidebar::AttentionState::Approval,
+                            design::COMPACT_ICON_SIZE,
+                        )
+                    } else {
+                        crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE)
+                    })
                     .chain((fit == FooterFit::Wide).then(|| {
                         design::caption(notice)
                             .class(cosmic::theme::Text::Custom(design::warning_text))
@@ -8013,10 +8049,14 @@ pub(super) fn request_view<'a>(
     let (question, context) = question_and_context(&request.description);
     let mut rows: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(vec![
-            // The same glyph the status line shows while the agent waits
-            // on the reader, so the pane and the panel agree about who is
+            // The same mark the status line and the sidebar show while the
+            // agent waits on this request, so they agree about what is
             // holding the conversation up.
-            crate::ui_controls::passive_icon(Icon::AgentWaiting, design::ROW_ICON_SIZE),
+            crate::sidebar::attention_mark(
+                crate::sidebar::AttentionState::of_activity(request.wait())
+                    .expect("a request is a wait"),
+                design::ROW_ICON_SIZE,
+            ),
             design::heading(request.title.as_str())
                 .width(Length::Fill)
                 .into(),

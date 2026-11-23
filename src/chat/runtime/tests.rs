@@ -2586,7 +2586,7 @@ fn outstanding_decisions_remain_waiting_after_streaming_stops() {
             actions: Vec::new(),
         }),
     );
-    assert_eq!(state.activity(), ActivityState::Waiting);
+    assert_eq!(state.activity(), ActivityState::Approval);
     apply_event(
         &mut state,
         &mut indices,
@@ -2595,7 +2595,7 @@ fn outstanding_decisions_remain_waiting_after_streaming_stops() {
             detail: String::new(),
         },
     );
-    assert_eq!(state.activity(), ActivityState::Waiting);
+    assert_eq!(state.activity(), ActivityState::Approval);
     apply_event(
         &mut state,
         &mut indices,
@@ -3729,7 +3729,7 @@ fn notification_waiting_context_revises_without_an_activity_transition() {
         assert_eq!(handle.notification_content(evidence.kind).preview, expected);
         assert_eq!(
             handle.snapshot(None).unwrap().activity(),
-            ActivityState::Waiting
+            ActivityState::Question
         );
         keys.push(evidence.key);
     }

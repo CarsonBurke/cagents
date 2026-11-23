@@ -114,7 +114,7 @@ impl Cagents {
         if self.sidebar_state.card_attention(card).state() == Some(sidebar::AttentionState::Limited)
         {
             return Status {
-                glyph: Icon::Warning,
+                glyph: Icon::UsageLimit,
                 label: "Stopped by a usage limit".to_owned(),
             };
         }
@@ -124,10 +124,16 @@ impl Cagents {
                     glyph: Icon::AgentWorking,
                     label: format!("{} working", activity.provider.label()),
                 },
-                ActivityState::Waiting => Status {
-                    glyph: Icon::AgentWaiting,
-                    label: "Waiting for your input".to_owned(),
-                },
+                waiting @ (ActivityState::Waiting
+                | ActivityState::Approval
+                | ActivityState::Question) => {
+                    let state = sidebar::AttentionState::of_activity(waiting)
+                        .expect("a wait is an attention state");
+                    Status {
+                        glyph: state.glyph().expect("a wait has a glyph"),
+                        label: state.look().label.to_owned(),
+                    }
+                }
                 ActivityState::Idle | ActivityState::Unknown => Status {
                     glyph: Icon::Agent,
                     label: format!("{} ready", activity.provider.label()),
@@ -252,13 +258,9 @@ fn folders(projects: &[sidebar::SidebarProject]) -> HashMap<PathBuf, Listed> {
     folders
 }
 
-/// A status's glyph: a spinner while the agent works.
+/// A status's glyph, in its state's look where it names one.
 pub(super) fn status_mark<'a>(glyph: Icon) -> Element<'a, Message> {
-    if glyph == Icon::AgentWorking {
-        crate::ui_controls::activity_spinner(f32::from(design::ROW_ICON_SIZE), design::accent_color)
-    } else {
-        crate::ui_controls::passive_icon(glyph, design::ROW_ICON_SIZE)
-    }
+    sidebar::status_glyph(glyph, design::ROW_ICON_SIZE)
 }
 
 #[cfg(test)]

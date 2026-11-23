@@ -24,8 +24,8 @@ use crate::{
     design::{self, Tone, space},
     model::{CardId, ProjectId, ProjectKind, WorktreeId},
     sidebar::{
-        ProjectCommand, RowDeletion, SidebarAction, SidebarEditor, SidebarProject, SidebarWorktree,
-        WorktreeOperationPhase, WorktreeOperationRow, WorktreePullRequestState,
+        AttentionState, ProjectCommand, RowDeletion, SidebarAction, SidebarEditor, SidebarProject,
+        SidebarWorktree, WorktreeOperationPhase, WorktreeOperationRow, WorktreePullRequestState,
         is_primary_worktree,
     },
     ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
@@ -41,7 +41,8 @@ const ROW_ESTIMATE: f32 = 58.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
     Working,
-    Waiting,
+    /// Waiting on the user, for permission, for an answer, or unnamed.
+    Waiting(AttentionState),
     Idle,
     /// An agent launched in a terminal that has yet to report.
     Starting,
@@ -53,7 +54,9 @@ impl AgentState {
     fn label(self) -> &'static str {
         match self {
             Self::Working => "working",
-            Self::Waiting => "waiting for you",
+            Self::Waiting(AttentionState::Approval) => "waiting for your permission",
+            Self::Waiting(AttentionState::Question) => "waiting for your answer",
+            Self::Waiting(_) => "waiting for you",
             Self::Idle => "idle",
             Self::Starting => "starting",
             Self::Shell => "terminal",
@@ -623,7 +626,7 @@ impl<'a> View<'a> {
             {
                 match agent.state {
                     AgentState::Working => working += 1,
-                    AgentState::Waiting => waiting += 1,
+                    AgentState::Waiting(_) => waiting += 1,
                     _ => {}
                 }
             }
@@ -653,7 +656,7 @@ impl<'a> View<'a> {
         if working > 0 {
             title.push(crate::interaction::tooltip(
                 widget::row::with_children(vec![
-                    crate::ui_controls::activity_spinner(12.0, design::accent_color),
+                    crate::ui_controls::activity_spinner(12.0, design::activity_color),
                     design::caption(working.to_string()).into(),
                 ])
                 .spacing(space::XXS)
@@ -779,9 +782,12 @@ impl<'a> View<'a> {
     fn operation(&self, operation: &'a WorktreeOperationRow) -> Element<'a, Action> {
         let failed = operation.phase == WorktreeOperationPhase::Failed;
         let glyph: Element<'a, Action> = if failed {
-            widget::icon(Icon::Warning.handle())
-                .size(design::ROW_ICON_SIZE)
-                .into()
+            // As the sidebar draws the same failed creation.
+            crate::sidebar::toned_icon_sized(
+                Icon::Error,
+                crate::sidebar::BadgeTone::Danger,
+                design::ROW_ICON_SIZE,
+            )
         } else {
             widget::container(crate::ui_controls::activity_spinner(
                 12.0,
@@ -1020,7 +1026,7 @@ impl<'a> View<'a> {
         }
         if let Some(label) = indicators.dirty {
             facts.push(crate::interaction::tooltip(
-                badge(label, Tone::Themed(design::warning_color)),
+                badge(label, Tone::Themed(design::muted_icon_color)),
                 "Uncommitted changes in the checkout",
             ));
         }
@@ -1064,12 +1070,10 @@ impl<'a> View<'a> {
     /// it is in; pressing it goes there.
     fn agent(&self, agent: &'a Agent) -> Element<'a, Action> {
         let glyph: Element<'a, Action> = match (agent.state, agent.provider) {
-            (AgentState::Working, _) => {
-                crate::ui_controls::activity_spinner(12.0, design::accent_color)
+            (AgentState::Working, _) => crate::sidebar::attention_mark(AttentionState::Working, 12),
+            (AgentState::Waiting(state), _) => {
+                crate::sidebar::attention_mark(state, design::COMPACT_ICON_SIZE)
             }
-            (AgentState::Waiting, _) => widget::icon(Icon::AgentWaiting.handle())
-                .size(design::COMPACT_ICON_SIZE)
-                .into(),
             (_, Some(provider)) => widget::icon(crate::ui_controls::provider_icon(provider))
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),

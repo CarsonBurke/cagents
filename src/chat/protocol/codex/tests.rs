@@ -1181,7 +1181,7 @@ fn notification_old_completion_preserves_current_question_topic_and_error_state(
     assert_eq!(state.requests.len(), 1);
     assert_eq!(state.requests[0].id, "71");
     assert!(state.error.is_none());
-    assert_eq!(state.activity(), crate::agent::ActivityState::Waiting);
+    assert_eq!(state.activity(), crate::agent::ActivityState::Question);
 }
 
 #[test]

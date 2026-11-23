@@ -119,11 +119,10 @@ impl Cagents {
             let (provider, state) = match (&card.kind, activity) {
                 (CardKind::Chat(_) | CardKind::Terminal(_), Some(activity)) => (
                     Some(activity.provider),
-                    match activity.state {
-                        crate::agent::ActivityState::Working => AgentState::Working,
-                        crate::agent::ActivityState::Waiting => AgentState::Waiting,
-                        crate::agent::ActivityState::Idle
-                        | crate::agent::ActivityState::Unknown => AgentState::Idle,
+                    match crate::sidebar::AttentionState::of_activity(activity.state) {
+                        Some(crate::sidebar::AttentionState::Working) => AgentState::Working,
+                        Some(wait) => AgentState::Waiting(wait),
+                        None => AgentState::Idle,
                     },
                 ),
                 (CardKind::Chat(session), None) => {
@@ -177,7 +176,7 @@ impl Cagents {
         for working in agents.values_mut() {
             working.sort_by_key(|agent| match agent.state {
                 AgentState::Working => 0,
-                AgentState::Waiting => 1,
+                AgentState::Waiting(_) => 1,
                 AgentState::Starting => 2,
                 AgentState::Idle => 3,
                 AgentState::Shell => 4,

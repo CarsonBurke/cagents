@@ -41,6 +41,11 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemberState {
     Working,
+    /// Waiting for the user to allow or refuse an action.
+    Approval,
+    /// Waiting for the user to answer a question.
+    Question,
+    /// Waiting on the user for something its provider does not name.
     Waiting,
     Limited,
     Idle,
@@ -49,8 +54,10 @@ pub enum MemberState {
 }
 
 impl MemberState {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Working,
+        Self::Approval,
+        Self::Question,
         Self::Waiting,
         Self::Limited,
         Self::Idle,
@@ -65,6 +72,8 @@ impl MemberState {
         }
         match activity {
             ActivityState::Working => Self::Working,
+            ActivityState::Approval => Self::Approval,
+            ActivityState::Question => Self::Question,
             ActivityState::Waiting => Self::Waiting,
             ActivityState::Idle => Self::Idle,
             ActivityState::Unknown => Self::Running,
@@ -74,6 +83,8 @@ impl MemberState {
     fn label(self) -> &'static str {
         match self {
             Self::Working => "working",
+            Self::Approval => "waiting for permission",
+            Self::Question => "waiting for an answer",
             Self::Waiting => "waiting for input",
             Self::Limited => "stopped by a usage limit",
             Self::Idle => "idle",
@@ -772,6 +783,24 @@ mod tests {
         assert_eq!(
             MemberState::of(ActivityState::Unknown, false),
             MemberState::Running
+        );
+    }
+
+    /// A member waiting on the user says what for, as the row's mark does.
+    #[test]
+    fn a_waiting_member_keeps_what_it_waits_for() {
+        use crate::agent::{ActivityState, Provider::Claude};
+        assert_eq!(
+            MemberState::of(ActivityState::Approval, false),
+            MemberState::Approval
+        );
+        assert_eq!(
+            MemberState::of(ActivityState::Question, false),
+            MemberState::Question
+        );
+        assert_eq!(
+            members(&[(Claude, MemberState::Approval)], 0).description(),
+            "Claude Code, waiting for permission"
         );
     }
 

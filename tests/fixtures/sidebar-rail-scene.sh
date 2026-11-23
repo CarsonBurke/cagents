@@ -26,6 +26,8 @@
 #   unread    a successful result ends the turn while its place is not open
 #   failed    an error result ends the turn
 #   waiting   a tool permission request, held open
+#   question  an AskUserQuestion request, held open
+#   limited   a usage-limit error result ends the turn
 #
 # Agents with no channel are spawned with `agent spawn --worktree`, among the
 # panes of one checkout: one waiting in cagents' rail-badges worktree, one
@@ -186,6 +188,16 @@ frames_for() {
                 '{"type":"control_request","request_id":"permission-@TURN@","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-@TURN@","input":{"command":"rm -rf target","description":"Clear the build cache"}}}' \
                 '{"_sleep":3600}' >"$frames"
             ;;
+        question)
+            printf '%s\n' \
+                '{"type":"control_request","request_id":"question-@TURN@","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"tool-@TURN@","input":{"questions":[{"question":"Which crash report should I start with?","header":"Report","multiSelect":false,"options":[{"label":"Newest","description":"The report from this morning"},{"label":"Most frequent","description":"The one seen 40 times"}]}]}}}' \
+                '{"_sleep":3600}' >"$frames"
+            ;;
+        limited)
+            printf '%s\n' \
+                '{"type":"result","uuid":"scene-result-@TURN@","subtype":"error_during_execution","is_error":true,"errors":["You'\''ve hit your limit · resets 6pm"]}' \
+                '{"_end":true}' >"$frames"
+            ;;
     esac
 }
 
@@ -232,7 +244,8 @@ cmd_live() {
     spawn failed glacier-ml "Eval harness"
     spawn failed glacier-ml "Eval harness"
     spawn waiting cagents "Sidebar rail"
-    spawn waiting ferry "Crash on resume"
+    spawn question ferry "Crash on resume"
+    spawn limited infra-terraform-modules-shared "Cost report"
     spawn working cagents "Transcript pipeline"
     spawn working cagents "Channel speed"
     spawn working atlas "Flaky login test"
@@ -296,5 +309,5 @@ case ${1:-} in
     live) cmd_live ;;
     unreachable) cmd_unreachable ;;
     theme) cmd_theme "${2:?dark or light}" ;;
-    *) sed -n '2,45p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,47p' "$0" >&2; exit 2 ;;
 esac

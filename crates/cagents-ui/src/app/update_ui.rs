@@ -250,7 +250,8 @@ fn disposition_tone(disposition: crate::update::impact::Disposition) -> design::
     let tone: fn(&cosmic::Theme) -> iced::Color = match disposition {
         Disposition::Continues => design::success_color,
         Disposition::Resumes | Disposition::ResumePicker => design::muted_color,
-        Disposition::WaitsForIdle | Disposition::Blocked => design::warning_color,
+        Disposition::WaitsForIdle => design::muted_color,
+        Disposition::Blocked => design::warning_color,
         Disposition::Interrupted => design::destructive_color,
     };
     tone.into()

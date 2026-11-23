@@ -632,7 +632,16 @@ impl SidebarChannel {
         // unread news, a failure, or an agent the members leave out.
         let described = AttentionSummary {
             working: self.members.agents_in(ChannelMemberState::Working),
-            waiting: self.members.agents_in(ChannelMemberState::Waiting),
+            waiting: [
+                ChannelMemberState::Approval,
+                ChannelMemberState::Question,
+                ChannelMemberState::Waiting,
+            ]
+            .map(|state| self.members.agents_in(state))
+            .iter()
+            .sum(),
+            approval: self.members.agents_in(ChannelMemberState::Approval),
+            question: self.members.agents_in(ChannelMemberState::Question),
             limited: self.members.agents_in(ChannelMemberState::Limited),
             ..AttentionSummary::default()
         };
@@ -3665,7 +3674,7 @@ impl SidebarState {
         if self
             .agent_activity
             .get(&card)
-            .is_some_and(|entry| entry.activity.state == crate::agent::ActivityState::Waiting)
+            .is_some_and(|entry| entry.activity.state.waits_on_user())
         {
             let row = self.listed_attention_card(card);
             self.retain_attention_rows(row, placement, Listing::Handled);
@@ -6212,7 +6221,7 @@ fn header<'a>(
     if loading {
         children.push(crate::ui_controls::activity_spinner(
             f32::from(ROW_ICON_SIZE),
-            design::warning_color,
+            design::muted_icon_color,
         ));
     }
     children.extend(actions);
@@ -7018,7 +7027,10 @@ fn project_identity_row(
         chrome.open_name.to_string()
     };
     match activity {
-        Some(crate::agent::ActivityState::Waiting) => name.push_str(", agent needs input"),
+        Some(state) if state.waits_on_user() => {
+            name.push_str(", agent ");
+            name.push_str(agent_wait_name(state));
+        }
         Some(crate::agent::ActivityState::Working) => name.push_str(", agent working"),
         _ => {}
     }
@@ -7181,12 +7193,12 @@ fn compact_operation_rows(
 }
 
 /// The leading glyph: the worktree icon the row will keep, muted, while the
-/// creation runs; a warning once it has failed. The spinner is the status
+/// creation runs; the error glyph once it has failed. The spinner is the status
 /// slot's in a row, and a corner badge's in the rail.
 fn operation_icon(phase: WorktreeOperationPhase, size: u16) -> Element<'static, SidebarAction> {
     match phase {
         WorktreeOperationPhase::Working => worktree_glyph_muted(size).into(),
-        WorktreeOperationPhase::Failed => toned_icon_sized(Icon::Warning, BadgeTone::Warning, size),
+        WorktreeOperationPhase::Failed => toned_icon_sized(Icon::Error, BadgeTone::Danger, size),
     }
 }
 
@@ -7892,8 +7904,15 @@ fn compact_project_identity(
         );
         let mut worktree_attention = state.worktree_attention(project.id, worktree.id);
         if attention.waiting_worktrees.contains(&worktree.id) {
-            description.push_str(", agent needs input");
+            description.push_str(", agent ");
+            description.push_str(agent_wait_name(
+                worktree_attention
+                    .activity()
+                    .unwrap_or(crate::agent::ActivityState::Waiting),
+            ));
             worktree_attention.waiting = 0;
+            worktree_attention.approval = 0;
+            worktree_attention.question = 0;
         }
         let news = worktree_attention.description();
         if !news.is_empty() {
@@ -7906,8 +7925,13 @@ fn compact_project_identity(
         description.push('\n');
         description.push_str(&news);
     }
-    if activity == Some(crate::agent::ActivityState::Waiting) {
-        description.push_str("\nAn agent is waiting for input");
+    if let Some(state) = activity.filter(|state| state.waits_on_user()) {
+        description.push_str("\nAn agent is ");
+        description.push_str(match state {
+            crate::agent::ActivityState::Approval => "waiting for your permission",
+            crate::agent::ActivityState::Question => "waiting for your answer",
+            _ => "waiting for input",
+        });
     }
     // The tooltip names the project and says what is going on in it; the
     // per-worktree breakdown is for a screen reader, which cannot glance at
@@ -8364,32 +8388,74 @@ fn agent_indicator(
     attention_indicator(AttentionSummary::card(activity, unread, false))
 }
 
+/// A state's mark at `size`, in its tone: the one drawing of each state that
+/// every surface showing an agent's state uses.
+pub fn attention_mark<'a, Message: Clone + 'a>(
+    state: AttentionState,
+    size: u16,
+) -> Element<'a, Message> {
+    let look = state.look();
+    let ink = look.tone.color();
+    match look.mark {
+        attention::Mark::Spinner => crate::ui_controls::activity_spinner(f32::from(size), ink),
+        attention::Mark::Dot => {
+            // The dot is a third of the glyph box, centred in it, so it
+            // takes the glyph's room in a row rather than moving its text.
+            let dot = (f32::from(size) / 3.0).round();
+            widget::container(
+                widget::container(cosmic::iced::widget::Space::new())
+                    .width(Length::Fixed(dot))
+                    .height(Length::Fixed(dot))
+                    .class(theme::Container::custom(move |theme| {
+                        cosmic::iced::widget::container::Style {
+                            background: Some(cosmic::iced::Background::Color(ink(theme))),
+                            border: cosmic::iced::Border {
+                                radius: (dot / 2.0).into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    })),
+            )
+            .center(Length::Fixed(f32::from(size)))
+            .into()
+        }
+        attention::Mark::Glyph(icon) => widget::container(widget::icon(icon.handle()).size(size))
+            .class(theme::Container::custom(move |theme| {
+                cosmic::iced::widget::container::Style {
+                    icon_color: Some(ink(theme)),
+                    ..Default::default()
+                }
+            }))
+            .into(),
+    }
+}
+
+/// A status glyph at `size`: an agent state's mark where the glyph names one,
+/// else the glyph in the muted ink of an informative icon.
+pub fn status_glyph<'a, Message: Clone + 'a>(glyph: Icon, size: u16) -> Element<'a, Message> {
+    match AttentionState::of_glyph(glyph) {
+        Some(state) => attention_mark(state, size),
+        None => crate::ui_controls::passive_icon(glyph, size),
+    }
+}
+
+/// What a row's accessible name says of an agent waiting on the user, by
+/// what it waits for.
+fn agent_wait_name(state: crate::agent::ActivityState) -> &'static str {
+    match state {
+        crate::agent::ActivityState::Approval => "needs your permission",
+        crate::agent::ActivityState::Question => "has a question for you",
+        _ => "needs input",
+    }
+}
+
 pub fn attention_indicator<Message: Clone + 'static>(
     summary: AttentionSummary,
 ) -> Option<Element<'static, Message>> {
     let state = summary.state()?;
-    let indicator: Element<'static, Message> = match state {
-        AttentionState::Waiting => status_icon(
-            Icon::Warning,
-            "An agent is waiting for input",
-            BadgeTone::Warning,
-        ),
-        AttentionState::Failed => {
-            status_icon(Icon::Error, "Unread failed agent update", BadgeTone::Danger)
-        }
-        AttentionState::Limited => status_icon(
-            Icon::Alarm,
-            "An agent is stopped by a usage limit until it resets",
-            BadgeTone::Warning,
-        ),
-        AttentionState::Working => crate::interaction::tooltip(
-            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::warning_color),
-            "An agent is actively working",
-        ),
-        AttentionState::Unread => {
-            status_icon(Icon::Attention, "Unread agent update", BadgeTone::Neutral)
-        }
-    };
+    let indicator =
+        crate::interaction::tooltip(attention_mark(state, ROW_ICON_SIZE), state.look().label);
     if summary.unread == 0 {
         return Some(indicator);
     }
@@ -8853,7 +8919,7 @@ fn in_progress_section(
             widget::column::with_children(vec![
                 crate::ui_controls::activity_spinner(
                     f32::from(ROW_ICON_SIZE),
-                    design::warning_color,
+                    design::activity_color,
                 ),
                 count.size(9).into(),
             ])
@@ -9114,9 +9180,12 @@ fn worktree_accessible_name(
     if unread {
         name.to_mut().push_str(", unread agent update");
     }
+    // The row's own wait is said below, by its kind.
     let news = AttentionSummary {
         working: 0,
         waiting: 0,
+        approval: 0,
+        question: 0,
         ..attention
     }
     .description();
@@ -9126,7 +9195,10 @@ fn worktree_accessible_name(
     }
     match activity {
         Some(crate::agent::ActivityState::Working) => name.to_mut().push_str(", agent working"),
-        Some(crate::agent::ActivityState::Waiting) => name.to_mut().push_str(", agent needs input"),
+        Some(state) if state.waits_on_user() => {
+            name.to_mut().push_str(", agent ");
+            name.to_mut().push_str(agent_wait_name(state));
+        }
         _ => {}
     }
     name
@@ -9248,7 +9320,7 @@ fn worktree_view<'a>(
             content = content.push(status_icon(
                 Icon::Changes,
                 label.to_owned(),
-                BadgeTone::Warning,
+                BadgeTone::Neutral,
             ));
         }
         content = content.push(slot(indicators.pull_request.and_then(|pr| {
@@ -10310,7 +10382,7 @@ fn source_control_header<'a>(
     let mut header = widget::row::with_children(vec![
         crate::interaction::tooltip(
             widget::container(if activity.is_some() {
-                crate::ui_controls::activity_spinner(14.0, design::warning_color)
+                crate::ui_controls::activity_spinner(14.0, design::muted_icon_color)
             } else {
                 worktree_icon().icon().size(ROW_ICON_SIZE).into()
             })
@@ -10528,7 +10600,7 @@ fn panel_navigation<'a>(
         source
             .change_count_label
             .as_deref()
-            .map(|count| (Cow::Borrowed(count), design::warning_text as fn(&_) -> _))
+            .map(|count| (Cow::Borrowed(count), design::muted_text as fn(&_) -> _))
     };
     let tabs = match navigation {
         PanelNavigation::None => return None,
@@ -11304,7 +11376,7 @@ fn branch_changes_section<'a>(
                 BranchChanges::Loading(base_ref) => column
                     .push(
                         widget::row::with_children(vec![
-                            crate::ui_controls::activity_spinner(14.0, design::warning_color),
+                            crate::ui_controls::activity_spinner(14.0, design::muted_icon_color),
                             design::caption(format!("Comparing with {}…", base_ref.short_name()))
                                 .into(),
                         ])
@@ -11393,7 +11465,7 @@ fn branch_changes_section<'a>(
         let tone = match row.entry.kind {
             ChangeKind::Added => BadgeTone::Success,
             ChangeKind::Deleted => BadgeTone::Danger,
-            _ => BadgeTone::Warning,
+            _ => BadgeTone::Neutral,
         };
         rows.push(crate::sticky_tree::Row { depth: file.depth, directory: false, element: panel_row(
             &*row.label, if flat { 0 } else { file.depth },
@@ -11515,7 +11587,7 @@ fn change_row_view<'a>(
         match row.entry.kind {
             ChangeKind::Added | ChangeKind::Untracked => BadgeTone::Success,
             ChangeKind::Deleted | ChangeKind::Unmerged => BadgeTone::Danger,
-            _ => BadgeTone::Warning,
+            _ => BadgeTone::Neutral,
         }
     };
     let mut status = widget::row::with_capacity(3)
@@ -12312,7 +12384,7 @@ fn commit_changes_section<'a>(
                 let tone = match entry.kind {
                     ChangeKind::Added => BadgeTone::Success,
                     ChangeKind::Deleted => BadgeTone::Danger,
-                    _ => BadgeTone::Warning,
+                    _ => BadgeTone::Neutral,
                 };
                 column = column.push(panel_row(
                     label.clone(),
@@ -12807,7 +12879,10 @@ fn resize_handle(width: f32, modal_open: bool) -> Splitter<'static, SidebarActio
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A badge's palette. `Warning` and `Danger` are for what needs the user;
+/// see [`design::warning_color`]. Durable facts, such as uncommitted changes,
+/// are `Neutral`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadgeTone {
     Neutral,
     Success,
@@ -12867,7 +12942,7 @@ fn dirty_count(dirty: &DirtyState) -> u64 {
 fn check_tone(status: CheckStatus) -> BadgeTone {
     match status {
         CheckStatus::Passing => BadgeTone::Success,
-        CheckStatus::Pending => BadgeTone::Warning,
+        CheckStatus::Pending => BadgeTone::Neutral,
         CheckStatus::Failing => BadgeTone::Danger,
         CheckStatus::Unknown => BadgeTone::Neutral,
     }
@@ -12891,7 +12966,7 @@ fn toned_icon<'a, Message: 'a>(icon_name: Icon, tone: BadgeTone) -> Element<'a, 
     toned_icon_sized(icon_name, tone, ROW_ICON_SIZE)
 }
 
-fn toned_icon_sized<'a, Message: 'a>(
+pub(crate) fn toned_icon_sized<'a, Message: 'a>(
     icon_name: Icon,
     tone: BadgeTone,
     size: u16,
@@ -12904,7 +12979,7 @@ fn toned_icon_sized<'a, Message: 'a>(
                     BadgeTone::Success => cosmic.success.base.into(),
                     BadgeTone::Warning => cosmic.warning.base.into(),
                     BadgeTone::Danger => cosmic.destructive.base.into(),
-                    _ => design::muted_icon_color(theme),
+                    BadgeTone::Neutral => design::muted_icon_color(theme),
                 }),
                 ..Default::default()
             }
@@ -12928,7 +13003,10 @@ pub fn status_icon<'a, Message: Clone + 'a>(
 pub fn check_indicator<Message: Clone + 'static>(status: CheckStatus) -> Element<'static, Message> {
     if status == CheckStatus::Pending {
         return crate::interaction::tooltip(
-            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::warning_color),
+            crate::ui_controls::activity_spinner(
+                f32::from(ROW_ICON_SIZE),
+                design::muted_icon_color,
+            ),
             "CI checks pending or running",
         );
     }

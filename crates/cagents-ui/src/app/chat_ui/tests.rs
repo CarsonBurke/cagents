@@ -2243,8 +2243,13 @@ fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() 
         }),
     )));
     assert!(app.sidebar_state.has_card_update(card));
-    assert_eq!(app.sidebar_state.card_attention(card).failed, 1);
+    // The unread failure is the limit itself, so it reads as the limit.
+    assert_eq!(app.sidebar_state.card_attention(card).failed, 0);
     assert_eq!(app.sidebar_state.card_attention(card).limited, 1);
+    assert_eq!(
+        app.sidebar_state.card_attention(card).state(),
+        Some(crate::sidebar::AttentionState::Limited)
+    );
     assert_eq!(app.sidebar_state.card_attention(card).waiting, 0);
 
     // Read the limited channel's update through the normal focused-pane

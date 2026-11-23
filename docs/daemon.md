@@ -41,7 +41,8 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 protocol 185 retired; the Work board (`cagents work`) tracks pull requests. It withholds notifications the CLI couldn't read.
 What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
-running.
+running, and on protocols before 199, an agent waiting for approval or for
+an answer reads as waiting.
 An admitted CLI from before protocol 179 receives store contention as a
 retryable `Internal` error so it can decode the reply. One from before protocol 188
 receives a refusal that came before anything changed (`not_admitted`) as
@@ -241,7 +242,7 @@ The candidate drives qualified source daemons through a frozen lifecycle subset:
 the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
 protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
 (`c73002744`), 177 (`374370965`), 178 (`3b1e81a4d`, also served by
-`f016f047b`), 179 (`43f253ef8`), 187 (`ccd4134c6`) and 191 (`e8bbb84f2`), and the
+`f016f047b`), 179 (`43f253ef8`), 187 (`ccd4134c6`), 191 (`e8bbb84f2`) and 198 (the signed 0.2.0 and 0.2.1), and the
 matched current protocol. A protocol bump never drops a pinned build; retiring
 one is a deliberate change that `scripts/check-update-sources` enforces.
 Every other source protocol, including 160, 165, 174, 176, the candidate

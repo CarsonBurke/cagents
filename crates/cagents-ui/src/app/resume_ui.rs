@@ -2283,7 +2283,7 @@ impl Cagents {
             design::caption("Opening the conversation…").into()
         } else if let Some(error) = &state.error {
             design::caption(error.as_str())
-                .class(cosmic::theme::Text::Custom(design::warning_text))
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
                 .into()
         } else {
             design::caption("↑↓ choose · Enter resume · Tab where to look · Esc close").into()

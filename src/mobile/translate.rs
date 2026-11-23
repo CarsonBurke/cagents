@@ -80,7 +80,10 @@ pub fn activity(state: ActivityState) -> api::Activity {
         ActivityState::Unknown => api::Activity::Unknown,
         ActivityState::Idle => api::Activity::Idle,
         ActivityState::Working => api::Activity::Working,
-        ActivityState::Waiting => api::Activity::Waiting,
+        // The mobile API names no kind of wait; the request itself says.
+        ActivityState::Waiting | ActivityState::Approval | ActivityState::Question => {
+            api::Activity::Waiting
+        }
     }
 }
 

@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 198,
+    proven_at: 199,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -124,6 +124,10 @@ pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
 /// is read as an excerpt, whose numbers place nothing.
 pub(crate) const PATCH_LINE_ORIGIN: u16 = 195;
 
+/// The first protocol whose agent activity says what a waiting agent waits
+/// for. An older client is told it waits, as it was before.
+pub(crate) const WAIT_KINDS: u16 = 199;
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
 /// added them. The wire format proof accepts exactly these.
@@ -164,6 +168,8 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
 const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
     ("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS),
     ("cagents::chat::ToolStatus", "Ended", ENDED_TOOL_STATUS),
+    ("cagents::agent::ActivityState", "Approval", WAIT_KINDS),
+    ("cagents::agent::ActivityState", "Question", WAIT_KINDS),
     (
         "cagents::terminal::ipc::ProtocolErrorCode",
         "store_busy",
@@ -809,6 +815,41 @@ mod tests {
         // The scope ends with the encoding it was entered for.
         assert!(!encoding_before(PROTOCOL_VERSION + 1));
         assert_eq!(encode(ToolStatus::Waiting), waiting);
+    }
+
+    /// What a waiting agent waits for reaches a client that knows the kinds,
+    /// and an older one is told it waits, as it was before.
+    #[test]
+    fn a_wait_kind_reaches_an_older_client_as_waiting() {
+        use crate::agent::ActivityState;
+        let encode = |state: ActivityState| postcard::to_stdvec(&state).unwrap();
+        // Encoded as derived: by declaration position, and by name in JSON.
+        for state in [
+            ActivityState::Unknown,
+            ActivityState::Idle,
+            ActivityState::Working,
+            ActivityState::Waiting,
+            ActivityState::Approval,
+            ActivityState::Question,
+        ] {
+            let encoded = encode(state);
+            assert_eq!(
+                postcard::from_bytes::<ActivityState>(&encoded).unwrap(),
+                state
+            );
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, format!("\"{state:?}\""));
+            assert_eq!(serde_json::from_str::<ActivityState>(&json).unwrap(), state);
+        }
+        assert_eq!(encode(ActivityState::Approval), [4]);
+        assert_eq!(encode(ActivityState::Question), [5]);
+        for state in [ActivityState::Approval, ActivityState::Question] {
+            assert_eq!(
+                encoding_for(WAIT_KINDS - 1, || encode(state)),
+                encode(ActivityState::Waiting)
+            );
+            assert_eq!(encoding_for(WAIT_KINDS, || encode(state)), encode(state));
+        }
     }
 
     /// A file change crosses the protocol that added its line origin both

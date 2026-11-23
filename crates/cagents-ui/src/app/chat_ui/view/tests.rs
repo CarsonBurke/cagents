@@ -1451,7 +1451,7 @@ fn unstarted_conversation_footer_is_a_neutral_draft_not_a_pending_connection() {
         draft.error = Some("Local attachment could not be read".into());
         assert_eq!(
             draft.conversation_status(false),
-            (Some(Icon::Warning), "Error".into())
+            (Some(Icon::Error), "Error".into())
         );
 
         let connecting = Runtime::new(
@@ -1559,7 +1559,7 @@ fn a_stopped_command_is_a_notice_rather_than_the_conversation_state() {
     ));
     assert_eq!(
         runtime.conversation_status(false),
-        (Some(Icon::Warning), "Stopped: out of memory".into())
+        (Some(Icon::Error), "Stopped: out of memory".into())
     );
 }
 
@@ -1600,7 +1600,7 @@ fn agent_status_counts_only_active_states_and_identifies_the_current_failure() {
         .retain(|agent| agent.status == chat::ToolStatus::Failed);
     assert_eq!(
         runtime.timeline_activity(false, None),
-        Some((Icon::Warning, "1 failed: Check restart safety".into()))
+        Some((Icon::Error, "1 failed: Check restart safety".into()))
     );
 }
 
@@ -1621,7 +1621,7 @@ fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a
     let mut renderer = crate::app::tests::headless_renderer();
     let mut ui = UserInterface::build(
         activity_row(
-            Some(Icon::Warning),
+            Some(Icon::Error),
             String::new(),
             runtime.agent_failure_control(),
         ),
@@ -2280,7 +2280,7 @@ fn conversation_tab_marks_only_the_main_conversations_own_state() {
     Arc::make_mut(&mut runtime.snapshot).detail = "Turn interrupted".into();
     assert_eq!(state(&runtime), None);
     Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
-    assert_eq!(runtime.parent_tab_state(), Some((Icon::Warning, "Failed")));
+    assert_eq!(runtime.parent_tab_state(), Some((Icon::Error, "Failed")));
 }
 
 #[test]
@@ -5152,7 +5152,7 @@ fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebu
                         }
                         // The open subagent's transcript does not show the
                         // main conversation's request, so its tab does.
-                        _ => label == "Main conversation: Waiting for you",
+                        _ => label == "Main conversation: Waiting for your permission",
                     })
             })
             .and_then(|node| node.node().bounds())

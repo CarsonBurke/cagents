@@ -103,11 +103,22 @@ impl AppTheme {
             palette::{Srgb, Srgba},
         };
         let palette = match self {
+            // Applying it passes it through `attention_in_yellow`, which
+            // `cosmic::theme::adjust_system_themes` registers, as it does each
+            // theme the desktop sends later.
             Self::System => {
                 return cosmic::Theme::system(std::sync::Arc::new(system.cosmic().clone()));
             }
-            Self::Dark => return cosmic::Theme::dark(),
-            Self::Light => return cosmic::Theme::light(),
+            Self::Dark => {
+                return cosmic::Theme::custom(std::sync::Arc::new(attention_in_yellow(
+                    cosmic::Theme::dark().cosmic().clone(),
+                )));
+            }
+            Self::Light => {
+                return cosmic::Theme::custom(std::sync::Arc::new(attention_in_yellow(
+                    cosmic::Theme::light().cosmic().clone(),
+                )));
+            }
             Self::CatppuccinMocha => TerminalTheme::CatppuccinMocha,
             Self::CatppuccinLatte => TerminalTheme::CatppuccinLatte,
             Self::Dracula => TerminalTheme::Dracula,
@@ -147,6 +158,62 @@ impl AppTheme {
         builder.destructive = Some(rgb(palette.ansi[1]));
         cosmic::Theme::custom(std::sync::Arc::new(builder.build()))
     }
+}
+
+/// The warning tone on a dark surface: COSMIC's own yellow.
+#[cfg(feature = "ui")]
+const ATTENTION_ON_DARK: (u8, u8, u8) = (0xF7, 0xE0, 0x62);
+/// The warning tone on a light surface: a dark gold, since a bright yellow
+/// vanishes into white. About 4.8:1 against the darkest light surface, a
+/// component's #D7D7D7, and 6.9:1 for white text on it.
+#[cfg(feature = "ui")]
+const ATTENTION_ON_LIGHT: (u8, u8, u8) = (0x72, 0x56, 0x00);
+
+/// COSMIC's warning is a salmon orange that, on a dark theme, is hard to tell
+/// from its destructive red, so a row waiting on the user read as an error.
+/// The shell keeps warning for what needs the user and paints it yellow,
+/// leaving red to failures alone. The terminal palettes already take warning
+/// from their own yellow.
+#[cfg(feature = "ui")]
+pub fn attention_in_yellow(mut theme: cosmic::cosmic_theme::Theme) -> cosmic::cosmic_theme::Theme {
+    use cosmic::cosmic_theme::palette::Srgba;
+    let (r, g, b) = if theme.is_dark {
+        ATTENTION_ON_DARK
+    } else {
+        ATTENTION_ON_LIGHT
+    };
+    let yellow = Srgba::new(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        1.0,
+    );
+    recolor(&mut theme.warning, yellow);
+    recolor(&mut theme.warning_button, yellow);
+    theme
+}
+
+/// Moves a colored component onto a new base, as COSMIC would have derived it
+/// from that base: its hover and pressed states are its base under a 20% and a
+/// 50% overlay, so they keep that share of the base's change.
+#[cfg(feature = "ui")]
+fn recolor(
+    component: &mut cosmic::cosmic_theme::Component,
+    base: cosmic::cosmic_theme::palette::Srgba,
+) {
+    let old = component.base;
+    let shift = |color: &mut cosmic::cosmic_theme::palette::Srgba, share: f32| {
+        color.red += (base.red - old.red) * share;
+        color.green += (base.green - old.green) * share;
+        color.blue += (base.blue - old.blue) * share;
+    };
+    shift(&mut component.hover, 0.8);
+    shift(&mut component.selected, 0.8);
+    shift(&mut component.pressed, 0.5);
+    shift(&mut component.disabled, 1.0);
+    shift(&mut component.border, 1.0);
+    shift(&mut component.disabled_border, 1.0);
+    component.base = base;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3527,6 +3594,72 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    /// Attention is yellow in the stock themes, legible on their surfaces and
+    /// never mistakable for the destructive red failures keep to themselves.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn stock_themes_paint_attention_a_legible_yellow_apart_from_failure() {
+        use cosmic::cosmic_theme::palette::Srgba;
+        fn luminance(color: Srgba) -> f32 {
+            let linear = |channel: f32| {
+                if channel <= 0.04045 {
+                    channel / 12.92
+                } else {
+                    ((channel + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.red) + 0.7152 * linear(color.green) + 0.0722 * linear(color.blue)
+        }
+        fn contrast(a: Srgba, b: Srgba) -> f32 {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+        // The desktop's theme, light or dark, as libcosmic applies it, both
+        // when the app first sets it and whenever the desktop sends another.
+        cosmic::theme::adjust_system_themes(attention_in_yellow);
+        let applied_system = |dark: bool| {
+            let desktop = if dark {
+                cosmic::cosmic_theme::Theme::dark_default()
+            } else {
+                cosmic::cosmic_theme::Theme::light_default()
+            };
+            let mut applied = cosmic::Theme::default();
+            applied.set_theme(
+                AppTheme::System
+                    .resolve(&cosmic::Theme::system(std::sync::Arc::new(desktop)))
+                    .theme_type,
+            );
+            applied
+        };
+        let system = cosmic::Theme::dark();
+        for (theme, resolved) in [
+            ("Dark", AppTheme::Dark.resolve(&system)),
+            ("Light", AppTheme::Light.resolve(&system)),
+            ("System dark", applied_system(true)),
+            ("System light", applied_system(false)),
+        ] {
+            let cosmic = resolved.cosmic();
+            let warning = cosmic.warning.base;
+            // Yellow: red and green both well above blue, and close together.
+            assert!(
+                warning.blue < warning.green * 0.5 && (warning.red - warning.green).abs() < 0.3,
+                "{theme} warning {warning:?} is not yellow"
+            );
+            for surface in [cosmic.bg_color(), cosmic.primary_container_color()] {
+                assert!(
+                    contrast(warning, surface) >= 4.5,
+                    "{theme} warning is illegible on {surface:?}"
+                );
+            }
+            let red = cosmic.destructive.base;
+            assert!(
+                (warning.green - red.green).abs() > 0.2,
+                "{theme} warning reads as the destructive red"
+            );
+            assert!(contrast(cosmic.warning.on, warning) >= 4.5);
+        }
+    }
+
     #[test]
     fn language_server_initialization_options_round_trip_and_are_bounded() {
         let mut settings = AppSettings::default();

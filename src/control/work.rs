@@ -1302,9 +1302,13 @@ fn sessions(sessions: &[crate::work::Session]) -> String {
     ]
     .into_iter()
     .filter_map(|(state, label)| {
+        // Every kind of wait counts as waiting.
         let count = sessions
             .iter()
-            .filter(|session| session.state == state)
+            .filter(|session| {
+                session.state == state
+                    || state == ActivityState::Waiting && session.state.waits_on_user()
+            })
             .count();
         (count > 0).then(|| format!("{count} {label}"))
     })

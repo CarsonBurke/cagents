@@ -11191,9 +11191,10 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) if runtime.connected() && !pending => {
                 let snapshot = runtime.handle()?.snapshot();
                 match snapshot.activity() {
-                    crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting => {
-                        true
-                    }
+                    crate::agent::ActivityState::Working
+                    | crate::agent::ActivityState::Waiting
+                    | crate::agent::ActivityState::Approval
+                    | crate::agent::ActivityState::Question => true,
                     crate::agent::ActivityState::Unknown => return None,
                     // The provider says nothing of what it has not been handed.
                     crate::agent::ActivityState::Idle if runtime.message_on_its_way() => true,
