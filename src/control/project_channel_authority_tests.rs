@@ -8,7 +8,10 @@ use super::*;
 use crate::{
     model::{BootId, CardId, CardKind, HostIncarnation, HostSessionId, ProjectKind},
     terminal::ipc::ProtocolError,
-    workspace_model::views::{Change, Pane, Scope, View},
+    workspace_model::{
+        PaneDestination, PaneMove,
+        views::{Pane, Scope, View},
+    },
 };
 use std::{
     cell::{Cell, RefCell},
@@ -326,6 +329,9 @@ fn assert_refused(error: AppError, authority: &Authority) {
     }
 }
 
+/// Serves the reads a verb makes before its one mutating request and returns
+/// that request: a workspace edit, or for `move` the daemon-authorized
+/// `MovePane` (#3708).
 fn first_edit(peer: &mut UnixStream, verb: &str, model: &WorkspaceModel) -> ClientEnvelope {
     match verb {
         "open" | "spawn" => read_model(peer, model),
@@ -338,11 +344,28 @@ fn first_edit(peer: &mut UnixStream, verb: &str, model: &WorkspaceModel) -> Clie
         _ => panic!("unknown verb"),
     }
     let request = next(peer);
-    assert!(matches!(
-        request.request,
-        ClientRequest::EditWorkspaceModel { .. }
-    ));
+    if verb == "move" {
+        assert!(matches!(request.request, ClientRequest::MovePane { .. }));
+    } else {
+        assert!(matches!(
+            request.request,
+            ClientRequest::EditWorkspaceModel { .. }
+        ));
+    }
     request
+}
+
+/// The daemon's reply to a move of the fixture pane into `destination`.
+fn pane_moved(model: &WorkspaceModel, from: ChannelId, destination: ChannelId) -> ServerMessage {
+    ServerMessage::Response {
+        response: ServerResponse::PaneMoved(PaneMove {
+            pane: model.views[0].panes[0].clone(),
+            from: Scope::Channel(from),
+            channel: model.channel(destination).unwrap().clone(),
+            created: false,
+            sequence: model.sequence + 1,
+        }),
+    }
 }
 
 #[test]
@@ -475,35 +498,24 @@ fn public_user_close_and_move_preserve_exact_destructive_intent_and_receipts() {
                 ClientRequest::EditWorkspaceModel {
                     edit: ModelEdit::DeleteChannel { id },
                 } if verb == "channel-close" => assert_eq!(*id, source),
-                ClientRequest::EditWorkspaceModel {
-                    edit:
-                        ModelEdit::ChangeView {
-                            scope,
-                            expected_revision,
-                            operation,
-                            change,
-                        },
+                // The daemon resolves placement and authority; the CLI names
+                // the exact pane it resolved and the destination channel.
+                ClientRequest::MovePane {
+                    pane: actual,
+                    destination: target,
+                    operation,
                 } if verb == "move" => {
-                    assert_eq!(scope, &Scope::Channel(source));
-                    assert_eq!(*expected_revision, 7);
+                    assert_eq!(*actual, Some(pane));
+                    assert_eq!(target, &PaneDestination::Channel(destination));
                     assert!(!operation.is_nil());
-                    assert_eq!(
-                        change,
-                        &Change::Transfer {
-                            id: pane,
-                            destination: Scope::Channel(destination),
-                            before: None
-                        }
-                    );
                 }
                 _ => panic!("wrong destructive edit: {:?}", request.request),
             }
-            let mut result = model;
             if verb == "move" {
-                let moved = result.views[0].panes.remove(0);
-                result.views[1].panes.push(moved);
+                reply(peer, &request, pane_moved(&model, source, destination));
+            } else {
+                model_reply(peer, &request, model);
             }
-            model_reply(peer, &request, result);
         });
         let context = ProjectChannelContext {
             authority: Authority::default(),
@@ -523,6 +535,10 @@ fn public_user_close_and_move_preserve_exact_destructive_intent_and_receipts() {
         );
         if verb == "move" {
             assert_eq!(output.data["placement"], json!(Scope::Channel(destination)));
+            assert_eq!(output.data["from"], json!(Scope::Channel(source)));
+            assert_eq!(output.data["moved"], true);
+            assert_eq!(output.data["created"], false);
+            assert_eq!(output.data["pane"]["id"], json!(pane));
         } else {
             assert_eq!(output.data["closed"], true);
         }
@@ -563,7 +579,13 @@ fn every_scoped_legacy_mutation_authenticates_captured_authority_before_reads_an
         })
         .err()
         .expect("the synthetic scoped edit is refused");
-        assert_refused(error, &authority);
+        if verb == "move" {
+            // A move keeps the daemon's refusal as its sentence (#3708).
+            assert_eq!(error.kind, "permission_denied");
+            assert_eq!(error.message, "The private fixture refused this mutation");
+        } else {
+            assert_refused(error, &authority);
+        }
         assert_eq!(resolves.get(), 1);
         assert!(later_sample.borrow().token().is_none());
         peer.finished();
@@ -882,8 +904,13 @@ fn selected_readiness_and_connection_failures_keep_original_error_and_never_retr
     assert_eq!(attempts.get(), 1);
 }
 
+/// The daemon owns the same-project rule since #3708
+/// (`host::agent_execution::tests::pane_move` covers it). The CLI sends the
+/// one move it resolved, never a workspace edit, and keeps the daemon's
+/// refusal as its sentence.
 #[test]
-fn public_move_refuses_cross_project_before_editing() {
+fn public_move_reports_the_daemons_cross_project_refusal_without_editing() {
+    const REFUSAL: &str = "Channel \"channel 1\" is in /inert-other-project, and this pane works in the fixture folder. A pane moves only between channels of its own project";
     let fixture = Fixture::new();
     let mut model = fixture.model.clone();
     model
@@ -892,7 +919,24 @@ fn public_move_refuses_cross_project_before_editing() {
         .find(|channel| channel.id == fixture.destination)
         .unwrap()
         .repository = "/inert-other-project".into();
-    let peer = Peer::new(connected(), move |peer| read_model(peer, &model));
+    let (pane, destination) = (fixture.pane, fixture.destination);
+    let peer = Peer::new(connected(), move |peer| {
+        let request = first_edit(peer, "move", &model);
+        assert!(matches!(
+            &request.request,
+            ClientRequest::MovePane { pane: actual, destination: target, .. }
+                if *actual == Some(pane) && *target == PaneDestination::Channel(destination)
+        ));
+        reply(
+            peer,
+            &request,
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                REFUSAL,
+                false,
+            )),
+        );
+    });
     let context = ProjectChannelContext {
         authority: Authority::default(),
         no_start: true,
@@ -903,10 +947,7 @@ fn public_move_refuses_cross_project_before_editing() {
     .err()
     .unwrap();
     assert_eq!(error.kind, "invalid_target");
-    assert_eq!(
-        error.message,
-        "Panes can only move between channels of the same project"
-    );
+    assert_eq!(error.message, REFUSAL);
     peer.finished();
 }
 
