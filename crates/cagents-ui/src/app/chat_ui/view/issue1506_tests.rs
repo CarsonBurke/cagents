@@ -1085,20 +1085,20 @@ fn child_picker_filters_full_names_and_keeps_order_during_status_changes() {
         child("failed", ToolStatus::Failed, false),
     ];
     let mut picker = child_navigation::Picker::new(&children);
-    let order: Vec<_> = picker
-        .rows(&children, &Default::default(), &Default::default())
-        .iter()
-        .map(|child| child.id.clone())
-        .collect();
-    children[1].status = ToolStatus::Failed;
-    assert_eq!(
+    let rows = |picker: &child_navigation::Picker, children: &[chat::Subagent]| {
         picker
-            .rows(&children, &Default::default(), &Default::default())
+            .rows(children, &Default::default(), &Default::default())
             .iter()
             .map(|child| child.id.clone())
-            .collect::<Vec<_>>(),
-        order
-    );
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&picker, &children), ["failed", "working", "finished"]);
+    // A child that newly needs attention leads that section; the rest keep
+    // the places they opened with.
+    children[1].status = ToolStatus::Failed;
+    assert_eq!(rows(&picker, &children), ["working", "failed", "finished"]);
+    children[0].status = ToolStatus::Succeeded;
+    assert_eq!(rows(&picker, &children), ["working", "failed", "finished"]);
     picker.query = "working".into();
     assert_eq!(
         picker
@@ -1107,18 +1107,19 @@ fn child_picker_filters_full_names_and_keeps_order_during_status_changes() {
         1
     );
     picker.query.clear();
-    picker.filter = child_navigation::Filter::Attention;
+    // A failure is listed with what needs attention, ahead of the rest.
+    let sections: Vec<_> = picker
+        .rows(&children, &Default::default(), &Default::default())
+        .into_iter()
+        .map(child_navigation::Section::of)
+        .collect();
     assert_eq!(
-        picker
-            .rows(&children, &Default::default(), &Default::default())
-            .len(),
-        2
-    );
-    picker.filter = child_navigation::Filter::Working;
-    assert!(
-        picker
-            .rows(&children, &Default::default(), &Default::default())
-            .is_empty()
+        sections,
+        [
+            child_navigation::Section::Attention,
+            child_navigation::Section::Attention,
+            child_navigation::Section::Finished
+        ]
     );
 }
 
@@ -1153,7 +1154,7 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                 open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
             for height in [180.0, 600.0] {
                 // The navbar contains only the trigger. Exercise the actual
-                // in-pane chooser, including its bounded page of choices.
+                // in-pane chooser, including its bounded window of choices.
                 let mut element = if open {
                     runtime.child_picker_view().expect("open chooser")
                 } else {
@@ -1193,8 +1194,18 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                             .is_some_and(|(_, id)| id.starts_with("worker-"))
                     })
                     .collect();
-                assert_eq!(choices.len(), if open { 24 } else { 0 });
+                // The chooser builds only the rows in and near its view.
                 if open {
+                    assert!(
+                        (8..=24).contains(&choices.len()),
+                        "{} choices mounted",
+                        choices.len()
+                    );
+                } else {
+                    assert!(choices.is_empty());
+                }
+                if open {
+                    let shown = choices.len();
                     let mut actual = choices.into_iter().map(str::to_owned).collect::<Vec<_>>();
                     let mut expected = runtime
                         .child_picker
@@ -1206,7 +1217,7 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                             &runtime.agent_work,
                         )
                         .into_iter()
-                        .take(24)
+                        .take(shown)
                         .map(|child| {
                             runtime.child_choice_name(child, &runtime.child_label(child, 80))
                         })
@@ -1338,11 +1349,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
         cache = next_cache;
         if let Some(picker) = &live.child_picker {
             assert_eq!(live.focus_control(), "chat-subagent-search");
-            assert!(
-                current
-                    .iter()
-                    .any(|label| label == "Close subagent chooser — Escape")
-            );
+            assert!(current.iter().any(|label| label == "Close subagents (Esc)"));
             assert!(
                 !current.iter().any(|label| label == &diagnostic_copy),
                 "covered transcript actions must be absent from AX"
@@ -1378,15 +1385,13 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     app.chat_runtime_mut(target).unwrap().refresh();
     let (empty, _) = labels(&app, target, cache);
     assert!(
-        empty
-            .iter()
-            .any(|label| label == "Close subagent chooser — Escape"),
+        empty.iter().any(|label| label == "Close subagents (Esc)"),
         "{empty:?}"
     );
     assert!(
         !empty
             .iter()
-            .any(|label| label.starts_with("Search and filter subagents:"))
+            .any(|label| label.starts_with("All subagents:"))
     );
     drop(app.handle_chat_ui(Action::SubagentPicker(target, false)));
     assert!(runtime(&app, target).child_picker.is_none());

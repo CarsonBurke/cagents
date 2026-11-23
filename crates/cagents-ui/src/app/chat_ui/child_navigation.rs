@@ -3,25 +3,46 @@ use super::*;
 
 mod reveal;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Filter {
-    #[default]
-    All,
-    Working,
+/// Where the chooser lists a child: what asks something of the reader first,
+/// then what is still going, then what has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Section {
     Attention,
-    Failed,
+    Working,
     Finished,
+}
+
+impl Section {
+    pub(super) fn of(child: &chat::Subagent) -> Self {
+        match rank(child) {
+            0 => Self::Working,
+            FINISHED => Self::Finished,
+            _ => Self::Attention,
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Attention => "Needs attention",
+            Self::Working => "Working",
+            Self::Finished => "Finished",
+        }
+    }
 }
 
 #[derive(Default)]
 pub(super) struct Picker {
     pub query: String,
-    pub filter: Filter,
-    pub page: usize,
-    order: Vec<String>,
+    /// The section a control opened the chooser on, so that pressing that
+    /// control again closes it.
+    pub opened_on: Option<Section>,
+    /// The list's scroll offset and height, which choose the rows it builds.
+    pub scroll: f32,
+    pub viewport: Option<f32>,
+    /// Each child's place, and the section it held, when the chooser opened.
+    order: Vec<(String, Section)>,
 }
 
-const PAGE_SIZE: usize = 24;
 /// Tabs mounted beside the Conversation tab, apart from a selected or
 /// focused child pinned to the strip. The chooser is the complete catalog.
 const MAX_DIRECT_TABS: usize = 24;
@@ -74,13 +95,26 @@ fn child_icon(child: &chat::Subagent) -> Icon {
 }
 
 /// The small mark beside a child's name. Work in progress moves, the way the
-/// Conversation tab's own mark does; every other state is a still glyph.
-fn status_mark<'a>(child: &chat::Subagent) -> Element<'a, Message> {
+/// Conversation tab's own mark does; every other state is a still glyph, in
+/// the warning or error color when it asks something of the reader.
+pub(super) fn status_mark<'a>(child: &chat::Subagent) -> Element<'a, Message> {
+    let toned = |icon: Icon, color: fn(&cosmic::Theme) -> iced::Color| -> Element<'a, Message> {
+        widget::container(widget::icon(icon.into()).size(design::COMPACT_ICON_SIZE))
+            .class(cosmic::theme::Container::custom(move |theme| {
+                widget::container::Style {
+                    icon_color: Some(color(theme)),
+                    ..Default::default()
+                }
+            }))
+            .into()
+    };
     match child_icon(child) {
         Icon::AgentWorking => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::accent_color,
         ),
+        icon @ Icon::Error => toned(icon, design::destructive_color),
+        icon @ (Icon::AgentWaiting | Icon::Unavailable) => toned(icon, design::warning_color),
         icon => crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
     }
 }
@@ -245,15 +279,172 @@ pub(super) fn child_label<'a>(
     }
 }
 
+/// Each child's latest report to the conversation, by the ID the child is
+/// listed under.
+type Reports<'a> = HashMap<&'a str, &'a chat::Item>;
+
+/// When a child last did anything its transcript or its report shows, in
+/// Unix milliseconds. A child whose transcript was trimmed away and that
+/// has not reported shows nothing.
+fn last_activity(child: &chat::Subagent, report: Option<&chat::Item>) -> Option<u64> {
+    let worked = child
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| item.at.or(item.started_at));
+    worked.max(report.and_then(|report| report.at.or(report.started_at)))
+}
+
+/// A report's body, or its summary when it has none.
+fn report_text(report: &chat::Item) -> Option<&str> {
+    match &report.content {
+        ItemContent::Delivery { body, summary, .. } => Some(
+            if body.trim().is_empty() {
+                summary
+            } else {
+                body
+            }
+            .as_str(),
+        ),
+        _ => None,
+    }
+}
+
+/// When a child's transcript shows it starting, in Unix milliseconds.
+fn first_activity(child: &chat::Subagent) -> Option<u64> {
+    child
+        .items
+        .iter()
+        .find_map(|item| item.started_at.or(item.at))
+}
+
+/// How long something has gone on: `40s`, `12m`, `1h 05m`, `2d 3h`.
+fn span(millis: u64) -> String {
+    let seconds = millis / 1_000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h {:02}m", seconds / 3_600, seconds % 3_600 / 60),
+        _ => format!("{}d {}h", seconds / 86_400, seconds % 86_400 / 3_600),
+    }
+}
+
+/// A chooser row's time: how long a working child has been at it, and how
+/// long ago any other child last did something.
+fn row_time(child: &chat::Subagent, report: Option<&chat::Item>, now: u64) -> Option<String> {
+    match Section::of(child) {
+        Section::Working => first_activity(child).map(|start| span(now.saturating_sub(start))),
+        _ => last_activity(child, report).map(|last| {
+            cagents::account::format_ago(
+                i64::try_from(now.saturating_sub(last) / 1_000).unwrap_or(i64::MAX),
+            )
+        }),
+    }
+}
+
+/// The chooser's height for one section heading and for one child's row,
+/// whose two lines are cut to one each, so the list can build only the
+/// rows in and near view.
+const HEADING_HEIGHT: f32 = 32.0;
+const ROW_HEIGHT: f32 = 56.0;
+/// How far beyond its viewport the list builds rows, so a key that moves
+/// focus to the next row finds it built.
+const OVERSCAN: f32 = 4.0 * ROW_HEIGHT;
+/// The viewport assumed before the list has reported its own.
+const FIRST_VIEWPORT: f32 = 900.0;
+/// A list this tall or shorter is built whole: about fifty rows, cheap to
+/// build, and taller than any pane the list could fit in.
+const WHOLE_LIST: f32 = 3.0 * FIRST_VIEWPORT;
+
+/// The span of the list, in its own offsets, whose rows are built: the
+/// viewport and `OVERSCAN` either side.
+///
+/// The scrollable reports its offset and height only while its content
+/// overflows, so once a list fits (the pane grew, or the chooser opened on
+/// a section of a short list) both may be stale for good. A list short
+/// enough to fit any pane is therefore built whole, and a longer one, which
+/// overflows and so reports, has its offset held to the furthest it can
+/// scroll.
+fn built_span(total: f32, scroll: f32, viewport: Option<f32>) -> (f32, f32) {
+    if total <= WHOLE_LIST {
+        return (f32::NEG_INFINITY, f32::INFINITY);
+    }
+    let viewport = viewport.unwrap_or(FIRST_VIEWPORT);
+    let scroll = scroll.clamp(0.0, (total - viewport).max(0.0));
+    (scroll - OVERSCAN, scroll + viewport + OVERSCAN)
+}
+
+/// One line of the chooser's list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Entry<'a> {
+    Heading(Section, usize),
+    Child(&'a chat::Subagent),
+}
+
+impl Entry<'_> {
+    fn height(&self) -> f32 {
+        match self {
+            Self::Heading(..) => HEADING_HEIGHT,
+            Self::Child(_) => ROW_HEIGHT,
+        }
+    }
+}
+
+/// `rows`, sorted by section, each section under a heading with its count.
+fn entries<'a>(rows: &[&'a chat::Subagent]) -> Vec<Entry<'a>> {
+    let mut entries = Vec::with_capacity(rows.len() + 3);
+    for (index, child) in rows.iter().enumerate() {
+        let section = Section::of(child);
+        if index == 0 || Section::of(rows[index - 1]) != section {
+            let count = rows[index..]
+                .iter()
+                .take_while(|other| Section::of(other) == section)
+                .count();
+            entries.push(Entry::Heading(section, count));
+        }
+        entries.push(Entry::Child(child));
+    }
+    entries
+}
+
+/// Where `section`'s heading starts in the list, when it lists any child.
+fn section_offset(entries: &[Entry<'_>], section: Section) -> Option<f32> {
+    let mut offset = 0.0;
+    for entry in entries {
+        if matches!(entry, Entry::Heading(shown, _) if *shown == section) {
+            return Some(offset);
+        }
+        offset += entry.height();
+    }
+    None
+}
+
 impl Picker {
-    /// The chooser keeps the order it opened with, so a row does not move out
-    /// from under the pointer when its child's state changes. It is the
-    /// tabs' order at that moment: working first, then the provider's order.
+    /// The chooser keeps the order it opened with within each section, so a
+    /// row does not move out from under the pointer while children report;
+    /// only a change of state moves a child to another section. Within a
+    /// section the child that did something last leads.
+    #[cfg(test)]
     pub fn new(children: &[chat::Subagent]) -> Self {
+        Self::ordered(children, &Reports::new())
+    }
+
+    fn ordered(children: &[chat::Subagent], reports: &Reports<'_>) -> Self {
         let mut order: Vec<_> = children.iter().collect();
-        order.sort_by_key(|child| rank(child));
+        order.sort_by_key(|child| {
+            (
+                Section::of(child),
+                std::cmp::Reverse(last_activity(
+                    child,
+                    reports.get(child.id.as_str()).copied(),
+                )),
+            )
+        });
         Self {
-            order: order.into_iter().map(|child| child.id.clone()).collect(),
+            order: order
+                .into_iter()
+                .map(|child| (child.id.clone(), Section::of(child)))
+                .collect(),
             ..Self::default()
         }
     }
@@ -268,46 +459,71 @@ impl Picker {
         let mut rows: Vec<_> = children
             .iter()
             .filter(|child| {
-                let admitted = match self.filter {
-                    Filter::All => true,
-                    Filter::Working => child.status == chat::ToolStatus::Running && !child.waiting,
-                    Filter::Attention => needs_attention(child),
-                    Filter::Failed => child.status == chat::ToolStatus::Failed,
-                    Filter::Finished => finished(child),
-                };
                 // The reader searches what the chooser shows: the numbered
                 // name, the task's first line, the model and the state.
-                admitted
-                    && (query.is_empty()
-                        || [
-                            &child_label(children, ordinals, child, usize::MAX),
-                            Runtime::native_child_task(child).unwrap_or_default(),
-                            &child.id,
-                            child.model.as_deref().unwrap_or_default(),
-                            work.caption(child),
-                        ]
-                        .iter()
-                        .any(|part| part.to_lowercase().contains(&query)))
+                query.is_empty()
+                    || [
+                        &child_label(children, ordinals, child, usize::MAX),
+                        Runtime::native_child_task(child).unwrap_or_default(),
+                        &child.id,
+                        child.model.as_deref().unwrap_or_default(),
+                        work.caption(child),
+                    ]
+                    .iter()
+                    .any(|part| part.to_lowercase().contains(&query))
             })
             .collect();
-        // Stable ordering preserves the provider's order among equal states.
         let order: HashMap<_, _> = self
             .order
             .iter()
             .enumerate()
-            .map(|(index, id)| (id.as_str(), index))
+            .map(|(index, (id, section))| (id.as_str(), (index, *section)))
             .collect();
+        // A child that arrived, or moved to another section, after the
+        // chooser opened leads its section, as the newest activity does.
         rows.sort_by_key(|child| {
-            order
-                .get(child.id.as_str())
-                .copied()
-                .unwrap_or(self.order.len())
+            let section = Section::of(child);
+            (
+                section,
+                order
+                    .get(child.id.as_str())
+                    .filter(|(_, opened)| *opened == section)
+                    .map_or(0, |(index, _)| index + 1),
+            )
         });
         rows
     }
 }
 
 impl Runtime {
+    /// A chooser opening on this conversation's children as they stand.
+    pub(super) fn child_picker_for_now(&self) -> Picker {
+        Picker::ordered(&self.snapshot.subagents, &self.child_reports())
+    }
+
+    /// Each child's latest report in the conversation, under the ID the
+    /// child is listed by: a report names its sender as the provider
+    /// addresses it.
+    fn child_reports(&self) -> Reports<'_> {
+        let mut reports = Reports::new();
+        for item in self.snapshot.items.iter().rev() {
+            if let ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                sender,
+                ..
+            } = &item.content
+                && !sender.is_empty()
+            {
+                let listed = self
+                    .agent_addresses
+                    .get(sender)
+                    .map_or(sender.as_str(), String::as_str);
+                reports.entry(listed).or_insert(item.as_ref());
+            }
+        }
+        reports
+    }
+
     /// What the conversation itself is doing, in the glyph and words its
     /// status line uses, for the pane's inspector. Its subagents are left to
     /// the strip of agent tabs above the composer.
@@ -429,7 +645,7 @@ impl Runtime {
             design::COMPACT_ICON_SIZE,
         ))
         .name(format!(
-            "Search and filter subagents: {} total, {working} working, {attention} need attention",
+            "All subagents: {} total, {working} working, {attention} need attention",
             children.len()
         ))
         .id(card_control_id(target.card, "chat-subagent-picker"))
@@ -461,7 +677,7 @@ impl Runtime {
                     // filter row says what it shows.
                     selected: false,
                     id: Some(card_control_id(target.card, "chat-subagent-finished")),
-                    on_press: Some(action(Action::SubagentChooser(target, Filter::Finished))),
+                    on_press: Some(action(Action::SubagentChooser(target, Section::Finished))),
                 },
                 true,
                 Some(crate::ui_controls::passive_icon(
@@ -505,10 +721,7 @@ impl Runtime {
                 crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(tabs)),
             ])
             .push_maybe(done)
-            .push(crate::interaction::tooltip(
-                trigger,
-                "Search and filter subagents",
-            ))
+            .push(crate::interaction::tooltip(trigger, "All subagents"))
             .spacing(space::XS)
             .align_y(Alignment::Center),
         )
@@ -516,176 +729,242 @@ impl Runtime {
         .clip(true)
         .into()
     }
-    /// Mount the chooser in the pane's ordinary widget tree. COSMIC popovers
-    /// expose only their trigger to accessibility, hiding their choices.
-    pub(super) fn child_picker_view(&self) -> Option<Element<'_, Message>> {
-        let target = self.target;
-        let picker = self.child_picker.as_ref()?;
-
-        let matches = picker.rows(
+    /// Where the open chooser's list shows `section`, when it lists any
+    /// child there.
+    pub(super) fn child_section_offset(&self, section: Section) -> Option<f32> {
+        let rows = self.child_picker.as_ref()?.rows(
             &self.snapshot.subagents,
             &self.child_ordinals,
             &self.agent_work,
         );
-        let page = picker.page.min(matches.len().saturating_sub(1) / PAGE_SIZE);
-        let count = matches.len();
-        let first = matches.get(page * PAGE_SIZE).map(|child| child.id.clone());
-        let page_rows: Vec<_> = matches
-            .into_iter()
-            .skip(page * PAGE_SIZE)
-            .take(PAGE_SIZE)
-            .collect();
-        let mut rows = Vec::with_capacity(PAGE_SIZE);
-        for child in page_rows {
-            let chosen = self.selected_subagent.as_ref() == Some(&child.id);
-            let status = self.native_child_status(child);
-            let label = self.child_label(child, 80);
-            let name = self.child_choice_name(child, &label);
-            let (heading, detail) = if picker.filter == Filter::Failed {
-                (
-                    Self::agent_failure_task(child).to_owned(),
-                    format!("{label} · {status}"),
-                )
-            } else {
-                (label.into_owned(), status.to_owned())
-            };
-            let row = widget::button::custom(
-                widget::row::with_children(vec![
-                    crate::ui_controls::passive_icon(child_icon(child), design::COMPACT_ICON_SIZE),
-                    widget::column::with_children(vec![
-                        design::body(heading).width(Length::Fill).into(),
-                        design::caption(detail).into(),
-                    ])
-                    .width(Length::Fill)
-                    .spacing(space::XS)
-                    .into(),
-                    crate::ui_controls::passive_icon(
-                        if chosen {
-                            Icon::Check
-                        } else {
-                            Icon::ChevronRight
-                        },
-                        design::COMPACT_ICON_SIZE,
-                    ),
-                ])
-                .spacing(space::S)
-                .align_y(Alignment::Center),
-            )
-            .name(name)
-            .id(card_control_id(
-                target.card,
-                &format!("chat-subagent-{}", child.id),
-            ))
-            .width(Length::Fill)
-            .padding([space::S, space::S])
-            .class(crate::ui_controls::control_style(chosen, None))
-            .selected(chosen)
-            .on_press(action(Action::SelectSubagent(
-                target,
-                Some(child.id.clone()),
-            )));
-            rows.push((
-                child_key(&child.id),
-                crate::interaction::keyboard_list_row(row),
-            ));
-        }
-        if rows.is_empty() {
-            rows.push(([0u8; 32], design::caption("No matching subagents").into()));
-        }
-        let mut filters = Vec::new();
-        for (filter, label) in [
-            (Filter::All, "All"),
-            (Filter::Working, "Working"),
-            (Filter::Attention, "Needs attention"),
-            (Filter::Failed, "Failed"),
-            (Filter::Finished, "Finished"),
-        ] {
-            filters.push(crate::ui_controls::view_tab(
-                crate::ui_controls::ViewTab {
-                    label: label.into(),
-                    description: format!("Filter subagents: {label}").into(),
-                    count: None,
-                    selected: picker.filter == filter,
-                    id: None,
-                    on_press: Some(action(Action::SubagentFilter(target, filter))),
-                },
-                true,
-                None,
-            ));
-        }
-        let list = crate::interaction::keyboard_list(
-            widget::column::with_children(vec![
-                widget::row::with_children(vec![
-                    design::heading("Subagents").width(Length::Fill).into(),
-                    crate::ui_controls::button::quiet("Close")
-                        .name("Close subagent chooser — Escape")
-                        .on_press(action(Action::SubagentPicker(target, false)))
-                        .into(),
-                ])
-                .align_y(Alignment::Center)
-                .into(),
-                crate::interaction::keyboard_list_entry(
-                    crate::ui_controls::field::search("Search subagents", &picker.query)
-                        .id(card_control_id(target.card, "chat-subagent-search"))
-                        .width(Length::Fill)
-                        .on_input(move |query| action(Action::SubagentQuery(target, query)))
-                        .on_submit_maybe(first.map(|id| {
-                            move |_: String| {
-                                action(Action::SelectSubagent(target, Some(id.clone())))
-                            }
-                        })),
-                ),
-                crate::interaction::overflow_fade_x(
-                    widget::scrollable(widget::row::with_children(filters).spacing(space::XS))
-                        .direction(iced::widget::scrollable::Direction::Horizontal(
-                            iced::widget::scrollable::Scrollbar::hidden(),
-                        ))
-                        .width(Length::Fill),
-                ),
-                widget::row::with_children(vec![
-                    design::caption(format!(
-                        "{}–{} of {count}",
-                        if count == 0 { 0 } else { page * PAGE_SIZE + 1 },
-                        ((page + 1) * PAGE_SIZE).min(count)
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-                    crate::ui_controls::button::quiet("Previous")
-                        .on_press_maybe(
-                            (page > 0).then_some(action(Action::SubagentPage(target, false))),
-                        )
-                        .into(),
-                    crate::ui_controls::button::quiet("Next")
-                        .on_press_maybe(
-                            ((page + 1) * PAGE_SIZE < count)
-                                .then_some(action(Action::SubagentPage(target, true))),
-                        )
-                        .into(),
-                ])
-                .spacing(space::XS)
-                .align_y(Alignment::Center)
-                .into(),
-                crate::interaction::keyed_list_rows(rows),
-            ])
-            .spacing(space::S)
-            .width(Length::Fill),
-            true,
+        section_offset(&entries(&rows), section)
+    }
+
+    /// What a chooser row says a child is doing, or how it ended: its
+    /// current step while it works, what it waits on, its error, or the
+    /// first line of its report.
+    pub(super) fn child_activity(
+        &self,
+        child: &chat::Subagent,
+        report: Option<&chat::Item>,
+    ) -> String {
+        let status = self.native_child_status(child);
+        let detail = child.detail.trim();
+        let reported = || {
+            report
+                .and_then(report_text)
+                .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+                .map(|line| Self::short_description(line, 160))
+        };
+        let failure = || {
+            chat::failure::Failure::parse(self.session.launch.provider, detail)
+                .map(|failure| failure.summary)
+        };
+        // The section's heading and the row's mark already say a child
+        // finished or failed; a stop or a denial is worth naming.
+        let named = !matches!(
+            child.status,
+            chat::ToolStatus::Succeeded | chat::ToolStatus::Failed
         );
-        // The panel's top and bottom inset scrolls with the list, so the
-        // viewport runs to the panel's edges and a row passing one fades
-        // into the panel instead of stopping a band short of it.
-        let panel = widget::container(crate::interaction::overflow_fade_y(
-            widget::scrollable(widget::container(list).padding(design::with_vertical_rail(
-                iced::Padding::from([space::M, 0.0]),
-            )))
+        let said = |words: Option<String>| match words.filter(|words| !words.is_empty()) {
+            Some(words) if words == status || !named => words,
+            Some(words) => format!("{status} · {words}"),
+            None => status.to_owned(),
+        };
+        match child.status {
+            chat::ToolStatus::Running if child.waiting => said(failure()),
+            chat::ToolStatus::Running => {
+                if let Some(error) = self.child_error(child) {
+                    return chat::failure::summary(self.session.launch.provider, error)
+                        .into_owned();
+                }
+                match child.items.last() {
+                    Some(item)
+                        if item.content.status().is_some_and(chat::ToolStatus::is_live)
+                            && !matches!(item.content, ItemContent::Text { .. }) =>
+                    {
+                        super::turn::step_label(&item.content).into_owned()
+                    }
+                    _ => status.to_owned(),
+                }
+            }
+            chat::ToolStatus::Waiting => status.to_owned(),
+            chat::ToolStatus::Failed | chat::ToolStatus::Denied => said(
+                failure()
+                    .or_else(reported)
+                    .or_else(|| detail.lines().next().map(str::to_owned)),
+            ),
+            _ => said(reported().or_else(|| {
+                detail
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(|line| Self::short_description(line, 160))
+            })),
+        }
+    }
+
+    /// Mount the chooser in the pane's ordinary widget tree. COSMIC popovers
+    /// expose only their trigger to accessibility, hiding their choices.
+    ///
+    /// One list, by section, builds only the rows in and near view: each
+    /// row is one height, so where any row sits is known without building
+    /// the rows before it.
+    pub(super) fn child_picker_view(&self) -> Option<Element<'_, Message>> {
+        let target = self.target;
+        let picker = self.child_picker.as_ref()?;
+        let rows = picker.rows(
+            &self.snapshot.subagents,
+            &self.child_ordinals,
+            &self.agent_work,
+        );
+        let first = rows.first().map(|child| child.id.clone());
+        let listed = entries(&rows);
+        let reports = self.child_reports();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        let (view_top, view_bottom) = built_span(
+            listed.iter().map(Entry::height).sum(),
+            picker.scroll,
+            picker.viewport,
+        );
+        let mut list: Vec<([u8; 32], Element<'_, Message>)> = Vec::new();
+        let mut skipped = 0.0;
+        let mut top = 0.0;
+        let gap = |height: f32, key: &str| -> ([u8; 32], Element<'_, Message>) {
+            (
+                child_key(key),
+                widget::Space::new().height(Length::Fixed(height)).into(),
+            )
+        };
+        for entry in &listed {
+            let height = entry.height();
+            let shown = top + height >= view_top && top <= view_bottom;
+            top += height;
+            if !shown {
+                skipped += height;
+                continue;
+            }
+            if skipped > 0.0 {
+                list.push(gap(skipped, "\0above"));
+                skipped = 0.0;
+            }
+            list.push(match *entry {
+                Entry::Heading(section, count) => (
+                    child_key(&format!("\0section-{section:?}")),
+                    widget::container(
+                        widget::row::with_children(vec![
+                            design::caption(section.heading())
+                                .class(cosmic::theme::Text::Custom(design::muted_text))
+                                .into(),
+                            design::caption(count.to_string())
+                                .class(cosmic::theme::Text::Custom(design::muted_text))
+                                .into(),
+                        ])
+                        .spacing(space::XS),
+                    )
+                    .padding([0.0, space::S])
+                    .height(Length::Fixed(HEADING_HEIGHT))
+                    .align_y(iced::alignment::Vertical::Bottom)
+                    .into(),
+                ),
+                Entry::Child(child) => (
+                    child_key(&child.id),
+                    crate::interaction::keyboard_list_row(self.child_choice(
+                        child,
+                        reports.get(child.id.as_str()).copied(),
+                        now,
+                    )),
+                ),
+            });
+        }
+        if skipped > 0.0 {
+            list.push(gap(skipped, "\0below"));
+        }
+        if list.is_empty() {
+            list.push((
+                [0u8; 32],
+                widget::container(design::caption(if picker.query.trim().is_empty() {
+                    "No subagents"
+                } else {
+                    "No matching subagents"
+                }))
+                .padding([space::S, space::S])
+                .into(),
+            ));
+        }
+        // A letter typed on a row goes on searching, as it would in the field.
+        let list = crate::interaction::focused_key(
+            crate::interaction::keyed_list_rows(list),
+            move |event| match event {
+                iced::keyboard::Event::KeyPressed {
+                    text: Some(text),
+                    modifiers,
+                    ..
+                } if !(modifiers.control() || modifiers.alt() || modifiers.logo())
+                    && text.chars().all(|letter| !letter.is_control())
+                    && !text.trim().is_empty() =>
+                {
+                    Some(action(Action::SubagentType(target, text.to_string())))
+                }
+                _ => None,
+            },
+        );
+        let header = widget::column::with_children(vec![
+            widget::row::with_children(vec![
+                design::heading("Subagents").width(Length::Fill).into(),
+                crate::ui_controls::icon_button(Icon::Close, "Close subagents (Esc)")
+                    .on_press(action(Action::SubagentPicker(target, false)))
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .into(),
+            crate::interaction::keyboard_list_entry(
+                crate::ui_controls::field::search("Search subagents", &picker.query)
+                    .id(card_control_id(target.card, "chat-subagent-search"))
+                    .width(Length::Fill)
+                    .on_input(move |query| action(Action::SubagentQuery(target, query)))
+                    .on_submit_maybe(first.map(|id| {
+                        move |_: String| action(Action::SelectSubagent(target, Some(id.clone())))
+                    })),
+            ),
+        ])
+        .spacing(space::S);
+        let scroller = crate::interaction::reveal_focus(crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                // No inset above the rows: the list's offsets are the rows' own.
+                widget::container(list).padding(design::with_vertical_rail(iced::Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: space::M,
+                    left: 0.0,
+                })),
+            )
             .id(card_control_id(target.card, "chat-subagent-list"))
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
+            .on_scroll(move |viewport| {
+                action(Action::SubagentScroll(
+                    target,
+                    viewport.absolute_offset().y,
+                    viewport.bounds().height,
+                ))
+            })
             .height(Length::Fill),
             design::sunken,
+        ));
+        let panel = widget::container(crate::interaction::keyboard_list(
+            widget::column::with_children(vec![header.into(), scroller])
+                .spacing(space::S)
+                .width(Length::Fill)
+                .height(Length::Fill),
+            true,
         ))
-        .padding([0.0, space::M])
+        .padding([space::M, space::M, 0.0, space::M])
         .width(Length::Fill)
         .height(Length::Fill)
         .class(design::surface(
@@ -697,6 +976,74 @@ impl Runtime {
             crate::interaction::opaque(panel),
             move || action(Action::SubagentPicker(target, false)),
         ))
+    }
+
+    /// One child's row in the chooser: its state's mark, its name over what
+    /// it is doing or how it ended, and its time.
+    fn child_choice(
+        &self,
+        child: &chat::Subagent,
+        report: Option<&chat::Item>,
+        now: u64,
+    ) -> Element<'_, Message> {
+        let target = self.target;
+        let chosen = self.selected_subagent.as_ref() == Some(&child.id);
+        let label = self.child_label(child, 80);
+        let name = self.child_choice_name(child, &label);
+        let line = |text: String, muted: bool| {
+            let text = design::caption(text)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                ));
+            if muted {
+                text.class(cosmic::theme::Text::Custom(design::muted_text))
+            } else {
+                text
+            }
+        };
+        let title = design::body(label.into_owned())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ));
+        let mut parts = vec![
+            widget::container(status_mark(child))
+                .width(Length::Fixed(f32::from(design::COMPACT_ICON_SIZE)))
+                .into(),
+            widget::column::with_children(vec![
+                title.width(Length::Fill).into(),
+                line(self.child_activity(child, report), true)
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .width(Length::Fill)
+            .spacing(space::XXS)
+            .into(),
+        ];
+        if let Some(time) = row_time(child, report, now) {
+            parts.push(line(time, true).into());
+        }
+        widget::button::custom(
+            widget::row::with_children(parts)
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+        )
+        .name(name)
+        .id(card_control_id(
+            target.card,
+            &format!("chat-subagent-{}", child.id),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fixed(ROW_HEIGHT))
+        .padding([space::XS, space::S])
+        .class(crate::sidebar::sidebar_button_style(chosen))
+        .selected(chosen)
+        .on_press(action(Action::SelectSubagent(
+            target,
+            Some(child.id.clone()),
+        )))
+        .into()
     }
 }
 
@@ -938,7 +1285,7 @@ mod tests {
         let open = messages
             .into_iter()
             .find_map(|message| match message {
-                Message::ChatUi(action @ Action::SubagentChooser(_, Filter::Finished)) => {
+                Message::ChatUi(action @ Action::SubagentChooser(_, Section::Finished)) => {
                     Some(action)
                 }
                 _ => None,
@@ -947,23 +1294,25 @@ mod tests {
         drop(app.handle_chat_ui(open));
         let runtime = app.chat_runtime_mut(target).unwrap();
         let picker = runtime.child_picker.as_ref().unwrap();
-        assert_eq!(picker.filter, Filter::Finished);
+        assert_eq!(picker.opened_on, Some(Section::Finished));
         assert_eq!(
             ids(picker.rows(
                 &runtime.snapshot.subagents,
                 &runtime.child_ordinals,
                 &runtime.agent_work,
             )),
-            ["done"]
+            ["live", "done"]
         );
+        // It opens at the finished section, below the working one.
+        assert_eq!(picker.scroll, HEADING_HEIGHT + ROW_HEIGHT);
         // Pressed again, it closes the chooser, as the chooser's toggle does.
-        drop(app.handle_chat_ui(Action::SubagentChooser(target, Filter::Finished)));
+        drop(app.handle_chat_ui(Action::SubagentChooser(target, Section::Finished)));
         assert!(app.chat_runtime_mut(target).unwrap().child_picker.is_none());
-        // Pressed while the chooser is open on another filter, it keeps
+        // Pressed while the chooser is open, it keeps
         // what the reader searched for.
         drop(app.handle_chat_ui(Action::SubagentPicker(target, true)));
         drop(app.handle_chat_ui(Action::SubagentQuery(target, "review".into())));
-        drop(app.handle_chat_ui(Action::SubagentChooser(target, Filter::Finished)));
+        drop(app.handle_chat_ui(Action::SubagentChooser(target, Section::Finished)));
         let picker = app
             .chat_runtime_mut(target)
             .unwrap()
@@ -971,8 +1320,8 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(
-            (picker.filter, picker.query.as_str()),
-            (Filter::Finished, "review")
+            (picker.opened_on, picker.query.as_str()),
+            (Some(Section::Finished), "review")
         );
     }
 
@@ -1253,31 +1602,17 @@ mod tests {
         let mut picker = Picker::new(&children);
         assert_eq!(
             ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
-            ["first", "second", "waiting", "failed", "done"]
+            ["waiting", "failed", "first", "second", "done"]
         );
-        // Rows do not move under the pointer while the chooser is open.
+        // Reporting does not move a row under the pointer while the chooser
+        // is open; a change of state moves it to the top of its new section,
+        // as its latest activity, and the rest keep their places.
         children[0].status = Running;
         children[1].status = Succeeded;
         assert_eq!(
             ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
-            ["first", "second", "waiting", "failed", "done"]
+            ["waiting", "failed", "done", "second", "first"]
         );
-        picker.filter = Filter::Attention;
-        assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
-            ["waiting", "failed"]
-        );
-        picker.filter = Filter::Working;
-        assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
-            ["second", "done"]
-        );
-        picker.filter = Filter::Finished;
-        assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
-            ["first"]
-        );
-        picker.filter = Filter::All;
         picker.query = "Agent second".into();
         assert_eq!(
             ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
@@ -1345,11 +1680,158 @@ mod tests {
             child("working", Running, false),
             child("asking", Running, true),
         ];
-        let mut picker = Picker::new(&children);
-        picker.filter = Filter::Working;
+        let picker = Picker::new(&children);
         assert_eq!(
             ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
-            ["working"]
+            ["asking", "waiting", "working"]
         );
+    }
+
+    fn active(mut child: chat::Subagent, started: u64, last: u64) -> chat::Subagent {
+        let item = |id: &str, at: u64| {
+            std::sync::Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: "Working".into(),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: Some(at),
+                at: Some(at),
+            })
+        };
+        child.items = vec![item("first", started), item("last", last)];
+        child
+    }
+
+    /// Within each section the child that did something last leads, and a
+    /// working child's row says how long it has worked while any other's
+    /// says how long ago it last did something.
+    #[test]
+    fn the_chooser_leads_each_section_with_its_latest_activity() {
+        use chat::ToolStatus::*;
+        let minute = 60_000;
+        let now = 1_000 * minute;
+        let children = vec![
+            active(child("old-done", Succeeded, false), 0, now - 180 * minute),
+            active(child("new-done", Succeeded, false), 0, now - 5 * minute),
+            active(
+                child("long-run", Running, false),
+                now - 90 * minute,
+                now - minute,
+            ),
+            active(child("fresh-run", Running, false), now - 2 * minute, now),
+            child("asking", Running, true),
+        ];
+        let picker = Picker::new(&children);
+        let rows = picker.rows(&children, &Ordinals::default(), &Default::default());
+        assert_eq!(
+            ids(rows.iter().copied()),
+            ["asking", "fresh-run", "long-run", "new-done", "old-done"]
+        );
+        assert_eq!(row_time(&children[2], None, now).as_deref(), Some("1h 30m"));
+        assert_eq!(row_time(&children[1], None, now).as_deref(), Some("5m ago"));
+        assert_eq!(
+            row_time(&children[4], None, now),
+            None,
+            "nothing to time it by"
+        );
+        // Each section is headed by its count, and the list knows where each
+        // starts without building a row.
+        let listed = entries(&rows);
+        assert_eq!(
+            listed
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Heading(section, count) => Some((*section, *count)),
+                    Entry::Child(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            [
+                (Section::Attention, 1),
+                (Section::Working, 2),
+                (Section::Finished, 2)
+            ]
+        );
+        assert_eq!(section_offset(&listed, Section::Attention), Some(0.0));
+        assert_eq!(
+            section_offset(&listed, Section::Finished),
+            Some(2.0 * HEADING_HEIGHT + 3.0 * ROW_HEIGHT)
+        );
+        let none = entries(&rows[..1]);
+        assert_eq!(section_offset(&none, Section::Finished), None);
+    }
+
+    /// A list that fits its viewport reports no scrolling, so an offset left
+    /// from opening on a section, or from a shorter window, must not leave
+    /// the rows above it unbuilt.
+    #[test]
+    fn a_stale_scroll_still_builds_every_row_in_view() {
+        // The pane grew to hold a list it had scrolled to the end of: the
+        // list last reported a short viewport and the offset at its end.
+        let fits = 2.0 * HEADING_HEIGHT + 30.0 * ROW_HEIGHT;
+        for (scroll, viewport) in [
+            (fits - 500.0, Some(500.0)),
+            (400.0, Some(1_000.0)),
+            (fits / 2.0, None),
+        ] {
+            let (top, bottom) = built_span(fits, scroll, viewport);
+            assert!(top <= 0.0 && bottom >= fits, "{top}..{bottom}");
+        }
+        // A long list scrolled past its end shows its last rows.
+        let long = 1_000.0 * ROW_HEIGHT;
+        let (top, bottom) = built_span(long, 2.0 * long, Some(500.0));
+        assert_eq!((top, bottom), (long - 500.0 - OVERSCAN, long + OVERSCAN));
+        let (top, _) = built_span(long, 300.0, Some(500.0));
+        assert_eq!(top, 300.0 - OVERSCAN);
+    }
+
+    /// A finished child whose transcript was trimmed away is timed, ordered
+    /// and summarized by the report it sent the conversation.
+    #[test]
+    fn a_finished_child_is_known_by_its_report() {
+        use chat::ToolStatus::*;
+        let minute = 60_000;
+        let now = 1_000 * minute;
+        let report = |sender: &str, body: &str, at: u64| chat::Item {
+            id: format!("report-{sender}"),
+            role: chat::Role::User,
+            content: ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                from: "general-purpose".into(),
+                sender: sender.into(),
+                summary: format!("Agent \"{sender}\" finished"),
+                body: body.into(),
+            },
+            started_at: None,
+            at: Some(at),
+        };
+        let children = vec![
+            child("early", Succeeded, false),
+            active(child("late", Succeeded, false), 0, now - 30 * minute),
+            child("quiet", Succeeded, false),
+        ];
+        let early = report(
+            "early",
+            "\nNo problem found.\nDetails follow.",
+            now - 2 * minute,
+        );
+        let late = report("late", "", now - 10 * minute);
+        let reports: Reports<'_> = [("early", &early), ("late", &late)].into_iter().collect();
+        let picker = Picker::ordered(&children, &reports);
+        assert_eq!(
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
+            ["early", "late", "quiet"]
+        );
+        assert_eq!(
+            row_time(&children[0], Some(&early), now).as_deref(),
+            Some("2m ago")
+        );
+        assert_eq!(
+            report_text(&early).map(str::trim_start),
+            Some("No problem found.\nDetails follow.")
+        );
+        assert_eq!(report_text(&late), Some("Agent \"late\" finished"));
     }
 }

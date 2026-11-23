@@ -2275,7 +2275,7 @@ impl Runtime {
             ),
             _ => (
                 format!("Choose from {} failed subagents", failed.len()),
-                Action::SubagentChooser(self.target, child_navigation::Filter::Failed),
+                Action::SubagentChooser(self.target, child_navigation::Section::Attention),
             ),
         };
         let tooltip = failed
@@ -3115,86 +3115,64 @@ impl Runtime {
         let mut transcript = VirtualRows::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
-            let provider = match self.session.launch.provider {
-                Provider::Codex => "Codex",
-                Provider::Claude => "Claude",
-                Provider::Omp => "OMP",
-                Provider::Antigravity => "Antigravity",
-                Provider::Muse => "Muse",
-            };
-            // A model the provider never reported is left out rather than
-            // announced, here and in the tooltip.
-            let model = agent
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|model| !model.is_empty());
-            let mut heading = vec![
-                widget::row::with_children(vec![
-                    design::transcript_name(self.child_label(agent, 80))
+            // The selected tab already names the agent. Beneath the tabs is
+            // what the tab cannot hold: how it stands, beside its mark, and
+            // the task it was given unless it goes by that task. Where it
+            // runs and on which model is on hover.
+            let mut summary = vec![
+                super::child_navigation::status_mark(agent),
+                design::caption(self.native_child_status(agent).to_owned())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            ];
+            match Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
+                Some(task) => summary.push(
+                    design::caption(format!("· {}", Self::short_description(task, 160)))
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
                         .width(Length::Fill)
                         .into(),
-                    design::heading(self.native_child_status(agent).to_owned())
-                        .size(design::TEXT_CAPTION)
-                        .into(),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
-            ];
-            // The name titles the transcript; the task it was given sits
-            // beneath it, quieter, so the reader knows what it is for, unless
-            // the agent already goes by that task.
-            if let Some(task) =
-                Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent))
-            {
-                heading.push(
-                    design::caption(Self::short_description(task, 80))
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .into(),
+                ),
+                None => summary.push(widget::Space::new().width(Length::Fill).into()),
+            }
+            let summary = crate::interaction::tooltip(
+                widget::row::with_children(summary)
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill),
+                self.native_child_identity(agent),
+            );
+            let mut identity = vec![summary];
+            // One waiting on its own background work is still going, and
+            // stopping it is how that work ends. The same square as the
+            // composer's own Stop, which cancels the conversation's turn.
+            if agent.status.is_live() && snapshot.capabilities.stop_subagent {
+                identity.push(
+                    crate::ui_controls::icon_button(
+                        Icon::Stop,
+                        "Stop this subagent; the conversation and other subagents carry on",
+                    )
+                    .id(card_control_id(target.card, "chat-subagent-stop"))
+                    .on_press_maybe(available.then(|| {
+                        action(Action::Command(
+                            target,
+                            Command::StopSubagent {
+                                id: agent.id.clone(),
+                            },
+                        ))
+                    }))
+                    .into(),
                 );
             }
-            heading.push(crate::interaction::tooltip(
-                design::caption(match model {
-                    Some(model) => format!(
-                        "{provider} subagent · {}",
-                        Self::short_description(model, 80)
-                    ),
-                    None => format!("{provider} subagent"),
-                }),
-                self.native_child_identity(agent),
-            ));
-            let heading: Element<'_, Message> = widget::column::with_children(heading)
-                .spacing(step::GAP_XS)
-                .width(Length::Fill)
-                .into();
             selected_identity = Some(
-                // One waiting on its own background work is still going, and
-                // stopping it is how that work ends.
-                if agent.status.is_live() && snapshot.capabilities.stop_subagent {
-                    widget::row::with_children(vec![
-                        heading,
-                        crate::ui_controls::button::quiet("Stop")
-                            .icon(Icon::Stop)
-                            .name(
-                                "Stop this subagent; the conversation and other subagents carry on",
-                            )
-                            .on_press_maybe(available.then(|| {
-                                action(Action::Command(
-                                    target,
-                                    Command::StopSubagent {
-                                        id: agent.id.clone(),
-                                    },
-                                ))
-                            }))
-                            .into(),
-                    ])
-                    .spacing(step::GAP_XS)
+                widget::row::with_children(identity)
+                    .spacing(space::XS)
                     .align_y(Alignment::Center)
-                    .into()
-                } else {
-                    heading
-                },
+                    .width(Length::Fill)
+                    .into(),
             );
             if let Some(placeholder) = child_placeholder(agent) {
                 transcript.push(transcript_body(placeholder, target));

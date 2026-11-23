@@ -457,10 +457,14 @@ pub enum Action {
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
     SubagentPicker(Target, bool),
-    /// Opens the subagent chooser on one filter, such as the failed or the
-    /// finished subagents a closing row or the strip counts.
-    SubagentChooser(Target, child_navigation::Filter),
+    /// Opens the subagent chooser at one section, such as the finished
+    /// subagents the strip counts.
+    SubagentChooser(Target, child_navigation::Section),
     SubagentQuery(Target, String),
+    /// Text typed on one of the chooser's rows, which goes on searching.
+    SubagentType(Target, String),
+    /// The chooser's list moved to this offset, in a viewport this tall.
+    SubagentScroll(Target, f32, f32),
     ToggleFailure(Target, String),
     CopyFailure(Target, String),
     FailureCopied(
@@ -469,8 +473,6 @@ pub enum Action {
         text_copy::FailureRequest,
         Result<String, String>,
     ),
-    SubagentFilter(Target, child_navigation::Filter),
-    SubagentPage(Target, bool),
     /// Shows the whole of one folded part of a coordination card, addressed
     /// by the card's item id and the part's name, or folds it again.
     Unfold(Target, String),
@@ -1000,11 +1002,11 @@ impl Action {
             Self::SubagentPicker(..) => "SubagentPicker",
             Self::SubagentChooser(..) => "SubagentChooser",
             Self::SubagentQuery(..) => "SubagentQuery",
+            Self::SubagentType(..) => "SubagentType",
+            Self::SubagentScroll(..) => "SubagentScroll",
             Self::ToggleFailure(..) => "ToggleFailure",
             Self::CopyFailure(..) => "CopyFailure",
             Self::FailureCopied(..) => "FailureCopied",
-            Self::SubagentFilter(..) => "SubagentFilter",
-            Self::SubagentPage(..) => "SubagentPage",
             Self::Unfold(..) => "Unfold",
             Self::OpenSession(..) => "OpenSession",
             Self::OpenAgent(..) => "OpenAgent",
@@ -16383,34 +16385,48 @@ impl Cagents {
             Action::FailureCopied(target, key, request, result) => {
                 return self.finish_failure_copy(target, key, request, result);
             }
-            Action::SubagentChooser(target, filter) => {
+            Action::SubagentChooser(target, section) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    // Pressed again on the filter it shows, the chooser
+                    // Pressed again on the section it opened on, the chooser
                     // closes, as its own toggle does.
                     if runtime
                         .child_picker
                         .as_ref()
-                        .is_some_and(|picker| picker.filter == filter)
+                        .is_some_and(|picker| picker.opened_on == Some(section))
                     {
                         return self.handle_chat_ui(Action::SubagentPicker(target, false));
                     }
                     // An open chooser keeps what the reader searched for.
-                    let picker = runtime.child_picker.get_or_insert_with(|| {
-                        child_navigation::Picker::new(&runtime.snapshot.subagents)
-                    });
-                    picker.filter = filter;
-                    picker.page = 0;
-                    return widget::text_input::focus(card_control_id(
-                        target.card,
-                        "chat-subagent-search",
-                    ))
-                    .map(cosmic::Action::App);
+                    let mut picker = runtime
+                        .child_picker
+                        .take()
+                        .unwrap_or_else(|| runtime.child_picker_for_now());
+                    picker.opened_on = Some(section);
+                    runtime.child_picker = Some(picker);
+                    let offset = runtime.child_section_offset(section).unwrap_or(0.0);
+                    if let Some(picker) = runtime.child_picker.as_mut() {
+                        picker.scroll = offset;
+                    }
+                    return Task::batch([
+                        iced::widget::scrollable::scroll_to(
+                            card_control_id(target.card, "chat-subagent-list"),
+                            iced::widget::scrollable::AbsoluteOffset {
+                                x: Some(0.0),
+                                y: Some(offset),
+                            },
+                        )
+                        .map(cosmic::Action::App),
+                        widget::text_input::focus(card_control_id(
+                            target.card,
+                            "chat-subagent-search",
+                        ))
+                        .map(cosmic::Action::App),
+                    ]);
                 }
             }
             Action::SubagentPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.child_picker =
-                        open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
+                    runtime.child_picker = open.then(|| runtime.child_picker_for_now());
                     if open {
                         return widget::text_input::focus(card_control_id(
                             target.card,
@@ -16434,7 +16450,7 @@ impl Cagents {
                     && let Some(picker) = runtime.child_picker.as_mut()
                 {
                     picker.query = query;
-                    picker.page = 0;
+                    picker.scroll = 0.0;
                     return iced::widget::scrollable::scroll_to(
                         card_control_id(target.card, "chat-subagent-list"),
                         iced::widget::scrollable::AbsoluteOffset {
@@ -16445,48 +16461,26 @@ impl Cagents {
                     .map(cosmic::Action::App);
                 }
             }
-            Action::SubagentPage(target, next) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && let Some(picker) = runtime.child_picker.as_mut()
+            Action::SubagentType(target, text) => {
+                if let Some(query) = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| runtime.child_picker.as_ref())
+                    .map(|picker| format!("{}{text}", picker.query))
                 {
-                    let last = picker
-                        .rows(
-                            &runtime.snapshot.subagents,
-                            &runtime.child_ordinals,
-                            &runtime.agent_work,
-                        )
-                        .len()
-                        .saturating_sub(1)
-                        / 24;
-                    picker.page = if next {
-                        picker.page.saturating_add(1).min(last)
-                    } else {
-                        picker.page.saturating_sub(1)
-                    };
-                    return iced::widget::scrollable::scroll_to(
-                        card_control_id(target.card, "chat-subagent-list"),
-                        iced::widget::scrollable::AbsoluteOffset {
-                            x: Some(0.0),
-                            y: Some(0.0),
-                        },
-                    )
-                    .map(cosmic::Action::App);
+                    let search = card_control_id(target.card, "chat-subagent-search");
+                    return Task::batch([
+                        self.handle_chat_ui(Action::SubagentQuery(target, query)),
+                        widget::text_input::focus(search.clone()).map(cosmic::Action::App),
+                        widget::text_input::move_cursor_to_end(search).map(cosmic::Action::App),
+                    ]);
                 }
             }
-            Action::SubagentFilter(target, filter) => {
+            Action::SubagentScroll(target, offset, height) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
                     && let Some(picker) = runtime.child_picker.as_mut()
                 {
-                    picker.filter = filter;
-                    picker.page = 0;
-                    return iced::widget::scrollable::scroll_to(
-                        card_control_id(target.card, "chat-subagent-list"),
-                        iced::widget::scrollable::AbsoluteOffset {
-                            x: Some(0.0),
-                            y: Some(0.0),
-                        },
-                    )
-                    .map(cosmic::Action::App);
+                    picker.scroll = offset;
+                    picker.viewport = Some(height);
                 }
             }
             Action::SelectSubagent(target, id) => {
