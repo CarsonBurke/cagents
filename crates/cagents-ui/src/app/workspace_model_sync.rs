@@ -286,6 +286,15 @@ pub(super) fn complete_reconciliations() -> usize {
     COMPLETE_RECONCILIATIONS.with(std::cell::Cell::get)
 }
 
+/// What settling a run started, kept as no task when it started none.
+fn settled_tasks(tasks: Vec<Task<Message>>) -> Task<Message> {
+    if tasks.is_empty() {
+        Task::none()
+    } else {
+        Task::batch(tasks)
+    }
+}
+
 /// Watches the daemon for shared-model edges.
 pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>) {
     let observer = std::thread::Builder::new()
@@ -1140,6 +1149,22 @@ impl Cagents {
         }
     }
 
+    /// Whether a view receipt for `scope` may retire a candidate channel by
+    /// reading which work the window's channels hold: the receipt's own
+    /// scope, or a candidate whose view is already held empty.
+    fn retirement_reads_channels(&self, scope: &crate::workspace_model::views::Scope) -> bool {
+        use crate::workspace_model::views::Scope;
+        self.channel_ui.retire_candidates.keys().any(|home| {
+            let channel = Scope::Channel(home.channel);
+            channel == *scope
+                || self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .any(|view| view.scope == channel && view.panes.is_empty())
+        })
+    }
+
     /// The complete reconciliation after a canonical edge, which a run of
     /// updates owes until its next update of another kind or its end;
     /// outside a run it runs now.
@@ -1638,6 +1663,15 @@ impl Cagents {
                     ModelEdit::ChangeView { operation, .. } => Some(*operation),
                     _ => None,
                 };
+                // Retiring reads the window's channels for work an emptied
+                // view leaves behind, so in a run it needs the edges before
+                // this receipt reconciled, as they would be one at a time.
+                let mut settled = Vec::new();
+                if let ModelEdit::ChangeView { scope, .. } = &edit
+                    && self.retirement_reads_channels(scope)
+                {
+                    self.settle_observed_run(&mut settled);
+                }
                 let transferred =
                     operation.and_then(|id| self.shared_views.requested_transfer_card(id));
                 let title = channel_title_only(&edit, &receipt.effects, &views);
@@ -1650,18 +1684,11 @@ impl Cagents {
                         effects: receipt.effects,
                     },
                 ) else {
-                    return Task::none();
+                    return settled_tasks(settled);
                 };
-                // Retiring reads the window's channels for work an emptied
-                // view leaves behind, so in a run it needs the edges before
-                // this receipt reconciled, as they would be one at a time.
-                let mut settled = Vec::new();
                 match &edit {
                     ModelEdit::ChangeView { scope, .. } => {
                         self.acknowledge_view_edit(scope.clone(), operation);
-                        if !self.channel_ui.retire_candidates.is_empty() {
-                            self.settle_observed_run(&mut settled);
-                        }
                         self.retire_settled_empty_channels();
                         self.retarget_transferred_pane_updates(transferred);
                     }

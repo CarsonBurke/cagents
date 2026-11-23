@@ -453,3 +453,65 @@ fn a_run_retires_a_channel_its_edges_emptied() {
     );
     assert_eq!(outcome(true), 1);
 }
+
+/// A peer moves a pane out of a channel and then deletes the channel, and
+/// both edges arrive together. Deleting retires the channel's own cards
+/// only, so the moved pane stays open where it went, as it does when the
+/// edges arrive one at a time.
+#[test]
+fn a_run_deleting_a_channel_keeps_the_pane_moved_out_of_it() {
+    let outcome = |run: bool| {
+        let (mut app, source, destination, [moved, _]) = two_panes(0);
+        drop(app.navigate_to_channel(destination));
+        let identity = app.workspace_model.identity;
+        let sequence = app.workspace_model.sequence;
+        let (transfer, views) = transfer_over(
+            identity,
+            sequence + 1,
+            app.workspace_model.views.clone(),
+            moved.id,
+            source,
+            destination,
+            uuid::Uuid::new_v4(),
+        );
+        let scope = Scope::Channel(source);
+        let revision = views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
+        let deleted = ModelUpdate::Changed {
+            sequence: sequence + 2,
+            edit: ModelEdit::DeleteChannel { id: source },
+            changes: EdgeChanges {
+                identity: Some(identity),
+                effects: EditEffects {
+                    removed_channels: vec![source],
+                    views: vec![ViewRevision {
+                        scope: scope.clone(),
+                        before: Some(revision),
+                        after: None,
+                    }],
+                    ..Default::default()
+                },
+                views: ViewChanges {
+                    sequence: sequence + 2,
+                    removed: vec![(scope, revision)],
+                    ..Default::default()
+                },
+            },
+        };
+        deliver(&mut app, vec![transfer, deleted], run);
+        (
+            app.card_state(moved.id)
+                .is_some_and(|state| state.existence.is_open()),
+            holds(&app, destination, moved.id),
+        )
+    };
+    assert_eq!(
+        outcome(false),
+        (true, true),
+        "one at a time, the moved pane stays open where it went"
+    );
+    assert_eq!(outcome(true), (true, true));
+}
