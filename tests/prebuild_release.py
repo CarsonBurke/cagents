@@ -41,7 +41,7 @@ set -euo pipefail
 while (($#)); do
     case $1 in --ref) ref=$2; shift 2 ;; --output) out=$2; shift 2 ;; --notes) notes=$2; shift 2 ;; *) shift ;; esac
 done
-printf '%s\n' "$(git rev-parse HEAD) $ref ${CAGENTS_BUILD_IDLE:-normal} ${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS:-unbounded} $CAGENTS_RELEASE_CACHE" \
+printf '%s\n' "$(git rev-parse HEAD) $ref ${CAGENTS_BUILD_IDLE:-normal} ${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS:-unbounded} $CAGENTS_RELEASE_CACHE $CAGENTS_RELEASE_SMOKE_CACHE" \
     >> "$PREBUILD_FIXTURE/builds"
 if [[ -n ${PREBUILD_HOLD:-} ]]; then
     trap 'touch "$PREBUILD_FIXTURE/stopped-$ref"; exit 143' TERM
@@ -49,12 +49,14 @@ if [[ -n ${PREBUILD_HOLD:-} ]]; then
     while [[ ! -e $PREBUILD_FIXTURE/release-$ref ]]; do sleep 0.02; done
 fi
 if [[ -e $PREBUILD_FIXTURE/fail ]]; then
+    rm -f "$PREBUILD_FIXTURE/fail-once"
     echo 'the build broke'
     exit 3
 fi
 [[ -s $notes ]]
 mkdir -p "$out"
 printf 'archive\n' > "$out/cagents-0.2.4-x86_64-unknown-linux-gnu.tar.gz"
+if [[ -e $PREBUILD_FIXTURE/other-commit ]]; then ref=0000000000000000000000000000000000000000; fi
 printf '{"version": "0.2.4", "source_commit": "%s", "protocol": 9}\n' "$ref" > "$out/release-metadata.json"
 """
 
@@ -84,7 +86,10 @@ class Prebuild(unittest.TestCase):
         self.memory(32)
         (self.proc / "pressure/memory").write_text(
             "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
-        (self.proc / "locks").write_text("")
+        # The host's own lock table: a waiter below takes a real lock.
+        (self.proc / "locks").symlink_to("/proc/locks")
+        self.holders = []
+        self.addCleanup(self.release_waiters)
         self.lock = self.root / "cargo.lock"
         Path(f"{self.lock}.queue").touch()
         bin_directory = self.root / "bin"
@@ -97,7 +102,8 @@ class Prebuild(unittest.TestCase):
             "CAGENTS_BUILD_LOCK": str(self.lock), "PATH": f"{bin_directory}:{os.environ['PATH']}"})
         environment.start()
         self.addCleanup(environment.stop)
-        for name, value in (("WATCH_SECONDS", 0.05), ("GRACE_SECONDS", 10), ("BACKOFF_SECONDS", 600)):
+        for name, value in (("WATCH_SECONDS", 0.05), ("GRACE_SECONDS", 10), ("BACKOFF_SECONDS", 600),
+                            ("SMOKE_CACHE", self.root / "smoke-cache")):
             patcher = patch.object(prebuild, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -122,11 +128,20 @@ class Prebuild(unittest.TestCase):
         (self.sentinel / "verdicts" / f"{sha}.json").write_text(json.dumps({"sha": sha, "passed": passed}))
 
     def waiter(self):
-        """A build waiting for shares, as /proc/locks shows its queue lock."""
-        found = Path(f"{self.lock}.queue").stat()
-        (self.proc / "locks").write_text(
-            f"1: FLOCK  ADVISORY  WRITE 4242 {os.major(found.st_dev):02x}:{os.minor(found.st_dev):02x}:"
-            f"{found.st_ino} 0 EOF\n2: POSIX  ADVISORY  WRITE 99 00:20:1 0 EOF\n")
+        """A build waiting for shares, holding the gate's queue lock in a
+        process of its own, as the host's lock table then shows."""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl, sys; f = open(sys.argv[1], 'a'); "
+             "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()", f"{self.lock}.queue"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.holders.append(holder)
+        self.assertEqual(holder.stdout.readline(), "held\n")
+
+    def release_waiters(self):
+        for holder in self.holders:
+            holder.stdin.close()
+            holder.wait(HANG_GUARD)
+        self.holders = []
 
     def builds(self):
         path = self.root / "builds"
@@ -161,7 +176,8 @@ class Prebuild(unittest.TestCase):
     def test_the_compiled_commit_is_bundled_in_the_background_by_its_own_scripts(self):
         self.compiled(self.first)
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.builds(), [[self.first, self.first, "1", "60", str(self.cache)]])
+        self.assertEqual(self.builds(), [[self.first, self.first, "1", "10", str(self.cache),
+                                          str(self.root / "smoke-cache")]])
         bundle = self.store.bundle(self.first)
         bundled = json.loads((bundle / "bundle.json").read_text())
         self.assertEqual((bundled["sha"], bundled["version"], bundled["protocol"], bundled["priority"]),
@@ -183,16 +199,42 @@ class Prebuild(unittest.TestCase):
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(len(self.builds()), 1)
 
-    def test_a_failed_build_is_recorded_with_its_log_and_not_retried(self):
+    def test_a_failed_build_is_recorded_with_its_log_and_tried_once_more_an_hour_later(self):
         self.compiled(self.first)
         (self.root / "fail").touch()
         self.assertEqual(self.run_once(), 0)
         failure = json.loads((self.store.failures / f"{self.first}.json").read_text())
-        self.assertEqual(failure["status"], 3)
+        self.assertIn("status 3", failure["status"])
         self.assertIn("the build broke", (self.store.failures / f"{self.first}.log").read_text())
         self.assertFalse(self.store.built(self.first))
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(len(self.builds()), 1)
+        for attempts in (2, 2):
+            failure["failed_at"] -= prebuild.RETRY_FAILED_SECONDS + 1
+            (self.store.failures / f"{self.first}.json").write_text(json.dumps(failure))
+            self.assertEqual(self.run_once(), 0)
+            failure = json.loads((self.store.failures / f"{self.first}.json").read_text())
+            self.assertEqual(failure["attempts"], attempts)
+        # The second failure is final.
+        self.assertEqual(len(self.builds()), 2)
+
+    def test_a_bundle_naming_another_commit_is_a_failure_not_a_bundle(self):
+        self.compiled(self.first)
+        (self.root / "other-commit").touch()
+        self.assertEqual(self.run_once(), 0)
+        self.assertIn("does not name this commit", self.store.failure(self.first)["status"])
+        self.assertFalse(self.store.bundle(self.first).exists())
+        self.assertEqual(list(self.store.bundles.glob(".*.partial")), [])
+
+    def test_an_incomplete_bundle_a_crash_left_is_replaced_and_stale_cache_runs_cleared(self):
+        self.compiled(self.first)
+        self.store.prepare()
+        (self.store.bundle(self.first) / "dist").mkdir(parents=True)
+        (self.cache / "run.left").mkdir(parents=True)
+        (self.cache / ".lock").touch()
+        self.assertEqual(self.run_once(), 0)
+        self.assertTrue(self.store.built(self.first))
+        self.assertFalse((self.cache / "run.left").exists())
 
     def test_it_does_not_start_while_memory_is_short_or_under_pressure_or_a_build_waits(self):
         self.compiled(self.first)
@@ -208,7 +250,7 @@ class Prebuild(unittest.TestCase):
     def setUp_readings(self):
         self.memory(32)
         (self.proc / "pressure/memory").write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
-        (self.proc / "locks").write_text("")
+        self.release_waiters()
 
     def test_a_build_waiting_for_shares_stops_the_background_build_which_resumes_later(self):
         self.compiled(self.first)
@@ -273,9 +315,9 @@ class Prebuild(unittest.TestCase):
             self.assertEqual(json.loads((self.store.bundle(second) / "bundle.json").read_text())["priority"],
                              "normal")
             thread.join(HANG_GUARD)
-        self.assertEqual(self.builds()[1], [second, second, "normal", "unbounded", str(self.cache)])
+        self.assertEqual(self.builds()[1][:5], [second, second, "normal", "unbounded", str(self.cache)])
         self.assertIn(f"start --no-block {prebuild.SERVICE}", (self.root / "systemctl").read_text())
-        self.assertFalse((self.store.root / "request.json").exists())
+        self.assertEqual(list(self.store.requests.iterdir()), [])
 
     def test_the_newest_bundles_and_pinned_ones_are_kept(self):
         commits = [self.first] + [self.commit(f"commit {index}") for index in range(4)]
@@ -293,6 +335,42 @@ class Prebuild(unittest.TestCase):
         os.utime(pinned, (old, old))
         self.assertEqual(self.run_once(keep=2), 0)
         self.assertEqual(sorted(path.name for path in self.store.kept()), sorted(commits[3:]))
+
+    def test_requests_build_in_order_and_one_already_bundled_is_not_requested(self):
+        second = self.commit("second")
+        third = self.commit("third")
+        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root)]
+        for sha in (third, second):
+            with patch.object(sys, "argv", [*arguments, "request", sha]):
+                prebuild.main()
+            time.sleep(0.01)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual([build[1] for build in self.builds()], [third, second])
+        self.assertEqual(list(self.store.requests.iterdir()), [])
+        # Once evicted, a commit requested while it was bundled is not rebuilt.
+        with patch.object(sys, "argv", [*arguments, "request", second]):
+            prebuild.main()
+        self.assertEqual(list(self.store.requests.iterdir()), [])
+        self.assertEqual(self.run_once(keep=0), 0)
+        self.assertEqual(len(self.builds()), 2)
+
+    def test_a_lock_on_another_file_with_the_same_inode_number_is_no_waiter(self):
+        found = Path(f"{self.lock}.queue").stat()
+        (self.proc / "locks").unlink()
+        # The test's own process holds no lock on the queue file.
+        (self.proc / "locks").write_text(f"1: FLOCK  ADVISORY  WRITE {os.getpid()} 00:20:{found.st_ino} 0 EOF\n")
+        self.assertFalse(prebuild.share_waiter())
+        self.waiter()
+        (self.proc / "locks").unlink()
+        (self.proc / "locks").symlink_to("/proc/locks")
+        self.assertTrue(prebuild.share_waiter())
+
+    def test_wait_gives_up_at_its_timeout_and_starts_the_service_meanwhile(self):
+        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root)]
+        with patch.object(prebuild, "pause", lambda seconds: None), \
+                patch.object(sys, "argv", [*arguments, "wait", self.first, "--timeout", "0.2"]):
+            self.assertEqual(prebuild.main(), 124)
+        self.assertIn(f"start --no-block {prebuild.SERVICE}", (self.root / "systemctl").read_text())
 
     def test_another_run_holding_the_store_leaves_it_alone(self):
         self.compiled(self.first)

@@ -471,18 +471,18 @@ def manager_environment():
             if key not in MANAGER_VARIABLES} | manager_environment_only()
 
 
-def prepare_slice():
-    """Whether builds can run in scopes here, capping the build slice's
-    memory first when its cap differs."""
+def prepare_slice(name=BUILD_SLICE):
+    """Whether builds can run in scopes of the slice `name` here, capping its
+    memory first, and for the idle slice making it idle, where they differ."""
     if os.environ.get("CAGENTS_BUILD_SCOPE") == "0":
         return False
-    wanted = f"MemoryHigh={budget() // 4096 * 4096}"
+    wanted = [f"MemoryHigh={budget() // 4096 * 4096}", *(IDLE_SLICE_SETTINGS if name == IDLE_SLICE else ())]
     try:
-        shown = systemctl("show", BUILD_SLICE, "--property=MemoryHigh")
+        shown = systemctl("show", name, *(f"--property={setting.split('=')[0]}" for setting in wanted))
         if shown.returncode != 0:
             return False
-        if shown.stdout.strip() != wanted:
-            return systemctl("set-property", "--runtime", BUILD_SLICE, wanted).returncode == 0
+        if sorted(shown.stdout.split()) != sorted(wanted):
+            return systemctl("set-property", "--runtime", name, *wanted).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
     return True
@@ -722,13 +722,17 @@ def follow_parent(parent):
 
 
 MANAGER_VARIABLES = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
-# A background build, such as a release prebuilt between main's checks, that
-# nothing else waits behind. The kernel schedules an idle group only on CPU
-# time no other group wants, so a build or test beside it runs as if it were
-# not there. Starved, it would sit on jobserver tokens other builds need, so
-# it takes none and runs its own Cargo jobs instead.
+# A background build, such as a release prebuilt beside main's checks, that
+# nothing else waits behind. It runs in its own slice at the top of the user
+# manager, which the kernel schedules only on CPU time that no sibling, such
+# as app.slice's tests and sessions or the build slice, wants: an idle group
+# yields only to its siblings, so it must not sit inside the build slice.
+# Starved, it would sit on jobserver tokens other builds need, so it takes
+# none and runs its own Cargo jobs instead.
 IDLE_SETTING = "CAGENTS_BUILD_IDLE"
-IDLE_PROPERTIES = ("--property=CPUWeight=idle", "--property=IOWeight=1")
+# A dash would nest it in another slice.
+IDLE_SLICE = "cagentsidle.slice"
+IDLE_SLICE_SETTINGS = ("CPUWeight=idle", "IOWeight=1")
 
 
 def idle():
@@ -748,8 +752,8 @@ def run(command, environment, scoped, group=True, capture=False, idle=False):
     would, then, if it is still running five seconds later, by stopping its
     whole scope. Unscoped, the command's own process group stands in for the
     scope, unless `group` is false, as for a command within another build,
-    whose scope or group ends it. An `idle` scope runs in the background of
-    every other."""
+    whose scope or group ends it. An `idle` scope runs in the idle slice,
+    behind everything else."""
     unit = f"cagents-build-{os.getpid()}-{time.monotonic_ns()}.scope"
     if scoped:
         # The command runs as this child: systemd-run execs it after making
@@ -757,8 +761,8 @@ def run(command, environment, scoped, group=True, capture=False, idle=False):
         settings = [f"{name}={environment[name]}" if name in environment else f"--unset={name}"
                     for name in MANAGER_VARIABLES]
         command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-                   f"--slice={BUILD_SLICE}", f"--unit={unit}", "--property=TimeoutStopSec=5",
-                   *(IDLE_PROPERTIES if idle else ()), "--",
+                   f"--slice={IDLE_SLICE if idle else BUILD_SLICE}", f"--unit={unit}",
+                   "--property=TimeoutStopSec=5", "--",
                    "env", *sorted(settings, key=lambda setting: not setting.startswith("--")),
                    *command]
         environment = {key: value for key, value in environment.items()
@@ -1059,7 +1063,7 @@ class Build:
                 # under `cargo-gate exec`, runs in its scope, with its
                 # jobserver, which its environment names.
                 self.nested = within_build()
-                self.scoped = not self.nested and prepare_slice()
+                self.scoped = not self.nested and prepare_slice(IDLE_SLICE if idle() else BUILD_SLICE)
                 self.jobserver = None
                 if (self.scoped or self.nested and lost_jobserver()) and not idle():
                     try:
@@ -1068,7 +1072,7 @@ class Build:
                         say(f"building without the shared jobserver: {error}")
                 trimmer = None
                 try:
-                    directory = slice_directory() if self.scoped else None
+                    directory = slice_directory() if self.scoped and not idle() else None
                     if directory:
                         trimmer = CacheTrimmer(directory, jobserver_directory() + ".reclaim")
                     yield self

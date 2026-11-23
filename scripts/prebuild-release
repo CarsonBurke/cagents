@@ -43,6 +43,8 @@ STORE = Path.home() / ".local/state/cagents-prebuilt"
 SENTINEL_STATE = Path.home() / ".local/state/cagents-main-sentinel"
 # Apart from the cache `scripts/release build` uses, which allows one build at a time.
 CACHE = Path.home() / ".cache/cagents-prebuild/ubuntu-22.04-amd64"
+# And apart from the smoke checks' runtime image, whose preparation allows one at a time.
+SMOKE_CACHE = Path.home() / ".cache/cagents-prebuild/smoke-ubuntu-24.04-amd64"
 CHECKOUT = ".worktrees/.prebuild"
 # Bundles kept, newest first; a pinned one is kept besides.
 KEEP = 3
@@ -61,10 +63,13 @@ WATCH_SECONDS = 5
 SUSTAINED = 2
 # How long a stopped background prebuild waits before it looks again.
 BACKOFF_SECONDS = 600
-# A build's whole admission wait: a background one that cannot start at once
-# gives up and tries again later rather than queue ahead of others.
-ADMISSION_SECONDS = {"background": 60, "normal": None}
+# A build's whole admission wait: a background one that cannot start almost
+# at once gives up and tries again later rather than queue ahead of others.
+ADMISSION_SECONDS = {"background": 10, "normal": None}
 GRACE_SECONDS = 60
+# A failed build is tried once more this long after, in case what failed was
+# the host rather than the commit; a second failure, or failing tests, is final.
+RETRY_FAILED_SECONDS = 3600
 
 
 def pause(seconds):
@@ -126,15 +131,37 @@ def share_waiter():
         return False
     for line in (proc() / "locks").read_text().splitlines():
         fields = line.split()
-        if "FLOCK" not in fields:
+        # A process blocked on the lock, behind its holder.
+        if fields[1:2] == ["->"]:
+            fields = fields[1:]
+        if len(fields) < 6 or fields[1] != "FLOCK":
             continue
-        index = fields.index("FLOCK")
         try:
-            major, minor, inode = fields[index + 4].split(":")
-        except (IndexError, ValueError):
+            pid, inode = int(fields[4]), int(fields[5].rsplit(":", 1)[1])
+        except ValueError:
             continue
-        if ((int(major, 16), int(minor, 16), int(inode))
-                == (os.major(found.st_dev), os.minor(found.st_dev), found.st_ino)):
+        if inode == found.st_ino and has_open(pid, found):
+            return True
+    return False
+
+
+def has_open(pid, found):
+    """Whether `pid` has the file `found` open. /proc/locks names the device of
+    the file system, which on btrfs is not the subvolume's that stat gives, so
+    its inode alone could be another file's."""
+    directory = Path(f"/proc/{pid}/fd")
+    try:
+        descriptors = os.listdir(directory)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    for descriptor in descriptors:
+        try:
+            opened = os.stat(directory / descriptor)
+        except OSError:
+            continue
+        if (opened.st_dev, opened.st_ino) == (found.st_dev, found.st_ino):
             return True
     return False
 
@@ -163,11 +190,12 @@ class Store:
         self.root = root
         self.bundles = root / "bundles"
         self.failures = root / "failures"
+        self.requests = root / "requests"
 
     def prepare(self):
         old = os.umask(0o077)
         try:
-            for directory in (self.root, self.bundles, self.failures):
+            for directory in (self.root, self.bundles, self.failures, self.requests):
                 directory.mkdir(parents=True, exist_ok=True)
         finally:
             os.umask(old)
@@ -181,8 +209,37 @@ class Store:
     def failure(self, sha):
         return read_json(self.failures / f"{sha}.json")
 
-    def request(self):
-        return read_json(self.root / "request.json")
+    def final_failure(self, sha):
+        """Its failure, unless it is to be tried again by now."""
+        failure = self.failure(sha)
+        if failure is None or failure["status"] == "tests failed" or failure.get("attempts", 1) >= 2:
+            return failure
+        return failure if time.time() - failure["failed_at"] < RETRY_FAILED_SECONDS else None
+
+    def fail(self, sha, status, log=None):
+        attempts = (self.failure(sha) or {}).get("attempts", 0) + 1
+        tail = log.read_text(errors="replace")[-4000:] if log and log.exists() else ""
+        write_json(self.failures / f"{sha}.json", {"sha": sha, "status": status, "failed_at": time.time(),
+                                                   "attempts": attempts, "log_tail": tail})
+        if log and log.exists():
+            shutil.move(log, self.failures / f"{sha}.log")
+        say(f"{sha} failed: {status}")
+
+    def requested(self):
+        """Requested commits, the earliest first."""
+        found = [read_json(path) for path in self.requests.glob("*.json")] if self.requests.is_dir() else []
+        return [request["sha"] for request in sorted(filter(None, found), key=lambda request: request["requested_at"])]
+
+    def done(self, sha):
+        (self.requests / f"{sha}.json").unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def pins(self):
+        """Held while pinning or evicting, so a pin is never left in a bundle
+        being removed."""
+        with (self.root / "pins.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
 
     def kept(self):
         """Complete bundles, newest first."""
@@ -192,16 +249,23 @@ class Store:
                       reverse=True)
 
     def evict(self, keep):
+        """Removes all but the `keep` newest bundles and those pinned, with
+        what a stopped build or an eviction left behind; the store lock is held."""
         now = time.time()
-        for index, path in enumerate(self.kept()):
-            pinned = path / "pinned"
-            if index < keep or pinned.exists() and now - pinned.stat().st_mtime < PIN_SECONDS:
-                continue
-            say(f"evicting {path.name}")
-            shutil.rmtree(path, ignore_errors=True)
-        # What a stopped build left behind; the store lock is held.
-        for partial in self.bundles.glob(".*.partial"):
-            shutil.rmtree(partial, ignore_errors=True)
+        with self.pins():
+            kept = self.kept()
+            for index, path in enumerate(kept):
+                pinned = path / "pinned"
+                if index < keep or pinned.exists() and now - pinned.stat().st_mtime < PIN_SECONDS:
+                    continue
+                say(f"evicting {path.name}")
+                path.replace(self.bundles / f".evict-{path.name}")
+            for path in self.bundles.iterdir():
+                name = path.name
+                left = (name.startswith(".evict-") or name.startswith(".") and name.endswith(".partial")
+                        or not name.startswith(".") and path not in kept)
+                if left and path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
 
 
 def sentinel_target(sentinel):
@@ -223,11 +287,13 @@ def verdict_failed(sentinel, sha):
 
 def choose(store, sentinel):
     """The commit to build next and its priority, or (None, None)."""
-    request = store.request()
-    if request and not store.built(request["sha"]) and store.failure(request["sha"]) is None:
-        return request["sha"], "normal"
+    for sha in store.requested():
+        if store.built(sha) or store.final_failure(sha) is not None:
+            store.done(sha)
+            continue
+        return sha, "normal"
     sha = sentinel_target(sentinel)
-    if sha and not store.built(sha) and store.failure(sha) is None:
+    if sha and not store.built(sha) and store.final_failure(sha) is None:
         return sha, "background"
     return None, None
 
@@ -249,14 +315,36 @@ class Stopped(Exception):
     """The build was stopped to make way, and is to be tried again."""
 
 
+class Failed(Exception):
+    """The build failed."""
+
+
+def clear_cache_runs(cache):
+    """Removes the work directories of builds stopped before they could,
+    unless a build is using the cache."""
+    if not (cache / ".lock").is_file():
+        return
+    with (cache / ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        for run_directory in cache.glob("run.*"):
+            shutil.rmtree(run_directory, ignore_errors=True)
+
+
 def build(repository, store, sentinel, cache, sha, priority):
     """Builds `sha`'s bundle into the store. Returns True once it is bundled,
     False once its build failed, and raises Stopped if it was stopped."""
-    checkout = prepare_checkout(repository, sha)
+    try:
+        checkout = prepare_checkout(repository, sha)
+    except subprocess.CalledProcessError as error:
+        raise Stopped(f"could not check out {sha}: {error.stderr.strip()}")
+    clear_cache_runs(cache)
     partial = store.bundles / f".{sha}.partial"
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(mode=0o700)
-    environment = dict(os.environ, CAGENTS_RELEASE_CACHE=str(cache))
+    environment = dict(os.environ, CAGENTS_RELEASE_CACHE=str(cache), CAGENTS_RELEASE_SMOKE_CACHE=str(SMOKE_CACHE))
     if priority == "background":
         environment["CAGENTS_BUILD_IDLE"] = "1"
     seconds = ADMISSION_SECONDS[priority]
@@ -289,8 +377,7 @@ def build(repository, store, sentinel, cache, sha, priority):
                 say(f"stopping {sha}: {reason}")
                 stop(child)
                 if verdict_failed(sentinel, sha):
-                    write_json(store.failures / f"{sha}.json",
-                               {"sha": sha, "status": "tests failed", "failed_at": time.time()})
+                    store.fail(sha, "tests failed")
                     shutil.rmtree(partial, ignore_errors=True)
                     return False
                 raise Stopped(reason)
@@ -302,24 +389,25 @@ def build(repository, store, sentinel, cache, sha, priority):
         (store.root / "building.json").unlink(missing_ok=True)
     if status == 124:
         raise Stopped("its admission waited too long")
-    if status:
-        tail = (partial / "build.log").read_text(errors="replace")[-4000:]
-        write_json(store.failures / f"{sha}.json",
-                   {"sha": sha, "status": status, "failed_at": time.time(), "log_tail": tail})
-        shutil.move(partial / "build.log", store.failures / f"{sha}.log")
+    try:
+        if status:
+            raise Failed(f"build-release-linux exited with status {status}")
+        metadata = read_json(partial / "dist/release-metadata.json") or {}
+        if metadata.get("source_commit") != sha or "version" not in metadata or "protocol" not in metadata:
+            raise Failed("its release metadata does not name this commit, a version and a protocol")
+        size = sum(path.stat().st_size for path in (partial / "dist").iterdir())
+        write_json(partial / "bundle.json", {
+            "schema": 1, "sha": sha, "version": metadata["version"], "protocol": metadata["protocol"],
+            "built_at": time.time(), "seconds": round(time.monotonic() - started), "priority": priority,
+            "bytes": size, "builder": f"scripts/build-release-linux at {sha}",
+        })
+        # An incomplete directory a crash left would refuse the rename.
+        shutil.rmtree(store.bundle(sha), ignore_errors=True)
+        partial.replace(store.bundle(sha))
+    except (Failed, OSError) as error:
+        store.fail(sha, str(error), partial / "build.log")
         shutil.rmtree(partial, ignore_errors=True)
-        say(f"{sha} failed with status {status}; its log is {store.failures / f'{sha}.log'}")
         return False
-    metadata = read_json(partial / "dist/release-metadata.json") or {}
-    if metadata.get("source_commit") != sha:
-        raise RuntimeError(f"the bundle of {sha} names another source commit")
-    size = sum(path.stat().st_size for path in (partial / "dist").iterdir())
-    write_json(partial / "bundle.json", {
-        "schema": 1, "sha": sha, "version": metadata["version"], "protocol": metadata["protocol"],
-        "built_at": time.time(), "seconds": round(time.monotonic() - started), "priority": priority,
-        "bytes": size, "builder": f"scripts/build-release-linux at {sha}",
-    })
-    partial.replace(store.bundle(sha))
     say(f"bundled {sha} ({metadata['version']}, {size / 2**30:.2f} GiB) in "
         f"{(time.monotonic() - started) / 60:.0f} min")
     return True
@@ -330,9 +418,9 @@ def why_stop(store, sentinel, sha, priority):
         return "its tests failed"
     if priority == "normal":
         return None
-    request = store.request()
-    if request and request["sha"] != sha and not store.built(request["sha"]):
-        return f"{request['sha']} was requested"
+    others = [other for other in store.requested() if other != sha and not store.built(other)]
+    if others:
+        return f"{others[0]} was requested"
     return busy_reason()
 
 
@@ -376,9 +464,8 @@ def run(repository, store, sentinel, cache, keep):
                            {"retry_after": time.time() + BACKOFF_SECONDS, "stopped": str(stopped)})
                 continue
             write_json(store.root / "state.json", {})
-            request = store.request()
-            if request and request["sha"] == sha:
-                (store.root / "request.json").unlink(missing_ok=True)
+            # Bundled or failed, as its waiter then sees.
+            store.done(sha)
             if done:
                 store.evict(keep)
 
@@ -391,7 +478,7 @@ def status(store, sentinel, as_json):
     report = {
         "bundles": [read_json(path / "bundle.json") for path in store.kept()],
         "building": building,
-        "request": store.request(),
+        "requested": store.requested(),
         "target": sentinel_target(sentinel),
         "failures": sorted((read_json(path) or {}).get("sha", path.stem)
                            for path in store.failures.glob("*.json")),
@@ -412,6 +499,8 @@ def status(store, sentinel, as_json):
     if building:
         print(f"building {building['sha']}  {building['priority']}, for "
               f"{(time.time() - building['started_at']) / 60:.0f} min")
+    for sha in report["requested"]:
+        print(f"requested {sha}")
     for sha in report["failures"]:
         print(f"failed   {sha}")
     return 0
@@ -435,6 +524,7 @@ def main():
     parser.add_argument("command", nargs="?", choices=("status", "request", "wait", "pin", "unpin"))
     parser.add_argument("sha", nargs="?")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--timeout", type=float, help="for wait: give up after this many seconds, exiting 124")
     args = parser.parse_args()
     repository = args.repository.resolve()
     store = Store(args.store)
@@ -448,36 +538,57 @@ def main():
         return status(store, args.sentinel_state, args.json)
     store.prepare()
     if args.command == "request":
-        (store.failures / f"{sha}.json").unlink(missing_ok=True)
-        write_json(store.root / "request.json", {"sha": sha, "requested_at": time.time()})
         if not store.built(sha):
-            subprocess.run(["systemctl", "--user", "start", "--no-block", SERVICE], check=False)
+            (store.failures / f"{sha}.json").unlink(missing_ok=True)
+            write_json(store.requests / f"{sha}.json", {"sha": sha, "requested_at": time.time()})
+            start_service()
         print(sha)
         return 0
     if args.command in ("pin", "unpin"):
-        if not store.built(sha):
-            say(f"{sha} is not bundled")
-            return 1
-        pin = store.bundle(sha) / "pinned"
-        if args.command == "pin":
-            pin.touch()
-        else:
-            pin.unlink(missing_ok=True)
+        with store.pins():
+            if not store.built(sha):
+                say(f"{sha} is not bundled")
+                return 1
+            pin = store.bundle(sha) / "pinned"
+            if args.command == "pin":
+                pin.touch()
+            else:
+                pin.unlink(missing_ok=True)
         return 0
-    # wait
+    return wait(store, sha, args.timeout)
+
+
+def start_service():
+    subprocess.run(["systemctl", "--user", "start", "--no-block", SERVICE], check=False,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def wait(store, sha, timeout):
+    """Blocks until `sha` is bundled, starting the service again whenever it
+    is not building it, as when a request reached it as it was ending."""
+    deadline = None if timeout is None else time.monotonic() + timeout
     last = None
     while not store.built(sha):
         failure = store.failure(sha)
         if failure is not None:
-            say(f"{sha} failed with status {failure['status']}; see {store.failures / f'{sha}.log'}")
+            say(f"{sha} failed: {failure['status']}; see {store.failures / f'{sha}.log'}")
             return 1
+        if deadline is not None and time.monotonic() >= deadline:
+            say(f"{sha} is still not bundled")
+            return 124
         building = read_json(store.root / "building.json")
-        line = (f"building, {(time.time() - building['started_at']) / 60:.0f} min so far"
-                if building and building.get("sha") == sha else "waiting for the build to start")
+        if building and not Path(f"/proc/{building.get('pid')}").exists():
+            building = None
+        if building and building.get("sha") == sha:
+            line = f"building, {(time.time() - building['started_at']) / 60:.0f} min so far"
+        else:
+            line = (f"waiting for the build of {building['sha']} to make way" if building
+                    else "waiting for the build to start")
+            start_service()
         if line != last:
             say(line)
             last = line
-        time.sleep(WATCH_SECONDS * 6)
+        pause(WATCH_SECONDS * 6)
     print(sha)
     return 0
 

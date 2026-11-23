@@ -986,26 +986,29 @@ including the artifact smoke checks and the metadata that lists every file's
 size and digest. It is built in a `.partial` directory and renamed into
 `~/.local/state/cagents-prebuilt/bundles/SHA` only once it is complete. The
 three newest bundles are kept (`--keep N`), plus any that a release has pinned
-in the past day. The build cache is
-`~/.cache/cagents-prebuild/ubuntu-22.04-amd64`, separate from the one
+in the past day. Its build cache and smoke runtime image
+are under `~/.cache/cagents-prebuild`, separate from the ones
 `scripts/release build` uses.
 
 A background prebuild never delays the sentinel's verdicts or anyone else's
 build:
 
-- **CPU:** its gate scope runs with `CAGENTS_BUILD_IDLE=1`, so it gets CPU time
-  only when no other process wants it. It runs its own Cargo jobs and holds
-  none of the shared jobserver's tokens.
+- **CPU:** its build runs with `CAGENTS_BUILD_IDLE=1`, so the gate puts it in
+  `cagentsidle.slice`, an idle slice beside `app.slice` and `background.slice`
+  that gets CPU time only when nothing else wants it. It runs its own Cargo
+  jobs and holds none of the shared jobserver's tokens.
 - **Memory:** it starts only with at least 16 GiB available, no memory
   pressure, and no build waiting for build memory shares. It stops when any of
   those changes for two checks in a row. It tries again ten minutes later,
   resuming from its warm build directory.
 
 `prebuild-release request SHA` builds a commit next at normal priority,
-interrupting a background prebuild of another commit. `wait SHA` blocks until
-the commit is bundled, and `status` lists bundles, the build running and any
-failures. A failed build is not retried until it is requested again. Its log
-is under `failures/` in the store.
+interrupting a background prebuild of another commit; requests build in the
+order they were made. `wait SHA [--timeout S]` blocks until the commit is
+bundled, and `status` lists bundles, the build running, requests and
+failures. A failed build is tried once more an hour later, in case the host
+rather than the commit failed; after that, or once its tests fail, only a
+request builds it again. Its log is under `failures/` in the store.
 
 Install the service on fw16 beside the sentinel, in
 `~/.config/systemd/user/cagents-prebuild.service`:
