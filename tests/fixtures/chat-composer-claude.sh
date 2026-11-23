@@ -608,6 +608,12 @@ handle_control() {
         metadata='{"effective":{},"sources":[]}'
     elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
         metadata=$(jq -c . "$usage_file")
+    elif [ "$subtype" = get_context_usage ] && [ -f "$config/fixture-context-usage.json" ]; then
+        # Optional context report, as Claude Code 2.1 answers it: totalTokens,
+        # isAutoCompactEnabled, maxTokens (the auto-compaction window while
+        # that is on) and autoCompactThreshold, where compaction starts. The
+        # model's whole window comes from a result's modelUsage.
+        metadata=$(jq -c . "$config/fixture-context-usage.json")
     elif [ "$subtype" = set_model ]; then
         model=$(printf '%s' "$frame" | jq -r '.request.model // "haiku"')
     elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then

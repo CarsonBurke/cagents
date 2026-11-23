@@ -2701,6 +2701,8 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
                     );
                     json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
+                // The adapter reads Codex's effective configuration for where it compacts.
+                "config/read" => json!({"config":{}}),
                 "model/list" | "skills/list" => json!({"data":[]}),
                 "thread/queue/list" | "thread/list" => json!({"data":[],"nextCursor":null}),
                 "turn/start" => {
@@ -2823,6 +2825,8 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
                 "thread/start" => {
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}}})
                 }
+                // The adapter reads Codex's effective configuration for where it compacts.
+                "config/read" => json!({"config":{}}),
                 "model/list" | "skills/list" => json!({"data":[]}),
                 "thread/queue/list" | "thread/list" => json!({"data":[],"nextCursor":null}),
                 "turn/start" => {
@@ -3033,6 +3037,8 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
                         assert_eq!(frame["params"]["threadId"], THREAD);
                         json!({"thread":thread,"model":"fixture-model"})
                     }
+                    // The adapter reads Codex's effective configuration for where it compacts.
+                    "config/read" => json!({"config":{}}),
                     "model/list" | "skills/list" => json!({"data":[]}),
                     "thread/queue/list" | "thread/list" | "thread/turns/list" => {
                         json!({"data":[],"nextCursor":null})

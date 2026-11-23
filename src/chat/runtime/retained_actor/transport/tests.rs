@@ -75,6 +75,9 @@ printf '{"type":"control_response","response":{"subtype":"success","request_id":
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$1"
 printf '{"type":"assistant","uuid":"scope-output","message":{"id":"scope-output","role":"assistant","content":[{"type":"text","text":"scope fallback initialized"}]}}\n'
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}\n' "$1"
+# Connected, the adapter asks where Claude Code compacts; take the request
+# rather than leave it a closed pipe.
+IFS= read -r frame || :
 "#
                 .into(),
                 "scope-fixture".into(),

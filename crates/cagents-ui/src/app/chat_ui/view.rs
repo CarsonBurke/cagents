@@ -1601,6 +1601,7 @@ impl Cagents {
                     self.chat_auth_recovery(runtime),
                     self.chat_ui.phases.get(&card),
                     self.settings.chat_enter_sends,
+                    self.settings.context_usage_display,
                     &self.settings.keyboard_shortcuts,
                     self.workspace
                         .presentation_geometry()
@@ -3084,6 +3085,7 @@ impl Runtime {
             recovery,
             transition,
             enter_sends,
+            crate::settings::AccountUsageDisplay::default(),
             shortcuts,
             content_width,
             transcript_clearance,
@@ -3101,6 +3103,7 @@ impl Runtime {
         recovery: Option<auth_recovery::Recovery>,
         transition: impl Into<ViewTransition>,
         enter_sends: bool,
+        context_display: crate::settings::AccountUsageDisplay,
         shortcuts: &crate::settings::KeyboardShortcuts,
         content_width: f32,
         transcript_clearance: f32,
@@ -4528,24 +4531,17 @@ impl Runtime {
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         let mut cost_shown = false;
-        if usage.context_limit > 0 {
+        if let Some(meter) = ContextMeter::of(usage, context_display) {
             // A context budget is a quantity a reader acts on - compact now,
             // or lose the thread - so it is drawn as a ring with its figure
             // beside it. The linear capsule this replaces spent the width of a
             // whole caption saying what the percentage already said.
-            let used = (usage.context_tokens as f32 / usage.context_limit as f32).clamp(0.0, 1.0);
+            //
             // The raw counts are checked once, if ever, so they are held
             // here rather than spending a permanent run of status-line
             // width: the ring and its percentage are what a reader acts on.
             // The tightest pane says the cost here too, rather than drop it.
-            let mut detail = format!(
-                "{:.0}% of context · {} of {} tokens · {} in · {} out",
-                used * 100.0,
-                usage.context_tokens,
-                usage.context_limit,
-                usage.input_tokens,
-                usage.output_tokens
-            );
+            let mut detail = meter.detail;
             if fit == FooterFit::Tight
                 && let Some((label, _)) = &cost
             {
@@ -4556,13 +4552,13 @@ impl Runtime {
             // The ring is a glyph; a screen reader hears what its tooltip
             // says, which in the tightest pane is also the only figure.
             let ring = crate::ui_controls::labelled(
-                crate::ui_controls::budget_radial(used),
+                crate::ui_controls::budget_radial(meter.fraction),
                 detail.clone(),
             );
             spend.push(crate::interaction::tooltip_above(
                 widget::row::with_children(std::iter::once(ring).chain(
                     (fit != FooterFit::Tight).then(|| {
-                        design::caption(format!("{:.0}%", used * 100.0))
+                        design::caption(meter.figure)
                             .wrapping(iced::widget::text::Wrapping::None)
                             .into()
                     }),
@@ -8269,6 +8265,102 @@ fn fast_mode_tooltip(mode: &crate::chat::FastMode) -> String {
         None if mode.state == crate::chat::FastModeState::Cooldown => "Fast mode is temporarily cooling down. The provider will resume it when available; click to turn it off.".into(),
         None => "Use the provider's faster mode for subsequent turns. It can use more allowance or cost more.".into(),
     }
+}
+
+/// What a conversation's context ring says, measured against the point where
+/// the provider compacts it on its own: 262k tokens of a 1M window that
+/// compacts at 300k is 87% of the way there, not 26%. Where it does not
+/// compact early, against the whole window.
+///
+/// The usage display setting decides what every part states - the figure,
+/// the ring's fill and the words - so a reader who chose Left sees the room
+/// left in all three, as account rings show it.
+#[derive(Debug, Clone, PartialEq)]
+struct ContextMeter {
+    /// The ring's fill.
+    fraction: f32,
+    /// The caption beside the ring: `13% left` or `87% used`.
+    figure: String,
+    /// The tooltip: the figure in words, the counts behind it, and the
+    /// conversation's input and output.
+    detail: String,
+}
+
+impl ContextMeter {
+    /// The meter for `usage`, or `None` while there is no budget to measure
+    /// against.
+    fn of(
+        usage: &crate::chat::Usage,
+        display: crate::settings::AccountUsageDisplay,
+    ) -> Option<Self> {
+        use crate::settings::AccountUsageDisplay;
+
+        let budget = usage.context_budget();
+        if budget == 0 {
+            return None;
+        }
+        let used = (usage.context_tokens as f64 / budget as f64).clamp(0.0, 1.0);
+        // Rounded as a reader expects, except that a figure never claims the
+        // budget untouched or spent while it is neither.
+        let used_percent = match (used * 100.0).round() as u32 {
+            0 if used > 0.0 => 1,
+            100 if used < 1.0 => 99,
+            percent => percent,
+        };
+        let (percent, fraction, suffix) = match display {
+            AccountUsageDisplay::Left => (100 - used_percent, 1.0 - used as f32, "left"),
+            AccountUsageDisplay::Used => (used_percent, used as f32, "used"),
+        };
+        let figure = format!("{percent}% {suffix}");
+        let counts = format!(
+            "{} of {} tokens",
+            token_count(usage.context_tokens),
+            token_count(budget)
+        );
+        let headline = if usage.compacts_early() {
+            let window = if usage.context_limit > 0 {
+                format!(" ({} window)", token_count(usage.context_limit))
+            } else {
+                String::new()
+            };
+            match display {
+                AccountUsageDisplay::Left => {
+                    format!("{figure} before auto-compact · {counts}{window}")
+                }
+                AccountUsageDisplay::Used => {
+                    format!("{percent}% of the way to auto-compact · {counts}{window}")
+                }
+            }
+        } else {
+            format!("{percent}% of context {suffix} · {counts}")
+        };
+        Some(Self {
+            fraction,
+            figure,
+            detail: format!(
+                "{headline} · {} in · {} out",
+                token_count(usage.input_tokens),
+                token_count(usage.output_tokens)
+            ),
+        })
+    }
+}
+
+/// A token count as a reader takes it in at a glance: `950`, `1.5k`,
+/// `262k`, `1M`.
+fn token_count(tokens: u64) -> String {
+    // From 999.5k up the count rounds to a million, so it reads as one.
+    let (scaled, unit) = match tokens {
+        999_500.. => (tokens as f64 / 1_000_000.0, "M"),
+        1_000.. => (tokens as f64 / 1_000.0, "k"),
+        _ => return tokens.to_string(),
+    };
+    let digits = if scaled < 10.0 {
+        format!("{scaled:.1}")
+    } else {
+        format!("{scaled:.0}")
+    };
+    format!("{}{unit}", digits.strip_suffix(".0").unwrap_or(&digits))
 }
 
 /// An amount in whole cents. A spend too small to round to one cent is

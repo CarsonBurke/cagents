@@ -804,6 +804,44 @@ fn resident_title_admission_refuses_without_waiting_for_the_state_owner() {
     assert_eq!(outcome.unwrap(), Err(TitleUnavailable::Busy));
 }
 
+/// The conversation's usage carries where the provider compacts, which the
+/// context meter measures against, as each reading states it. A reset keeps
+/// it, since it is the session's setting rather than the conversation's.
+#[test]
+fn usage_keeps_the_compaction_point_each_reading_states() {
+    let mut state = Snapshot::default();
+    let mut indices = BTreeMap::new();
+    let reading = |context_tokens, compact_limit| {
+        Event::Usage(crate::chat::Usage {
+            context_tokens,
+            context_limit: 1_000_000,
+            compact_limit,
+            ..Default::default()
+        })
+    };
+    apply_event(&mut state, &mut indices, reading(230_000, Some(267_000)));
+    assert_eq!(state.usage.compact_limit, Some(267_000));
+    assert_eq!(state.usage.context_budget(), 267_000);
+    // A reading without input or output counts keeps the earlier counts but
+    // states the compaction point afresh.
+    apply_event(&mut state, &mut indices, reading(0, Some(300_000)));
+    assert_eq!(state.usage.context_tokens, 230_000);
+    assert_eq!(state.usage.compact_limit, Some(300_000));
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Reset {
+            reason: "cleared".into(),
+        },
+    );
+    assert_eq!(state.usage.context_tokens, 0);
+    assert_eq!(state.usage.compact_limit, Some(300_000));
+    // Auto-compaction turned off: the whole window is the budget again.
+    apply_event(&mut state, &mut indices, reading(20_000, None));
+    assert_eq!(state.usage.compact_limit, None);
+    assert_eq!(state.usage.context_budget(), 1_000_000);
+}
+
 #[test]
 fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
     let mut state = Snapshot::default();
@@ -6270,9 +6308,12 @@ fn provider_exit_stops_pending_claude_file_edits_in_cached_and_fresh_queries() {
                 }]
             }
         });
+        // Claude Code is asked where it compacts once connected, then the
+        // test's refresh ends it.
         let (_directory, handle) = claude_initialization_pipe(&format!(
             "print(json.dumps({{'type': 'control_response', 'response': {{'subtype': 'success', 'request_id': request['request_id'], 'response': {{}}}}}}), flush=True)\n\
              print({call:?}, flush=True)\n\
+             assert json.loads(sys.stdin.readline())['request']['subtype'] == 'get_context_usage'\n\
              json.loads(sys.stdin.readline())\n\
              sys.exit(7)\n",
             call = call.to_string(),

@@ -315,7 +315,12 @@ use crate::{
 /// Version 200 adds `checkout` to `ModelChannel` and `ModelEdit::CreateChannel`:
 /// the linked worktree a channel works in. An older client is sent channels
 /// without it, and its channel creation is read as one in the main checkout.
-pub const PROTOCOL_VERSION: u16 = 200;
+///
+/// Version 201 appends `compact_limit` to `Usage`: where the provider
+/// auto-compacts the conversation, which the context meter measures against.
+/// An older client is sent usage without it; usage read from an older update
+/// source has none, which leaves the whole window as the budget.
+pub const PROTOCOL_VERSION: u16 = 201;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -347,8 +352,8 @@ mod older_clients;
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
     ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN,
-    PLAN_AND_RESET_READINGS, WAIT_KINDS, WAITING_TOOL_STATUS, decoding_before, decoding_from,
-    encoding_before,
+    PLAN_AND_RESET_READINGS, USAGE_COMPACT_LIMIT, WAIT_KINDS, WAITING_TOOL_STATUS, decoding_before,
+    decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

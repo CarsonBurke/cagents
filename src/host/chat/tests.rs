@@ -2265,6 +2265,8 @@ fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread
                             {"type":"agentMessage","id":"saved-answer","text":"existing exact-thread answer","phase":"final_answer"}
                         ]}],"nextCursor":null}})
                 }
+                // The adapter reads Codex's effective configuration for where it compacts.
+                "config/read" => serde_json::json!({"config":{}}),
                 "model/list" | "skills/list" | "thread/list" | "thread/queue/list" => {
                     serde_json::json!({"data":[],"nextCursor":null})
                 }

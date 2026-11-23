@@ -190,6 +190,8 @@ fn serve_until(
         let result = match frame["method"].as_str().unwrap() {
             "initialize" => json!({"userAgent":"codex/0.166.0","codexHome":home}),
             "thread/resume" => json!({"thread":thread,"model":"fixture-model"}),
+            // The adapter reads Codex's effective configuration for where it compacts.
+            "config/read" => json!({"config":{}}),
             "model/list" | "skills/list" => json!({"data":[]}),
             "thread/queue/list" | "thread/list" | "thread/turns/list" => {
                 json!({"data":[],"nextCursor":null})

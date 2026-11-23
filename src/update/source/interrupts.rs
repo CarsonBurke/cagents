@@ -558,7 +558,7 @@ mod tests {
     use super::*;
     use crate::{
         model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe},
-        terminal_ipc::{ClientEnvelope, ServerEnvelope, ServerMessage, read_frame, write_frame},
+        terminal_ipc::{ClientEnvelope, ServerEnvelope, ServerMessage, read_frame},
     };
     use std::{
         os::unix::net::UnixStream,
@@ -569,6 +569,15 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    /// Answers as a protocol 156 daemon encodes, which the client reads as
+    /// one: a value a later protocol grew is sent as that daemon had it.
+    fn write_frame<T: serde::Serialize>(
+        writer: &mut impl std::io::Write,
+        value: &T,
+    ) -> Result<(), crate::terminal_ipc::FrameError> {
+        crate::terminal_ipc::encoding_for(156, || crate::terminal_ipc::write_frame(writer, value))
+    }
 
     fn fixture() -> (Session, impact::DaemonImpact, directory::Entry) {
         let proof = HostSessionProof {

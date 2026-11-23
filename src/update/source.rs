@@ -749,7 +749,7 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
     ReleasedSource {
         protocol: 198,
         // The signed releases 0.2.0 to 0.2.3 all serve it.
-        release: "0.2.1",
+        release: "0.2.0–0.2.3",
     },
 ];
 
@@ -826,6 +826,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (
         199,
         "intermediate #3777 protocol; superseded by 200 without a qualified installed update source",
+    ),
+    (
+        200,
+        "intermediate #3774 protocol; superseded by 201 without a qualified installed update source",
     ),
 ];
 
@@ -1515,7 +1519,7 @@ mod admission_message_tests {
                  protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744), \
                  protocol 177 (0.1.3+local.374370965), protocol 178 (0.1.3+local.3b1e81a4d), \
                  protocol 179 (0.1.3+local.43f253ef8), protocol 187 (0.1.3+local.ccd4134c6), \
-                 protocol 191 (0.1.3+local.e8bbb84f2), protocol 198 (0.2.1) and protocol {}.",
+                 protocol 191 (0.1.3+local.e8bbb84f2), protocol 198 (0.2.0–0.2.3) and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));
             assert!(message.contains("did not request preparation or shutdown"));

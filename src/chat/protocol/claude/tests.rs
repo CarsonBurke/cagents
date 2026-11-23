@@ -15283,3 +15283,138 @@ fn user_frames_hide_model_notes_and_unwrap_local_command_output() {
     let silent = adapter.receive(json!({"type":"user","uuid":"clear","message":{"role":"user","content":"<local-command-stdout></local-command-stdout>"}})).unwrap();
     assert!(items(&silent).is_empty(), "{:?}", items(&silent));
 }
+
+/// Claude Code resolves where auto-compaction falls - its settings at every
+/// level, CLAUDE_CODE_AUTO_COMPACT_WINDOW, /autocompact and the model - and
+/// reports it as `get_context_usage`'s window, which the adapter asks for once
+/// connected. That point is kept apart from the model's whole window, which a
+/// turn's result names, so neither replaces the other.
+#[test]
+fn the_context_budget_follows_claude_codes_auto_compaction_window() {
+    let mut adapter = Claude::default();
+    let initialize = adapter.initialize().unwrap();
+    let request = initialize.writes[0]["request_id"].as_str().unwrap();
+    let connected = adapter
+        .receive(reply(request, json!({"models":[]})))
+        .unwrap();
+    let asked = connected
+        .writes
+        .iter()
+        .find(|frame| frame["request"]["subtype"] == "get_context_usage")
+        .expect("the context budget is asked for once connected");
+    let asked = asked["request_id"].as_str().unwrap().to_owned();
+    let usage_of = |step: &Step| {
+        step.events.iter().rev().find_map(|event| match event {
+            Event::Usage(usage) => Some(usage.clone()),
+            _ => None,
+        })
+    };
+    let report = adapter
+        .receive(reply(
+            &asked,
+            json!({"totalTokens":14000,"maxTokens":300000,"rawMaxTokens":300000,
+                "autocompactSource":"settings","autoCompactThreshold":267000,
+                "isAutoCompactEnabled":true}),
+        ))
+        .unwrap();
+    let usage = usage_of(&report).unwrap();
+    assert_eq!(usage.context_tokens, 14_000);
+    // Compaction starts at the threshold, short of the 300k window.
+    assert_eq!(usage.compact_limit, Some(267_000));
+    let result = adapter
+        .receive(
+            json!({"type":"result","subtype":"success","is_error":false,"session_id":"00000000-0000-4000-8000-000000000001",
+            "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000}}}),
+        )
+        .unwrap();
+    let usage = usage_of(&result).unwrap();
+    assert_eq!(usage.context_limit, 1_000_000);
+    assert_eq!(usage.compact_limit, Some(267_000));
+    assert_eq!(usage.context_budget(), 267_000);
+
+    // A model changed outside `set_model`, such as by a typed /model, has its
+    // own window and so its own compaction point: it is asked again. The same
+    // window asks nothing.
+    let asks = |step: &Step| {
+        step.writes
+            .iter()
+            .any(|frame| frame["request"]["subtype"] == "get_context_usage")
+    };
+    let result_in = |window: u64| {
+        json!({"type":"result","subtype":"success","is_error":false,"session_id":"00000000-0000-4000-8000-000000000001",
+            "modelUsage":{"claude-model":{"contextWindow":window}}})
+    };
+    assert!(!asks(&adapter.receive(result_in(1_000_000)).unwrap()));
+    let switched = adapter.receive(result_in(200_000)).unwrap();
+    assert!(asks(&switched), "{:?}", switched.writes);
+    assert_eq!(usage_of(&switched).unwrap().context_budget(), 200_000);
+
+    // Clearing the conversation clears its figures, not where the session
+    // compacts.
+    adapter
+        .receive(json!({"type":"conversation_reset"}))
+        .unwrap();
+    assert_eq!(adapter.usage.context_tokens, 0);
+    assert_eq!(adapter.usage.compact_limit, Some(267_000));
+
+    // With auto-compaction off the reported window is the model's whole
+    // window, and nothing compacts early.
+    let refresh = adapter.command(Command::Refresh).unwrap();
+    let asked = refresh.writes[0]["request_id"].as_str().unwrap().to_owned();
+    let off = adapter
+        .receive(reply(
+            &asked,
+            json!({"totalTokens":20000,"maxTokens":1000000,"isAutoCompactEnabled":false}),
+        ))
+        .unwrap();
+    let usage = usage_of(&off).unwrap();
+    assert_eq!(usage.compact_limit, None);
+    assert_eq!(usage.context_budget(), 1_000_000);
+
+    // A window reported without its threshold is the budget itself.
+    let refresh = adapter.command(Command::Refresh).unwrap();
+    let asked = refresh.writes[0]["request_id"].as_str().unwrap().to_owned();
+    let windowed = adapter
+        .receive(reply(
+            &asked,
+            json!({"totalTokens":20000,"maxTokens":300000,"isAutoCompactEnabled":true}),
+        ))
+        .unwrap();
+    assert_eq!(usage_of(&windowed).unwrap().compact_limit, Some(300_000));
+
+    // A refresh the reader asked for says why it got nothing.
+    let refresh = adapter.command(Command::Refresh).unwrap();
+    assert_eq!(refresh.writes[0]["request"].get("_cagents_automatic"), None);
+    let asked = refresh.writes[0]["request_id"].as_str().unwrap().to_owned();
+    let refused = adapter
+        .receive(json!({"type":"control_response","response":{"subtype":"error","request_id":asked,"error":"Unsupported"}}))
+        .unwrap();
+    assert!(
+        refused
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { fatal: false, .. })),
+        "{:?}",
+        refused.events
+    );
+
+    // One asked for unprompted leaves the figures and tells the reader
+    // nothing: the context ring is display data a CLI may not offer.
+    let mut adapter = Claude::default();
+    let initialize = adapter.initialize().unwrap();
+    let request = initialize.writes[0]["request_id"].as_str().unwrap();
+    let connected = adapter
+        .receive(reply(request, json!({"models":[]})))
+        .unwrap();
+    let asked = connected
+        .writes
+        .iter()
+        .find(|frame| frame["request"]["subtype"] == "get_context_usage")
+        .unwrap();
+    assert_eq!(asked["request"].get("_cagents_automatic"), None);
+    let asked = asked["request_id"].as_str().unwrap().to_owned();
+    let refused = adapter
+        .receive(json!({"type":"control_response","response":{"subtype":"error","request_id":asked,"error":"Unsupported"}}))
+        .unwrap();
+    assert!(refused.events.is_empty(), "{:?}", refused.events);
+}

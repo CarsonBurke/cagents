@@ -4289,7 +4289,12 @@ fn apply_projected_event(
             state.subagents.clear();
             indices.clear();
             state.requests.clear();
-            state.usage = Default::default();
+            // Where the conversation compacts is the session's setting, not
+            // the cleared conversation's.
+            state.usage = crate::chat::Usage {
+                compact_limit: state.usage.compact_limit,
+                ..Default::default()
+            };
             state.session_id = None;
             state.title = None;
             state.has_earlier = false;
@@ -4628,6 +4633,9 @@ fn apply_projected_event(
             if value.cost_estimate.is_some() {
                 state.usage.cost_estimate = value.cost_estimate;
             }
+            // Every reading states where the provider compacts as it knows it
+            // then, and `None` says it doesn't compact early or hasn't said.
+            state.usage.compact_limit = value.compact_limit;
         }
         Event::PromptSuggestion {
             session_id,
