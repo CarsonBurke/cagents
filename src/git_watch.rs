@@ -183,7 +183,7 @@ pub enum Interest {
 }
 
 impl Interest {
-    fn watches_files(self) -> bool {
+    pub fn watches_files(self) -> bool {
         self != Self::Metadata
     }
 }
@@ -1086,6 +1086,9 @@ impl Monitor {
                 let mut watcher = create_watcher();
                 let mut registered: BTreeMap<PathBuf, (RecursiveMode, u64, u64)> = BTreeMap::new();
                 let mut unadmitted = BTreeMap::new();
+                // What the last registration left unwatched, per project: a
+                // worktree that leaves this set gained watches only now.
+                let mut was_unwatched: BTreeMap<ProjectId, BTreeSet<WorktreeId>> = BTreeMap::new();
                 while requests.recv().is_ok() {
                     let projects = {
                         let configuration = desired_configuration
@@ -1177,35 +1180,22 @@ impl Monitor {
                     for (&id, project) in &projects {
                         let metadata_covered = !failures.contains_key(&id);
                         let coverage = metadata_covered && !content_failures.contains_key(&id);
-                        let before = old
-                            .get(&id)
-                            .into_iter()
-                            .flat_map(|project| &project.worktrees)
-                            .map(|worktree| (worktree.id, worktree))
-                            .collect::<HashMap<_, _>>();
-                        let changed = project
-                            .worktrees
-                            .iter()
-                            .filter(|worktree| {
-                                worktree.needs_read_after(before.get(&worktree.id).copied())
-                            })
-                            .map(|worktree| worktree.id)
-                            .collect::<BTreeSet<_>>();
-                        // A rearm may have missed events while its watches
-                        // were down. Rebuilding every watch may have missed
-                        // any; re-registering a replaced directory, only an
-                        // edit to watched files: a worktree whose files are
-                        // unwatched is read when its owner needs it anyway.
-                        let worktrees = if changed.is_empty() && rearmed.contains(&id) {
+                        let now_unwatched = if metadata_covered {
+                            unwatched.remove(&id).unwrap_or_default()
+                        } else {
                             project
                                 .worktrees
                                 .iter()
-                                .filter(|worktree| rearm.all || worktree.interest.watches_files())
                                 .map(|worktree| worktree.id)
                                 .collect()
-                        } else {
-                            changed
                         };
+                        let worktrees = reads_after_registration(
+                            project,
+                            old.get(&id).map(Arc::as_ref),
+                            was_unwatched.get(&id),
+                            &now_unwatched,
+                            rearmed.contains(&id).then_some(rearm.all),
+                        );
                         // Acknowledge coverage even when the paths did not change:
                         // this settles fallback after a successful retry.
                         pending.changes.entry(id).or_default().merge(Change {
@@ -1215,11 +1205,12 @@ impl Monitor {
                             error: failures
                                 .remove(&id)
                                 .or_else(|| content_failures.remove(&id)),
-                            unwatched: metadata_covered
-                                .then(|| unwatched.remove(&id).unwrap_or_default()),
+                            unwatched: metadata_covered.then(|| now_unwatched.clone()),
                             ..Change::default()
                         });
+                        was_unwatched.insert(id, now_unwatched);
                     }
+                    was_unwatched.retain(|id, _| projects.contains_key(id));
                     if !pending.changes.is_empty() {
                         wake();
                     }
@@ -1355,6 +1346,43 @@ fn reconcile(
         }
     }
     rearmed
+}
+
+/// The worktrees `project`'s owner must read once a registration has put
+/// its watches in place, given the plan `before` it and which worktrees the
+/// previous and this registration left without file watches:
+///
+/// - One whose plan asks for it ([`Worktree::needs_read_after`]).
+/// - One whose files are watched only now, because the budget reached it:
+///   an edit made while it was unwatched would otherwise never show.
+/// - When the project's watches were re-registered (`rearmed`), every
+///   worktree whose files are watched, or every one at all when all
+///   watches were rebuilt (`Some(true)`): events may have been lost while
+///   they were down.
+fn reads_after_registration(
+    project: &Project,
+    before: Option<&Project>,
+    was_unwatched: Option<&BTreeSet<WorktreeId>>,
+    now_unwatched: &BTreeSet<WorktreeId>,
+    rearmed: Option<bool>,
+) -> BTreeSet<WorktreeId> {
+    let before = before
+        .into_iter()
+        .flat_map(|project| &project.worktrees)
+        .map(|worktree| (worktree.id, worktree))
+        .collect::<HashMap<_, _>>();
+    project
+        .worktrees
+        .iter()
+        .filter(|worktree| {
+            let watched =
+                worktree.interest.watches_files() && !now_unwatched.contains(&worktree.id);
+            worktree.needs_read_after(before.get(&worktree.id).copied())
+                || (watched && was_unwatched.is_some_and(|was| was.contains(&worktree.id)))
+                || rearmed.is_some_and(|all| all || worktree.interest.watches_files())
+        })
+        .map(|worktree| worktree.id)
+        .collect()
 }
 
 impl Drop for Monitor {
@@ -1869,6 +1897,81 @@ mod tests {
         let demoted = cooled.worktrees.iter().find(|w| w.id == worked).unwrap();
         assert!(!demoted.needs_read_after(Some(promoted)));
         assert_eq!(cooled, cold);
+    }
+
+    #[test]
+    fn a_worktree_the_budget_reaches_only_now_is_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        for worktree in &mut project.worktrees {
+            worktree.census = census(&["src/main.rs", "docs/index.md"]);
+            for directory in worktree.census.directories.iter() {
+                std::fs::create_dir_all(worktree.absolute(directory)).unwrap();
+            }
+            std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
+        }
+        std::fs::create_dir_all(project.common_dir.join("worktrees")).unwrap();
+        let id = project.id;
+        let (first, linked) = (project.worktrees[0].id, project.worktrees[1].id);
+        let metadata = {
+            let mut bare = project.clone();
+            for worktree in &mut bare.worktrees {
+                worktree.interest = Interest::Metadata;
+            }
+            Registrations::within(&BTreeMap::from([(id, Arc::new(bare))]), MAX_DIRECTORIES)
+                .desired
+                .len()
+        };
+        // Room for the linked checkout's three directories, beyond the
+        // first checkout's root, which its metadata already watches.
+        let limit = metadata + 3;
+        let plan = |active: WorktreeId| {
+            let mut project = project.clone();
+            for worktree in &mut project.worktrees {
+                worktree.interest = if worktree.id == active {
+                    Interest::Active
+                } else {
+                    Interest::Shown
+                };
+            }
+            let projects = BTreeMap::from([(id, Arc::new(project.clone()))]);
+            let unwatched = Registrations::within(&projects, limit)
+                .unwatched
+                .remove(&id)
+                .unwrap_or_default();
+            (project, unwatched)
+        };
+        let (worked_first, first_unwatched) = plan(first);
+        assert!(first_unwatched.contains(&linked), "the budget fell short");
+        // Work moves to the linked checkout: its plan is the same, it only
+        // moved up the order, yet it is watched only now.
+        let (worked_linked, linked_unwatched) = plan(linked);
+        assert!(!linked_unwatched.contains(&linked));
+        assert!(
+            !worked_linked.worktrees[1].needs_read_after(Some(&worked_first.worktrees[1])),
+            "the plan alone does not ask for it"
+        );
+        let reads = reads_after_registration(
+            &worked_linked,
+            Some(&worked_first),
+            Some(&first_unwatched),
+            &linked_unwatched,
+            None,
+        );
+        assert_eq!(reads, BTreeSet::from([linked]));
+        // Registering the same plan again reads nothing; re-registering the
+        // project's watches reads every worktree whose files are watched.
+        let again = |rearmed| {
+            reads_after_registration(
+                &worked_linked,
+                Some(&worked_linked),
+                Some(&linked_unwatched),
+                &linked_unwatched,
+                rearmed,
+            )
+        };
+        assert!(again(None).is_empty());
+        assert_eq!(again(Some(false)), BTreeSet::from([first, linked]));
     }
 
     #[test]

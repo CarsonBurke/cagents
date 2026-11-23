@@ -12,14 +12,14 @@ const LOCAL_WORKERS: usize = 2;
 /// see edits to its files, and how often a project whose Git metadata it
 /// cannot see has its worktree list read.
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
-/// How old the status of a checkout on show, but which nobody works in and
-/// whose files are not watched, may grow before it is read again. Git's own
-/// bookkeeping is watched for every checkout, so this only bounds how long
-/// an edit made outside the application, without staging or committing, goes
-/// unseen there. A checkout that is neither shown nor worked in is not read
-/// on a timer at all: with hundreds of worktrees, reading each in turn kept
-/// a Git process running and the disk busy for as long as the window had
-/// focus.
+/// How old the status of a checkout whose files are not watched may be when
+/// its row comes into view, or while it has a pane out of sight, before it
+/// is read again. Git's own bookkeeping is watched for every checkout, so
+/// this only bounds how long an edit made outside the application, without
+/// staging or committing, goes unseen there. A row that stays in view is not
+/// read again on a timer, nor is a checkout nobody looks at: with hundreds of
+/// worktrees, reading each in turn kept a Git process running and the disk
+/// busy for as long as the window had focus.
 const SHOWN_STALE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
@@ -173,6 +173,8 @@ pub(super) struct State {
     /// [`Interest::Active`]: git_watch::Interest::Active
     /// [`Interest::Shown`]: git_watch::Interest::Shown
     work: BTreeMap<(ProjectId, WorktreeId), git_watch::Interest>,
+    /// The checkout rows in view at the last periodic check.
+    shown: HashSet<(ProjectId, WorktreeId)>,
 }
 
 impl State {
@@ -278,8 +280,27 @@ impl State {
             )
             .map(|((project, _), _)| *project)
             .collect::<BTreeSet<_>>();
-        self.work = work;
-        for project in moved {
+        let before = std::mem::replace(&mut self.work, work);
+        // Moving between on screen and out of sight changes only the order
+        // the budget goes in, which matters only while it falls short: a
+        // project re-plans when a checkout gains or loses file watches, or
+        // when one that wants them goes without.
+        let replan = moved
+            .into_iter()
+            .filter(|project| {
+                let Some(entry) = self.entries.get(project) else {
+                    return false;
+                };
+                let was = entry.interest(*project, &before);
+                let now = entry.interest(*project, &self.work);
+                now.iter().any(|(worktree, interest)| {
+                    interest.watches_files()
+                        != was.get(worktree).is_some_and(|was| was.watches_files())
+                        || (interest.watches_files() && entry.unwatched.contains(worktree))
+                })
+            })
+            .collect::<Vec<_>>();
+        for project in replan {
             self.changed(
                 project,
                 git_watch::Change {
@@ -297,9 +318,11 @@ impl State {
     ///   checkout whose `HEAD` moved.
     /// - A checkout someone works in on screen, or selected, whose files are
     ///   not watched is read every [`FALLBACK_INTERVAL`].
-    /// - One that is shown, or worked in out of sight, is read once its
-    ///   status is [`SHOWN_STALE`].
-    /// - Every other checkout waits for a Git event, or for being shown.
+    /// - One worked in out of sight is read once its status is
+    ///   [`SHOWN_STALE`], and so is one whose row has come into view since
+    ///   the last check.
+    /// - Every other checkout, a row that stays in view included, waits for
+    ///   a Git event, or for its row to come into view again.
     fn due(
         &self,
         shown: &HashSet<(ProjectId, WorktreeId)>,
@@ -320,7 +343,9 @@ impl State {
                 let key = (project, record.id);
                 let interval = if self.work.get(&key) == Some(&git_watch::Interest::Active) {
                     FALLBACK_INTERVAL
-                } else if self.work.contains_key(&key) || shown.contains(&key) {
+                } else if self.work.contains_key(&key)
+                    || (shown.contains(&key) && !self.shown.contains(&key))
+                {
                     SHOWN_STALE
                 } else {
                     continue;
@@ -350,7 +375,10 @@ impl State {
                     entry.fallback = None;
                     entry.unwatched.clone_from(unwatched);
                 }
-                None if covered => entry.fallback = None,
+                None if covered => {
+                    entry.fallback = None;
+                    entry.unwatched.clear();
+                }
                 None => {
                     entry.fallback = Some(
                         change
@@ -560,6 +588,7 @@ impl Cagents {
         for (project, change) in self.refresh_ui.git.due(&shown, Instant::now()) {
             self.refresh_ui.git.changed(project, change);
         }
+        self.refresh_ui.git.shown = shown;
         self.start_git_reads()
     }
 
@@ -2176,10 +2205,17 @@ mod tests {
         assert_eq!(
             reads(&state, SHOWN_STALE),
             [(false, BTreeSet::from([worked, looked_at, out_of_sight]))],
-            "a shown checkout, or one worked in out of sight, is read once its \
-             status is old; the watched one and the 797 neither shown nor \
-             worked in never are"
+            "a row come into view, or a checkout worked in out of sight, is \
+             read once its status is old; the watched one and the 797 neither \
+             shown nor worked in never are"
         );
+        // A row that stays in view is not read again on a timer.
+        state.shown = shown.clone();
+        assert_eq!(
+            reads(&state, SHOWN_STALE),
+            [(false, BTreeSet::from([worked, out_of_sight]))]
+        );
+        state.shown.clear();
 
         // Metadata the watcher cannot see brings back the worktree list,
         // still without reading every checkout.
@@ -2196,6 +2232,53 @@ mod tests {
             reads(&state, FALLBACK_INTERVAL),
             [(true, BTreeSet::from([worked]))]
         );
+    }
+
+    /// Panes come into and out of view all the time; that re-plans watches
+    /// only when it can change which checkouts' files are watched.
+    #[test]
+    fn work_moving_on_and_off_screen_replans_only_when_coverage_can_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture(&directory.path().join("repo"));
+        let template = snapshot.worktrees[0].clone();
+        for index in 0..2 {
+            let mut record = template.0.clone();
+            record.id = WorktreeId::new();
+            record.path = directory.path().join(format!("worktree-{index}"));
+            snapshot.worktrees.push((record, template.1.clone()));
+        }
+        let (worked, other) = (snapshot.worktrees[1].0.id, snapshot.worktrees[2].0.id);
+        let project = ProjectId::new();
+        let mut state = State::default();
+        state.entries.insert(project, Entry::new(snapshot, 1, None));
+        let replans = |state: &mut State, work: &[(WorktreeId, git_watch::Interest)]| {
+            state.queue.clear();
+            state.entries.get_mut(&project).unwrap().pending = Default::default();
+            state.set_work(
+                work.iter()
+                    .map(|(id, interest)| ((project, *id), *interest))
+                    .collect(),
+            );
+            state.queue.contains(&project)
+        };
+        use git_watch::Interest::{Active, Shown};
+        assert!(
+            replans(&mut state, &[(worked, Active)]),
+            "it gains file watches"
+        );
+        assert!(
+            !replans(&mut state, &[(worked, Shown)]),
+            "out of sight it keeps them, and the budget covers everything"
+        );
+        // The budget falls short of the other checkout someone works in.
+        state.entries.get_mut(&project).unwrap().unwatched = BTreeSet::from([other]);
+        assert!(replans(&mut state, &[(worked, Shown), (other, Active)]));
+        assert!(
+            replans(&mut state, &[(worked, Active), (other, Shown)]),
+            "the order decides which of them the budget covers"
+        );
+        state.entries.get_mut(&project).unwrap().unwatched.clear();
+        assert!(replans(&mut state, &[]), "both lose their watches");
     }
 
     #[test]
