@@ -18471,6 +18471,7 @@ impl Cagents {
                 // The workspace is on screen: a daemon startup notice has
                 // nothing left to explain.
                 instance::dismiss_startup_wait_notice();
+                instance::mark_ui_window_opened();
                 // Chats the last window closed without hearing whether they
                 // stopped are asked about again, and its refusals reported.
                 let report = Task::batch([self.begin_startup_gate(), self.resume_stopping_chats()]);

@@ -81,6 +81,9 @@ glob = "0.3.4"
 hayro = "0.7.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+# The shell libcosmic runs on; named only to tell a lost display connection
+# apart from other event loop errors when the UI stops.
+iced_winit = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false }
 # Exact same package/source as libcosmic's iced; only its hot feature is added.
 iced_hot = { package = "iced", git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, optional = true }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }

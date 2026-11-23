@@ -46,6 +46,7 @@ pub mod tab_history;
 pub mod tab_strip;
 pub mod ui_controls;
 pub mod ui_memory;
+pub mod window_system;
 pub mod work_ui;
 pub mod workspace;
 pub mod workspace_widget;

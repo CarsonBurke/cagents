@@ -148,6 +148,16 @@ pub(crate) fn main_with_before_start(
             }
             let _ = cagents::instance::report_ui_startup(&Err("an update is in progress".into()));
         }
+        // The window was already on screen, so this ended a running app, not
+        // its startup: no startup dialog, and a message saying what happened.
+        Err(error) if cagents::instance::ui_window_opened() => {
+            let reason = cagents_ui::window_system::stopped_reason(error.as_ref());
+            tracing::error!(error = reason, "cagents-ui stopped");
+            // Answers a launcher still waiting on the startup gate; a no-op
+            // once the gate has reported.
+            let _ = cagents::instance::report_ui_startup(&Err(format!("stopped: {reason}")));
+            return report(Err(format!("stopped: {reason}").into()));
+        }
         Err(error) => report_startup_failure(
             &error.to_string(),
             cagents::instance::is_daemon_still_starting(error.as_ref()),

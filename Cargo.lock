@@ -1385,6 +1385,7 @@ dependencies = [
  "hayro",
  "iced",
  "iced_accessibility",
+ "iced_winit",
  "image",
  "imara-diff",
  "indexmap",
