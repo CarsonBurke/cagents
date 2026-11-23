@@ -518,6 +518,8 @@ struct Pane {
     theme: cosmic::Theme,
     shortcuts: crate::settings::KeyboardShortcuts,
     last_event_phases: [Duration; 3],
+    /// Input the next frame hands its interface after laying it out.
+    pending_events: Vec<cosmic::iced::Event>,
 }
 
 impl Pane {
@@ -547,6 +549,7 @@ impl Pane {
             theme: cosmic::Theme::dark(),
             shortcuts: crate::settings::KeyboardShortcuts::default(),
             last_event_phases: [Duration::ZERO; 3],
+            pending_events: Vec::new(),
         }
     }
 
@@ -776,12 +779,19 @@ impl Pane {
         );
         let laid_out = clock.elapsed();
         let clock = Instant::now();
+        let mut events = std::mem::take(&mut self.pending_events);
         if pointer_event {
+            events.insert(
+                0,
+                cosmic::iced::Event::Mouse(mouse::Event::CursorMoved {
+                    position: cosmic::iced::Point::new(400.0, 400.0),
+                }),
+            );
+        }
+        if !events.is_empty() {
             let point = cosmic::iced::Point::new(400.0, 400.0);
             ui.update(
-                &[cosmic::iced::Event::Mouse(mouse::Event::CursorMoved {
-                    position: point,
-                })],
+                &events,
                 mouse::Cursor::Available(point),
                 &mut self.renderer,
                 &mut cosmic::iced::advanced::clipboard::Null,
@@ -1052,6 +1062,109 @@ fn a_frame_after_an_interaction_on_a_full_window() {
         pane.publish();
     })
     .row("busy started or stopped");
+}
+
+/// A transcript of short exchanges, five items each: a prompt, three
+/// commands and a one-paragraph answer, so its length rather than any one
+/// body decides what a frame costs.
+fn short_transcript(turns: usize) -> Vec<chat::Item> {
+    let mut items = Vec::with_capacity(turns * 5);
+    for turn in 0..turns {
+        items.push(item(
+            format!("{turn}-prompt"),
+            chat::Role::User,
+            prose(
+                format!("Please check case {turn}."),
+                false,
+                chat::Phase::Final,
+            ),
+        ));
+        for step in 0..3 {
+            items.push(item(
+                format!("{turn}-step-{step}"),
+                chat::Role::Assistant,
+                ItemContent::Command {
+                    label: String::new(),
+                    command: format!("cargo test --lib case_{turn}_{step}"),
+                    working_directory: "/project".into(),
+                    action: chat::CommandAction::Run,
+                    status: chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(1_250),
+                    output: "test case ... ok\n".repeat(4),
+                },
+            ));
+        }
+        items.push(item(
+            format!("{turn}-answer"),
+            chat::Role::Assistant,
+            prose(
+                format!("Case {turn} passes; the **cursor** is kept across refreshes."),
+                false,
+                chat::Phase::Final,
+            ),
+        ));
+    }
+    items
+}
+
+/// What a frame of a transcript costs by how long it is, with nothing
+/// changed, after a wheel notch, and while its newest answer streams. The
+/// store's window holds 128 items, but a selected subagent's transcript is
+/// not windowed, and the slope is what each loaded row costs every frame.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_frame_of_a_transcript_by_length() {
+    // `CAGENTS_FRAME_COST_TURNS=200` measures (or profiles) one length.
+    let lengths = std::env::var("CAGENTS_FRAME_COST_TURNS").map_or_else(
+        |_| vec![26, 200, 2_000],
+        |turns| {
+            turns
+                .split(',')
+                .map(|turns| turns.trim().parse().expect("a number of turns"))
+                .collect()
+        },
+    );
+    for turns in lengths {
+        let items = short_transcript(turns);
+        let (mut runtime, handle) = cold_runtime(&items);
+        preparation::drain_fixture_within(&mut runtime, 4 * items.len() + 64);
+        let mut pane = Pane::showing(runtime, handle, items);
+        for _ in 0..WARMUP {
+            pane.frame();
+        }
+        let count = pane.items.len();
+        pane.sample(|_, _| {})
+            .row(&format!("{count} items, no change"));
+        let mut wheel = Stages::default();
+        let mut events = Stage::default();
+        for frame in 0..WARMUP + SAMPLES {
+            pane.pending_events = vec![cosmic::iced::Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines {
+                    x: 0.0,
+                    y: if frame % 16 < 8 { 3.0 } else { -3.0 },
+                },
+            })];
+            let stage = pane.frame();
+            if frame >= WARMUP {
+                wheel.record(stage);
+                events.0.push(pane.last_event_phases[0]);
+            }
+        }
+        wheel.row(&format!("{count} items, wheel"));
+        println!(
+            "{:>28}: wheel event handling median {:>8.3} ms",
+            format!("{count} items"),
+            events.median().as_secs_f64() * 1e3
+        );
+        pane.metadata.busy = true;
+        pane.sample(|pane, _| {
+            pane.tail().push_str(CHUNK);
+            pane.publish();
+            pane.prepare_publication();
+        })
+        .row(&format!("{count} items, streaming"));
+    }
 }
 
 /// The snapshot a provider with a long catalog publishes: its models,
