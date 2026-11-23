@@ -476,6 +476,11 @@ impl Project {
         for name in ["refs", "worktrees"] {
             paths.insert(self.common_dir.join(name), RecursiveMode::Recursive);
         }
+        // A reftable repository keeps its refs here instead.
+        let reftable = self.common_dir.join("reftable");
+        if reftable.is_dir() {
+            paths.insert(reftable, RecursiveMode::NonRecursive);
+        }
         for worktree in &self.worktrees {
             if let Some(parent) = worktree.root.parent() {
                 paths.insert(parent.to_owned(), RecursiveMode::NonRecursive);
@@ -504,6 +509,7 @@ impl Project {
                 relative == Path::new("config")
                     || relative == Path::new("packed-refs")
                     || relative.starts_with("refs")
+                    || relative.starts_with("reftable")
             }) {
                 change.references = true;
                 change.configuration |= common == Some(Path::new("config"));
@@ -527,6 +533,22 @@ impl Project {
                 .max_by_key(|worktree| worktree.git_dir.components().count())
                 .map(|worktree| worktree.id);
             for worktree in &self.worktrees {
+                // A checkout removed or moved without Git is seen from its
+                // parent, whether or not its files are watched.
+                if path == &worktree.root
+                    && matches!(
+                        event.kind,
+                        EventKind::Any
+                            | EventKind::Other
+                            | EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                    )
+                {
+                    change.topology = true;
+                    change.membership = true;
+                    change.worktrees.insert(worktree.id);
+                }
                 if path == &worktree.root.join(".git") {
                     change.topology = true;
                     change.membership = true;
@@ -2385,6 +2407,43 @@ mod tests {
                 .change(&modified(project.common_dir.join("worktrees/new/gitdir")))
                 .unwrap()
                 .topology
+        );
+    }
+
+    #[test]
+    fn a_checkout_removed_without_git_or_a_reftable_write_is_seen() {
+        let mut project = project(Path::new("/repo"));
+        // Only Git's bookkeeping is watched in it, so nothing of its census
+        // claims the event from its parent directory.
+        project.worktrees[1].interest = Interest::Metadata;
+        project.worktrees[1].census = Arc::default();
+        let linked = &project.worktrees[1];
+        for kind in [
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::From)),
+        ] {
+            let change = project
+                .change(&Event::new(kind).add_path(linked.root.clone()))
+                .unwrap();
+            assert!(change.topology && change.membership, "{kind:?}");
+            assert!(change.worktrees.contains(&linked.id));
+        }
+        assert!(
+            project
+                .change(
+                    &Event::new(EventKind::Modify(ModifyKind::Metadata(
+                        notify::event::MetadataKind::Any
+                    )))
+                    .add_path(linked.root.clone())
+                )
+                .is_none(),
+            "touching the directory moves nothing"
+        );
+        assert!(
+            project
+                .change(&modified(project.common_dir.join("reftable/tables.list")))
+                .unwrap()
+                .references
         );
     }
 

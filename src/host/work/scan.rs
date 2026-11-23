@@ -514,8 +514,27 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 .any(|worktree| roots.get(&worktree.id).copied() != Some(&worktree.root))
     });
     let retry_plan = previous.is_some_and(|previous| previous.plan_error.is_some());
-    // Files are watched in the worktrees someone works in, and in the
-    // primary checkout; Git's bookkeeping is watched in every one.
+    // Files are watched first in the worktrees someone works in and the
+    // primary checkout, then, within the budget, in those with uncommitted
+    // changes or recent work, where an agent elsewhere may be editing by
+    // path. Git's bookkeeping is watched in every one.
+    let recent = |worktree: &Worktree| {
+        worktree.dirty.as_ref().is_some_and(|dirty| dirty.paths > 0)
+            || [
+                worktree.created_at_unix_ms,
+                worktree
+                    .head
+                    .as_ref()
+                    .and_then(|head| head.committed_at_unix_ms),
+                worktree
+                    .dirty
+                    .as_ref()
+                    .and_then(|dirty| dirty.newest_modified_at_unix_ms),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|at| now_unix_ms.saturating_sub(at) <= crate::work::ACTIVE_WINDOW_MS)
+    };
     let interests = worktrees
         .iter()
         .map(|worktree| {
@@ -523,6 +542,8 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 git_watch::Interest::Active
             } else if worktree.primary {
                 git_watch::Interest::Shown
+            } else if recent(worktree) {
+                git_watch::Interest::Background
             } else {
                 git_watch::Interest::Metadata
             };
@@ -779,6 +800,24 @@ mod tests {
         full: bool,
         in_use: &BTreeSet<PathBuf>,
     ) -> Local {
+        run_at(
+            fixture,
+            previous,
+            change,
+            full,
+            in_use,
+            crate::chat::now_ms().unwrap(),
+        )
+    }
+
+    fn run_at(
+        fixture: &Fixture,
+        previous: Option<&Local>,
+        change: &git_watch::Change,
+        full: bool,
+        in_use: &BTreeSet<PathBuf>,
+        now_unix_ms: u64,
+    ) -> Local {
         let repository = fixture.root.join(".git");
         // A project keeps its ID across scans, as the board's does.
         let id = previous
@@ -800,7 +839,7 @@ mod tests {
                         .to_owned()]),
                 )]),
             },
-            now_unix_ms: crate::chat::now_ms().unwrap(),
+            now_unix_ms,
             cancellation: &CancellationToken::new(),
         })
         .unwrap()
@@ -1007,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn files_are_watched_where_a_session_runs_and_in_the_primary_checkout() {
+    fn files_are_watched_where_a_session_runs_or_work_is_recent() {
         let fixture = fixture();
         let interests = |local: &Local| {
             local
@@ -1024,39 +1063,47 @@ mod tests {
             interests(&first),
             BTreeMap::from([
                 (fixture.root.clone(), git_watch::Interest::Shown),
-                (fixture.linked.clone(), git_watch::Interest::Metadata),
+                (fixture.linked.clone(), git_watch::Interest::Background),
             ]),
-            "an idle linked worktree is watched for Git's bookkeeping alone"
+            "a worktree committed to just now is watched within the budget"
         );
+
+        // A day later it is watched for Git's bookkeeping alone.
+        let later = crate::chat::now_ms().unwrap() + 24 * 60 * 60 * 1000;
+        let none = BTreeSet::new();
+        let at = |previous: &Local, in_use: &BTreeSet<PathBuf>| {
+            run_at(
+                &fixture,
+                Some(previous),
+                &git_watch::Change::default(),
+                false,
+                in_use,
+                later,
+            )
+        };
+        let idle = at(&first, &none);
+        assert_eq!(
+            interests(&idle)[&fixture.linked],
+            git_watch::Interest::Metadata
+        );
+        assert_eq!(interests(&idle)[&fixture.root], git_watch::Interest::Shown);
 
         // A session starting there re-plans it, with nothing else to read.
         let in_use = BTreeSet::from([fixture.linked.clone()]);
-        let working = run_with(
-            &fixture,
-            Some(&first),
-            &git_watch::Change::default(),
-            false,
-            &in_use,
-        );
+        let working = at(&idle, &in_use);
         assert_eq!(
             interests(&working)[&fixture.linked],
             git_watch::Interest::Active
         );
         assert_eq!(working.listed_at, first.listed_at);
-        let again = run_with(
-            &fixture,
-            Some(&working),
-            &git_watch::Change::default(),
-            false,
-            &in_use,
-        );
+        let again = at(&working, &in_use);
         assert!(Arc::ptr_eq(
             working.plan.as_ref().unwrap(),
             again.plan.as_ref().unwrap()
         ));
 
         // Once it ends, the worktree goes back to its bookkeeping alone.
-        let ended = run(&fixture, Some(&again), &git_watch::Change::default());
+        let ended = at(&again, &none);
         assert_eq!(
             interests(&ended)[&fixture.linked],
             git_watch::Interest::Metadata

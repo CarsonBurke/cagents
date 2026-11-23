@@ -899,17 +899,30 @@ started without an announcement.
 
 ## Work board polling
 
-The daemon's Work board keeps each open project's Git facts current. The Git
-watcher covers projects within a budget of 8192 directory watches, and each
-checkout's tracked directories count against it, so a repository with
-hundreds of worktrees is polled instead. Each worktree of a polled project
-comes due on its own. A worktree with a working agent session, or a file
-edited in the last four minutes, is read every 15 s, and any other every
-120 s; reads due within the next 15 s share one scan. An edit keeps its card
-in **Active** for three hours, but stops the 15 s `git status` reads minutes
-after the edits stop. Previously one recent edit anywhere
-made the whole project re-read every worktree every 15 s; later, each recently
-dirty worktree did so independently for the three-hour card-activity window.
+The daemon's Work board keeps each open project's Git facts current without
+running Git while nothing happens. The Git watcher sees Git's bookkeeping in
+every worktree (its `HEAD`, index, refs, and the worktree list), a few
+directories each. Within a budget of 8192 directory watches it also watches
+the files of the worktrees a session runs in and of the primary checkout,
+then those with uncommitted changes or work in the last three hours. A scan
+follows an event and reads only what it moved: the worktree list after a
+topology change, the refs after a ref or configuration change, and the
+status of each worktree the event named or whose branch moved. A worktree
+whose files are not watched is read every 15 s only while an agent works
+there or its files changed in the last four minutes, and once when a window
+starts watching the board with its status more than 15 minutes old. A
+request for a fresh board re-reads every worktree. A project whose
+bookkeeping cannot be watched is polled: each worktree comes due on its own,
+every 15 s while live and every 120 s otherwise, with the refs at each poll
+and the worktree list every 120 s.
+
+Before, a project past the budget re-read every worktree's status every
+120 s and a covered one every 10 minutes, and the publisher reassembled a
+watched board every 5 s. On a workstation, an installed daemon with a few
+hundred worktrees ran about three `git status` per second. Its
+measured disk reads, 6 to 48 MB/s, were almost all major page faults in its
+own executable from the scan threads under memory pressure, not Git's or
+transcript reads: what an idle daemon costs follows how often it runs code.
 
 `scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]
 [DIRECTORIES]` builds a private fixture from a matched `cagents` and
@@ -924,27 +937,43 @@ counted from Git's own trace2 records, which every fixture process writes, so
 even the shortest are seen; each is attributed to the process that started
 it, and the CLI's are reported apart from the daemon's. It also reports
 per-thread `/proc/PID/task/*/io` deltas, so `work-scan` read calls and bytes
-can be compared directly. The fixture's
+can be compared directly, each thread's wakeups, and, where `systemd-run`
+can place the daemon in its own scope, the block I/O of the daemon and its
+Git processes together. The fixture's
 processes and setup commits read no Git configuration outside it. It removes
 everything it created on exit and refuses agent authority; run it from
 `ssh fw16`.
 
-Historical reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees,
-3 active, 300 s, `0ac78d249` (before) against `9b8523e9a` (after):
+An idle project on fw16 (Ryzen 7 7840HS), `dev-runtime`, 800 worktrees of
+200 tracked directories, none active, 180 s after the load, `348b2ff29`
+(before) against this change (after). Block I/O is the daemon's cgroup,
+which includes its Git processes; wakeups are the daemon's context switches:
+
+| | Before | After |
+| --- | --- | --- |
+| Git processes | 804 | 0 |
+| `git status` per second | 4.45 | 0 |
+| Git CPU, % of one core | 4.50 | 0 |
+| Daemon CPU, % of one core | 0.24 | 0.01 |
+| Block reads over the 180 s | 31.7–51.4 MB | 0–1.0 MB |
+| Daemon wakeups per second | 15.5 | 1.7 |
+| `work-scan` wakeups per second | 13.8 | 0 |
+
+The remaining wakeups are the tray (1.2/s) and the async runtime. The load
+is unchanged here, 2,408 Git processes against 2,411, because every fixture
+worktree was just made and so has its files watched within the budget, and
+the load still reads each status twice: once to plan and once after its
+watches are registered. A build that watched only bookkeeping in such
+worktrees loaded with 1,608 and held 2,609 watches rather than 8,994.
+
+Earlier reference, 250 worktrees, 3 active, 300 s, `0ac78d249` (before)
+against `9b8523e9a` (after), when every worktree was still polled:
 
 | | Before | After |
 | --- | --- | --- |
 | `git status` per second | 15.79 | 2.47 |
 | Git CPU, % of one core | 7.22 | 1.71 |
 | Daemon CPU, % of one core | 1.83 | 0.45 |
-
-A fixture checkout holds 40 files. A real checkout costs more per read: on a
-347-worktree repository with 8 active worktrees, the scanner's Git processes
-took at least half a core before this change.
-
-Rerun the fixture for the current cadence; its per-thread I/O
-output makes the daemon's `work-scan` reads comparable as well as the Git
-process count.
 
 ### Watch planning
 

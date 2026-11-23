@@ -94,6 +94,12 @@ fn wait_until(mut ready: impl FnMut() -> bool) {
 }
 
 fn complete_scan(scanner: &mut Scanner, handle: &Handle) {
+    complete_scan_at(scanner, handle, now_unix_ms());
+}
+
+/// Completes a scan as if at `now_unix_ms`, so a fixture made just now can
+/// stand for worktrees nobody has touched for a while.
+fn complete_scan_at(scanner: &mut Scanner, handle: &Handle, now_unix_ms: u64) {
     scanner.dispatch(handle);
     assert_eq!(handle.0.jobs.state.lock().unwrap().queue.len(), 1);
     let job = handle.0.jobs.next().unwrap();
@@ -105,7 +111,7 @@ fn complete_scan(scanner: &mut Scanner, handle: &Handle) {
         full: job.full,
         in_use: &job.in_use,
         hints: &job.hints,
-        now_unix_ms: now_unix_ms(),
+        now_unix_ms,
         cancellation: &handle.0.cancellation,
     });
     assert!(result.is_ok(), "real Git scan: {result:?}");
@@ -474,6 +480,9 @@ fn an_idle_board_runs_no_git_and_an_event_reads_only_its_worktree() {
             .unwrap()
             .clone()
     };
+    // The worktrees were made just now; scans as of a day later find them
+    // idle, so only Git's bookkeeping is watched in them.
+    let later = now_unix_ms() + 24 * 60 * 60 * 1000;
     let rescan = |scanner: &mut Scanner| {
         handle
             .shared()
@@ -481,7 +490,7 @@ fn an_idle_board_runs_no_git_and_an_event_reads_only_its_worktree() {
             .get_mut(&repository)
             .unwrap()
             .last_scan = Some(Instant::now() - SCAN_SPACING);
-        complete_scan(scanner, &handle);
+        complete_scan_at(scanner, &handle, later);
         scanner.configure(&handle);
     };
     // Waits for the watcher to report something for the project, and takes
@@ -493,7 +502,7 @@ fn an_idle_board_runs_no_git_and_an_event_reads_only_its_worktree() {
         });
     };
 
-    complete_scan(&mut scanner, &handle);
+    complete_scan_at(&mut scanner, &handle, later);
     scanner.configure(&handle);
     coverage(&mut scanner, &handle, id, true);
     // The registration asks for one read of what it now watches.
@@ -575,12 +584,24 @@ fn an_idle_board_runs_no_git_and_an_event_reads_only_its_worktree() {
     }
     rescan(&mut scanner);
     let in_use = worktree(&local(&handle), &linked[3]).id;
+    // The worktree with a staged change has its files watched too, within
+    // the budget: an agent elsewhere may be editing it by path.
+    let changed = worktree(&local(&handle), &linked[7]).id;
     drained(&mut scanner, &|tracked| {
         tracked
             .unwatched
             .as_ref()
-            .is_some_and(|unwatched| !unwatched.contains(&in_use))
+            .is_some_and(|unwatched| !unwatched.contains(&in_use) && !unwatched.contains(&changed))
     });
+    let idle = worktree(&local(&handle), &linked[5]).id;
+    assert!(
+        handle.shared().projects[&repository]
+            .unwatched
+            .as_ref()
+            .unwrap()
+            .contains(&idle),
+        "an idle one's still are not"
+    );
     // Gaining file watches asks for one read.
     if handle.shared().projects[&repository].pending.is_some() {
         rescan(&mut scanner);

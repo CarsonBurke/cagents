@@ -211,6 +211,9 @@ struct Tracked {
     /// A request asked for this scan and waits on it.
     urgent: bool,
     last_scan: Option<Instant>,
+    /// When a scan that re-read every worktree last finished. Most scans
+    /// read only what an event moved, so a recent one is not a fresh board.
+    last_full_scan: Option<Instant>,
     /// Whether the watcher covers everything this project asked it to.
     covered: bool,
     /// With Git's bookkeeping watched, the worktrees whose own files are
@@ -255,6 +258,7 @@ impl Tracked {
             full: true,
             urgent: false,
             last_scan: None,
+            last_full_scan: None,
             covered: false,
             unwatched: None,
             watch_recoverable: false,
@@ -526,23 +530,25 @@ impl Shared {
         let soon = now + ACTIVE_POLL;
         let worktrees = tracked.local.iter().flat_map(|local| &local.worktrees);
         Some(match &tracked.unwatched {
+            // Every live worktree is due within one active poll.
             Some(unwatched) => git_watch::Change {
                 worktrees: worktrees
                     .filter(|worktree| {
-                        unwatched.contains(&worktree.id)
-                            && self.worktree_live(worktree)
-                            && worktree.status_read_at.unwrap_or(last) + ACTIVE_POLL <= soon
+                        unwatched.contains(&worktree.id) && self.worktree_live(worktree)
                     })
                     .map(|worktree| worktree.id)
                     .collect(),
                 ..git_watch::Change::default()
             },
+            // No event announces a commit or a fetch here, so each poll also
+            // reads the refs: two processes, against one per worktree.
             None => git_watch::Change {
                 worktrees: worktrees
                     .filter(|worktree| self.worktree_due(worktree, last) <= soon)
                     .map(|worktree| worktree.id)
                     .collect(),
                 topology: Self::list_due(tracked, last) <= soon,
+                references: true,
                 ..git_watch::Change::default()
             },
         })
@@ -638,9 +644,11 @@ impl Shared {
     /// Whether something may be changing this checkout between scans: a
     /// working agent session sampled in it, or a file edited in the last few
     /// minutes (an agent launched elsewhere can edit a worktree by path, and
-    /// each scan refreshes this while it keeps editing). A card stays Active
+    /// each read refreshes this while it keeps editing). A card stays Active
     /// for the longer product window, but a finished edit must not keep an
     /// uncovered worktree running `git status` every 15 seconds for hours.
+    /// A worktree with uncommitted changes or recent work has its files
+    /// watched within the budget instead, so this polls only past it.
     fn worktree_live(&self, worktree: &scan::Worktree) -> bool {
         let within = |at: u64, window: Duration| {
             u128::from(now_unix_ms().saturating_sub(at)) <= window.as_millis()
@@ -1044,7 +1052,7 @@ impl Handle {
                 // Waits for a scan that starts after this request: one already
                 // running may have read the worktrees before the change the
                 // caller wants to see.
-                let rescan = fresh && !recent(tracked.last_scan);
+                let rescan = fresh && !recent(tracked.last_full_scan);
                 // A first scan that just failed answers with its failure.
                 let first = tracked.local.is_none()
                     && !(tracked.scan_error.is_some() && recent(tracked.last_scan));
@@ -1422,6 +1430,9 @@ impl Handle {
             Ok(local) => {
                 tracked.scan_error = None;
                 tracked.local = Some(Arc::new(local));
+                if job.full {
+                    tracked.last_full_scan = tracked.last_scan;
+                }
             }
             Err(error) => {
                 tracing::debug!(%error, project = %tracked.name, "Work board scan failed");
