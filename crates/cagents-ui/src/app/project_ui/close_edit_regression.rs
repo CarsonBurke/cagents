@@ -18,10 +18,21 @@ const BASELINE: &str = "baseline\n";
 const FIXTURE_ORDINAL: u32 = 7;
 
 /// The project rows the daemon publishes with each edit this peer streams,
-/// as `public_effects` records them, so the window acts on real effects.
-fn canonical_effects(edit: &ModelEdit) -> EditEffects {
+/// as `public_effects` records them, so the window acts on real effects. A
+/// close deletes the folder's strip view and closes the editor in it, as
+/// `record_project_removal` does.
+fn canonical_effects(edit: &ModelEdit, editor: CardId) -> EditEffects {
     match edit {
         ModelEdit::CloseProject { repository } => EditEffects {
+            views: vec![crate::workspace_model::delta::ViewRevision {
+                scope: crate::workspace_model::views::Scope::Worktree {
+                    repository: repository.clone(),
+                    path: repository.clone(),
+                },
+                before: Some(1),
+                after: None,
+            }],
+            closed: vec![editor],
             removed_projects: vec![repository.clone()],
             ..Default::default()
         },
@@ -424,7 +435,7 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
                         proof: proof(),
                         message: ServerMessage::WorkspaceModelEdited {
                             sequence: index as u64 + 2,
-                            effects: canonical_effects(&edit),
+                            effects: canonical_effects(&edit, card),
                             edit,
                         },
                     },
