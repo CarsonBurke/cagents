@@ -1548,7 +1548,7 @@ fn process_admitted_request(
         }
         ClientRequest::DeviceTrust { request } => {
             drop(_shared);
-            let reply = super::device_trust::process(request)?;
+            let reply = super::device_trust::process(host, request)?;
             Ok((ServerResponse::DeviceTrust(reply), Vec::new(), false))
         }
         ClientRequest::PeerChallenge => {
