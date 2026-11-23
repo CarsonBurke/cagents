@@ -812,6 +812,9 @@ struct Claude {
     /// until the first one. A task that leaves it is no longer running,
     /// whether or not its own notification arrived.
     background_level: Option<HashSet<String>>,
+    /// Every task seen to start and not yet to end, of any type, for the
+    /// count before Claude Code reports its level. Oldest first.
+    started_tasks: VecDeque<String>,
     /// The live background task count last published; see
     /// [`Self::background_tasks`].
     published_background_tasks: usize,
@@ -4075,14 +4078,23 @@ impl Adapter for Claude {
 
 impl Claude {
     /// How many background tasks are live: Claude Code's level once it has
-    /// reported one, which is exact. Until then, the background commands and
-    /// agents this conversation saw start and not yet end, so a release that
-    /// never reports the level still counts what it started.
+    /// reported one, which is exact. Until then, at least one while any
+    /// background command, agent or other task this conversation saw start
+    /// has not been seen to end, so a release that never reports the level
+    /// still counts what it started. A task whose end went unseen keeps
+    /// counting until a level says otherwise: an overcount only keeps a chat
+    /// running.
     fn background_tasks(&self) -> usize {
-        match &self.background_level {
-            Some(live) => live.len(),
-            None => self.launches.len() + self.tasks.len(),
+        if let Some(live) = &self.background_level {
+            return live.len();
         }
+        let tasks = self
+            .started_tasks
+            .iter()
+            .chain(&self.tasks)
+            .filter(|task| !self.foreground_tasks.contains(task))
+            .collect::<HashSet<_>>();
+        self.launches.len() + tasks.len()
     }
 
     fn receive_frame(&mut self, frame: Value) -> Result<Step, String> {
@@ -4198,6 +4210,7 @@ impl Claude {
                 self.permissions = None;
                 self.tool_order.clear();
                 self.tasks.clear();
+                self.started_tasks.clear();
                 self.report_tasks.clear();
                 self.command_tasks.clear();
                 self.subagent_tasks.clear();
@@ -7563,6 +7576,14 @@ impl Claude {
                 }
                 let foreground = self.foreground_tasks.iter().any(|known| known == task);
                 if string(frame, "subtype") == "task_started"
+                    && !self.started_tasks.iter().any(|known| known == task)
+                {
+                    self.started_tasks.push_back(task.into());
+                    if self.started_tasks.len() > MAX_TOOLS {
+                        self.started_tasks.pop_front();
+                    }
+                }
+                if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
                 {
                     if string(frame, "task_type") == "local_agent"
@@ -7602,6 +7623,7 @@ impl Claude {
                 });
                 if ended.is_some() {
                     self.tasks.retain(|running| running != task);
+                    self.started_tasks.retain(|running| running != task);
                     self.foreground_tasks.retain(|known| known != task);
                 }
                 let resumed = ended.is_none() && waiting;

@@ -14079,6 +14079,18 @@ fn a_background_shell_counts_before_any_level_is_reported() {
         "summary":"Background command \"Serve\" completed (exit code 0)"}),
     );
     assert_eq!(lead.snapshot.background_tasks, 0);
+
+    // A task of another type, such as a monitor, counts from its start.
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"t","session_id":"00000000-0000-4000-8000-000000000001","task_id":"watch",
+        "task_type":"monitor","description":"Watch the build"}),
+    );
+    assert_eq!(lead.snapshot.background_tasks, 1);
+    lead.receive(
+        json!({"type":"system","subtype":"task_notification","uuid":"n2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"watch",
+        "status":"completed","summary":"Done"}),
+    );
+    assert_eq!(lead.snapshot.background_tasks, 0);
 }
 
 #[test]

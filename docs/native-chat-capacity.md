@@ -16,7 +16,8 @@ its last turn longest ago among the Claude chats that:
 - no window is showing, preferring one no window has open in a tab;
 - have finished a turn and have nothing under way: no turn, request,
   queued message, or background task such as a subagent, a shell command run
-  in the background or a monitor, since stopping Claude ends those;
+  in the background or a monitor, since stopping Claude ends those. A task
+  whose end Claude doesn't report keeps its chat until it does;
 - the daemon owes nothing: no automation owns them, no message waits for
   them, and their agent has no run or launch unfinished;
 - no transition such as a start, close or return to the terminal holds.
