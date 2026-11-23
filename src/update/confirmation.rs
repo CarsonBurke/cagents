@@ -4,12 +4,13 @@ const CONFIRMATION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
 /// How long a waiting update pauses before it reads its decision and the
 /// conversations it would stop again. Half a second is too short for a
-/// person answering a prompt to notice; tests answer at once, and pausing a
-/// production half-second per prompt made the update tests slow.
-#[cfg(not(test))]
-pub(super) const DECISION_POLL: Duration = Duration::from_millis(500);
-#[cfg(test)]
-pub(super) const DECISION_POLL: Duration = Duration::from_millis(10);
+/// person answering a prompt to notice; tests answer at once, so a pause
+/// would only slow them.
+const DECISION_POLL: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_millis(500)
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
@@ -1227,12 +1228,13 @@ mod tests {
         for whole_update in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().to_owned();
+            // One preview: each fixture mints new pane IDs, which would
+            // renew the nonce on every poll and race the decision below.
+            let blocked = impact::tests::blocked_preview();
             let worker = thread::spawn(move || {
                 let mut job = job(&path);
                 initialize(&path, &job.id).unwrap();
-                wait(&path, &mut job, false, |_| {
-                    Ok(impact::tests::blocked_preview())
-                })
+                wait(&path, &mut job, false, |_| Ok(blocked.clone()))
             });
             let current = published(directory.path(), None);
             if whole_update {

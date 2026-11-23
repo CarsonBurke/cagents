@@ -1060,15 +1060,16 @@ fn quiesce_inner(
     }
 }
 
-/// A preparation still refused as busy after the reviewed conversations ended.
-/// The terminal service and its terminals kept running.
 /// How long the update pauses between checks that the confirmed
 /// interruptions have ended; tests settle at once, so they check sooner.
-#[cfg(not(test))]
-const INTERRUPT_POLL: Duration = Duration::from_millis(100);
-#[cfg(test)]
-const INTERRUPT_POLL: Duration = Duration::from_millis(10);
+const INTERRUPT_POLL: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_millis(100)
+};
 
+/// A preparation still refused as busy after the reviewed conversations ended.
+/// The terminal service and its terminals kept running.
 const PREPARE_BUSY_AFTER_ENDS: &str = "The source daemon stayed busy finishing another operation, so it did not checkpoint. The terminal service and its terminals were not stopped; the conversations below had already ended. Retry the update once it finishes.";
 
 fn settle_interrupts(
