@@ -3341,18 +3341,23 @@ impl Cagents {
         };
         let title = channel.title.clone();
         let title_source = channel.title_source;
-        // A worktree removed while the channel was unshared would have the
-        // registry refuse the channel every time it is offered, so it is
-        // offered in the main checkout, where its panes already start.
-        let checkout = channel
-            .checkout
-            .clone()
-            .filter(|checkout| crate::device::is_remote() || checkout.exists());
+        let checkout = channel.checkout.clone();
         let project_id = channel.project_id;
         let Some(project) = self.sidebar_model.project(project_id) else {
             return;
         };
         let repository = project.repository.clone();
+        // A worktree removed or broken while the channel was unshared would
+        // have the registry refuse the channel every time it is offered, so
+        // the checkout is checked as the registry checks it, and a channel
+        // whose worktree fails is offered in the main checkout instead.
+        let checkout = checkout.filter(|checkout| {
+            crate::device::is_remote()
+                || std::fs::canonicalize(&repository).is_ok_and(|repository| {
+                    crate::workspace_model::canonical_checkout(&repository, checkout)
+                        .is_ok_and(|checkout| checkout.is_some())
+                })
+        });
         if self.project_ui.closed.contains(&repository) {
             return;
         }

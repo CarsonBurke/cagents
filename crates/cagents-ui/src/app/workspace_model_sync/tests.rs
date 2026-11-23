@@ -6075,23 +6075,23 @@ fn a_window_joining_with_an_unshared_channel_keeps_and_publishes_it() {
     );
 }
 
-/// A channel this window made in a worktree that was removed before the
-/// registry heard of it is introduced in the main checkout, where its panes
-/// already start: the registry would refuse the missing worktree every time.
+/// A channel this window made in a worktree that was removed, or stopped being
+/// a worktree, before the registry heard of it is introduced in the main
+/// checkout, where its panes already start: the registry would refuse such a
+/// checkout every time the channel was offered.
 #[test]
-fn an_unshared_channel_whose_worktree_is_gone_is_published_in_the_main_checkout() {
+fn an_unshared_channel_whose_worktree_fails_is_published_in_the_main_checkout() {
     let (mut app, project, _) = app_with_project();
-    let kept = tempfile::tempdir().unwrap();
-    let removed = kept.path().join("removed-worktree");
-    let gone = ChannelId::new();
-    let present = ChannelId::new();
-    let mut channel = local(gone, project, "gone", 0);
-    channel.checkout = Some(removed);
-    let mut other = local(present, project, "present", 1);
-    other.checkout = Some(kept.path().to_path_buf());
+    let directory = tempfile::tempdir().unwrap();
+    let removed = ChannelId::new();
+    let broken = ChannelId::new();
+    let mut gone = local(removed, project, "gone", 0);
+    gone.checkout = Some(directory.path().join("removed-worktree"));
+    let mut plain = local(broken, project, "plain directory", 1);
+    plain.checkout = Some(directory.path().to_path_buf());
     Arc::make_mut(&mut app.durable)
         .channels
-        .extend([channel, other]);
+        .extend([gone, plain]);
     let published = intercept_publishes(&mut app);
 
     let _ = app.apply_workspace_model_update(ModelUpdate::Connected(registry(Vec::new())));
@@ -6103,11 +6103,8 @@ fn an_unshared_channel_whose_worktree_is_gone_is_published_in_the_main_checkout(
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    assert_eq!(created.get(&gone), Some(&None));
-    assert_eq!(
-        created.get(&present),
-        Some(&Some(kept.path().to_path_buf()))
-    );
+    assert_eq!(created.get(&removed), Some(&None));
+    assert_eq!(created.get(&broken), Some(&None));
 }
 
 /// Once this window has recorded that the registry holds a channel, the

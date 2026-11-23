@@ -508,11 +508,22 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
 }
 
 /// A project's main checkout: its primary worktree, or the folder itself.
+///
+/// A submodule's or a `--separate-git-dir` checkout's repository is a Git
+/// directory kept elsewhere, which names none of its rows. `git worktree
+/// list` names the main checkout first, so the first row is that checkout;
+/// the Git directory itself is never a place to work.
 pub(super) fn project_main_checkout(project: &SidebarProject) -> PathBuf {
+    let separate = project.kind != ProjectKind::Folder
+        && project
+            .repository
+            .file_name()
+            .is_some_and(|name| name != ".git");
     project
         .worktrees
         .iter()
         .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+        .or_else(|| separate.then(|| project.worktrees.first()).flatten())
         .map(|worktree| worktree.path.clone())
         .unwrap_or_else(|| {
             project
@@ -1652,6 +1663,32 @@ impl Cagents {
 mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectChannel};
+
+    /// A submodule keeps its Git directory inside the superproject's, which
+    /// is never where its panes should start: its main checkout is the row
+    /// `git worktree list` names first. A Git directory named `.git` still
+    /// finds its checkout beside it, wherever that row is listed.
+    #[test]
+    fn a_main_checkout_is_never_a_git_directory_kept_elsewhere() {
+        let row = |path: &str| SidebarWorktree::from_durable(WorktreeId::new(), path.into(), None);
+        let project = |repository: &str, rows: Vec<SidebarWorktree>| {
+            SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "repo".into(),
+                repository.into(),
+                rows,
+                Vec::new(),
+            )
+        };
+        let submodule = project(
+            "/super/.git/modules/sub",
+            vec![row("/super/sub"), row("/super/sub-feature")],
+        );
+        assert_eq!(project_main_checkout(&submodule), Path::new("/super/sub"));
+        let ordinary = project("/repo/.git", vec![row("/repo-feature"), row("/repo")]);
+        assert_eq!(project_main_checkout(&ordinary), Path::new("/repo"));
+    }
 
     thread_local! {
         /// How many cards this thread has searched every channel for.
