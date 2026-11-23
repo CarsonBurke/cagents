@@ -1388,11 +1388,12 @@ pub(in crate::app) mod tests {
             ))
         );
         // With a release on offer, the way on is to retry it.
-        let asset = |name| serde_json::json!({"id": 1, "name": name, "size": 1});
+        let digest = [0u8; 32];
+        let asset = |name| serde_json::json!({"name": name, "size": 1, "sha256": digest});
         let release = serde_json::from_value(serde_json::json!({
             "version": "9.8.7",
             "url": "https://example.invalid/release",
-            "id": 1,
+            "metadata": digest,
             "archive": asset("cagents.tar.zst"),
             "checksums": asset("SHA256SUMS"),
             "installer": asset("install.sh"),
