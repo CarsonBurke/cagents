@@ -47,6 +47,8 @@ mod projection_oracle;
 mod pull_request_ui;
 #[cfg(test)]
 mod question_tests;
+#[cfg(test)]
+mod reconcile_oracle;
 mod refresh_ui;
 mod repository_loaded;
 mod repository_ui;

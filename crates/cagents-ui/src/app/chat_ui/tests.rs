@@ -26051,3 +26051,134 @@ fn a_reopen_waiting_when_the_window_closed_leaves_only_its_stop_saved() {
     assert!(!next.chat_ui.closing_in_background());
     assert!(!next.has_close_failure_notices());
 }
+
+/// A window that has reconciled a shared channel whose primary chat is
+/// unnamed, then attached that chat's runtime, whose conversation already has
+/// a provider name. Returns the window, the chat, and an echo of the edge that
+/// brought the chat's pane, which changes nothing.
+fn window_with_a_named_runtime_attached_since_reconciliation() -> (
+    Cagents,
+    CardId,
+    super::super::workspace_model_sync::ModelUpdate,
+) {
+    use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+    use crate::repository::RepositoryId;
+    use crate::sidebar::SidebarProject;
+    use crate::workspace_model::{
+        ModelChannel, ModelEdit,
+        delta::{EditEffects, ViewChanges, ViewRevision},
+        views::{Change, Pane, Scope, View},
+    };
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let project = ProjectId::new();
+    let repository = std::path::PathBuf::from("/repo/.git");
+    app.sidebar_model.projects.push(SidebarProject::new(
+        project,
+        RepositoryId::new(),
+        "repo".into(),
+        repository.clone(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let id = ChannelId::new();
+    Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+        id,
+        project_id: project,
+        // A new channel is unnamed, with a manual source.
+        title: String::new(),
+        title_source: ChannelTitleSource::Manual,
+        ordinal: 1,
+        shared: true,
+        cards: vec![card],
+        focused: Some(card),
+    }];
+    Arc::make_mut(&mut app.durable).active_channel = Some(id);
+    let pane = Pane::from_card(
+        app.card_state(card).unwrap(),
+        app.durable.card_scopes.get(&card).cloned(),
+    )
+    .unwrap();
+    let view = View {
+        scope: Scope::Channel(id),
+        revision: 5,
+        retired: Vec::new(),
+        panes: vec![pane.clone()],
+    };
+    app.workspace_model = crate::workspace_model::WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 10,
+        channels: vec![ModelChannel {
+            id,
+            repository,
+            title: String::new(),
+            title_source: ChannelTitleSource::Manual,
+            ordinal: 1,
+        }],
+        views: vec![view.clone()],
+        ..Default::default()
+    };
+    app.shared_views.attached.insert(card);
+    drop(app.reconcile_workspace_model());
+    drop(app.project_workspace(false));
+    assert_eq!(app.durable.channels[0].title, "");
+    // The runtime attaching: no observation of it yet, and a conversation
+    // that already has a name.
+    app.chat_ui.channel_names.remove(&target);
+    let handle = chat_runtime(&app, card).handle().unwrap().clone();
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.title = Some("Parser cache work".into());
+    handle.publish_snapshot_for_test(snapshot);
+    let echo = super::super::workspace_model_sync::ModelUpdate::Changed {
+        sequence: 10,
+        edit: ModelEdit::ChangeView {
+            scope: Scope::Channel(id),
+            expected_revision: 4,
+            operation: uuid::Uuid::nil(),
+            change: Change::Insert { pane, before: None },
+        },
+        changes: super::super::workspace_model_sync::EdgeChanges {
+            identity: Some(app.workspace_model.identity),
+            views: ViewChanges {
+                sequence: 10,
+                views: vec![view],
+                ..Default::default()
+            },
+            effects: EditEffects {
+                views: vec![ViewRevision {
+                    scope: Scope::Channel(id),
+                    before: Some(4),
+                    after: Some(5),
+                }],
+                ..Default::default()
+            },
+        },
+    };
+    (app, card, echo)
+}
+
+/// A runtime that attached after the last complete reconciliation names its
+/// channel on the next edge, even one that skips the reconciliation, and that
+/// edge projects the chrome the name reaches.
+#[test]
+fn a_skipped_edge_suggests_the_name_of_a_runtime_attached_since_reconciliation() {
+    use super::super::workspace_model_sync::complete_reconciliations;
+    let (mut app, card, echo) = window_with_a_named_runtime_attached_since_reconciliation();
+    let before = complete_reconciliations();
+    let (_, projection) = app.apply_workspace_model_updates(vec![echo]);
+    assert_eq!(complete_reconciliations(), before, "the echo skips");
+    assert_eq!(app.durable.channels[0].title, "Parser cache work");
+    assert_eq!(projection, crate::app::Projection::Chrome);
+    assert_eq!(
+        app.channel_primary_chat(&app.durable.channels[0]),
+        Some(card)
+    );
+    // Through an update, the projection oracle checks that declaration.
+    let (mut app, _, echo) = window_with_a_named_runtime_attached_since_reconciliation();
+    let before = complete_reconciliations();
+    drop(app.update(Message::WorkspaceModelObserved(echo)));
+    assert_eq!(complete_reconciliations(), before, "the echo skips");
+    assert_eq!(app.durable.channels[0].title, "Parser cache work");
+}

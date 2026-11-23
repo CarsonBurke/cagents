@@ -1115,6 +1115,18 @@ impl Cagents {
             .collect()
     }
 
+    /// A digest of the worktree roots, independent of their order, that
+    /// changes when one is added or removed.
+    pub(super) fn worktree_roots_digest(&self) -> u64 {
+        use std::hash::BuildHasher;
+        let hasher =
+            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        self.worktree_root_candidates()
+            .fold(0, |digest: u64, root| {
+                digest.wrapping_add(hasher.hash_one(root))
+            })
+    }
+
     fn worktree_root_candidates(&self) -> impl Iterator<Item = &Path> {
         self.known_worktree_roots
             .iter()

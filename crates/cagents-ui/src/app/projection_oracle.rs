@@ -238,7 +238,7 @@ impl Snapshot {
 
     /// The parts that differ from `full`'s, each with its first differing
     /// lines.
-    fn differences(&self, full: &Self) -> Vec<String> {
+    pub(super) fn differences(&self, full: &Self) -> Vec<String> {
         let mut differences = Vec::new();
         let mut compare = |part: &str, narrow: &dyn Debug, full: &dyn Debug, equal: bool| {
             if !equal {

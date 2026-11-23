@@ -6932,6 +6932,25 @@ fn reconciling_unchanged_navigation_orders_keeps_the_sidebar_revision() {
 /// reconciliation that adopts what they installed.
 fn spawn_burst(baseline: &WorkspaceModel, repository: &Path) -> (ChannelId, Vec<ModelUpdate>) {
     let created = shared(ChannelId::new(), repository, "Spawned", 1);
+    // The agent's start, then its rename: each edge changes its record, as
+    // an edge that changed nothing would skip the reconciliation.
+    let mut agent = crate::agent_execution::Agent::fixture_placed_in(created.id);
+    agent.spec.target.repository = repository.to_path_buf();
+    let mut renamed = agent.clone();
+    renamed.name = Some("worker".into());
+    let agents_changed =
+        |sequence: u64, agent: &crate::agent_execution::Agent| ModelUpdate::Changed {
+            sequence: baseline.sequence + sequence,
+            edit: ModelEdit::AgentsChanged,
+            changes: EdgeChanges {
+                identity: Some(baseline.identity),
+                effects: EditEffects {
+                    agents: vec![agent.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
     let edges = vec![
         ModelUpdate::Changed {
             sequence: baseline.sequence + 1,
@@ -6951,22 +6970,8 @@ fn spawn_burst(baseline: &WorkspaceModel, repository: &Path) -> (ChannelId, Vec<
                 ..Default::default()
             },
         },
-        ModelUpdate::Changed {
-            sequence: baseline.sequence + 2,
-            edit: ModelEdit::AgentsChanged,
-            changes: EdgeChanges {
-                identity: Some(baseline.identity),
-                ..Default::default()
-            },
-        },
-        ModelUpdate::Changed {
-            sequence: baseline.sequence + 3,
-            edit: ModelEdit::AgentsChanged,
-            changes: EdgeChanges {
-                identity: Some(baseline.identity),
-                ..Default::default()
-            },
-        },
+        agents_changed(2, &agent),
+        agents_changed(3, &renamed),
     ];
     (created.id, edges)
 }
@@ -7186,4 +7191,442 @@ fn agent_labels_share_the_reconciliation_of_the_edges_they_precede() {
         app.chrome_ui.agent_labels.get(&agent).map(String::as_str),
         Some("Tighten the parser cache")
     );
+}
+
+/// One observer edge, as the real observer delivers it with its change set.
+fn changed_edge(
+    identity: uuid::Uuid,
+    sequence: u64,
+    edit: ModelEdit,
+    effects: EditEffects,
+    views: Vec<crate::workspace_model::views::View>,
+) -> ModelUpdate {
+    ModelUpdate::Changed {
+        sequence,
+        edit,
+        changes: EdgeChanges {
+            identity: Some(identity),
+            views: ViewChanges {
+                sequence,
+                views,
+                ..Default::default()
+            },
+            effects,
+        },
+    }
+}
+
+/// Applies `update` and answers whether it ran a complete reconciliation.
+fn reconciles(app: &mut Cagents, update: ModelUpdate) -> bool {
+    let before = complete_reconciliations();
+    drop(app.apply_workspace_model_update(update));
+    complete_reconciliations() != before
+}
+
+/// A copy of an edge this window already installed, such as the observer's
+/// echo of its own receipt, changes no row and no view, so it skips the
+/// complete reconciliation. Each kind an agent start produces is covered, and
+/// the reconcile oracle checks every skip against a complete reconciliation.
+#[test]
+fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
+    use crate::workspace_model::{
+        delta::ViewRevision,
+        views::{Change, Pane, Scope, View},
+    };
+    let (mut app, project, repository) = app_with_project();
+    let channel = ChannelId::new();
+    let mut row = local(channel, project, "Work", 1);
+    row.shared = true;
+    Arc::make_mut(&mut app.durable).channels.push(row);
+    app.workspace_model = registry(vec![shared(channel, &repository, "Work", 1)]);
+    app.workspace_model.views.push(View::empty(channel));
+    let identity = app.workspace_model.identity;
+    let scope = Scope::Channel(channel);
+    let pane = Pane {
+        id: crate::model::CardId::new(),
+        title: "docs".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        scope: None,
+        kind: crate::model::CardKind::Browser(crate::model::BrowserSession {
+            id: crate::model::BrowserId::new(),
+            current_url: "https://example.com".parse().unwrap(),
+            history: vec![],
+            history_index: 0,
+            scroll_x: 0.,
+            scroll_y: 0.,
+            fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+        }),
+    };
+    let revised = |before, after| EditEffects {
+        views: vec![ViewRevision {
+            scope: scope.clone(),
+            before: Some(before),
+            after: Some(after),
+        }],
+        ..Default::default()
+    };
+    let inserted = View {
+        scope: scope.clone(),
+        revision: 5,
+        panes: vec![pane.clone()],
+        retired: vec![],
+    };
+    let insert = ModelEdit::ChangeView {
+        scope: scope.clone(),
+        expected_revision: 0,
+        operation: uuid::Uuid::new_v4(),
+        change: Change::Insert {
+            pane: pane.clone(),
+            before: None,
+        },
+    };
+    let mut agent = crate::agent_execution::Agent::fixture_placed_in(channel);
+    agent.spec.target.repository = repository.clone();
+    let agents = || EditEffects {
+        agents: vec![agent.clone()],
+        ..Default::default()
+    };
+    let mut renamed = agent.clone();
+    renamed.name = Some("worker".into());
+    let other = ChannelId::new();
+    let seed = ModelEdit::SeedView {
+        scope: Scope::Channel(other),
+        panes: vec![],
+        closed: vec![],
+    };
+    let seeded = View::empty(other);
+    let seed_effects = || EditEffects {
+        views: vec![ViewRevision {
+            scope: Scope::Channel(other),
+            before: None,
+            after: Some(seeded.revision),
+        }],
+        ..Default::default()
+    };
+    let retitle = ModelEdit::RetitleChannel {
+        id: channel,
+        title: "Work".into(),
+    };
+    let titled = || EditEffects {
+        channels: vec![shared(channel, &repository, "Work", 1)],
+        ..Default::default()
+    };
+    // (kind, first delivery, its echo)
+    let cases = [
+        (
+            "ChangeView.Insert",
+            changed_edge(
+                identity,
+                10,
+                insert.clone(),
+                revised(0, 5),
+                vec![inserted.clone()],
+            ),
+            changed_edge(identity, 10, insert, revised(0, 5), vec![inserted.clone()]),
+        ),
+        (
+            "AgentsChanged",
+            changed_edge(identity, 11, ModelEdit::AgentsChanged, agents(), vec![]),
+            changed_edge(identity, 11, ModelEdit::AgentsChanged, agents(), vec![]),
+        ),
+        (
+            "AgentsChanged, a later edge repeating the record",
+            changed_edge(
+                identity,
+                12,
+                ModelEdit::AgentsChanged,
+                EditEffects {
+                    agents: vec![renamed.clone()],
+                    ..Default::default()
+                },
+                vec![],
+            ),
+            changed_edge(
+                identity,
+                13,
+                ModelEdit::AgentsChanged,
+                EditEffects {
+                    agents: vec![renamed],
+                    ..Default::default()
+                },
+                vec![],
+            ),
+        ),
+        (
+            "SeedView",
+            changed_edge(
+                identity,
+                14,
+                seed.clone(),
+                seed_effects(),
+                vec![seeded.clone()],
+            ),
+            changed_edge(identity, 14, seed, seed_effects(), vec![seeded]),
+        ),
+        (
+            "RetitleChannel to the held title",
+            changed_edge(identity, 15, retitle.clone(), titled(), vec![]),
+            changed_edge(identity, 16, retitle, titled(), vec![]),
+        ),
+    ];
+    for (kind, first, echo) in cases {
+        if !kind.starts_with("RetitleChannel") {
+            assert!(reconciles(&mut app, first), "{kind}: a change reconciles");
+        } else {
+            drop(app.apply_workspace_model_update(first));
+        }
+        let before = complete_reconciliations();
+        let (_, projected) = app.apply_workspace_model_update_effect(echo);
+        assert_eq!(
+            complete_reconciliations(),
+            before,
+            "{kind}: an edge that changes nothing skips the reconciliation"
+        );
+        assert!(!projected, "{kind}: and the projection after it");
+    }
+    // Work only a complete reconciliation finishes is not skipped, even for
+    // an edge that changed nothing.
+    app.pending_repository_reconciliation
+        .push(repository.clone());
+    assert!(reconciles(
+        &mut app,
+        changed_edge(
+            identity,
+            17,
+            ModelEdit::AgentsChanged,
+            EditEffects::default(),
+            vec![]
+        ),
+    ));
+    assert!(app.pending_repository_reconciliation.is_empty());
+    // Nor is a worktree discovered since the last reconciliation, which
+    // decides where a card in it belongs.
+    app.known_worktree_roots
+        .insert(repository.join(".worktrees/feature"));
+    assert!(reconciles(
+        &mut app,
+        changed_edge(
+            identity,
+            18,
+            ModelEdit::AgentsChanged,
+            EditEffects::default(),
+            vec![]
+        ),
+    ));
+    assert!(!reconciles(
+        &mut app,
+        changed_edge(
+            identity,
+            19,
+            ModelEdit::AgentsChanged,
+            EditEffects::default(),
+            vec![]
+        ),
+    ));
+    // An edge older than the last complete snapshot, holding a view revision
+    // the window already passed, changes nothing either. (The snapshot
+    // sequence is set by hand: only the fence matters here.)
+    app.shared_views.snapshot_sequence = 40;
+    let stale = View {
+        scope: scope.clone(),
+        revision: 3,
+        panes: vec![],
+        retired: vec![],
+    };
+    assert!(!reconciles(
+        &mut app,
+        changed_edge(
+            identity,
+            20,
+            ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 0,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Remove { id: pane.id },
+            },
+            revised(2, 3),
+            vec![stale],
+        ),
+    ));
+    assert_eq!(
+        app.workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == scope),
+        Some(&inserted)
+    );
+    // An edge whose kind settles a lifecycle intent still reconciles when it
+    // is older than the snapshot and carries no row.
+    for (sequence, edit) in [
+        (21, ModelEdit::DeleteChannel { id: other }),
+        (
+            22,
+            ModelEdit::CloseProject {
+                repository: repository.join("elsewhere"),
+            },
+        ),
+    ] {
+        assert!(
+            reconciles(
+                &mut app,
+                changed_edge(identity, sequence, edit, EditEffects::default(), vec![]),
+            ),
+            "a stale lifecycle edge reconciles"
+        );
+    }
+    // A newer view still reconciles.
+    let removed = View {
+        scope: scope.clone(),
+        revision: 50,
+        panes: vec![],
+        retired: vec![pane.id],
+    };
+    assert!(reconciles(
+        &mut app,
+        changed_edge(
+            identity,
+            50,
+            ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 5,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Remove { id: pane.id },
+            },
+            EditEffects {
+                closed: vec![pane.id],
+                ..revised(5, 50)
+            },
+            vec![removed],
+        ),
+    ));
+}
+
+/// A window holding a name for `channel` until its pane arrives, which has
+/// reconciled the edge that brought the pane, and that edge to deliver again.
+fn window_holding_a_channel_name() -> (Cagents, ChannelId, ModelUpdate) {
+    use crate::workspace_model::{
+        delta::ViewRevision,
+        views::{Change, Pane, Scope, View},
+    };
+    let (mut app, project, repository) = app_with_project();
+    let channel = ChannelId::new();
+    let mut row = local(channel, project, "", 1);
+    row.shared = true;
+    row.cards = vec![app.durable.cards[0].id];
+    row.focused = row.cards.first().copied();
+    Arc::make_mut(&mut app.durable).channels.push(row);
+    Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+    app.workspace_model = registry(vec![shared(channel, &repository, "", 1)]);
+    app.workspace_model.views.push(View::empty(channel));
+    let identity = app.workspace_model.identity;
+    let scope = Scope::Channel(channel);
+    // The window's chat, whose pane header and window title take the
+    // channel's name.
+    let session = crate::chat::Session {
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        id: crate::model::TerminalId::new(),
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Omp,
+            recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: "/bin/sh".into(),
+                arguments: Vec::new(),
+                working_directory: PathBuf::from("/tmp"),
+                environment: Default::default(),
+            },
+            session_id: None,
+        },
+        proof: None,
+        terminal: None,
+    };
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards[0].title = session.launch.provider.chat_title().into();
+    durable.cards[0].kind = crate::model::CardKind::Chat(session);
+    let card = &durable.cards[0];
+    // Already shared, as the pane the edge carries.
+    app.shared_views.attached.insert(card.id);
+    let pane = Pane {
+        id: card.id,
+        title: card.title.clone(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        scope: None,
+        kind: card.kind.clone(),
+    };
+    let insert = changed_edge(
+        identity,
+        10,
+        ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: 0,
+            operation: uuid::Uuid::nil(),
+            change: Change::Insert {
+                pane: pane.clone(),
+                before: None,
+            },
+        },
+        EditEffects {
+            views: vec![ViewRevision {
+                scope: scope.clone(),
+                before: Some(0),
+                after: Some(5),
+            }],
+            ..Default::default()
+        },
+        vec![View {
+            scope,
+            revision: 5,
+            panes: vec![pane],
+            retired: vec![],
+        }],
+    );
+    assert!(reconciles(&mut app, insert.clone()));
+    app.remember_channel_name(
+        channel,
+        "Parser cache".into(),
+        crate::model::ChannelTitleSource::Provider,
+    );
+    (app, channel, insert)
+}
+
+fn channel_title(app: &Cagents, channel: ChannelId) -> Option<&str> {
+    app.durable
+        .channels
+        .iter()
+        .find(|held| held.id == channel)
+        .map(|held| held.title.as_str())
+}
+
+/// The naming stage a complete reconciliation ends with also runs for an edge
+/// that skips it: a name held until its channel's pane arrived is applied, and
+/// the edge declares the chrome projection the new name needs. Declaring none
+/// would leave the derived state stale, which the projection oracle reports.
+#[test]
+fn a_skipped_edge_applies_a_held_channel_name_and_projects_its_chrome() {
+    let (mut app, channel, echo) = window_holding_a_channel_name();
+    // Derived state current before the edge, so only what it leaves shows.
+    drop(app.project_workspace(false));
+    let before = complete_reconciliations();
+    let (_, projection) = app.apply_workspace_model_updates(vec![echo]);
+    assert_eq!(complete_reconciliations(), before, "the echo skips");
+    assert_eq!(channel_title(&app, channel), Some("Parser cache"));
+    assert_eq!(projection, Projection::Chrome);
+    let skipped = super::projection_oracle::Snapshot::capture(&app);
+    drop(app.project_workspace(false));
+    let projected = super::projection_oracle::Snapshot::capture(&app);
+    assert!(
+        !skipped.differences(&projected).is_empty(),
+        "the new name is stale until projected"
+    );
+    // Through an update, the projection oracle checks the chrome projection
+    // the edge declares.
+    let (mut app, channel, echo) = window_holding_a_channel_name();
+    let before = complete_reconciliations();
+    drop(app.update(Message::WorkspaceModelObserved(echo)));
+    assert_eq!(complete_reconciliations(), before, "the echo skips");
+    assert_eq!(channel_title(&app, channel), Some("Parser cache"));
 }

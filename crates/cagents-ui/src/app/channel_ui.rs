@@ -702,6 +702,13 @@ impl State {
         !self.deleting.is_empty()
     }
 
+    /// Whether a deletion is under way or failed. A complete reconciliation
+    /// leaves such a channel's shared rows alone, so the first one after it
+    /// settles absorbs them.
+    pub(super) fn deletion_unsettled(&self) -> bool {
+        !self.deleting.is_empty() || !self.failed.is_empty()
+    }
+
     pub(super) fn was_deleted(&self, id: ChannelId) -> bool {
         self.deleted.contains(&id)
     }
@@ -1376,7 +1383,7 @@ impl Cagents {
 
     /// A manual name survives its conversation leaving, so only an automatic
     /// one needs giving back.
-    fn remember_channel_name(
+    pub(super) fn remember_channel_name(
         &mut self,
         id: ChannelId,
         title: String,

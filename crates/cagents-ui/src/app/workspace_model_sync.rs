@@ -241,6 +241,75 @@ fn channel_title_only(
     .then_some(*id)
 }
 
+/// What installing one edge did.
+struct Installed {
+    /// Lifecycle work the edge's removals started.
+    task: Task<Message>,
+    /// Whether the edge changed anything a reconciliation reads.
+    changed: bool,
+}
+
+/// The edit's kind, such as `ChangeView.Insert`, for traces.
+fn edit_kind(edit: &ModelEdit) -> &'static str {
+    use crate::workspace_model::views::Change;
+    match edit {
+        ModelEdit::OpenProject { .. } => "OpenProject",
+        ModelEdit::ReopenProject { .. } => "ReopenProject",
+        ModelEdit::CloseProject { .. } => "CloseProject",
+        ModelEdit::CreateChannel { .. } => "CreateChannel",
+        ModelEdit::ResetNavigation { .. } => "ResetNavigation",
+        ModelEdit::ReorderNavigation { .. } => "ReorderNavigation",
+        ModelEdit::RetitleChannel { .. } => "RetitleChannel",
+        ModelEdit::SuggestChannelTitle { .. } => "SuggestChannelTitle",
+        ModelEdit::DeleteChannel { .. } => "DeleteChannel",
+        ModelEdit::AgentsChanged => "AgentsChanged",
+        ModelEdit::SeedView { .. } => "SeedView",
+        ModelEdit::ChangeView { change, .. } => match change {
+            Change::Insert { .. } => "ChangeView.Insert",
+            Change::Update { .. } => "ChangeView.Update",
+            Change::Transfer { .. } => "ChangeView.Transfer",
+            Change::Remove { .. } => "ChangeView.Remove",
+            Change::Move { .. } => "ChangeView.Move",
+            Change::InsertIfEmpty { .. } => "ChangeView.InsertIfEmpty",
+            Change::RemoveSource { .. } => "ChangeView.RemoveSource",
+            Change::UpdateTerminalSource { .. } => "ChangeView.UpdateTerminalSource",
+        },
+        ModelEdit::SuggestConversationTitle { .. } => "SuggestConversationTitle",
+        ModelEdit::RetiredChannelWorkChanged => "RetiredChannelWorkChanged",
+        ModelEdit::RetireEmptyChannel { .. } => "RetireEmptyChannel",
+        ModelEdit::CloseConfirmedProject { .. } => "CloseConfirmedProject",
+    }
+}
+
+/// Records an edge's edit and the shape of its change set, so a native trace
+/// can count which kinds of edge a workload pays for.
+fn trace_edge(update: &ModelUpdate) {
+    if !tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG) {
+        return;
+    }
+    let (source, edit, effects, views) = match update {
+        ModelUpdate::Committed {
+            receipt,
+            edit,
+            views,
+        } => ("receipt", edit, &receipt.effects, views),
+        ModelUpdate::Changed { edit, changes, .. } => {
+            ("observer", edit, &changes.effects, &changes.views)
+        }
+        _ => return,
+    };
+    tracing::debug!(target: "cagents::workspace_pipeline", stage = "edge", source,
+        kind = edit_kind(edit),
+        effect_views = effects.views.len(), closed = effects.closed.len(),
+        channels = effects.channels.len(), projects = effects.projects.len(),
+        removed_projects = effects.removed_projects.len(),
+        removed_channels = effects.removed_channels.len(),
+        navigation = effects.navigation_orders.len(), agents = effects.agents.len(),
+        removed_agents = effects.removed_agents.len(), views = views.views.len(),
+        removed_views = views.removed.len(), absent_views = views.absent.len(),
+        "Received a shared model edge");
+}
+
 /// Metadata rows have independent clocks: a newer receipt for one scope must
 /// not discard a delayed observer edge for a different channel or project.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1116,15 +1185,21 @@ impl Cagents {
         let enclosing = self.observed_run.replace(ObservedRun::default());
         let mut tasks = Vec::with_capacity(updates.len() + 1);
         let mut projection = Projection::Unchanged;
+        // Each update's own work, apart from the reconciliation the run
+        // settles, which is timed as its own stages.
+        let mut phase = WorkspaceProjectionTiming::new(true);
         for update in updates {
             if !defers_reconciliation(&update) {
                 projection = projection.widen(self.settle_observed_run(&mut tasks));
+                phase.mark("run_settle");
             }
             let (task, applied) = self.apply_workspace_model_update_projection(update);
             tasks.push(task);
             projection = projection.widen(applied);
+            phase.mark("edge_apply");
         }
         projection = projection.widen(self.settle_observed_run(&mut tasks));
+        phase.mark("run_settle");
         self.observed_run = enclosing;
         (Task::batch(tasks), projection)
     }
@@ -1260,6 +1335,7 @@ impl Cagents {
             }
             update => update,
         };
+        trace_edge(&update);
         let foreign = match &update {
             ModelUpdate::Committed { receipt, .. } => {
                 receipt.identity != self.workspace_model.identity
@@ -1301,6 +1377,14 @@ impl Cagents {
             Err(reason) => {
                 tracing::trace!(target: "cagents::workspace_projection", selected = false, reason, "Projecting shared model")
             }
+        }
+        if let ModelUpdate::Changed {
+            sequence,
+            edit,
+            changes,
+        } = update
+        {
+            return self.apply_changed_edge(sequence, &edit, changes);
         }
         let (task, changed) = self.apply_workspace_model_update_full_effect(update);
         (
@@ -1912,12 +1996,10 @@ impl Cagents {
                 )));
                 self.apply_closed_project_tombstones()
             }
-            ModelUpdate::Edited { sequence, edit } => self.apply_model_edge(sequence, edit, None),
-            ModelUpdate::Changed {
-                sequence,
-                edit,
-                changes,
-            } => self.apply_changed_edge(sequence, &edit, changes),
+            ModelUpdate::Edited { sequence, edit } => self.apply_model_edge(sequence, edit),
+            ModelUpdate::Changed { .. } => {
+                unreachable!("a changed edge is applied with its own projection")
+            }
             ModelUpdate::Ranked { channel, model } => {
                 // The publisher and observer use separate connections. Keep the
                 // complete response: a rank alone cannot fence an older observer
@@ -1971,28 +2053,11 @@ impl Cagents {
         }
     }
 
-    /// Folds one observed edge, and installs what it changed when the observer
-    /// resolved that from its copy of the views.
-    fn apply_model_edge(
-        &mut self,
-        sequence: u64,
-        edit: ModelEdit,
-        changes: Option<EdgeChanges>,
-    ) -> Task<Message> {
+    /// Folds one observed edge that carries no change set.
+    fn apply_model_edge(&mut self, sequence: u64, edit: ModelEdit) -> Task<Message> {
         if sequence <= self.workspace_model.sequence {
             // A snapshot overtook this edge, so its channel and agent rows are
-            // older than the window's. A view the observer read for it can
-            // still be newer than that snapshot: the edit that made it newer
-            // arrives as an edge the observer then has nothing to apply for.
-            // A scope the snapshot lacks was deleted after this edge; one
-            // created again after the snapshot arrives with a later edge.
-            let refreshed =
-                changes.is_some_and(|changes| self.install_edge_views(changes.views, false));
-            let reconciled = if refreshed {
-                self.reconcile_workspace_model()
-            } else {
-                Task::none()
-            };
+            // older than the window's.
             if let ModelEdit::DeleteChannel { id } = edit {
                 // A snapshot can overtake this explicit instruction.
                 // It must still revoke automatic revival, even when
@@ -2002,9 +2067,9 @@ impl Cagents {
                     .channels
                     .retain(|channel| channel.id != id);
                 let retired = self.retire_peer_channel(id);
-                return Task::batch([reconciled, retired, self.finish_channel_reopen(id)]);
+                return Task::batch([retired, self.finish_channel_reopen(id)]);
             }
-            return reconciled;
+            return Task::none();
         }
         // An explicit delete is an instruction rather than an absence,
         // so folding it in retires the channel whether or not this
@@ -2058,9 +2123,6 @@ impl Cagents {
             self.shared_views.metadata_revisions.insert(key, sequence);
         }
         self.workspace_model.fold(sequence, &edit);
-        if let Some(changes) = changes {
-            return self.apply_changed_edge(sequence, &edit, changes);
-        }
         if let ModelEdit::RetitleChannel { id, .. } | ModelEdit::SuggestChannelTitle { id, .. } =
             &edit
             && let Some(task) = self.absorb_channel_title(*id)
@@ -2093,32 +2155,116 @@ impl Cagents {
     /// Installs one observed change and projects it once. A publishing window
     /// uses the same installation before acknowledging its pending operation,
     /// then performs its one projection after that overlay has been removed.
+    ///
+    /// Also returns what is left to project: an edge that changed nothing
+    /// leaves the window as the last reconciliation and projection made it,
+    /// so it skips both, unless the window holds work only a complete
+    /// reconciliation finishes.
     fn apply_changed_edge(
         &mut self,
         sequence: u64,
         edit: &ModelEdit,
         changes: EdgeChanges,
-    ) -> Task<Message> {
+    ) -> (Task<Message>, Projection) {
         let title = channel_title_only(edit, &changes.effects, &changes.views);
-        let Some(installed) = self.install_changed_edge(sequence, edit, changes) else {
-            return Task::none();
+        let mut phase = WorkspaceProjectionTiming::new(true);
+        let Some(Installed {
+            task: installed,
+            changed,
+        }) = self.install_edge(sequence, edit, changes)
+        else {
+            return (Task::none(), Projection::Unchanged);
         };
+        phase.mark("edge_install");
+        if !changed {
+            // An echo of an edge this window already installed, such as the
+            // observer's copy of its own receipt, or an edge older than every
+            // row it names.
+            match self.reconciliation_owed() {
+                Some(reason) => {
+                    tracing::trace!(target: "cagents::workspace_projection", selected = false, reason, "Reconciling an edge that changed nothing");
+                }
+                None => {
+                    tracing::trace!(target: "cagents::workspace_projection", selected = true, "Skipped an edge that changed nothing");
+                    // In a run that already owes a reconciliation, the window
+                    // is not yet reconciled to compare against. The check
+                    // leaves out the naming stage, which runs next either way.
+                    #[cfg(test)]
+                    if !self.observed_run.is_some_and(|owed| owed.reconcile) {
+                        super::reconcile_oracle::check_skipped(self, edit_kind(edit));
+                    }
+                    // A runtime attached since the last reconciliation can
+                    // make a channel name suggestion, which that
+                    // reconciliation's naming stage would have sampled. A
+                    // name it writes reaches the pane headers and the window
+                    // title, as a presentation edge's does.
+                    let naming_source = Arc::downgrade(&self.durable);
+                    let naming = self.refresh_channel_naming();
+                    let projection = if naming_source.as_ptr() == Arc::as_ptr(&self.durable) {
+                        Projection::Unchanged
+                    } else {
+                        Projection::Chrome
+                    };
+                    return (Task::batch([installed, naming]), projection);
+                }
+            }
+        }
         if let Some(id) = title
             && let Some(title) = self.absorb_channel_title(id)
         {
-            return Task::batch([installed, title]);
+            return (Task::batch([installed, title]), Projection::Full);
         }
-        Task::batch([installed, self.reconcile_after_edge()])
+        (
+            Task::batch([installed, self.reconcile_after_edge()]),
+            Projection::Full,
+        )
     }
 
-    /// Installs canonical rows and scope authority, preserving lifecycle tasks
-    /// without projecting the workspace or advancing a complete-model watermark.
+    /// Work this window holds that only a complete reconciliation finishes,
+    /// so an edge must not skip it even when the edge changed nothing.
+    ///
+    /// Some of it can stay held for a long time, such as a deletion whose
+    /// registry request failed or a local conversation still waiting to
+    /// publish; every edge until it settles then reconciles, as before edges
+    /// could skip, and the trace gives the reason.
+    fn reconciliation_owed(&self) -> Option<&'static str> {
+        if !self.pending_repository_reconciliation.is_empty() {
+            Some("a repository reconciliation is deferred")
+        } else if self.holds_unpublished_local_chat() {
+            Some("an unpublished local conversation needs reconciliation")
+        } else if self.channel_title_suggestion_pending() {
+            Some("a channel name suggestion is waiting")
+        } else if self.channel_ui.deletion_unsettled() {
+            Some("a channel deletion is unsettled")
+        } else if self.shared_views.reconciled_roots != self.worktree_roots_digest() {
+            Some("the worktree roots changed")
+        } else {
+            None
+        }
+    }
+
     fn install_changed_edge(
         &mut self,
         sequence: u64,
         edit: &ModelEdit,
         changes: EdgeChanges,
     ) -> Option<Task<Message>> {
+        self.install_edge(sequence, edit, changes)
+            .map(|installed| installed.task)
+    }
+
+    /// Installs canonical rows and scope authority, preserving lifecycle tasks
+    /// without projecting the workspace or advancing a complete-model watermark.
+    ///
+    /// `None` for another registry's edge. Otherwise it reports whether the
+    /// edge changed anything a reconciliation reads: a view, a closed pane, a
+    /// canonical row, or this window's own lifecycle state.
+    fn install_edge(
+        &mut self,
+        sequence: u64,
+        edit: &ModelEdit,
+        changes: EdgeChanges,
+    ) -> Option<Installed> {
         if changes
             .identity
             .is_some_and(|identity| identity != self.workspace_model.identity)
@@ -2135,15 +2281,30 @@ impl Cagents {
         {
             self.settle_observed_run(&mut tasks);
         }
+        // Each of these edits settles a lifecycle intent that the
+        // reconciliation completes, whatever rows it carries.
+        let settles_lifecycle = matches!(
+            edit,
+            ModelEdit::DeleteChannel { .. }
+                | ModelEdit::CloseProject { .. }
+                | ModelEdit::CloseConfirmedProject { .. }
+                | ModelEdit::RetireEmptyChannel { .. }
+                | ModelEdit::RetiredChannelWorkChanged
+        );
+        let closed = self.shared_views.closed.len();
         self.shared_views
             .closed
             .extend(changes.effects.closed.iter().copied());
-        self.install_edge_views(
+        let mut changed = self.install_edge_views(
             changes.views,
             sequence > self.shared_views.snapshot_sequence,
-        );
+        ) | (self.shared_views.closed.len() != closed)
+            | settles_lifecycle;
         if sequence < self.shared_views.snapshot_sequence {
-            return Some(settled_tasks(tasks));
+            return Some(Installed {
+                task: settled_tasks(tasks),
+                changed,
+            });
         }
         let floor = self.shared_views.snapshot_sequence;
         let (protected_channels, protected_projects) =
@@ -2172,25 +2333,36 @@ impl Cagents {
             if !accepts(MetadataKey::Project(project.repository.clone())) {
                 continue;
             }
+            let reopened = model.closed_projects.len();
             model
                 .closed_projects
                 .retain(|path| path != &project.repository);
+            changed |= model.closed_projects.len() != reopened;
             match model
                 .projects
                 .iter_mut()
                 .find(|held| held.repository == project.repository)
             {
-                Some(held) => *held = project,
-                None => model.projects.push(project),
+                Some(held) if *held == project => {}
+                Some(held) => {
+                    *held = project;
+                    changed = true;
+                }
+                None => {
+                    model.projects.push(project);
+                    changed = true;
+                }
             }
         }
         for repository in effects.removed_projects {
             // Closing a project also deletes its order. Record that tombstone
             // even if a later reopen or live child already protects the parent.
             if accepts(MetadataKey::Navigation(repository.clone())) {
+                let held = model.navigation_orders.len();
                 model
                     .navigation_orders
                     .retain(|held| held.repository != repository);
+                changed |= model.navigation_orders.len() != held;
             }
             if protected_projects.contains(&repository)
                 || !accepts(MetadataKey::Project(repository.clone()))
@@ -2201,6 +2373,7 @@ impl Cagents {
             if !model.closed_projects.contains(&repository) {
                 model.closed_projects.push(repository.clone());
             }
+            changed = true;
             closed_projects.push(repository);
         }
         for channel in effects.channels {
@@ -2208,8 +2381,15 @@ impl Cagents {
                 continue;
             }
             match model.channels.iter_mut().find(|held| held.id == channel.id) {
-                Some(held) => *held = channel,
-                None => model.channels.push(channel),
+                Some(held) if *held == channel => {}
+                Some(held) => {
+                    *held = channel;
+                    changed = true;
+                }
+                None => {
+                    model.channels.push(channel);
+                    changed = true;
+                }
             }
         }
         for id in effects.removed_channels {
@@ -2217,10 +2397,18 @@ impl Cagents {
                 continue;
             }
             model.channels.retain(|held| held.id != id);
+            changed = true;
             removed_channels.push(id);
         }
         for order in effects.navigation_orders {
             if !accepts(MetadataKey::Navigation(order.repository.clone())) {
+                continue;
+            }
+            let held = model
+                .navigation_orders
+                .iter()
+                .find(|held| held.repository == order.repository);
+            if held.map_or(order.items.is_empty(), |held| *held == order) {
                 continue;
             }
             model
@@ -2229,21 +2417,31 @@ impl Cagents {
             if !order.items.is_empty() {
                 model.navigation_orders.push(order);
             }
+            changed = true;
         }
         for agent in effects.agents {
             if !accepts(MetadataKey::Agent(agent.id)) {
                 continue;
             }
             match model.agents.iter_mut().find(|held| held.id == agent.id) {
-                Some(held) => *held = agent,
-                None => model.agents.push(agent),
+                Some(held) if *held == agent => {}
+                Some(held) => {
+                    *held = agent;
+                    changed = true;
+                }
+                None => {
+                    model.agents.push(agent);
+                    changed = true;
+                }
             }
         }
         for id in effects.removed_agents {
             if !accepts(MetadataKey::Agent(id)) {
                 continue;
             }
+            let held = model.agents.len();
             model.agents.retain(|held| held.id != id);
+            changed |= model.agents.len() != held;
         }
         model.sequence = model.sequence.max(sequence);
         for repository in closed_projects {
@@ -2261,8 +2459,12 @@ impl Cagents {
         {
             self.cancel_shared_project_close(repository);
             self.project_ui.closed.remove(repository);
+            changed = true;
         }
-        Some(Task::batch(tasks))
+        Some(Installed {
+            task: Task::batch(tasks),
+            changed,
+        })
     }
 
     /// Installs complete views by revision, adding a scope the window lacks
@@ -2376,8 +2578,7 @@ impl Cagents {
         }
         // A manual name ends a pending suggestion, and a name arriving can
         // release one this window was holding back.
-        tasks.push(self.refresh_channel_title_suggestions());
-        self.restore_channel_names();
+        tasks.push(self.refresh_channel_naming());
         Some(Task::batch(tasks))
     }
 
@@ -2517,10 +2718,14 @@ impl Cagents {
         if self.workspace_model.identity == NO_REGISTRY {
             return Task::none();
         }
+        // Only a complete pass is timed: it is the one every structural edge
+        // pays, and its stages split the reconciliation's own walks from the
+        // shared views' projection.
         #[cfg(test)]
-        if repositories.is_none() {
+        if repositories.is_none() && !super::reconcile_oracle::verifying() {
             COMPLETE_RECONCILIATIONS.with(|count| count.set(count.get() + 1));
         }
+        let mut phase = WorkspaceProjectionTiming::new(repositories.is_none());
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
         let model = std::mem::take(&mut self.workspace_model);
@@ -2538,6 +2743,7 @@ impl Cagents {
                 Adoption::Retained => {}
             }
         }
+        phase.mark("reconcile_projects");
         // Written only where an order changed, so an unchanged sidebar keeps
         // its revision and the navigation list its cache.
         let navigation_order = |project: &SidebarProject| {
@@ -2587,6 +2793,7 @@ impl Cagents {
                 },
             }
         }
+        phase.mark("reconcile_channels");
         let mut republished = Vec::new();
         let retired = channels_absent_from_model(&self.durable.channels, &model.channels);
         for (id, shared) in retired {
@@ -2619,6 +2826,7 @@ impl Cagents {
         for id in republished {
             self.publish_shared_channel(id, &model, &mut opened);
         }
+        phase.mark("reconcile_publish");
         // Admission uses this incoming snapshot, not fences left by a previous
         // projection. A stale sibling pane is fenced by itself: it must not
         // defer an unrelated fresh actor's admission to the same scope.
@@ -2672,6 +2880,7 @@ impl Cagents {
         if changed {
             self.sort_durable_channels();
         }
+        phase.mark("reconcile_agents");
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
@@ -2681,12 +2890,27 @@ impl Cagents {
             }
             None => self.reconcile_shared_views(),
         });
+        phase.mark("reconcile_shared_views");
         if changed {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
         }
-        tasks.push(self.refresh_channel_title_suggestions());
-        self.restore_channel_names();
+        // The reconcile oracle compares everything before this stage, which a
+        // skipped edge runs as well.
+        #[cfg(test)]
+        let naming = !super::reconcile_oracle::verifying();
+        #[cfg(not(test))]
+        let naming = true;
+        if naming {
+            tasks.push(self.refresh_channel_naming());
+        }
+        phase.mark("reconcile_naming");
+        if repositories.is_none() {
+            // Which worktree a card belongs to reads these roots, so a change
+            // to them owes the next edge a reconciliation. Read after the
+            // pass, which can adopt projects and their worktrees.
+            self.shared_views.reconciled_roots = self.worktree_roots_digest();
+        }
         Task::batch(tasks)
     }
 
@@ -3159,15 +3383,25 @@ impl Cagents {
     ///
     /// Compared canonically, because the shared key is canonical and a window
     /// may have opened the same checkout through a symlink.
+    ///
+    /// The paths are compared as they are first, and resolved only when none
+    /// is equal: every complete reconciliation asks this for each shared
+    /// project, and resolving every other project's path costs file system
+    /// calls for each one.
     pub(super) fn project_for_repository(&self, repository: &Path) -> Option<ProjectId> {
-        self.sidebar_model
-            .projects
+        let projects = &self.sidebar_model.projects;
+        projects
             .iter()
-            .find(|project| {
-                project.repository == repository
-                    || !crate::device::is_remote()
-                        && canonical_repository(&project.repository)
-                            .is_ok_and(|canonical| canonical == repository)
+            .find(|project| project.repository == repository)
+            .or_else(|| {
+                (!crate::device::is_remote())
+                    .then(|| {
+                        projects.iter().find(|project| {
+                            canonical_repository(&project.repository)
+                                .is_ok_and(|canonical| canonical == repository)
+                        })
+                    })
+                    .flatten()
             })
             .map(|project| project.id)
     }
@@ -3451,6 +3685,8 @@ impl Cagents {
     /// publisher thread owns the connection and the retry, and the window learns
     /// the outcome as an update like any other.
     pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) {
+        #[cfg(test)]
+        super::reconcile_oracle::published();
         self.capture_view_update_source(&edit);
         let navigation = matches!(
             &edit,

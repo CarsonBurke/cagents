@@ -637,6 +637,17 @@ allocate nothing.
   fixture's eligibility does not show that a native workload qualifies, so
   count selected and full projections in the native run.
 
+`cagents::workspace_pipeline=debug` also splits each update of model edges
+into phases: `edge_install` for installing an edge's rows and views,
+`edge_apply` for the rest of its handling, and `run_settle` for the one
+complete reconciliation a run of edges owes. That reconciliation is split again,
+from `reconcile_projects` to `reconcile_naming`, so its own walks show apart
+from the shared views' projection (`reconcile_shared_views`). An edge that
+changes nothing the window holds, such as the observer's copy of this window's
+own receipt, skips the reconciliation and the projection after it. At
+`cagents::workspace_projection=trace`, each such edge is logged as "Skipped an
+edge that changed nothing", or the log gives the reason it reconciled anyway.
+
 Measure edits on the generated large workspace with fixture agents streaming,
 one of them visible, and drive a fixed number of pane title edits at a fixed
 interval through `ApplyWorkspaceEdit` from a separate client. Compare UI
