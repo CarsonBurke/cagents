@@ -119,8 +119,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Separator {
 const ATTENTION_GLOW: f32 = 5.0;
 /// The attention frame's stroke, as a share of its tone.
 const ATTENTION_STROKE_ALPHA: f32 = crate::design::ATTENTION_BORDER_ALPHA;
-/// The glow's strength where it meets the stroke, as a share of its tone.
-const ATTENTION_GLOW_ALPHA: f32 = 0.2;
+/// The glow's strength where it meets the stroke, as a share of its tone. A
+/// warm tone over a dark surface reads as a heavier band than over a light
+/// one, so the dark theme takes less of it.
+const ATTENTION_GLOW_ALPHA_DARK: f32 = 0.14;
+const ATTENTION_GLOW_ALPHA_LIGHT: f32 = 0.28;
 
 /// The mark of a pane that needs the person: a translucent stroke in `tone`
 /// on the pane's edge, fading inward over a few pixels, so the pane reads
@@ -249,6 +252,11 @@ impl<Message> Widget<Message, Theme, Renderer> for AttentionFrame {
             1.0
         };
         let tone = (self.tone)(theme);
+        let glow = if theme.cosmic().is_dark {
+            ATTENTION_GLOW_ALPHA_DARK
+        } else {
+            ATTENTION_GLOW_ALPHA_LIGHT
+        };
         let mut ring = self.outer(layout.bounds(), layout.virtual_offset(), scale);
         let stroke = (crate::design::BORDER_WIDTH * scale).round().max(1.0) / scale;
         paint_ring(
@@ -264,7 +272,7 @@ impl<Message> Widget<Message, Theme, Renderer> for AttentionFrame {
         let pixel = 1.0 / scale;
         for step in 0..steps as usize {
             let remaining = 1.0 - (step as f32 + 0.5) / steps;
-            let alpha = ATTENTION_GLOW_ALPHA * remaining * remaining;
+            let alpha = glow * remaining * remaining;
             paint_ring(renderer, ring, pixel, tone.scale_alpha(alpha));
             ring = shrink(ring, pixel);
         }
