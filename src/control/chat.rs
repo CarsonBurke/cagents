@@ -189,13 +189,13 @@ fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) 
         String::new()
     };
     // Every resident is listed; those beyond the slot holders page saved
-    // history without a provider.
+    // history, or their provider stopped, so none runs.
     let readers = (capacity.residents.len() as u32 + capacity.omitted_residents)
         .saturating_sub(capacity.resident);
     let readers = match readers {
         0 => String::new(),
-        1 => "; 1 chat only shows saved history and doesn't count toward the limit".to_owned(),
-        n => format!("; {n} chats only show saved history and don't count toward the limit"),
+        1 => "; 1 chat is saved history or stopped and doesn't count toward the limit".to_owned(),
+        n => format!("; {n} chats are saved history or stopped and don't count toward the limit"),
     };
     let mut data = json!(capacity);
     data["persistence_warning"] = json!(persistence_warning);
@@ -477,7 +477,7 @@ mod tests {
             None,
         );
         assert!(output.human.starts_with(
-            "Native chats: 1 used / 128 limit (1 resident, 0 spawning; 2 chats only show saved history and don't count toward the limit)"
+            "Native chats: 1 used / 128 limit (1 resident, 0 spawning; 2 chats are saved history or stopped and don't count toward the limit)"
         ));
     }
 

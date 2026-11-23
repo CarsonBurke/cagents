@@ -1140,6 +1140,23 @@ impl LocalHandle {
         Ok(true)
     }
 
+    /// As [`Self::try_close_if_idle`], with `detached` deciding what the
+    /// provider leaves running. The decision precedes the claim, since
+    /// teardown may begin as soon as the actor grants it; a refusal restores
+    /// the earlier one, so a later close is decided as it would have been.
+    pub(crate) fn try_stop_if_idle(
+        &self,
+        generation: u64,
+        detached: DetachedWork,
+    ) -> Result<bool, String> {
+        let previous = self.0.detached_work.replace(detached);
+        let stopped = self.try_close_if_idle(generation);
+        if matches!(stopped, Ok(false)) {
+            self.0.detached_work.restore(previous);
+        }
+        stopped
+    }
+
     pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
         // Publish retention before the actor's close fence: it may begin
         // teardown immediately after acknowledging that fence.
@@ -2141,13 +2158,20 @@ impl DetachedDecision {
     const STOP: u8 = 1;
     const SPARE: u8 = 2;
     fn decide(&self, detached: DetachedWork) {
-        self.0.store(
+        self.replace(detached);
+    }
+    /// Decides `detached`, returning the earlier decision for [`Self::restore`].
+    fn replace(&self, detached: DetachedWork) -> u8 {
+        self.0.swap(
             match detached {
                 DetachedWork::Stop => Self::STOP,
                 DetachedWork::Spare => Self::SPARE,
             },
-            Ordering::Release,
-        );
+            Ordering::AcqRel,
+        )
+    }
+    fn restore(&self, previous: u8) {
+        self.0.store(previous, Ordering::Release);
     }
     fn get(&self) -> Option<DetachedWork> {
         match self.0.load(Ordering::Acquire) {

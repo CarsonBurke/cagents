@@ -5407,3 +5407,248 @@ fn exited_claude_card_resumes_its_conversation_once_in_the_same_daemon() {
     )
     .unwrap();
 }
+
+/// A full daemon makes room for a new chat by stopping the provider of a
+/// finished Claude chat no window shows, never one on screen. The stopped
+/// chat stays resident, holds no slot, and resumes in place, making room in
+/// turn.
+#[test]
+fn a_full_daemon_stops_a_finished_hidden_chat_to_make_room() {
+    let _helper_executable = retained_helper_executable();
+    const MODE: &str = "CAGENTS_MAKE_ROOM_TEST";
+    if std::env::var_os(MODE).is_none() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        for path in [
+            "home/.claude",
+            "run",
+            "data",
+            "config",
+            "cache",
+            "bin",
+            "project",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        fs::write(root.join("persist-history"), "").unwrap();
+        let test = thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env_clear()
+            .env(
+                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                retained_helper_executable(),
+            )
+            .env(MODE, "1")
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CAGENTS_HOLDER_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "making room failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    install_provider(&root.join("bin/claude"));
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("make-room-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("only"),
+    };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut state = HostState::new(proof.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&root.join("registry.sqlite3")).unwrap());
+    state.native_chat_capacity = 1;
+    let host = Arc::new(HostLock::new(state));
+    // A stopped actor commits its final outcomes, attention included, before
+    // its resume can retire it.
+    let notifications = super::super::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    struct Cleanup(Vec<crate::daemon::holder_registry::Record>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for record in &self.0 {
+                for process in [&record.root, &record.holder] {
+                    if process.is_current() {
+                        unsafe {
+                            libc::kill(process.pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut cleanup = Cleanup(Vec::new());
+    let lines = |name: &str| {
+        fs::read_to_string(root.join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let start = |client: ClientId| {
+        let launch = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            root.join("project"),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        let id = launch.id;
+        start_execution(
+            &host,
+            client,
+            launch,
+            Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+        )
+        .map(|_| id)
+    };
+    // A finished turn, after which no window shows the chat.
+    let finish_turn = |id: TerminalId, cleanup: &mut Cleanup| {
+        let handle = host.lock().unwrap().chats[&id].handle.clone();
+        cleanup.0.push(handle.actor_identity().unwrap().record);
+        wait_until(
+            || handle.attachment_snapshot().ready,
+            "actor never initialized",
+        );
+        let _ = fs::remove_file(root.join("provider-done"));
+        handle
+            .command(chat::Command::Prompt {
+                text: "A turn that finishes".into(),
+                attachments: Vec::new(),
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+        wait_until(
+            || {
+                root.join("provider-done").exists()
+                    && handle.finished_at().is_some()
+                    && handle.is_idle()
+                    && handle.update_activity() == (false, true)
+            },
+            "the turn never finished",
+        );
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&id)
+            .unwrap()
+            .subscribers
+            .clear();
+        handle
+    };
+    let set_visible = |id: TerminalId, visible: bool| {
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&id)
+            .unwrap()
+            .subscribers
+            .insert(9, visible);
+    };
+
+    let first = start(0).unwrap();
+    let first_handle = finish_turn(first, &mut cleanup);
+    let conversation = first_handle.confirmed_session_id();
+    assert!(conversation.is_some());
+    // The card holds the descriptor the daemon publishes for its chat.
+    let ServerResponse::ChatListed { sessions } =
+        process(&host, 1, ClientRequest::ChatList).unwrap()
+    else {
+        panic!("the daemon did not list its chats");
+    };
+    let card = sessions
+        .into_iter()
+        .find(|session| session.id == first)
+        .unwrap();
+
+    // A chat on screen is never stopped for another.
+    set_visible(first, true);
+    let refused = start(1).unwrap_err();
+    assert_eq!(refused.code, ProtocolErrorCode::ChatCapacity, "{refused:?}");
+    assert!(!first_handle.is_completed());
+
+    // Hidden, the finished chat makes room.
+    set_visible(first, false);
+    let second = start(1).unwrap();
+    assert!(first_handle.is_completed() && first_handle.attachment_snapshot().exited);
+    assert!(!first_handle.owns_work());
+    {
+        let state = host.lock().unwrap();
+        assert!(state.chats.contains_key(&first), "the stopped chat stays");
+        assert_eq!(capacity::usage(&state), 1);
+        let status = capacity::status_from_state(&state);
+        let row = status.residents.iter().find(|row| row.chat_id == first);
+        assert_eq!(row.unwrap().status, "stopped (no slot)");
+    }
+
+    // Resuming the stopped chat while full stops the other finished one.
+    let second_handle = finish_turn(second, &mut cleanup);
+    let ServerResponse::ChatResumePrepared { session: successor } = process_inner(
+        &host,
+        2,
+        ClientRequest::ChatPrepareResume {
+            source: card.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("a stopped card must prepare its resume");
+    };
+    let ServerResponse::ChatAttached {
+        session: started, ..
+    } = process(
+        &host,
+        2,
+        ClientRequest::ChatStart {
+            session: successor,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("the resumed chat did not start");
+    };
+    let resumed = host.lock().unwrap().chats[&started.id].handle.clone();
+    cleanup.0.push(resumed.actor_identity().unwrap().record);
+    assert!(second_handle.is_completed());
+    assert_eq!(capacity::usage(&host.lock().unwrap()), 1);
+    wait_until(
+        || resumed.attachment_snapshot().ready,
+        "the resumed chat never initialized",
+    );
+    assert_eq!(
+        lines("launches").last(),
+        conversation.as_ref(),
+        "the stopped conversation resumed"
+    );
+    process(
+        &host,
+        2,
+        ClientRequest::ChatClose {
+            chat_id: started.id,
+        },
+    )
+    .unwrap();
+}
