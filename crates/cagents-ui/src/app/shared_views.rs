@@ -343,6 +343,22 @@ fn view_scope_hold<'a>(
     })
 }
 
+/// How many times one connection sends the removal of a pane closed here
+/// that the registry keeps refusing. A reconnect is a new chance.
+const OUTSTANDING_CLOSE_SENDS: u8 = 4;
+
+/// Where a pane this window closed stands with a registry that still lists it.
+#[derive(Clone, Debug, Default)]
+pub(super) struct OutstandingClose {
+    /// The registry, scope and view revision its removal was last sent at.
+    sent_at: Option<(uuid::Uuid, Scope, u64)>,
+    /// Removals sent for it on this connection.
+    sends: u8,
+    /// Another client changed the pane since: it stays open there, and
+    /// nothing is sent for it on this connection.
+    kept_elsewhere: bool,
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub(super) removals: HashMap<CardId, Option<removal::RemovalSource>>,
@@ -366,10 +382,9 @@ pub(super) struct State {
     pub(super) closed: HashSet<CardId>,
     /// Panes this window closed, and keeps closed, that a shared view still
     /// lists: their removal never reached the registry, or it was refused.
-    /// Each maps to where its removal was last sent - registry, scope and
-    /// view revision - so one refused is sent again only once that view
-    /// changes or this window reconnects, never in a loop.
-    pub(super) outstanding_closes: HashMap<CardId, Option<(uuid::Uuid, Scope, u64)>>,
+    /// Its removal is sent again at most once per view revision, and only a
+    /// few times per connection, so a refusal never becomes a loop.
+    pub(super) outstanding_closes: HashMap<CardId, OutstandingClose>,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -3619,10 +3634,7 @@ impl Cagents {
             view.panes.retain(|pane| !closed.contains(&pane.id));
             for id in closed {
                 if !self.shared_views.closed.contains(&id) {
-                    self.shared_views
-                        .outstanding_closes
-                        .entry(id)
-                        .or_insert(None);
+                    self.shared_views.outstanding_closes.entry(id).or_default();
                 }
                 if !view.retired.contains(&id) {
                     view.retired.push(id);
@@ -4742,10 +4754,12 @@ impl Cagents {
             scope: pane.scope.clone(),
         };
         // A conversation's pane also changes as its provider confirms what
-        // it already is, as when its session is named after the close.
-        let confirms = closed.scope == pane.scope
-            && matches!((&closed.kind, &pane.kind), (CardKind::Chat(closed), CardKind::Chat(current))
-                if super::chat_ui::background_close::only_confirms(closed, current));
+        // it already is, as when its session is named after the close. And a
+        // draft nobody has started holds no work: one whose options differ
+        // only lost an edit of this window's to the same trouble as its close.
+        let confirms = matches!((&closed.kind, &pane.kind), (CardKind::Chat(closed), CardKind::Chat(current))
+                if super::chat_ui::background_close::only_confirms(closed, current)
+                    || (closed.is_unstarted() && current.is_unstarted()));
         if !confirms && !views::same_removal_source(&closed, pane) {
             return None;
         }
@@ -4753,9 +4767,9 @@ impl Cagents {
     }
 
     /// Sends again the removal of each pane this window closed that a view
-    /// still lists. One is sent at most once for each revision of its view
-    /// and each connection to the registry, so a refusal waits for the view
-    /// to change rather than repeating.
+    /// still lists. One is sent at most once for each revision of its view,
+    /// and at most [`OUTSTANDING_CLOSE_SENDS`] times per connection, so a
+    /// refusal waits for the view to change or a reconnect, never looping.
     fn publish_outstanding_closes(&mut self) {
         if self.shared_views.outstanding_closes.is_empty() {
             return;
@@ -4766,7 +4780,7 @@ impl Cagents {
         let mut sends = Vec::new();
         for view in &self.workspace_model.views {
             for pane in &view.panes {
-                let Some(attempt) = self.shared_views.outstanding_closes.get(&pane.id) else {
+                let Some(close) = self.shared_views.outstanding_closes.get(&pane.id) else {
                     continue;
                 };
                 if !self.closed_here(pane.id) {
@@ -4774,7 +4788,9 @@ impl Cagents {
                 }
                 held.insert(pane.id);
                 let at = (identity, view.scope.clone(), view.revision);
-                if attempt.as_ref() == Some(&at)
+                if close.kept_elsewhere
+                    || close.sends >= OUTSTANDING_CLOSE_SENDS
+                    || close.sent_at.as_ref() == Some(&at)
                     || !self.shared_views.initialized.contains(&view.scope)
                     || self.shared_views.seeding.contains(&view.scope)
                     || self.shared_views.blocked.contains(&view.scope)
@@ -4794,14 +4810,24 @@ impl Cagents {
             .outstanding_closes
             .retain(|id, _| held.contains(id));
         for ((identity, scope, revision), pane) in sends {
-            self.shared_views
+            let change = self.outstanding_removal(&scope, &pane);
+            let close = self
+                .shared_views
                 .outstanding_closes
-                .insert(pane.id, Some((identity, scope.clone(), revision)));
-            let Some(change) = self.outstanding_removal(&scope, &pane) else {
+                .entry(pane.id)
+                .or_default();
+            let Some(change) = change else {
+                close.kept_elsewhere = true;
                 tracing::info!(card = %pane.id, ?scope, "a pane closed here changed in another client; it stays open there");
                 continue;
             };
-            tracing::debug!(card = %pane.id, ?scope, "sending again the removal of a pane closed here");
+            close.sent_at = Some((identity, scope.clone(), revision));
+            close.sends += 1;
+            if close.sends == OUTSTANDING_CLOSE_SENDS {
+                tracing::warn!(card = %pane.id, ?scope, "the removal of a pane closed here is sent a last time on this connection");
+            } else {
+                tracing::debug!(card = %pane.id, ?scope, "sending again the removal of a pane closed here");
+            }
             let operation = uuid::Uuid::new_v4();
             self.shared_views
                 .pending

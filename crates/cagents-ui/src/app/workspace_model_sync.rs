@@ -1727,8 +1727,8 @@ impl Cagents {
                 self.shared_views.closed.extend(closed);
                 // A new connection is a new chance for each removal of a pane
                 // closed here that the registry still lists.
-                for attempt in self.shared_views.outstanding_closes.values_mut() {
-                    *attempt = None;
+                for close in self.shared_views.outstanding_closes.values_mut() {
+                    *close = Default::default();
                 }
                 let closed = self.apply_closed_project_tombstones();
                 let reconciled = self.reconcile_workspace_model();

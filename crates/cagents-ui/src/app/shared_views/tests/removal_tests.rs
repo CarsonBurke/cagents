@@ -791,6 +791,41 @@ fn a_refused_close_keeps_the_pane_closed_and_sends_its_removal_again() {
             "{name}: a changed view is a new chance to retire the pane"
         );
         assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
+
+        // A registry that keeps refusing while the view keeps changing gets
+        // a few sends per connection, not one for every revision.
+        let mut sends = 2;
+        let mut last = resent_close(&app, original.id, resent).unwrap().0;
+        loop {
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+                scope: scope.clone(),
+                operation: last,
+                error: "fixture refusal".into(),
+            }));
+            let held = app
+                .workspace_model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
+            held.revision += 1;
+            drop(app.reconcile_shared_views());
+            match resent_close(&app, original.id, last) {
+                Some((operation, _)) => {
+                    sends += 1;
+                    last = operation;
+                    assert!(sends <= 10, "{name}: the removal is sent without end");
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            sends,
+            super::super::OUTSTANDING_CLOSE_SENDS,
+            "{name}: sends per connection"
+        );
+        assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
+        assert_eq!(notices(&app), Vec::<String>::new(), "{name}");
     }
 }
 

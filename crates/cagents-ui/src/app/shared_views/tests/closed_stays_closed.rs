@@ -13,11 +13,22 @@ const WAIT: Duration = Duration::from_secs(5);
 /// draft stays closed, its removal is sent again, and a new chat's first
 /// message is saved and started. Before, the view reopened the closed card,
 /// storage refused it, and every first message failed on that refusal.
+///
+/// The registry may also hold an older copy of the draft, when a change to
+/// its options was lost to the same trouble. That is still this window's
+/// draft, not another client's: it is removed again without a notice.
 #[test]
 fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
-    for refusal in [
-        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT,
-        "The pane change waited too long for the daemon to be resent",
+    for (refusal, older) in [
+        (
+            crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT,
+            false,
+        ),
+        (
+            "The pane change waited too long for the daemon to be resent",
+            false,
+        ),
+        (crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT, true),
     ] {
         let (mut app, channel, card, target, receiver) = unpublished_default_chat();
         let scope = Scope::Channel(channel);
@@ -67,7 +78,18 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
         // The Insert lands; the Close does not.
         let mut accepted = View::empty(channel);
         accepted.revision = 1;
-        accepted.panes.push(pane.clone());
+        let mut held = pane.clone();
+        if older {
+            let CardKind::Chat(session) = &mut held.kind else {
+                panic!("a chat pane")
+            };
+            session
+                .launch
+                .recipe
+                .arguments
+                .push("--option-before-the-lost-edit".into());
+        }
+        accepted.panes.push(held);
         app.workspace_model.views = vec![accepted];
         app.acknowledge_view_edit(scope.clone(), Some(insert));
         drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
@@ -84,6 +106,16 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
         );
         assert!(!app.workspace.order().any(|id| id == card), "{refusal}");
         assert!(!app.cards.contains_key(&card), "{refusal}");
+        let told: Vec<_> = app
+            .status
+            .iter()
+            .chain(app.notices.recent().map(|entry| &entry.notice))
+            .map(|notice| notice.message.to_string())
+            .collect();
+        assert!(
+            told.is_empty(),
+            "{refusal}: nothing to tell when the removal is sent again: {told:?}"
+        );
         assert!(
             app.shared_views.pending.iter().any(|(operation, _, change)| {
                 *operation != close
@@ -190,7 +222,9 @@ fn a_pane_storage_refuses_does_not_stop_another_chat_starting() {
     };
     let message = app.draft_start_save_failure(fresh, &refused);
     assert!(message.contains("\u{201c}Stuck draft\u{201d}"), "{message}");
-    assert!(message.contains("cannot be resurrected"), "{message}");
+    assert!(message.contains("Close or change"), "{message}");
+    // The storage rule is for diagnostics, not the reader.
+    assert!(!message.contains("cannot be resurrected"), "{message}");
     assert!(!message.contains("save notice"), "{message}");
     let own = crate::session::PaneSaveRefusal::Refused {
         pane: Some(fresh),

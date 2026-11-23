@@ -12188,11 +12188,23 @@ impl Cagents {
                     receipt
                         .recv_timeout(Duration::from_secs(30))
                         .map_err(|error| {
-                            PaneSaveRefusal::Unsaved(format!("the save did not complete: {error}"))
+                            PaneSaveRefusal::Unsaved(match error {
+                                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                                    "the save had not finished after 30 seconds. Send again to retry."
+                                }
+                                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                                    "the save stopped before it finished. Send again to retry."
+                                }
+                            }
+                            .into())
                         })?
                 })
                 .await
-                .map_err(|_| PaneSaveRefusal::Unsaved("the session save worker stopped".into()))
+                .map_err(|_| {
+                    PaneSaveRefusal::Unsaved(
+                        "the save stopped before it finished. Send again to retry.".into(),
+                    )
+                })
                 .and_then(|r| r),
                 Err(error) => Err(error),
             };
@@ -12200,9 +12212,10 @@ impl Cagents {
         })
     }
 
-    /// What a draft says when its first save failed: why, naming the pane
-    /// storage refused when that was another one, so the reader knows what
-    /// to change or close before sending again.
+    /// What a draft says when its first save failed: why, in terms of what
+    /// the reader can do. When storage refused another pane, that pane is
+    /// named, since changing or closing it is what lets this draft save. The
+    /// storage rule itself is for diagnostics: the session writer logs it.
     pub(super) fn draft_start_save_failure(
         &self,
         card: CardId,
@@ -12220,27 +12233,30 @@ impl Cagents {
                     .unwrap_or_default();
                 format!("{LEAD} {reason}")
             }
-            PaneSaveRefusal::Refused {
-                pane,
-                category,
-                rule,
-            } => {
-                let what = match pane {
-                    Some(pane) if *pane == card => "this pane".to_owned(),
-                    Some(pane) => match self
-                        .card_state(*pane)
-                        .map(|state| self.card_display_title(state))
-                        .filter(|title| !title.is_empty())
-                    {
-                        Some(title) => format!("the pane \u{201c}{title}\u{201d}"),
-                        None => format!("pane {pane}"),
-                    },
-                    None => "the window's panes".to_owned(),
-                };
-                format!(
-                    "{LEAD} Storage refused {what}: {} (rule: {rule}). Change or close {what}, then send again.",
-                    category.label()
-                )
+            PaneSaveRefusal::Refused { pane, category, .. } => {
+                let label = category.label();
+                match pane {
+                    Some(pane) if *pane == card => format!(
+                        "{LEAD} Storage refused this pane's changes ({label}). Change the draft or its options, then send again."
+                    ),
+                    Some(pane) => {
+                        let what = self
+                            .card_state(*pane)
+                            .map(|state| self.card_display_title(state))
+                            .filter(|title| !title.is_empty())
+                            .map_or_else(
+                                || "another pane".to_owned(),
+                                |title| format!("the pane \u{201c}{title}\u{201d}"),
+                            );
+                        format!(
+                            "{LEAD} Storage refused changes to {what} ({label}). Close or change {what}, then send again."
+                        )
+                    }
+                    None => format!(
+                        "{LEAD} Storage refused the window's saved state ({label}). {}",
+                        category.guidance()
+                    ),
+                }
             }
         }
     }
