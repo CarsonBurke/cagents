@@ -547,7 +547,7 @@ fn poll_proposal(
     match client.automation_until(
         authority,
         Request::Proposal { id },
-        deadline.min(Instant::now() + IO_TIMEOUT),
+        deadline.min(Instant::now() + io_timeout()),
     ) {
         Ok(reply) => Ok(Some(reply)),
         Err(error) if is_timeout_error(&error) && Instant::now() >= deadline => Ok(None),

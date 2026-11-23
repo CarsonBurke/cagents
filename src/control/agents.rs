@@ -2968,6 +2968,7 @@ mod tests {
                     );
                 });
                 let caller = scope.spawn(move || {
+                    let _budget = ordinary_budget::quick();
                     let mut client = ControlClient::from_stream(client_stream).unwrap();
                     let before = client.stream.read_timeout().unwrap();
                     let read = client.agent(
@@ -2983,7 +2984,7 @@ mod tests {
                 // This is a fixture guard, not the client's reply budget.
                 // An accidentally extended budget must fail observation,
                 // rather than wait forever or accept a cleanup-induced EOF.
-                let guard = IO_TIMEOUT + Duration::from_secs(5);
+                let guard = ordinary_budget::QUICK + Duration::from_secs(5);
                 let seen = request_seen.recv_timeout(guard);
                 let observed = seen.is_ok().then(|| result.recv_timeout(guard));
                 drop(cleanup);
@@ -3001,10 +3002,10 @@ mod tests {
                 "console reply exceeded the fixture guard for {command:?}: {observed:?}"
             );
             let (read, before, after) = observed.unwrap();
-            assert_eq!(before, Some(IO_TIMEOUT), "before {command:?}");
-            assert_eq!(after, Some(IO_TIMEOUT), "after {command:?}");
+            assert_eq!(before, Some(ordinary_budget::QUICK), "before {command:?}");
+            assert_eq!(after, Some(ordinary_budget::QUICK), "after {command:?}");
             assert!(
-                matches!(&read, Err(ControlError::ReplyTimeout { timeout, .. }) if *timeout == IO_TIMEOUT),
+                matches!(&read, Err(ControlError::ReplyTimeout { timeout, .. }) if *timeout == ordinary_budget::QUICK),
                 "a stalled console command must keep the ordinary timeout: {command:?}: {read:?}"
             );
         }
@@ -3012,6 +3013,7 @@ mod tests {
 
     fn slow_durable_submission(console: bool) {
         use crate::agent_execution::ConsoleCommand;
+        let _budget = ordinary_budget::quick();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let (_, reply) = running();
         let (agent, run) = status_reply(reply).unwrap();
@@ -3045,7 +3047,7 @@ mod tests {
                 ClientRequest::Agent { operation, .. } if operation == expected));
             // The acceptance's commit waits on a loaded disk for longer than
             // an ordinary reply may take.
-            thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+            thread::sleep(ordinary_budget::QUICK + Duration::from_millis(500));
             let sent = write_frame(
                 &mut server_stream,
                 &ServerEnvelope {
@@ -3082,7 +3084,10 @@ mod tests {
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         let reply = client.agent(Authority::default(), operation);
         if reply.is_ok() {
-            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+            assert_eq!(
+                client.stream.read_timeout().unwrap(),
+                Some(ordinary_budget::QUICK)
+            );
             let read = client
                 .agent(
                     Authority::default(),
@@ -3103,7 +3108,7 @@ mod tests {
         drop(client);
         server.join().unwrap();
         assert_eq!(reply.unwrap(), Reply::Accepted(accepted));
-        assert_eq!(timeout, Some(IO_TIMEOUT));
+        assert_eq!(timeout, Some(ordinary_budget::QUICK));
     }
 
     #[test]
