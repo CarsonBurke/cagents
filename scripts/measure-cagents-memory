@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Report cagents processes' RSS/PSS from /proc/PID/smaps_rollup.
 
 Use --environ to select one private development or fixture runtime without

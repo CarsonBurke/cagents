@@ -878,13 +878,13 @@ memory from `smaps_rollup` for the fixture daemon, actors and providers before
 counting actor wakeups. Run it at both one and twenty actors for a memory
 comparison. It removes every process and directory it created on exit. Run it
 from a genuine user shell, such as `ssh fw16`; it refuses agent authority.
+Set `CAGENTS_IDLE_ACTOR_FRAME_BYTES=2097152` when comparing a fix for idle
+protocol-frame retention: the fixture emits one 2 MiB tool result per actor,
+then waits for every actor to settle before the census.
 
 `scripts/measure-cagents-memory --environ NAME=VALUE` is the same read-only
 RSS/PSS census for a native development session, including its UI. Pass the
 session's private runtime directory so it cannot include another session.
-Set `CAGENTS_IDLE_ACTOR_FRAME_BYTES=2097152` when comparing a fix for idle
-protocol-frame retention: the fixture emits one 2 MiB tool result per actor,
-then waits for every actor to settle before the census.
 
 Reference on fw16 (Ryzen 7 7840HS, 16 threads), `dev-runtime`, 45 idle actors,
 60 s, `0b8b9aace` (before) against `6e62e851a` (after). The host was shared

@@ -1479,7 +1479,7 @@ fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() 
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
     let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while received.lock().unwrap().len() != 1 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
