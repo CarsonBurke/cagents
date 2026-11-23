@@ -753,7 +753,10 @@ impl ExecutionEvidence {
             retired: store.and_then(|path| read_retired_owners(&path)),
             processes: "/proc".into(),
             exec_settle: EXEC_SETTLE,
-            starting_patience: starting_patience(),
+            // Inspection proves every pane within one shared deadline; a
+            // pane still starting is reported unchecked at once rather than
+            // spending that deadline on it.
+            starting_patience: Duration::ZERO,
             deadline: Some(deadline),
         }
     }
@@ -1092,15 +1095,14 @@ fn starting_patience() -> Duration {
 }
 
 /// Let this test process's Codex proofs wait out processes still starting
-/// for as long as a test waits for anything ([`crate::test_timing::EVENTUALLY`]).
-/// The proof reads every process of the user on the host, so a test that
-/// shares the host with others would otherwise depend on how quickly their
-/// processes finish `execve`. Only for a process that runs one test.
+/// for far longer than a correct host needs. The proof reads every process
+/// of the user on the host, so a test that shares the host with others would
+/// otherwise depend on how quickly their processes finish `execve`. Only for
+/// an isolated rerun of one test; it stays within that rerun's own limit, so
+/// a process that never settles still reports its refusal.
 #[cfg(test)]
 pub(super) fn wait_out_starting_processes_for_test() {
-    STARTING_PATIENCE_FOR_TEST
-        .set(crate::test_timing::EVENTUALLY)
-        .unwrap();
+    let _ = STARTING_PATIENCE_FOR_TEST.set(Duration::from_secs(15));
 }
 
 fn saved_codex_execution(execution: CodexExecution) -> SavedExecution {
