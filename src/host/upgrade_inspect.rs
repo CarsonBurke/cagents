@@ -929,27 +929,9 @@ impl ExecutionEvidence {
         saved_codex_execution(self.codex_execution(source))
     }
 
-    /// A process that has not published its arguments yet is usually one
-    /// in `execve`, which a loaded host can stretch past one process's
-    /// settle. Look again for a short while before reporting it; any other
-    /// answer returns at once.
     fn codex_execution(&self, source: &Session) -> CodexExecution {
-        let patience = Instant::now() + self.starting_patience;
-        loop {
-            let execution = self
-                .inspect_codex_execution(source)
-                .unwrap_or_else(|reason| CodexExecution::Unproved { reason });
-            let starting = matches!(
-                &execution,
-                CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING
-            );
-            let now = Instant::now();
-            if !starting || now >= patience || self.deadline.is_some_and(|deadline| now >= deadline)
-            {
-                return execution;
-            }
-            std::thread::sleep(STARTING_RETRY);
-        }
+        self.inspect_codex_execution(source)
+            .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
     }
 
     fn inspect_codex_execution(&self, source: &Session) -> Result<CodexExecution, String> {
@@ -1060,6 +1042,10 @@ impl ExecutionEvidence {
             source.launch.session_id.as_deref(),
             &sockets,
             self.exec_settle,
+            // A process that has not published its arguments yet is usually
+            // one in `execve`, which a loaded host can stretch past one
+            // process's settle.
+            self.starting_patience,
             self.deadline,
         );
         if let Some(deadline) = self.deadline {
@@ -1078,7 +1064,7 @@ impl ExecutionEvidence {
 
 pub(super) const CODEX_PROCESS_STARTING: &str = "A process has not published its arguments yet";
 
-/// How long a Codex proof looks again at a process still starting.
+/// How long a Codex proof looks again at processes still starting.
 const CODEX_STARTING_PATIENCE: Duration = Duration::from_millis(1500);
 /// The pause between those looks.
 const STARTING_RETRY: Duration = Duration::from_millis(20);
@@ -1214,18 +1200,37 @@ pub(super) fn execution_end(
 /// shows the arguments its leader no longer does (see [`threads`]). One that
 /// still shows none is read again for up to `settle`; a published executable
 /// keeps it unproved, while no executable or argv excludes a kernel thread.
+///
+/// Processes still unproved after the whole table has been read are looked
+/// at again, alone, for up to `patience`. One that has exited, or whose ID
+/// now names a later process, is settled: it could write nothing. The table
+/// is not read again, so processes that keep starting elsewhere on the host
+/// cannot keep the answer from settling, and each look costs only the
+/// processes it waits on.
 fn codex_listener_survives(
     processes: &Path,
     pane: crate::model::TerminalId,
     conversation: Option<&str>,
     sockets: &[&Path],
     settle: Duration,
+    patience: Duration,
     inspection_deadline: Option<Instant>,
 ) -> Result<CodexExecution, String> {
-    use std::os::unix::ffi::OsStrExt;
+    let patience = Instant::now() + patience;
     let marker = format!("cagents-codex-{pane}");
-    let marker = marker.as_bytes();
-    let uid = crate::daemon::current_uid().to_string();
+    let process = CodexProcessJudge {
+        marker: marker.as_bytes(),
+        conversation,
+        uid: crate::daemon::current_uid().to_string(),
+    };
+    let running = |pid: u32| {
+        Ok(CodexExecution::Running {
+            pid: Some(pid),
+            socket: sockets
+                .first()
+                .map_or_else(PathBuf::new, |socket| socket.to_path_buf()),
+        })
+    };
     // Kernel threads never publish argv or an executable. Retry empty argv
     // within the same settle bound as exec, then exclude only processes with
     // neither argv nor an executable. A readable exe with unpublished argv
@@ -1238,7 +1243,10 @@ fn codex_listener_survives(
         });
         settled_arguments(path, remaining)
     };
+    // The first reason the table could not be read whole, apart from
+    // processes still starting, which `starting` holds instead.
     let mut unreadable = None;
+    let mut starting = Vec::new();
     let entries = std::fs::read_dir(processes)
         .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
     for entry in entries {
@@ -1252,75 +1260,214 @@ fn codex_listener_survives(
                 continue;
             }
         };
-        if entry
+        let Some(pid) = entry
             .file_name()
             .to_str()
-            .is_none_or(|name| name.parse::<u32>().is_err())
-        {
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
             continue;
-        }
+        };
         let path = entry.path();
+        match process.judge(&path, arguments) {
+            Ok(Judgement::Unrelated) => {}
+            Ok(Judgement::Writer) => return running(pid),
+            Ok(Judgement::Starting) => {
+                // An identity it cannot read only stops it settling by
+                // being replaced.
+                let start = match process_start(&path) {
+                    Started::At(start) => Some(start),
+                    Started::Gone => continue,
+                    Started::Unknown => None,
+                };
+                starting.push(StartingProcess { pid, path, start });
+            }
+            Err(reason) => {
+                unreadable.get_or_insert(reason);
+            }
+        }
+    }
+    let bound = || {
+        bound_socket(processes, sockets)
+            .map(|socket| socket.map(|socket| CodexExecution::Running { pid: None, socket }))
+            .map_err(|error| format!("Cannot inspect bound sockets: {error}"))
+    };
+    if starting.is_empty() {
+        return match bound() {
+            Ok(Some(running)) => Ok(running),
+            Ok(None) => unreadable.map_or(Ok(CodexExecution::Ended), Err),
+            Err(reason) => Err(unreadable.unwrap_or(reason)),
+        };
+    }
+    // A process still starting outranks a socket table that cannot be read,
+    // which is read again below.
+    if let Ok(Some(running)) = bound() {
+        return Ok(running);
+    }
+    let settled = match process.look_again(starting, patience, inspection_deadline, &mut unreadable)
+    {
+        LookedAgain::Writer(pid) => return running(pid),
+        LookedAgain::Settled => true,
+        LookedAgain::Starting => false,
+    };
+    // A process that finished starting may have bound a listener since the
+    // table was read.
+    match bound() {
+        Ok(Some(running)) => Ok(running),
+        _ if !settled => Err(CODEX_PROCESS_STARTING.into()),
+        Ok(None) => unreadable.map_or(Ok(CodexExecution::Ended), Err),
+        Err(reason) => Err(unreadable.unwrap_or(reason)),
+    }
+}
+
+/// What one process of the table says of a Codex pane's execution.
+enum Judgement {
+    /// Another user's, a kernel thread, ended, or not a writer of the pane.
+    Unrelated,
+    /// A writer of the pane: its executable and arguments name it.
+    Writer,
+    /// Runnable with an executable, but no arguments yet, as in `execve`.
+    Starting,
+}
+
+/// A process found starting.
+struct StartingProcess {
+    pid: u32,
+    /// Its `/proc` entry.
+    path: PathBuf,
+    /// When it started, unless that could not be read.
+    start: Option<u64>,
+}
+
+/// What looking again at the processes found starting told.
+#[derive(Debug, PartialEq, Eq)]
+enum LookedAgain {
+    /// This one of them is a writer of the pane.
+    Writer(u32),
+    /// None of them is; each published other arguments, exited or was
+    /// replaced by a later process.
+    Settled,
+    /// One was still starting when patience ran out.
+    Starting,
+}
+
+/// Judges processes for [`codex_listener_survives`].
+struct CodexProcessJudge<'a> {
+    marker: &'a [u8],
+    conversation: Option<&'a str>,
+    uid: String,
+}
+
+impl CodexProcessJudge<'_> {
+    fn judge(
+        &self,
+        path: &Path,
+        arguments: impl FnOnce(&Path) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<Judgement, String> {
         // The effective user, not the owner of `/proc/<pid>`, which becomes
         // root for a process that made itself non-dumpable.
         let status = match std::fs::read_to_string(path.join("status")) {
             Ok(status) => status,
-            Err(error) if inaccessible_process(&error) => continue,
-            Err(error) => {
-                unreadable.get_or_insert_with(|| format!("Cannot inspect process status: {error}"));
-                continue;
-            }
+            Err(error) if inaccessible_process(&error) => return Ok(Judgement::Unrelated),
+            Err(error) => return Err(format!("Cannot inspect process status: {error}")),
         };
         let effective = status
             .lines()
             .find_map(|line| line.strip_prefix("Uid:"))
-            .and_then(|ids| ids.split_whitespace().nth(1));
-        match effective {
-            Some(effective) if effective != uid => continue,
-            Some(_) => {}
-            None => {
-                unreadable.get_or_insert_with(|| "Cannot read a process's user".into());
-                continue;
-            }
+            .and_then(|ids| ids.split_whitespace().nth(1))
+            .ok_or("Cannot read a process's user")?;
+        if effective != self.uid {
+            return Ok(Judgement::Unrelated);
         }
-        let argv = match arguments(&path) {
-            Ok(argv) => argv,
-            Err(reason) => {
-                if reason == CODEX_PROCESS_STARTING {
-                    unreadable = Some(reason);
-                } else {
-                    unreadable.get_or_insert(reason);
-                }
-                continue;
-            }
+        let argv = match arguments(path) {
+            Ok(Some(argv)) => argv,
+            Ok(None) => return Ok(Judgement::Unrelated),
+            Err(reason) if reason == CODEX_PROCESS_STARTING => return Ok(Judgement::Starting),
+            Err(reason) => return Err(reason),
         };
-        let Some(argv) = argv else { continue };
         // Identify the executable as well as its arguments: argv[0] can be
         // rewritten, and a command merely mentioning a path is no writer.
-        let executable = match process_executable(&path) {
-            Ok(Some(executable)) => executable,
-            Ok(None) => continue,
-            Err(reason) => {
-                unreadable.get_or_insert(reason);
-                continue;
-            }
+        let Some(executable) = process_executable(path)? else {
+            return Ok(Judgement::Unrelated);
         };
-        if codex_writer_arguments(&executable, &argv, marker, conversation) {
-            return Ok(CodexExecution::Running {
-                pid: entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse().ok()),
-                socket: sockets
-                    .first()
-                    .map_or_else(PathBuf::new, |socket| socket.to_path_buf()),
-            });
-        }
+        Ok(
+            if codex_writer_arguments(&executable, &argv, self.marker, self.conversation) {
+                Judgement::Writer
+            } else {
+                Judgement::Unrelated
+            },
+        )
     }
-    let bound = std::fs::read(processes.join("net/unix")).map_err(|error| {
-        unreadable
-            .clone()
-            .unwrap_or_else(|| format!("Cannot inspect bound sockets: {error}"))
-    })?;
+
+    /// Looks again at only the processes found `starting` until each has
+    /// settled, for up to `patience`. One that has exited, or whose ID now
+    /// names a later process, is settled. A reason one could not be read
+    /// goes to `unreadable`, and settles it as a full read of the table would.
+    fn look_again(
+        &self,
+        mut starting: Vec<StartingProcess>,
+        patience: Instant,
+        inspection_deadline: Option<Instant>,
+        unreadable: &mut Option<String>,
+    ) -> LookedAgain {
+        while !starting.is_empty() {
+            let now = Instant::now();
+            if now >= patience || inspection_deadline.is_some_and(|deadline| now >= deadline) {
+                return LookedAgain::Starting;
+            }
+            std::thread::sleep(STARTING_RETRY);
+            let mut still = Vec::with_capacity(starting.len());
+            for process in starting {
+                // One look each: the table's read already waited out a settle.
+                match self.judge(&process.path, |path| {
+                    settled_arguments(path, Duration::ZERO)
+                }) {
+                    Ok(Judgement::Writer) => return LookedAgain::Writer(process.pid),
+                    Ok(Judgement::Unrelated) => {}
+                    Ok(Judgement::Starting) => {
+                        // Read after the judgement: what was judged under a
+                        // changed identity was a later process, which did not
+                        // exist when the table was read.
+                        let replaced = match process_start(&process.path) {
+                            Started::At(now) => process.start.is_some_and(|start| start != now),
+                            Started::Gone => true,
+                            Started::Unknown => false,
+                        };
+                        if !replaced {
+                            still.push(process);
+                        }
+                    }
+                    Err(reason) => {
+                        unreadable.get_or_insert(reason);
+                    }
+                }
+            }
+            starting = still;
+        }
+        LookedAgain::Settled
+    }
+}
+
+/// When a process started, which names it across `execve` and tells it
+/// from a later process given the same ID.
+enum Started {
+    At(u64),
+    Gone,
+    Unknown,
+}
+
+fn process_start(path: &Path) -> Started {
+    match std::fs::read(path.join("stat")) {
+        Ok(stat) => crate::model::agent_recovery::process_identity(&stat)
+            .map_or(Started::Unknown, |(_, start)| Started::At(start)),
+        Err(error) if gone(&error) => Started::Gone,
+        Err(_) => Started::Unknown,
+    }
+}
+
+/// The first of `sockets` still bound, by `/proc/net/unix`.
+fn bound_socket(processes: &Path, sockets: &[&Path]) -> io::Result<Option<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+    let bound = std::fs::read(processes.join("net/unix"))?;
     // Paths may contain spaces: match the complete suffix after the columns.
     for line in bound.split(|byte| *byte == b'\n').skip(1) {
         for socket in sockets {
@@ -1351,14 +1498,11 @@ fn codex_listener_survives(
                             .unwrap_or(false)
                     });
             if matches || alias {
-                return Ok(CodexExecution::Running {
-                    pid: None,
-                    socket: socket.to_path_buf(),
-                });
+                return Ok(Some(socket.to_path_buf()));
             }
         }
     }
-    unreadable.map_or(Ok(CodexExecution::Ended), Err)
+    Ok(None)
 }
 
 /// This user's processes started to serve a Codex pane's listener, by the
@@ -2941,6 +3085,7 @@ mod tests {
                 card.launch.session_id.as_deref(),
                 &[listener.as_path(), control.as_path()],
                 EXEC_SETTLE,
+                Duration::ZERO,
                 None,
             ) {
                 Ok(CodexExecution::Ended) => absent += 1,
@@ -3000,6 +3145,7 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink("/usr/bin/codex", process.join("exe")).unwrap();
         std::fs::write(process.join("cmdline"), b"").unwrap();
+        std::fs::write(process.join("stat"), fake_stat(4242, 1)).unwrap();
         std::fs::write(thread.join("cmdline"), b"").unwrap();
         std::fs::write(
             thread.join("stat"),
@@ -3328,6 +3474,7 @@ mod tests {
                 None,
                 &[&socket],
                 Duration::ZERO,
+                Duration::ZERO,
                 None
             )
             .unwrap(),
@@ -3343,6 +3490,7 @@ mod tests {
                 pane,
                 None,
                 &[&socket],
+                Duration::ZERO,
                 Duration::ZERO,
                 None
             )
@@ -3377,6 +3525,7 @@ mod tests {
         std::fs::write(process.join("cmdline"), b"").unwrap();
         std::fs::write(thread.join("cmdline"), b"").unwrap();
         std::fs::write(thread.join("stat"), "4242 (kernel) R 1 4242 4242 0 0 0 0").unwrap();
+        std::fs::write(process.join("stat"), fake_stat(4242, 7)).unwrap();
         std::fs::write(thread.join("status"), "SigPnd: 0\nShdPnd: 0\n").unwrap();
         let table = ExecutionEvidence {
             processes: processes.path().into(),
@@ -3415,30 +3564,55 @@ mod tests {
         .unwrap();
     }
 
+    /// A `/proc/<pid>/stat` naming a runnable process that started at `start`.
+    fn fake_stat(pid: u32, start: u64) -> String {
+        format!("{pid} (sh) R 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0")
+    }
+
+    /// Adds to a fake process table a process of this user in `execve`:
+    /// runnable, with an executable, and no arguments yet. It appears whole,
+    /// as a real one does.
+    fn starting_process(processes: &Path, pid: u32) {
+        let staging = processes.join(format!(".{pid}"));
+        let thread = staging.join(format!("task/{pid}"));
+        std::fs::create_dir_all(&thread).unwrap();
+        let uid = crate::daemon::current_uid();
+        std::fs::write(
+            staging.join("status"),
+            format!("Uid: {uid} {uid} {uid} {uid}\n"),
+        )
+        .unwrap();
+        std::fs::write(staging.join("stat"), fake_stat(pid, u64::from(pid))).unwrap();
+        std::fs::write(staging.join("cmdline"), b"").unwrap();
+        std::fs::write(thread.join("cmdline"), b"").unwrap();
+        std::fs::write(thread.join("stat"), fake_stat(pid, u64::from(pid))).unwrap();
+        std::fs::write(thread.join("status"), "SigPnd: 0\nShdPnd: 0\n").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/sh", staging.join("exe")).unwrap();
+        std::fs::rename(staging, processes.join(pid.to_string())).unwrap();
+    }
+
+    /// Lets a fake process finish `execve`, publishing unrelated arguments
+    /// in one step.
+    fn publish(processes: &Path, pid: u32) {
+        let process = processes.join(pid.to_string());
+        std::fs::write(process.join(".cmdline"), b"sh\0-c\0true\0").unwrap();
+        std::fs::rename(process.join(".cmdline"), process.join("cmdline")).unwrap();
+    }
+
+    fn fake_table() -> tempfile::TempDir {
+        let processes = tempfile::tempdir_in("/var/tmp").unwrap();
+        std::fs::create_dir(processes.path().join("net")).unwrap();
+        std::fs::write(processes.path().join("net/unix"), "header\n").unwrap();
+        processes
+    }
+
     #[test]
     fn codex_proof_waits_for_a_process_that_publishes_its_arguments() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let [card, _] = codex_cards(root.path());
-        let processes = tempfile::tempdir_in("/var/tmp").unwrap();
-        let process = processes.path().join("4242");
-        let thread = process.join("task/4242");
-        std::fs::create_dir_all(&thread).unwrap();
-        std::fs::create_dir(processes.path().join("net")).unwrap();
-        std::fs::write(processes.path().join("net/unix"), "header\n").unwrap();
-        let uid = crate::daemon::current_uid();
-        std::fs::write(
-            process.join("status"),
-            format!("Uid: {uid} {uid} {uid} {uid}\n"),
-        )
-        .unwrap();
-        // A process in `execve`: runnable, with an executable, and no
-        // arguments yet.
-        std::fs::write(process.join("cmdline"), b"").unwrap();
-        std::fs::write(thread.join("cmdline"), b"").unwrap();
-        std::fs::write(thread.join("stat"), "4242 (sh) R 1 4242 4242 0 0 0 0").unwrap();
-        std::fs::write(thread.join("status"), "SigPnd: 0\nShdPnd: 0\n").unwrap();
-        std::os::unix::fs::symlink("/usr/bin/sh", process.join("exe")).unwrap();
+        let processes = fake_table();
+        starting_process(processes.path(), 4242);
         let impatient = ExecutionEvidence {
             processes: processes.path().into(),
             exec_settle: Duration::ZERO,
@@ -3451,11 +3625,11 @@ mod tests {
         // It publishes unrelated arguments a moment later. A proof with
         // patience waits for that and finds nothing of the pane.
         let (published, publishing) = crossbeam_channel::bounded(1);
-        let cmdline = process.join("cmdline");
+        let table = processes.path().to_path_buf();
         let publisher = std::thread::spawn(move || {
             publishing.recv().unwrap();
             std::thread::sleep(Duration::from_millis(100));
-            std::fs::write(cmdline, b"sh\0-c\0true\0").unwrap();
+            publish(&table, 4242);
         });
         let patient = ExecutionEvidence {
             starting_patience: crate::test_timing::EVENTUALLY,
@@ -3464,6 +3638,170 @@ mod tests {
         published.send(()).unwrap();
         assert_eq!(patient.codex_execution(&card), CodexExecution::Ended);
         publisher.join().unwrap();
+    }
+
+    /// A busy host always has some process in `execve`. The proof waits
+    /// only on those it found starting, so processes that start after it
+    /// read the table cannot keep it from settling.
+    #[test]
+    fn codex_proof_settles_while_other_processes_keep_starting() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let processes = fake_table();
+        starting_process(processes.path(), 4242);
+        let evidence = ExecutionEvidence {
+            processes: processes.path().into(),
+            exec_settle: Duration::ZERO,
+            starting_patience: crate::test_timing::EVENTUALLY,
+            ..evidence(holders.path(), Vec::new())
+        };
+        let (stop, stopped) = crossbeam_channel::bounded::<()>(0);
+        let table = processes.path().to_path_buf();
+        let churn = std::thread::spawn(move || {
+            // Each process publishes a moment after it appears, and by then
+            // another has always just appeared.
+            let mut pending = std::collections::VecDeque::from([4242]);
+            for pid in 5000.. {
+                match stopped.recv_timeout(Duration::from_millis(10)) {
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    _ => return pid - 5000,
+                }
+                starting_process(&table, pid);
+                pending.push_back(pid);
+                if pending.len() > 5 {
+                    publish(&table, pending.pop_front().unwrap());
+                }
+            }
+            unreachable!()
+        });
+        assert_eq!(evidence.codex_execution(&card), CodexExecution::Ended);
+        drop(stop);
+        // 4242 published only once five more had started.
+        assert!(churn.join().unwrap() >= 5);
+    }
+
+    fn starting_in(processes: &Path, pids: &[u32]) -> Vec<StartingProcess> {
+        pids.iter()
+            .map(|&pid| StartingProcess {
+                pid,
+                path: processes.join(pid.to_string()),
+                start: Some(u64::from(pid)),
+            })
+            .collect()
+    }
+
+    fn unrelated_judge() -> CodexProcessJudge<'static> {
+        CodexProcessJudge {
+            marker: b"cagents-codex-pane",
+            conversation: None,
+            uid: crate::daemon::current_uid().to_string(),
+        }
+    }
+
+    #[test]
+    fn codex_proof_settles_a_starting_process_that_exits_or_is_replaced() {
+        let processes = fake_table();
+        starting_process(processes.path(), 4242);
+        starting_process(processes.path(), 4243);
+        let judge = unrelated_judge();
+        let mut unreadable = None;
+        // Looked at again for a moment, they are still starting.
+        assert_eq!(
+            judge.look_again(
+                starting_in(processes.path(), &[4242, 4243]),
+                Instant::now() + Duration::from_millis(500),
+                None,
+                &mut unreadable
+            ),
+            LookedAgain::Starting
+        );
+        // 4242 exits, and a later process, itself starting, takes 4243's ID.
+        std::fs::remove_dir_all(processes.path().join("4242")).unwrap();
+        let replaced = processes.path().join("4243");
+        std::fs::write(replaced.join("stat"), fake_stat(4243, 9_999)).unwrap();
+        assert_eq!(
+            judge.look_again(
+                starting_in(processes.path(), &[4242, 4243]),
+                Instant::now() + crate::test_timing::EVENTUALLY,
+                None,
+                &mut unreadable
+            ),
+            LookedAgain::Settled
+        );
+        assert_eq!(unreadable, None);
+        // One whose identity cannot be read can't be told replaced, so it
+        // stays starting.
+        std::fs::write(replaced.join("stat"), "unreadable").unwrap();
+        assert_eq!(
+            judge.look_again(
+                starting_in(processes.path(), &[4243]),
+                Instant::now() + Duration::from_millis(500),
+                None,
+                &mut unreadable
+            ),
+            LookedAgain::Starting
+        );
+    }
+
+    #[test]
+    fn codex_proof_finds_a_writer_among_the_processes_it_found_starting() {
+        let processes = fake_table();
+        starting_process(processes.path(), 4242);
+        starting_process(processes.path(), 4243);
+        let writer = processes.path().join("4243");
+        std::fs::remove_file(writer.join("exe")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/codex", writer.join("exe")).unwrap();
+        std::fs::write(
+            writer.join(".cmdline"),
+            b"codex\0--profile\0cagents-codex-pane\0",
+        )
+        .unwrap();
+        std::fs::rename(writer.join(".cmdline"), writer.join("cmdline")).unwrap();
+        let mut unreadable = None;
+        assert_eq!(
+            unrelated_judge().look_again(
+                starting_in(processes.path(), &[4242, 4243]),
+                Instant::now() + crate::test_timing::EVENTUALLY,
+                None,
+                &mut unreadable
+            ),
+            LookedAgain::Writer(4243)
+        );
+    }
+
+    /// A process still starting outranks a reason the table could not be
+    /// read; once it settles, that reason is the answer.
+    #[test]
+    fn codex_proof_reports_a_process_starting_before_other_unreadable_state() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let processes = fake_table();
+        starting_process(processes.path(), 4242);
+        // A process whose user cannot be read.
+        let unreadable = processes.path().join("4243");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::write(unreadable.join("status"), "Name:\tx\n").unwrap();
+        std::fs::remove_file(processes.path().join("net/unix")).unwrap();
+        let impatient = ExecutionEvidence {
+            processes: processes.path().into(),
+            exec_settle: Duration::ZERO,
+            ..evidence(holders.path(), Vec::new())
+        };
+        assert_eq!(
+            impatient.codex_execution(&card),
+            CodexExecution::Unproved {
+                reason: CODEX_PROCESS_STARTING.into()
+            }
+        );
+        publish(processes.path(), 4242);
+        assert_eq!(
+            impatient.codex_execution(&card),
+            CodexExecution::Unproved {
+                reason: "Cannot read a process's user".into()
+            }
+        );
     }
 
     #[test]
@@ -3662,6 +4000,7 @@ mod tests {
         std::fs::create_dir(&process).unwrap();
         std::os::unix::fs::symlink("/usr/bin/codex", process.join("exe")).unwrap();
         std::fs::write(process.join("cmdline"), b"").unwrap();
+        std::fs::write(process.join("stat"), fake_stat(4242, 1)).unwrap();
         let uid = crate::daemon::current_uid();
         let user = |uid: u32| format!("Name:\tcodex\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
         std::fs::write(process.join("status"), user(uid)).unwrap();
