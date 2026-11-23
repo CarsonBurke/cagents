@@ -812,6 +812,9 @@ struct Claude {
     /// until the first one. A task that leaves it is no longer running,
     /// whether or not its own notification arrived.
     background_level: Option<HashSet<String>>,
+    /// The live background task count last published; see
+    /// [`Self::background_tasks`].
+    published_background_tasks: usize,
     /// The call each background shell task Claude Code reported belongs to,
     /// oldest first, so the level can settle that call's row.
     command_task_calls: VecDeque<(String, String)>,
@@ -2742,11 +2745,7 @@ impl Claude {
             .filter(|task| task["ambient"].as_bool() != Some(true))
             .filter_map(|task| task["parent_task_id"].as_str())
             .collect::<HashSet<_>>();
-        let previous = self.background_level.replace(live.clone());
-        if previous.as_ref().map(HashSet::len) != Some(live.len()) {
-            step.events.push(Event::BackgroundTasks(live.len()));
-        }
-        let Some(previous) = previous else {
+        let Some(previous) = self.background_level.replace(live.clone()) else {
             return;
         };
         let mut left = previous.difference(&live).cloned().collect::<Vec<_>>();
@@ -4065,11 +4064,27 @@ impl Adapter for Claude {
             }
         }
         self.reconcile_waiting_agents(&mut step);
+        let live = self.background_tasks();
+        if live != self.published_background_tasks {
+            self.published_background_tasks = live;
+            step.events.push(Event::BackgroundTasks(live));
+        }
         Ok(step)
     }
 }
 
 impl Claude {
+    /// How many background tasks are live: Claude Code's level once it has
+    /// reported one, which is exact. Until then, the background commands and
+    /// agents this conversation saw start and not yet end, so a release that
+    /// never reports the level still counts what it started.
+    fn background_tasks(&self) -> usize {
+        match &self.background_level {
+            Some(live) => live.len(),
+            None => self.launches.len() + self.tasks.len(),
+        }
+    }
+
     fn receive_frame(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
         let parent = frame["parent_tool_use_id"]

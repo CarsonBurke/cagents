@@ -138,6 +138,10 @@ enum ActorCommand {
     IdlePrompt(String),
     CloseIfIdle {
         generation: u64,
+        /// What a granted close leaves running, decided as it is granted.
+        /// A close that decides it also refuses while the provider reports
+        /// live background tasks, which it would end.
+        detached: Option<DetachedWork>,
         closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
@@ -714,6 +718,7 @@ impl LocalHandle {
                     visible,
                     observe_next,
                     stop,
+                    detached_work: detached_work.clone(),
                     incoming,
                     wake: reader,
                     notify,
@@ -1121,9 +1126,17 @@ impl LocalHandle {
             .map_err(String::from)
     }
 
-    fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
+    fn claim_idle_close(
+        &self,
+        generation: u64,
+        detached: Option<DetachedWork>,
+    ) -> Result<bool, String> {
         let (closed, response) = crossbeam_channel::bounded(1);
-        self.ownership_command(ActorCommand::CloseIfIdle { generation, closed })?;
+        self.ownership_command(ActorCommand::CloseIfIdle {
+            generation,
+            detached,
+            closed,
+        })?;
         response
             .try_recv()
             .map_err(|error| format!("Provider idle close was not acknowledged: {error}"))
@@ -1133,7 +1146,7 @@ impl LocalHandle {
     /// occurred; the caller may take a new snapshot and retry its exact owner.
     /// Nonidle state and uncertain acknowledgement remain errors.
     pub(crate) fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
-        if !self.claim_idle_close(generation)? {
+        if !self.claim_idle_close(generation, None)? {
             return Ok(false);
         }
         self.close()?;
@@ -1141,22 +1154,20 @@ impl LocalHandle {
     }
 
     /// As [`Self::try_close_if_idle`], with `detached` deciding what the
-    /// provider leaves running. The decision precedes the claim, since
-    /// teardown may begin as soon as the actor grants it. Unless the actor
-    /// granted it, which is when it set `stop`, the earlier decision comes
-    /// back, so a later close is decided as it would have been: after a
-    /// changed generation, a busy actor's refusal or a lost acknowledgement.
+    /// provider leaves running, and refused while it reports live background
+    /// tasks. The actor decides in the step that grants the close, so a
+    /// refused, stale or unacknowledged claim decides nothing, and teardown,
+    /// which may begin at once, finds the decision made.
     pub(crate) fn try_stop_if_idle(
         &self,
         generation: u64,
         detached: DetachedWork,
     ) -> Result<bool, String> {
-        let previous = self.0.detached_work.replace(detached);
-        let stopped = self.try_close_if_idle(generation);
-        if !self.0.stop.load(Ordering::Acquire) {
-            self.0.detached_work.restore(previous);
+        if !self.claim_idle_close(generation, Some(detached))? {
+            return Ok(false);
         }
-        stopped
+        self.close()?;
+        Ok(true)
     }
 
     pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
@@ -1168,7 +1179,7 @@ impl LocalHandle {
         ) {
             self.0.retain_cleanup_receipt.store(true, Ordering::Release);
         }
-        if !self.claim_idle_close(generation)? {
+        if !self.claim_idle_close(generation, None)? {
             return Err("Provider state changed before conditional idle close".into());
         }
         self.close_for_resume()
@@ -2169,20 +2180,13 @@ impl DetachedDecision {
     const STOP: u8 = 1;
     const SPARE: u8 = 2;
     fn decide(&self, detached: DetachedWork) {
-        self.replace(detached);
-    }
-    /// Decides `detached`, returning the earlier decision for [`Self::restore`].
-    fn replace(&self, detached: DetachedWork) -> u8 {
-        self.0.swap(
+        self.0.store(
             match detached {
                 DetachedWork::Stop => Self::STOP,
                 DetachedWork::Spare => Self::SPARE,
             },
-            Ordering::AcqRel,
-        )
-    }
-    fn restore(&self, previous: u8) {
-        self.0.store(previous, Ordering::Release);
+            Ordering::Release,
+        );
     }
     fn get(&self) -> Option<DetachedWork> {
         match self.0.load(Ordering::Acquire) {
@@ -2459,6 +2463,8 @@ struct Actor {
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    /// What teardown leaves running; see [`ActorCommand::CloseIfIdle`].
+    detached_work: Arc<DetachedDecision>,
     incoming: crossbeam_channel::Receiver<CommandRequest>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
@@ -3272,7 +3278,11 @@ impl Actor {
                     }
                     (None, Command::Interrupt)
                 }
-                ActorCommand::CloseIfIdle { generation, closed } => {
+                ActorCommand::CloseIfIdle {
+                    generation,
+                    detached,
+                    closed,
+                } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     // A stale generation must never hide new requests, child
                     // work or pending transport. Only a proved idle actor can
@@ -3282,8 +3292,17 @@ impl Actor {
                         let _ = refuse(idle_close_refusal(readiness, &state));
                         continue;
                     }
+                    if detached.is_some() && state.background_tasks != 0 {
+                        let _ = refuse(
+                            "The provider reports background tasks that closing would end".into(),
+                        );
+                        continue;
+                    }
                     let unchanged = state.generation == generation;
                     if unchanged {
+                        if let Some(detached) = detached {
+                            self.detached_work.decide(detached);
+                        }
                         self.stop.store(true, Ordering::Release);
                     }
                     let _ = closed.send(unchanged);

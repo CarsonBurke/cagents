@@ -24,8 +24,9 @@ its last turn longest ago among the Claude chats that:
 The conversation stays open where it was. Its pane says that Claude stopped
 and keeps your draft; Resume conversation continues it in place, so nothing is
 lost but the idle process. Anything else the provider left running, outside
-the tasks it reports, is kept or stopped as closing the chat would decide. The daemon does this only when a
-chat needs the slot, never on a timer, and never to a chat on screen.
+the tasks it reports, is kept or stopped as closing the chat would decide. The
+daemon does this only when a chat needs the slot, never on a timer, and never to
+a chat on screen.
 
 If no chat qualifies, the daemon refuses the new chat with "No room for another
 chat", how many are open, and the limit. The pane keeps the message you wrote
