@@ -652,6 +652,9 @@ struct ExecutionEvidence {
     /// How long a process that may still run can show no arguments before
     /// it proves nothing.
     exec_settle: Duration,
+    /// How long a Codex proof that found a process still starting looks
+    /// again before it reports that.
+    starting_patience: Duration,
     deadline: Option<Instant>,
 }
 
@@ -750,6 +753,10 @@ impl ExecutionEvidence {
             retired: store.and_then(|path| read_retired_owners(&path)),
             processes: "/proc".into(),
             exec_settle: EXEC_SETTLE,
+            // Inspection proves every pane within one shared deadline; a
+            // pane still starting is reported unchecked at once rather than
+            // spending that deadline on it.
+            starting_patience: Duration::ZERO,
             deadline: Some(deadline),
         }
     }
@@ -766,6 +773,7 @@ impl ExecutionEvidence {
             retired: Err("A Codex pane has no census".into()),
             processes: "/proc".into(),
             exec_settle: EXEC_SETTLE,
+            starting_patience: starting_patience(),
             deadline: None,
         }
     }
@@ -918,18 +926,30 @@ impl ExecutionEvidence {
     /// Classify execution independently of adoption capabilities. Missing
     /// listener ownership or continuity is not evidence of a surviving writer.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
-        match self.codex_execution(source) {
-            CodexExecution::Ended => SavedExecution::Ended,
-            CodexExecution::Running { .. } | CodexExecution::RetainedProcesses => {
-                SavedExecution::Running
-            }
-            CodexExecution::Unproved { .. } => SavedExecution::Unchecked,
-        }
+        saved_codex_execution(self.codex_execution(source))
     }
 
+    /// A process that has not published its arguments yet is usually one
+    /// in `execve`, which a loaded host can stretch past one process's
+    /// settle. Look again for a short while before reporting it; any other
+    /// answer returns at once.
     fn codex_execution(&self, source: &Session) -> CodexExecution {
-        self.inspect_codex_execution(source)
-            .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
+        let patience = Instant::now() + self.starting_patience;
+        loop {
+            let execution = self
+                .inspect_codex_execution(source)
+                .unwrap_or_else(|reason| CodexExecution::Unproved { reason });
+            let starting = matches!(
+                &execution,
+                CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING
+            );
+            let now = Instant::now();
+            if !starting || now >= patience || self.deadline.is_some_and(|deadline| now >= deadline)
+            {
+                return execution;
+            }
+            std::thread::sleep(STARTING_RETRY);
+        }
     }
 
     fn inspect_codex_execution(&self, source: &Session) -> Result<CodexExecution, String> {
@@ -1058,6 +1078,43 @@ impl ExecutionEvidence {
 
 pub(super) const CODEX_PROCESS_STARTING: &str = "A process has not published its arguments yet";
 
+/// How long a Codex proof looks again at a process still starting.
+const CODEX_STARTING_PATIENCE: Duration = Duration::from_millis(1500);
+/// The pause between those looks.
+const STARTING_RETRY: Duration = Duration::from_millis(20);
+
+#[cfg(test)]
+static STARTING_PATIENCE_FOR_TEST: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+fn starting_patience() -> Duration {
+    #[cfg(test)]
+    if let Some(&patience) = STARTING_PATIENCE_FOR_TEST.get() {
+        return patience;
+    }
+    CODEX_STARTING_PATIENCE
+}
+
+/// Let this test process's Codex proofs wait out processes still starting
+/// for far longer than a correct host needs. The proof reads every process
+/// of the user on the host, so a test that shares the host with others would
+/// otherwise depend on how quickly their processes finish `execve`. Only for
+/// an isolated rerun of one test; it stays within that rerun's own limit, so
+/// a process that never settles still reports its refusal.
+#[cfg(test)]
+pub(super) fn wait_out_starting_processes_for_test() {
+    let _ = STARTING_PATIENCE_FOR_TEST.set(Duration::from_secs(15));
+}
+
+fn saved_codex_execution(execution: CodexExecution) -> SavedExecution {
+    match execution {
+        CodexExecution::Ended => SavedExecution::Ended,
+        CodexExecution::Running { .. } | CodexExecution::RetainedProcesses => {
+            SavedExecution::Running
+        }
+        CodexExecution::Unproved { .. } => SavedExecution::Unchecked,
+    }
+}
+
 /// The same execution proof used by source inspection, close and resume.
 /// A socket or surviving process group need not identify a live process ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1098,6 +1155,9 @@ pub(super) enum ExecutionEnd {
     Ended,
     /// A process or bound socket of it survives.
     Running,
+    /// A process that could be its provider is still starting, so nothing
+    /// can be told yet; asking again in a moment can.
+    Starting,
     /// The evidence cannot tell, or does not cover this shape of pane.
     Unproved,
 }
@@ -1129,7 +1189,17 @@ pub(super) fn execution_end(
         retired,
         ..ExecutionEvidence::codex(boot)
     };
-    match evidence.classify(source) {
+    let saved = if source.launch.provider == crate::agent::Provider::Codex {
+        match evidence.codex_execution(source) {
+            CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING => {
+                return ExecutionEnd::Starting;
+            }
+            execution => saved_codex_execution(execution),
+        }
+    } else {
+        evidence.classify(source)
+    };
+    match saved {
         SavedExecution::Ended | SavedExecution::Unrecorded => ExecutionEnd::Ended,
         SavedExecution::Running => ExecutionEnd::Running,
         SavedExecution::Unproved | SavedExecution::Unchecked => ExecutionEnd::Unproved,
@@ -2407,6 +2477,7 @@ mod tests {
             retired: Ok(Vec::new()),
             processes: "/proc".into(),
             exec_settle: EXEC_SETTLE,
+            starting_patience: Duration::ZERO,
             deadline: None,
         }
     }
@@ -3342,6 +3413,57 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn codex_proof_waits_for_a_process_that_publishes_its_arguments() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let processes = tempfile::tempdir_in("/var/tmp").unwrap();
+        let process = processes.path().join("4242");
+        let thread = process.join("task/4242");
+        std::fs::create_dir_all(&thread).unwrap();
+        std::fs::create_dir(processes.path().join("net")).unwrap();
+        std::fs::write(processes.path().join("net/unix"), "header\n").unwrap();
+        let uid = crate::daemon::current_uid();
+        std::fs::write(
+            process.join("status"),
+            format!("Uid: {uid} {uid} {uid} {uid}\n"),
+        )
+        .unwrap();
+        // A process in `execve`: runnable, with an executable, and no
+        // arguments yet.
+        std::fs::write(process.join("cmdline"), b"").unwrap();
+        std::fs::write(thread.join("cmdline"), b"").unwrap();
+        std::fs::write(thread.join("stat"), "4242 (sh) R 1 4242 4242 0 0 0 0").unwrap();
+        std::fs::write(thread.join("status"), "SigPnd: 0\nShdPnd: 0\n").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/sh", process.join("exe")).unwrap();
+        let impatient = ExecutionEvidence {
+            processes: processes.path().into(),
+            exec_settle: Duration::ZERO,
+            ..evidence(holders.path(), Vec::new())
+        };
+        assert!(matches!(
+            impatient.codex_execution(&card),
+            CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING
+        ));
+        // It publishes unrelated arguments a moment later. A proof with
+        // patience waits for that and finds nothing of the pane.
+        let (published, publishing) = crossbeam_channel::bounded(1);
+        let cmdline = process.join("cmdline");
+        let publisher = std::thread::spawn(move || {
+            publishing.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(cmdline, b"sh\0-c\0true\0").unwrap();
+        });
+        let patient = ExecutionEvidence {
+            starting_patience: crate::test_timing::EVENTUALLY,
+            ..impatient
+        };
+        published.send(()).unwrap();
+        assert_eq!(patient.codex_execution(&card), CodexExecution::Ended);
+        publisher.join().unwrap();
     }
 
     #[test]

@@ -1320,6 +1320,9 @@ enum Holds {
     /// A process of its provider survives the helper that controlled it.
     /// [`lost_processes`] says which, and can end them.
     Running,
+    /// A process that could be its provider is still starting; the same
+    /// Close can tell in a moment.
+    Starting,
     /// Nothing proves whether something of it still runs.
     Unproved,
 }
@@ -1337,6 +1340,9 @@ fn lost_execution_refusal(session: &Session, holds: Holds) -> String {
         Holds::Running => format!(
             "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so the conversation was kept rather than leave {provider} running unseen."
         ),
+        Holds::Starting => {
+            "A program on this computer was still starting, so Cagents can't yet tell whether this conversation stopped. Close it again in a moment.".into()
+        }
         Holds::Unproved => format!(
             "{LOST_EXECUTION_UNPROVED}. Its Cagents helper is gone, and Cagents can't tell whether its {provider} process stopped, so it was kept rather than leave {provider} running unseen. After the computer restarts nothing of it can run, so closing it will work."
         ),
@@ -1601,6 +1607,7 @@ fn what_holds(
     match super::upgrade_inspect::execution_end(session, &proof.boot_id, owners.clone()) {
         ExecutionEnd::Ended => {}
         ExecutionEnd::Running => return Ok(Some(Holds::Running)),
+        ExecutionEnd::Starting => return Ok(Some(Holds::Starting)),
         ExecutionEnd::Unproved => return Ok(Some(Holds::Unproved)),
     }
     match session
