@@ -4172,8 +4172,7 @@ fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
     );
     // A restored source descriptor can still carry the old provider
     // default. Accepted identity wins without loading the conversation.
-    app.card_state_mut(pane.id).unwrap().title =
-        chat_ui::chat_card_title(crate::agent::Provider::Claude).into();
+    app.card_state_mut(pane.id).unwrap().title = crate::agent::Provider::Claude.chat_title().into();
     assert_eq!(
         app.card_display_title(app.card_state(pane.id).unwrap()),
         label
@@ -4237,7 +4236,7 @@ fn unloaded_spawn_label_reaches_the_sidebar_attention_row_without_a_model_change
     };
     agent.placement = placement.clone();
     agent.spec.target.placement = Some(placement.clone());
-    pane.title = chat_ui::chat_card_title(crate::agent::Provider::Claude).into();
+    pane.title = crate::agent::Provider::Claude.chat_title().into();
     pane.scope = Some(path.clone());
     app.workspace_model.channels.clear();
     app.workspace_model.views = vec![crate::workspace_model::views::View {

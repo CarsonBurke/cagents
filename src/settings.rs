@@ -945,8 +945,12 @@ fn default_browser_search_url() -> String {
     "https://duckduckgo.com/?q={query}".into()
 }
 
+/// The width a new native pane takes until the person sets their own,
+/// as a fraction of the workspace.
+pub const DEFAULT_NATIVE_PANE_FRACTION: f32 = 0.5;
+
 const fn default_native_fraction() -> f32 {
-    0.5
+    DEFAULT_NATIVE_PANE_FRACTION
 }
 
 const fn default_chat_enter_sends() -> bool {

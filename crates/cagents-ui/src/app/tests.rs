@@ -8942,7 +8942,7 @@ fn pane_clone_starts_a_new_chat_without_reusing_source_conversation() {
     assert_ne!(cloned, source_id);
     assert_eq!(
         app.card_state(cloned).unwrap().title,
-        crate::app::chat_ui::chat_card_title(crate::agent::Provider::Claude),
+        crate::agent::Provider::Claude.chat_title(),
         "unnamed chat clones retain the provider's default title"
     );
     let CardKind::Chat(copy) = &app.card_state(cloned).unwrap().kind else {

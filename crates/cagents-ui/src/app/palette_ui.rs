@@ -848,7 +848,7 @@ impl Cagents {
                         return None;
                     };
                     let (channel, primary) = pane_channels.get(&card.id)?.1?;
-                    (card.title == chat_ui::chat_card_title(session.launch.provider)
+                    (card.title == session.launch.provider.chat_title()
                         || (channel.title_source == crate::model::ChannelTitleSource::Manual
                             && primary == Some(card.id)))
                     .then_some(channel.title.as_str())
@@ -2382,7 +2382,7 @@ mod tests {
         };
         let mut secondary = app.card_state(primary).unwrap().clone();
         secondary.id = CardId::new();
-        secondary.title = chat_ui::chat_card_title(provider).into();
+        secondary.title = provider.chat_title().into();
         secondary.kind = CardKind::Chat(session.clone());
         let utility = app.workspace.focused().unwrap();
         let durable = Arc::make_mut(&mut app.durable);
