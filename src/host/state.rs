@@ -295,6 +295,9 @@ pub(crate) struct HostState {
     /// What each terminal still spawning will run, so a Close can tell one
     /// about to start a Codex CLI on its conversation.
     spawning_terminals: BTreeMap<TerminalId, TerminalSession>,
+    /// Terminals a chat is returning to, each by the chat whose claim covers
+    /// it while it spawns.
+    pub(super) handoff_terminals: BTreeMap<TerminalId, TerminalId>,
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
@@ -511,6 +514,7 @@ impl HostState {
             spawning: BTreeSet::new(),
             spawning_transcripts: BTreeMap::new(),
             spawning_terminals: BTreeMap::new(),
+            handoff_terminals: BTreeMap::new(),
             startup_custody: BTreeSet::new(),
             publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
@@ -1552,7 +1556,7 @@ impl HostState {
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view_reserved(terminal_id, paired, None, None, None)
+        self.reserve_spawn_for_view_reserved(terminal_id, paired, None, None, None, false)
     }
 
     /// A reservation for a spawn whose worker will open `transcript`.
@@ -1562,7 +1566,7 @@ impl HostState {
         terminal_id: TerminalId,
         transcript: &std::path::Path,
     ) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view_reserved(terminal_id, None, None, Some(transcript), None)
+        self.reserve_spawn_for_view_reserved(terminal_id, None, None, Some(transcript), None, false)
     }
 
     /// A reservation for a spawn of `terminal`, checked as a real one is.
@@ -1571,7 +1575,7 @@ impl HostState {
         &mut self,
         terminal: &TerminalSession,
     ) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view_reserved(terminal.id, None, None, None, Some(terminal))
+        self.reserve_spawn_for_view_reserved(terminal.id, None, None, None, Some(terminal), false)
     }
 
     /// Reserves `terminal_id` for a spawn whose worker will open `transcript`.
@@ -1584,6 +1588,7 @@ impl HostState {
         transition: Option<&super::chat::TerminalViewReservation<'_>>,
         transcript: Option<&std::path::Path>,
         spawned: Option<&TerminalSession>,
+        adopting: bool,
     ) -> Result<(), ProtocolError> {
         let owns_transition = transition.is_some_and(|transition| {
             paired.is_some_and(|source| source.id == terminal_id)
@@ -1622,10 +1627,13 @@ impl HostState {
         // A Codex CLI on a conversation another pane has claimed would be a
         // second writer of it, and a Close of that pane proves none can start
         // while it reads (see `settle_lost_execution`). A pane's own claim
-        // covers its terminal view and its paired console.
-        if let Some(spawned) = spawned
+        // covers its terminal view, its paired console and the terminal it
+        // is returning to. Adopting a holder launches nothing.
+        let handoff = self.handoff_terminals.get(&terminal_id);
+        if let Some(spawned) = spawned.filter(|_| !adopting)
             && self.chat_spawning.iter().any(|(id, claim)| {
                 *id != terminal_id
+                    && Some(id) != handoff
                     && claim
                         .terminal
                         .as_ref()
@@ -5071,12 +5079,22 @@ fn start_terminal_view_owned_reserved(
                 false,
             ));
         }
+        let executed = execution_recipe.as_ref().map_or_else(
+            || session.clone(),
+            |recipe| TerminalSession {
+                launch: recipe.clone(),
+                ..session.clone()
+            },
+        );
         state.reserve_spawn_for_view_reserved(
             terminal_id,
             paired.then_some(&session),
             transition,
             session.transcript_path.as_deref(),
-            Some(&session),
+            // What it runs, which an upgrade's relaunch may set apart from
+            // its descriptor.
+            Some(&executed),
+            adoption.is_some(),
         )?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {

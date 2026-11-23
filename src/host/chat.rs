@@ -4608,7 +4608,22 @@ fn process_inner(
                 record.completion_observed = false;
                 state.inventory_generation += 1;
                 state.recovery_independence.extend(chat_id, terminal_id);
+                // The terminal resumes this chat's conversation under its
+                // claim, which refuses any other's (see
+                // `reserve_spawn_for_view_reserved`).
+                state.handoff_terminals.insert(terminal_id, chat_id);
             }
+            struct HandingOff<'a>(&'a SharedHost, TerminalId);
+            impl Drop for HandingOff<'_> {
+                fn drop(&mut self) {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .handoff_terminals
+                        .remove(&self.1);
+                }
+            }
+            let _handing_off = HandingOff(host, terminal_id);
             // Closing interrupts active work and waits for confirmed teardown.
             // Never start a second writer before teardown has been proved.
             owners.close(host, &closing)?;

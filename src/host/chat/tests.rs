@@ -3106,6 +3106,14 @@ fn returning_to_terminal_waits_for_provider_interruption() {
     control_client_closes_chat(true, true);
 }
 
+/// A Codex chat on a known conversation returns to a terminal running
+/// Codex's CLI on it, under the chat's own claim, which refuses that CLI to
+/// every other pane (see `reserve_spawn_for_view_reserved`).
+#[test]
+fn a_codex_chat_on_a_known_conversation_returns_to_its_terminal() {
+    control_client_closes_chat_as(true, true, Provider::Codex);
+}
+
 /// The terminal frames queued on a native chat's connection, after closing it.
 ///
 /// A chat client reads only its own chat's frames and ends its presentation
@@ -3130,8 +3138,12 @@ fn terminal_frames(delivery: &crate::host::delivery::DeliveryQueue) -> Vec<Serve
 }
 
 fn control_client_closes_chat(slow: bool, return_terminal: bool) {
+    control_client_closes_chat_as(slow, return_terminal, Provider::Claude);
+}
+
+fn control_client_closes_chat_as(slow: bool, return_terminal: bool, provider: Provider) {
     let directory = tempfile::tempdir().unwrap();
-    let cli = directory.path().join("claude");
+    let cli = directory.path().join(provider.executable());
     std::fs::write(&cli, "#!/bin/sh\nexec cat\n").unwrap();
     std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     struct Interruptible;
@@ -3243,7 +3255,7 @@ fn control_client_closes_chat(slow: bool, return_terminal: bool) {
         id: chat_id,
         launch: chat::Launch {
             provider: if return_terminal {
-                Provider::Claude
+                provider
             } else {
                 Provider::Codex
             },
@@ -3256,7 +3268,9 @@ fn control_client_closes_chat(slow: bool, return_terminal: bool) {
             } else {
                 recipe
             },
-            session_id: None,
+            // A Codex chat's claim names its conversation once known.
+            session_id: (return_terminal && provider == Provider::Codex)
+                .then(|| "12345678-1234-4234-8234-123456789abc".into()),
             draft_model: None,
         },
         proof: Some(proof),
@@ -3326,8 +3340,12 @@ fn control_client_closes_chat(slow: bool, return_terminal: bool) {
                 .launch
                 .arguments
                 .windows(2)
-                .any(|args| args == ["--resume", "12345678-1234-4234-8234-123456789abc"])
+                .any(|args| args[1] == "12345678-1234-4234-8234-123456789abc"
+                    && (args[0] == "--resume" || args[0] == "resume")),
+            "{:?}",
+            terminal.launch.arguments
         );
+        assert!(host.lock().unwrap().handoff_terminals.is_empty());
         let replacement = host.lock().unwrap().terminals.remove(&terminal.id).unwrap();
         let _ = replacement.handle.shutdown();
     } else {
