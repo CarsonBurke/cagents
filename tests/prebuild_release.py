@@ -367,8 +367,12 @@ class Prebuild(unittest.TestCase):
             self.waiter()
             time.sleep(prebuild.WATCH_SECONDS * (prebuild.SUSTAINED + 3))
             self.assertFalse((self.root / f"stopped-{self.first}").exists())
-            # Memory running short still stops it.
-            self.memory(2)
+            # Less than 6 GiB, which stops a background build, does not stop
+            # it; memory running out does.
+            self.memory(4)
+            time.sleep(prebuild.WATCH_SECONDS * (prebuild.SUSTAINED + 3))
+            self.assertFalse((self.root / f"stopped-{self.first}").exists())
+            self.memory(1)
             thread.join(HANG_GUARD)
         self.assertEqual(outcome, ["waited"])
         state = json.loads((self.store.root / "state.json").read_text())
@@ -378,7 +382,9 @@ class Prebuild(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             prebuild.status(self.store, self.sentinel, as_json=False)
         self.assertIn(f"starved  {self.first}  (waited)", output.getvalue())
-        self.assertIn(f"stopped  {self.first}  less than", output.getvalue())
+        # Starved, it takes no backoff: it queues again at once.
+        self.assertEqual(state["retry_after"], 0)
+        self.assertNotIn("stopped  ", output.getvalue())
         self.release_waiters()
         self.setUp_readings()
         state["retry_after"] = time.time() - 1
@@ -408,12 +414,90 @@ class Prebuild(unittest.TestCase):
 
     def test_the_admission_splits_the_wait_from_the_build(self):
         self.compiled(self.first)
-        with patch.dict(os.environ, PREBUILD_GATE_WAIT="1.6"):
+        gate_wait = 1.6
+        with patch.dict(os.environ, PREBUILD_GATE_WAIT=str(gate_wait)):
             self.assertEqual(self.run_once(), 0)
         bundled = json.loads((self.store.bundle(self.first) / "bundle.json").read_text())
-        self.assertGreaterEqual(bundled["waited_seconds"], 1)
-        self.assertLess(bundled["seconds"], bundled["waited_seconds"] + 5)
+        # The gate's queue is the wait; the quick build after it is the build.
+        self.assertGreaterEqual(bundled["waited_seconds"], gate_wait - 0.1)
+        self.assertLess(bundled["seconds"], gate_wait)
         self.assertIn("prebuild-release: admitted ", (self.store.bundle(self.first) / "build.log").read_text())
+
+    def test_queued_at_the_gate_memory_does_not_stop_it_and_once_admitted_does(self):
+        self.compiled(self.first)
+        with patch.dict(os.environ, PREBUILD_HOLD="1", PREBUILD_GATE_WAIT="0.6"):
+            thread, outcome = self.start()
+            self.wait_for(lambda: (self.store.root / "building.json").exists(), "the queued build")
+            self.memory(4)
+            self.wait_for(lambda: (self.root / f"started-{self.first}").exists(), "the admission")
+            thread.join(HANG_GUARD)
+        self.assertTrue((self.root / f"stopped-{self.first}").exists())
+        self.assertEqual(outcome, ["waited"])
+        self.assertIn("6 GiB", json.loads((self.store.root / "state.json").read_text())["stopped"])
+
+    def test_crossing_into_starvation_mid_build_skips_the_backoff(self):
+        self.compiled(self.first)
+        self.store.prepare()
+        (self.store.root / "state.json").write_text(json.dumps({
+            "sha": self.first, "first_tried_at": time.time(), "stopped_since": time.time()}))
+        with patch.object(prebuild, "STARVED_SECONDS", 1), patch.dict(os.environ, PREBUILD_HOLD="1"):
+            thread, outcome = self.start()
+            self.wait_for(lambda: (self.root / f"started-{self.first}").exists(), "the build")
+            time.sleep(1)
+            self.waiter()
+            # Stopped for the waiter, it is starved by then and queues again
+            # at once rather than back off, the waiter no longer stopping it.
+            self.wait_for(lambda: len(self.builds()) == 2, "the starved build")
+            state = json.loads((self.store.root / "state.json").read_text())
+            (self.root / f"release-{self.first}").touch()
+            thread.join(HANG_GUARD)
+        self.assertEqual([build[2:4] for build in self.builds()], [["1", "10"], ["normal", "unbounded"]])
+        self.assertEqual(state["retry_after"], 0)
+        self.assertIn("waiting for build memory shares", state["stopped"])
+        self.assertEqual(outcome, [0])
+        self.assertEqual(self.pauses, [])
+
+    def test_only_a_bundle_of_the_targets_history_holds_off_starvation(self):
+        old = self.old_commit("old", 3)
+        side = self.commit("side")
+        self.git("reset", "-q", "--hard", old)
+        self.compiled(old)
+        self.store.prepare()
+        (self.store.bundle(side)).mkdir()
+        (self.store.bundle(side) / "bundle.json").write_text(json.dumps(
+            {"sha": side, "version": "0.2.4", "protocol": 9, "built_at": time.time(), "bytes": 1}))
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.builds()[-1][2:4], ["normal", "unbounded"])
+
+    def test_a_target_built_by_any_route_ends_its_record(self):
+        self.compiled(self.first)
+        self.store.prepare()
+        long_ago = time.time() - 31 * 60
+        record = {"sha": self.first, "first_tried_at": long_ago, "stopped_since": long_ago,
+                  "starved": "waited", "retry_after": time.time() + 300, "stopped": "a build is waiting"}
+        (self.store.root / "state.json").write_text(json.dumps(record))
+        # A request builds the target: nothing is left to build, and the
+        # record ends rather than starve whatever comes next.
+        with patch.object(sys, "argv", [PROGRAM_PATH, "--repository", str(self.repository),
+                                        "--store", str(self.store.root), "request", self.first]):
+            prebuild.main()
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(json.loads((self.store.root / "state.json").read_text()), {})
+        # Had main moved on before the record ended, the next target still
+        # starts afresh: a background build, with no starved status.
+        (self.store.root / "state.json").write_text(json.dumps(record))
+        second = self.commit("second")
+        self.compiled(second)
+        self.memory(10)
+        self.assertEqual(self.run_once(), "waited")
+        state = json.loads((self.store.root / "state.json").read_text())
+        self.assertEqual(state["sha"], second)
+        self.assertNotIn("starved", state)
+        self.assertNotIn("retry_after", state)
+        self.assertLessEqual(time.time() - state["stopped_since"], 5)
+        self.memory(32)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.builds()[-1][2:4], ["1", "10"])
 
     def test_a_newer_target_keeps_the_backoff_and_a_request_keeps_the_record(self):
         self.compiled(self.first)
