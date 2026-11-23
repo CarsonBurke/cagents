@@ -104,6 +104,10 @@ pub(in crate::host) struct Broker {
     thread: Option<JoinHandle<()>>,
 }
 
+/// How often the scheduler rechecks while it holds an active firing or a
+/// precheck worker, whose retries no other event announces.
+const OWNED_WORK_RECHECK: Duration = Duration::from_secs(60);
+
 fn warn_history_maintenance(error: &str) {
     let diagnostic: String = error
         .chars()
@@ -567,6 +571,11 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .active_automation_firings()?;
         let owners: std::collections::BTreeSet<_> = active.iter().map(|firing| firing.id).collect();
+        // Broker-owned work retries some steps on the ordinary cadence, such
+        // as releasing a run whose provider is still busy or retiring a
+        // precheck whose child has not been reaped, and nothing else wakes
+        // the scheduler for those. While any is held, keep that cadence.
+        let mut owns_work = !active.is_empty();
         let mut checking = false;
         let candidates = self
             .0
@@ -697,13 +706,21 @@ impl Handle {
                 self.history_retry_remaining()
                     .unwrap_or(Duration::from_millis(50)),
             ),
-            Err(error) => {
+            // A failure already backing off was reported when it began.
+            Err(error) => self.history_retry_remaining().or_else(|| {
                 self.defer_history_maintenance();
                 warn_history_maintenance(&error);
                 self.history_retry_remaining()
-            }
+            }),
         };
-        let delay = [automation_delay, history_delay]
+        owns_work |= !self
+            .0
+            .workers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
+        let owned_delay = owns_work.then_some(OWNED_WORK_RECHECK);
+        let delay = [automation_delay, history_delay, owned_delay]
             .into_iter()
             .flatten()
             .min();
@@ -2054,6 +2071,35 @@ mod tests {
         wake.wake();
         assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_tick_with_nothing_scheduled_or_owned_sets_no_deadline() {
+        use crate::{
+            host::model::Registry,
+            model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("test"),
+                boot_id: BootId::new("test"),
+                host_incarnation: HostIncarnation::new("test"),
+            },
+        )));
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(registry)),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            launching: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        assert_eq!(handle.tick(&host).unwrap(), None);
     }
 
     #[test]

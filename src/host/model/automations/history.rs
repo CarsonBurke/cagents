@@ -442,8 +442,9 @@ impl Registry {
     }
 
     /// Return the next actual tombstone-pruning deadline. Protected rows are
-    /// deliberately excluded: their owner sends a wake edge when they become
-    /// eligible, so they must not keep an otherwise idle scheduler awake.
+    /// deliberately excluded: they become eligible as the scheduler settles
+    /// the firing that protects them, which it rechecks while it holds one,
+    /// so they must not keep an otherwise idle scheduler awake.
     pub(crate) fn next_removed_automation_history_deadline(&self) -> Result<Option<u64>, String> {
         let deleted: Option<u64> = self
             .db

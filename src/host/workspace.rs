@@ -231,6 +231,14 @@ fn edit_then<T>(
             &applied.receipt.effects,
         );
         drop(state);
+        // Closing a project pauses its automations and queues their notice,
+        // which the scheduler sends; with no schedule left it would not wake.
+        if matches!(
+            edit,
+            ModelEdit::CloseProject { .. } | ModelEdit::CloseConfirmedProject { .. }
+        ) {
+            super::automations::wake(host);
+        }
         tracing::debug!(
             operation = "workspace-model-edit",
             sequence = applied.receipt.sequence,
