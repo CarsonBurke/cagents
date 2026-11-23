@@ -247,6 +247,7 @@ fn admit(window: &mut Window) -> crate::workspace_model::WorkspaceModel {
                 title: "view".into(),
                 title_source: Default::default(),
                 ordinal: 1,
+                checkout: None,
             })
             .collect(),
         views: vec![View::empty(Scope::Channel(window.active)), view],
@@ -842,6 +843,7 @@ fn observed_window_model(window: &Window) -> crate::workspace_model::WorkspaceMo
                 title: "view".into(),
                 title_source: Default::default(),
                 ordinal: 1,
+                checkout: None,
             })
             .collect(),
         views: vec![View::empty(window.active), hidden],
@@ -1103,6 +1105,7 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
                 title: "new scope".into(),
                 title_source: Default::default(),
                 ordinal: model.channels.len() as u32,
+                checkout: None,
             });
             if channel == destination {
                 model.views.push(View::empty(channel));
@@ -1590,6 +1593,7 @@ fn window_seeding_a_saved_terminal() -> (
                 title: "view".into(),
                 title_source: Default::default(),
                 ordinal: 1,
+                checkout: None,
             })
             .collect(),
         views: vec![View::empty(Scope::Channel(window.active)), view],

@@ -2986,10 +2986,13 @@ impl Cagents {
         // has, which is what a folded create carries until a read supplies the
         // real one.
         let rerank = shared.ordinal != PENDING_ORDINAL && local.ordinal != shared.ordinal;
+        // The registry's spelling of the checkout is the one every window and
+        // the CLI compare.
+        let recheckout = local.checkout != shared.checkout;
         // The registry naming a channel is the proof this window is looking for:
         // from here its absence is a deletion rather than ignorance.
         let record = !local.shared;
-        if !retitle && !rerank && !record {
+        if !retitle && !rerank && !recheckout && !record {
             return false;
         }
         // A name cleared in another window asks for the automatic one, which
@@ -3005,6 +3008,9 @@ impl Cagents {
         }
         if rerank {
             channel.ordinal = shared.ordinal;
+        }
+        if recheckout {
+            channel.checkout = shared.checkout.clone();
         }
         channel.shared = true;
         if cleared {
@@ -3039,6 +3045,7 @@ impl Cagents {
                 // conversations inside it.
                 cards: Vec::new(),
                 focused: None,
+                checkout: shared.checkout.clone(),
             });
         self.sidebar_state.reveal_project(project_id);
         Adoption::Applied
@@ -3294,18 +3301,25 @@ impl Cagents {
             name,
         });
         // A new channel's title is empty; a revived one keeps the name it had.
-        let (title, title_source) = self
+        let (title, title_source, checkout) = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
-            .map(|channel| (channel.title.clone(), channel.title_source))
+            .map(|channel| {
+                (
+                    channel.title.clone(),
+                    channel.title_source,
+                    channel.checkout.clone(),
+                )
+            })
             .unwrap_or_default();
         self.publish_model_edit(ModelEdit::CreateChannel {
             id,
             repository,
             title,
             title_source,
+            checkout,
         });
     }
 
@@ -3327,6 +3341,7 @@ impl Cagents {
         };
         let title = channel.title.clone();
         let title_source = channel.title_source;
+        let checkout = channel.checkout.clone();
         let project_id = channel.project_id;
         let Some(project) = self.sidebar_model.project(project_id) else {
             return;
@@ -3352,6 +3367,7 @@ impl Cagents {
             repository,
             title,
             title_source,
+            checkout,
         });
     }
 

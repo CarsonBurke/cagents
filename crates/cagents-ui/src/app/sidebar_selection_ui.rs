@@ -35,6 +35,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: Vec::new(),
                 focused: None,
+                checkout: None,
             });
         }
         durable.active_channel = Some(channels[2]);
@@ -317,6 +318,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: Vec::new(),
                 focused: None,
+                checkout: None,
             });
         }
         app.refresh_sidebar_channels();
@@ -450,6 +452,7 @@ pub(in crate::app) mod tests {
                 shared: false,
                 cards: Vec::new(),
                 focused: None,
+                checkout: None,
             });
         app.refresh_sidebar_channels();
 

@@ -524,6 +524,7 @@ mod tests {
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.workspace_model.channels.push(ModelChannel {
@@ -532,6 +533,7 @@ mod tests {
             title: "Fixture".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         });
         app.workspace_model.views.push(View {
             scope: scope.clone(),

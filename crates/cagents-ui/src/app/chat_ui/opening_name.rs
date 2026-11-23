@@ -341,6 +341,7 @@ mod tests {
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         }];
         app.workspace_model.views = vec![View {
             scope: Scope::Channel(id),

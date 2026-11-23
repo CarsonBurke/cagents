@@ -1681,6 +1681,7 @@ mod tests {
             shared: false,
             cards: vec![first.id, second.id],
             focused: Some(first.id),
+            checkout: None,
         });
         let notices = sessions
             .into_iter()
@@ -2706,6 +2707,7 @@ mod tests {
                 shared: true,
                 cards: vec![],
                 focused: None,
+                checkout: None,
             });
         let CardKind::Terminal(mut console) = super::super::tests::terminal_card_state().kind
         else {
@@ -2753,6 +2755,7 @@ mod tests {
                 title: "Scheduled".into(),
                 title_source: Default::default(),
                 ordinal: 0,
+                checkout: None,
             });
         app.chrome_ui
             .agent_labels
@@ -3407,6 +3410,7 @@ mod tests {
                 shared: false,
                 cards: vec![card],
                 focused: Some(card),
+                checkout: None,
             });
         app.sidebar_state.set_card_activity(
             card,
@@ -3833,6 +3837,7 @@ mod tests {
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         drop(app.update_notifications(Action::Activated(Target::Session(session))));
         assert!(app.workspace.focused().is_none());
@@ -3917,6 +3922,7 @@ mod tests {
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         drop(app.update_notifications(Action::Activated(Target::Session(session))));
         assert_eq!(app.durable.active_channel, Some(channel));

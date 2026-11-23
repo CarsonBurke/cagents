@@ -554,6 +554,7 @@ fn a_selected_channel_restores_its_chats_focus_and_title() {
         shared: true,
         cards: vec![fixture.terminal_card_id, fixture.browser_card_id],
         focused: Some(fixture.browser_card_id),
+        checkout: None,
     }];
     fixture.workspace.active_channel = Some(channel_id);
     fixture.persist(&database_path);

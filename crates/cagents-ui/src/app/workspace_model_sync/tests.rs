@@ -801,6 +801,7 @@ fn agent_and_rank_edges_carry_canonical_rows_without_full_reads() {
                         repository: created.repository.clone(),
                         title: created.title.clone(),
                         title_source: created.title_source,
+                        checkout: None,
                     },
                     EditEffects {
                         channels: vec![created],
@@ -1126,6 +1127,7 @@ fn create_publisher_keeps_the_canonical_rank_without_unrelated_views() {
         repository,
         title: "Requested title".into(),
         title_source: Default::default(),
+        checkout: None,
     };
     let expected_edit = edit.clone();
     let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2302,6 +2304,7 @@ fn model_read_publishes_new_managed_chat_before_initialized_view_projection() {
                 repository: agent.spec.target.repository.clone(),
                 title: "Independent channel".into(),
                 title_source: Default::default(),
+                checkout: None,
             },
             6 => ModelEdit::OpenProject {
                 repository: "/other/.git".into(),
@@ -4720,6 +4723,7 @@ fn shared(id: ChannelId, repository: &Path, title: &str, ordinal: u32) -> ModelC
         repository: repository.to_path_buf(),
         title: title.to_owned(),
         ordinal,
+        checkout: None,
     }
 }
 
@@ -4733,6 +4737,7 @@ fn local(id: ChannelId, project: ProjectId, title: &str, ordinal: u32) -> Projec
         shared: false,
         cards: Vec::new(),
         focused: None,
+        checkout: None,
     }
 }
 
@@ -5498,6 +5503,50 @@ fn an_adopted_channel_arrives_empty_and_starts_no_conversation() {
     );
 }
 
+/// A channel's checkout is part of what it is, so every window shows it
+/// working in the same directory: one made here tells the registry, and one
+/// the registry holds arrives with it.
+#[test]
+fn a_channels_checkout_is_published_and_adopted() {
+    let (mut app, project, repository) = app_with_project();
+    let published = intercept_publishes(&mut app);
+    let feature = PathBuf::from("/repo-feature");
+    let mine = app
+        .create_channel(
+            project,
+            "feature".into(),
+            Default::default(),
+            Some(feature.clone()),
+        )
+        .unwrap();
+    assert!(drain(&published).iter().any(|edit| matches!(
+        edit,
+        ModelEdit::CreateChannel { id, checkout: Some(checkout), .. }
+            if *id == mine && *checkout == feature
+    )));
+
+    let theirs = ChannelId::new();
+    let mut elsewhere = shared(theirs, &repository, "created elsewhere", 7);
+    elsewhere.checkout = Some(feature.clone());
+    app.workspace_model = registry(vec![elsewhere]);
+    let _ = app.reconcile_workspace_model();
+    let adopted = |app: &Cagents| {
+        app.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == theirs)
+            .expect("the channel is adopted into this window")
+            .checkout
+            .clone()
+    };
+    assert_eq!(adopted(&app), Some(feature));
+
+    app.workspace_model.channels[0].checkout = None;
+    app.workspace_model.sequence += 1;
+    let _ = app.reconcile_workspace_model();
+    assert_eq!(adopted(&app), None, "the registry's checkout wins");
+}
+
 /// The registry's rank decides the order, so an adopted channel created
 /// after a local one renders above it - in every window, whichever one made
 /// which.
@@ -6019,6 +6068,7 @@ fn a_window_joining_with_an_unshared_channel_keeps_and_publishes_it() {
                 // channel being introduced is not a channel being created.
                 title: "mine".into(),
                 title_source: crate::model::ChannelTitleSource::Prompt,
+                checkout: None,
             },
         ],
         "the project comes first, or the channel would have no owner"
@@ -6235,6 +6285,7 @@ fn delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_chann
             repository: repository.clone(),
             title: "Original".into(),
             title_source: Default::default(),
+            checkout: None,
         },
     }));
     drop(app.apply_workspace_model_update(ModelUpdate::Edited {
@@ -6272,6 +6323,7 @@ fn delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_chann
             repository,
             title: "Still pending".into(),
             title_source: Default::default(),
+            checkout: None,
         },
     }));
     let before_duplicate = app.durable.channels.clone();
@@ -6541,6 +6593,7 @@ fn six_creations_stay_above_saved_mixed_rows_through_pending_echoes_rank_leap_an
                 repository: repository.clone(),
                 title: String::new(),
                 title_source: Default::default(),
+                checkout: None,
             },
         }));
         assert_eq!(
@@ -6599,6 +6652,7 @@ fn six_creations_stay_above_saved_mixed_rows_through_pending_echoes_rank_leap_an
             repository: repository.clone(),
             title: "stale echo".into(),
             title_source: Default::default(),
+            checkout: None,
         },
     }));
     assert_eq!(
@@ -6702,6 +6756,7 @@ fn folded_remote_creations_and_pending_rank_ceiling_keep_newest_first_without_wr
                 repository: repository.clone(),
                 title: format!("Remote {index}"),
                 title_source: Default::default(),
+                checkout: None,
             },
         }));
         let rows =

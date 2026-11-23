@@ -104,6 +104,7 @@ fn home_admits_retained_worktree_and_channel_views_without_navigation() {
                 shared: true,
                 cards: vec![card.id],
                 focused: Some(card.id),
+                checkout: None,
             });
             model.channels.push(ModelChannel {
                 id: channel,
@@ -111,6 +112,7 @@ fn home_admits_retained_worktree_and_channel_views_without_navigation() {
                 title: "Offscreen conversation".into(),
                 title_source: Default::default(),
                 ordinal: 1,
+                checkout: None,
             });
             let scope = Scope::Channel(channel);
             let mut view = View::empty(scope.clone());

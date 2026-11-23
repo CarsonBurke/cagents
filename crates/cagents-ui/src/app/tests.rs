@@ -2091,6 +2091,7 @@ fn shared_channel_edges_leave_every_channel_id_naming_one_node() {
         repository: repository.clone(),
         title: title.to_owned(),
         ordinal,
+        checkout: None,
     };
 
     draw_frames(&mut app, 4, |app, frame| {
@@ -7016,6 +7017,7 @@ fn a_background_read_reselects_only_the_scope_its_project_holds() {
             shared: false,
             cards: Vec::new(),
             focused: None,
+            checkout: None,
         });
     Arc::make_mut(&mut app.durable).active_channel = Some(channel);
     assert!(app.project_owns_active_scope(other, launch));
@@ -7077,6 +7079,7 @@ pub(super) fn alt_tab_test_app() -> (Cagents, crate::model::ChannelId) {
         shared: false,
         cards: vec![channel_card],
         focused: Some(channel_card),
+        checkout: None,
     });
     app.sidebar_model.projects.push(SidebarProject::new(
         project,
@@ -8667,6 +8670,7 @@ mod repository_clone_navigation {
                 shared: false,
                 cards: vec![clone],
                 focused: Some(clone),
+                checkout: None,
             });
         assert_eq!(
             app.repository_panel_destination(&fixture.root, other, Some(clone)),
@@ -12731,6 +12735,7 @@ fn attention_channel_test_app() -> (Cagents, CardId, crate::model::ChannelId) {
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
     drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
         SidebarFilter::Attention,
@@ -13524,6 +13529,7 @@ fn an_agent_finishing_its_turn_marks_its_project_for_a_read() {
             shared: false,
             cards: vec![card],
             focused: None,
+            checkout: None,
         });
     app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
     app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));

@@ -886,6 +886,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
     drop(app.resize_main_window(1200.0, 800.0));
     assert!(!app.sidebar_state.worktree_has_panes(second, nested_row));
@@ -1161,6 +1162,7 @@ fn refused_optimistic_channel_title_is_restored_by_equal_authoritative_read() {
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -1179,6 +1181,7 @@ fn refused_optimistic_channel_title_is_restored_by_equal_authoritative_read() {
                 title: "Original prompt title".into(),
                 title_source: ChannelTitleSource::Prompt,
                 ordinal: 1,
+                checkout: None,
             }],
             views: vec![View {
                 scope: Scope::Channel(channel),

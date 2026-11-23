@@ -8212,7 +8212,7 @@ impl Cagents {
             tasks.push(self.open_clicked_link(url));
         }
         if let Some(path) = checkout_open {
-            tasks.push(self.navigate_to_worktree(path, false));
+            tasks.push(self.open_checkout(path, false, DurableChange::Navigation).1);
         }
         if let Some((project, target)) = checkout {
             tasks.push(self.prepare_pr_checkout(card, project, target));
@@ -19714,9 +19714,10 @@ impl Cagents {
                             .worktrees
                             .push(SidebarWorktree::from_repository(&worktree, None));
                     }
-                    // The new row, the selection moving to it and its
-                    // terminal are projected after this update.
-                    let terminal = self.select_worktree(worktree.path, true);
+                    // The new row, its channel and that channel's first pane
+                    // are projected after this update.
+                    let (_, terminal) =
+                        self.open_checkout(worktree.path, true, DurableChange::Content);
                     Task::batch([
                         terminal,
                         self.repository_load_task(repository, Some(project_id), false),

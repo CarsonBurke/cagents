@@ -268,6 +268,7 @@ mod tests {
                 shared: false,
                 cards: vec![shell],
                 focused: Some(shell),
+                checkout: None,
             });
 
         // Nothing is derived while the view is closed.

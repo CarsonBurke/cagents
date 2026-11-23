@@ -165,6 +165,7 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
     app.workspace_model.identity = uuid::Uuid::new_v4();
     let (published, requests) = test_model_channel();
@@ -381,6 +382,7 @@ fn failed_first_start_save_retries_with_a_fresh_candidate_after_its_cause_is_rep
             shared: false,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
     app.workspace_model.identity = uuid::Uuid::new_v4();
     let _requests = shared_channel(&mut app, channel, card);
@@ -582,6 +584,7 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
                         shared: false,
                         cards: vec![card],
                         focused: Some(card),
+                        checkout: None,
                     });
             }
             "runtime-replaced" => {
@@ -720,6 +723,7 @@ fn changed_draft_or_source_and_stale_checkpoint_cannot_authorize_first_start() {
                         shared: false,
                         cards: vec![card],
                         focused: Some(card),
+                        checkout: None,
                     });
             }
             "backend" => {
@@ -1270,6 +1274,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
                 shared: true,
                 cards: vec![],
                 focused: None,
+                checkout: None,
             });
         Arc::make_mut(&mut app.durable).active_channel = Some(channel);
         app.active_workspace = Some(repository.clone());
@@ -1281,6 +1286,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             title: String::new(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         });
         app.workspace_model.views.push(View {
             revision: 1,

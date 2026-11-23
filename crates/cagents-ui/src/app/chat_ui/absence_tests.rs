@@ -67,6 +67,7 @@ fn world() -> World {
                 shared: true,
                 cards: vec![],
                 focused: None,
+                checkout: None,
             });
         app.workspace_model.channels.push(ModelChannel {
             id,
@@ -74,6 +75,7 @@ fn world() -> World {
             title: String::new(),
             title_source: Default::default(),
             ordinal,
+            checkout: None,
         });
         app.workspace_model.views.push(View {
             revision: 1,
@@ -122,6 +124,7 @@ fn unrelated_snapshot(world: &World, shape: Unrelated, step: u64) -> WorkspaceMo
                 title: format!("Other agent {step}"),
                 title_source: Default::default(),
                 ordinal: 10 + step as u32,
+                checkout: None,
             });
             model.views.push(View {
                 revision: 1,

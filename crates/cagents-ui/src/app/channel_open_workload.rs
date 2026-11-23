@@ -217,6 +217,7 @@ pub(super) fn large_workspace(scale: &Scale) -> (Cagents, Vec<ChannelId>, tempfi
             shared: true,
             cards: members.iter().map(|card| card.id).collect(),
             focused: members.first().map(|card| card.id),
+            checkout: None,
         });
         app.workspace_model
             .channels
@@ -226,6 +227,7 @@ pub(super) fn large_workspace(scale: &Scale) -> (Cagents, Vec<ChannelId>, tempfi
                 title: format!("Channel {index}"),
                 title_source: Default::default(),
                 ordinal: index as u32 + 1,
+                checkout: None,
             });
         durable.cards.extend(members);
         channels.push(id);

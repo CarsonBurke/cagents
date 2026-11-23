@@ -166,6 +166,7 @@ pub(crate) fn seed_store(
                     .filter(|id| held.contains(id))
                     .collect(),
                 focused: channel.focused.filter(|id| held.contains(id)),
+                checkout: None,
             })
             .collect(),
         active_channel: window.active_channel,

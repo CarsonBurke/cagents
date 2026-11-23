@@ -2202,6 +2202,7 @@ fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() 
         shared: false,
         cards: vec![card],
         focused: Some(card),
+        checkout: None,
     })
     .collect();
     app.sidebar_state
@@ -2343,6 +2344,7 @@ fn tail_only_history_cannot_replace_a_channels_first_task() {
         shared: true,
         cards: vec![card],
         focused: Some(card),
+        checkout: None,
     }];
     app.workspace_model.views = vec![View {
         scope: Scope::Channel(id),
@@ -4189,6 +4191,7 @@ fn new_panes_keep_the_selected_channel_when_launch_directory_changes() {
             shared: false,
             cards: vec![source],
             focused: Some(source),
+            checkout: None,
         });
         durable.active_channel = Some(channel);
         app.active_workspace = Some(root.clone());
@@ -9888,6 +9891,7 @@ fn a_refused_first_prompt_name_is_offered_again_from_a_chat_on_no_screen() {
         shared: true,
         cards: vec![card],
         focused: Some(card),
+        checkout: None,
     }];
     let pane = Pane::from_card(
         app.card_state(card).unwrap(),
@@ -9974,6 +9978,7 @@ fn a_cleared_channel_name_takes_its_conversation_name_again() {
         shared: true,
         cards: vec![card],
         focused: Some(card),
+        checkout: None,
     }];
     let pane = Pane::from_card(
         app.card_state(card).unwrap(),
@@ -10045,6 +10050,7 @@ fn a_cleared_channel_name_takes_its_conversation_name_again() {
         title: title.into(),
         title_source: ChannelTitleSource::Manual,
         ordinal: 1,
+        checkout: None,
     };
     app.workspace_model.identity = uuid::Uuid::new_v4();
     app.workspace_model.channels = vec![shared("Their name")];
@@ -10090,6 +10096,7 @@ fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof()
         shared: true,
         cards: vec![card],
         focused: Some(card),
+        checkout: None,
     }];
     Arc::make_mut(&mut app.durable).active_channel = Some(channel);
     app.sidebar_model
@@ -10115,6 +10122,7 @@ fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof()
         title: "Old automatic title".into(),
         title_source: ChannelTitleSource::Prompt,
         ordinal: 1,
+        checkout: None,
     }];
     let pane = Pane::from_card(
         app.card_state(card).unwrap(),
@@ -10218,6 +10226,7 @@ fn a_secondary_title_wake_is_used_when_it_becomes_primary_without_another_wake()
         shared: true,
         cards: vec![a, b],
         focused: Some(b),
+        checkout: None,
     }];
     app.workspace_model.views = vec![View {
         scope: Scope::Channel(id),
@@ -10329,6 +10338,7 @@ fn manual_channel_name_titles_its_main_chat_without_hiding_sibling_titles() {
         shared: false,
         cards: vec![card, sibling_id],
         focused: Some(card),
+        checkout: None,
     });
     assert_eq!(
         app.card_display_title(app.card_state(card).unwrap()),
@@ -10372,6 +10382,7 @@ fn manual_channel_title_survives_provider_updates_after_utility_and_closing_pane
         shared: false,
         cards: vec![CardId::new(), terminal_id, closing_id, card, sibling_id],
         focused: Some(card),
+        checkout: None,
     });
     assert_eq!(
         app.channel_primary_chat(app.durable.channels.last().unwrap()),
@@ -12029,6 +12040,7 @@ fn resuming_a_stopped_chat_keeps_its_transcript_and_draft_and_starts_once() {
         shared: true,
         cards: vec![],
         focused: None,
+        checkout: None,
     });
     durable.active_channel = Some(channel);
     drop(app.insert_chat_card(source.clone(), None, None));
@@ -12955,6 +12967,7 @@ fn retained_chat_close_and_channel_move_do_not_overtake_each_other() {
                 title: "Chat moves".into(),
                 title_source: Default::default(),
                 ordinal: 0,
+                checkout: None,
             })
             .collect();
         let mut view = View::empty(source);
@@ -12973,6 +12986,7 @@ fn retained_chat_close_and_channel_move_do_not_overtake_each_other() {
                 shared: true,
                 cards: if id == source { vec![card] } else { vec![] },
                 focused: (id == source).then_some(card),
+                checkout: None,
             });
         }
         let (tx, rx) = test_model_channel();
@@ -15790,6 +15804,7 @@ fn a_channel_closes_when_its_last_pane_does() {
             shared: true,
             cards: vec![terminal],
             focused: Some(terminal),
+            checkout: None,
         });
         durable.active_channel = Some(channel);
         // Already in the chat's directory, so starting it changes no scope.
@@ -15825,6 +15840,7 @@ fn a_channel_closes_when_its_last_pane_does() {
             title: String::new(),
             title_source: Default::default(),
             ordinal: home.creation_ordinal,
+            checkout: None,
         });
         let panes = [terminal, chat]
             .into_iter()
@@ -16406,6 +16422,7 @@ fn a_chat_replaced_by_its_provider_cli_keeps_its_channel() {
         shared: false,
         cards: Vec::new(),
         focused: None,
+        checkout: None,
     });
     durable.active_channel = Some(channel);
     app.active_workspace = Some(PathBuf::from(FIXTURE_DIRECTORY));
@@ -23820,6 +23837,7 @@ fn live_shared_recovery_fixture_for_identity(session_id: Option<&str>) -> LiveSh
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
     }
     app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
@@ -23841,6 +23859,7 @@ fn live_shared_recovery_fixture_for_identity(session_id: Option<&str>) -> LiveSh
             title: "Recovery fixture".into(),
             title_source: Default::default(),
             ordinal: 1,
+            checkout: None,
         }],
         views: vec![view],
         ..WorkspaceModel::default()

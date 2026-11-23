@@ -1856,6 +1856,7 @@ pub(in crate::app) mod tests {
             title: "Retained Home".into(),
             title_source: Default::default(),
             ordinal: home.creation_ordinal,
+            checkout: None,
         });
         app.workspace_model.views.push(View {
             scope: Scope::Channel(home.channel),
@@ -1874,6 +1875,7 @@ pub(in crate::app) mod tests {
             shared: true,
             cards: vec![card],
             focused: Some(card),
+            checkout: None,
         });
         // This reducer fixture has no resident worker. Supply its simulated
         // positive-absence receipt before testing canonical Home retirement.
