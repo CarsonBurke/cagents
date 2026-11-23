@@ -37,6 +37,7 @@ mod latency_ui;
 mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
+mod pane_follow;
 mod pane_inspector;
 mod pr_checkout_ui;
 mod project_ui;
@@ -5447,6 +5448,7 @@ pub enum Message {
     ChatUi(chat_ui::Action),
     UpdateUi(update_ui::Action),
     UpdateResume(update_resume::Action),
+    MovedPane(pane_follow::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
     SidebarSelection(sidebar_selection_ui::Action),
@@ -6115,6 +6117,8 @@ pub struct Cagents {
     resume_ui: resume_ui::State,
     update_ui: update_ui::State,
     update_resume: update_resume::State,
+    /// Where a pane another client moved out of this window's channel went.
+    pane_follow: Option<pane_follow::Notice>,
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
@@ -16543,6 +16547,7 @@ impl Application for Cagents {
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::new(),
             update_resume,
+            pane_follow: None,
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
@@ -16809,6 +16814,7 @@ impl Application for Cagents {
             part!("chat", self.chat_subscription()),
             part!("notification", self.notification_subscription()),
             part!("notice expiry", self.notice_expiry_subscription()),
+            part!("moved pane notice", self.pane_follow_subscription()),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             Subscription::run(crate::desktop_cursor_blink::stream).map(Message::CursorBlink),
             part!("refresh", self.refresh_subscription()),
@@ -17567,6 +17573,7 @@ impl Application for Cagents {
                 .map(Message::OperationRecovery),
             self.daemon_health_banner(),
             self.update_resume_banner(),
+            self.pane_follow_banner(),
             self.automation_approval_banner(),
             bar,
         ])
@@ -18464,6 +18471,7 @@ impl Cagents {
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
             Message::UpdateResume(action) => self.update_update_resume(action),
+            Message::MovedPane(action) => self.update_pane_follow(action),
             Message::StartupWindowOpened(window) => {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
