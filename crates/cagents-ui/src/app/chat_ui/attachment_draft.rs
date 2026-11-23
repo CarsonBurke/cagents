@@ -4,20 +4,13 @@ use crate::editor_history::{self, Excerpt, TextChange};
 use cosmic::widget::text_editor::{self, Content, Cursor, Position};
 
 /// Native lines preserve boundaries which a whole-string line parser can merge.
-pub(super) fn excerpt(
-    content: &Content<cosmic::Renderer>,
-    first: usize,
-    last: usize,
-    normalized: bool,
-) -> Excerpt {
+pub(super) fn excerpt(content: &Content<cosmic::Renderer>, first: usize, last: usize) -> Excerpt {
     let count = content.line_count();
     let mut result = Excerpt::new(first);
     for index in first..=last.min(count.saturating_sub(1)) {
         if let Some(line) = content.line(index) {
             let ending = if index + 1 == count {
                 ""
-            } else if normalized {
-                "\n"
             } else if line.ending == text_editor::LineEnding::None {
                 text_editor::LineEnding::default().as_str()
             } else {
@@ -40,70 +33,12 @@ pub(super) fn move_to(content: &mut Content, cursor: Cursor) {
     content.move_to(cursor);
 }
 
-fn selected_span(content: &Content<cosmic::Renderer>, view: &Excerpt) -> Option<Cursor> {
-    let cursor = content.cursor();
-    let Some(anchor) = cursor.selection else {
-        return Some(cursor);
-    };
-    let Some(selected) = content.selection().filter(|s| !s.is_empty()) else {
-        return Some(Cursor {
-            position: cursor.position,
-            selection: None,
-        });
-    };
-    let locate = |view: &Excerpt| {
-        let caret = view.offset(cursor.position)?;
-        let anchor = view.offset(anchor)?;
-        let (low, high) = (caret.min(anchor), caret.max(anchor));
-        let mut found = None;
-        // Word/line selections expose their original anchor, not the expanded
-        // span. Accept one exact containing match; ambiguity cancels late IO.
-        let mut from = high.saturating_sub(selected.len());
-        while !view.text().is_char_boundary(from) {
-            from -= 1;
-        }
-        while from <= low {
-            let Some(at) = view.text().get(from..)?.find(&selected).map(|at| at + from) else {
-                break;
-            };
-            if at > low {
-                break;
-            }
-            let end = at + selected.len();
-            if end >= high {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some((view.position(at), view.position(end)));
-            }
-            from = at + view.text().get(at..)?.chars().next()?.len_utf8();
-        }
-        let (start, end) = found?;
-        Some(if caret < anchor {
-            Cursor {
-                position: start,
-                selection: Some(end),
-            }
-        } else {
-            Cursor {
-                position: end,
-                selection: Some(start),
-            }
-        })
-    };
-    locate(view).or_else(|| {
-        let first = view.position(0).line;
-        let last = cursor.position.line.max(anchor.line).saturating_add(1);
-        locate(&excerpt(content, first, last, true))
-    })
-}
-
-/// The lines around the cursor that hold its selection's actual span.
-fn cursor_lines(content: &Content<cosmic::Renderer>) -> (usize, usize) {
-    let cursor = content.cursor();
-    let anchor = cursor.selection.unwrap_or(cursor.position);
-    let first = cursor.position.line.min(anchor.line).saturating_sub(1);
-    let last = cursor
+/// The lines an edit of the composer's selection can reach: those it covers,
+/// and one either side for a delete that joins lines.
+fn edited_lines(content: &Content<cosmic::Renderer>, span: Cursor) -> (usize, usize) {
+    let anchor = span.selection.unwrap_or(span.position);
+    let first = span.position.line.min(anchor.line).saturating_sub(1);
+    let last = span
         .position
         .line
         .max(anchor.line)
@@ -112,27 +47,21 @@ fn cursor_lines(content: &Content<cosmic::Renderer>) -> (usize, usize) {
     (first, last)
 }
 
-/// The span the composer's selection covers, as a plain selection from its
-/// anchor to its caret. A word or line selection reports only where it
-/// began; `None` when its span can't be told apart from another like it.
-pub(super) fn selection_span(content: &Content<cosmic::Renderer>) -> Option<Cursor> {
-    let (first, last) = cursor_lines(content);
-    selected_span(content, &excerpt(content, first, last, false))
-}
-
-/// Perform the real composer edit, measuring its local replacement only when
-/// an attachment needs mapping. This adapter leaves native editing and Undo alone.
+/// Perform the real composer edit and measure what it replaced, or `None`
+/// when it changed nothing. The selection's actual span, which a word or
+/// line selection's cursor does not report, says where the edit begins, so a
+/// change beside repeated text is placed where the reader made it.
 pub(super) fn edit(
     content: &mut Content<cosmic::Renderer>,
     edit: text_editor::Edit,
-) -> Result<Option<TextChange>, ()> {
+) -> Option<TextChange> {
     let count = content.line_count();
-    let (first, last) = cursor_lines(content);
-    let before = excerpt(content, first, last, false);
-    let selection = selected_span(content, &before);
-    let changed_from = selection.and_then(|selection| {
-        let caret = before.offset(selection.position)?;
-        Some(match selection.selection {
+    let span = content.selection_span();
+    let (first, last) = edited_lines(content, span);
+    let before = excerpt(content, first, last);
+    let changed_from = (|| {
+        let caret = before.offset(span.position)?;
+        Some(match span.selection {
             Some(anchor) => caret.min(before.offset(anchor)?),
             None if matches!(edit, text_editor::Edit::Backspace) => before
                 .text()
@@ -142,17 +71,18 @@ pub(super) fn edit(
                 .map_or(caret, |c| caret - c.len_utf8()),
             None => caret,
         })
-    });
+    })()
+    // Without a known start the difference alone still describes the edit.
+    .unwrap_or(usize::MAX);
     content.perform(text_editor::Action::Edit(edit));
-    let changed_from = changed_from.ok_or(())?;
     let after_count = content.line_count();
     let after_last = last
         .saturating_add(after_count)
         .saturating_sub(count)
         .max(first)
         .min(after_count.saturating_sub(1));
-    let after = excerpt(content, first, after_last, false);
-    Ok(editor_history::replacement(&before, &after, changed_from))
+    let after = excerpt(content, first, after_last);
+    editor_history::replacement(&before, &after, changed_from)
 }
 
 #[derive(Clone, Copy)]
@@ -161,22 +91,10 @@ pub(super) struct Bookmark {
     pub valid: bool,
 }
 impl Bookmark {
+    /// Where an insertion made now would go: over the selection's actual
+    /// span, or at the caret.
     pub fn capture(content: &Content) -> Self {
-        let cursor = content.cursor();
-        let anchor = cursor.selection.unwrap_or(cursor.position);
-        let view = excerpt(
-            content,
-            cursor.position.line.min(anchor.line).saturating_sub(1),
-            cursor.position.line.max(anchor.line).saturating_add(1),
-            false,
-        );
-        match selected_span(content, &view) {
-            Some(cursor) => Self::new(cursor),
-            None => Self {
-                cursor,
-                valid: false,
-            },
-        }
+        Self::new(content.selection_span())
     }
     pub fn new(cursor: Cursor) -> Self {
         Self {
@@ -385,16 +303,14 @@ mod tests {
             position: point(0, 0),
             selection: None,
         });
-        let change = edit(&mut content, Edit::Paste(Arc::new("🚀\n".into())))
-            .unwrap()
-            .unwrap();
+        let change = edit(&mut content, Edit::Paste(Arc::new("🚀\n".into()))).unwrap();
         bookmark.changed(&change);
         assert!(bookmark.valid);
         assert_eq!(bookmark.cursor.position, point(2, 3));
         // Later typing at the exact captured point goes after the incoming
         // image; callbacks completing out of order remain at their own anchor.
         content.move_to(bookmark.cursor);
-        let change = edit(&mut content, Edit::Insert('x')).unwrap().unwrap();
+        let change = edit(&mut content, Edit::Insert('x')).unwrap();
         bookmark.changed(&change);
         assert_eq!(bookmark.cursor.position, point(2, 3));
     }
@@ -409,7 +325,7 @@ mod tests {
             position: point(0, 8),
             selection: None,
         });
-        let change = edit(&mut content, Edit::Insert('!')).unwrap().unwrap();
+        let change = edit(&mut content, Edit::Insert('!')).unwrap();
         bookmark.changed(&change);
         assert!(!bookmark.valid);
         assert_eq!(content.text(), "alpha be!ta gamma");
@@ -426,12 +342,12 @@ mod tests {
                 position: point(0, at),
                 selection: None,
             });
-            let change = edit(&mut content, Edit::Insert('!')).unwrap().unwrap();
+            let change = edit(&mut content, Edit::Insert('!')).unwrap();
             bookmark.changed(&change);
             assert_eq!(bookmark.valid, valid, "insertion at selection edge {at}");
             if valid {
                 content.move_to(bookmark.cursor);
-                edit(&mut content, Edit::Paste(Arc::new("[Image 1]".into()))).unwrap();
+                edit(&mut content, Edit::Paste(Arc::new("[Image 1]".into())));
                 assert_eq!(
                     content.text(),
                     "alpha [Image 1]! gamma",
@@ -462,13 +378,63 @@ mod tests {
             assert!(bookmark.valid);
             let selected = content.selection().unwrap();
             content.move_to(bookmark.cursor);
-            let change = edit(&mut content, Edit::Paste(Arc::new("[Image 1]".into())))
-                .unwrap()
-                .unwrap();
+            let change = edit(&mut content, Edit::Paste(Arc::new("[Image 1]".into()))).unwrap();
             assert_eq!(change.start, bookmark.cursor.selection.unwrap());
             assert_eq!(change.removed.replace("\r\n", "\n"), selected);
             assert!(content.text().contains("[Image 1]"));
         }
+    }
+
+    /// A word or line selection's cursor reports the points it was made
+    /// between; the editor reports the span it covers, even where the
+    /// selected text fits more than one place around those points (#3693).
+    #[test]
+    fn word_and_line_selections_report_and_edit_the_span_they_cover() {
+        let span = |content: &Content<cosmic::Renderer>| content.selection_span();
+        let mut content = Content::<cosmic::Renderer>::with_text("ab 中中中\nnext");
+        content.move_to(Cursor {
+            position: point(0, 6),
+            selection: None,
+        });
+        content.perform(text_editor::Action::SelectWord);
+        assert_eq!(content.selection().as_deref(), Some("中中"));
+        assert_eq!(content.cursor().position, point(0, 6), "the click point");
+        assert_eq!(
+            span(&content),
+            Cursor {
+                position: point(0, 9),
+                selection: Some(point(0, 3)),
+            }
+        );
+        // Dragged back over the word before, the caret leads at the start.
+        content.perform(text_editor::Action::Select(text_editor::Motion::Left));
+        assert_eq!(content.selection().as_deref(), Some("ab 中中"));
+        assert_eq!(
+            span(&content),
+            Cursor {
+                position: point(0, 0),
+                selection: Some(point(0, 9)),
+            }
+        );
+        let change = edit(&mut content, Edit::Insert('x')).unwrap();
+        assert_eq!(change.start, point(0, 0));
+        assert_eq!(change.removed, "ab 中中");
+        assert_eq!(content.text(), "x中\nnext");
+
+        content.move_to(Cursor {
+            position: point(1, 2),
+            selection: None,
+        });
+        content.perform(text_editor::Action::SelectLine);
+        assert_eq!(
+            span(&content),
+            Cursor {
+                position: point(1, 4),
+                selection: Some(point(1, 0)),
+            }
+        );
+        content.perform(text_editor::Action::ClearSelection);
+        assert_eq!(span(&content).selection, None);
     }
 
     #[test]
@@ -478,18 +444,18 @@ mod tests {
             position: point(0, 1),
             selection: None,
         });
-        let change = edit(&mut content, Edit::Insert('a')).unwrap().unwrap();
+        let change = edit(&mut content, Edit::Insert('a')).unwrap();
         assert_eq!(change.start, point(0, 1));
         assert_eq!(change.inserted, "a");
         content.move_to(Cursor {
             position: point(1, 2),
             selection: None,
         });
-        let change = edit(&mut content, Edit::Backspace).unwrap().unwrap();
+        let change = edit(&mut content, Edit::Backspace).unwrap();
         assert_eq!(change.start, point(1, 0));
         assert_eq!(change.removed, "π");
         assert_eq!(
-            excerpt(&content, 0, content.line_count() - 1, false).text(),
+            excerpt(&content, 0, content.line_count() - 1).text(),
             content.text()
         );
     }

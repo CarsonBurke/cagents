@@ -98,8 +98,7 @@ impl Cagents {
             return Task::none();
         };
         runtime.replace_draft(text_editor::Content::new());
-        runtime.history_cursor = None;
-        runtime.history_stash = None;
+        runtime.end_history_walk();
         self.chat_ui.drafts.remove(&target.card);
         self.persist();
         Task::none()
@@ -112,7 +111,7 @@ impl Runtime {
             .history_stash
             .as_ref()
             .filter(|_| self.history_cursor.is_some())
-            .unwrap_or(&self.composer);
+            .map_or(&self.composer, |stash| &stash.composer);
         !content.is_empty()
     }
 

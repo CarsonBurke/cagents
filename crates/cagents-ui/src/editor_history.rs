@@ -15,6 +15,11 @@
 //!
 //! Memory is bounded per document by both the number of steps and the bytes
 //! they retain; the oldest steps are forgotten first.
+//!
+//! A step may also carry *effects*: changes the document's owner made beside
+//! its text, such as taking an attachment off a draft, which undo reverses
+//! and redo makes again through the [`EditBuffer`]. A document with none
+//! uses `()`.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -59,6 +64,18 @@ impl TextChange {
         advance_native(self.start, self.inserted.len(), &self.inserted_breaks)
     }
 
+    /// The change that takes this one back, addressed against the document
+    /// this one produced.
+    pub fn inverse(&self) -> Self {
+        Self {
+            start: self.start,
+            removed: self.inserted.clone(),
+            inserted: self.removed.clone(),
+            removed_breaks: self.inserted_breaks.clone(),
+            inserted_breaks: self.removed_breaks.clone(),
+        }
+    }
+
     fn bytes(&self) -> usize {
         self.removed.capacity()
             + self.inserted.capacity()
@@ -82,8 +99,9 @@ pub enum EditKind {
     Other,
 }
 
-/// A buffer the history can rewind and replay.
-pub trait EditBuffer {
+/// A buffer the history can rewind and replay, with the effects `E` its
+/// steps carry beside the text.
+pub trait EditBuffer<E = ()> {
     /// Replaces `expected`, which starts at `start`, with `replacement`.
     ///
     /// Refuses — answering `false` and changing nothing — when the text at
@@ -99,13 +117,26 @@ pub trait EditBuffer {
 
     /// Places the caret, and the selection with it.
     fn set_cursor(&mut self, cursor: Cursor);
+
+    /// Told of each change a replay has just made, in the order made: undo
+    /// reverses `change` (`undone`), redo makes it again. Anything that
+    /// follows positions in the text, such as an insertion still on its way,
+    /// moves with it as it would with any other edit.
+    fn replayed(&mut self, _change: &TextChange, _undone: bool) {}
+
+    /// Reverses an effect a step carries (`undone`), or makes it again.
+    /// Undo reverses a step's effects after its text, last first; redo makes
+    /// them again after its text, in order.
+    fn effect(&mut self, _effect: &E, _undone: bool) {}
 }
 
 #[derive(Debug, Clone)]
-struct Transaction {
+struct Transaction<E> {
     before_revision: u64,
     after_revision: u64,
     changes: Vec<TextChange>,
+    /// What the step changed beside the text, in the order it was done.
+    effects: Vec<E>,
     /// The caret before the first change, restored by undo.
     before: Cursor,
     /// The caret after the last change, restored by redo.
@@ -114,11 +145,12 @@ struct Transaction {
     last_edit: Instant,
 }
 
-impl Transaction {
+impl<E> Transaction<E> {
     fn bytes(&self) -> usize {
         TRANSACTION_OVERHEAD
             + self.changes.capacity() * std::mem::size_of::<TextChange>()
             + self.changes.iter().map(TextChange::bytes).sum::<usize>()
+            + self.effects.capacity() * std::mem::size_of::<E>()
     }
 }
 
@@ -137,11 +169,11 @@ pub enum Replay {
 
 /// One document's undo and redo stacks.
 #[derive(Debug)]
-pub struct History {
+pub struct History<E = ()> {
     revision: u64,
     next_revision: u64,
-    undo: VecDeque<Transaction>,
-    redo: Vec<Transaction>,
+    undo: VecDeque<Transaction<E>>,
+    redo: Vec<Transaction<E>>,
     /// Whether the newest undo step may still absorb the next keystroke.
     open: bool,
     /// Bytes retained by both stacks, as [`Transaction::bytes`] counts them.
@@ -152,11 +184,16 @@ pub struct History {
 
 impl Default for History {
     fn default() -> Self {
-        Self::with_limits(MAX_TRANSACTIONS, MAX_BYTES)
+        Self::new()
     }
 }
 
-impl History {
+impl<E> History<E> {
+    /// An empty history with the default budget.
+    pub fn new() -> Self {
+        Self::with_limits(MAX_TRANSACTIONS, MAX_BYTES)
+    }
+
     fn with_limits(max_transactions: usize, max_bytes: usize) -> Self {
         Self {
             revision: 0,
@@ -270,6 +307,7 @@ impl History {
                 after_revision,
                 before,
                 changes: vec![change],
+                effects: Vec::new(),
                 after,
                 kind,
                 last_edit: now,
@@ -301,6 +339,7 @@ impl History {
                 before_revision,
                 after_revision,
                 changes,
+                effects: Vec::new(),
                 before,
                 after,
                 kind: EditKind::Other,
@@ -310,8 +349,28 @@ impl History {
         );
     }
 
+    /// Records a step that changed nothing in the text, only `effect` beside
+    /// it, with the caret at `at`. It never coalesces with its neighbours.
+    pub fn record_effect(&mut self, effect: E, at: Cursor, now: Instant) {
+        self.drop_redo();
+        let (before_revision, after_revision) = self.advance_revision();
+        self.push(
+            Transaction {
+                before_revision,
+                after_revision,
+                changes: Vec::new(),
+                effects: vec![effect],
+                before: at,
+                after: at,
+                kind: EditKind::Other,
+                last_edit: now,
+            },
+            false,
+        );
+    }
+
     /// Reverts the newest step and restores the caret it started from.
-    pub fn undo(&mut self, buffer: &mut impl EditBuffer) -> Replay {
+    pub fn undo(&mut self, buffer: &mut impl EditBuffer<E>) -> Replay {
         self.open = false;
         let Some(transaction) = self.undo.pop_back() else {
             return Replay::Empty;
@@ -326,6 +385,10 @@ impl History {
                 self.clear();
                 return Replay::Diverged;
             }
+            buffer.replayed(change, true);
+        }
+        for effect in transaction.effects.iter().rev() {
+            buffer.effect(effect, true);
         }
         buffer.set_cursor(transaction.before);
         self.revision = transaction.before_revision;
@@ -334,7 +397,7 @@ impl History {
     }
 
     /// Re-applies the newest undone step and restores the caret it ended at.
-    pub fn redo(&mut self, buffer: &mut impl EditBuffer) -> Replay {
+    pub fn redo(&mut self, buffer: &mut impl EditBuffer<E>) -> Replay {
         self.open = false;
         let Some(transaction) = self.redo.pop() else {
             return Replay::Empty;
@@ -349,6 +412,10 @@ impl History {
                 self.clear();
                 return Replay::Diverged;
             }
+            buffer.replayed(change, false);
+        }
+        for effect in &transaction.effects {
+            buffer.effect(effect, false);
         }
         buffer.set_cursor(transaction.after);
         self.revision = transaction.after_revision;
@@ -356,7 +423,7 @@ impl History {
         Replay::Applied
     }
 
-    fn push(&mut self, transaction: Transaction, open: bool) {
+    fn push(&mut self, transaction: Transaction<E>, open: bool) {
         self.bytes += transaction.bytes();
         self.undo.push_back(transaction);
         self.open = open;
@@ -386,7 +453,12 @@ impl History {
 }
 
 /// Whether `change` extends `last`, merging it in when it does.
-fn coalesce(last: &mut Transaction, change: &TextChange, kind: EditKind, now: Instant) -> bool {
+fn coalesce<E>(
+    last: &mut Transaction<E>,
+    change: &TextChange,
+    kind: EditKind,
+    now: Instant,
+) -> bool {
     if kind == EditKind::Other
         || last.kind != kind
         || now.saturating_duration_since(last.last_edit) > GROUP_IDLE
@@ -1418,5 +1490,92 @@ mod tests {
             while history.redo(&mut model) == Replay::Applied {}
             assert_eq!(model.text, last, "round {round}");
         }
+    }
+
+    /// A buffer that keeps the order in which a replay reports its text
+    /// changes and its effects.
+    #[derive(Default)]
+    struct Ledger {
+        model: Option<Model>,
+        events: Vec<String>,
+    }
+
+    impl EditBuffer<&'static str> for Ledger {
+        fn replace(
+            &mut self,
+            start: Position,
+            expected: &str,
+            replacement: &str,
+            breaks: &[usize],
+        ) -> bool {
+            self.model
+                .as_mut()
+                .unwrap()
+                .replace(start, expected, replacement, breaks)
+        }
+
+        fn set_cursor(&mut self, cursor: Cursor) {
+            self.model.as_mut().unwrap().set_cursor(cursor);
+        }
+
+        fn replayed(&mut self, change: &TextChange, undone: bool) {
+            let change = if undone {
+                change.inverse()
+            } else {
+                change.clone()
+            };
+            self.events.push(format!(
+                "{:?}->{:?}@{}",
+                change.removed, change.inserted, change.start.column
+            ));
+        }
+
+        fn effect(&mut self, effect: &&'static str, undone: bool) {
+            self.events
+                .push(format!("{}{effect}", if undone { "-" } else { "+" }));
+        }
+    }
+
+    #[test]
+    fn a_step_of_effects_alone_is_undone_and_redone_in_its_place() {
+        let mut history = History::<&'static str>::new();
+        let mut ledger = Ledger {
+            model: Some(Model::new("")),
+            ..Ledger::default()
+        };
+        let now = Instant::now();
+        let record = |history: &mut History<&'static str>, model: &mut Model, text: &str| {
+            let offset = model.text.len();
+            let before = Excerpt::document(&model.text);
+            model.text.push_str(text);
+            let after = Excerpt::document(&model.text);
+            let change = replacement(&before, &after, offset).unwrap();
+            history.record(change, EditKind::Other, model.cursor, model.cursor, now);
+        };
+        record(&mut history, ledger.model.as_mut().unwrap(), "ab");
+        let cursor = ledger.model.as_ref().unwrap().cursor;
+        history.record_effect("tile", cursor, now);
+        record(&mut history, ledger.model.as_mut().unwrap(), "c");
+
+        assert_eq!(history.undo(&mut ledger), Replay::Applied);
+        assert_eq!(history.undo(&mut ledger), Replay::Applied);
+        assert_eq!(ledger.model.as_ref().unwrap().text, "ab", "no text moved");
+        assert_eq!(history.undo(&mut ledger), Replay::Applied);
+        assert_eq!(ledger.model.as_ref().unwrap().text, "");
+        assert_eq!(history.redo(&mut ledger), Replay::Applied);
+        assert_eq!(history.redo(&mut ledger), Replay::Applied);
+        assert_eq!(
+            ledger.events,
+            [
+                r#""c"->""@2"#,
+                "-tile",
+                r#""ab"->""@0"#,
+                r#"""->"ab"@0"#,
+                "+tile",
+            ]
+        );
+        // A new step drops the effect's redo with the rest.
+        record(&mut history, ledger.model.as_mut().unwrap(), "d");
+        assert!(!history.can_redo());
     }
 }

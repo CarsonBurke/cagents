@@ -84,6 +84,15 @@ impl Pane {
     pub(super) fn is_session(&self) -> bool {
         matches!(self, Self::Session(_))
     }
+
+    /// Where a session's text begins and where its next words go, which
+    /// follow every change of the draft, an undo step's included.
+    pub(super) fn places(&mut self) -> Vec<&mut attachment_draft::Bookmark> {
+        match self {
+            Self::Session(session) => vec![&mut session.start, &mut session.end],
+            _ => Vec::new(),
+        }
+    }
 }
 
 pub(super) struct Session {
@@ -217,22 +226,11 @@ impl Runtime {
         if spaced {
             insertion.push(' ');
         }
-        let change = match attachment_draft::edit(
+        let Some(change) = attachment_draft::edit(
             &mut self.composer,
             text_editor::Edit::Paste(Arc::new(insertion)),
-        ) {
-            Ok(Some(change)) => change,
-            Ok(None) => return,
-            Err(()) => {
-                // Written, but not measurably: nothing placed by position
-                // can be trusted, nor undo steps that would replay over it.
-                for bookmark in self.attachment_bookmarks.values_mut() {
-                    bookmark.valid = false;
-                }
-                self.dictation_lost_place();
-                self.composer_undo.clear();
-                return;
-            }
+        ) else {
+            return;
         };
         for bookmark in self.attachment_bookmarks.values_mut() {
             bookmark.changed(&change);
@@ -284,7 +282,7 @@ impl Runtime {
         }
     }
 
-    /// An edit whose extent could not be measured: where dictation was
+    /// An edit that does not say where it moved text: where dictation was
     /// writing is unknown, so what follows goes at the end of the draft and
     /// Discard keeps what is there.
     pub(super) fn dictation_lost_place(&mut self) {
@@ -325,28 +323,19 @@ impl Runtime {
                 selection: Some(start.cursor.position),
             },
         );
-        match attachment_draft::edit(&mut self.composer, text_editor::Edit::Delete) {
-            Ok(Some(change)) => {
-                for bookmark in self.attachment_bookmarks.values_mut() {
-                    bookmark.changed(&change);
-                }
-                self.cancel_invalid_attachment_jobs();
-                // Discarding is a step too, so undo brings the words back.
-                self.composer_undo.record(
-                    change,
-                    crate::editor_history::EditKind::Other,
-                    before,
-                    self.composer.cursor(),
-                    std::time::Instant::now(),
-                );
+        if let Some(change) = attachment_draft::edit(&mut self.composer, text_editor::Edit::Delete) {
+            for bookmark in self.attachment_bookmarks.values_mut() {
+                bookmark.changed(&change);
             }
-            Ok(None) => {}
-            Err(()) => {
-                for bookmark in self.attachment_bookmarks.values_mut() {
-                    bookmark.valid = false;
-                }
-                self.composer_undo.clear();
-            }
+            self.cancel_invalid_attachment_jobs();
+            // Discarding is a step too, so undo brings the words back.
+            self.composer_undo.record(
+                change,
+                crate::editor_history::EditKind::Other,
+                before,
+                self.composer.cursor(),
+                std::time::Instant::now(),
+            );
         }
         self.reconcile_references(inline);
         self.revision = self.revision.wrapping_add(1);
@@ -1386,7 +1375,6 @@ mod tests {
             &mut runtime.composer,
             text_editor::Edit::Paste(Arc::new("Oh, ".to_owned())),
         )
-        .unwrap()
         .unwrap();
         runtime.dictation_edited(&change);
         hear(&mut app, final_text("two"));
@@ -1425,6 +1413,21 @@ mod tests {
         assert_eq!(draft(&app, card), "Hello there again world");
         assert!(app.chat_runtime_mut(target).unwrap().undo_composer(false));
         assert_eq!(draft(&app, card), "Hello there world");
+    }
+
+    /// Undo moves text as any edit does, so where the next words go follows
+    /// it: taking back a misheard utterance leaves dictation writing there.
+    #[test]
+    fn after_undoing_an_utterance_the_next_one_lands_in_its_place() {
+        let (mut app, card, target) = dictating("Hello world", 5);
+        hear(&mut app, final_text("there"));
+        assert!(app.chat_runtime_mut(target).unwrap().undo_composer(false));
+        assert_eq!(draft(&app, card), "Hello world");
+        hear(&mut app, final_text("again"));
+        assert_eq!(draft(&app, card), "Hello again world");
+        // Discard takes back what this session still has in the draft.
+        drop(app.handle_chat_ui(Action::DictationDiscard(target)));
+        assert_eq!(draft(&app, card), "Hello world");
     }
 
     #[test]
