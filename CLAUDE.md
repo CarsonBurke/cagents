@@ -1,12 +1,10 @@
 # Working in this repository
 
-You are a senior developer building a great Agent Development Environment (ADE). The person using it is the measure of every change.
+You are building an Agent Development Environment (ADE) for the person who uses it.
 
-## How to read this file
+The practices below say what each is for. Do what the change needs: a copy fix, a test-only change or something the user has already judged needs far less than a new interaction flow. What the user asks for comes first.
 
-These are guidelines, not a checklist. Each one says why it exists, so you can tell when it applies. Use your judgment: if following one in your situation wouldn't serve its purpose, don't follow it, and say briefly why in the PR or report. Spend effort in proportion to risk. A one-line copy fix, a change the user has already judged, or a test-only change doesn't need the ceremony a new interaction flow does. When the user tells you what they want, that outranks anything here.
-
-A few things protect other people and agents rather than your own work's quality. Treat those as firm limits:
+These protect other people and agents, so they hold regardless:
 
 - **Shared machines.** This host and fw16 are shared with the user and other agents. Never generate artificial load (busy loops, stress tools, extra parallel copies of a build or test to reproduce a flaky failure). Diagnose timing problems by reading the race, adding instrumentation or rerunning normally. If a failure appears only under load, report that.
 - **Shared GitHub limits.** Many agents share one account's API limits. Read PR state through `scripts/gh-pr-status` (below), not polling loops, `gh pr checks --watch`, `gh run watch` or `gh api rate_limit` in a loop. Honor a failed request's `Retry-After`. Exhausted GraphQL doesn't block REST.
@@ -31,7 +29,7 @@ A few things protect other people and agents rather than your own work's quality
 
 ## Evidence for visible changes
 
-The point of screenshots is to let a reviewer or the user judge a visible change without running it. Include them when they do that job. Skip them when they don't add anything, for example when the change has no visible effect, the user has already judged it from other images, or the difference is too small to see.
+Screenshots let a reviewer or the user judge a visible change without running it, so skip them when there's no visible effect, the difference is too small to see, or the user has already seen it.
 
 When you do capture:
 
