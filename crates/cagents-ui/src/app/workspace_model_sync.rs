@@ -1160,25 +1160,41 @@ impl Cagents {
         update: ModelUpdate,
     ) -> (Task<Message>, Projection) {
         // Another client's move of a pane out of the channel this window
-        // shows, read before the move empties it here.
+        // shows, read before the move empties it here. Both reads are of the
+        // window's channels, which in a run hold only the edges reconciled so
+        // far: a move out of the shown channel first settles what the edges
+        // before it owe, so it meets the window as it would alone.
+        let mut tasks = Vec::new();
+        let mut settled = Projection::Unchanged;
         let departure = match &update {
             ModelUpdate::Changed { edit, changes, .. }
                 if changes
                     .identity
                     .is_none_or(|identity| identity == self.workspace_model.identity) =>
             {
+                if self.moves_out_of_shown_channel(edit) {
+                    settled = self.settle_observed_run(&mut tasks);
+                }
                 self.pane_departure(edit)
             }
             _ => None,
         };
         let (task, projection) = self.project_workspace_model_update(update);
+        let projection = projection.widen(settled);
+        // An update that settled nothing keeps its own task as it is.
+        let task = if tasks.is_empty() {
+            task
+        } else {
+            tasks.push(task);
+            Task::batch(std::mem::take(&mut tasks))
+        };
         let Some(departure) = departure else {
             return (task, projection);
         };
+        tasks.push(task);
         // The departure reads where the edit put the pane, which only the
         // reconciliation the edge owes writes into the window's channels; in
         // a run that reconciliation would otherwise wait for the run's end.
-        let mut tasks = vec![task];
         let projection = projection.widen(self.settle_observed_run(&mut tasks));
         let active = self.durable.active_channel;
         tasks.push(self.pane_departed(departure));
@@ -1636,9 +1652,16 @@ impl Cagents {
                 ) else {
                     return Task::none();
                 };
+                // Retiring reads the window's channels for work an emptied
+                // view leaves behind, so in a run it needs the edges before
+                // this receipt reconciled, as they would be one at a time.
+                let mut settled = Vec::new();
                 match &edit {
                     ModelEdit::ChangeView { scope, .. } => {
                         self.acknowledge_view_edit(scope.clone(), operation);
+                        if !self.channel_ui.retire_candidates.is_empty() {
+                            self.settle_observed_run(&mut settled);
+                        }
                         self.retire_settled_empty_channels();
                         self.retarget_transferred_pane_updates(transferred);
                     }
@@ -1664,7 +1687,7 @@ impl Cagents {
                 let projected = title
                     .and_then(|id| self.absorb_channel_title(id))
                     .unwrap_or_else(|| self.reconcile_after_edge());
-                Task::batch([result, finish, projected])
+                Task::batch(settled.into_iter().chain([result, finish, projected]))
             }
             ModelUpdate::ScopeConflicted {
                 identity,

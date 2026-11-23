@@ -73,6 +73,22 @@ impl Cagents {
     /// read before the edit is applied. Only another client's transfer
     /// counts: this window's own move already shows the pane where the
     /// person put it, and its late echo finds the pane gone from here.
+    /// Whether `edit` moves a pane out of the channel this window shows to
+    /// another channel, the only edit [`Self::pane_departure`] can answer.
+    pub(super) fn moves_out_of_shown_channel(&self, edit: &ModelEdit) -> bool {
+        matches!(
+            edit,
+            ModelEdit::ChangeView {
+                scope: Scope::Channel(from),
+                change: Change::Transfer {
+                    destination: Scope::Channel(to),
+                    ..
+                },
+                ..
+            } if from != to && self.durable.active_channel == Some(*from)
+        )
+    }
+
     pub(super) fn pane_departure(&self, edit: &ModelEdit) -> Option<Departure> {
         let ModelEdit::ChangeView {
             scope: Scope::Channel(from),

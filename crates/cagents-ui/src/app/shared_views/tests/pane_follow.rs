@@ -65,22 +65,48 @@ fn transfer_edge(
     destination: ChannelId,
     operation: uuid::Uuid,
 ) -> ModelUpdate {
+    transfer_over(
+        app.workspace_model.identity,
+        app.workspace_model.sequence + 1,
+        app.workspace_model.views.clone(),
+        card,
+        source,
+        destination,
+        operation,
+    )
+    .0
+}
+
+/// The edge a transfer of `card` publishes at `sequence` over `views`, and
+/// the views it leaves.
+fn transfer_over(
+    identity: uuid::Uuid,
+    sequence: u64,
+    mut views: Vec<View>,
+    card: CardId,
+    source: ChannelId,
+    destination: ChannelId,
+    operation: uuid::Uuid,
+) -> (ModelUpdate, Vec<View>) {
     let (source, destination) = (Scope::Channel(source), Scope::Channel(destination));
-    let mut views = app.workspace_model.views.clone();
     let before = views
         .iter()
         .map(|view| (view.scope.clone(), view.revision))
         .collect::<Vec<_>>();
+    let expected = before
+        .iter()
+        .find(|(scope, _)| *scope == source)
+        .map(|(_, revision)| *revision)
+        .unwrap();
     views::transfer(&mut views, &source, card, &destination, None).unwrap();
     for view in &mut views {
         view.revision += 1;
     }
-    let sequence = app.workspace_model.sequence + 1;
-    ModelUpdate::Changed {
+    let edge = ModelUpdate::Changed {
         sequence,
         edit: ModelEdit::ChangeView {
             scope: source.clone(),
-            expected_revision: before[0].1,
+            expected_revision: expected,
             operation,
             change: Change::Transfer {
                 id: card,
@@ -89,7 +115,7 @@ fn transfer_edge(
             },
         },
         changes: EdgeChanges {
-            identity: Some(app.workspace_model.identity),
+            identity: Some(identity),
             effects: EditEffects {
                 views: before
                     .into_iter()
@@ -103,11 +129,37 @@ fn transfer_edge(
             },
             views: ViewChanges {
                 sequence,
-                views,
+                views: views.clone(),
                 ..Default::default()
             },
         },
+    };
+    (edge, views)
+}
+
+/// Delivers `updates` as one run, as the observer stream does when they
+/// queued together while the window was busy; otherwise one at a time.
+fn deliver(app: &mut Cagents, updates: Vec<ModelUpdate>, run: bool) {
+    if !run {
+        for update in updates {
+            drop(app.update(Message::WorkspaceModelObserved(update)));
+        }
+        return;
     }
+    let (sender, receiver) = async_channel::unbounded();
+    app.workspace_model_rx = receiver;
+    let mut updates = updates.into_iter();
+    let first = updates.next().expect("a run has a first update");
+    for update in updates {
+        sender.send_blocking(update).unwrap();
+    }
+    drop(app.update(Message::WorkspaceModelArrived(
+        crate::app::ingress::Arrival::detached(first),
+    )));
+    assert!(
+        app.workspace_model_rx.is_empty(),
+        "the update drains its run"
+    );
 }
 
 fn holds(app: &Cagents, channel: ChannelId, card: CardId) -> bool {
@@ -239,4 +291,165 @@ fn a_window_on_another_channel_is_left_alone() {
     assert!(holds(&app, destination, moved.id));
     assert_eq!(app.durable.active_channel, Some(destination));
     assert_eq!(notice(&app), None);
+}
+
+/// A peer brings a pane into the channel this window shows and then moves it
+/// on, and both edges arrive together. The second edge's departure is read
+/// against the window as the first left it, so the moved pane is offered
+/// as it is when the edges arrive one at a time.
+#[test]
+fn a_run_offers_a_pane_an_earlier_edge_in_it_brought_here() {
+    let outcome = |run: bool| {
+        let (mut app, source, destination, [_, stays]) = two_panes(1);
+        let mut arrived = stays.clone();
+        arrived.id = CardId::new();
+        arrived.title = "arrived".into();
+        if let CardKind::Browser(browser) = &mut arrived.kind {
+            browser.id = BrowserId::new();
+        }
+        let identity = app.workspace_model.identity;
+        let sequence = app.workspace_model.sequence;
+        let scope = Scope::Channel(source);
+        let mut views = app.workspace_model.views.clone();
+        let held = views.iter_mut().find(|view| view.scope == scope).unwrap();
+        let before = held.revision;
+        held.panes.push(arrived.clone());
+        held.revision += 1;
+        let inserted = held.clone();
+        let insert = ModelUpdate::Changed {
+            sequence: sequence + 1,
+            edit: ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: before,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Insert {
+                    pane: arrived.clone(),
+                    before: None,
+                },
+            },
+            changes: EdgeChanges {
+                identity: Some(identity),
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope,
+                        before: Some(before),
+                        after: Some(before + 1),
+                    }],
+                    ..Default::default()
+                },
+                views: ViewChanges {
+                    sequence: sequence + 1,
+                    views: vec![inserted],
+                    ..Default::default()
+                },
+            },
+        };
+        let (transfer, _) = transfer_over(
+            identity,
+            sequence + 2,
+            views,
+            arrived.id,
+            source,
+            destination,
+            uuid::Uuid::new_v4(),
+        );
+        deliver(&mut app, vec![insert, transfer], run);
+        (
+            holds(&app, destination, arrived.id),
+            app.durable.active_channel == Some(source),
+            app.workspace.focused() == Some(stays.id),
+            notice(&app).map(str::to_owned),
+        )
+    };
+    let each = outcome(false);
+    assert!(each.0, "the pane ends where the move put it");
+    assert!(each.3.is_some(), "one at a time, the moved pane is offered");
+    assert_eq!(outcome(true), each);
+}
+
+/// This window closed its last pane in a channel, and before the receipt
+/// arrives a peer's pane came and went: the peer's move out and this
+/// window's receipt arrive together. The channel is as empty as it is when
+/// they arrive one at a time, so it retires the same way.
+#[test]
+fn a_run_retires_a_channel_its_edges_emptied() {
+    let outcome = |run: bool| {
+        let (mut app, source, destination, [moved, stays]) = two_panes(0);
+        drop(app.navigate_to_channel(destination));
+        // `stays` is this window's own pane, closed here: its removal is
+        // published and closing it captured the channel for retirement.
+        // `moved` is the peer's, adopted after that capture.
+        app.card_state_mut(stays.id).unwrap().existence =
+            crate::app::project_ui::removed_existence("closed");
+        app.shared_views.closed.insert(stays.id);
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == source)
+            .unwrap()
+            .cards
+            .retain(|&card| card != stays.id);
+        let home = crate::workspace_model::ChannelIncarnation {
+            registry: app.workspace_model.identity,
+            channel: source,
+            creation_ordinal: 1,
+        };
+        app.channel_ui
+            .retire_candidates
+            .insert(home, crate::app::channel_ui::Retirement::Closed);
+        let (tx, rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        let identity = app.workspace_model.identity;
+        let sequence = app.workspace_model.sequence;
+        let (transfer, mut views) = transfer_over(
+            identity,
+            sequence + 1,
+            app.workspace_model.views.clone(),
+            moved.id,
+            source,
+            destination,
+            uuid::Uuid::new_v4(),
+        );
+        let scope = Scope::Channel(source);
+        let held = views.iter_mut().find(|view| view.scope == scope).unwrap();
+        let before = held.revision;
+        held.panes.clear();
+        held.revision += 1;
+        let emptied = held.clone();
+        let receipt = ModelUpdate::Committed {
+            receipt: crate::workspace_model::delta::EditReceipt {
+                identity,
+                sequence: sequence + 2,
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope: scope.clone(),
+                        before: Some(before),
+                        after: Some(before + 1),
+                    }],
+                    ..Default::default()
+                },
+            },
+            edit: ModelEdit::ChangeView {
+                scope,
+                expected_revision: before,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Remove { id: stays.id },
+            },
+            views: ViewChanges {
+                sequence: sequence + 2,
+                views: vec![emptied],
+                ..Default::default()
+            },
+        };
+        deliver(&mut app, vec![transfer, receipt], run);
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. }))
+            .count()
+    };
+    assert_eq!(
+        outcome(false),
+        1,
+        "one at a time, the emptied channel retires"
+    );
+    assert_eq!(outcome(true), 1);
 }
