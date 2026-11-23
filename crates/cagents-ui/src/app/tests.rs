@@ -12490,6 +12490,60 @@ fn choosing_a_pane_reads_its_update_at_once() {
     assert!(app.sidebar_state.has_card_update(ids[2]));
 }
 
+/// Scrolling a pane's content is reading it, as the pointer resting on it,
+/// however long, is not.
+#[test]
+fn scrolling_a_pane_reads_it_where_resting_the_pointer_does_not() {
+    let (mut app, ids) = four_terminals();
+    let window = window::Id::RESERVED;
+    app.core.set_main_window_id(Some(window));
+    drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+        window, true,
+    ))));
+    app.settings.focus_follows_mouse = true;
+    for &card in &ids[1..] {
+        app.observe_agent_update_for_card(card);
+    }
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[1]));
+    assert_eq!(app.workspace.focused(), Some(ids[1]));
+    drop(app.sync_visible_attention());
+    drop(app.update(Message::AcknowledgeVisiblePane {
+        card: ids[1],
+        epoch: app.attention_focus_epoch,
+    }));
+    assert!(
+        app.sidebar_state.has_card_update(ids[1]),
+        "resting reads nothing"
+    );
+
+    viewport(&mut app, WorkspaceViewportEvent::PointerScrolled(ids[1]));
+    assert!(
+        !app.sidebar_state.has_card_update(ids[1]),
+        "scrolling reads"
+    );
+    // The pane being read is chosen now, so news there is read as it comes.
+    app.observe_agent_update_for_card(ids[1]);
+    assert!(!app.sidebar_state.has_card_update(ids[1]));
+
+    // A pane scrolled without the focus is read where it stands.
+    viewport(&mut app, WorkspaceViewportEvent::PointerScrolled(ids[2]));
+    assert_eq!(app.workspace.focused(), Some(ids[1]));
+    assert!(!app.sidebar_state.has_card_update(ids[2]));
+    assert!(app.sidebar_state.has_card_update(ids[3]));
+    // Only panes whose scrolling reads or chooses something hear the wheel.
+    assert!(app.reads_on_scroll(ids[3]));
+    assert!(!app.reads_on_scroll(ids[1]) && !app.reads_on_scroll(ids[2]));
+
+    // A pane the pointer rests on with nothing new is chosen by scrolling,
+    // so its later news is read as it comes.
+    app.settings.focus_follows_mouse = true;
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[0]));
+    assert!(app.reads_on_scroll(ids[0]));
+    viewport(&mut app, WorkspaceViewportEvent::PointerScrolled(ids[0]));
+    app.observe_agent_update_for_card(ids[0]);
+    assert!(!app.sidebar_state.has_card_update(ids[0]));
+}
+
 /// Moving focus alone is saved once per burst rather than once per move,
 /// but the durable state carries it at once, so any save that happens
 /// sooner - or the one on exit - records it.

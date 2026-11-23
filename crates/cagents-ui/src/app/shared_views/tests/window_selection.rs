@@ -91,6 +91,7 @@ fn workspace_element(app: &Cagents) -> Element<'_, Message> {
         workspace_widget::card_widget_id,
         workspace_widget::Events {
             viewport: move |event| Message::Viewport { generation, event },
+            reads_on_scroll: |_| false,
         },
     )
 }

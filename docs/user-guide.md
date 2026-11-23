@@ -149,7 +149,8 @@ determine which models and permission modes are available.
   focuses it at once, without scrolling, and puts the keyboard in its message
   input, terminal or editor. An open chat menu or picker, dialog or palette
   suppresses it. A pane the pointer only rests on keeps its alert; it is read
-  when you click it, type in it or go to it by tab, sidebar or palette.
+  when you click it, type in it, scroll it or go to it by tab, sidebar or
+  palette.
   Turn it off in **Settings > General > Workspace** to focus panes only by
   clicking them or with pane navigation.
 - Focusing a chat pane in any way, by clicking it, navigating to it, switching

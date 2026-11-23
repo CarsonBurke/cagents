@@ -454,7 +454,8 @@ impl EntryProbe {
             )
             .traced_by(&input)
             .on_pointer_focus("click", "other click")
-            .on_pointer_enter(Some("enter")),
+            .on_pointer_enter(Some("enter"))
+            .on_pointer_scroll(Some("scroll")),
             &input,
         );
         let mut tree = Tree::new(&surface);
@@ -537,6 +538,26 @@ impl EntryProbe {
 
 fn moved(position: Point) -> Event {
     Event::Mouse(mouse::Event::CursorMoved { position })
+}
+
+#[test]
+fn the_wheel_over_a_pane_reports_reading_it_and_elsewhere_nothing() {
+    let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+        delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+    });
+    let mut probe = EntryProbe::new();
+    probe.send(wheel.clone(), mouse::Cursor::Available(EntryProbe::INSIDE));
+    assert_eq!(mem::take(&mut probe.messages), ["scroll"]);
+    probe.send(wheel.clone(), mouse::Cursor::Available(EntryProbe::OUTSIDE));
+    probe.send(wheel, mouse::Cursor::Available(EntryProbe::NEIGHBOUR));
+    // A touchpad lifting reports a wheel that moved nothing.
+    probe.send(
+        Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 },
+        }),
+        mouse::Cursor::Available(EntryProbe::INSIDE),
+    );
+    assert!(probe.messages.is_empty());
 }
 
 #[test]
@@ -1894,10 +1915,11 @@ fn wheel_scrolls_card_content_without_moving_the_workspace() {
         .unwrap();
     let mut workspace = Workspace::default();
     workspace.resize_viewport(400.0);
-    for index in 0..3 {
+    let cards: Vec<_> = (0..3).map(|_| CardId::new()).collect();
+    for (index, &card) in cards.iter().enumerate() {
         workspace
             .add_card(
-                WorkspaceCard::new(CardId::new(), "Scrollable", CardWidth::Fixed(320.0)).unwrap(),
+                WorkspaceCard::new(card, "Scrollable", CardWidth::Fixed(320.0)).unwrap(),
                 index,
                 index == 0,
             )
@@ -1921,6 +1943,7 @@ fn wheel_scrolls_card_content_without_moving_the_workspace() {
         card_widget_id,
         Events {
             viewport: Observation::Workspace,
+            reads_on_scroll: |_| true,
         },
     );
     let mut tree = Tree::new(&element);
@@ -1961,6 +1984,19 @@ fn wheel_scrolls_card_content_without_moving_the_workspace() {
         message,
         Observation::Workspace(WorkspaceViewportEvent::Scrolled(_))
     )));
+    // The pane under the pointer hears every turn, though its content took
+    // the wheel.
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| matches!(
+                message,
+                Observation::Workspace(WorkspaceViewportEvent::PointerScrolled(card))
+                    if *card == cards[0]
+            ))
+            .count(),
+        3
+    );
 }
 
 /// A leaf that reports every key press it is shown, as its card.
@@ -2052,7 +2088,10 @@ fn keys_typed_while_the_camera_travels_reach_the_pane_it_is_travelling_to() {
         |context| Element::new(KeyProbe(context.id)),
         card_widget_id,
         // Whatever the strip reports about itself is not a key press.
-        Events { viewport: |_| None },
+        Events {
+            viewport: |_| None,
+            reads_on_scroll: |_| false,
+        },
     );
     let mut tree = Tree::new(&element);
     let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
@@ -2247,6 +2286,7 @@ fn a_reported_viewport_width_is_not_reported_twice_in_one_frame() {
                 card_widget_id,
                 Events {
                     viewport: |event| event,
+                    reads_on_scroll: |_| false,
                 },
             ),
             Size::new(900.0, height),
@@ -2522,7 +2562,10 @@ fn opening_card_contents_are_built_before_their_space_is_ready() {
                 widget::Space::new().into()
             },
             card_widget_id,
-            Events { viewport: |_| () },
+            Events {
+                viewport: |_| (),
+                reads_on_scroll: |_| false,
+            },
         );
         drop(element);
         built.take()
@@ -2579,7 +2622,10 @@ fn composed_workspace_view_exposes_only_visible_card_bodies_to_a_screen_reader()
             })
         },
         card_widget_id,
-        Events { viewport: |_| () },
+        Events {
+            viewport: |_| (),
+            reads_on_scroll: |_| false,
+        },
     );
     let mut tree = Tree::new(&composed);
     let renderer = tokio::runtime::Builder::new_current_thread()
@@ -3667,7 +3713,10 @@ fn restored_camera_initializes_native_scroll_once_before_the_first_frame() {
         scroll_id.clone(),
         |_| Element::new(OverlayProbe),
         card_widget_id,
-        Events { viewport: |_| () },
+        Events {
+            viewport: |_| (),
+            reads_on_scroll: |_| false,
+        },
     );
     let mut tree = Tree::new(&element);
     let node = element.as_widget_mut().layout(

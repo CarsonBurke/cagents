@@ -2375,6 +2375,8 @@ fn update_workspace_viewport(
         // `focus_pane_keyboard_after_entry` and `_after_press`, which leave a
         // control the person chose where it is. The workspace's own request
         // would focus the pane's control regardless.
+        // Reading a pane moves nothing; the owner answers it before this.
+        WorkspaceViewportEvent::PointerScrolled(_) => (ViewportUpdate::unchanged(), false),
         WorkspaceViewportEvent::PointerEntered(card) => {
             let update = workspace
                 .focus_without_scrolling(card)
@@ -6347,6 +6349,30 @@ impl Cagents {
         Task::batch([focus, read])
     }
 
+    /// Whether the wheel over `id` reads or chooses anything, so only those
+    /// panes report it.
+    fn reads_on_scroll(&self, id: CardId) -> bool {
+        (self.sidebar_state.has_card_update(id) && self.shows_own_transcript(id))
+            || self.hover_focused(id)
+    }
+
+    /// Scrolling a pane's content is reading it: its news is read, and the
+    /// pane the pointer had only rested on becomes the one chosen. A pane
+    /// scrolled without holding the focus is read where it stands, even in
+    /// a window without keyboard focus, since the wheel goes to the window
+    /// under the pointer. As for a press, scrolling a subagent's transcript
+    /// leaves the parent's news unread.
+    fn read_scrolled_pane(&mut self, id: CardId) -> Task<Message> {
+        if self.workspace.focused() == Some(id) {
+            self.hover_focus = None;
+        }
+        if self.sidebar_state.has_card_update(id) && self.shows_own_transcript(id) {
+            self.mark_cards_read(vec![id])
+        } else {
+            Task::none()
+        }
+    }
+
     /// Records that the reader chose `id`, if it holds the focus, and reads
     /// it. Only a pane that took the focus was chosen.
     fn note_chosen(&mut self, id: CardId) -> Task<Message> {
@@ -9169,7 +9195,13 @@ impl Cagents {
             && self.workspace.focused() == Some(card)
             && !self.hover_focused(card)
             && !self.modal_is_open()
-            && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
+            && self.shows_own_transcript(card)
+    }
+
+    /// Whether `card` shows its own news: not a chat pane showing one of its
+    /// subagents' transcripts, which says nothing about the parent's.
+    fn shows_own_transcript(&self, card: CardId) -> bool {
+        !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
@@ -17736,6 +17768,7 @@ impl Application for Cagents {
                         let generation = self.workspace_view_generation;
                         move |event| Message::Viewport { generation, event }
                     },
+                    reads_on_scroll: |id| self.reads_on_scroll(id),
                 },
             )
         };
@@ -19185,9 +19218,13 @@ impl Cagents {
                     event,
                     WorkspaceViewportEvent::PointerFocused { .. }
                         | WorkspaceViewportEvent::PointerEntered(_)
+                        | WorkspaceViewportEvent::PointerScrolled(_)
                 ) && self.workspace_inputs_blocked()
                 {
                     return Task::none();
+                }
+                if let WorkspaceViewportEvent::PointerScrolled(card) = event {
+                    return self.read_scrolled_pane(card);
                 }
                 if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
                     && (!self.settings.focus_follows_mouse
