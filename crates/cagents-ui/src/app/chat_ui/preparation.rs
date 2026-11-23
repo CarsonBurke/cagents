@@ -5,6 +5,12 @@ use std::sync::atomic::AtomicUsize;
 pub(super) const SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const QUEUED_BYTES: usize = 72 * 1024 * 1024;
 const QUEUED_ITEMS: usize = 128;
+/// The largest source, other than the growing answer's, that the update
+/// staging it waits to parse; see [`State::settle_staged`]. A message this
+/// size parses well within the budget, while a larger one, such as a long
+/// finished message the chat hydrates, would hold the update for the whole
+/// budget and still arrive later.
+const SETTLED_BYTES: usize = 16 * 1024;
 // Bytes leased across the application, bounded by QUEUED_BYTES.
 application_atomic!(fn reserved() -> AtomicUsize);
 static ATTEMPT: AtomicU64 = AtomicU64::new(1);
@@ -302,7 +308,7 @@ enum Claim {
     Unclaimed,
     /// Its subscription, which may already hold a parser.
     Subscribed,
-    /// The update that staged it handed it to a parser (`State::settle_tail`).
+    /// The update that staged it handed it to a parser (`State::settle_staged`).
     HandedOver,
 }
 
@@ -1007,61 +1013,89 @@ impl State {
         }
     }
 
-    /// Parse the growing answer's newest publication now and wait up to
-    /// `budget` for it, so the update that staged it can also install it.
+    /// Parse what this update staged for the transcript now, on the parsers
+    /// that are free, and wait up to `budget` in all for them, so the update
+    /// that staged them can also install them.
     ///
     /// A streamed chunk otherwise costs two updates and two frames: the
     /// wake that stages the publication draws the old text while its parse
-    /// runs, and the prepared message draws again. The parse usually takes
-    /// well under a millisecond, far less than the frame between them.
-    /// A parse that outlasts the budget keeps going and arrives as an
-    /// ordinary `MarkdownPrepared`.
-    pub(super) fn settle_tail(&mut self, target: Target, budget: Duration) -> Settled {
-        let Some((id, entry)) = self.entries.iter_mut().find(|(_, entry)| {
-            // A run its subscription has seen may already be parsing.
-            entry.running
-                && entry.claim.get() == Claim::Unclaimed
-                && entry.shared.priority.load(Ordering::Relaxed) == TAIL
-        }) else {
-            return Settled::Idle;
-        };
-        if entry.shared.cancelled.load(Ordering::Relaxed) {
-            return Settled::Idle;
-        }
+    /// runs, and the prepared message draws again. That holds for every
+    /// message a publication brings, not only the growing answer: a step that
+    /// adds a message and then a tool call leaves the message behind the
+    /// newest row before it is ever parsed. A parse usually takes well under
+    /// a millisecond, far less than the frame between them. A parse that
+    /// outlasts the budget keeps going and arrives as an ordinary
+    /// `MarkdownPrepared`.
+    ///
+    /// Only ranked inputs no subscription has seen yet are taken, best rank
+    /// first, and only while a parser is free with nobody queued for it, so
+    /// nothing waiting is overtaken. Besides the growing answer, whose
+    /// parse picks up where its last one ended, only sources up to
+    /// [`SETTLED_BYTES`] are waited for; larger ones parse in their turn.
+    pub(super) fn settle_staged(&mut self, target: Target, budget: Duration) -> Vec<Settled> {
         // Outside the application's executor (as in most tests) the
-        // subscription parses it.
+        // subscriptions parse them.
         let Ok(executor) = tokio::runtime::Handle::try_current() else {
-            return Settled::Idle;
+            return Vec::new();
         };
-        let Some(permit) = entry.shared.workers.try_acquire_tail() else {
-            return Settled::Idle;
-        };
-        entry.claim.set(Claim::HandedOver);
-        let handoff = Arc::new(Handoff::default());
-        executor.spawn_blocking({
-            let handoff = handoff.clone();
-            let shared = entry.shared.clone();
-            move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute(shared, permit)
-                }))
-                .unwrap_or_else(|_| Err("A message could not be loaded. Retry loading it.".into()));
-                handoff.fill(result);
-            }
-        });
-        let (id, run) = (id.clone(), entry.run);
-        match handoff.wait(budget) {
-            Some(result) => Settled::Ready(id, run, Ready::new(result)),
-            None => Settled::Pending(cosmic::task::future(async move {
-                let result = handoff.arrival().await;
-                action(Action::MarkdownPrepared(
-                    target,
-                    id,
-                    run,
-                    Ready::new(result),
-                ))
-            })),
+        let mut staged: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                // A run its subscription has seen may already be parsing.
+                entry.running
+                    && entry.claim.get() == Claim::Unclaimed
+                    && !entry.shared.cancelled.load(Ordering::Relaxed)
+                    && match entry.shared.priority.load(Ordering::Relaxed) {
+                        UNRANKED => false,
+                        TAIL => true,
+                        _ => entry.shared.lease.bytes() <= SETTLED_BYTES,
+                    }
+            })
+            .map(|(id, entry)| (entry.shared.priority.load(Ordering::Relaxed), id, entry))
+            .collect();
+        staged.sort_unstable_by(|(a, a_id, _), (b, b_id, _)| a.cmp(b).then_with(|| a_id.cmp(b_id)));
+        let mut handed = Vec::new();
+        for (rank, id, entry) in staged {
+            let Some(permit) = entry.shared.workers.try_acquire_free(rank == TAIL) else {
+                break;
+            };
+            entry.claim.set(Claim::HandedOver);
+            let handoff = Arc::new(Handoff::default());
+            executor.spawn_blocking({
+                let handoff = handoff.clone();
+                let shared = entry.shared.clone();
+                move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute(shared, permit)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err("A message could not be loaded. Retry loading it.".into())
+                    });
+                    handoff.fill(result);
+                }
+            });
+            handed.push((id.clone(), entry.run, handoff));
         }
+        let deadline = std::time::Instant::now() + budget;
+        handed
+            .into_iter()
+            .map(|(id, run, handoff)| {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match handoff.wait(left) {
+                    Some(result) => Settled::Ready(id, run, Ready::new(result)),
+                    None => Settled::Pending(cosmic::task::future(async move {
+                        let result = handoff.arrival().await;
+                        action(Action::MarkdownPrepared(
+                            target,
+                            id,
+                            run,
+                            Ready::new(result),
+                        ))
+                    })),
+                }
+            })
+            .collect()
     }
 
     /// The handed-over parse of `run` was not accepted, so the run parses
@@ -1632,11 +1666,8 @@ impl Drop for ReplySlot {
         }
     }
 }
-/// What `State::settle_tail` did with the growing answer.
+/// What `State::settle_staged` did with one staged input it handed over.
 pub(super) enum Settled {
-    /// Nothing was handed over; any staged input parses through its
-    /// subscription.
-    Idle,
     /// Parsed within the budget, to accept now.
     Ready(String, u64, Ready),
     /// Still parsing; the task delivers it.
@@ -2005,18 +2036,21 @@ impl Pool {
     }
 }
 impl Pool {
-    /// A parser for the growing tail at once, if one is free and no other
-    /// input waits for it. Nothing is overtaken: with a waiter queued this
-    /// declines, and the tail waits its turn through the queue as usual.
-    fn try_acquire_tail(self: &Arc<Self>) -> Option<Permit> {
+    /// A parser at once, if one is free and no other input waits for it.
+    /// Nothing is overtaken: with a waiter queued this declines, and the
+    /// input waits its turn through the queue as usual. A parser the growing
+    /// tail holds counts toward the share it may take while others wait.
+    fn try_acquire_free(self: &Arc<Self>, tail: bool) -> Option<Permit> {
         let mut queue = self.lock();
         if !queue.waiting.is_empty() {
             return None;
         }
         let permit = self.permits.clone().try_acquire_owned().ok()?;
-        queue.tail_held += 1;
+        if tail {
+            queue.tail_held += 1;
+        }
         Some(Permit {
-            tail: Some(self.clone()),
+            tail: tail.then(|| self.clone()),
             _permit: permit,
         })
     }
