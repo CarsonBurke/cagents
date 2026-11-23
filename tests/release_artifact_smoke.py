@@ -47,6 +47,9 @@ class SmokeBoundary(unittest.TestCase):
             "import json,os,pathlib,sys\n"
             "p=pathlib.Path(os.environ['SMOKE_CONTRACT_CALLS'])\n"
             "with p.open('a') as output: output.write(json.dumps(sys.argv[1:])+'\\n')\n"
+            "if os.environ.get('SMOKE_CONTRACT_HANG'):\n"
+            "    pathlib.Path(os.environ['SMOKE_CONTRACT_HANG'], str(os.getpid())).touch()\n"
+            "    import time; time.sleep(600)\n"
             "sys.exit(17 if sys.argv[-2]==os.environ.get('SMOKE_CONTRACT_FAIL_ARTIFACT') else 0)\n"
         )
         boundary.chmod(0o755)
@@ -95,6 +98,27 @@ class SmokeBoundary(unittest.TestCase):
         self.assertEqual(list(self.work.iterdir()), [])
         self.assertEqual((self.base / "base-sentinel").read_text(), "untouched\n")
         self.assertFalse(self.network_calls.exists())
+
+    def test_an_interrupted_smoke_stops_every_run_before_removing_their_roots(self):
+        running = self.directory / "running"
+        running.mkdir()
+        smoke = subprocess.Popen(
+            [str(SMOKE), "--dist", str(self.dist), "--version", VERSION, "--rootfs", str(self.base)],
+            env=self.environment | {"SMOKE_CONTRACT_HANG": str(running)},
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + HANG_GUARD
+        while len(list(running.iterdir())) < len(ARTIFACTS):
+            self.assertLess(time.monotonic(), deadline, "the smokes did not all start")
+            time.sleep(0.05)
+        smoke.send_signal(signal.SIGTERM)
+        self.assertNotEqual(smoke.wait(timeout=HANG_GUARD), 0)
+        for pid in (int(path.name) for path in running.iterdir()):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            self.fail(f"sandbox {pid} outlived the interrupted smoke")
+        self.assert_clean()
 
     def test_each_artifact_gets_private_offline_namespace_and_read_only_inputs(self):
         result = self.invoke()

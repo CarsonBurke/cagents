@@ -134,29 +134,48 @@ fi
 rm -rf -- $(printf '%q' "$remote_output")
 # Every lane's tests gate the release through main's sentinel, which runs them
 # per commit in the ordinary test profile; the release build runs none itself.
-# A commit main moved past before its tests ran is tested now, beside the build.
+# A kept verdict answers at once; a commit main moved past before its tests
+# ran is tested now, beside the build, and a failing verdict stops the build.
+# Should the build fail first, the tests go on and keep their verdict, which
+# the next attempt reuses.
+verdict=/var/tmp/cagents-release/$VERSION-tests.json
 "\$checkout/scripts/main-build-sentinel" --repository "\$PWD" \
-    --require-tests $(printf '%q' "$commit") > /var/tmp/cagents-release/$VERSION-tests.json 2>&1 </dev/null &
+    --require-tests $(printf '%q' "$commit") > "\$verdict" 2>&1 </dev/null &
 tests=\$!
 # The gate admits the build beside other agents' and holds its shares. The
 # builder sizes its own Cargo jobs from the host's CPUs and available memory.
 "\$checkout/scripts/cargo-gate" exec \
     "\$checkout/scripts/build-release-linux" --ref $(printf '%q' "$TAG") \
-    --output $(printf '%q' "$remote_output") --notes /var/tmp/cagents-release/$VERSION-notes.md </dev/null
-verdict=/var/tmp/cagents-release/$VERSION-tests.json
-status=0
-wait "\$tests" || status=\$?
-if ((status)); then
+    --output $(printf '%q' "$remote_output") --notes /var/tmp/cagents-release/$VERSION-notes.md </dev/null &
+build=\$!
+refuse() {
     cat "\$verdict" >&2 || :
     rm -rf -- $(printf '%q' "$remote_output") "\$verdict"
-    case \$status in
-        1) reason='its tests fail' ;;
-        3) reason='a test lane stopped outside the code, as when the build host refused it; run the release again' ;;
+    case \$1 in
+        1) reason='its tests fail. A failing verdict is final: once a failure is shown to be outside the code, remove ~/.local/state/cagents-main-sentinel/verdicts/'$(printf '%q' "$commit")'.json on the build host to test it again' ;;
+        3) reason='a test lane stopped outside the code, as when the build host refused it; run the release again to test it again' ;;
         *) reason='the sentinel could not give a verdict' ;;
     esac
     printf 'release: the commit has no passing test verdict from the main sentinel: %s (above).\n' "\$reason" >&2
     printf '%s\n' 'release: its test logs are under ~/.local/state/cagents-main-sentinel/logs' >&2
     exit 1
+}
+first=
+status=0
+wait -n -p first "\$tests" "\$build" || status=\$?
+if [[ \$first == "\$tests" ]]; then
+    if ((status)); then
+        # The gate passes the signal on to the build it runs.
+        kill -TERM "\$build" 2>/dev/null || :
+        wait "\$build" || :
+        refuse "\$status"
+    fi
+    wait "\$build"
+else
+    ((status == 0)) || { rm -f -- "\$verdict"; exit "\$status"; }
+    status=0
+    wait "\$tests" || status=\$?
+    ((status == 0)) || refuse "\$status"
 fi
 rm -f -- "\$verdict"
 EOF

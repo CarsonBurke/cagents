@@ -29,8 +29,9 @@ from a source with the helper that lacks either.
 Before exposing the bundle, the builder installs and removes each Debian
 package and extracts each portable archive in a disposable Ubuntu 24.04 runtime
 image, all five at once. This runtime checks actual package dependencies, shipped commands,
-matched daemon startup as the production instance (so with release semantics:
-no debug assertions, production identity) and safe shutdown, live-daemon removal guards, and
+matched daemon startup as the production instance (which shows the shipped
+binaries were built without debug assertions or the development feature, the
+setting their whole production identity follows) and safe shutdown, live-daemon removal guards, and
 preservation of unrelated files and saved app data. The compiler environment
 remains Ubuntu 22.04; runtime smoke does not replace the glibc baseline checks.
 The runtime image is prepared once with network access by
@@ -151,8 +152,8 @@ A release goes out in five steps, each through `mise run release`
    It refuses the bundle unless main's sentinel there has a passing test
    verdict for the tagged commit; a commit without one, such as a version bump
    main moved past before its tests ran, is tested while the bundle builds
-   (`scripts/main-build-sentinel --require-tests`). The build host must
-   therefore be the sentinel's, fw16.
+   (`scripts/main-build-sentinel --require-tests`); a failing verdict stops
+   the build at once. The build host must therefore be the sentinel's, fw16.
    The bundle's `release-metadata.json` carries the release notes an installed
    cagents shows before it updates: by default the `feat`, `fix` and `perf`
    commit subjects since the previous tag, or a file passed with
