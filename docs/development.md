@@ -1035,6 +1035,17 @@ build:
   pressure, and no build waiting for build memory shares. It stops when any of
   those changes for two checks in a row. It tries again ten minutes later,
   resuming from its warm build directory.
+- **Starvation:** fw16 is rarely idle, so yielding to every build could leave
+  releases with no bundle. The prebuild counts as starved when main's newest
+  bundle is two hours older than the commit to build (or, with no bundle,
+  that commit is two hours old), or when it has kept making way for half an
+  hour since it was first stopped without finishing a bundle. A starved
+  prebuild then queues for one build memory share like any other build and
+  keeps it while others wait. It still runs on idle CPU time, and still
+  starts and stops on available memory and pressure. `status` shows when it
+  is starved and why. Each bundle records how long it waited before the
+  admission of the build that finished it (`waited_seconds`) and how long
+  that build took (`seconds`).
 
 `prebuild-release request SHA` builds a commit next at normal priority,
 interrupting a background prebuild of another commit; requests build in the
