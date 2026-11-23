@@ -241,29 +241,6 @@ pub(super) fn prompt(
     Ok((accepted, start))
 }
 
-/// Where an agent placed in the checkout at `path` goes: a linked worktree's
-/// channel, or, for the main checkout, a new channel as for an agent placed
-/// nowhere. A checkout that isn't one of the project's is refused.
-fn checkout_placement(
-    host: &SharedHost,
-    repository: &std::path::Path,
-    path: &std::path::Path,
-) -> Result<Option<crate::agent_execution::Placement>, String> {
-    let Some(checkout) = crate::workspace_model::canonical_checkout(repository, path)? else {
-        return Ok(None);
-    };
-    let title = crate::workspace_model::checkout_branch(repository, &checkout)
-        .or_else(|| {
-            checkout
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| checkout.display().to_string());
-    super::workspace::checkout_channel(host, 0, repository, &checkout, &title)
-        .map(|channel| Some(crate::agent_execution::Placement::Channel(channel)))
-        .map_err(|error| error.message)
-}
-
 /// Accepts `request` and starts it. A follow-up that could not start is
 /// still accepted, and its run records why; the error says so too.
 fn accept(
@@ -312,14 +289,15 @@ fn accept(
                 Some(ceiling.child(spec.provider, spec.permission_mode.as_deref())?);
         }
         selected.account = Some(selected_account(&selected)?.id());
-        // A worktree's work is in its checkout's channel, so an agent placed
-        // in a worktree, by this CLI or an older one, starts there. The
-        // request keeps the placement it named: it is the retry's key.
-        if let Some(crate::agent_execution::Placement::Worktree { path, .. }) =
-            &selected.target.placement
+        // The registry starts an agent placed in a worktree, by this CLI or an
+        // older one, in its checkout's channel, and checks the checkout is
+        // the project's. The project is named here by its key, however the
+        // caller named it.
+        let key = selected.target.repository.clone();
+        if let Some(crate::agent_execution::Placement::Worktree { repository, .. }) =
+            &mut selected.target.placement
         {
-            selected.target.placement =
-                checkout_placement(host, &selected.target.repository, path)?;
+            *repository = key;
         }
         Some(selected)
     } else {

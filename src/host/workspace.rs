@@ -137,50 +137,6 @@ pub(super) fn edit_delta(
     edit_then(host, origin, edit, |_| Ok(())).map(|(receipt, ())| receipt)
 }
 
-/// The channel a linked worktree's work opens in: its oldest channel, or a new
-/// one named after `title`, its branch. Every window and the CLI choose the
-/// same one, so an agent placed in the worktree lands where its windows look.
-pub(super) fn checkout_channel(
-    host: &SharedHost,
-    origin: ClientId,
-    repository: &std::path::Path,
-    checkout: &std::path::Path,
-    title: &str,
-) -> Result<crate::model::ChannelId, ProtocolError> {
-    let existing = |registry: &Registry| -> Result<_, ProtocolError> {
-        Ok(registry
-            .model()
-            .map_err(unavailable)?
-            .channels
-            .iter()
-            .filter(|channel| {
-                channel.repository == repository && channel.checkout.as_deref() == Some(checkout)
-            })
-            .min_by_key(|channel| (channel.ordinal, channel.id))
-            .map(|channel| channel.id))
-    };
-    if let Some(id) = existing(&writer(host)?.lock().unwrap_or_else(|p| p.into_inner()))? {
-        return Ok(id);
-    }
-    let id = crate::model::ChannelId::new();
-    let edit = ModelEdit::CreateChannel {
-        id,
-        repository: repository.to_path_buf(),
-        title: crate::workspace_model::channel_title(title).unwrap_or_else(|| title.to_owned()),
-        title_source: crate::model::ChannelTitleSource::Manual,
-        checkout: Some(checkout.to_path_buf()),
-    };
-    // Another request may have made one meanwhile; the oldest still wins.
-    let (_, chosen) = edit_then(host, origin, edit, existing)?;
-    chosen.ok_or_else(|| {
-        ProtocolError::new(
-            ProtocolErrorCode::InvalidRequest,
-            "The worktree's channel could not be made",
-            false,
-        )
-    })
-}
-
 /// Commit and publish an edit, then run `then` before the writer is released,
 /// so it sees this edit and no later one.
 fn edit_then<T>(

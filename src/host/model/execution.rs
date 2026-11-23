@@ -1445,6 +1445,38 @@ impl Registry {
                 }
                 // A removed channel must never be resurrected by a follow-up.
                 require_placement(tx, &agent.placement, &agent.spec.target.repository)?;
+                let mut agent = agent;
+                // Worktree strips take no new panes. An agent the startup
+                // repair left in one keeps it while its pane is there; one
+                // whose pane is gone moves to its checkout's channel, where
+                // its pane reopens.
+                if let Placement::Worktree {
+                    repository: owner,
+                    path,
+                } = &agent.placement
+                    && !super::views::read(tx, &agent.placement)?
+                        .panes
+                        .iter()
+                        .any(|pane| pane.id == crate::model::CardId::from_uuid(agent.id.as_uuid()))
+                {
+                    let channel =
+                        match worktree_channel(tx, owner, path, &agent.spec.target.repository)? {
+                            Some(channel) => channel,
+                            None => prompt_channel(
+                                tx,
+                                &agent.spec.target.repository,
+                                &request.prompt,
+                                &agent.spec,
+                            )?,
+                        };
+                    agent.placement = Placement::Channel(channel);
+                    agent.spec.target.placement = Some(agent.placement.clone());
+                    tx.execute(
+                        "UPDATE agents SET record = ?2 WHERE id = ?1",
+                        params![agent.id.to_string(), encode(&agent)?],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
                 agent
             }
             Destination::New(spec) => {
@@ -1487,26 +1519,37 @@ impl Registry {
                 if !exists {
                     return Err("The target project is not open".into());
                 }
-                let placement = match &spec.target.placement {
-                    Some(placement) => {
-                        require_placement(tx, placement, &spec.target.repository)?;
-                        placement.clone()
-                    }
-                    None => {
-                        let channel = ChannelId::new();
-                        let ordinal = take_ordinal(tx, "next_channel_ordinal")?;
-                        tx.execute(
-                            "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
-                            params![channel.to_string(), repository, crate::workspace_model::channel_title_from_prompt(&request.prompt).unwrap_or_else(|| format!("{} agent", spec.provider.label())), ordinal],
-                        ).map_err(|error| error.to_string())?;
-                        Placement::Channel(channel)
-                    }
+                // Work placed in a worktree goes to its checkout's channel, made
+                // in this transaction so a refused submission leaves none.
+                let placed = match &spec.target.placement {
+                    Some(Placement::Worktree {
+                        repository: owner,
+                        path,
+                    }) => worktree_channel(tx, owner, path, &spec.target.repository)?
+                        .map(Placement::Channel),
+                    placement => placement.clone(),
                 };
+                let placement = match placed {
+                    Some(placement) => {
+                        require_placement(tx, &placement, &spec.target.repository)?;
+                        placement
+                    }
+                    None => Placement::Channel(prompt_channel(
+                        tx,
+                        &spec.target.repository,
+                        &request.prompt,
+                        spec,
+                    )?),
+                };
+                let mut spec = spec.clone();
+                if matches!(spec.target.placement, Some(Placement::Worktree { .. })) {
+                    spec.target.placement = Some(placement.clone());
+                }
                 let agent = Agent {
                     name: request.name.clone(),
                     id: AgentId::new(),
                     origin: origin.clone(),
-                    spec: spec.clone(),
+                    spec,
                     placement,
                     session: None,
                     console: None,
@@ -2926,6 +2969,68 @@ fn read_agent(db: &Connection, id: AgentId) -> Result<Agent, String> {
         )
         .map_err(|error| error.to_string())?;
     decode(&record)
+}
+
+/// A new channel for an agent placed nowhere, named from its prompt.
+fn prompt_channel(
+    tx: &Transaction<'_>,
+    repository: &std::path::Path,
+    prompt: &str,
+    spec: &crate::agent_execution::Spec,
+) -> Result<ChannelId, String> {
+    let channel = ChannelId::new();
+    let ordinal = take_ordinal(tx, "next_channel_ordinal")?;
+    tx.execute(
+        "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
+        params![
+            channel.to_string(),
+            repository_key(repository)?,
+            crate::workspace_model::channel_title_from_prompt(prompt)
+                .unwrap_or_else(|| format!("{} agent", spec.provider.label())),
+            ordinal
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(channel)
+}
+
+/// The channel work placed in the checkout at `path` goes to: a linked
+/// worktree's oldest channel, or a new one named after its branch. `None` for
+/// the project's main checkout, whose work starts a channel of its own, as
+/// work placed nowhere does.
+fn worktree_channel(
+    tx: &Transaction<'_>,
+    owner: &std::path::Path,
+    path: &std::path::Path,
+    repository: &std::path::Path,
+) -> Result<Option<ChannelId>, String> {
+    let Some(checkout) = require_checkout(owner, path, repository)? else {
+        return Ok(None);
+    };
+    let title = crate::workspace_model::checkout_branch(repository, &checkout)
+        .or_else(|| {
+            checkout
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| checkout.display().to_string());
+    super::worktree_repair::checkout_channel(tx, repository, Some(&checkout), &title)
+        .map(|(channel, _)| Some(channel))
+}
+
+/// The linked worktree at `path`, by its canonical path, or `None` for the
+/// project's main checkout. A path that is no checkout of the project, or no
+/// longer exists, is refused.
+pub(super) fn require_checkout(
+    owner: &std::path::Path,
+    path: &std::path::Path,
+    repository: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if owner != repository || !path.is_absolute() {
+        return Err("The worktree belongs to another project or has an invalid path".into());
+    }
+    crate::workspace_model::canonical_checkout(repository, path)
+        .map_err(|error| format!("The worktree cannot take an agent: {error}"))
 }
 
 pub(super) fn require_placement(
@@ -6198,6 +6303,111 @@ mod tests {
         (registry, directory, request)
     }
 
+    /// A registry with a Git project of one linked worktree, and a request
+    /// for an agent placed in the checkout at `path`.
+    fn checkout_fixture() -> (
+        Registry,
+        tempfile::TempDir,
+        crate::workspace_model::CheckoutFixture,
+        impl Fn(&std::path::Path, &str) -> Submit,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let checkout = crate::workspace_model::CheckoutFixture::new();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: checkout.repository.clone(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Git,
+            })
+            .unwrap();
+        let repository = checkout.repository.clone();
+        let request = move |path: &std::path::Path, key: &str| Submit {
+            name: None,
+            destination: Destination::New(Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: repository.clone(),
+                    directory: path.into(),
+                    placement: Some(Placement::Worktree {
+                        repository: repository.clone(),
+                        path: path.into(),
+                    }),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            }),
+            prompt: "Read the fixture".into(),
+            idempotency_key: key.into(),
+        };
+        (registry, directory, checkout, request)
+    }
+
+    /// Worktree strips take no new pane, so an agent placed in a linked
+    /// worktree, however its path is spelled, starts in that worktree's one
+    /// channel, named after its branch; one placed in the main checkout
+    /// starts a channel of its own, as one placed nowhere does.
+    #[test]
+    fn work_placed_in_a_worktree_starts_in_its_checkouts_channel() {
+        let (mut registry, _directory, checkout, request) = checkout_fixture();
+        let linked = registry
+            .submit_agent(&Origin::User, &request(&checkout.linked, "linked"), 1)
+            .unwrap();
+        let channel = linked.agent.channel().expect("the worktree's channel");
+        assert_eq!(
+            linked.agent.spec.target.placement,
+            Some(Placement::Channel(channel))
+        );
+        let alias = checkout.directory.path().join("alias");
+        std::os::unix::fs::symlink(&checkout.linked, &alias).unwrap();
+        for (path, key) in [(alias, "alias"), (checkout.linked.join("."), "dot")] {
+            let again = registry
+                .submit_agent(&Origin::User, &request(&path, key), 2)
+                .unwrap();
+            assert_eq!(again.agent.channel(), Some(channel), "{key}");
+        }
+        let model = registry.model().unwrap();
+        assert_eq!(model.channels.len(), 1);
+        assert_eq!(
+            model.channels[0].checkout.as_deref(),
+            Some(checkout.linked.as_path())
+        );
+        assert_eq!(model.channels[0].title, "feature");
+
+        let main = registry
+            .submit_agent(&Origin::User, &request(&checkout.main, "main"), 3)
+            .unwrap();
+        let own = main.agent.channel().expect("a channel of its own");
+        let model = registry.model().unwrap();
+        assert_eq!(model.channels.len(), 2);
+        let own = model.channels.iter().find(|c| c.id == own).unwrap();
+        assert_eq!(own.checkout, None);
+        assert_eq!(own.title, "Read the fixture");
+    }
+
+    /// A placement in a directory that is no checkout of the project is
+    /// refused, and the refusal leaves no channel behind.
+    #[test]
+    fn a_refused_worktree_placement_leaves_no_channel() {
+        let (mut registry, _directory, checkout, request) = checkout_fixture();
+        let elsewhere = tempfile::tempdir().unwrap();
+        for path in [
+            elsewhere.path().to_owned(),
+            checkout.directory.path().join("gone"),
+        ] {
+            assert!(
+                registry
+                    .submit_agent(&Origin::User, &request(&path, "elsewhere"), 1)
+                    .is_err(),
+                "{path:?}"
+            );
+        }
+        assert!(registry.model().unwrap().channels.is_empty());
+    }
+
     #[test]
     fn implicit_agent_channel_is_created_once_through_retry_and_closes_with_its_project() {
         let (mut registry, directory, request) = fixture();
@@ -6248,13 +6458,25 @@ mod tests {
         );
     }
 
+    /// A new agent placed in the main checkout's strip starts in a channel of
+    /// its own, with or without the strip; only an agent the startup repair
+    /// left in a strip still needs that strip open for a follow-up.
     #[test]
-    fn worktree_placement_requires_the_exact_open_view_without_creating_a_channel() {
+    fn a_worktree_placement_starts_in_a_channel_and_follow_ups_need_the_open_strip() {
         let (mut registry, directory, mut request) = fixture();
         let scope = Placement::Worktree {
             repository: directory.path().into(),
             path: directory.path().into(),
         };
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.target.placement = Some(scope.clone());
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let channel = accepted.agent.channel().expect("a channel of its own");
+        assert_eq!(registry.model().unwrap().channels.len(), 1);
+        assert_eq!(registry.model().unwrap().channels[0].id, channel);
+
         registry
             .apply(&ModelEdit::SeedView {
                 scope: scope.clone(),
@@ -6262,14 +6484,6 @@ mod tests {
                 closed: vec![],
             })
             .unwrap();
-        let Destination::New(spec) = &mut request.destination else {
-            unreachable!()
-        };
-        spec.target.placement = Some(scope.clone());
-        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
-        assert_eq!(accepted.agent.placement, scope);
-        assert!(accepted.agent.channel().is_none());
-        assert!(registry.model().unwrap().channels.is_empty());
         require_placement(&registry.db, &scope, directory.path()).unwrap();
         let foreign = tempfile::tempdir().unwrap();
         assert!(require_placement(&registry.db, &scope, foreign.path()).is_err());
@@ -6293,9 +6507,13 @@ mod tests {
         );
         let mut retry = request.clone();
         retry.idempotency_key = "missing-view".into();
+        let Destination::New(spec) = &mut retry.destination else {
+            unreachable!()
+        };
+        spec.target.placement = Some(missing);
         assert!(registry.submit_agent(&Origin::User, &retry, 2).is_err());
         assert_eq!(registry.model().unwrap().agents.len(), 1);
-        assert!(registry.model().unwrap().channels.is_empty());
+        assert_eq!(registry.model().unwrap().channels.len(), 1);
     }
 
     #[test]

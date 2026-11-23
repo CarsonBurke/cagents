@@ -1319,8 +1319,19 @@ pub(super) fn require_project(tx: &Transaction<'_>, definition: &Definition) -> 
     if !exists {
         return Err("The automation's project is no longer open".into());
     }
-    if let Some(placement) = &definition.agent.target.placement {
-        super::execution::require_placement(tx, placement, &definition.agent.target.repository)?;
+    match &definition.agent.target.placement {
+        // Its agents start in the checkout's channel, so the checkout, not a
+        // worktree strip, must still be the project's.
+        Some(crate::agent_execution::Placement::Worktree {
+            repository: owner,
+            path,
+        }) => {
+            super::execution::require_checkout(owner, path, &definition.agent.target.repository)?;
+        }
+        Some(placement) => {
+            super::execution::require_placement(tx, placement, &definition.agent.target.repository)?
+        }
+        None => {}
     }
     if let Some(channel) = definition.agent.target.channel()
         && !channel_in_project(tx, channel, &definition.agent.target.repository)?
@@ -1706,9 +1717,11 @@ fn accept_firing(
             {
                 // Naming is a user choice, independent of the execution prompt.
                 // Only initialize the owned channel: subsequent firings and
-                // automation renames preserve any separately chosen title.
+                // automation renames preserve any separately chosen title. A
+                // worktree's channel is shared and keeps its branch's name.
                 tx.execute(
-                    "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1",
+                    "UPDATE channels SET title = ?2, title_source = ?3
+                     WHERE id = ?1 AND checkout IS NULL",
                     params![
                         channel.to_string(),
                         automation.definition.name,
@@ -3205,56 +3218,58 @@ mod tests {
         (automation, firing, agent)
     }
 
+    /// Worktree strips take no new pane. An automation placed in the main
+    /// checkout's strip starts its agents as one placed nowhere does, in a
+    /// channel it owns and names; one placed in a linked worktree starts them
+    /// in that worktree's shared channel, which keeps its branch's name.
     #[test]
-    fn fresh_automation_preserves_worktree_placement_without_owning_a_channel() {
+    fn an_automation_placed_in_a_worktree_starts_in_its_checkouts_channel() {
         use crate::agent_execution::Placement;
         let (mut registry, directory, mut definition) = fixture();
-        let scope = Placement::Worktree {
+        definition.agent.target.placement = Some(Placement::Worktree {
             repository: directory.path().into(),
             path: directory.path().into(),
-        };
+        });
+        definition.session_mode = SessionMode::Fresh;
+        let (automation, _, agent) = completed_reusable_run(&mut registry, definition.clone());
+        let owned = agent.channel().expect("a channel of its own");
+        assert_eq!(
+            registry.automation(automation.id).unwrap().channel,
+            Some(owned)
+        );
+        let model = registry.model().unwrap();
+        let channel = model.channels.iter().find(|c| c.id == owned).unwrap();
+        assert_eq!(
+            (channel.title.as_str(), channel.checkout.as_deref()),
+            ("Review daily", None)
+        );
+
+        let checkout = crate::workspace_model::CheckoutFixture::new();
         registry
-            .apply(&ModelEdit::SeedView {
-                scope: scope.clone(),
-                panes: vec![],
-                closed: vec![],
+            .apply(&ModelEdit::OpenProject {
+                repository: checkout.repository.clone(),
+                name: "Repository".into(),
+                kind: ProjectKind::Git,
             })
             .unwrap();
-        definition.agent.target.placement = Some(scope.clone());
-        definition.session_mode = SessionMode::Fresh;
-        let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
-        assert_eq!(agent.placement, scope);
-        assert!(registry.model().unwrap().channels.is_empty());
-        assert!(
-            registry
-                .automation(automation.id)
-                .unwrap()
-                .channel
-                .is_none()
+        definition.agent.target = Target {
+            repository: checkout.repository.clone(),
+            directory: checkout.linked.clone(),
+            placement: Some(Placement::Worktree {
+                repository: checkout.repository.clone(),
+                path: checkout.linked.clone(),
+            }),
+        };
+        let (automation, _, agent) = completed_reusable_run(&mut registry, definition);
+        let shared = agent.channel().expect("the worktree's channel");
+        assert_eq!(
+            registry.automation(automation.id).unwrap().channel,
+            Some(shared)
         );
-        let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
-        registry
-            .finish_automation_release(firing.id, &closed, 230)
-            .unwrap();
-        let current = registry.automation(automation.id).unwrap();
-        assert!(current.active_firing.is_none());
-        let next = registry
-            .claim_automation(
-                current.id,
-                current.revision,
-                None,
-                crate::automations::Trigger::Manual {
-                    request: Uuid::new_v4(),
-                },
-                None,
-                true,
-                300,
-            )
-            .unwrap()
-            .accepted
-            .unwrap();
-        assert_eq!(next.agent.placement, scope);
-        assert!(registry.model().unwrap().channels.is_empty());
+        let model = registry.model().unwrap();
+        let channel = model.channels.iter().find(|c| c.id == shared).unwrap();
+        assert_eq!(channel.title, "feature");
+        assert_eq!(channel.checkout.as_deref(), Some(checkout.linked.as_path()));
     }
 
     #[test]
