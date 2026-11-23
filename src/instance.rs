@@ -555,6 +555,19 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
     Ok(())
 }
 
+static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
+
+/// Records that the UI's main window is on screen. A failure after this ends
+/// a running window, not its startup.
+pub fn mark_ui_window_opened() {
+    UI_WINDOW_OPENED.store(true, Ordering::Release);
+}
+
+/// Whether [`mark_ui_window_opened`] ran in this process.
+pub fn ui_window_opened() -> bool {
+    UI_WINDOW_OPENED.load(Ordering::Acquire)
+}
+
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
