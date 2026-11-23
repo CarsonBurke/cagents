@@ -47,8 +47,9 @@ const PROBE_PAGE: usize = 20;
 /// Projects which name the same GitHub repository are normally polled in one
 /// forge pass. Keep their conditional revalidation together too: otherwise
 /// each checkout spends a REST request to learn the same ETag has not moved.
-/// This also preserves the watched cadence for a single project.
-const PROBE_FOR: Duration = Duration::from_secs(30);
+/// It equals the watched interval, and a poll stamps the probe before it
+/// schedules the next one, so a lone project still probes every interval.
+const PROBE_FOR: Duration = WATCHED_INTERVAL;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Snapshot {
@@ -237,6 +238,9 @@ struct Listing {
     /// projects can share a listing, and only the first should spend a probe
     /// in this cadence.
     probed_at: Instant,
+    /// Why that revalidation failed, which a project sharing the listing in
+    /// the same cadence reports too rather than showing it as current.
+    failed: Option<String>,
 }
 
 impl Listing {
@@ -495,7 +499,10 @@ fn listing<E: crate::repository::ProcessExecutor>(
         return Ok(pull_requests);
     };
     if freshness != Freshness::Fresh && previous.probed_at.elapsed() < PROBE_FOR {
-        return Ok(previous.pull_requests.clone());
+        return match previous.failed {
+            Some(error) => Err(error),
+            None => Ok(previous.pull_requests),
+        };
     }
     // Asked before the listing is read, so a change landing between the two
     // shows as a change next time rather than hiding under a new validator.
@@ -503,6 +510,7 @@ fn listing<E: crate::repository::ProcessExecutor>(
     // Do not let another local checkout immediately repeat an unavailable or
     // failed revalidation. It can reuse this listing until the next cadence.
     previous.probed_at = Instant::now();
+    previous.failed = None;
     if let Answer::Current(probe) = &answer
         && freshness != Freshness::Fresh
         && previous.at.elapsed() < relist_after(freshness)
@@ -543,6 +551,7 @@ fn listing<E: crate::repository::ProcessExecutor>(
         }
         Err(error) => {
             // Its validator still matches it, for when GitHub answers again.
+            previous.failed = Some(error.clone());
             memory.listings.put(previous);
             Err(error)
         }
@@ -610,6 +619,7 @@ fn read_listing<E: crate::repository::ProcessExecutor>(
         viewer: read.viewer,
         probe,
         probed_at: Instant::now(),
+        failed: None,
     })
 }
 
@@ -1064,7 +1074,7 @@ mod tests {
 
         // A second local project on this remote reuses the same GraphQL
         // result and its recent conditional probe.
-        listing(
+        let shared = listing(
             &gh,
             &repository,
             &mut second,
@@ -1073,6 +1083,8 @@ mod tests {
         )
         .unwrap();
         assert!(forge.take().is_empty());
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].number, 1);
 
         let cache_key = ListingKey {
             repository: repository.clone(),
@@ -1090,6 +1102,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(forge.take(), ["probe"]);
+
+        // A revalidation that fails is not repeated by the other project in
+        // the same cadence, nor shown to it as current.
+        forge.change(SECOND, "W/\"2\"");
+        forge
+            .listing_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        listings.listing_mut(&cache_key, |listing| {
+            listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
+        });
+        let poll = |memory: &mut Memory| {
+            listing(&gh, &repository, memory, Freshness::Watched, &cancellation)
+        };
+        assert!(poll(&mut first).is_err());
+        assert_eq!(forge.take(), ["probe", "listing"]);
+        assert!(poll(&mut second).is_err());
+        assert!(forge.take().is_empty());
     }
 
     #[test]
@@ -1182,6 +1211,7 @@ mod tests {
                 .collect(),
             viewer: "me".into(),
             probed_at: Instant::now(),
+            failed: None,
             probe: Probe::Unknown,
         };
         let ahead = |body: serde_json::Value, seconds: i64| {
