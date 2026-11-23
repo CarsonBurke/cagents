@@ -208,6 +208,12 @@ fn a_proof_answers_one_challenge_and_its_capability_ends_with_the_connection() {
     let replay = authenticate_at(&path, &host, client, peer, &claim(session), &proof).unwrap_err();
     assert_eq!(replay.code, ProtocolErrorCode::PermissionDenied);
 
+    // It has no session here, so it moves none of the device's panes.
+    let Err(error) = super::super::agent_execution::terminals::mover(&host, client) else {
+        panic!("a peer connection must not move panes");
+    };
+    assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+
     // Another connection cannot act with it.
     let elsewhere =
         super::super::agent_execution::terminals::authenticate(&host, client + 1, &authority)

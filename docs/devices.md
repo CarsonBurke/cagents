@@ -144,16 +144,20 @@ cagents --device build-host agent close AGENT
 ```
 
 On the device, the session has a session's scope: it may start, message, wait
-for and close its own agents and terminals there, read listings, and message
-other sessions. It may not change accounts, the daemon, installations or device
-links, and, as on this computer, it may only use a project already open on the
-device. Its agents there are its children: they belong to the session that
-started them, not to the device's own sessions. It keeps the permission
-ceiling it had here when its connection was proved: the agents it starts on
-the device with `agent spawn` get no more than it could give them here, and it
-may approve their tool requests there only if it could here. As on this
-computer, the ceiling does not cover a provider CLI it starts itself with
-`terminal spawn`.
+for and close its own agents and terminals there, and message other sessions.
+Like a session on the device, it can also read every terminal's screen and
+every conversation there, including your own, so allow agents only on a device
+whose contents you would show them. It may not change accounts, the daemon,
+installations or device links, and, as on this computer, it may only use a
+project already open on the device. Its agents there are its children: they
+belong to the session that started them, not to the device's own sessions. It
+keeps the permission ceiling it had here when its connection was proved: the
+agents it starts on the device with `agent spawn` get no more than it could
+give them here, and it may approve their tool requests there only if it could
+here. As on this computer, the ceiling does not cover a provider CLI it starts
+itself with `terminal spawn`. An agent it starts on the device is a session of
+that device, so it may use the device's own links to further devices if a
+person there allowed them.
 
 | Command | What it does |
 | --- | --- |
@@ -164,12 +168,11 @@ computer, the ceiling does not cover a provider CLI it starts itself with
 | `cagents device unlink NAME` | Forgets the link here and on the device. |
 
 Only a person may link, allow, deny or unlink: the CLI refuses these commands
-in a cagents session, so an agent cannot grant itself a device through
-cagents. Like every session scope, this is cagents' own interface, not an
+in a cagents session, so an agent cannot grant itself a device through cagents.
+Like every session scope, this is cagents' own interface, not an
 operating-system sandbox: an agent with a shell and your SSH keys can already
-act as you on the device. A session that tries a
-device it may not use is told so, with the command a person can run, rather
-than a connection error.
+act as you on the device. A session that tries a device it may not use is told
+so, with the command a person can run, rather than a connection error.
 
 Linking stores a random key in `device-trust.json`, readable only by you, in
 each daemon's data directory. A session's own capability never leaves this
