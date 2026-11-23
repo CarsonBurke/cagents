@@ -727,14 +727,31 @@ impl Cagents {
             .filter(|target| target.card == card)
     }
 
-    /// The chat whose microphone is on while no part of it is on screen.
+    /// The chat whose microphone is on while it is not, or will not be once
+    /// the strip stops moving, at least half on screen: an edge of it left
+    /// in view shows neither its strip nor its tab legibly.
     fn dictation_out_of_sight(&self) -> Option<Target> {
+        let workspace = &self.workspace;
         self.chat_ui
             .dictation
             .active
             .map(|(target, _)| target)
             .filter(|target| {
-                self.workspace.visibility(target.card) != Some(VisibilityClass::Visible)
+                let card = target.card;
+                if workspace.is_hidden(card)
+                    || workspace.visibility(card) != Some(VisibilityClass::Visible)
+                {
+                    return true;
+                }
+                let Some(geometry) = workspace.card_geometry(card) else {
+                    return true;
+                };
+                // Where the camera is going, so that passing over the chat
+                // on the way elsewhere does not flash the strip away.
+                let start = workspace.camera().target();
+                let end = start + workspace.viewport_width();
+                let shown = geometry.end.min(end) - geometry.start.max(start);
+                shown < geometry.width() / 2.0
             })
     }
 
@@ -754,17 +771,9 @@ impl Cagents {
         widget::container(
             widget::row::with_children(vec![
                 meter(self.chat_ui.dictation.client.level()),
-                widget::row::with_children(vec![
-                    design::body("Microphone on: dictating into ")
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .into(),
-                    crate::ui_controls::fade_text(title)
-                        .width(Length::Shrink)
-                        .into(),
-                ])
-                .width(Length::Fill)
-                .align_y(Alignment::Center)
-                .into(),
+                crate::ui_controls::fade_text(format!("Microphone on: dictating into {title}"))
+                    .width(Length::Fill)
+                    .into(),
                 crate::ui_controls::button::quiet("Show chat")
                     .on_press_maybe((!blocked).then_some(Message::Palette(
                         crate::app::palette_ui::Action::FocusPane(target.card),
@@ -1707,7 +1716,18 @@ mod tests {
         assert_eq!(app.dictation_microphone_in(other), None);
         assert_eq!(app.dictation_out_of_sight(), None);
 
-        // Its tab put away while another chat is read.
+        // Another chat that fills the window is read: the dictating one is
+        // scrolled away, or no more than an edge of it shows.
+        app.workspace.resize_viewport(500.0);
+        for pane in [card, other] {
+            drop(app.workspace.set_card_width(pane, CardWidth::Fraction(1.0)));
+        }
+        drop(app.workspace.focus(other));
+        assert_eq!(app.dictation_out_of_sight(), Some(target));
+        assert_eq!(app.dictation_microphone_in(card), Some(target));
+        drop(app.workspace.focus(card));
+        assert_eq!(app.dictation_out_of_sight(), None);
+        // Its tab put away.
         drop(app.workspace.focus(other));
         drop(app.workspace.hide_card(card));
         assert_ne!(
