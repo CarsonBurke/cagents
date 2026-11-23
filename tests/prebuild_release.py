@@ -30,9 +30,14 @@ _loader.exec_module(prebuild)
 HANG_GUARD = 60
 
 GATE = """#!/bin/sh
-# As the gate's exec: runs the command within the build's shares.
+# As the gate's exec: runs the command within the build's shares, once
+# admitted after PREBUILD_GATE_WAIT seconds when that is set.
 [ "$1" = exec ] || exit 99
 shift
+if [ -n "${PREBUILD_GATE_WAIT:-}" ]; then
+    echo "cargo-gate: waiting for 2 of the 6 build memory shares on fixture; the others are in use"
+    sleep "$PREBUILD_GATE_WAIT"
+fi
 exec "$@"
 """
 
@@ -329,26 +334,30 @@ class Prebuild(unittest.TestCase):
         with patch.dict(os.environ, GIT_COMMITTER_DATE=stamp, GIT_AUTHOR_DATE=stamp):
             return self.commit(message)
 
-    def test_a_bundle_two_hours_behind_starves_the_prebuild_which_queues_for_a_share(self):
+    def test_main_two_hours_without_a_bundle_starves_the_prebuild_which_builds_as_any_other(self):
         old = self.old_commit("old", 3)
         self.compiled(old)
-        # No bundle, and its commit is three hours old: starved at once.
+        # No bundle, and its commit is three hours old: starved at once, it
+        # builds in the build slice and queues without a deadline.
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.builds()[-1][2:4], ["1", "unbounded"])
+        self.assertEqual(self.builds()[-1][2:4], ["normal", "unbounded"])
         self.assertEqual(json.loads((self.store.bundle(old) / "bundle.json").read_text())["priority"], "starved")
-        # A commit within two hours of the newest bundle yields as before.
-        recent = self.old_commit("recent", 2.5)
-        self.compiled(recent)
+        # After a quiet night the morning's commit is new: it yields as ever.
+        morning = self.commit("morning")
+        self.compiled(morning)
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.builds()[-1][2:4], ["1", "10"])
-        # One more than two hours newer than it starves again.
-        self.compiled(self.commit("newest"))
+        # Commits newer than every bundle for two hours starve it again,
+        # however new the tip.
+        self.old_commit("unbundled", 2.5)
+        later = self.commit("later")
+        self.compiled(later)
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.builds()[-1][2:4], ["1", "unbounded"])
+        self.assertEqual(self.builds()[-1][2:4], ["normal", "unbounded"])
 
     def test_half_an_hour_of_making_way_starves_it_and_waiters_no_longer_stop_it(self):
         self.compiled(self.first)
-        (self.store.root).mkdir(parents=True, exist_ok=True)
+        self.store.prepare()
         (self.store.root / "state.json").write_text(json.dumps({
             "sha": self.first, "first_tried_at": time.time() - 3600, "stopped_since": time.time() - 31 * 60,
             "retry_after": time.time() - 1, "stopped": "a build is waiting for build memory shares"}))
@@ -364,19 +373,68 @@ class Prebuild(unittest.TestCase):
         self.assertEqual(outcome, ["waited"])
         state = json.loads((self.store.root / "state.json").read_text())
         self.assertIn("GiB of memory", state["stopped"])
-        self.assertIn("made way for 31 min", state["starved"])
+        self.assertEqual(state["starved"], "waited")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            prebuild.status(self.store, self.sentinel, as_json=False)
+        self.assertIn(f"starved  {self.first}  (waited)", output.getvalue())
+        self.assertIn(f"stopped  {self.first}  less than", output.getvalue())
         self.release_waiters()
         self.setUp_readings()
         state["retry_after"] = time.time() - 1
         (self.store.root / "state.json").write_text(json.dumps(state))
-        self.assertEqual(self.run_once(), 0)
+        with patch.dict(os.environ, PREBUILD_GATE_WAIT="0.3"):
+            self.assertEqual(self.run_once(), 0)
         bundled = json.loads((self.store.bundle(self.first) / "bundle.json").read_text())
         self.assertEqual(bundled["priority"], "starved")
-        # Its wait counts from the first try, an hour ago.
-        self.assertGreaterEqual(bundled["waited_seconds"], 3590)
+        # Its wait counts from the first try, an hour ago, to the admission.
+        self.assertGreaterEqual(bundled["waited_seconds"], 3600)
         self.assertLess(bundled["seconds"], 60)
         # A bundle ends the starvation.
         self.assertEqual(json.loads((self.store.root / "state.json").read_text()), {})
+
+    def test_a_prebuild_never_started_counts_its_wait_and_starved_starts_on_less_memory(self):
+        self.compiled(self.first)
+        self.memory(10)
+        self.assertEqual(self.run_once(), "waited")
+        state = json.loads((self.store.root / "state.json").read_text())
+        self.assertLessEqual(time.time() - state["stopped_since"], 5)
+        state["stopped_since"] -= 31 * 60
+        (self.store.root / "state.json").write_text(json.dumps(state))
+        # Starved, it starts above the floor rather than the 16 GiB a
+        # background one waits for.
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.builds()[-1][2:4], ["normal", "unbounded"])
+
+    def test_the_admission_splits_the_wait_from_the_build(self):
+        self.compiled(self.first)
+        with patch.dict(os.environ, PREBUILD_GATE_WAIT="1.6"):
+            self.assertEqual(self.run_once(), 0)
+        bundled = json.loads((self.store.bundle(self.first) / "bundle.json").read_text())
+        self.assertGreaterEqual(bundled["waited_seconds"], 1)
+        self.assertLess(bundled["seconds"], bundled["waited_seconds"] + 5)
+        self.assertIn("prebuild-release: admitted ", (self.store.bundle(self.first) / "build.log").read_text())
+
+    def test_a_newer_target_keeps_the_backoff_and_a_request_keeps_the_record(self):
+        self.compiled(self.first)
+        self.store.prepare()
+        since = time.time() - 600
+        (self.store.root / "state.json").write_text(json.dumps({
+            "sha": self.first, "first_tried_at": since, "stopped_since": since,
+            "retry_after": time.time() + 300, "stopped": "a build is waiting for build memory shares"}))
+        second = self.commit("second")
+        self.compiled(second)
+        self.assertEqual(self.run_once(), "waited")
+        self.assertEqual(self.builds(), [])
+        state = json.loads((self.store.root / "state.json").read_text())
+        self.assertEqual((state["sha"], state["stopped_since"]), (second, since))
+        # A request builds without touching it.
+        with patch.object(sys, "argv", [PROGRAM_PATH, "--repository", str(self.repository),
+                                        "--store", str(self.store.root), "request", self.first]):
+            prebuild.main()
+        self.assertEqual(self.run_once(), "waited")
+        self.assertTrue(self.store.built(self.first))
+        self.assertEqual(json.loads((self.store.root / "state.json").read_text())["stopped_since"], since)
 
     def test_memory_running_short_stops_the_background_build(self):
         self.compiled(self.first)

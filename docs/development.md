@@ -1039,13 +1039,18 @@ build:
   releases with no bundle. The prebuild counts as starved when main's newest
   bundle is two hours older than the commit to build (or, with no bundle,
   that commit is two hours old), or when it has kept making way for half an
-  hour since it was first stopped without finishing a bundle. A starved
-  prebuild then queues for one build memory share like any other build and
-  keeps it while others wait. It still runs on idle CPU time, and still
-  starts and stops on available memory and pressure. `status` shows when it
-  is starved and why. Each bundle records how long it waited before the
-  admission of the build that finished it (`waited_seconds`) and how long
-  that build took (`seconds`).
+  hour since it was first stopped or deferred without finishing a bundle.
+  Main's newest bundle counts as stale once main has had commits newer than
+  it for two hours, so the first commit after a quiet night is not starved.
+  A starved prebuild builds like any other build: it queues fairly for its
+  build memory shares, keeps them while others wait, and runs in the build
+  slice at normal CPU weight. On idle CPU time, a host busy enough to starve
+  it would leave it holding shares while hardly running. It still starts
+  above the memory floor only and stops when memory runs short or pressure
+  rises. `status` shows when it is starved and why. Each bundle records how
+  long it waited, from the first try at its commit to the gate's admission
+  of the build that finished it (`waited_seconds`), and how long that build
+  took (`seconds`).
 
 `prebuild-release request SHA` builds a commit next at normal priority,
 interrupting a background prebuild of another commit; requests build in the
