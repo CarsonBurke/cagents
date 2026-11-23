@@ -17,7 +17,7 @@ glyphs on a tile.
   a gutter, syntax-coloured lines and a highlighted active line ending in a
   coral I-beam caret; coral- and slate-edged pages sit behind it.
 
-From 24 px up the marks stay distinct: a coral robot in an upright pane against
+From 24 px up the marks stay distinct: a coral robot in a square pane against
 a fanned stack of lined pages. At 16 px they reduce to their colours, an orange
 mark on a dark pane against a dark page with a teal top.
 
@@ -32,8 +32,8 @@ mark on a dark pane against a dark page with a teal top.
   teal eyes, slate ears and an antenna.
 - Palette: coral (`#FF7A48`), teal (`#6CC2B3`, `#74CCBC` → `#46988A`), slate
   (`#8EA4C8`, `#7C8FB2` → `#5A6B8C`) and obsidian.
-- Both drawings are scaled to keep at least 8 px of the 128 px grid clear on
-  every side, shadows included.
+- Both drawings are scaled to fill the 120 px live area COSMIC's own icons use,
+  keeping 4 px of the 128 px grid clear on every side, shadows included.
 
 ## Files
 

@@ -33,33 +33,29 @@
       <stop offset="1" stop-color="#1C2230"/>
     </linearGradient>
   </defs>
-  <!-- Scaled and centred so the panes and shadows keep the icon grid's margin -->
-  <g transform="translate(64 64) scale(.92) translate(-65 -69)">
+  <!-- Square panes scaled to the 120 px live area COSMIC icons use, shadows included -->
+  <g transform="translate(64 64) scale(1.111) translate(-53.0 -53.0)">
     <!-- Background session pane -->
-    <clipPath id="clip-back">
-      <rect x="40" y="14" width="72" height="86" rx="10"/>
-    </clipPath>
+    <clipPath id="clip-back"><rect x="24" y="0" width="80" height="80" rx="10"/></clipPath>
     <g filter="url(#sh)">
-      <rect x="40" y="19" width="72" height="86" rx="10" fill="#11151F"/>
-      <rect x="40" y="14" width="72" height="86" rx="10" fill="url(#obs-back)"/>
-      <rect x="40" y="14" width="72" height="8" fill="#6CC2B3" clip-path="url(#clip-back)"/>
-      <rect x="40" y="14" width="72" height="8" fill="url(#gloss)" clip-path="url(#clip-back)"/>
-      <rect x="40.8" y="14.8" width="70.4" height="84.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
-      <rect x="86" y="32" width="18" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
-      <rect x="86" y="41" width="12" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.5"/>
-      <rect x="86" y="50" width="15" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+      <rect x="24" y="5" width="80" height="80" rx="10" fill="#11151F"/>
+      <rect x="24" y="0" width="80" height="80" rx="10" fill="url(#obs-back)"/>
+      <rect x="24" y="0" width="80" height="8" fill="#6CC2B3" clip-path="url(#clip-back)"/>
+      <rect x="24" y="0" width="80" height="8" fill="url(#gloss)" clip-path="url(#clip-back)"/>
+      <rect x="24.8" y="0.8" width="78.4" height="78.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+      <rect x="78" y="18" width="18" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+      <rect x="78" y="27" width="12" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.5"/>
+      <rect x="78" y="36" width="15" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
     </g>
     <!-- Active session pane with its agent -->
-    <clipPath id="clip-front">
-      <rect x="16" y="28" width="72" height="86" rx="10"/>
-    </clipPath>
+    <clipPath id="clip-front"><rect x="0" y="16" width="80" height="80" rx="10"/></clipPath>
     <g filter="url(#sh-r)">
-      <rect x="16" y="33" width="72" height="86" rx="10" fill="#11151F"/>
-      <rect x="16" y="28" width="72" height="86" rx="10" fill="url(#obs)"/>
-      <rect x="16" y="28" width="72" height="8" fill="#FF7A48" clip-path="url(#clip-front)"/>
-      <rect x="16" y="28" width="72" height="8" fill="url(#gloss)" clip-path="url(#clip-front)"/>
-      <rect x="16.8" y="28.8" width="70.4" height="84.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
-      <g transform="translate(52.0 79.0) scale(1.2)" opacity="1.0">
+      <rect x="0" y="21" width="80" height="80" rx="10" fill="#11151F"/>
+      <rect x="0" y="16" width="80" height="80" rx="10" fill="url(#obs)"/>
+      <rect x="0" y="16" width="80" height="8" fill="#FF7A48" clip-path="url(#clip-front)"/>
+      <rect x="0" y="16" width="80" height="8" fill="url(#gloss)" clip-path="url(#clip-front)"/>
+      <rect x="0.8" y="16.8" width="78.4" height="78.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+      <g transform="translate(38.0 70.2) scale(1.15)">
         <rect x="-1.5" y="-27" width="3" height="10" rx="1.5" fill="#8EA4C8"/>
         <circle cx="0" cy="-27" r="4" fill="#B83D16"/>
         <circle cx="0" cy="-27.6" r="3.4" fill="url(#coral)"/>
