@@ -3029,6 +3029,8 @@ mod tests {
         let tip = run.tip();
         assert!(tip.starts_with("Messaged 3 agents\n\n"), "{tip}");
         assert!(tip.contains("\ntriage: Not sent"), "{tip}");
+        // A reason that opens with its state says it once.
+        assert!(tip.contains("\nui-tests, packaging: Queued for"), "{tip}");
         assert!(tip.ends_with("\n\nRebase."), "{tip}");
     }
 }

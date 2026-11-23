@@ -1272,7 +1272,10 @@ impl RowStatus {
             .as_deref()
             .filter(|detail| !detail.trim().is_empty())
         {
-            Some(detail) if self.text.is_empty() => detail.to_owned(),
+            // "Queued for its next step" says "Queued" already.
+            Some(detail) if self.text.is_empty() || detail.starts_with(&*self.text) => {
+                detail.to_owned()
+            }
             Some(detail) => format!("{}: {detail}", self.text),
             None => self.text.to_string(),
         }
