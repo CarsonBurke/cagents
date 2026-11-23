@@ -463,9 +463,10 @@ if [ "$scene" = agents ]; then
 fi
 
 # Generic tool cards opened to their input and output: a call to a tool
-# Claude Code doesn't have, an MCP call with list and multi-line arguments,
-# and a command the harness blocked. Both failures arrive wrapped in Claude
-# Code's <tool_use_error> tags.
+# Claude Code doesn't have, an MCP call with list and multi-line arguments
+# that returns JSON, and a command the harness blocked. Both failures arrive
+# wrapped in Claude Code's <tool_use_error> tags. The turn ends with a call
+# Auto mode denied, whose input the permissions card shows.
 if [ "$scene" = tool-cards ]; then
     cp "$here/reasoning-row-scene/tool-cards.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
@@ -490,7 +491,23 @@ if [ "$scene" = tool-cards ]; then
     shot tool-cards-open
     scroll_bottom
     shot tool-cards-open-end
-    printf '%s\n' 'Captured the tool cards closed and open.'
+    # Hovering a call's input offers it exactly as it was sent.
+    scroll_top
+    evidence drive hover "$(find_row 'good design')" >/dev/null
+    sleep 1
+    evidence shot tool-cards-input-hover
+    # The footer names the denied call; it opens the permissions card.
+    blocked=$(evidence drive --json observe | /usr/bin/python3 -c '
+import json,sys
+runs=[r for r in json.load(sys.stdin)["runs"] if "blocked" in r["text"].lower() and "bash" in r["text"].lower()]
+if not runs: raise SystemExit("reasoning-row-scene: no denial in the footer")
+r=max(runs,key=lambda r:r["y"])
+print("{},{}".format(round(r["x"]+r["width"]/2),round(r["y"]+r["height"]/2)))
+')
+    evidence drive click "$blocked" >/dev/null
+    sleep 1
+    shot tool-cards-denial
+    printf '%s\n' 'Captured the tool cards closed and open, and the denied call.'
     exit 0
 fi
 

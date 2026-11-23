@@ -1,14 +1,18 @@
-//! A tool call's input as its detail shows it.
+//! JSON a provider hands over, as a person reads it.
 //!
-//! Providers hand a call's arguments over as JSON, and the detail used to
-//! show that JSON as it came: a prompt to a subagent was one line of `\n`
-//! escapes, and a command was quoted twice, once for the shell and once for
-//! JSON. A reader wants the values. An input that is only a command reads as
-//! the command; any other object reads as its members, each value as the
-//! text it holds. Members that fit on their key's line come first, so a
+//! Providers pass a call's arguments, many tools' results and some approval
+//! details as JSON, and the app used to show that JSON as it came: a prompt
+//! to a subagent was one line of `\n` escapes, and a command was quoted
+//! twice, once for the shell and once for JSON. A reader wants the values.
+//! An input that is only a command reads as the command; any other object
+//! reads as its members, each value as the text it holds and each number as
+//! written. Members that fit on their key's line come first, so a
 //! call's settings are not pushed below a long prompt; each group keeps the
-//! order the members arrived in, which for Claude is sorted by key. Nothing
-//! is escaped: the lines are for reading, selecting and copying, not parsing.
+//! order the members arrived in. For Claude that is alphabetical, but not by
+//! Claude: its adapter re-serializes the input through a `serde_json` map
+//! that the daemon builds without `preserve_order`, so the model's order is
+//! gone before this code sees it. Nothing is escaped: the lines are for
+//! reading, selecting and copying, not parsing.
 //!
 //! ```text
 //! description: Review the change
@@ -35,15 +39,26 @@ const DEPTH: usize = 16;
 /// How an input is drawn: the lines of its readable form, and whether they
 /// are a shell command to highlight as one.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Readable {
-    pub(super) text: String,
-    pub(super) command: bool,
+pub struct Readable {
+    pub text: String,
+    pub command: bool,
 }
 
 /// The input's readable form, or `None` when it is shown as it came: when
 /// it is not one whole JSON object or array (a call still streaming, a
 /// shortened input, a plain-text argument), or is too large to read here.
-pub(super) fn readable(input: &str) -> Option<Readable> {
+pub fn readable(input: &str) -> Option<Readable> {
+    read(input, true)
+}
+
+/// A tool's result read as [`readable`] reads an input, except that a
+/// result holding only a `command` is that member rather than a command the
+/// call ran.
+pub fn result(output: &str) -> Option<String> {
+    read(output, false).map(|readable| readable.text)
+}
+
+fn read(input: &str, commands: bool) -> Option<Readable> {
     let trimmed = input.trim();
     // An input still streaming is an unclosed prefix, which is not read
     // through only to fail at its end on every delta.
@@ -55,13 +70,18 @@ pub(super) fn readable(input: &str) -> Option<Readable> {
     {
         return None;
     }
-    let node: Node = serde_json::from_str(trimmed).ok()?;
     // Each level indents its lines further, so deep nesting would multiply
     // the input's size; arguments nested that deep are not read as lines.
-    if node.depth() > DEPTH {
+    let (depth, numbers) = scan(trimmed);
+    if depth > DEPTH {
         return None;
     }
-    if let Node::Map(members) = &node
+    let numbers = std::cell::RefCell::new(numbers.into_iter());
+    let mut deserializer = serde_json::Deserializer::from_str(trimmed);
+    let node = serde::de::DeserializeSeed::deserialize(Read(&numbers), &mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    if commands
+        && let Node::Map(members) = &node
         && let [(key, Node::Text(command))] = members.as_slice()
         && matches!(key.as_str(), "command" | "cmd")
     {
@@ -84,10 +104,21 @@ pub(super) fn readable(input: &str) -> Option<Readable> {
     })
 }
 
+/// A value an adapter holds, such as an approval's details, as lines to
+/// read; a value too large or deep to read stays JSON.
+pub fn value(value: &serde_json::Value) -> String {
+    let json = value.to_string();
+    match readable(&json) {
+        Some(readable) => readable.text,
+        None if value.is_string() => value.as_str().unwrap_or_default().to_owned(),
+        None => json,
+    }
+}
+
 /// Whether a call was made without arguments, so its detail has no input to
 /// show. This runs as the detail is drawn, so it reads no further than the
 /// brackets.
-pub(super) fn is_empty(input: &str) -> bool {
+pub fn is_empty(input: &str) -> bool {
     let input = input.trim();
     input.is_empty()
         || [("{", "}"), ("[", "]")].into_iter().any(|(open, close)| {
@@ -111,21 +142,6 @@ enum Node {
 }
 
 impl Node {
-    /// How many lists and objects deep the value nests.
-    fn depth(&self) -> usize {
-        match self {
-            Node::List(items) => 1 + items.iter().map(Node::depth).max().unwrap_or(0),
-            Node::Map(members) => {
-                1 + members
-                    .iter()
-                    .map(|(_, value)| value.depth())
-                    .max()
-                    .unwrap_or(0)
-            }
-            Node::Text(_) | Node::Scalar(_) => 0,
-        }
-    }
-
     /// The value on its key's line, when it fits there.
     fn inline(&self) -> Option<&str> {
         match self {
@@ -204,55 +220,109 @@ fn member(out: &mut String, key: &str, value: &Node, indent: usize) {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for Node {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::{MapAccess, SeqAccess, Visitor};
-        struct Read;
-        impl<'de> Visitor<'de> for Read {
-            type Value = Node;
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a JSON value")
-            }
-            fn visit_str<E>(self, value: &str) -> Result<Node, E> {
-                Ok(Node::Text(value.to_owned()))
-            }
-            fn visit_string<E>(self, value: String) -> Result<Node, E> {
-                Ok(Node::Text(value))
-            }
-            fn visit_bool<E>(self, value: bool) -> Result<Node, E> {
-                Ok(Node::Scalar(value.to_string()))
-            }
-            fn visit_i64<E>(self, value: i64) -> Result<Node, E> {
-                Ok(Node::Scalar(value.to_string()))
-            }
-            fn visit_u64<E>(self, value: u64) -> Result<Node, E> {
-                Ok(Node::Scalar(value.to_string()))
-            }
-            fn visit_f64<E>(self, value: f64) -> Result<Node, E> {
-                Ok(Node::Scalar(
-                    serde_json::Number::from_f64(value)
-                        .map_or_else(|| value.to_string(), |number| number.to_string()),
-                ))
-            }
-            fn visit_unit<E>(self) -> Result<Node, E> {
-                Ok(Node::Scalar("null".into()))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Node, A::Error> {
-                let mut items = Vec::new();
-                while let Some(item) = seq.next_element()? {
-                    items.push(item);
+/// How deeply `json` nests its lists and objects, and the text of each
+/// number in it, in the order written. A number is shown as written:
+/// read as a float, `1.50` would read as `1.5` and an integer past `u64`
+/// as an exponent. Run on valid JSON only; anything else fails to parse
+/// after.
+fn scan(json: &str) -> (usize, Vec<&str>) {
+    let bytes = json.as_bytes();
+    let (mut depth, mut deepest, mut numbers) = (0usize, 0, Vec::new());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'"' => {
+                index += 1;
+                while let Some(&byte) = bytes.get(index) {
+                    index += match byte {
+                        b'\\' => 2,
+                        b'"' => break,
+                        _ => 1,
+                    };
                 }
-                Ok(Node::List(items))
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Node, A::Error> {
-                let mut members = Vec::new();
-                while let Some(member) = map.next_entry()? {
-                    members.push(member);
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                while bytes.get(index + 1).is_some_and(|byte| {
+                    matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                }) {
+                    index += 1;
                 }
-                Ok(Node::Map(members))
+                numbers.push(&json[start..=index]);
             }
+            _ => {}
         }
-        deserializer.deserialize_any(Read)
+        index += 1;
+    }
+    (deepest, numbers)
+}
+
+/// Reads a [`Node`], taking each number's text from what [`scan`] found:
+/// the parser visits values in the order they are written.
+#[derive(Clone, Copy)]
+struct Read<'n, 's>(&'n std::cell::RefCell<std::vec::IntoIter<&'s str>>);
+
+impl Read<'_, '_> {
+    fn number<E: serde::de::Error>(self) -> Result<Node, E> {
+        self.0
+            .borrow_mut()
+            .next()
+            .map(|text| Node::Scalar(text.to_owned()))
+            .ok_or_else(|| E::custom("a number the scan did not find"))
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Read<'_, '_> {
+    type Value = Node;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Node, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Read<'_, '_> {
+    type Value = Node;
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    fn visit_str<E>(self, value: &str) -> Result<Node, E> {
+        Ok(Node::Text(value.to_owned()))
+    }
+    fn visit_string<E>(self, value: String) -> Result<Node, E> {
+        Ok(Node::Text(value))
+    }
+    fn visit_bool<E>(self, value: bool) -> Result<Node, E> {
+        Ok(Node::Scalar(value.to_string()))
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Node, E> {
+        self.number()
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Node, E> {
+        self.number()
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Node, E> {
+        self.number()
+    }
+    fn visit_unit<E>(self) -> Result<Node, E> {
+        Ok(Node::Scalar("null".into()))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Node, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(self)? {
+            items.push(item);
+        }
+        Ok(Node::List(items))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Node, A::Error> {
+        let mut members = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            members.push((key, map.next_value_seed(self)?));
+        }
+        Ok(Node::Map(members))
     }
 }
 
@@ -276,6 +346,11 @@ mod tests {
             }
         );
         assert!(shown(json!({"cmd": "ls -la"})).command);
+        // A result that names a command did not run one.
+        assert_eq!(
+            result(r#"{"command":"ls -la"}"#).as_deref(),
+            Some("command: ls -la")
+        );
         // A command among other arguments is one member of several.
         let input = json!({"command": "cargo test", "timeout": 600000});
         assert_eq!(
@@ -341,6 +416,15 @@ mod tests {
     }
 
     #[test]
+    fn numbers_read_as_written() {
+        let input = r#"{"price":1.50,"id":123456789012345678901234,"offset":-2e-3,"count":7,"label":"1.50 [x]","tags":["a\\\"]",0.10]}"#;
+        assert_eq!(
+            readable(input).unwrap().text,
+            "price: 1.50\nid: 123456789012345678901234\noffset: -2e-3\ncount: 7\nlabel: 1.50 [x]\ntags:\n  - a\\\"]\n  - 0.10"
+        );
+    }
+
+    #[test]
     fn what_is_not_one_whole_json_value_is_shown_as_it_came() {
         for input in [
             "",
@@ -348,6 +432,8 @@ mod tests {
             r#"{"command":"still stre"#,
             "\"a JSON string\"",
             "42",
+            "{} {}",
+            "[1] [2]",
         ] {
             assert_eq!(readable(input), None, "{input}");
         }

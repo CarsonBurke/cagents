@@ -6583,3 +6583,24 @@ fn images_left_after_a_reference_is_deleted_keep_their_own_labels() {
         );
     });
 }
+
+/// A decision Codex offers with terms is labelled by its name and described
+/// by its terms, never as the JSON it arrives as.
+#[test]
+fn decisions_with_terms_read_as_words() {
+    let amendment =
+        json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","push"]}});
+    assert_eq!(
+        decision_label("decision-2", &amendment),
+        "Allow and remember"
+    );
+    assert_eq!(
+        decision_label("decision-3", &json!({"acceptWithNetworkPolicy":{}})),
+        "Accept with network policy"
+    );
+    assert_eq!(decision_label("decision-0", &json!("accept")), "Allow once");
+    assert_eq!(
+        crate::chat::readable::value(&amendment["acceptWithExecpolicyAmendment"]),
+        "execpolicy_amendment:\n  - git\n  - push"
+    );
+}

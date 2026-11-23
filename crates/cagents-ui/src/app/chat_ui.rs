@@ -140,7 +140,6 @@ mod step;
 mod stopped;
 mod text_copy;
 mod thumbnails;
-mod tool_input;
 mod tool_text;
 mod tool_title;
 mod turn;
@@ -253,7 +252,13 @@ async fn rebind_receipt(
 pub enum CopyPart {
     Text,
     Input,
+    /// A tool call's input exactly as the provider sent it, where the
+    /// detail shows it as readable lines.
+    Sent,
     Output,
+    /// A tool's result exactly as it returned it, where the detail shows it
+    /// as readable lines.
+    Received,
     Change(usize),
 }
 
@@ -2074,9 +2079,10 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
             }
             Some(text)
         }
-        (CopyPart::Text, ItemContent::Tool { input, output, .. }) => {
-            joined(&[&tool_text::tool_input(input).0, output])
-        }
+        (CopyPart::Text, ItemContent::Tool { input, output, .. }) => joined(&[
+            &tool_text::tool_input(input).0,
+            &tool_text::tool_output(output).0,
+        ]),
         (
             CopyPart::Text,
             ItemContent::Image {
@@ -2099,14 +2105,19 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
         (CopyPart::Input, ItemContent::Tool { input, .. }) => {
             joined(&[&tool_text::tool_input(input).0])
         }
-        (CopyPart::Output, ItemContent::Command { output, .. })
-        | (CopyPart::Output, ItemContent::Tool { output, .. }) => joined(&[output]),
+        (CopyPart::Sent, ItemContent::Tool { input, .. }) => joined(&[input]),
+        (CopyPart::Output, ItemContent::Command { output, .. }) => joined(&[output]),
+        (CopyPart::Output, ItemContent::Tool { output, .. }) => {
+            joined(&[&tool_text::tool_output(output).0])
+        }
+        (CopyPart::Received, ItemContent::Tool { output, .. }) => joined(&[output]),
         // The code blocks of a Markdown answer are the cache's own, resolved
         // by the caller before it reaches this.
         (CopyPart::Change(index), ItemContent::Changes { changes, .. }) => {
             changes.get(index).map(|change| change.diff.clone())
         }
-        (CopyPart::Change(_), _) | (CopyPart::Input | CopyPart::Output, _) => None,
+        (CopyPart::Change(_), _)
+        | (CopyPart::Input | CopyPart::Sent | CopyPart::Output | CopyPart::Received, _) => None,
     }
 }
 
@@ -2137,7 +2148,7 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
         } => {
             find::contains(name, query)
                 || find::contains(&tool_text::tool_input(input).0, query)
-                || find::contains(output, query)
+                || find::contains(&tool_text::tool_output(output).0, query)
         }
         ItemContent::WebSearch {
             query: search,
@@ -2668,16 +2679,13 @@ impl CachedItem {
                         ToolText::update(input, &text, language)
                     }
                 }),
-                Some(prepare_text(
-                    output,
-                    result,
-                    if prepared_output.is_some() {
-                        Language::Plain
-                    } else {
-                        Language::structured(result)
-                    },
-                    prepared_output,
-                )),
+                Some(match prepared_output {
+                    Some(prepared) => ToolText::from_prepared(output, prepared),
+                    None => {
+                        let (text, language) = tool_text::tool_output(result);
+                        ToolText::update(output, &text, language)
+                    }
+                }),
             ),
             _ => (None, None),
         };
@@ -3712,6 +3720,9 @@ pub(super) struct Runtime {
         HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>,
     >,
     selection_document: std::cell::RefCell<view::SelectionDocument>,
+    /// Blocked calls' inputs as the permissions card reads them, by tool use
+    /// id, so a view parses each input once rather than on every frame.
+    denial_inputs: std::cell::RefCell<HashMap<String, Arc<str>>>,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
@@ -5244,6 +5255,7 @@ impl Runtime {
             history_stash: None,
             selection_bookmarks: Default::default(),
             selection_document: Default::default(),
+            denial_inputs: Default::default(),
             scroll: view::Scroll::default(),
             subagent_scroll: HashMap::new(),
             page_request: None,

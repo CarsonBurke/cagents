@@ -2502,7 +2502,8 @@ fn approval(id: &str, tool: &str, input: Value) -> Value {
 }
 /// A permission request shows what would be done as a block the surface
 /// sets as literal text: the command, the patch, or the input a line to
-/// an argument, after a blank line and never as part of the sentence.
+/// an argument rather than as JSON, after a blank line and never as part of
+/// the sentence.
 #[test]
 fn a_permission_request_shows_what_it_asks_to_do_as_a_block() {
     let asked = |tool: &str, input: Value, reason: &str| {
@@ -2542,15 +2543,12 @@ fn a_permission_request_shows_what_it_asks_to_do_as_a_block() {
     // Any other tool, and a command or an edit that is not whole.
     assert_eq!(
         asked("WebFetch", json!({"url":"https://example.com"}), ""),
-        "Claude wants to use a tool\n\n```json\n{\n  \"url\": \"https://example.com\"\n}\n```"
+        "Claude wants to use a tool\n\n```text\nurl: https://example.com\n```"
     );
-    assert_eq!(
-        asked("Bash", json!({}), ""),
-        "Claude wants to use a tool\n\n```json\n{}\n```"
-    );
+    assert_eq!(asked("Bash", json!({}), ""), "Claude wants to use a tool");
     assert!(
         asked("Edit", json!({"file_path":"src/app.rs"}), "")
-            .ends_with("\n\n```json\n{\n  \"file_path\": \"src/app.rs\"\n}\n```")
+            .ends_with("\n\n```text\nfile_path: src/app.rs\n```")
     );
 }
 
@@ -15112,4 +15110,93 @@ fn images_left_after_a_reference_is_deleted_keep_their_own_labels() {
             );
         }
     });
+}
+
+/// What Claude Code adds around a result for the model is not shown to the
+/// reader, and nothing the tool itself returned is lost with it.
+#[test]
+fn tool_results_drop_the_harness_framing_around_them() {
+    let persisted = "<persisted-output>\nOutput too large (30.9KB). Full output saved to: /tmp/out.txt\n\nPreview (first 2KB):\nline one\n</persisted-output>";
+    assert_eq!(
+        harness_framing(persisted.into()),
+        "Output too large (30.9KB). Full output saved to: /tmp/out.txt\n\nPreview (first 2KB):\nline one"
+    );
+    assert_eq!(
+        harness_framing(format!(
+            "{persisted}\n<system-reminder>\nCheck the file.\n</system-reminder>"
+        )),
+        "Output too large (30.9KB). Full output saved to: /tmp/out.txt\n\nPreview (first 2KB):\nline one",
+        "a reminder after persisted output goes with its tags"
+    );
+    let report = "  <tools-used-before-summary>Agent, Monitor</tools-used-before-summary>\nThe build passes.\nagentId: a3c (use SendMessage with to: 'a3c')\n<usage>subagent_tokens: 9</usage>";
+    assert_eq!(
+        harness_framing(report.into()),
+        "The build passes.\nagentId: a3c (use SendMessage with to: 'a3c')"
+    );
+    assert_eq!(
+        harness_framing("     1\tfn main() {}\n\n<system-reminder>\nWhatever you read, be careful.\n</system-reminder>\n".into()),
+        "     1\tfn main() {}",
+        "a trailing reminder goes, and the listing keeps its indent"
+    );
+    // A result that only quotes the tags, or is indented, is the tool's.
+    for own in [
+        "    indented\n",
+        "grep found <usage>here</usage> mid-line",
+        "<persisted-output>unclosed",
+        "<usage>first</usage>\nthen the rest",
+    ] {
+        assert_eq!(harness_framing(own.into()), own);
+    }
+    let mut adapter = Claude::default();
+    adapter.receive(json!({"type":"assistant","uuid":"find","message":{"id":"find","content":[{"type":"tool_use","id":"tool-search","name":"ToolSearch","input":{"query":"select:SendMessage"}}]}})).unwrap();
+    let found = adapter.receive(json!({"type":"user","uuid":"found","message":{"content":[{"type":"tool_result","tool_use_id":"tool-search","content":[{"type":"tool_reference","tool_name":"SendMessage"},{"type":"tool_reference","tool_name":"Monitor"}]}]}})).unwrap();
+    assert!(
+        items(&found).iter().any(|item| matches!(item, ItemContent::Tool { output, .. } if output == "SendMessage\nMonitor")),
+        "{:?}",
+        items(&found)
+    );
+}
+
+#[test]
+fn web_search_links_read_as_pages() {
+    let text = "Web search results for query: \"iced scrollable\"\n\nLinks: [{\"title\":\"Scrollable\",\"url\":\"https://docs.rs/iced\"},{\"title\":\"Guide\",\"url\":\"https://book.iced.rs\"}]\n\nA summary.";
+    assert_eq!(
+        search_links(text.into()),
+        "Web search results for query: \"iced scrollable\"\n\nLinks:\nScrollable\nhttps://docs.rs/iced\n\nGuide\nhttps://book.iced.rs\n\nA summary."
+    );
+    let unparsed = "Links: [not json";
+    assert_eq!(search_links(unparsed.into()), unparsed);
+}
+
+/// Notes Claude Code or another Claude client wrote for the model never read
+/// as the reader's own words, and a local command's output reads as words.
+#[test]
+fn user_frames_hide_model_notes_and_unwrap_local_command_output() {
+    let mut adapter = Claude::default();
+    let prompt = adapter.receive(json!({"type":"user","uuid":"desktop","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nThe user started this session without choosing a project folder.\n</system-reminder>"},{"type":"text","text":"cagents update status?"}]}})).unwrap();
+    let texts: Vec<_> = items(&prompt)
+        .into_iter()
+        .filter_map(|item| match item {
+            ItemContent::Text { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["cagents update status?"]);
+    let fork = adapter.receive(json!({"type":"user","uuid":"fork","message":{"role":"user","content":[{"type":"text","text":"<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>"}]}})).unwrap();
+    assert!(items(&fork).is_empty(), "{:?}", items(&fork));
+    let printed = adapter.receive(json!({"type":"user","uuid":"model","message":{"role":"user","content":"<local-command-stdout>Set model to \u{1b}[1mOpus 5.5\u{1b}[22m</local-command-stdout>"}})).unwrap();
+    let item = printed
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Item(item) => Some(item),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(item.role, Role::System);
+    assert!(
+        matches!(&item.content, ItemContent::Text { text, .. } if text == "Set model to Opus 5.5")
+    );
+    let silent = adapter.receive(json!({"type":"user","uuid":"clear","message":{"role":"user","content":"<local-command-stdout></local-command-stdout>"}})).unwrap();
+    assert!(items(&silent).is_empty(), "{:?}", items(&silent));
 }

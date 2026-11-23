@@ -116,6 +116,24 @@ pub(super) fn code_frame<'a>(
     copy: Option<Action>,
     state: super::text_copy::CopyState,
 ) -> Element<'a, Message> {
+    code_frame_with(body, caption, copy, state, None)
+}
+
+/// How wide a code frame's header keeps clear for a control beside its
+/// Copy, such as Copy as sent.
+const ALSO_WIDTH: f32 = 112.0;
+
+/// [`code_frame`] with `also` shown beside its Copy while it is hovered,
+/// and kept shown while it says what it did.
+fn code_frame_with<'a>(
+    body: Element<'a, Message>,
+    caption: Option<String>,
+    copy: Option<Action>,
+    state: super::text_copy::CopyState,
+    also: Option<(Element<'a, Message>, bool)>,
+) -> Element<'a, Message> {
+    let telling = state.is_telling() || also.as_ref().is_some_and(|(_, telling)| *telling);
+    let also = also.map(|(also, _)| also);
     let Some(caption) = caption else {
         return widget::container(body)
             .class(design::surface(
@@ -155,7 +173,10 @@ pub(super) fn code_frame<'a>(
                 .spacing(GAP_S)
                 .align_y(Alignment::Center),
         )
-        .padding(iced::Padding::ZERO.right(24.0 + GAP_XS))
+        .padding(
+            iced::Padding::ZERO
+                .right(24.0 + GAP_XS + if also.is_some() { ALSO_WIDTH } else { 0.0 }),
+        )
         .width(Length::Fill)
         .height(24)
         .align_y(Alignment::Center)
@@ -167,16 +188,20 @@ pub(super) fn code_frame<'a>(
     match copy {
         Some(copy) => super::hover::over_pinned(
             block,
-            widget::container(small_icon(
-                state.icon(),
-                state.label("Copy this block"),
-                copy,
-            ))
+            widget::container(
+                widget::row::with_children(also.into_iter().chain([small_icon(
+                    state.icon(),
+                    state.label("Copy this block"),
+                    copy,
+                )]))
+                .spacing(GAP_XS)
+                .align_y(Alignment::Center),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Alignment::End)
             .align_y(Alignment::Start),
-            state.is_telling(),
+            telling,
         ),
         None => block.into(),
     }
@@ -277,29 +302,74 @@ impl Runtime {
                     ..
                 }
             );
-        code_frame(
-            block.view_logical_with_reader(
+        let logical = selectable_prose::Logical {
+            identity: selection::logical_identity(
+                &item.id,
+                &match part {
+                    CopyPart::Input => vec![4],
+                    CopyPart::Change(index) => vec![6, index as u32],
+                    _ => vec![5],
+                },
+            ),
+            start: 0,
+        };
+        // Where the detail reads a call's input or result as lines, the JSON
+        // stays a click away, exact.
+        let raw = match (&part, &item.content) {
+            (CopyPart::Input, ItemContent::Tool { input: raw, .. }) => Some((
+                raw,
+                CopyPart::Sent,
+                "Copy the input exactly as the provider sent it",
+            )),
+            (CopyPart::Output, ItemContent::Tool { output: raw, .. }) => Some((
+                raw,
+                CopyPart::Received,
+                "Copy the result exactly as the tool returned it",
+            )),
+            _ => None,
+        }
+        .filter(|(raw, ..)| *block.text != ***raw);
+        // What a call was given wraps, and so does a result read as lines;
+        // what a call printed and a patch keep their columns and scroll
+        // sideways.
+        let view = if matches!(part, CopyPart::Input) || raw.is_some() {
+            tool_text::ToolText::view_wrapped_with_reader
+        } else {
+            tool_text::ToolText::view_logical_with_reader
+        };
+        let raw = raw.map(|(_, part, description)| {
+            let state = self.copy_state(&item.id, Some(&part));
+            (
+                crate::ui_controls::button::quiet("Copy JSON")
+                    .instead(
+                        "Copied",
+                        matches!(state, super::text_copy::CopyState::Copied),
+                    )
+                    .instead(
+                        "Copy again",
+                        matches!(state, super::text_copy::CopyState::Refused(_)),
+                    )
+                    .description(description)
+                    .on_press(action(Action::Copy(target, id.clone(), part)))
+                    .into(),
+                state.is_telling(),
+            )
+        });
+        code_frame_with(
+            view(
+                block,
                 self.syntax_theme,
                 limit.map(|height| (height, follows)),
                 target,
                 self.find.as_deref(),
-                selectable_prose::Logical {
-                    identity: selection::logical_identity(
-                        &item.id,
-                        &match part {
-                            CopyPart::Input => vec![4],
-                            CopyPart::Change(index) => vec![6, index as u32],
-                            _ => vec![5],
-                        },
-                    ),
-                    start: 0,
-                },
+                logical,
                 self.scroll_memory.clone(),
                 self.selected_subagent.clone(),
             ),
             Some(caption.to_owned()),
             Some(copy),
             self.copy_state(&item.id, Some(&part)),
+            raw,
         )
     }
 
@@ -825,7 +895,7 @@ impl Runtime {
                 rows.push(literal_content::search_view(self, item, cached, settings))
             }
             ItemContent::Tool { input, output, .. } => {
-                if !super::tool_input::is_empty(input) {
+                if !chat::readable::is_empty(input) {
                     rows.push(self.tool_code_surface(
                         item,
                         cached,
@@ -835,7 +905,14 @@ impl Runtime {
                     ));
                     rows.extend(self.excerpt_note(item, CopyPart::Input));
                 }
-                if output.is_empty() {
+                if cached
+                    .coordination
+                    .as_deref()
+                    .is_some_and(|coordinated| coordinated.reading.output_is_agent_states())
+                {
+                    // The agents' own rows say how each one is; the provider's
+                    // map of their states is not for a reader.
+                } else if output.is_empty() {
                     rows.push(design::caption("No output.").into());
                 } else {
                     rows.push(self.tool_code_surface(

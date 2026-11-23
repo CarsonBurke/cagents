@@ -1488,7 +1488,7 @@ impl Claude {
                 kind: chat::RequestKind::Consent,
                 id: id.clone(),
                 title: "Unsupported Claude consent dialog".into(),
-                description: format!("{message}\n{request}"),
+                description: format!("{message}\n\n{}", crate::chat::readable::value(request)),
                 fields: vec![],
                 actions: vec![],
             };
@@ -1555,7 +1555,22 @@ impl Claude {
         )];
         if !question && let Some(suggestions) = session_permission_suggestions(request) {
             let mut session = choice("allow_session", "Allow for session");
-            session.description = format!("Session only: {suggestions}");
+            // The rules the choice would add, as Claude Code writes one in
+            // settings: `Bash(git push:*)`.
+            let rules: Vec<String> = suggestions
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|suggestion| suggestion["rules"].as_array().into_iter().flatten())
+                .map(|rule| {
+                    format!(
+                        "{}({})",
+                        string(rule, "toolName"),
+                        string(rule, "ruleContent")
+                    )
+                })
+                .collect();
+            session.description = format!("Allows {} until this session ends.", rules.join(", "));
             actions.push(session);
         }
         actions.push(choice(
@@ -1998,10 +2013,18 @@ impl Claude {
                 }));
             }
         } else if let Some(content) = message["content"].as_str() {
-            step.events.push(Event::Item(if context {
-                context_item(format!("{id}:0"), content.into())
+            let local = (!context && role == Role::User)
+                .then(|| local_command_output(content))
+                .flatten();
+            // A command that printed nothing, such as `/clear`, leaves no note.
+            let item = if local.as_deref() == Some("") {
+                None
+            } else if context {
+                Some(context_item(format!("{id}:0"), content.into()))
+            } else if let Some(output) = local {
+                Some(text_item(format!("{id}:0"), Role::System, output, false))
             } else {
-                text_item(
+                Some(text_item(
                     format!("{id}:0"),
                     role,
                     if role == Role::User {
@@ -2010,8 +2033,9 @@ impl Claude {
                         content.into()
                     },
                     false,
-                )
-            }));
+                ))
+            };
+            step.events.extend(item.map(Event::Item));
         } else if let Some(content) = message["content"].as_array() {
             let message_key = ScopedId::new(child, id);
             let base = frame["_cagents_block_base"]
@@ -2121,8 +2145,22 @@ impl Claude {
                         } else {
                             string(block, if thinking { "thinking" } else { "text" })
                         };
+                        // A reader's prompt from another Claude client can
+                        // carry the client's notes to the model as blocks
+                        // of their own, and a fork's first turn its setup.
+                        if !context && !thinking && role == Role::User && model_only_note(text) {
+                            continue;
+                        }
+                        let local = (!context && !thinking && role == Role::User)
+                            .then(|| local_command_output(text))
+                            .flatten();
+                        if local.as_deref() == Some("") {
+                            continue;
+                        }
                         step.events.push(Event::Item(if context {
                             context_item(format!("{id}:{index}"), text.into())
+                        } else if let Some(output) = local {
+                            text_item(format!("{id}:{index}"), Role::System, output, false)
                         } else {
                             text_item(format!("{id}:{index}"), role, text.into(), thinking)
                         }));
@@ -4920,11 +4958,14 @@ fn permission_description(name: &str, input: &Value, sentences: &[&str]) -> Stri
             question.retain(|sentence| !sentence.is_empty());
             ("sh", string(input, "command").to_owned())
         }
-        _ => (
-            "json",
-            serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()),
-        ),
+        // Any other tool's arguments read one to a line, as its step shows
+        // them.
+        _ => ("text", crate::chat::readable::value(input)),
     };
+    // A call without arguments has nothing to show beneath the question.
+    if payload.trim().is_empty() {
+        return question.join("\n");
+    }
     // The surface reads the block as running from the first fence to the
     // last, so a fence inside the payload is part of it and needs no longer
     // fence around it.
@@ -5375,7 +5416,28 @@ fn model_only_note(text: &str) -> bool {
     image_note(text)
         || wrapped("system-reminder")
         || wrapped("local-command-caveat")
+        || wrapped("fork-boilerplate")
         || (text.starts_with("(Re-invocation of /") && text.ends_with(')'))
+}
+
+/// What a reader is told when the model refused and Claude Code withdrew its
+/// reply to answer with another model. The frame is the harness's record of
+/// the switch, not words for a reader.
+const MODEL_REFUSAL_FALLBACK: &str = "The model declined this request, so Claude Code withdrew its reply and is answering with a fallback model.";
+
+/// What a local slash command such as `/model` printed, which Claude Code
+/// records as a user message wrapped in `<local-command-stdout>` or
+/// `<local-command-stderr>` and coloured for a terminal. The reader is
+/// shown the words, as a note from the app rather than as their own.
+fn local_command_output(text: &str) -> Option<String> {
+    let text = text.trim();
+    let inner = ["local-command-stdout", "local-command-stderr"]
+        .into_iter()
+        .find_map(|tag| {
+            text.strip_prefix(&format!("<{tag}>"))?
+                .strip_suffix(&format!("</{tag}>"))
+        })?;
+    Some(clean_permission_text(inner).trim().to_owned())
 }
 
 /// Claude Code's notes on an image: how it scaled one a tool returned, such
@@ -6625,6 +6687,7 @@ fn apply_result(
         (true, Some(status)) => status,
         (true, None) => ToolStatus::Failed,
     };
+    let text = harness_framing(text);
     let text = if failed { harness_error(text) } else { text };
     match content {
         ItemContent::Changes { changes, status } if !failed => {
@@ -6675,6 +6738,15 @@ fn apply_result(
             });
             *status = result;
         }
+        ItemContent::Tool {
+            name,
+            output,
+            status,
+            ..
+        } if name == "WebSearch" => {
+            *output = search_links(text);
+            *status = result;
+        }
         ItemContent::Command { output, status, .. } | ItemContent::Tool { output, status, .. } => {
             *output = text;
             *status = result;
@@ -6688,6 +6760,90 @@ fn apply_result(
         | ItemContent::Delivery { .. } => {}
     }
 }
+
+/// A web search's result with its `Links: [...]` line, a JSON array of the
+/// pages found, as one page to a line pair: its title, then its address.
+fn search_links(text: String) -> String {
+    let mut readable = String::with_capacity(text.len());
+    let mut changed = false;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            readable.push('\n');
+        }
+        let links = line
+            .strip_prefix("Links: ")
+            .and_then(|links| serde_json::from_str::<Vec<Value>>(links).ok());
+        let Some(links) = links else {
+            readable.push_str(line);
+            continue;
+        };
+        changed = true;
+        readable.push_str("Links:");
+        // A blank line between pages, as between a search's results.
+        for (index, link) in links.iter().enumerate() {
+            if index > 0 {
+                readable.push('\n');
+            }
+            for part in [string(link, "title"), string(link, "url")] {
+                let part = part.trim();
+                if !part.is_empty() {
+                    readable.push('\n');
+                    readable.push_str(part);
+                }
+            }
+        }
+    }
+    if changed { readable } else { text }
+}
+
+/// A result without the elements Claude Code adds around it for the model:
+/// a long output it saved to a file arrives as `<persisted-output>` holding
+/// where and a preview, an agent's report is led by the tools it used and
+/// followed by its token `<usage>`, and a reminder can trail any result. The
+/// reader is shown the result. Only whole elements at either end are
+/// framing; the same tags inside are what the tool returned.
+fn harness_framing(text: String) -> String {
+    fn element<'a>(text: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
+        let rest = text
+            .strip_prefix('<')?
+            .strip_prefix(name)?
+            .strip_prefix('>')?;
+        rest.split_once(&format!("</{name}>"))
+    }
+    // Whitespace is the tool's own unless framing is taken from beside it:
+    // a listing's first line may be indented.
+    // A line of its own is left whole, so only line breaks go with a tag.
+    const BREAKS: &[char] = &['\n', '\r'];
+    let mut body = text.as_str();
+    let mut framed = false;
+    // Reminders follow everything else, persisted output included.
+    loop {
+        let trimmed = body.trim_end();
+        let Some(open) = ["usage", "system-reminder"].into_iter().find_map(|name| {
+            let open = trimmed
+                .strip_suffix(&format!("</{name}>"))?
+                .rfind(&format!("<{name}>"))?;
+            element(&trimmed[open..], name)
+                .is_some_and(|(_, after)| after.is_empty())
+                .then_some(open)
+        }) else {
+            break;
+        };
+        (body, framed) = (&trimmed[..open], true);
+    }
+    if let Some((inner, "")) = element(body.trim(), "persisted-output") {
+        (body, framed) = (inner.trim_start_matches(BREAKS), true);
+    }
+    if let Some((_, rest)) = element(body.trim_start(), "tools-used-before-summary") {
+        (body, framed) = (rest.trim_start_matches(BREAKS), true);
+    }
+    if framed {
+        body.trim_end().to_owned()
+    } else {
+        text
+    }
+}
+
 /// A failed call's result without the `<tool_use_error>` tags Claude Code
 /// wraps around an error its harness raised, rather than the tool, such as
 /// a refused input or a blocked command. The tags and the `Error: ` they
@@ -6853,6 +7009,9 @@ fn content_text(value: &Value) -> String {
             .map(|b| {
                 if matches!(string(b, "type"), "image" | "document") {
                     format!("[{} attachment]", string(b, "type"))
+                } else if string(b, "type") == "tool_reference" {
+                    // A tool search answers with the tools it loaded.
+                    string(b, "tool_name").to_owned()
                 } else {
                     b.as_str()
                         .or_else(|| b["text"].as_str())
@@ -7384,7 +7543,7 @@ impl Claude {
                 step.events.push(Event::Item(text_item(
                     required(frame, "uuid")?.into(),
                     Role::System,
-                    frame.to_string(),
+                    MODEL_REFUSAL_FALLBACK.to_owned(),
                     false,
                 )));
             }

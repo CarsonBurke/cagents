@@ -34,10 +34,25 @@ impl Language {
 }
 
 /// A tool call's input as its detail shows, finds and copies it: readable
-/// lines in place of the JSON a provider sent ([`super::tool_input`]), or
-/// the input as it came when it is not one whole JSON value.
+/// lines in place of the JSON a provider sent ([`chat::readable`]), or the
+/// input as it came when it is not one whole JSON value.
 pub(super) fn tool_input(input: &str) -> (Cow<'_, str>, Language) {
-    match super::tool_input::readable(input) {
+    readable(input)
+}
+
+/// What a tool returned, read the way its input is: an MCP server's or a
+/// coordination tool's JSON result reads as its values. Output that is not
+/// one whole JSON value, such as an excerpt of a long one, is shown as it
+/// came.
+pub(super) fn tool_output(output: &str) -> (Cow<'_, str>, Language) {
+    match chat::readable::result(output) {
+        Some(readable) => (Cow::Owned(readable), Language::Plain),
+        None => (Cow::Borrowed(output), Language::structured(output)),
+    }
+}
+
+fn readable(input: &str) -> (Cow<'_, str>, Language) {
+    match chat::readable::readable(input) {
         Some(readable) => (
             Cow::Owned(readable.text),
             if readable.command {
@@ -95,7 +110,10 @@ impl PreparedSources {
                     let (input, language) = tool_input(input);
                     PreparedText::new(&input, language)
                 }),
-                output: Some(PreparedText::new(output, Language::structured(output))),
+                output: Some({
+                    let (output, language) = tool_output(output);
+                    PreparedText::new(&output, language)
+                }),
                 ..Self::default()
             },
             ItemContent::Changes { changes, .. } => Self {
@@ -126,7 +144,16 @@ pub(super) struct ToolText {
     pub(super) flow_cache: flow_layout::Cache,
     language: Language,
     pub(super) text: Arc<str>,
+    /// Whether every line can wrap within the pane: a line past
+    /// [`prose::CodeBlock::PARAGRAPH`] is shaped whole and only scrolls.
+    wraps: bool,
     syntax: std::cell::RefCell<Option<(crate::settings::EditorSyntaxTheme, prose::CodeBlock)>>,
+}
+
+/// Whether every line of `text` is short enough to wrap.
+fn wraps(text: &str) -> bool {
+    text.split('\n')
+        .all(|line| line.len() <= prose::CodeBlock::PARAGRAPH)
 }
 
 /// What a closed step's row says beyond its verb.
@@ -448,6 +475,7 @@ impl ToolText {
                 .unwrap_or_default(),
             language: prepared.language,
             text: prepared.text.clone(),
+            wraps: wraps(&prepared.text),
             syntax: std::cell::RefCell::new(None),
         }
     }
@@ -498,6 +526,7 @@ impl ToolText {
             flow_cache,
             language,
             text: Arc::from(text),
+            wraps: wraps(text),
             syntax: std::cell::RefCell::new(None),
         }
     }
@@ -518,6 +547,7 @@ impl ToolText {
             find,
             None,
             None,
+            false,
         )
     }
 
@@ -529,7 +559,15 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, Some((height, false)), target, find, None, None)
+        self.surface(
+            theme,
+            Some((height, false)),
+            target,
+            find,
+            None,
+            None,
+            false,
+        )
     }
 
     /// `limit` is the height the text scrolls within and whether it follows
@@ -552,6 +590,32 @@ impl ToolText {
             find,
             Some(logical),
             Some((memory, context, identity)),
+            false,
+        )
+    }
+
+    /// [`Self::view_logical_with_reader`] for what a call was given, whose
+    /// lines wrap within the pane rather than scroll sideways: a reader
+    /// scans arguments, where an output's columns are worth keeping.
+    pub(super) fn view_wrapped_with_reader(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        limit: Option<(f32, bool)>,
+        target: Target,
+        find: Option<&str>,
+        logical: selectable_prose::Logical,
+        memory: scroll::Memory,
+        context: Option<String>,
+    ) -> Element<'static, Message> {
+        let identity = logical.identity;
+        self.surface(
+            theme,
+            limit,
+            target,
+            find,
+            Some(logical),
+            Some((memory, context, identity)),
+            true,
         )
     }
 
@@ -567,7 +631,9 @@ impl ToolText {
         find: Option<&str>,
         logical: Option<selectable_prose::Logical>,
         reader: Option<(scroll::Memory, Option<String>, u64)>,
+        wrap: bool,
     ) -> Element<'static, Message> {
+        let wrap = wrap && self.wraps;
         let reader =
             Some(reader.unwrap_or_else(|| (scroll::Memory::default(), None, self.reader_identity)));
         let mut syntax = self.syntax.borrow_mut();
@@ -607,8 +673,39 @@ impl ToolText {
         .padding(design::with_vertical_rail(iced::Padding::from([
             step::GAP_S,
             step::GAP_M,
-        ])))
-        .width(Length::Shrink);
+        ])));
+        let body: Element<'static, Message> = if wrap {
+            body.width(Length::Fill).into()
+        } else {
+            self.sideways(
+                body.width(Length::Shrink).into(),
+                previous_width,
+                target,
+                logical_id,
+                reader.as_ref(),
+            )
+        };
+        // Find reveals the matching source in the outer transcript. A nested
+        // viewport would otherwise keep a deep match hidden at its old offset.
+        let limit = limit.filter(|_| {
+            find.is_none()
+                || !find_navigation::tool_uncapped(target, self.reader_identity, &self.text)
+        });
+        let Some((height, follows)) = limit else {
+            return body;
+        };
+        self.bounded(body, height, follows, target, logical_id, reader)
+    }
+
+    /// `body` scrolling sideways, its offset kept in the reader's memory.
+    fn sideways(
+        &self,
+        body: Element<'static, Message>,
+        previous_width: f32,
+        target: Target,
+        logical_id: Option<u64>,
+        reader: Option<&(scroll::Memory, Option<String>, u64)>,
+    ) -> Element<'static, Message> {
         let body = scroll::minimum_width(body, previous_width);
         let mut horizontal = widget::scrollable(body)
             .direction(iced::widget::scrollable::Direction::Horizontal(
@@ -625,7 +722,7 @@ impl ToolText {
                 scroll::reader_key(identity, scroll::ReaderAxis::Horizontal),
             ));
         }
-        let body: Element<'static, Message> = match &reader {
+        match reader {
             Some((memory, context, identity)) => scroll::block_source(
                 horizontal,
                 memory.clone(),
@@ -635,16 +732,20 @@ impl ToolText {
                 Some(self.reader_source.clone()),
             ),
             None => horizontal.into(),
-        };
-        // Find reveals the matching source in the outer transcript. A nested
-        // viewport would otherwise keep a deep match hidden at its old offset.
-        let limit = limit.filter(|_| {
-            find.is_none()
-                || !find_navigation::tool_uncapped(target, self.reader_identity, &self.text)
-        });
-        let Some((height, follows)) = limit else {
-            return body;
-        };
+        }
+    }
+
+    /// `body` within `height`, scrolling down and following its end when
+    /// `follows`.
+    fn bounded(
+        &self,
+        body: Element<'static, Message>,
+        height: f32,
+        follows: bool,
+        target: Target,
+        logical_id: Option<u64>,
+        reader: Option<(scroll::Memory, Option<String>, u64)>,
+    ) -> Element<'static, Message> {
         let mut scrolled = widget::scrollable(body)
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
@@ -724,6 +825,17 @@ mod tests {
         }
         (element, node)
     }
+    #[test]
+    fn only_lines_short_enough_to_shape_as_paragraphs_wrap() {
+        let long = "x".repeat(prose::CodeBlock::PARAGRAPH);
+        assert!(wraps(&format!("prompt:\n  {}", &long[2..])));
+        assert!(!wraps(&format!("prompt:\n  {long}\nnext")));
+        let block = ToolText::update(None, &long, Language::Plain);
+        assert!(block.wraps);
+        let block = ToolText::update(Some(block), &format!("{long}x"), Language::Plain);
+        assert!(!block.wraps, "an updated block rereads its lines");
+    }
+
     #[test]
     fn view_shares_cached_syntax_spans_and_keeps_complete_tool_text() {
         use iced::advanced::{

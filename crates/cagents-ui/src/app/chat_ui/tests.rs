@@ -290,6 +290,11 @@ fn permission_retry_preserves_the_draft_and_requires_a_current_exact_action() {
     assert_eq!(runtime.attachments.len(), 1);
     assert!(runtime.commands.is_idle());
     assert_eq!(runtime.snapshot.permission_denials.len(), 1);
+    assert_eq!(
+        &*runtime.denial_input("blocked", "{\"command\":\"git push origin topic\"}"),
+        "git push origin topic",
+        "the card reads the blocked command, not the JSON the retry draft carries"
+    );
 }
 
 #[test]
@@ -21375,6 +21380,17 @@ fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
     // A call made without arguments copies its result alone.
     assert_eq!(copy_text(CopyPart::Text, &tool).as_deref(), Some("done"));
     assert_eq!(copy_text(CopyPart::Input, &tool), None);
+    // The readable input is not the only way out: the call as the provider
+    // sent it copies byte for byte.
+    let sent = "{\"prompt\":\"Read the diff.\\nReport what breaks.\",\"description\":\"Review\"}";
+    let review = ItemContent::Tool {
+        name: "Agent".to_owned(),
+        input: sent.to_owned(),
+        output: String::new(),
+        status: chat::ToolStatus::Succeeded,
+    };
+    assert_eq!(copy_text(CopyPart::Sent, &review).as_deref(), Some(sent));
+    assert_eq!(copy_text(CopyPart::Sent, &command), None);
     assert_eq!(
         copy_text(
             CopyPart::Text,

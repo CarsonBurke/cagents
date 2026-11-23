@@ -12,6 +12,8 @@ pub mod notification;
 pub mod presentation;
 pub mod pricing;
 pub mod prompt_cache;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod readable;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
