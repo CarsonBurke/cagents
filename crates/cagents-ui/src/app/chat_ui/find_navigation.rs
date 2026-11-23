@@ -1366,18 +1366,24 @@ fn contains_checked(
             output,
             ..
         } => {
-            for text in [name, output] {
-                if matches_checked(text, pattern, current)? {
+            if matches_checked(name, pattern, current)? {
+                return Some(true);
+            }
+            // The input and output are matched as the detail shows them,
+            // which is what a match is revealed in. Reading them is the
+            // costly part, so it waits until nothing cheaper has matched.
+            for text in [
+                tool_text::tool_output(output).0,
+                tool_text::tool_input(input).0,
+            ] {
+                if !current() {
+                    return None;
+                }
+                if matches_checked(&text, pattern, current)? {
                     return Some(true);
                 }
             }
-            // The input is matched as its detail shows it, which is what a
-            // match is revealed in. Reading it is the costly part, so it
-            // waits until nothing cheaper has matched.
-            if !current() {
-                return None;
-            }
-            return matches_checked(&tool_text::tool_input(input).0, pattern, current);
+            return Some(false);
         }
         ItemContent::Changes { changes, .. } => {
             for change in changes {

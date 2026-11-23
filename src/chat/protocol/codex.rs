@@ -1924,10 +1924,15 @@ impl Codex {
                         .unwrap_or("(command not supplied)"),
                     params["cwd"].as_str().unwrap_or("(not supplied)")
                 );
-                for key in ["kind", "additionalPermissions", "networkApprovalContext"] {
-                    if !params[key].is_null() {
-                        description.push_str(&format!("\n{key}: {}", params[key]));
-                    }
+                let details: serde_json::Map<String, Value> =
+                    ["kind", "additionalPermissions", "networkApprovalContext"]
+                        .into_iter()
+                        .filter(|key| !params[*key].is_null())
+                        .map(|key| (key.to_owned(), params[key].clone()))
+                        .collect();
+                if !details.is_empty() {
+                    description.push('\n');
+                    description.push_str(&crate::chat::readable::value(&Value::Object(details)));
                 }
                 if let Some(decisions) = params["availableDecisions"].as_array() {
                     for (index, decision) in decisions.iter().enumerate() {
@@ -1952,8 +1957,8 @@ impl Codex {
             }
             "item/permissions/requestApproval" => {
                 description.push_str(&format!(
-                    "\nRequested permissions: {}",
-                    params["permissions"]
+                    "\nRequested permissions:\n{}",
+                    crate::chat::readable::value(&params["permissions"])
                 ));
                 actions.insert(
                     "grant-turn".into(),
@@ -2040,10 +2045,16 @@ impl Codex {
             .map(|(id, value)| Choice {
                 id: id.clone(),
                 label: decision_label(id, value),
-                description: if value.is_object() {
-                    value.to_string()
-                } else {
-                    String::new()
+                // A decision with terms, such as a rule it would add, says
+                // what they are; its own name is the label.
+                description: match value.as_object() {
+                    Some(decision) if decision.len() == 1 => decision
+                        .values()
+                        .next()
+                        .map(crate::chat::readable::value)
+                        .unwrap_or_default(),
+                    Some(_) => crate::chat::readable::value(value),
+                    None => String::new(),
                 },
             })
             .collect();
@@ -4197,7 +4208,15 @@ fn unique_answer<'a>(answers: &'a [Answer], field: &str) -> Result<&'a Answer, S
     Ok(answer)
 }
 fn decision_label(id: &str, value: &Value) -> String {
-    match value.as_str().unwrap_or(id) {
+    // A decision with terms is an object keyed by its name.
+    let name = value.as_str().unwrap_or_else(|| {
+        value
+            .as_object()
+            .filter(|decision| decision.len() == 1)
+            .and_then(|decision| decision.keys().next())
+            .map_or(id, String::as_str)
+    });
+    match name {
         "accept" => "Allow once",
         "acceptForSession" => "Allow for session",
         "decline" | "deny" => "Deny",
@@ -4205,9 +4224,29 @@ fn decision_label(id: &str, value: &Value) -> String {
         "grant-turn" => "Grant for this turn",
         "grant-session" => "Grant for session",
         "submit" => "Submit answers",
-        _ => return value.to_string(),
+        "acceptWithExecpolicyAmendment" => "Allow and remember",
+        // A decision this version doesn't know is named by its own words:
+        // `{"acceptWithNetworkPolicy": …}` is offered as Accept with network
+        // policy.
+        other => return words(other),
     }
     .into()
+}
+/// A camelCase protocol name as words: `acceptForSession` reads as Accept
+/// for session.
+fn words(name: &str) -> String {
+    let mut words = String::with_capacity(name.len() + 4);
+    for (index, c) in name.chars().enumerate() {
+        if index == 0 {
+            words.extend(c.to_uppercase());
+        } else if c.is_uppercase() {
+            words.push(' ');
+            words.extend(c.to_lowercase());
+        } else {
+            words.push(c);
+        }
+    }
+    words
 }
 fn item_key(turn: &str, item: &str) -> String {
     format!("{turn}/{item}")

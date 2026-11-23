@@ -1,14 +1,17 @@
-//! A tool call's input as its detail shows it.
+//! JSON a provider hands over, as a person reads it.
 //!
-//! Providers hand a call's arguments over as JSON, and the detail used to
-//! show that JSON as it came: a prompt to a subagent was one line of `\n`
-//! escapes, and a command was quoted twice, once for the shell and once for
-//! JSON. A reader wants the values. An input that is only a command reads as
+//! Providers pass a call's arguments, many tools' results and some approval
+//! details as JSON, and the app used to show that JSON as it came: a prompt
+//! to a subagent was one line of `\n` escapes, and a command was quoted
+//! twice, once for the shell and once for JSON. A reader wants the values. An input that is only a command reads as
 //! the command; any other object reads as its members, each value as the
 //! text it holds. Members that fit on their key's line come first, so a
 //! call's settings are not pushed below a long prompt; each group keeps the
-//! order the members arrived in, which for Claude is sorted by key. Nothing
-//! is escaped: the lines are for reading, selecting and copying, not parsing.
+//! order the members arrived in. For Claude that is alphabetical, but not by
+//! Claude: its adapter re-serializes the input through a `serde_json` map
+//! that the daemon builds without `preserve_order`, so the model's order is
+//! gone before this code sees it. Nothing is escaped: the lines are for
+//! reading, selecting and copying, not parsing.
 //!
 //! ```text
 //! description: Review the change
@@ -35,15 +38,15 @@ const DEPTH: usize = 16;
 /// How an input is drawn: the lines of its readable form, and whether they
 /// are a shell command to highlight as one.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Readable {
-    pub(super) text: String,
-    pub(super) command: bool,
+pub struct Readable {
+    pub text: String,
+    pub command: bool,
 }
 
 /// The input's readable form, or `None` when it is shown as it came: when
 /// it is not one whole JSON object or array (a call still streaming, a
 /// shortened input, a plain-text argument), or is too large to read here.
-pub(super) fn readable(input: &str) -> Option<Readable> {
+pub fn readable(input: &str) -> Option<Readable> {
     let trimmed = input.trim();
     // An input still streaming is an unclosed prefix, which is not read
     // through only to fail at its end on every delta.
@@ -84,10 +87,21 @@ pub(super) fn readable(input: &str) -> Option<Readable> {
     })
 }
 
+/// A value an adapter holds, such as an approval's details, as lines to
+/// read; a value too large or deep to read stays JSON.
+pub fn value(value: &serde_json::Value) -> String {
+    let json = value.to_string();
+    match readable(&json) {
+        Some(readable) => readable.text,
+        None if value.is_string() => value.as_str().unwrap_or_default().to_owned(),
+        None => json,
+    }
+}
+
 /// Whether a call was made without arguments, so its detail has no input to
 /// show. This runs as the detail is drawn, so it reads no further than the
 /// brackets.
-pub(super) fn is_empty(input: &str) -> bool {
+pub fn is_empty(input: &str) -> bool {
     let input = input.trim();
     input.is_empty()
         || [("{", "}"), ("[", "]")].into_iter().any(|(open, close)| {

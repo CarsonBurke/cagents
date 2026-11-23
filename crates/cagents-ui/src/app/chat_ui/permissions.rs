@@ -231,6 +231,12 @@ impl Runtime {
                 view::RequestSurface::Permissions,
             ));
         }
+        self.denial_inputs.borrow_mut().retain(|id, _| {
+            snapshot
+                .permission_denials
+                .iter()
+                .any(|denial| denial.tool_use_id == *id)
+        });
         for denial in snapshot.permission_denials.iter().rev() {
             let mut details = vec![
                 design::body(format!("{} blocked", denial.tool_name)).into(),
@@ -249,8 +255,10 @@ impl Runtime {
                     // component fill of the surface it sits on.
                     widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
-                            widget::container(view::body(input.as_str()))
-                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                            widget::container(view::body(
+                                self.denial_input(&denial.tool_use_id, input).to_string(),
+                            ))
+                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
                         )
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
@@ -333,6 +341,16 @@ impl Runtime {
             }
         }
         permissions_surface(content, width, target.card)
+    }
+
+    /// A blocked call's input as lines to read; the retry draft keeps the
+    /// exact JSON, so authorizing a retry loses nothing.
+    pub(super) fn denial_input(&self, id: &str, input: &str) -> Arc<str> {
+        self.denial_inputs
+            .borrow_mut()
+            .entry(id.to_owned())
+            .or_insert_with(|| super::tool_text::tool_input(input).0.into())
+            .clone()
     }
 
     fn permission_settings_view(&self, enabled: bool) -> Vec<Element<'_, Message>> {
