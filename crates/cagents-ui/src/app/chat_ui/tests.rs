@@ -19640,6 +19640,13 @@ fn a_later_error_replaces_the_capacity_refusal_and_its_guidance() {
         }),
     );
     assert!(chat_runtime(&app, card).capacity_refused());
+    let labels = capacity_refusal_labels(&mut app, card);
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Close a chat you have finished with")),
+        "{labels:?}"
+    );
     // A failure of something else in the pane, such as saving the draft,
     // takes the refusal's place; its notice must not tell the user to close
     // a chat.
