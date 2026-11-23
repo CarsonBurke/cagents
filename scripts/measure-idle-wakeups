@@ -8,9 +8,13 @@ count from zero; those that exit are left out.
     scripts/measure-idle-wakeups --seconds 60
     scripts/measure-idle-wakeups --pattern cagentsd --seconds 10
     scripts/measure-idle-wakeups --environ XDG_RUNTIME_DIR=/run/user/1000/x
+    scripts/measure-idle-wakeups --pattern cagentsd --seconds 10 --per-thread
 
-The default pattern matches retained Claude actors
-(`cagents-native --cagents-native-actor FD`).
+The pattern is matched against the command line of processes whose name
+starts with `cagents`, so the shell that runs this script is never a target.
+The default matches retained Claude actors
+(`cagents-native --cagents-native-actor FD`). `--per-thread` also lists each
+thread by PID and TID, which tells equally named threads apart.
 """
 import argparse
 import collections
@@ -26,9 +30,18 @@ def matching(pattern, environ):
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as file:
                 command = file.read().replace(b"\0", b" ").decode(errors="replace")
+            with open(f"/proc/{pid}/comm") as file:
+                name = file.read().strip()
         except OSError:
             continue
-        if pattern not in command or int(pid) == os.getpid():
+        # The pattern names a cagents command-line mode. Do not let the shell
+        # which invoked this script become a false target merely because its
+        # own argv includes the cagentsd pattern.
+        if (
+            pattern not in command
+            or int(pid) == os.getpid()
+            or not name.startswith("cagents")
+        ):
             continue
         if environ is not None:
             try:
@@ -71,6 +84,11 @@ def main():
     parser.add_argument("--pattern", default="--cagents-native-actor")
     parser.add_argument("--seconds", type=float, default=60)
     parser.add_argument(
+        "--per-thread",
+        action="store_true",
+        help="also print each process/thread delta instead of only name aggregates",
+    )
+    parser.add_argument(
         "--environ",
         metavar="NAME=VALUE",
         help="only processes whose environment holds exactly this entry",
@@ -83,14 +101,25 @@ def main():
     time.sleep(arguments.seconds)
     after = snapshot(pids)
     seconds = arguments.seconds
+    deltas = []
     by_name = collections.defaultdict(lambda: [0, 0, 0])
-    for key, (name, switches, on_cpu) in after.items():
-        _, old_switches, old_cpu = before.get(key, (name, 0, 0))
+    for (pid, tid), (name, switches, on_cpu) in after.items():
+        _, old_switches, old_cpu = before.get((pid, tid), (name, 0, 0))
+        delta_switches = switches - old_switches
+        delta_cpu = on_cpu - old_cpu
+        deltas.append((int(pid), int(tid), name, delta_switches, delta_cpu))
         total = by_name[name]
         total[0] += 1
-        total[1] += switches - old_switches
-        total[2] += on_cpu - old_cpu
+        total[1] += delta_switches
+        total[2] += delta_cpu
     print(f"processes={len(pids)} seconds={seconds:g}")
+    if arguments.per_thread:
+        print(f"{'pid':>7} {'tid':>7} {'thread':16} {'wakeups/s':>10} {'cpu % core':>10}")
+        for pid, tid, name, switches, on_cpu in sorted(deltas):
+            print(
+                f"{pid:7} {tid:7} {name:16} {switches / seconds:10.2f}"
+                f" {100 * on_cpu / 1e9 / seconds:10.3f}"
+            )
     print(f"{'thread':16} {'threads':>7} {'wakeups/s':>10} {'per process':>11} {'cpu % core':>10}")
     for name, (count, switches, on_cpu) in sorted(by_name.items(), key=lambda item: -item[1][1]):
         print(
