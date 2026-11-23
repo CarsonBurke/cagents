@@ -90,9 +90,12 @@ pub(super) struct Turn {
     /// and its latest observation. An earlier item can finish after later
     /// items appeared; for a running group this is the last sign of life.
     span: Span,
-    /// The span before the item it last took in, which a message that
-    /// leaves the group for the messages after it gives back.
-    spanned_before: Span,
+    /// The span before its latest message card, which the group returns to
+    /// when that message leaves it for the messages after it.
+    before_card: Span,
+    /// What the group took in since that card, such as hidden thinking,
+    /// which leaves with the message for the run it starts.
+    since_card: Span,
     /// The key the reader's disclosure choice is stored under, and the
     /// collapsed strip's own line. Both are formed here, once per snapshot,
     /// because the view draws them on every frame and they change only when
@@ -127,7 +130,8 @@ impl Turn {
             newest_running: false,
             outcome: None,
             span: item.map(Span::of).unwrap_or_default(),
-            spanned_before: Span::default(),
+            before_card: Span::default(),
+            since_card: Span::default(),
             key: item.map(|item| item.id.clone()).unwrap_or_default(),
             summary: String::new(),
             messages: false,
@@ -255,7 +259,7 @@ impl Turn {
     /// history reaches the store unstamped, and a group that mixes it with live work should report
     /// the span it can account for rather than nothing at all.
     fn spans(&mut self, item: &Item) {
-        self.spanned_before = self.span;
+        self.since_card.takes_in(Span::of(item));
         self.span.takes_in(Span::of(item));
     }
 
@@ -551,10 +555,12 @@ pub(super) fn group<'c, T: Borrow<Item>>(
             let first = turn.prose.pop().expect("the message drawn last");
             let lone = turn.prompt.is_empty() && turn.steps.is_empty() && turn.prose.is_empty();
             if !lone {
-                // It was the last the group took in, so the group's time
-                // ends where it did before the message.
-                turn.span = turn.spanned_before;
+                // The group's time ends where it did before the message;
+                // the message, and what came after it, start the run's.
+                let since = turn.since_card;
+                turn.span = turn.before_card;
                 turns.push(Turn::opened(items, first.index, false));
+                turns.last_mut().expect("the run").span.takes_in(since);
             }
             let run = turns.last_mut().expect("a group is open");
             run.messages = true;
@@ -634,9 +640,18 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                 turn.observe(status);
             }
         }
+        let before = turn.span;
         turn.spans(item);
-        if let Some(thought) = unplaced.take() {
+        let thought = unplaced.take();
+        if let Some(thought) = thought {
             turn.span.takes_in(thought);
+        }
+        if slot == Slot::Card && !joins_messages {
+            // A message drawn as a card may yet leave for a run of its own,
+            // taking its time and the thinking that led to it.
+            turn.before_card = before;
+            turn.since_card = Span::of(item);
+            turn.since_card.takes_in(thought.unwrap_or_default());
         }
         match slot {
             Slot::Step => turn.steps.push(Placed { index, slot }),
@@ -2976,6 +2991,14 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].working_for(90_000), Some(1_000));
         assert_eq!(turns[1].working_for(90_000), Some(1_000));
+        // Hidden thinking between the messages goes with them too.
+        let mut items = items;
+        items.insert(3, thought("t", "", 30_000, 40_000));
+        items[4].at = Some(41_000);
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].working_for(90_000), Some(1_000));
+        assert_eq!(turns[1].working_for(90_000), Some(11_000));
     }
 
     /// A message to every teammate reaches more agents than the run can

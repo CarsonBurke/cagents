@@ -1909,7 +1909,13 @@ fn open_folded_messages(
         if was.is_some_and(|old| old.messages) {
             continue;
         }
-        search.inherit_turn(&turn.key, true, opened);
+        // A message the search opened opens its group for the search too,
+        // which gives both back when it ends.
+        if search.opened_item(&first.id) {
+            search.turn(&turn.key, opened);
+        } else {
+            search.inherit_turn(&turn.key, true, opened);
+        }
     }
 }
 

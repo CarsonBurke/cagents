@@ -627,11 +627,11 @@ impl MessageRun {
             first.get_or_insert_with(|| item.id.clone());
             let (status, output) = reported(item, coordinated);
             let state = message_state(reading, message, status, output);
-            each.push(format!(
+            each.push(tip_line(&format!(
                 "{}: {}",
                 recipient(message, reading, listed).plain(),
                 state.reason()
-            ));
+            )));
             states.push(state);
             // Compared whole, as the agent wrote them: messages that open
             // alike and differ further on are not one message.
@@ -816,7 +816,9 @@ fn message_state(
         (_, Some(receipt)) => received(receipt.arrival),
         _ => match (reading.outcome.delivery, reading.outcome.run.as_ref()) {
             (Some(delivery), _) => RowStatus {
-                detail: Some(delivered(delivery).to_owned()),
+                // "Delivered" says all "Sent" would.
+                detail: (!matches!(delivery, Delivery::Sent))
+                    .then(|| delivered(delivery).to_owned()),
                 ..RowStatus::plain(match delivery {
                     Delivery::Queued => "Queued",
                     Delivery::Resumed => "Resumed",
@@ -1063,6 +1065,17 @@ fn plain(markdown: &str) -> String {
     text.trim().to_owned()
 }
 
+/// `text` as one line of a tooltip's list, cut where it runs long.
+fn tip_line(text: &str) -> String {
+    const CHARS: usize = 160;
+    let mut line = one_line_of(text);
+    if let Some((end, _)) = line.char_indices().nth(CHARS) {
+        line.truncate(end);
+        line = format!("{}…", line.trim_end());
+    }
+    line
+}
+
 /// `text` bounded for a tooltip, which wraps at its own width.
 fn bounded(text: &str) -> String {
     let mut lines = text.trim().lines();
@@ -1273,9 +1286,7 @@ impl RowStatus {
             .filter(|detail| !detail.trim().is_empty())
         {
             // "Queued for its next step" says "Queued" already.
-            Some(detail) if self.text.is_empty() || detail.starts_with(&*self.text) => {
-                detail.to_owned()
-            }
+            Some(detail) if detail.contains(&*self.text) => detail.to_owned(),
             Some(detail) => format!("{}: {detail}", self.text),
             None => self.text.to_string(),
         }

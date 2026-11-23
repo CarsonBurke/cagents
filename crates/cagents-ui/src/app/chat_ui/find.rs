@@ -272,6 +272,10 @@ impl Disclosure {
             opened.edit().insert(key.to_owned(), choice);
         }
     }
+    /// Whether this search, not the reader, opened item `id`.
+    pub(super) fn opened_item(&self, id: &str) -> bool {
+        self.items.contains(id)
+    }
     pub(super) fn manual_item(&mut self, id: &str) {
         self.items.remove(id);
     }
