@@ -159,6 +159,8 @@ JOBS = (
         Suite("release metadata", "tests/release_metadata.py", sources=("scripts/release-metadata",),
               syntax=(("bash", "scripts/release"), ("bash", "scripts/publish-release"),
                       ("bash", "scripts/build-release-linux"))),
+        Suite("release cut", "tests/release_cut.py",
+              sources=("scripts/release", "scripts/release-metadata")),
         Suite("GitHub status bootstrap", "tests/gh-pr-status.py",
               sources=("scripts/gh-pr-status", "scripts/cargo_artifacts.py")),
         Suite("GitHub request telemetry", "tests/gh-observe.py", sources=("scripts/gh-observe",)),

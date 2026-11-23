@@ -138,40 +138,48 @@ contract remain Linux-specific until a qualified target has its own contract.
 
 ## Publishing
 
-A release goes out in five steps, each through `mise run release`
-(`scripts/release --help`):
+A release signs and publishes a bundle the build host has already built and
+smoke-tested: fw16 prebuilds main's newest compiled commit in the background
+([Prebuilding release bundles](development.md#prebuilding-release-bundles)).
+Main always declares the next version: publishing a release opens and lands the
+pull request that starts the next patch version. A release goes out in three
+steps, each through `mise run release` (`scripts/release --help`):
 
-1. `mise run release -- bump 0.2.0` sets the product manifests and
-   `Cargo.lock` to the new version. Land that through a pull request, then tag
-   the merged commit and push the tag:
-   `git tag -a v0.2.0 -m v0.2.0 COMMIT && git push origin v0.2.0`.
-2. `mise run release -- build 0.2.0` builds the tag on the build host (`fw16`,
-   or `--build-host HOST`) with `scripts/build-release-linux` from the tag's own
-   checkout, admitted through `scripts/cargo-gate` beside other builds, and
-   brings the verified bundle back to `~/.local/state/cagents-release/0.2.0`.
-   It refuses the bundle unless main's sentinel there has a passing test
-   verdict for the tagged commit; a commit without one, such as a version bump
-   main moved past before its tests ran, is tested while the bundle builds
-   (`scripts/main-build-sentinel --require-tests`); a failing verdict stops
-   the build at once. The build host must therefore be the sentinel's, fw16.
-   The bundle's `release-metadata.json` carries the release notes an installed
-   cagents shows before it updates: by default the `feat`, `fix` and `perf`
-   commit subjects since the previous tag, or a file passed with
-   `--notes FILE` (at most 64 KiB). Read them with
-   `jq -r .notes ~/.local/state/cagents-release/0.2.0/release-metadata.json`.
-3. Sign the metadata with your own key (see [Signing](#signing)). No repository
-   script signs: `ssh-keygen -Y sign -n cagents-release -f KEY
-   ~/.local/state/cagents-release/0.2.0/release-metadata.json`.
-4. Rehearse the update from the previous release through a file feed (below).
-5. `mise run release -- publish 0.2.0` asks you to type the version, then runs
-   `scripts/publish-release`. It checks the signature against the keys the tag
-   lists, the metadata against every asset, the checksums, the archive layouts
-   and an offline smoke install before uploading anything. It uploads to a
-   draft it owns, downloads and compares the served bytes, then publishes. It
-   never moves tags or overwrites a published release. Authentication stays in
-   the local `gh` configuration, outside the build environment. Publishing
-   makes the release the update every installed cagents offers within six
-   hours.
+1. `mise run release -- cut --key KEY` picks the newest bundle of main whose
+   tests passed in main's sentinel. It shows how many commits that bundle is
+   behind main and offers to wait for a prebuild of the tip instead; `--wait`
+   waits without asking, building the tip at normal priority while its tests
+   run beside it. `--commit SHA` picks a particular bundle. It then:
+   - copies the bundle to `~/.local/state/cagents-release/VERSION`, where
+     VERSION is the one the commit declares;
+   - checks every file against the size and digest recorded when it was built
+     and smoke-tested;
+   - writes the release notes an installed cagents shows before it updates. By
+     default these are the `feat`, `fix` and `perf` commit subjects since the
+     previous tag; `--notes FILE` supplies them instead (at most 64 KiB);
+   - tags the commit `vVERSION` locally;
+   - signs the metadata with KEY (or `CAGENTS_RELEASE_SIGNING_KEY`); touch the
+     security key when it asks. Without a key, it prints the signing command
+     (see [Signing](#signing)).
+2. Rehearse the update from the previous release through a file feed (below).
+3. `mise run release -- publish VERSION` asks you to type the version, pushes
+   the tag, then runs `scripts/publish-release`. It checks the signature
+   against the keys the tag lists, the metadata against every asset, the
+   checksums, the archive layouts and an offline smoke install before
+   uploading anything. It uploads to a draft it owns, downloads and compares
+   the served bytes, then publishes. It never moves tags or overwrites a
+   published release. Authentication stays in the local `gh` configuration,
+   outside the build environment. Publishing makes the release the update
+   every installed cagents offers within six hours. Finally, it opens the
+   pull request that sets main to the next patch version
+   (`scripts/release bump`) and lands it with `scripts/land-pr`.
+
+To build a tag without a prebuild, as before, bump and tag it yourself, then
+run `mise run release -- build VERSION`. This builds the tag on the build host
+with `scripts/build-release-linux`, from the tag's own checkout, admitted
+through `scripts/cargo-gate` beside other builds, and requires the commit's
+passing test verdict from main's sentinel. It brings the verified bundle back
+to the same place, ready for signing.
 
 `mise run release:verify -- --version 0.2.0 --dist DIR` runs the same checks
 without publishing. Both modes repeat the offline artifact smoke against a
