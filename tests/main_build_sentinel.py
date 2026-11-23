@@ -46,10 +46,39 @@ if sys.argv[1] == 'test':
                 if value == selection)
     sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     with open(os.environ['SENTINEL_TESTS'], 'a') as out:
-        out.write(json.dumps([sha, lane, os.environ.get('CAGENTS_BUILD_REMOTE')]) + '\\n')
-    print(f'test result for {lane}')
+        out.write(json.dumps([sha, lane, os.environ.get('CAGENTS_BUILD_REMOTE'),
+                              os.environ.get('RUST_TEST_THREADS'),
+                              os.environ.get('CAGENTS_TEST_FIXTURE')]) + '\\n')
+    if Path('litter-' + lane).exists():
+        Path('left-by-a-test').write_text('')
+    if Path('refused-' + lane).exists():
+        print('build-disk-guard: not enough space')
+        sys.exit(2)
+    print('     Running unittests src/lib.rs')
+    print('running 400 tests')
+    for index in range(400):
+        print(f'test passing_number_{index} ... ok')
     if Path('failing-' + lane).exists():
         print('test lane_breaks ... FAILED')
+        print('')
+        print('failures:')
+        print('')
+        print('---- lane_breaks stdout ----')
+        print('')
+        print("thread 'lane_breaks' panicked at src/lib.rs:1:1:")
+        print('the reason it broke')
+        print('')
+        print('')
+        print('failures:')
+        print('    lane_breaks')
+        print('')
+        print('test result: FAILED. 400 passed; 1 failed')
+        print('error: test failed, to rerun pass `--lib`')
+        print('     Running tests/later.rs')
+        for index in range(400):
+            print(f'test later_number_{index} ... ok')
+        print('error: 1 target failed:')
+        print('    `--lib`')
         sys.exit(101)
     sys.exit(0)
 assert sys.argv[-1] == '--message-format=json', sys.argv
@@ -484,6 +513,82 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.now += 120
         self.tick()
         self.assertEqual(sum(sha == failing for sha, _ in self.tested()), len(sentinel.TEST_LANES) - 1)
+
+    def test_the_issue_shows_each_failure_and_the_lane_command_without_passing_tests(self):
+        self.tick()
+        (self.origin / "failing-ui").touch()
+        self.commit("break a UI test")
+        self.now += 120
+        self.tick()
+        body = (self.state / "test-issue.md").read_text()
+        self.assertIn("test lane_breaks ... FAILED", body)
+        self.assertIn("the reason it broke", body)
+        self.assertIn("error: 1 target failed:", body)
+        self.assertNotIn("passing_number_", body)
+        self.assertNotIn("later_number_", body)
+        self.assertIn("`RUST_TEST_THREADS=2 scripts/cargo-gate test --locked --all-targets --no-fail-fast "
+                      + " ".join(sentinel.TEST_LANES["ui"]) + "`", body)
+
+    def test_lanes_get_their_thread_count_and_none_of_the_callers_test_variables(self):
+        with patch.dict(os.environ, RUST_TEST_THREADS="64", CAGENTS_TEST_FIXTURE="leaked"):
+            self.tick()
+        threads = {lane: (remote, count, fixture) for _, lane, remote, count, fixture
+                   in (json.loads(line) for line in (self.root / "tests").read_text().splitlines())}
+        for lane, (remote, count, fixture) in threads.items():
+            self.assertEqual((remote, count, fixture), ("fw16", sentinel.TEST_THREADS.get(lane), None), lane)
+
+    def test_a_lane_stopped_outside_the_code_keeps_no_verdict_and_is_tested_again_later(self):
+        self.tick()
+        (self.origin / "refused-host").touch()
+        refused = self.commit("merge while the build host is full")
+        self.now += 120
+        self.tick()
+        self.assertFalse((self.state / "verdicts" / f"{refused}.json").exists())
+        self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertNotEqual(state.get("tested"), refused)
+        before = self.tested()
+        self.now += 120
+        self.tick()
+        self.assertEqual(self.tested(), before)
+        self.now += 1800
+        self.tick()
+        self.assertGreater(len(self.tested()), len(before))
+        # Required directly, it reports the stop as neither pass nor failure.
+        verdict = sentinel.require_tests(self.repo, self.state, refused)
+        self.assertEqual(verdict["outside_code"], ["host"])
+        self.assertFalse((self.state / "verdicts" / f"{refused}.json").exists())
+
+    def test_a_removed_verdict_is_tested_again_by_the_watcher(self):
+        self.tick()
+        tip = json.loads((self.state / "state.json").read_text())["tested"]
+        before = len(self.tested())
+        (self.state / "verdicts" / f"{tip}.json").unlink()
+        self.now += 120
+        self.tick()
+        self.assertEqual(len(self.tested()), 2 * before)
+        self.assertTrue((self.state / "verdicts" / f"{tip}.json").exists())
+
+    def test_files_a_test_leaves_in_the_checkout_do_not_stop_later_checks(self):
+        (self.origin / "litter-cli").touch()
+        self.commit("a test that litters")
+        self.tick()
+        checkout = self.repo / ".worktrees" / "main-build-sentinel"
+        self.assertFalse((checkout / "left-by-a-test").exists())
+        merged = self.commit("merge after it")
+        self.now += 120
+        self.tick()
+        self.assertEqual(json.loads((self.state / "state.json").read_text())["checked"], merged)
+
+    def test_a_required_commit_not_yet_fetched_is_fetched_and_the_checkout_returned(self):
+        self.tick()
+        checked = json.loads((self.state / "state.json").read_text())["checked"]
+        unfetched = self.commit("version bump just pushed")
+        verdict = sentinel.require_tests(self.repo, self.state, unfetched)
+        self.assertTrue(verdict["passed"])
+        self.assertEqual(verdict["sha"], unfetched)
+        checkout = self.repo / ".worktrees" / "main-build-sentinel"
+        self.assertEqual(self.command("git", "-C", str(checkout), "rev-parse", "HEAD"), checked)
 
     def with_evidence_tool(self):
         """Gives main a native-evidence that builds stand-in executables."""

@@ -12,6 +12,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
+import resource
 import shutil
 import socket
 import subprocess
@@ -59,6 +61,18 @@ TEST_LANE_MANIFESTS = {"ui": "crates/cagents-ui/Cargo.toml", "browser": "crates/
                        "editor": "crates/ceditor/Cargo.toml",
                        "dictate": "crates/cagents-dictate/Cargo.toml"}
 TEST_TITLE = "Main test sentinel: test failure"
+# Lanes whose UI fixtures still interfere with each other at higher
+# parallelism (#2058); the others take a test thread per CPU.
+TEST_THREADS = {"ui": "2", "browser": "2"}
+# Cargo exits 101 when a test fails or the code does not compile. Any other
+# status, such as the disk guard's refusal or a kill, says nothing about the
+# commit, so it leaves no verdict and the lane is tested again.
+CODE_FAILURE = 101
+# A caller's test variables would change what the lanes test.
+TEST_ENVIRONMENT_IGNORED = re.compile(r"CAGENTS_TEST_|RUST_TEST_|RUSTFLAGS$|RUSTDOCFLAGS$|CARGO_PROFILE_"
+                                      r"|CARGO_BUILD_RUSTFLAGS$|CARGO_ENCODED_RUSTFLAGS$|CARGO_INCREMENTAL$")
+# Room in the issue for each failing lane's failures, below GitHub's limit.
+EXCERPT_CHARACTERS = 12000
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
 # native-evidence's task for these builds: its path must be short, for sockets.
@@ -316,29 +330,84 @@ def read_verdict(directory, sha):
     return json.loads(path.read_text()) if path.exists() else None
 
 
+def test_command(lane):
+    return ["scripts/cargo-gate", "test", "--locked", "--all-targets", "--no-fail-fast", *TEST_LANES[lane]]
+
+
+def test_environment(lane):
+    environment = {name: value for name, value in os.environ.items()
+                   if not TEST_ENVIRONMENT_IGNORED.match(name)}
+    # No priority bypass, held lease, or local compilation override.
+    environment["CAGENTS_BUILD_REMOTE"] = "fw16"
+    if lane in TEST_THREADS:
+        environment["RUST_TEST_THREADS"] = TEST_THREADS[lane]
+    return environment
+
+
 def test_commit(repository, directory, sha):
     """Runs each test lane the commit has, in the sentinel's worktree, and
-    records the verdict: passed only when every lane's tests ran and passed."""
+    returns the verdict: passed only when every lane's tests ran and passed.
+    It is recorded unless a lane failed for a reason outside the code."""
     checkout = checkout_commit(repository, sha)
     (directory / "logs").mkdir(exist_ok=True)
     lanes = {}
-    for lane, selection in TEST_LANES.items():
+    for lane in TEST_LANES:
         if lane in TEST_LANE_MANIFESTS and not (checkout / TEST_LANE_MANIFESTS[lane]).exists():
             continue
         print(f"main-build-sentinel: {sha} test {lane}", flush=True)
         started = time.monotonic()
+        command = test_command(lane)
         with (directory / "logs" / f"{sha}-test-{lane}.log").open("w") as log:
-            status = subprocess.run(
-                [str(checkout / "scripts/cargo-gate"), "test", "--locked", "--all-targets",
-                 "--no-fail-fast", *selection],
-                cwd=checkout, env=dict(os.environ, CAGENTS_BUILD_REMOTE="fw16"),
-                stdout=log, stderr=subprocess.STDOUT).returncode
+            status = subprocess.run([str(checkout / command[0]), *command[1:]], cwd=checkout,
+                                    env=test_environment(lane), stdout=log,
+                                    stderr=subprocess.STDOUT).returncode
         lanes[lane] = {"status": status, "seconds": round(time.monotonic() - started)}
+    # A test that leaves files in the checkout must not stop later checks.
+    changed = git(checkout, "status", "--porcelain", "--untracked-files=all")
+    if changed:
+        print(f"main-build-sentinel: {sha} tests changed the checkout; restoring it:\n{changed}", flush=True)
+        git(checkout, "reset", "--quiet", "--hard")
+        git(checkout, "clean", "--quiet", "-fd")
     verdict = {"sha": sha, "passed": all(entry["status"] == 0 for entry in lanes.values()),
                "lanes": lanes, "finished": time.time()}
+    outside = [lane for lane, entry in lanes.items() if entry["status"] not in (0, CODE_FAILURE)]
+    if outside:
+        verdict["outside_code"] = outside
+        print(f"main-build-sentinel: {sha} {', '.join(outside)} stopped outside the code; "
+              "no verdict is kept", flush=True)
+        return verdict
     verdict_path(directory, sha).parent.mkdir(exist_ok=True)
     save(verdict_path(directory, sha), verdict)
     return verdict
+
+
+FAILURE_LINE = re.compile(r"^(test .* \.\.\. FAILED|error(\[E\d+\])?: |---- .* ----$|failures:$"
+                          r"|test result: FAILED)")
+
+
+def failure_excerpt(text, limit=EXCERPT_CHARACTERS):
+    """The parts of a lane's output that say what failed: the failing tests,
+    each one's captured output, compile errors and Cargo's closing summary;
+    the passing tests between them are left out."""
+    lines = text.splitlines()
+    kept = []
+    # A failing test's captured output runs to the next failure; an error,
+    # such as a compiler's, to its first blank line.
+    block = None
+    for index, line in enumerate(lines):
+        if FAILURE_LINE.match(line):
+            block = "test" if line.startswith("---- ") else "error" if line.startswith("error") else None
+        elif line.startswith("     Running ") or block == "error" and not line.strip():
+            block = None
+            continue
+        elif not block:
+            continue
+        kept.append(line)
+    excerpt = "\n".join(kept) or text
+    if len(excerpt) > limit:
+        half = limit // 2
+        excerpt = excerpt[:half] + "\n[...]\n" + excerpt[-half:]
+    return excerpt
 
 
 def report_tests(directory, state, verdict):
@@ -363,15 +432,16 @@ def report_tests(directory, state, verdict):
     body = (f"Main's tests fail at `{sha}` on fw16. No release can be cut from a commit "
             "whose tests have not passed.\n\n"
             f"Last passing commit: `{state.get('tests_last_good', 'none recorded')}`.\n\n"
-            "Each lane runs `scripts/cargo-gate test --locked --all-targets --no-fail-fast` "
-            "in the ordinary test profile.\n\n")
+            "Each lane runs in the ordinary test profile.\n\n")
     for lane, entry in verdict["lanes"].items():
         body += f"- {lane}: exit {entry['status']} in {entry['seconds']} s\n"
     for lane, entry in verdict["lanes"].items():
         if entry["status"]:
             log = directory / "logs" / f"{sha}-test-{lane}.log"
-            tail = log.read_text(errors="replace")[-5000:].replace("```", "'''")
-            body += f"\n{lane} output (tail; complete log on fw16 at `{log}`):\n```text\n{tail}\n```\n"
+            excerpt = failure_excerpt(log.read_text(errors="replace")).replace("```", "'''")
+            threads = f"RUST_TEST_THREADS={TEST_THREADS[lane]} " if lane in TEST_THREADS else ""
+            body += (f"\n{lane}, as `{threads}{' '.join(test_command(lane))}` "
+                     f"(complete log on fw16 at `{log}`):\n```text\n{excerpt}\n```\n")
     body_file = directory / "test-issue.md"
     body_file.write_text(body)
     if not state.get("test_issue"):
@@ -390,9 +460,20 @@ def test_main(repository, directory, state):
     path = directory / "state.json"
     sha = state.get("checked")
     if not state.get("tests_pending"):
-        if not sha or state.get("tested") == sha or state.get("compiled") != sha:
+        if not sha or state.get("compiled") != sha:
+            return
+        # A verdict removed by hand has the commit tested again.
+        if state.get("tested") == sha and read_verdict(directory, sha) is not None:
+            return
+        if time.time() < state.get("tests_retry_after", 0):
             return
         verdict = read_verdict(directory, sha) or test_commit(repository, directory, sha)
+        if verdict.get("outside_code"):
+            # Not the code's verdict; tested again after a pause.
+            state["tests_retry_after"] = time.time() + 1800
+            save(path, state)
+            return
+        state.pop("tests_retry_after", None)
         state["tests_pending"] = sha
         save(path, state)
     verdict = read_verdict(directory, state["tests_pending"])
@@ -411,9 +492,9 @@ def test_main(repository, directory, state):
     save(path, state)
 
 
-def require_tests(repository, directory, sha):
-    """Blocks until no tick runs, then returns `sha`'s verdict, testing it
-    first if it has none."""
+def require_tests(repository, directory, revision):
+    """Blocks until no tick runs, then returns the commit's verdict, testing
+    it first if it has none, and fetching main first if it is not known here."""
     worktrees = repository / ".worktrees"
     worktrees.mkdir(exist_ok=True)
     directory.mkdir(parents=True, exist_ok=True)
@@ -421,7 +502,20 @@ def require_tests(repository, directory, sha):
           (directory / "lock").open("a") as lock):
         fcntl.flock(checkout_lock, fcntl.LOCK_EX)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return read_verdict(directory, sha) or test_commit(repository, directory, sha)
+        commit = f"{revision}^{{commit}}"
+        if subprocess.run(["git", "-C", str(repository), "rev-parse", "--quiet", "--verify", commit],
+                          stdout=subprocess.DEVNULL).returncode:
+            git(repository, "fetch", "--no-tags", "origin", "main")
+        sha = git(repository, "rev-parse", "--verify", commit)
+        verdict = read_verdict(directory, sha)
+        if verdict is None:
+            verdict = test_commit(repository, directory, sha)
+            # Back where the watcher left its checkout, which it builds from.
+            path = directory / "state.json"
+            checked = json.loads(path.read_text()).get("checked") if path.exists() else None
+            if checked:
+                checkout_commit(repository, checked)
+        return verdict
 
 
 def tick(repository, directory, github_repository):
@@ -505,9 +599,10 @@ def tick_locked(repository, directory, github_repository):
             save(path, state)
         # Before bisecting moves the checkout off the commit it builds.
         keep_main_build(repository, directory, state)
-        test_main(repository, directory, state)
+        # After bisecting, which names the commit that broke a check sooner.
         if state.get("bisect"):
             bisect(repository, directory, state)
+        test_main(repository, directory, state)
 
 
 def main():
@@ -516,16 +611,19 @@ def main():
     parser.add_argument("--state", type=Path, default=Path.home() / ".local/state/cagents-main-sentinel")
     parser.add_argument("--github-repository", default="CarsonBurke/cagents")
     parser.add_argument("--require-tests", metavar="SHA",
-                        help="print SHA's test verdict, testing it first if it has none; "
-                             "exit 0 only if its tests passed")
+                        help="print SHA's test verdict, testing it first if it has none; exit 0 "
+                             "if its tests passed, 1 if they failed, 3 if a lane stopped outside "
+                             "the code, as when the build host refused it")
     args = parser.parse_args()
     if socket.gethostname().split(".")[0] != "fw16":
         parser.error("run this watcher on fw16; builds still go through scripts/cargo-gate")
+    # Some UI test runs need more files than a service's default limit of 1024.
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
     if args.require_tests:
-        sha = git(args.repository.resolve(), "rev-parse", "--verify", f"{args.require_tests}^{{commit}}")
-        verdict = require_tests(args.repository.resolve(), args.state.resolve(), sha)
+        verdict = require_tests(args.repository.resolve(), args.state.resolve(), args.require_tests)
         print(json.dumps(verdict, indent=2))
-        sys.exit(0 if verdict["passed"] else 1)
+        sys.exit(0 if verdict["passed"] else 3 if verdict.get("outside_code") else 1)
     tick(args.repository.resolve(), args.state.resolve(), args.github_repository)
 
 
