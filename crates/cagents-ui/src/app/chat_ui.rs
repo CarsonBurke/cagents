@@ -14644,7 +14644,7 @@ impl Cagents {
                         );
                         runtime.refresh();
                         drop(refresh_part);
-                        let _rest_part = crate::performance::ui_trace::part(
+                        let rest_part = crate::performance::ui_trace::part(
                             crate::performance::ui_trace::Phase::Update,
                             "wake rest",
                         );
@@ -14722,6 +14722,7 @@ impl Cagents {
                             self.persist();
                         }
                         let refresh_limits = self.refresh_chat_limit_accounts();
+                        drop(rest_part);
                         let _tasks_part = crate::performance::ui_trace::part(
                             crate::performance::ui_trace::Phase::Update,
                             "wake tasks",

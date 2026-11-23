@@ -157,7 +157,9 @@ impl Drop for Scope {
         }
         match self.0.take() {
             Some(entry) => {
-                if entry.phase == Phase::Update {
+                // Only an update's own scope entered a depth; a labeled share
+                // of one, from `part`, did not.
+                if entry.phase == Phase::Update && entry.total {
                     UPDATE_DEPTH.set(UPDATE_DEPTH.get().saturating_sub(1));
                 }
                 let elapsed = entry.started.elapsed();

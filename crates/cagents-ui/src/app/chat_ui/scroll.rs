@@ -1962,6 +1962,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 if !viewport.changed {
                     break;
                 }
+                let _relayout_part = layout_part("anchored relayout");
                 node = self.content.as_widget_mut().layout(child, renderer, limits);
                 continue;
             }
