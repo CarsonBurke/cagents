@@ -735,6 +735,11 @@ impl Cagents {
     /// [`State::note_shown`]. While every project is fully watched no row
     /// needs a read for coming into view, and none are collected.
     pub(super) fn sync_git_shown(&mut self) {
+        // Without a refresh subscription nothing reads on a timer; focus
+        // coming back runs a periodic check against the rows last noted.
+        if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
+            return;
+        }
         if !self.refresh_ui.git.entries.values().any(Entry::degraded) {
             self.refresh_ui.git.shown.clear();
             self.refresh_ui.git.newly_shown.clear();

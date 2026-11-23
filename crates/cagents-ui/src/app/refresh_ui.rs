@@ -93,7 +93,10 @@ impl ProjectSchedule {
 
     /// Translate host pacing from the wall clock only when it changes. The
     /// resulting `Instant` remains the subscription identity until an event
-    /// changes the budget or the deadline is reached.
+    /// changes the budget or the deadline is reached. One reached while the
+    /// wall clock still has the host paused, because the two clocks drifted
+    /// apart, is translated again: a finished one-shot keeps its identity,
+    /// so an unchanged past deadline would never wake the window again.
     fn observe_host_ready(
         &mut self,
         ready: impl IntoIterator<Item = (ProjectId, Option<u64>)>,
@@ -110,7 +113,7 @@ impl ProjectSchedule {
             if self
                 .host_ready
                 .get(&project)
-                .is_none_or(|&(known, _)| known != ready_at)
+                .is_none_or(|&(known, deadline)| known != ready_at || deadline <= now)
             {
                 self.host_ready.insert(
                     project,
@@ -1277,6 +1280,34 @@ mod tests {
         assert_eq!(
             app.project_refresh_deadline(Instant::now(), false),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_host_pause_outlasting_its_deadline_is_translated_again() {
+        let mut schedule = ProjectSchedule::default();
+        let project = ProjectId::new();
+        let start = Instant::now();
+        schedule.observe_host_ready([(project, Some(1_030))], 1_000, start);
+        let first = schedule.host_ready_at(project).unwrap();
+        assert_eq!(first, start + Duration::from_secs(30));
+        schedule.observe_host_ready(
+            [(project, Some(1_030))],
+            1_010,
+            start + Duration::from_secs(10),
+        );
+        assert_eq!(
+            schedule.host_ready_at(project),
+            Some(first),
+            "unchanged while pending"
+        );
+        // The monotonic deadline passed, but the wall clock lags a second.
+        let reached = first + Duration::from_millis(5);
+        schedule.observe_host_ready([(project, Some(1_030))], 1_029, reached);
+        assert_eq!(
+            schedule.host_ready_at(project),
+            Some(reached + Duration::from_secs(1)),
+            "the same past deadline would never fire again"
         );
     }
 
