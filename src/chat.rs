@@ -1674,7 +1674,12 @@ pub struct Snapshot {
     /// kind: shells, monitors and the agents above. They run in its process
     /// group, so stopping the provider ends them, and with them whatever
     /// they would have reported to the conversation.
-    #[serde(default)]
+    ///
+    /// Only the daemon reads it, from the actor it runs or from a retained
+    /// helper's resident metadata, so it never goes on the client wire: the
+    /// count belongs to the provider process, and a saved or relayed
+    /// snapshot outlives it.
+    #[serde(skip)]
     pub background_tasks: usize,
     /// Whether the provider takes commands, so that what waits to be sent
     /// can wait for it rather than for a refusal.
