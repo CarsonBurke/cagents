@@ -7478,6 +7478,13 @@ fn locked_mailbox_requests_are_retryable_without_accepting_or_consuming_mail() {
         .unwrap()
         .install_model(Registry::at(&path).unwrap());
     let store = registry(&host).unwrap();
+    // Each operation meets the rival's lock at once rather than after the
+    // store's busy timeout; what it reports is the contract under test.
+    store
+        .lock()
+        .unwrap()
+        .set_busy_handler_for_test(Some(|_| false))
+        .unwrap();
     let incoming = Message {
         id: MessageId::new(),
         from: Party {
