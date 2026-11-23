@@ -17582,6 +17582,7 @@ impl Application for Cagents {
             self.update_resume_banner(),
             self.pane_follow_banner(),
             self.automation_approval_banner(),
+            self.dictation_banner(),
             bar,
         ])
         .width(Length::Fill)

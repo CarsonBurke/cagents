@@ -705,6 +705,85 @@ impl Cagents {
         }
     }
 
+    /// The chat whose microphone is open, opening or listening, while it is
+    /// pane `card`.
+    pub(in crate::app) fn dictation_microphone_in(&self, card: CardId) -> Option<Target> {
+        self.chat_ui
+            .dictation
+            .active
+            .map(|(target, _)| target)
+            .filter(|target| target.card == card)
+    }
+
+    /// The chat whose microphone is on while it is not, or will not be once
+    /// the strip stops moving, at least half on screen: an edge of it left
+    /// in view shows neither its strip nor its tab legibly.
+    fn dictation_out_of_sight(&self) -> Option<Target> {
+        let workspace = &self.workspace;
+        self.chat_ui
+            .dictation
+            .active
+            .map(|(target, _)| target)
+            .filter(|target| {
+                let card = target.card;
+                if workspace.is_hidden(card)
+                    || workspace.visibility(card) != Some(VisibilityClass::Visible)
+                {
+                    return true;
+                }
+                let Some(geometry) = workspace.card_geometry(card) else {
+                    return true;
+                };
+                // Where the camera is going, so that passing over the chat
+                // on the way elsewhere does not flash the strip away.
+                let viewport = workspace.viewport_width();
+                let start = workspace
+                    .camera()
+                    .target()
+                    .clamp(0.0, workspace.geometry().max_offset(viewport));
+                let shown = geometry.end.min(start + viewport) - geometry.start.max(start);
+                // A chat wider than the window counts as seen when it fills it.
+                shown < geometry.width().min(viewport) / 2.0
+            })
+    }
+
+    /// Says the microphone is on while the chat it writes into is out of
+    /// sight: in a tab scrolled away, another channel or another project.
+    /// It cannot be hidden, as the status bar can, and it offers the way
+    /// back to that chat and a way to stop. While the chat is in view, its
+    /// own strip says this.
+    pub(in crate::app) fn dictation_banner(&self) -> Element<'_, Message> {
+        let Some(target) = self.dictation_out_of_sight() else {
+            return iced::widget::Space::new().height(Length::Shrink).into();
+        };
+        let title = self
+            .card_state(target.card)
+            .map_or("a chat", |card| self.card_display_title(card));
+        let blocked = self.modal_is_open();
+        widget::container(
+            widget::row::with_children(vec![
+                meter(self.chat_ui.dictation.client.level()),
+                crate::ui_controls::fade_text(format!("Microphone on: dictating into {title}"))
+                    .width(Length::Fill)
+                    .into(),
+                crate::ui_controls::button::quiet("Show chat")
+                    .on_press_maybe((!blocked).then_some(Message::Palette(
+                        crate::app::palette_ui::Action::FocusPane(target.card),
+                    )))
+                    .into(),
+                crate::ui_controls::button::secondary("Stop dictating")
+                    .on_press(action(Action::DictationStop(target)))
+                    .into(),
+            ])
+            .spacing(space::M)
+            .align_y(Alignment::Center),
+        )
+        .padding([space::S, space::M])
+        .width(Length::Fill)
+        .class(design::surface(Some(design::sunken), [0.0; 4], false))
+        .into()
+    }
+
     pub(super) fn dictation_discard(&mut self, target: Target) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
@@ -1623,6 +1702,50 @@ mod tests {
         assert!(app.chat_ui.dictation.active.is_none());
         drop(app.dictation_event(Event::Cancelled { session: SESSION }));
         assert!(app.chat_ui.dictation.sessions.is_empty());
+    }
+
+    /// The microphone being on is never out of sight: the chat's tab says
+    /// so while it shows, and the window says so, with a way back and a way
+    /// to stop, while it does not. Stopping ends both.
+    #[test]
+    fn an_open_microphone_shows_from_anywhere_until_it_stops() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = listen(&mut app, "dictation", SESSION, "Fix", 3);
+        let other = super::super::tests::live_chat(&mut app, Some("reading"));
+        app.workspace.resize_viewport(1600.0);
+        drop(app.workspace.focus(card));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(app.dictation_microphone_in(card), Some(target));
+        assert_eq!(app.dictation_microphone_in(other), None);
+        assert_eq!(app.dictation_out_of_sight(), None);
+
+        // Another chat that fills the window is read: the dictating one is
+        // scrolled away, or no more than an edge of it shows.
+        app.workspace.resize_viewport(500.0);
+        for pane in [card, other] {
+            drop(app.workspace.set_card_width(pane, CardWidth::Fraction(1.0)));
+        }
+        drop(app.workspace.focus(other));
+        assert_eq!(app.dictation_out_of_sight(), Some(target));
+        assert_eq!(app.dictation_microphone_in(card), Some(target));
+        drop(app.workspace.focus(card));
+        assert_eq!(app.dictation_out_of_sight(), None);
+        // Its tab put away.
+        drop(app.workspace.focus(other));
+        drop(app.workspace.hide_card(card));
+        assert_ne!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(app.dictation_out_of_sight(), Some(target));
+        assert_eq!(app.dictation_microphone_in(card), Some(target));
+
+        drop(app.handle_chat_ui(Action::DictationStop(target)));
+        assert_eq!(app.dictation_out_of_sight(), None);
+        assert_eq!(app.dictation_microphone_in(card), None);
     }
 
     /// Leaving the window while holding the shortcut ends push-to-talk,
