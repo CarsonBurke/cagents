@@ -3610,6 +3610,8 @@ pub enum SettingsField {
     ChatEnterSends,
     ChatExpandToolGroups,
     ChatContentFraction,
+    DictationModel,
+    DictationSends,
     DefaultNativePaneFraction,
     ShowStatusBar,
     AccountUsageDisplay,
@@ -3667,11 +3669,12 @@ pub enum SettingsField {
     ShortcutToggleProjects,
     ShortcutRenamePane,
     ShortcutOpenWorktrees,
+    ShortcutDictate,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 39] = [
+    const SHORTCUTS: [Self; 40] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3711,6 +3714,7 @@ impl SettingsField {
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
         Self::ShortcutOpenWorktrees,
+        Self::ShortcutDictate,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3761,6 +3765,7 @@ impl SettingsField {
             Self::ShortcutChatPermissions => "Choose chat permission mode",
             Self::ShortcutChatModel => "Choose chat model",
             Self::ShortcutChatAccount => "Choose chat account",
+            Self::ShortcutDictate => "Dictate",
             Self::ShortcutToggleInspector => "Toggle inspector",
             Self::ShortcutOpenSettings => "Open settings",
             Self::ShortcutOpenWorktrees => "Open worktrees",
@@ -3780,6 +3785,8 @@ impl SettingsField {
             Self::ChatContentFraction => "Chat content width",
             Self::DefaultNativePaneFraction => "Native pane minimum width",
             Self::ChatEnterSends => "Chat send key",
+            Self::DictationModel => "Speech model",
+            Self::DictationSends => "Send when dictation stops",
             Self::ShowStatusBar => "Status bar",
             Self::AccountUsageDisplay => "Account usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
@@ -3850,9 +3857,11 @@ impl SettingsField {
             | Self::DefaultChannelPane
             | Self::Confirm(_)
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
-                SettingsCategory::NativeChat
-            }
+            Self::ChatEnterSends
+            | Self::ChatExpandToolGroups
+            | Self::ChatContentFraction
+            | Self::DictationModel
+            | Self::DictationSends => SettingsCategory::NativeChat,
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::InspectorOpenByDefault
             | Self::InspectorShowActivity
@@ -3879,6 +3888,7 @@ impl SettingsField {
             | Self::ShortcutChatPermissions
             | Self::ShortcutChatModel
             | Self::ShortcutChatAccount
+            | Self::ShortcutDictate
             | Self::ShortcutToggleInspector
             | Self::ShortcutOpenSettings
             | Self::ShortcutOpenWorktrees
@@ -3938,6 +3948,7 @@ struct ShortcutDraft {
     chat_permissions: String,
     chat_model: String,
     chat_account: String,
+    dictate: String,
     toggle_inspector: String,
     open_settings: String,
     open_worktrees: String,
@@ -3982,6 +3993,7 @@ impl ShortcutDraft {
             chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
             chat_model: settings::format_chords(&shortcuts.chat_model),
             chat_account: settings::format_chords(&shortcuts.chat_account),
+            dictate: settings::format_chords(&shortcuts.dictate),
             toggle_inspector: settings::format_chords(&shortcuts.toggle_inspector),
             open_settings: settings::format_chords(&shortcuts.open_settings),
             open_worktrees: settings::format_chords(&shortcuts.open_worktrees),
@@ -4059,6 +4071,8 @@ struct SettingsDraft {
     chat_enter_sends: bool,
     chat_expand_tool_groups: bool,
     chat_content_fraction: String,
+    dictation_model: String,
+    dictation_sends: bool,
     default_native_pane_fraction: String,
     show_status_bar: bool,
     account_usage_display: settings::AccountUsageDisplay,
@@ -4136,6 +4150,8 @@ impl SettingsDraft {
             chat_enter_sends: settings.chat_enter_sends,
             chat_expand_tool_groups: settings.chat_expand_tool_groups,
             chat_content_fraction: settings.chat_content_fraction.to_string(),
+            dictation_model: settings.dictation_model.clone().unwrap_or_default(),
+            dictation_sends: settings.dictation_sends,
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
             account_usage_display: settings.account_usage_display,
@@ -4211,6 +4227,8 @@ impl SettingsDraft {
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = value == "true",
             SettingsField::ChatContentFraction => self.chat_content_fraction = value,
+            SettingsField::DictationModel => self.dictation_model = value,
+            SettingsField::DictationSends => self.dictation_sends = value == "true",
             SettingsField::DefaultNativePaneFraction => self.default_native_pane_fraction = value,
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
             SettingsField::AccountUsageDisplay => {
@@ -4269,6 +4287,7 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutChatModel => self.keyboard_shortcuts.chat_model = value,
             SettingsField::ShortcutChatAccount => self.keyboard_shortcuts.chat_account = value,
+            SettingsField::ShortcutDictate => self.keyboard_shortcuts.dictate = value,
             SettingsField::ShortcutToggleInspector => {
                 self.keyboard_shortcuts.toggle_inspector = value
             }
@@ -4370,6 +4389,10 @@ fn settings_update(
         }
         SettingsField::ShortcutChatAccount => {
             next.keyboard_shortcuts.chat_account = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDictate => {
+            next.keyboard_shortcuts.dictate = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutChatModel => {
@@ -4484,6 +4507,16 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.chat_enter_sends = enabled)
             .map_err(|_| "Choose which key sends a chat message.".to_owned()),
+        SettingsField::DictationModel => cagents_dictate::catalog::find(value)
+            .map(|model| {
+                next.dictation_model =
+                    (model.id != cagents_dictate::catalog::DEFAULT).then(|| model.id.to_owned());
+            })
+            .ok_or_else(|| "Choose one of the speech models.".to_owned()),
+        SettingsField::DictationSends => value
+            .parse::<bool>()
+            .map(|enabled| next.dictation_sends = enabled)
+            .map_err(|_| "Choose whether dictation sends the message.".to_owned()),
         SettingsField::ShowStatusBar => value
             .parse::<bool>()
             .map(|enabled| next.show_status_bar = enabled)
@@ -10590,6 +10623,13 @@ impl Cagents {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.keyboard_modifiers = *modifiers;
         }
+        // Letting go of a dictation shortcut held down ends push-to-talk,
+        // whatever has the keyboard now.
+        if let keyboard::Event::KeyReleased { physical_key, .. } = &event
+            && let Some(task) = self.dictation_key_released(*physical_key)
+        {
+            return (task, Projection::Full);
+        }
         // The viewer dialog, a modal, takes every key. Its own Escape and an
         // open context menu's are answered in `Gallery::dialog_view`.
         if self.chat_ui.image_dialog.is_some() {
@@ -10922,6 +10962,18 @@ impl Cagents {
         match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts, focused)
             .filter(|_| !workspace_widget::deferred_shortcut_taken(&event, captured, focused))
         {
+            Some(workspace_widget::GlobalShortcut::Dictate) => {
+                let held = match event {
+                    keyboard::Event::KeyPressed { physical_key, .. } => Some(physical_key),
+                    _ => None,
+                };
+                let task = if self.workspace_inputs_blocked() {
+                    Task::none()
+                } else {
+                    self.dictate_focused(held)
+                };
+                (task, Projection::Full)
+            }
             Some(command) => {
                 let modifiers = match event {
                     keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
@@ -12594,6 +12646,7 @@ impl Cagents {
                         .collect(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    dictation: self.dictation_settings(),
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),

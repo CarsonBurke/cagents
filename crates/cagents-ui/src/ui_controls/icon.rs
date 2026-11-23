@@ -113,6 +113,7 @@ icons! {
     List => "list",
     Lock => "lock",
     MergedPullRequest => "merged-pull-request",
+    Microphone => "microphone",
     Minus => "minus",
     More => "more",
     Night => "night",

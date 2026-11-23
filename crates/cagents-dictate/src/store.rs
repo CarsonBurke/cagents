@@ -69,7 +69,9 @@ pub enum Status {
 pub fn status(root: &Path, model: &Model) -> Status {
     let directory = directory(root, model);
     let installed = fs::read_to_string(directory.join(MANIFEST))
-        .is_ok_and(|manifest| manifest == self::manifest(model))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Manifest>(&text).ok())
+        .is_some_and(|manifest| manifest == Manifest::of(model))
         && model.files.iter().all(|file| {
             fs::metadata(directory.join(file.name)).is_ok_and(|meta| meta.len() == file.size)
         });
@@ -106,25 +108,46 @@ pub fn partial(directory: &Path, name: &str) -> PathBuf {
     directory.join(file)
 }
 
+/// What an install records about the model it installed. It is compared as
+/// data, not as text: the order JSON objects keep depends on which features
+/// of `serde_json` a build happens to unify, so the app and the helper that
+/// wrote the file may spell the same manifest differently.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Manifest {
+    model: String,
+    revision: String,
+    files: Vec<ManifestFile>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ManifestFile {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+impl Manifest {
+    fn of(model: &Model) -> Self {
+        Self {
+            model: model.id.to_owned(),
+            revision: model.revision.to_owned(),
+            files: model
+                .files
+                .iter()
+                .map(|file| ManifestFile {
+                    name: file.name.to_owned(),
+                    size: file.size,
+                    sha256: file.sha256.to_owned(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The manifest an install of `model` writes last.
 pub fn manifest(model: &Model) -> String {
-    let files: Vec<_> = model
-        .files
-        .iter()
-        .map(|file| {
-            serde_json::json!({
-                "name": file.name,
-                "size": file.size,
-                "sha256": file.sha256,
-            })
-        })
-        .collect();
-    let mut manifest = serde_json::to_string_pretty(&serde_json::json!({
-        "model": model.id,
-        "revision": model.revision,
-        "files": files,
-    }))
-    .expect("a manifest serializes");
+    let mut manifest =
+        serde_json::to_string_pretty(&Manifest::of(model)).expect("a manifest serializes");
     manifest.push('\n');
     manifest
 }
@@ -250,6 +273,27 @@ mod tests {
         );
         fs::write(directory.join(MANIFEST), manifest(model)).unwrap();
         assert_eq!(status(root.path(), model), Status::Installed);
+        // The same manifest with its keys in another order, as a build of
+        // serde_json that sorts them writes it, is the same install.
+        let reordered = format!(
+            "{{\"revision\":{},\"files\":{},\"model\":{}}}",
+            serde_json::to_string(model.revision).unwrap(),
+            serde_json::to_value(Manifest::of(model)).unwrap()["files"],
+            serde_json::to_string(model.id).unwrap(),
+        );
+        fs::write(directory.join(MANIFEST), reordered).unwrap();
+        assert_eq!(status(root.path(), model), Status::Installed);
+        // A manifest of another revision is not this install.
+        fs::write(
+            directory.join(MANIFEST),
+            manifest(model).replace(model.revision, "000000000000"),
+        )
+        .unwrap();
+        assert!(matches!(
+            status(root.path(), model),
+            Status::Partial { .. }
+        ));
+        fs::write(directory.join(MANIFEST), manifest(model)).unwrap();
 
         // A file of the wrong size is not an install.
         File::create(directory.join(first.name))

@@ -366,7 +366,8 @@ exit 83
 
     def assert_built(self, *arguments, **changes):
         result, calls = self.launch(*arguments, **changes)
-        self.assertEqual(len(calls), 3, result.stderr)
+        # The command line, the daemon, the app and dictation's helper.
+        self.assertEqual(len(calls), 4, result.stderr)
         self.assertNotIn("skipping the build", result.stderr)
 
     def assert_skipped(self, *arguments, **changes):
@@ -401,7 +402,7 @@ exit 83
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("may only confirm that nothing needs compiling", result.stderr)
         lines = guard_calls.read_text().splitlines()
-        self.assertEqual(len(lines), 3)
+        self.assertEqual(len(lines), 4)
         for line in lines:
             self.assertIn(f"wrapper={self.runner.with_name('refuse-compile')} ", line)
             self.assertNotIn(f"lock={self.env['CAGENTS_BUILD_LOCK']} ", line)
@@ -583,7 +584,7 @@ exit 83
     def test_a_guarded_build_records_the_same_identity_as_any_other(self):
         result = self.under_native_lock("flock", "--close")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.cargo_calls.read_text().splitlines()), 3)
+        self.assertEqual(len(self.cargo_calls.read_text().splitlines()), 4)
         self.cargo_calls.unlink()
         result = self.under_native_lock("flock", "--close")
         self.assertIn("skipping the build", result.stderr)
@@ -777,7 +778,7 @@ exit 83
         # Cargo's dependency lists stay there, so nothing here can say the
         # products are current.
         offload = self.runner.with_name("cargo-offload")
-        # One slot there serves all three builds: the hold runs the script.
+        # One slot there serves all four builds: the hold runs the script.
         offload.write_text('#!/bin/sh\n[ "$1" != --host ] || { echo build-host; exit 0; }\n'
                            '[ "$1" != --hold ] || { shift; printf "hold\\n" >>"$CARGO_CALLS"; exec "$@"; }\n'
                            'exec cargo "$@"\n')
@@ -785,7 +786,7 @@ exit 83
         for _ in range(2):
             result, calls = self.launch("--browserless")
             self.assertEqual(calls[0], "hold", result.stderr)
-            self.assertEqual(len(calls), 4, calls)
+            self.assertEqual(len(calls), 5, calls)
             self.assertNotIn("skipping the build", result.stderr)
 
     def test_identity_records_hide_environment_values_and_stay_private(self):
@@ -1226,10 +1227,12 @@ exit 1
             f"{common} --no-default-features --features development,host --bin cagentsd",
         ])
         self.assertEqual(integrated[:2], browserless[:2])
+        helper = f"{common} -p cagents-dictate --features engine --bin cagents-dictate"
         self.assertEqual(browserless[2:], [
-            f"{common} -p cagents-ui --features development --bin cagents-ui"])
+            f"{common} -p cagents-ui --features development --bin cagents-ui", helper])
         self.assertEqual(integrated[2:], [
-            f"{common} -p cagents-ui --features development,integrated-browser --bin cagents-ui"])
+            f"{common} -p cagents-ui --features development,integrated-browser --bin cagents-ui",
+            helper])
 
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")

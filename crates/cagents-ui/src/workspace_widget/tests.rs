@@ -3387,6 +3387,7 @@ fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
         ("a", Code::KeyA, GlobalShortcut::ChatAccount),
         ("m", Code::KeyM, GlobalShortcut::ChatModel),
         ("o", Code::KeyO, GlobalShortcut::ChatPermissions),
+        (" ", Code::Space, GlobalShortcut::Dictate),
     ] {
         for focused in [
             FocusedPane::Terminal,

@@ -4030,24 +4030,7 @@ impl Runtime {
             .lines()
             .any(|line| !line.text.trim().is_empty());
         let has_draft = has_text || !self.attachments.is_empty();
-        // The submit modes the send controls expose, in the order the keyboard
-        // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
-        // A message just sent is about to start a turn, so what is written
-        // after it steers or waits as it would once the turn shows.
-        let under_way = self.turn_under_way();
-        let modes: &[PromptMode] = if under_way {
-            match snapshot.capabilities.steer {
-                // A message taken back from the queue goes back the way it
-                // was queued unless the other chord says otherwise.
-                true if self.resend == Some(PromptMode::Queue) => {
-                    &[PromptMode::Queue, PromptMode::Steer]
-                }
-                true => &[PromptMode::Steer, PromptMode::Queue],
-                false => &[PromptMode::Queue],
-            }
-        } else {
-            &[PromptMode::Send]
-        };
+        let modes = self.submit_modes();
         // The placeholder names what the field is for. Spelling out both
         // chords on it meant the one piece of text in an empty composer was
         // keyboard documentation, repeated on every pane, and it went stale
@@ -4142,6 +4125,12 @@ impl Runtime {
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
             let viewing = self.image_viewer.is_some() && self.child_picker.is_none();
+            // Finishing counts too: an Escape pressed again while the last
+            // words arrive must not fall through and interrupt the turn.
+            let dictating = self
+                .dictation
+                .as_ref()
+                .is_some_and(dictation::Pane::is_session);
             editor
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
@@ -4210,6 +4199,18 @@ impl Runtime {
                     let picking = self.model_picker.is_some()
                         || self.account_picker
                         || self.permission_picker;
+                    // While dictating, Escape stops listening and keeps what
+                    // was said, ahead of closing an image or interrupting
+                    // the turn; once it has stopped, Escape does nothing
+                    // until the last words are in. Sending waits for them.
+                    if dictating
+                        && !picking
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::DictationStop(
+                            target,
+                        ))));
+                    }
                     // Escape closes the topmost layer first: an open image
                     // above the draft goes before a running turn, which the
                     // next Escape interrupts.
@@ -4331,6 +4332,7 @@ impl Runtime {
         };
         let mut row: Vec<Element<'_, Message>> = Vec::new();
         row.extend(plus.map(control));
+        row.extend(self.dictation_control(shortcuts, !read_only).map(control));
         row.push(editor);
         row.extend(submissions.into_iter().map(control));
         // The editor and its controls are one object: a single raised
@@ -4344,6 +4346,7 @@ impl Runtime {
                         self.queue_view()
                             .into_iter()
                             .chain(self.restored_waiting_notice())
+                            .chain(self.dictation_view())
                             .chain(self.composer_note_view())
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.
@@ -4709,6 +4712,26 @@ impl Runtime {
         )
     }
 
+    /// The submit modes the send controls expose, in the order the keyboard
+    /// reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
+    /// A message just sent is about to start a turn, so what is written
+    /// after it steers or waits as it would once the turn shows.
+    pub(super) fn submit_modes(&self) -> &'static [PromptMode] {
+        if self.turn_under_way() {
+            match self.snapshot.capabilities.steer {
+                // A message taken back from the queue goes back the way it
+                // was queued unless the other chord says otherwise.
+                true if self.resend == Some(PromptMode::Queue) => {
+                    &[PromptMode::Queue, PromptMode::Steer]
+                }
+                true => &[PromptMode::Steer, PromptMode::Queue],
+                false => &[PromptMode::Queue],
+            }
+        } else {
+            &[PromptMode::Send]
+        }
+    }
+
     /// The control that cancels the active turn.
     ///
     /// A provider whose interrupt does not spare background subagents takes
@@ -4807,7 +4830,7 @@ impl Runtime {
     /// copyable. A pane that can start a new conversation in its place,
     /// which takes the message along, and a refused first message stay
     /// editable.
-    fn composer_read_only(&self, transitioning: bool) -> bool {
+    pub(super) fn composer_read_only(&self, transitioning: bool) -> bool {
         transitioning
             || (self
                 .start_blocked

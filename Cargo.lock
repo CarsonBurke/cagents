@@ -1365,6 +1365,7 @@ dependencies = [
  "blake3",
  "cagents",
  "cagents-browser-import",
+ "cagents-dictate",
  "cookie 0.18.2",
  "crossbeam-channel",
  "directories",
