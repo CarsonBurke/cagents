@@ -2245,6 +2245,48 @@ class RemoteRun(unittest.TestCase):
                 self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
                 lock.close()
 
+    def slot_leased(self, base, index, owner, age, built=True):
+        slot = Path(base, f"slot-{index}")
+        (slot / "src" / ("target" if built else "")).mkdir(parents=True, exist_ok=True)
+        (slot / "owner").write_text(f"{owner}\n")
+        leased = time.time() - age
+        os.utime(slot / "owner", (leased, leased))
+
+    def leased_slot(self, base, slots):
+        lease, lines = self.lease(base, slots=slots)
+        index = json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"]
+        lease.stdin.close()
+        self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
+        return index
+
+    def test_without_its_own_slot_a_lease_takes_the_one_leased_least_lately(self):
+        with self.slots() as base:
+            # Slot 1 was leased longest ago, by a checkout gone quiet.
+            for index, age in ((0, 600), (1, 3600), (2, 10)):
+                self.slot_leased(base, index, f"checkout-{index}", age)
+            self.assertEqual(self.leased_slot(base, 3), 1)
+            # The checkout then comes back to it, and each lease is recorded.
+            self.assertEqual(self.leased_slot(base, 3), 1)
+            records = [json.loads(line) for line in Path(base, "leases.log").read_text().splitlines()]
+            self.assertEqual([(record["slot"], record["own"], record["previous"]) for record in records],
+                             [(1, False, "checkout-1"), (1, True, "key")])
+
+    def test_of_its_own_slots_a_checkout_takes_the_one_it_used_last(self):
+        with self.slots() as base:
+            self.slot_leased(base, 0, "key", 3600)
+            self.slot_leased(base, 1, "key", 10)
+            self.slot_leased(base, 2, "checkout-2", 7200)
+            self.assertEqual(self.leased_slot(base, 3), 1)
+
+    def test_an_empty_slot_is_taken_before_a_new_one_is_made(self):
+        with self.slots() as base:
+            self.slot_leased(base, 0, "checkout-0", 10)
+            self.hold(base, 0)
+            # Emptied, as below the disk floor, with its owner left behind.
+            self.slot_leased(base, 1, "checkout-1", 10, built=False)
+            self.assertEqual(self.leased_slot(base, 3), 1)
+            self.assertFalse(Path(base, "slot-2").exists())
+
     def test_a_further_slot_is_made_while_the_disk_holds_one(self):
         with self.slots() as base:
             self.hold(base, 0, None)

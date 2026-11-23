@@ -704,6 +704,8 @@ GIB = 2**30
 # floor the host keeps free, before one is made. The variable is for tests
 # standing in for the build host; ssh does not pass it on.
 SLOT_DISK = int(os.environ.get("CAGENTS_OFFLOAD_SLOT_DISK_BYTES") or 50 * GIB)
+# The most the record of leases, leases.log in each repository's slots, holds.
+LEASE_RECORD_BYTES = 1 << 20
 # How long a new slot is taken to be filling to that size.
 SLOT_FILLS = 12 * 3600
 # The most incremental compilation state a slot keeps, unless its lease names
@@ -1293,11 +1295,20 @@ if command == "lease":
         except OSError:
             return ""
     # This checkout's last slot, then one another checkout built in, whose
-    # compiled dependencies it shares, then an empty one. Up to `slots` are
+    # compiled dependencies it shares, the one leased least lately first: its
+    # checkout is the least likely to come back for it, while a lowest-first
+    # order took the same few slots from checkouts still building in them.
+    # Then an empty one. Up to `slots` are
     # made, each only while the disk holds another build's output beside the
     # floor; how many build at once is then down to their memory shares.
     def built(index):
         return os.path.isdir(os.path.join(base, f"slot-{index}", "src", "target"))
+    def leased_at(index):
+        # Each lease rewrites the owner as it takes the slot.
+        try:
+            return os.stat(os.path.join(base, f"slot-{index}", "owner")).st_mtime_ns
+        except OSError:
+            return 0
     def free():
         stat = os.statvfs(base)
         return stat.f_bavail * stat.f_frsize
@@ -1325,7 +1336,14 @@ if command == "lease":
         pending = SLOT_DISK * sum(1 for index in existing if growing(index))
         if not existing or len(existing) < slots and free() - floor - pending >= SLOT_DISK:
             indices.append(max(existing, default=-1) + 1)
-        return sorted(indices, key=lambda index: (owner(index) != key, not built(index), index)), None
+        def order(index):
+            own, made = owner(index) == key, built(index)
+            # This checkout's own slots, the one it used last first; another
+            # checkout's, the one leased least lately first; empty ones, and
+            # then a new one, in turn.
+            recency = -leased_at(index) if own else leased_at(index) if made else 0
+            return (not own, not made, recency, index)
+        return sorted(indices, key=order), None
     while True:
         order, why = candidates()
         if why != "same" and queue.closed:
@@ -1363,6 +1381,21 @@ if command == "lease":
             continue
         break
     leases.append(slot)
+    # Which leases found their checkout's own slot, the affinity the order
+    # above is for: one line each, the older half dropped past a bound.
+    try:
+        record = os.path.join(base, "leases.log")
+        if os.path.exists(record) and os.path.getsize(record) > LEASE_RECORD_BYTES:
+            with open(record) as file:
+                kept = file.readlines()
+            with open(record + ".new", "w") as file:
+                file.writelines(kept[len(kept) // 2:])
+            os.replace(record + ".new", record)
+        with open(record, "a") as file:
+            file.write(json.dumps({"time": round(time.time()), "slot": index, "own": owner(index) == key,
+                                   "previous": owner(index), "key": key}) + "\n")
+    except OSError:
+        pass
     # What this build is, at once, so that a request for the same build
     # waits for it rather than build it again elsewhere.
     with open(os.path.join(slot, "claim.new"), "w") as file:
