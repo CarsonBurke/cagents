@@ -18,6 +18,8 @@ fn isolated(test: &str) -> Option<std::path::PathBuf> {
             std::env::var_os("XDG_RUNTIME_DIR"),
             Some(root.join("run").into_os_string())
         );
+        // This rerun runs one test, which shares the host with others.
+        crate::host::upgrade_inspect::wait_out_starting_processes_for_test();
         return Some(root);
     }
     let directory = tempfile::tempdir().unwrap();
@@ -1783,4 +1785,33 @@ fn codex_retained_processes_do_not_claim_an_unbound_socket_is_serving() {
         failure.to_string(),
         "The previous Codex execution still has live processes. Wait for them to finish, then try again."
     );
+}
+
+/// A process still starting clears in a moment. Close says to try again
+/// then, not to wait for a restart, as it does when nothing can tell.
+#[test]
+fn a_close_that_finds_a_process_starting_asks_to_try_again() {
+    let session = Session {
+        id: TerminalId::new(),
+        launch: chat::Launch {
+            provider: Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: std::env::temp_dir(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+        },
+        proof: None,
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: chat::NativeContinuity::ReconnectOnly,
+    };
+    let starting = lost_execution_refusal(&session, Holds::Starting);
+    assert!(starting.contains("again in a moment"), "{starting}");
+    assert!(!starting.contains("restart"), "{starting}");
+    let unproved = lost_execution_refusal(&session, Holds::Unproved);
+    assert!(unproved.contains("restarts"), "{unproved}");
 }
