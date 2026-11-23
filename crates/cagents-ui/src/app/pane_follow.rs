@@ -205,7 +205,12 @@ impl Cagents {
                 // As the sidebar opens it: a channel the move emptied and
                 // retired is gone, and so is the way back.
                 let from = notice.departure.from;
-                if !self.durable.channels.iter().any(|channel| channel.id == from) {
+                if !self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == from)
+                {
                     return Task::none();
                 }
                 self.select_sidebar_rows(
@@ -240,9 +245,11 @@ impl Cagents {
     }
 
     pub(super) fn pane_follow_subscription(&self) -> Subscription<Message> {
-        self.pane_follow.as_ref().map_or_else(Subscription::none, |notice| {
-            Subscription::run_with(Expiry(notice.deadline), expiry_stream)
-        })
+        self.pane_follow
+            .as_ref()
+            .map_or_else(Subscription::none, |notice| {
+                Subscription::run_with(Expiry(notice.deadline), expiry_stream)
+            })
     }
 
     pub(super) fn pane_follow_banner(&self) -> Element<'_, Message> {
@@ -252,7 +259,11 @@ impl Cagents {
         let severity = NoticeSeverity::Success;
         let enabled = !self.modal_is_open();
         let (label, name, action) = if notice.departure.follow {
-            ("Go back", "Go back to the channel the pane left", Action::GoBack)
+            (
+                "Go back",
+                "Go back to the channel the pane left",
+                Action::GoBack,
+            )
         } else {
             ("Open", "Open the pane in its new channel", Action::Open)
         };

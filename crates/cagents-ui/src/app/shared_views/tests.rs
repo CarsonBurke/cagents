@@ -1,4 +1,5 @@
 mod history_start;
+mod pane_follow;
 mod published_card_edits;
 mod removal_tests;
 #[cfg(not(feature = "integrated-browser"))]
@@ -8,7 +9,6 @@ mod seed_refusal;
 mod startup_admission;
 mod startup_terminals;
 mod unadmitted_first_send;
-mod pane_follow;
 mod window_selection;
 mod window_startup;
 
