@@ -1594,6 +1594,7 @@ impl PromptSuggestion {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Snapshot {
     /// Resident live-turn excerpt; never transcript serialization or wire state.
     #[serde(skip)]
@@ -1693,6 +1694,58 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// How a request to hand the queued messages to the running turn stands.
+    /// Last, so that a client or source from before it reads the rest.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
+    )]
+    pub send_now: Option<SendNow>,
+}
+
+/// As derived, except that a client from before [`SendNow`] is sent the
+/// fields it decodes: see [`Snapshot::send_now`].
+impl Serialize for Snapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// As derived, except that one from a source before [`SendNow`] has no
+/// request to read and stands for none.
+impl<'de> Deserialize<'de> for Snapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
+        }
+        Self::deserialize(deserializer)
+    }
+}
+
+/// What became of a request to hand the queued messages to the running turn
+/// ([`Command::SendQueuedNow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendNow {
+    /// Asked for. The provider has not yet said how the turn will make way,
+    /// or is still admitting a queued message the request has to name.
+    Requested,
+    /// The turn takes the messages in without being stopped: whatever it was
+    /// waiting on carries on out of its way.
+    Delivering,
+    /// The turn could not take them in, so it was stopped and the messages
+    /// start the next one.
+    Stopped,
+    /// Nothing was waiting that could go early; what is queued goes when the
+    /// turn reaches it.
+    Declined,
+}
+
+impl SendNow {
+    /// Whether the request is still being carried out, so asking again would
+    /// only repeat it.
+    pub fn in_flight(self) -> bool {
+        self != Self::Declined
+    }
 }
 
 /// When a provider takes a message it is holding.
@@ -2135,7 +2188,10 @@ impl Command {
             | Self::LoadLater
             | Self::LoadFileChanges { .. }
             | Self::LoadFileChangePatches { .. }
-            | Self::ReadTextCopy { .. } => false,
+            | Self::ReadTextCopy { .. }
+            // The messages it hurries gave their work when they were queued,
+            // and asking twice changes nothing.
+            | Self::SendQueuedNow => false,
         }
     }
 
@@ -2167,7 +2223,8 @@ impl Command {
             | Self::SetInterruptMode { .. }
             | Self::ListBranches
             | Self::LoadLater
-            | Self::ReadTextCopy { .. } => false,
+            | Self::ReadTextCopy { .. }
+            | Self::SendQueuedNow => false,
         }
     }
 }
@@ -2256,6 +2313,11 @@ pub enum Command {
         source: TextCopySource,
         offset: u64,
     },
+    /// Hand everything queued to the running turn now, without stopping its
+    /// subagents or background work. Carried only where
+    /// [`Capabilities::send_queued_now`] says so; [`Snapshot::send_now`]
+    /// says how it went.
+    SendQueuedNow,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -3215,6 +3277,7 @@ pub struct Skill {
     pub invocation: String,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Capabilities {
     pub steer: bool,
     pub queue: bool,
@@ -3241,6 +3304,33 @@ pub struct Capabilities {
     /// background, rather than only the turn and the work inside it.
     #[serde(default)]
     pub interrupt_stops_background: bool,
+    /// Whether [`Command::SendQueuedNow`] is carried: the provider can hand
+    /// what is queued to a turn blocked on long work without stopping the
+    /// work. Last, so that a client or source from before it reads the rest.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
+    )]
+    pub send_queued_now: bool,
+}
+
+/// As derived, except that a client from before [`SendNow`] is sent the
+/// fields it decodes: see [`Capabilities::send_queued_now`].
+impl Serialize for Capabilities {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// As derived, except that one from a source before [`SendNow`] cannot send
+/// what is queued early.
+impl<'de> Deserialize<'de> for Capabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
+        }
+        Self::deserialize(deserializer)
+    }
 }
 /// Provider-confirmed speed setting, independent of model reasoning effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3483,6 +3573,9 @@ pub enum Event {
     },
     QueueChanged(Vec<QueuedMessage>),
     QueueRemoval(QueueRemoval),
+    /// How a request to send what is queued now stands, or `None` once it is
+    /// over: the messages it named left the queue or the turn ended.
+    SendNow(Option<SendNow>),
     /// Published until the provider has answered the asynchronous history
     /// request, independently of the command acknowledgement.
     HistoryLoading(bool),

@@ -307,7 +307,13 @@ use crate::{
 /// Version 198 appends device links: `DeviceTrust`, the peer challenge and
 /// authentication through which a linked computer's session acts on this
 /// daemon, and `SignDeviceChallenge`, with their replies.
-pub const PROTOCOL_VERSION: u16 = 198;
+///
+/// Version 200 appends `Capabilities::send_queued_now`, `Snapshot::send_now`
+/// and `Command::SendQueuedNow`, which hand what is queued to a turn blocked
+/// on long work without stopping its subagents. An older client is sent
+/// snapshots without both fields; one read from an older update source has
+/// neither. 199 is reserved for a parallel branch.
+pub const PROTOCOL_VERSION: u16 = 200;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -339,7 +345,8 @@ mod older_clients;
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
     ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS,
-    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
+    SEND_QUEUED_NOW, WAITING_TOOL_STATUS, WithoutTrailing, before_send_queued_now, decoding_before,
+    decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
