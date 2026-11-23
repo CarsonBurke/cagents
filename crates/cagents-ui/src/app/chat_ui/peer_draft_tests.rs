@@ -1690,3 +1690,79 @@ fn a_refused_first_start_catches_up_after_the_winner_is_proven() {
         assert!(peer.app.chat_ui.retiring.is_empty());
     });
 }
+
+/// This window changes the draft's permissions before another window's model
+/// choice reaches it. Its update was built without the choice; neither the
+/// window, while the update is on its way, nor the registry, once it takes
+/// it, may drop the choice, and the permissions stay this window's.
+#[test]
+fn a_permission_change_keeps_a_model_another_window_chose_meanwhile() {
+    let mut peer = peer();
+    let target = draft_runtime(&peer.app, peer.card).target;
+    Arc::make_mut(&mut peer.app.chat_runtime_mut(target).unwrap().snapshot)
+        .capabilities
+        .permission_modes = ["default", PLAN_MODE].map(String::from).to_vec();
+    drop(peer.app.update(Message::ChatUi(Action::PermissionMode(
+        target,
+        PLAN_MODE.into(),
+    ))));
+    let (operation, _, change) = peer.app.shared_views.pending.last().unwrap().clone();
+    let Change::Update { before, pane } = &change else {
+        panic!("expected a pane update, not {change:?}");
+    };
+    let CardKind::Chat(permitted) = &pane.kind else {
+        unreachable!()
+    };
+    assert_ne!(permitted.launch.recipe, peer.draft.launch.recipe);
+    assert_eq!(permitted.launch.draft_model, None);
+
+    // The other window's choice reaches the registry first.
+    let mut chosen = peer.draft.clone();
+    super::draft_choice::set(
+        &mut chosen,
+        &(Some("other-model".into()), Some("low".into())),
+    );
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(chosen.clone()),
+    ));
+    let mut both = permitted.clone();
+    super::draft_choice::carry(&chosen, &mut both);
+    let shows_both = |app: &Cagents| {
+        let runtime = draft_runtime(app, peer.card);
+        assert_eq!(runtime.session, both);
+        assert!(runtime.draft_model_chosen);
+        assert_eq!(
+            runtime.snapshot.selected_model.as_deref(),
+            Some("other-model")
+        );
+        assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
+        assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some(PLAN_MODE));
+        assert_eq!(
+            app.card_state(peer.card).map(|state| &state.kind),
+            Some(&CardKind::Chat(both.clone()))
+        );
+    };
+    shows_both(&peer.app);
+
+    // The registry takes the update over the choice and keeps both.
+    let mut registry = peer
+        .app
+        .workspace_model
+        .views
+        .iter()
+        .find(|view| view.scope == Scope::Channel(peer.channel))
+        .unwrap()
+        .clone();
+    assert!(!registry.source_update_conflicts(before, pane));
+    assert!(registry.apply(&change).unwrap());
+    let saved = registry.panes[0].kind.clone();
+    assert_eq!(saved, CardKind::Chat(both.clone()));
+    drop(project(&mut peer.app, peer.channel, peer.card, saved));
+    peer.app
+        .acknowledge_view_edit(Scope::Channel(peer.channel), Some(operation));
+    assert!(peer.app.shared_views.pending.is_empty());
+    shows_both(&peer.app);
+}
