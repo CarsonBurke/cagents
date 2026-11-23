@@ -211,14 +211,6 @@ impl Cagents {
             if !views::same_removal_source(before, &local) {
                 return Err(());
             }
-            let repository = match scope {
-                Scope::Channel(channel) => self
-                    .workspace_model
-                    .channel(*channel)
-                    .map(|channel| channel.repository.clone())
-                    .ok_or(())?,
-                Scope::Worktree { repository, .. } => repository.clone(),
-            };
             let terminal = match self.cards.get(&card) {
                 Some(CardRuntime::Terminal(handle)) => handle
                     .execution_instance()
@@ -226,34 +218,9 @@ impl Cagents {
                     .map(|(instance, owner)| TerminalRemovalBasis::Worker { owner, instance }),
                 _ => None,
             };
-            let change = Change::RemoveSource {
-                registry: self.workspace_model.identity,
-                repository: repository.clone(),
-                before: before.clone(),
-                terminal,
-                capture: matches!(before.kind, CardKind::Terminal(_)).then(|| {
-                    CapturedTerminalSource {
-                        registry: self.workspace_model.identity,
-                        repository,
-                        scope: scope.clone(),
-                        view_revision: self
-                            .workspace_model
-                            .views
-                            .iter()
-                            .find(|v| &v.scope == scope)
-                            .unwrap()
-                            .revision,
-                        model_sequence: self.shared_views.snapshot_sequence.max(
-                            self.shared_views
-                                .view_sequences
-                                .get(scope)
-                                .copied()
-                                .unwrap_or(0),
-                        ),
-                        before: Box::new(before.clone()),
-                    }
-                }),
-            };
+            let change = self
+                .removal_source_change(scope, before, terminal)
+                .ok_or(())?;
             if !self.removal_source_expected(scope, &change) {
                 return Err(());
             }
@@ -272,6 +239,53 @@ impl Cagents {
                 false
             }
         }
+    }
+
+    /// The removal of `before`, as `scope` lists it now, consenting to close
+    /// exactly that source. `None` when the scope's project or view is
+    /// unknown here.
+    pub(super) fn removal_source_change(
+        &self,
+        scope: &Scope,
+        before: &Pane,
+        terminal: Option<TerminalRemovalBasis>,
+    ) -> Option<Change> {
+        let repository = match scope {
+            Scope::Channel(channel) => self
+                .workspace_model
+                .channel(*channel)
+                .map(|channel| channel.repository.clone())?,
+            Scope::Worktree { repository, .. } => repository.clone(),
+        };
+        let capture = match before.kind {
+            CardKind::Terminal(_) => Some(CapturedTerminalSource {
+                registry: self.workspace_model.identity,
+                repository: repository.clone(),
+                scope: scope.clone(),
+                view_revision: self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .find(|view| &view.scope == scope)?
+                    .revision,
+                model_sequence: self.shared_views.snapshot_sequence.max(
+                    self.shared_views
+                        .view_sequences
+                        .get(scope)
+                        .copied()
+                        .unwrap_or(0),
+                ),
+                before: Box::new(before.clone()),
+            }),
+            _ => None,
+        };
+        Some(Change::RemoveSource {
+            registry: self.workspace_model.identity,
+            repository,
+            before: before.clone(),
+            terminal,
+            capture,
+        })
     }
 
     /// Whether the captured source is still what the registry holds for the

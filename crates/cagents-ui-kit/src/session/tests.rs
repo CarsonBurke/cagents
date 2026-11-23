@@ -789,7 +789,7 @@ fn a_refused_checkpoint_names_the_cause_without_the_store_error() {
     let queue = Arc::new((
         Mutex::new(QueueState {
             latest: Some(Arc::new(workspace())),
-            checkpoints: vec![response],
+            checkpoints: vec![Checkpoint::Window(response)],
             ..QueueState::default()
         }),
         Condvar::new(),
@@ -2069,7 +2069,7 @@ fn a_failure_no_rebase_can_fix_is_reported_instead_of_rebased() {
     let queue = Arc::new((
         Mutex::new(QueueState {
             latest: Some(Arc::new(workspace())),
-            checkpoints: vec![response],
+            checkpoints: vec![Checkpoint::Window(response)],
             shutdown: true,
             ..QueueState::default()
         }),
@@ -3380,6 +3380,68 @@ fn a_refused_autosave_stays_reported_until_a_later_one_lands() {
     assert!(writes.flush(&store).is_empty());
     assert!(writes.quarantine.is_empty());
     assert_eq!(writes.quarantine.window_state(), None);
+}
+
+/// A pane's barrier vouches only for that pane. One pane storage refuses -
+/// a closed card brought back, as #2444's stuck draft was - fails the window
+/// barrier, but not the barrier of another pane, which saved around it; its
+/// own barrier names it and the rule it broke.
+#[test]
+fn a_pane_barrier_is_not_failed_by_another_panes_refusal() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pane-barrier.sqlite3");
+    let timeout = Duration::from_secs(5);
+    let (runtime, _) = SessionRuntime::open(&path, BootId::new("boot-pane-barrier")).unwrap();
+    let mut state = workspace();
+    let mut other = state.cards[0].clone();
+    other.id = CardId::new();
+    other.title = "draft".into();
+    if let CardKind::Terminal(session) = &mut other.kind {
+        session.id = TerminalId::new();
+    }
+    state.cards.push(other.clone());
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime.flush(timeout).unwrap();
+    let card = state.cards.remove(0);
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime.flush(timeout).unwrap();
+    let pane_flush = |card: CardId| {
+        runtime
+            .request_pane_flush(card)
+            .unwrap()
+            .recv_timeout(timeout)
+            .expect("the pane barrier is answered")
+    };
+    assert_eq!(pane_flush(other.id), Ok(()));
+
+    let resurrected = card.id;
+    state.cards.insert(0, card);
+    state.cards[1].title = "draft, renamed".into();
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime
+        .flush(timeout)
+        .expect_err("the window barrier still reports the refused pane");
+    assert_eq!(
+        pane_flush(other.id),
+        Ok(()),
+        "the other pane's change landed around the refused one"
+    );
+    let saved = runtime
+        .operation_store()
+        .load_card(other.id, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "draft, renamed");
+    let refusal = pane_flush(resurrected).expect_err("its own refusal fails its barrier");
+    let PaneSaveRefusal::Refused { pane, rule, .. } = &refusal else {
+        panic!("a refusal by rule, not a storage failure: {refusal:?}")
+    };
+    assert_eq!(*pane, Some(resurrected));
+    assert!(rule.as_str().contains("cannot be resurrected"), "{refusal}");
+    assert!(
+        refusal.to_string().contains(&resurrected.to_string()),
+        "{refusal}"
+    );
 }
 
 #[test]

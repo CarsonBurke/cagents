@@ -1,3 +1,4 @@
+mod closed_stays_closed;
 mod history_start;
 mod pane_follow;
 mod published_card_edits;

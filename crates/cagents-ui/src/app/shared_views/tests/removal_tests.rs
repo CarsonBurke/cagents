@@ -712,10 +712,25 @@ fn a_refused_close_of_a_pane_already_gone_reports_nothing() {
     }
 }
 
-/// A Close the registry refused while it still holds the pane keeps the
-/// pane, and says so in plain words rather than as a session update.
+/// The removal of `card` this window sent again after `refused`, if any.
+fn resent_close(app: &Cagents, card: CardId, refused: uuid::Uuid) -> Option<(uuid::Uuid, Change)> {
+    app.shared_views
+        .pending
+        .iter()
+        .find_map(|(operation, _, change)| {
+            (*operation != refused
+                && matches!(change, Change::RemoveSource { before, .. } if before.id == card))
+            .then(|| (*operation, change.clone()))
+        })
+}
+
+/// A Close the registry refused while it still holds the pane leaves the
+/// pane closed here: its identity is never reopened, which storage would
+/// refuse, and its removal is sent again rather than asking the person to
+/// close it twice (#2093, #2444).
 #[test]
-fn a_refused_close_keeps_the_pane_and_says_so() {
+fn a_refused_close_keeps_the_pane_closed_and_sends_its_removal_again() {
+    use super::super::workspace_model_sync::ModelUpdate;
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
     for (name, terminal, worktree) in CLOSE_CASES {
         let (mut app, original) = close_fixture(directory.path(), terminal, worktree);
@@ -723,20 +738,12 @@ fn a_refused_close_keeps_the_pane_and_says_so() {
         let held = view_holding(&app, &scope);
         assert!(held.panes.contains(&original), "{name}");
         registry_refuses(&mut app, operation, change, held);
-        // A worktree's pane comes back only once something shows that
-        // worktree again, so the notice says only that it may.
-        let shown = app.workspace.order().any(|id| id == original.id);
-        assert_eq!(shown, !worktree, "{name}");
-        let expected = if shown {
-            PANE_KEPT
-        } else {
-            PANE_KEPT_ELSEWHERE
-        };
-        assert_eq!(notices(&app), [expected.to_owned()], "{name}");
+        assert_eq!(notices(&app), Vec::<String>::new(), "{name}");
+        assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
         assert!(
-            app.card_state(original.id)
+            !app.card_state(original.id)
                 .is_some_and(|card| card.existence.is_open()),
-            "{name}"
+            "{name}: the closed card stays closed"
         );
         assert!(
             !app.shared_views
@@ -745,13 +752,52 @@ fn a_refused_close_keeps_the_pane_and_says_so() {
                 .any(|(id, ..)| *id == operation),
             "{name}"
         );
+        let (resent, change) = resent_close(&app, original.id, operation)
+            .unwrap_or_else(|| panic!("{name}: the removal is sent again"));
+        let Change::RemoveSource {
+            before, capture, ..
+        } = &change
+        else {
+            unreachable!()
+        };
+        assert_eq!(before.id, original.id, "{name}");
+        assert_eq!(
+            capture.is_some(),
+            terminal,
+            "{name}: a terminal's removal names its source"
+        );
+
+        // Refused again with the view unchanged, it waits for the view to
+        // change or the window to reconnect instead of repeating.
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+            scope: scope.clone(),
+            operation: resent,
+            error: "fixture refusal".into(),
+        }));
+        assert_eq!(resent_close(&app, original.id, operation), None, "{name}");
+        assert_eq!(notices(&app), Vec::<String>::new(), "{name}");
+        let mut changed = view_holding(&app, &scope);
+        changed.revision += 1;
+        let held = app
+            .workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == scope)
+            .unwrap();
+        *held = changed;
+        drop(app.reconcile_shared_views());
+        assert!(
+            resent_close(&app, original.id, resent).is_some(),
+            "{name}: a changed view is a new chance to retire the pane"
+        );
+        assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
     }
 }
 
 /// A Close the registry refuses without reporting the scope, as when its
-/// resend waited too long, says only what happened to the pane: kept while
-/// the observed view still holds it, nothing once it is gone. The
-/// registry's own wording stays in the trace.
+/// resend waited too long - the daemon trouble behind #2444 - says nothing:
+/// the pane stays closed, and its removal is sent again while the observed
+/// view still holds it. The registry's own wording stays in the trace.
 #[test]
 fn a_close_refused_without_a_view_says_only_what_happened_to_the_pane() {
     use super::super::workspace_model_sync::ModelUpdate;
@@ -775,16 +821,15 @@ fn a_close_refused_without_a_view_says_only_what_happened_to_the_pane() {
             operation,
             error: "The pane change waited too long for the daemon to be resent".into(),
         }));
-        let expected: Vec<String> = if retired {
-            Vec::new()
-        } else {
-            vec![PANE_KEPT.to_owned()]
-        };
-        assert_eq!(notices(&app), expected, "retired={retired}");
-        assert_eq!(
-            app.workspace.order().any(|id| id == original.id),
-            !retired,
+        assert_eq!(notices(&app), Vec::<String>::new(), "retired={retired}");
+        assert!(
+            !app.workspace.order().any(|id| id == original.id),
             "retired={retired}"
+        );
+        assert_eq!(
+            resent_close(&app, original.id, operation).is_some(),
+            !retired,
+            "retired={retired}: only a pane the view still holds is removed again"
         );
         assert!(
             !app.shared_views
@@ -796,114 +841,80 @@ fn a_close_refused_without_a_view_says_only_what_happened_to_the_pane() {
     }
 }
 
-/// A terminal a refused Close kept can be closed again, at once or behind
-/// another pane's close. The refused Close had already ended its shell, so
-/// the kept pane mustn't still count as one whose removal is under way
-/// (#3266).
+/// A terminal whose Close the registry refused stays closed: its shell was
+/// already ended by that Close, so nothing is left to close again, and
+/// nothing still counts it as closing (#3266). Its removal is sent again.
 #[test]
-fn a_terminal_kept_by_a_refused_close_can_be_closed_again() {
+fn a_terminal_whose_close_was_refused_stays_closed_and_is_removed_again() {
     use crate::app::terminal_close::CloseOutcome;
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-    for queued in [false, true] {
-        let (mut app, original) = close_fixture(directory.path(), true, false);
-        let card = original.id;
-        let (tx, _published) = async_channel::unbounded();
-        app.workspace_model_tx = tx;
-        drop(app.update(Message::CloseCard(card)));
-        let intent = app
-            .terminal_close
-            .clone()
-            .expect("the Close asks the daemon to end the terminal");
-        let authority = app.terminal_cleanup_authority(card);
-        let worker = authority.worker().cloned().unwrap();
-        let receipt = authority.receipt(worker.clone());
-        drop(app.update(Message::TerminalCloseFinished {
-            card,
-            terminal: intent.terminal,
-            proof: intent.proof,
-            generation: intent.generation,
-            outcome: CloseOutcome::ClosedWithBasis(receipt),
-        }));
-        drop(app.update(Message::CommitClose(card)));
-        app.publish_view_changes();
-        let (operation, scope, change) = app
-            .shared_views
-            .pending
-            .iter()
-            .find_map(|(operation, scope, change)| {
-                matches!(change, Change::RemoveSource { before, .. } if before.id == card)
-                    .then(|| (*operation, scope.clone(), change.clone()))
-            })
-            .expect("the Close is published");
-        let held = view_holding(&app, &scope);
-        registry_refuses(&mut app, operation, change, held);
-        assert_eq!(notices(&app), [PANE_KEPT.to_owned()], "queued={queued}");
-        assert!(
-            app.workspace.order().any(|id| id == card),
-            "queued={queued}"
-        );
-        // Neither half of what hides the ended-terminal footer is left, so
-        // the kept pane shows its ended shell rather than a blank pane.
-        assert!(
-            !app.closed_terminal_cards.contains(&card) && !app.terminal_close_pending(card),
-            "queued={queued}: the kept pane is no longer closing"
-        );
-
-        app.status = None;
-        app.notices.entries.clear();
-        if queued {
-            app.queue_card_close(card, false);
-            drop(app.next_queued_card_close());
-        } else {
-            drop(app.update(Message::CloseCard(card)));
-        }
-        assert!(
-            app.pane_close_owned(card),
-            "queued={queued}: the second Close starts: status {:?}",
-            app.status
-        );
-        assert_eq!(notices(&app), Vec::<String>::new(), "queued={queued}");
-
-        // The second Close goes all the way: the daemon is asked again, and
-        // once it answers the pane leaves this window and its removal is
-        // published again.
-        let again = app
-            .terminal_close
-            .clone()
-            .filter(|intent| intent.card == card)
-            .unwrap_or_else(|| panic!("queued={queued}: the daemon is asked to close it again"));
-        // The ended shell's daemon still hosts it, so the Close reads the
-        // same worker back as the basis for its receipt.
-        let receipt = app.terminal_cleanup_authority(card).receipt(worker);
-        drop(app.update(Message::TerminalCloseFinished {
-            card,
-            terminal: again.terminal,
-            proof: again.proof,
-            generation: again.generation,
-            outcome: CloseOutcome::ClosedWithBasis(receipt),
-        }));
-        drop(app.update(Message::CommitClose(card)));
-        app.publish_view_changes();
-        assert!(
-            !app.workspace.order().any(|id| id == card),
-            "queued={queued}: the pane is removed"
-        );
-        assert!(
-            app.shared_views
-                .pending
-                .iter()
-                .any(|(pending, _, change)| *pending != operation
-                    && matches!(change, Change::RemoveSource { before, .. } if before.id == card)),
-            "queued={queued}: the second Close is published: pending {:?}",
-            app.shared_views.pending
-        );
-    }
+    let (mut app, original) = close_fixture(directory.path(), true, false);
+    let card = original.id;
+    let (tx, _published) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    drop(app.update(Message::CloseCard(card)));
+    let intent = app
+        .terminal_close
+        .clone()
+        .expect("the Close asks the daemon to end the terminal");
+    let authority = app.terminal_cleanup_authority(card);
+    let worker = authority.worker().cloned().unwrap();
+    let receipt = authority.receipt(worker);
+    drop(app.update(Message::TerminalCloseFinished {
+        card,
+        terminal: intent.terminal,
+        proof: intent.proof,
+        generation: intent.generation,
+        outcome: CloseOutcome::ClosedWithBasis(receipt),
+    }));
+    drop(app.update(Message::CommitClose(card)));
+    app.publish_view_changes();
+    let (operation, scope, change) = app
+        .shared_views
+        .pending
+        .iter()
+        .find_map(|(operation, scope, change)| {
+            matches!(change, Change::RemoveSource { before, .. } if before.id == card)
+                .then(|| (*operation, scope.clone(), change.clone()))
+        })
+        .expect("the Close is published");
+    let held = view_holding(&app, &scope);
+    registry_refuses(&mut app, operation, change, held);
+    assert_eq!(notices(&app), Vec::<String>::new());
+    assert!(!app.workspace.order().any(|id| id == card));
+    assert!(
+        !app.cards.contains_key(&card),
+        "nothing attaches the closed terminal"
+    );
+    assert!(
+        !app.closed_terminal_cards.contains(&card) && !app.terminal_close_pending(card),
+        "the closed pane is no longer closing"
+    );
+    assert!(
+        app.terminal_close.is_none(),
+        "the daemon is not asked again"
+    );
+    assert!(
+        matches!(
+            resent_close(&app, card, operation),
+            Some((
+                _,
+                Change::RemoveSource {
+                    capture: Some(_),
+                    ..
+                }
+            ))
+        ),
+        "its removal is sent again: pending {:?}",
+        app.shared_views.pending
+    );
 }
 
 /// When the pane changed to a successor in the registry, as another window
-/// navigating it does, the Close is refused and the successor is shown.
+/// navigating it does, the Close is refused. The pane stays closed here, and
+/// open in that window, which this one does not close for it.
 #[test]
-fn a_close_refused_for_a_successor_shows_it_and_says_so() {
+fn a_close_refused_for_a_successor_stays_closed_here_and_says_so() {
     let (mut app, channel, _, original) = channel_move_fixture();
     let (operation, scope, change) = published_close(&mut app, "browser in a channel", &original);
     let mut successor = view_holding(&app, &scope);
@@ -911,12 +922,21 @@ fn a_close_refused_for_a_successor_shows_it_and_says_so() {
         panic!("browser fixture")
     };
     browser.current_url = "https://example.com/next".parse().unwrap();
-    let shown = successor.panes[0].kind.clone();
     assert_eq!(scope, Scope::Channel(channel));
     registry_refuses(&mut app, operation, change, successor);
-    assert_eq!(notices(&app), [PANE_KEPT.to_owned()]);
-    assert!(app.workspace.order().any(|id| id == original.id));
-    assert_eq!(app.card_state(original.id).unwrap().kind, shown);
+    assert_eq!(notices(&app), [PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()]);
+    assert!(!app.workspace.order().any(|id| id == original.id));
+    let card = app.card_state(original.id).unwrap();
+    assert!(!card.existence.is_open());
+    assert_eq!(
+        card.kind, original.kind,
+        "the closed card keeps what it closed"
+    );
+    assert_eq!(
+        resent_close(&app, original.id, operation),
+        None,
+        "another window's pane is not closed for it"
+    );
 }
 
 /// A terminal's refused source update says nothing once the person has

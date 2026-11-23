@@ -60,7 +60,13 @@ fn fixture_for_provider(provider: Provider) -> (Cagents, tempfile::TempDir, Card
 
 /// Drive only the save Task. Provider-start Tasks returned by the reducer
 /// below are deliberately not polled against a user's daemon or executable.
-pub(super) fn checkpoint(task: Task<Message>) -> (Target, uuid::Uuid, Result<(), String>) {
+pub(super) fn checkpoint(
+    task: Task<Message>,
+) -> (
+    Target,
+    uuid::Uuid,
+    Result<(), crate::session::PaneSaveRefusal>,
+) {
     use cosmic::iced::futures::StreamExt;
     // Some existing UI parents run inside Tokio. An owned joined thread
     // keeps this save-only executor independent of that caller's runtime.
@@ -1007,38 +1013,19 @@ fn deliberate_retry_does_not_rearm_an_unrelated_refused_identity() {
     let retry = app.start_chat_draft(target);
     let retried = app.chat_ui.draft_checkpoints[&card].candidate.clone();
     assert_ne!(retried.id, candidate.id);
-    let (target, attempt, result) = checkpoint(retry);
+    let (_target, _attempt, result) = checkpoint(retry);
+    // The barrier answers for this pane's own writes only: another pane's
+    // refused identity is that pane's problem, not a reason to keep this
+    // conversation from starting.
     assert!(
-        result.is_err(),
-        "unrelated refusal is still truthful save health"
+        result.is_ok(),
+        "an unrelated refusal must not fail this draft's checkpoint: {result:?}"
     );
     // This card's own C landed beside the unrelated refusal.
     assert_eq!(stored(&app, card), retried);
-    drop(app.draft_start_checkpointed(target, attempt, result));
-    no_starter(&app, card);
-    assert_eq!(runtime(&app, card).composer.text(), "Edited first prompt");
-    // The failed receipt returns C to A, so later autosaves of the composer
-    // the reader still sees are accepted rather than refused for C.
-    assert!(
-        app.session
-            .as_ref()
-            .unwrap()
-            .flush(Duration::from_secs(5))
-            .is_err()
-    );
-    assert_eq!(stored(&app, card), source);
+    // And this Send did not retry the window's refused writes on the way.
     assert_eq!(stored(&app, other), unrelated);
     assert_ne!(stored(&app, other), refused);
-    match app.cards.get_mut(&card).unwrap() {
-        CardRuntime::Chat(runtime) => {
-            runtime.replace_draft(text_editor::Content::with_text("Autosaved after failure"))
-        }
-        _ => unreachable!(),
-    }
-    app.persist();
-    let _ = app.session.as_ref().unwrap().flush(Duration::from_secs(5));
-    let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
-    assert_eq!(saved.chat_drafts[&card], "Autosaved after failure");
 }
 
 #[test]

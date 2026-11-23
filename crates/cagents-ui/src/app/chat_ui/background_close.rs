@@ -39,7 +39,7 @@ pub(in crate::app) struct Closing {
 
 /// Whether `current` is `closed` with nothing changed but what its provider has
 /// confirmed since: the conversation's identity and how its provider is kept.
-pub(super) fn only_confirms(closed: &chat::Session, current: &chat::Session) -> bool {
+pub(in crate::app) fn only_confirms(closed: &chat::Session, current: &chat::Session) -> bool {
     if closed
         .launch
         .session_id
@@ -503,6 +503,32 @@ impl Cagents {
                 .background_closes
                 .values()
                 .any(|closing| closing.reopens.contains(&card))
+    }
+
+    /// Whether the closed chat pane `card` goes through the stop of a
+    /// conversation it started: a view that brings it back is handled here,
+    /// out of sight, until that stop settles and its removal follows, or on
+    /// what still runs when the daemon refused to stop it. An unstarted
+    /// draft has nothing to stop, so nothing here waits for it.
+    pub(in crate::app) fn chat_close_returns_through_stop(&self, card: CardId) -> bool {
+        let started = |session: &chat::Session| !session.is_unstarted();
+        self.chat_ui.stopped_closes.get(&card).is_some_and(started)
+            || self
+                .chat_ui
+                .background_closes
+                .values()
+                .any(|closing| closing.card == card && started(&closing.session))
+            || self
+                .durable
+                .stopping_chats
+                .iter()
+                .any(|stopping| stopping.card == card && started(&stopping.session))
+            || ((self.chat_ui.hidden_returns.contains(&card)
+                || self.chat_ui.stopped_returns.contains(&card)
+                || self.chat_ui.fenced_returns.contains(&card))
+                && self.card_state(card).is_some_and(
+                    |state| matches!(&state.kind, CardKind::Chat(session) if started(session)),
+                ))
     }
 
     /// Gives up the reopen held in `card`, which is closing.

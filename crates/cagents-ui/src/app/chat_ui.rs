@@ -76,7 +76,7 @@ mod artifacts;
 mod attachment_draft;
 mod attachment_tile;
 mod auth_recovery;
-mod background_close;
+pub(in crate::app) mod background_close;
 pub(in crate::app) use background_close::shares_conversation;
 #[cfg(test)]
 pub(in crate::app) mod blocked_recovery_tests;
@@ -382,7 +382,11 @@ pub enum Action {
     OpeningName(CardId, String, Option<String>),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
-    DraftStartCheckpointed(Target, uuid::Uuid, Result<(), String>),
+    DraftStartCheckpointed(
+        Target,
+        uuid::Uuid,
+        Result<(), crate::session::PaneSaveRefusal>,
+    ),
     /// Explicitly continue a settled saved-history reader in this same pane.
     /// Restoring a pane never acquires this launch permission.
     ResumeSaved(Target),
@@ -12174,21 +12178,71 @@ impl Cagents {
             .session
             .as_ref()
             .expect("writer was checked above")
-            .request_flush();
+            .request_pane_flush(target.card);
         cosmic::task::future(async move {
+            use crate::session::PaneSaveRefusal;
+            // Only what this draft's own save needs can fail its start: a
+            // refused write of some other pane leaves this one saved.
             let result = match receipt {
                 Ok(receipt) => tokio::task::spawn_blocking(move || {
                     receipt
                         .recv_timeout(Duration::from_secs(30))
-                        .map_err(|error| format!("Session save did not complete: {error}"))?
+                        .map_err(|error| {
+                            PaneSaveRefusal::Unsaved(format!("the save did not complete: {error}"))
+                        })?
                 })
                 .await
-                .map_err(|_| "The session save worker stopped".to_owned())
+                .map_err(|_| PaneSaveRefusal::Unsaved("the session save worker stopped".into()))
                 .and_then(|r| r),
                 Err(error) => Err(error),
             };
             Message::ChatUi(Action::DraftStartCheckpointed(target, attempt, result))
         })
+    }
+
+    /// What a draft says when its first save failed: why, naming the pane
+    /// storage refused when that was another one, so the reader knows what
+    /// to change or close before sending again.
+    pub(super) fn draft_start_save_failure(
+        &self,
+        card: CardId,
+        error: &crate::session::PaneSaveRefusal,
+    ) -> String {
+        use crate::session::PaneSaveRefusal;
+        const LEAD: &str =
+            "The conversation could not be saved, so nothing was started. Your draft is retained.";
+        match error {
+            PaneSaveRefusal::Unsaved(reason) => {
+                let mut letters = reason.chars();
+                let reason = letters
+                    .next()
+                    .map(|first| first.to_uppercase().chain(letters).collect::<String>())
+                    .unwrap_or_default();
+                format!("{LEAD} {reason}")
+            }
+            PaneSaveRefusal::Refused {
+                pane,
+                category,
+                rule,
+            } => {
+                let what = match pane {
+                    Some(pane) if *pane == card => "this pane".to_owned(),
+                    Some(pane) => match self
+                        .card_state(*pane)
+                        .map(|state| self.card_display_title(state))
+                        .filter(|title| !title.is_empty())
+                    {
+                        Some(title) => format!("the pane \u{201c}{title}\u{201d}"),
+                        None => format!("pane {pane}"),
+                    },
+                    None => "the window's panes".to_owned(),
+                };
+                format!(
+                    "{LEAD} Storage refused {what}: {} (rule: {rule}). Change or close {what}, then send again.",
+                    category.label()
+                )
+            }
+        }
     }
 
     fn draft_start_scope(&self, card: CardId) -> Option<crate::workspace_model::views::Scope> {
@@ -12239,7 +12293,7 @@ impl Cagents {
         &mut self,
         target: Target,
         attempt: uuid::Uuid,
-        result: Result<(), String>,
+        result: Result<(), crate::session::PaneSaveRefusal>,
     ) -> Task<Message> {
         let Some(pending) = self.chat_ui.draft_checkpoints.get(&target.card) else {
             return Task::none();
@@ -12336,8 +12390,9 @@ impl Cagents {
         if let Err(error) = result {
             self.release_draft_start_capture(target.card);
             tracing::warn!(card = %target.card, %error, "First conversation checkpoint did not complete");
+            let message = self.draft_start_save_failure(target.card, &error);
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
-                runtime.error = Some("The conversation could not be saved, so nothing was started. Your draft is retained; check the workspace save notice before trying again.".into());
+                runtime.error = Some(message);
             }
             return self.restore_failed_draft_start_focus(target, &source);
         }
