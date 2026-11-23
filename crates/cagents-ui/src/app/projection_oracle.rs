@@ -406,6 +406,7 @@ impl Cagents {
                     | Message::AcknowledgeVisiblePane { .. }
                     | Message::TerminalWake { .. }
                     | Message::WorkspaceModelObserved(_)
+                    | Message::WorkspaceModelArrived(_)
                     | Message::KeyEvent { .. }
                     | Message::LifecycleSweep
                     | Message::LifecycleSweepElapsed(_)

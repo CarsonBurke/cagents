@@ -6840,3 +6840,262 @@ fn reconciling_unchanged_navigation_orders_keeps_the_sidebar_revision() {
         vec![NavigationItem::Worktree("/repo/other".into())]
     );
 }
+
+/// A new shared channel and an agent change, as the observer reports a
+/// spawn elsewhere: edges whose only consequence here is the complete
+/// reconciliation that adopts what they installed.
+fn spawn_burst(baseline: &WorkspaceModel, repository: &Path) -> (ChannelId, Vec<ModelUpdate>) {
+    let created = shared(ChannelId::new(), repository, "Spawned", 1);
+    let edges = vec![
+        ModelUpdate::Changed {
+            sequence: baseline.sequence + 1,
+            edit: ModelEdit::CreateChannel {
+                id: created.id,
+                repository: repository.to_path_buf(),
+                title: created.title.clone(),
+                title_source: Default::default(),
+            },
+            changes: EdgeChanges {
+                identity: Some(baseline.identity),
+                effects: EditEffects {
+                    channels: vec![created.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        },
+        ModelUpdate::Changed {
+            sequence: baseline.sequence + 2,
+            edit: ModelEdit::AgentsChanged,
+            changes: EdgeChanges {
+                identity: Some(baseline.identity),
+                ..Default::default()
+            },
+        },
+        ModelUpdate::Changed {
+            sequence: baseline.sequence + 3,
+            edit: ModelEdit::AgentsChanged,
+            changes: EdgeChanges {
+                identity: Some(baseline.identity),
+                ..Default::default()
+            },
+        },
+    ];
+    (created.id, edges)
+}
+
+fn window_with_registry() -> (Cagents, WorkspaceModel, PathBuf) {
+    let (mut app, _, repository) = app_with_project();
+    let mut baseline = registry(vec![shared(ChannelId::new(), &repository, "First", 0)]);
+    baseline.sequence = 100;
+    assert!(app.install_workspace_model_snapshot(baseline.clone()));
+    drop(app.reconcile_workspace_model());
+    (app, baseline, repository)
+}
+
+/// Delivers `updates` as the observer's stream does when they queued
+/// together: the first as the message, the rest waiting in the channel.
+fn deliver_run(app: &mut Cagents, updates: Vec<ModelUpdate>) {
+    let (sender, receiver) = async_channel::unbounded();
+    app.workspace_model_rx = receiver;
+    let mut updates = updates.into_iter();
+    let first = updates.next().expect("a run has a first update");
+    for update in updates {
+        sender.send_blocking(update).unwrap();
+    }
+    drop(app.update(Message::WorkspaceModelArrived(
+        super::super::ingress::Arrival::detached(first),
+    )));
+    assert!(
+        app.workspace_model_rx.is_empty(),
+        "the update drains its run"
+    );
+}
+
+fn channel_ids(app: &Cagents) -> Vec<ChannelId> {
+    app.durable
+        .channels
+        .iter()
+        .map(|channel| channel.id)
+        .collect()
+}
+
+#[test]
+fn a_run_of_observed_edges_reconciles_once_and_ends_where_each_alone_would() {
+    let titles = |app: &Cagents| {
+        app.durable
+            .channels
+            .iter()
+            .map(|channel| channel.title.clone())
+            .collect::<Vec<_>>()
+    };
+    // Each edge alone: one complete reconciliation apiece.
+    let (mut each, baseline, repository) = window_with_registry();
+    let (created, edges) = spawn_burst(&baseline, &repository);
+    let count = edges.len();
+    let before = complete_reconciliations();
+    for edge in edges {
+        drop(each.update(Message::WorkspaceModelObserved(edge)));
+    }
+    assert_eq!(complete_reconciliations() - before, count);
+    assert!(channel_ids(&each).contains(&created));
+
+    // The same edges as the run the observer stream delivers: one
+    // reconciliation, after the last edge, and the same window.
+    let (mut run, baseline, repository) = window_with_registry();
+    let (created, edges) = spawn_burst(&baseline, &repository);
+    let before = complete_reconciliations();
+    deliver_run(&mut run, edges);
+    assert_eq!(
+        complete_reconciliations() - before,
+        1,
+        "a run reconciles once, after its last edge"
+    );
+    assert!(channel_ids(&run).contains(&created));
+    assert_eq!(titles(&run), titles(&each));
+    assert_eq!(run.workspace_model.sequence, each.workspace_model.sequence);
+    assert!(
+        run.observed_run.is_none(),
+        "the run's account closes with it"
+    );
+}
+
+#[test]
+fn a_reconnection_in_a_run_meets_the_window_reconciled_and_leaves_nothing_owed() {
+    let (mut app, baseline, repository) = window_with_registry();
+    let (created, mut edges) = spawn_burst(&baseline, &repository);
+    edges.truncate(1);
+    // A reconnection's complete model reconciles inside its own handler. It
+    // meets the window as the edge before it left it, reconciled, and its
+    // own complete pass leaves the run nothing to do at its end.
+    let mut connected = app.workspace_model.clone();
+    connected.sequence = baseline.sequence + 1;
+    connected
+        .channels
+        .push(shared(created, &repository, "Spawned", 1));
+    edges.push(ModelUpdate::ConnectedClosed {
+        model: connected,
+        closed: Vec::new(),
+    });
+    let before = complete_reconciliations();
+    deliver_run(&mut app, edges);
+    assert_eq!(
+        complete_reconciliations() - before,
+        2,
+        "the edge's owed pass, then the reconnection's own, and none after"
+    );
+    assert!(channel_ids(&app).contains(&created));
+}
+
+#[test]
+fn a_run_applies_its_edges_in_the_order_they_were_sent() {
+    let edges = |baseline: &WorkspaceModel, repository: &Path, id: ChannelId| {
+        let created = shared(id, repository, "Spawned", 1);
+        let retitled = |sequence: u64, title: &str| ModelUpdate::Changed {
+            sequence: baseline.sequence + sequence,
+            edit: ModelEdit::RetitleChannel {
+                id,
+                title: title.into(),
+            },
+            changes: EdgeChanges {
+                identity: Some(baseline.identity),
+                effects: EditEffects {
+                    channels: vec![ModelChannel {
+                        title: title.into(),
+                        ..created.clone()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        vec![
+            ModelUpdate::Changed {
+                sequence: baseline.sequence + 1,
+                edit: ModelEdit::CreateChannel {
+                    id,
+                    repository: repository.to_path_buf(),
+                    title: created.title.clone(),
+                    title_source: Default::default(),
+                },
+                changes: EdgeChanges {
+                    identity: Some(baseline.identity),
+                    effects: EditEffects {
+                        channels: vec![created.clone()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+            retitled(2, "Parser cache"),
+            ModelUpdate::Changed {
+                sequence: baseline.sequence + 3,
+                edit: ModelEdit::AgentsChanged,
+                changes: EdgeChanges {
+                    identity: Some(baseline.identity),
+                    ..Default::default()
+                },
+            },
+            retitled(4, "Parser cache work"),
+        ]
+    };
+    let title = |app: &Cagents, id: ChannelId| {
+        app.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| channel.title.clone())
+    };
+    let id = ChannelId::new();
+    let (mut each, baseline, repository) = window_with_registry();
+    for edge in edges(&baseline, &repository, id) {
+        drop(each.update(Message::WorkspaceModelObserved(edge)));
+    }
+    let (mut run, baseline, repository) = window_with_registry();
+    deliver_run(&mut run, edges(&baseline, &repository, id));
+    assert_eq!(title(&run, id).as_deref(), Some("Parser cache work"));
+    assert_eq!(title(&run, id), title(&each, id));
+    assert_eq!(run.workspace_model.sequence, baseline.sequence + 4);
+    assert_eq!(run.workspace_model.sequence, each.workspace_model.sequence);
+}
+
+#[test]
+fn an_update_of_another_kind_meets_the_window_reconciled_after_the_edges_before_it() {
+    let (mut app, baseline, repository) = window_with_registry();
+    let (created, mut edges) = spawn_burst(&baseline, &repository);
+    let last = edges.pop().unwrap();
+    // A failed reopen reconciles nothing itself; one at a time, it would
+    // follow the edges' own reconciliation.
+    edges.push(ModelUpdate::ReopenFailed {
+        repository: repository.clone(),
+        error: "refused".into(),
+    });
+    edges.push(last);
+    let before = complete_reconciliations();
+    deliver_run(&mut app, edges);
+    assert_eq!(
+        complete_reconciliations() - before,
+        2,
+        "the edges before it share one reconciliation, the edge after it another"
+    );
+    assert!(channel_ids(&app).contains(&created));
+}
+
+#[test]
+fn agent_labels_share_the_reconciliation_of_the_edges_they_precede() {
+    let (mut app, baseline, repository) = window_with_registry();
+    let (created, mut edges) = spawn_burst(&baseline, &repository);
+    let agent = crate::model::AgentId::new();
+    edges.insert(
+        0,
+        ModelUpdate::AgentLabels(vec![(agent, "Tighten the parser cache".into())]),
+    );
+    let before = complete_reconciliations();
+    deliver_run(&mut app, edges);
+    assert_eq!(complete_reconciliations() - before, 1);
+    assert!(channel_ids(&app).contains(&created));
+    assert_eq!(
+        app.chrome_ui.agent_labels.get(&agent).map(String::as_str),
+        Some("Tighten the parser cache")
+    );
+}

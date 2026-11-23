@@ -251,6 +251,41 @@ pub(super) enum MetadataKey {
     Agent(crate::model::AgentId),
 }
 
+/// What a run of shared model updates owes the window at its end, or before
+/// an update that must meet the window reconciled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ObservedRun {
+    /// The complete reconciliation its edges deferred.
+    reconcile: bool,
+    /// A notification activation that agent labels made worth retrying,
+    /// once the window is reconciled.
+    activation: bool,
+}
+
+/// Whether `update` may leave the reconciliation it ends with to the end of
+/// its run: canonical edges and the labels that precede them, which read
+/// nothing a reconciliation produces before their own.
+fn defers_reconciliation(update: &ModelUpdate) -> bool {
+    matches!(
+        update,
+        ModelUpdate::Changed { .. }
+            | ModelUpdate::Committed { .. }
+            | ModelUpdate::SeedCommitted { .. }
+            | ModelUpdate::AgentLabels(_)
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPLETE_RECONCILIATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many complete reconciliations against a registry this thread has run.
+#[cfg(test)]
+pub(super) fn complete_reconciliations() -> usize {
+    COMPLETE_RECONCILIATIONS.with(std::cell::Cell::get)
+}
+
 /// Watches the daemon for shared-model edges.
 pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>) {
     let observer = std::thread::Builder::new()
@@ -1052,6 +1087,72 @@ impl Cagents {
         self.apply_workspace_model_update_effect(update).0
     }
 
+    /// Applies a run of shared model updates in order, then reconciles once.
+    ///
+    /// An edge's complete reconciliation brings the whole window up to date
+    /// with the model as it then stands, and saves. A later edge in the same
+    /// run supersedes that state, so reconciling after each edge does the
+    /// same complete pass once per edge for a result only the last pass
+    /// keeps: in a large workspace, an agent spawn's edges, or a startup's
+    /// seeds and their receipts, held the window for a reconciliation apiece.
+    /// Within a run, each edge still installs its rows and settles its own
+    /// intent as it arrives, and consecutive edges share the reconciliation
+    /// they owe. Any other update first has what is owed done, so it meets
+    /// the window as it would after the edges before it, one at a time.
+    pub(super) fn apply_workspace_model_updates(
+        &mut self,
+        updates: Vec<ModelUpdate>,
+    ) -> (Task<Message>, Projection) {
+        // A run dispatched within another's handler keeps its own account.
+        let enclosing = self.observed_run.replace(ObservedRun::default());
+        let mut tasks = Vec::with_capacity(updates.len() + 1);
+        let mut projection = Projection::Unchanged;
+        for update in updates {
+            if !defers_reconciliation(&update) {
+                projection = projection.widen(self.settle_observed_run(&mut tasks));
+            }
+            let (task, applied) = self.apply_workspace_model_update_projection(update);
+            tasks.push(task);
+            projection = projection.widen(applied);
+        }
+        projection = projection.widen(self.settle_observed_run(&mut tasks));
+        self.observed_run = enclosing;
+        (Task::batch(tasks), projection)
+    }
+
+    /// Does what the run has owed so far: the complete reconciliation its
+    /// edges deferred, then a notification activation that waited for it.
+    fn settle_observed_run(&mut self, tasks: &mut Vec<Task<Message>>) -> Projection {
+        let Some(owed) = self.observed_run else {
+            return Projection::Unchanged;
+        };
+        if owed.reconcile {
+            tasks.push(self.reconcile_workspace_model());
+        }
+        if owed.activation {
+            tasks.push(self.retry_notification_activation());
+        }
+        self.observed_run = Some(ObservedRun::default());
+        if owed.reconcile {
+            Projection::Full
+        } else {
+            Projection::Unchanged
+        }
+    }
+
+    /// The complete reconciliation after a canonical edge, which a run of
+    /// updates owes until its next update of another kind or its end;
+    /// outside a run it runs now.
+    fn reconcile_after_edge(&mut self) -> Task<Message> {
+        match &mut self.observed_run {
+            Some(owed) => {
+                owed.reconcile = true;
+                Task::none()
+            }
+            None => self.reconcile_workspace_model(),
+        }
+    }
+
     /// Gives the application an explicit tail budget. Only a proven
     /// presentation change may avoid structural sidebar/ownership work.
     pub(super) fn apply_workspace_model_update_projection(
@@ -1182,6 +1283,11 @@ impl Cagents {
         // apply_viewport before returning to the common projection tail.
         if self.settings_blur_pending() {
             return Err("a settings draft is leaving focus");
+        }
+        // The presentation proof compares this edge with a window already
+        // reconciled to the model before it.
+        if self.observed_run.is_some_and(|owed| owed.reconcile) {
+            return Err("an earlier edge's reconciliation is owed");
         }
         let (edit, effects, changes, pending, identity) = match update {
             ModelUpdate::Committed {
@@ -1432,8 +1538,16 @@ impl Cagents {
                 // An activation that waited on this metadata has a new basis
                 // even when the model sequence and local panes did not change.
                 self.notification_ui.scope_changed();
-                let reconcile = self.reconcile_workspace_model();
-                let activation = self.retry_notification_activation();
+                // Labels come just before the edges that carry their agents,
+                // so in a run they share those edges' reconciliation.
+                let reconcile = self.reconcile_after_edge();
+                let activation = match &mut self.observed_run {
+                    Some(owed) => {
+                        owed.activation = true;
+                        Task::none()
+                    }
+                    None => self.retry_notification_activation(),
+                };
                 Task::batch([reconcile, activation, self.sync_chrome()])
             }
             ModelUpdate::SeedCommitted { .. } => {
@@ -1512,7 +1626,7 @@ impl Cagents {
                 };
                 let projected = title
                     .and_then(|id| self.absorb_channel_title(id))
-                    .unwrap_or_else(|| self.reconcile_workspace_model());
+                    .unwrap_or_else(|| self.reconcile_after_edge());
                 Task::batch([result, finish, projected])
             }
             ModelUpdate::ScopeConflicted {
@@ -1907,7 +2021,7 @@ impl Cagents {
         {
             return Task::batch([installed, title]);
         }
-        Task::batch([installed, self.reconcile_workspace_model()])
+        Task::batch([installed, self.reconcile_after_edge()])
     }
 
     /// Installs canonical rows and scope authority, preserving lifecycle tasks
@@ -2297,11 +2411,19 @@ impl Cagents {
 
     fn reconcile_workspace_model_in(&mut self, repositories: Option<&[&Path]>) -> Task<Message> {
         if repositories.is_none() {
-            // A complete pass covers every scope a deferred one would select.
+            // A complete pass covers every scope a deferred one would select,
+            // and everything a run of model updates has owed so far.
             self.pending_repository_reconciliation.clear();
+            if let Some(owed) = &mut self.observed_run {
+                owed.reconcile = false;
+            }
         }
         if self.workspace_model.identity == NO_REGISTRY {
             return Task::none();
+        }
+        #[cfg(test)]
+        if repositories.is_none() {
+            COMPLETE_RECONCILIATIONS.with(|count| count.set(count.get() + 1));
         }
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
