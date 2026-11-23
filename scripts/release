@@ -8,6 +8,9 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_HOST=${CAGENTS_RELEASE_BUILD_HOST:-fw16}
 BUNDLES=${CAGENTS_RELEASE_BUNDLES:-"${XDG_STATE_HOME:-$HOME/.local/state}/cagents-release"}
 GITHUB_REPOSITORY=${CAGENTS_RELEASE_GITHUB_REPOSITORY:-CarsonBurke/cagents}
+# The rehearsal's private user on the build host; by default
+# /var/tmp/cr/release-VERSION, short as its sockets need.
+REHEARSAL_ROOT=${CAGENTS_RELEASE_REHEARSAL_ROOT:-}
 VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 # Workspace members that carry the product version.
 MANIFESTS=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
@@ -47,6 +50,14 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
                    fixes and speedups since the previous tag here.
+  rehearse VERSION [--build-host HOST]
+                   Rehearse installed cagents updating from the newest
+                   published release to the cut VERSION, on HOST, with that
+                   commit's scripts/rehearse-update: a private user with two
+                   windows, chats, agents and terminals is updated through
+                   `cagents daemon upgrade`; its work must survive and the
+                   update must end Complete, with no refusal or failure for
+                   the reopened windows to report.
   feed VERSION --feed DIR
                    Add the signed bundle to a file feed, for rehearsing the
                    update before publishing (docs/releasing.md#rehearsing).
@@ -511,6 +522,73 @@ start_next_version() {
     [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
 }
 
+# The version is updated from what is published now, with the bytes cut: the
+# bundle of the commit the host built, checked against the cut's metadata.
+rehearse() {
+    local metadata=$BUNDLES/$VERSION/release-metadata.json sha digest previous started
+    [[ -f $metadata ]] || fail "cut $VERSION first: scripts/release cut"
+    sha=$(jq -er .source_commit "$metadata") || fail "$metadata names no source commit"
+    digest=$(jq -er --arg archive "cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz" '.assets[$archive].sha256' \
+        "$metadata") || fail "$metadata lists no archive for $VERSION"
+    previous=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName --jq .tagName) \
+        || fail 'cannot read the newest published release'
+    previous=${previous#v}
+    [[ $previous =~ $VERSION_PATTERN && $previous != "$VERSION" ]] \
+        || fail "the newest published release is $previous; there is nothing to rehearse"
+    printf 'Rehearsing the update from %s to %s on %s; it takes a few minutes.\n' "$previous" "$VERSION" "$BUILD_HOST"
+    started=$SECONDS
+    on_host "$sha" "$VERSION" "$previous" "$digest" "$GITHUB_REPOSITORY" "$REHEARSAL_ROOT" <<'HOST' \
+        || fail "the rehearsal of $VERSION did not pass"
+set -euo pipefail
+cd ~/"$1"
+repository=$PWD sha=$2 version=$3 previous=$4 digest=$5 github=$6 root=${7:-/var/tmp/cr/release-$3}
+scripts/prebuild-release --repository "$repository" pin "$sha" >/dev/null
+trap 'scripts/prebuild-release --repository "$repository" unpin "$sha" >/dev/null 2>&1 || :' EXIT
+new=$HOME/.local/state/cagents-prebuilt/bundles/$sha/dist
+[[ $(sha256sum < "$new/cagents-$version-x86_64-unknown-linux-gnu.tar.gz") == "$digest "* ]] \
+    || { echo "release: $(hostname)'s bundle of $sha is not the one cut" >&2; exit 1; }
+old=$HOME/.cache/cagents-release-rehearsal/$previous
+if [[ ! -f $old/SHA256SUMS ]]; then
+    rm -rf -- "$old.partial"
+    mkdir -p -- "$old.partial"
+    gh release download "v$previous" -R "$github" -D "$old.partial" \
+        -p "cagents-$previous-x86_64-unknown-linux-gnu.tar.gz" -p SHA256SUMS -p install.sh
+    rm -rf -- "$old"
+    mv -- "$old.partial" "$old"
+fi
+(cd "$old" && sha256sum --check --strict --ignore-missing --quiet SHA256SUMS)
+# The harness of the commit released, which knows what that build does.
+harness=$repository/.worktrees/.rehearse-release
+git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main
+if [[ -d $harness ]]; then
+    git -C "$harness" checkout -q --force --detach "$sha"
+else
+    git -C "$repository" worktree prune
+    git -C "$repository" worktree add -q --detach "$harness" "$sha"
+fi
+rehearse=$harness/scripts/rehearse-update
+[[ ! -e $root ]] || "$rehearse" --root "$root" cleanup >/dev/null
+status=0
+"$rehearse" --root "$root" run --old-dir "$old" --old-version "$previous" --old-installer "$old/install.sh" \
+    --new-dir "$new" --new-version "$version" --new-installer "$new/install.sh" --answer yes >/dev/null || status=$?
+report=$root/report.txt
+[[ -f $report ]] && sed -n '/^Total duration:/p;/^Outcome:/p;/^Regressions/,/^Steps/{/^Steps/d;p;}' "$report"
+# What the reopened windows read: a failure or refusal here is what they
+# would report as "Update failed" or "Update not installed".
+update=$(jq -r '"\(.phase) \((.refusal // null) != null)"' "$root/home/.local/share/cagents-install/.update/status.json" \
+    2>/dev/null) || update=absent
+echo "Update status: $update"
+if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == 'Complete false' ]]; then
+    "$rehearse" --root "$root" cleanup >/dev/null
+else
+    echo "release: its report, records and screenshots are in $root on $(hostname)" >&2
+    exit 1
+fi
+HOST
+    printf 'Rehearsed %s to %s in %d min %d s.\n' "$previous" "$VERSION" $(((SECONDS - started) / 60)) \
+        $(((SECONDS - started) % 60))
+}
+
 signed_bundle() {
     local bundle=$BUNDLES/$VERSION
     [[ -f $bundle/release-metadata.json.sig ]] \
@@ -522,6 +600,7 @@ case $COMMAND in
     bump) bump ;;
     build) build ;;
     cut) cut ;;
+    rehearse) rehearse ;;
     feed)
         [[ -n $FEED ]] || fail 'feed needs --feed DIR'
         "$ROOT_DIR/scripts/release-metadata" feed --dir "$(signed_bundle)" --feed "$FEED"

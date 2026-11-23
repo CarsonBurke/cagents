@@ -163,7 +163,23 @@ steps, each through `mise run release` (`scripts/release --help`):
    - signs the metadata with KEY (or `CAGENTS_RELEASE_SIGNING_KEY`); touch the
      security key when it asks. Without a key, it prints the signing command
      (see [Signing](#signing)).
-2. Rehearse the update from the previous release through a file feed (below).
+2. `mise run release -- rehearse VERSION` rehearses installed cagents updating
+   from the newest published release to the cut, on the build host. It uses
+   the released commit's `scripts/rehearse-update`
+   ([Rehearsing an update](development.md#rehearsing-an-update)):
+   - a private user with its own headless desktop installs the published
+     release;
+   - it opens two windows and seeds chats, agents, a channel and terminals
+     with a long-lived child;
+   - it updates to the cut's bundle, the bytes the cut checked, through
+     `cagents daemon upgrade`;
+   - it requires every pane, chat, agent and terminal to survive and the
+     windows to reopen.
+
+   The update must end `Complete`, with no refusal, so the reopened windows
+   report no "Update failed". A rehearsal that does not pass leaves its report,
+   records and screenshots in `/var/tmp/cr/release-VERSION` on the host.
+   The in-app path through a file feed (below) needs builds that read one.
 3. `mise run release -- publish VERSION` asks you to type the version, then
    runs `scripts/publish-release --push-tag`. It checks the signature against
    the keys the tag lists, the metadata against every asset, the checksums,

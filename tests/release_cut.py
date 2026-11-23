@@ -59,7 +59,16 @@ echo "$*" >> "$FIXTURE/gh.log"
 case "$1 $2" in
     "pr create") echo "https://github.com/fixture/repository/pull/77" ;;
     "pr list") cat "$FIXTURE/open-pr" 2>/dev/null ;;
-    "release view") cat "$FIXTURE/release-draft" 2>/dev/null ;;
+    "release view")
+        if [[ " $* " == *" tagName "* ]]; then cat "$FIXTURE/published" 2>/dev/null || echo v0.2.3
+        else cat "$FIXTURE/release-draft" 2>/dev/null; fi ;;
+    "release download")
+        version=${3#v}
+        while (($#)); do [[ $1 == -D ]] && directory=$2; shift; done
+        cd "$directory"
+        echo "archive of $version" > "cagents-$version-x86_64-unknown-linux-gnu.tar.gz"
+        echo "#!/bin/sh" > install.sh
+        sha256sum "cagents-$version-x86_64-unknown-linux-gnu.tar.gz" install.sh > SHA256SUMS ;;
 esac
 exit 0
 """
@@ -80,6 +89,24 @@ status=$(cat "$FIXTURE/publish-status" 2>/dev/null || echo 0)
 ((status == 0)) || exit "$status"
 [[ " $* " == *" --push-tag "* ]] && git -C "$(dirname "$0")/.." push -q origin "refs/tags/v$2"
 exit 0
+"""
+
+# The commit's rehearsal harness: records how it is run, and reports the
+# fixture's outcome and update status.
+REHEARSE = r"""#!/bin/bash
+root=$2 command=$3
+echo "$0 $command ${*:4}" >> "$FIXTURE/rehearse.log"
+case $command in
+    cleanup) rm -rf "$root" ;;
+    run)
+        mkdir -p "$root/home/.local/share/cagents-install/.update"
+        outcome=$(cat "$FIXTURE/rehearse-outcome" 2>/dev/null || echo PASS)
+        printf 'Total duration: 61.2s\nOutcome: %s\n' "$outcome" > "$root/report.txt"
+        [[ $outcome == PASS ]] || printf 'Regressions / evidence gaps:\nthe shell terminal is gone\n\nSteps\n' >> "$root/report.txt"
+        cat "$FIXTURE/rehearse-status" 2>/dev/null > "$root/home/.local/share/cagents-install/.update/status.json" \
+            || echo '{"phase": "Complete"}' > "$root/home/.local/share/cagents-install/.update/status.json"
+        [[ $outcome == PASS ]] ;;
+esac
 """
 
 # Exits with each line of land-statuses in turn, then 0.
@@ -126,6 +153,7 @@ class ReleaseCut(unittest.TestCase):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
         self.tool(self.repo / "scripts/publish-release", PUBLISH)
         self.tool(self.repo / "scripts/land-pr", LAND)
+        self.tool(self.repo / "scripts/rehearse-update", REHEARSE)
         (self.repo / ".gitignore").write_text(".worktrees/\n")
         lock = ["version = 4\n"]
         for name, manifest in (("cagents", "Cargo.toml"), ("cagents-ui", "crates/cagents-ui/Cargo.toml"),
@@ -149,11 +177,17 @@ class ReleaseCut(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True)
         self.git("remote", "add", "origin", str(self.origin))
         self.git("push", "-q", "origin", "main", "v0.2.3")
+        # The host's checkout of the same repository.
+        host = self.host / "repo"
+        self.git("init", "-q", cwd=host)
+        self.git("remote", "add", "origin", str(self.origin), cwd=host)
+        self.git("fetch", "-q", "origin", cwd=host)
         self.bundles = []
         self.write_status()
         self.env = {key: value for key, value in os.environ.items() if not key.startswith(("CAGENTS_", "GIT_"))} | {
             "HOME": str(self.home), "FIXTURE": str(self.root), "PATH": f"{self.bin}:{os.environ['PATH']}",
-            "CAGENTS_RELEASE_BUNDLES": str(self.root / "bundles"), "XDG_STATE_HOME": str(self.home / ".state")}
+            "CAGENTS_RELEASE_BUNDLES": str(self.root / "bundles"), "XDG_STATE_HOME": str(self.home / ".state"),
+            "CAGENTS_RELEASE_REHEARSAL_ROOT": str(self.root / "cr")}
 
     def tool(self, path, text):
         path.write_text(text)
@@ -344,6 +378,64 @@ class ReleaseCut(unittest.TestCase):
         self.bundle(self.fix)
         result = self.release("cut", "--key", str(self.root / "key"))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rehearse_updates_the_published_release_to_the_cut_with_the_cut_commits_harness(self):
+        self.cut_signed()
+        result = self.release("rehearse", "0.2.4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Rehearsing the update from 0.2.3 to 0.2.4", result.stdout)
+        self.assertIn("Outcome: PASS", result.stdout)
+        self.assertIn("Update status: Complete false", result.stdout)
+        self.assertRegex(result.stdout, r"Rehearsed 0\.2\.3 to 0\.2\.4 in \d+ min \d+ s")
+        harness = self.host / "repo/.worktrees/.rehearse-release"
+        run = next(line for line in self.log("rehearse.log") if " run " in line)
+        old = self.host / ".cache/cagents-release-rehearsal/0.2.3"
+        new = self.host / f".local/state/cagents-prebuilt/bundles/{self.fix}/dist"
+        self.assertEqual(run, f"{harness}/scripts/rehearse-update run --old-dir {old} --old-version 0.2.3 "
+                              f"--old-installer {old}/install.sh --new-dir {new} --new-version 0.2.4 "
+                              f"--new-installer {new}/install.sh --answer yes")
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=harness), self.fix)
+        self.assertFalse((self.root / "cr").exists())
+        self.assertEqual([line for line in self.log("prebuild.log") if line.split()[0] in ("pin", "unpin")][-2:],
+                         [f"pin {self.fix}", f"unpin {self.fix}"])
+        # The published release is fetched once and kept.
+        self.assertEqual(sum(line.startswith("release download") for line in self.log("gh.log")), 1)
+        self.assertEqual(self.release("rehearse", "0.2.4").returncode, 0)
+        self.assertEqual(sum(line.startswith("release download") for line in self.log("gh.log")), 1)
+
+    def test_a_passing_rehearsal_whose_update_failed_does_not_pass(self):
+        self.cut_signed()
+        (self.root / "rehearse-status").write_text('{"phase": "Failed"}\n')
+        result = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Update status: Failed false", result.stdout)
+        self.assertIn(f"in {self.root / 'cr'}", result.stderr)
+        self.assertTrue((self.root / "cr/report.txt").exists())
+        (self.root / "rehearse-status").write_text('{"phase": "Complete", "refusal": {"kind": "busy"}}\n')
+        self.assertIn("Update status: Complete true", self.release("rehearse", "0.2.4").stdout)
+
+    def test_a_failed_rehearsal_reports_what_regressed(self):
+        self.cut_signed()
+        (self.root / "rehearse-outcome").write_text("FAIL\n")
+        result = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the shell terminal is gone", result.stdout)
+        self.assertIn("did not pass", result.stderr)
+
+    def test_rehearse_refuses_a_host_bundle_other_than_the_one_cut(self):
+        self.cut_signed()
+        archive = self.host / f".local/state/cagents-prebuilt/bundles/{self.fix}/dist/cagents-0.2.4-{TARGET}.tar.gz"
+        archive.write_bytes(b"something else")
+        result = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not the one cut", result.stderr)
+        self.assertEqual(self.log("rehearse.log"), [])
+
+    def test_rehearse_needs_a_cut_and_something_published_before_it(self):
+        self.assertIn("cut 0.2.4 first", self.release("rehearse", "0.2.4").stderr)
+        self.cut_signed()
+        (self.root / "published").write_text("v0.2.4\n")
+        self.assertIn("nothing to rehearse", self.release("rehearse", "0.2.4").stderr)
 
     def test_a_refused_publication_leaves_no_tag_on_origin(self):
         self.cut_signed()
