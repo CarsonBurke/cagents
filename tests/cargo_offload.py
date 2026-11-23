@@ -2245,6 +2245,28 @@ class RemoteRun(unittest.TestCase):
                 self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
                 lock.close()
 
+    def test_without_its_own_slot_a_lease_takes_the_one_leased_least_lately(self):
+        with self.slots() as base:
+            now = time.time()
+            # Slot 0 was leased last; slot 2, long ago, by a checkout gone quiet.
+            for index, age in ((0, 10), (1, 600), (2, 3600)):
+                slot = Path(base, f"slot-{index}")
+                (slot / "src" / "target").mkdir(parents=True)
+                (slot / "owner").write_text(f"checkout-{index}\n")
+                os.utime(slot / "owner", (now - age, now - age))
+            lease, lines = self.lease(base, slots=3)
+            self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 2)
+            lease.stdin.close()
+            self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
+            # Each lease records whether it found its own slot.
+            again, lines = self.lease(base, slots=3)
+            self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 2)
+            again.stdin.close()
+            self.assertEqual(again.wait(timeout=HANG_GUARD), 0)
+            records = [json.loads(line) for line in Path(base, "leases.log").read_text().splitlines()]
+            self.assertEqual([(record["slot"], record["own"], record["previous"]) for record in records],
+                             [(2, False, "checkout-2"), (2, True, "key")])
+
     def test_a_further_slot_is_made_while_the_disk_holds_one(self):
         with self.slots() as base:
             self.hold(base, 0, None)
