@@ -1087,7 +1087,7 @@ class IdleBuilds(unittest.TestCase):
         def systemctl(*arguments):
             calls.append(arguments)
             shown = "MemoryHigh=infinity\nCPUWeight=[not set]\nIOWeight=[not set]\n" if len(calls) == 1 else \
-                f"CPUWeight=idle\nIOWeight=1\nMemoryHigh={3 * 2**30}\n"
+                f"CPUWeight=idle\nIOWeight=1\nMemoryHigh={3 * 2**29}\n"
             return subprocess.CompletedProcess(arguments, 0, shown, "")
 
         with unittest.mock.patch.object(build_host, "systemctl", systemctl), \
@@ -1098,7 +1098,7 @@ class IdleBuilds(unittest.TestCase):
             self.assertTrue(build_host.prepare_slice(build_host.IDLE_SLICE))
         self.assertEqual(calls, [
             ("show", "cagentsidle.slice", "--property=MemoryHigh", "--property=CPUWeight", "--property=IOWeight"),
-            ("set-property", "--runtime", "cagentsidle.slice", f"MemoryHigh={3 * 2**30}", "CPUWeight=idle",
+            ("set-property", "--runtime", "cagentsidle.slice", f"MemoryHigh={3 * 2**29}", "CPUWeight=idle",
              "IOWeight=1"),
             ("show", "cagentsidle.slice", "--property=MemoryHigh", "--property=CPUWeight", "--property=IOWeight")])
 

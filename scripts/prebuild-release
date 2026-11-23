@@ -259,7 +259,10 @@ class Store:
                 if index < keep or pinned.exists() and now - pinned.stat().st_mtime < PIN_SECONDS:
                     continue
                 say(f"evicting {path.name}")
-                path.replace(self.bundles / f".evict-{path.name}")
+                evicted = self.bundles / f".evict-{path.name}"
+                # What an earlier eviction could not finish removing.
+                shutil.rmtree(evicted, ignore_errors=True)
+                path.replace(evicted)
             for path in self.bundles.iterdir():
                 name = path.name
                 left = (name.startswith(".evict-") or name.startswith(".") and name.endswith(".partial")
@@ -307,6 +310,8 @@ def prepare_checkout(repository, sha):
     if checkout.exists():
         git(checkout, "checkout", "--quiet", "--force", "--detach", sha)
     else:
+        # A registration left by a checkout removed by hand would refuse it.
+        git(repository, "worktree", "prune")
         git(repository, "worktree", "add", "--quiet", "--detach", str(checkout), sha)
     return checkout
 
@@ -387,7 +392,8 @@ def build(repository, store, sentinel, cache, sha, priority):
         raise
     finally:
         (store.root / "building.json").unlink(missing_ok=True)
-    if status == 124:
+    # 124 is also what a smoke check's timeout exits with, which is a failure.
+    if status == 124 and "build admission timed out" in (partial / "build.log").read_text(errors="replace"):
         raise Stopped("its admission waited too long")
     try:
         if status:
@@ -418,6 +424,8 @@ def why_stop(store, sentinel, sha, priority):
         return "its tests failed"
     if priority == "normal":
         return None
+    if sha in store.requested():
+        return "it was requested at normal priority"
     others = [other for other in store.requested() if other != sha and not store.built(other)]
     if others:
         return f"{others[0]} was requested"
@@ -462,6 +470,10 @@ def run(repository, store, sentinel, cache, keep):
             except Stopped as stopped:
                 write_json(store.root / "state.json",
                            {"retry_after": time.time() + BACKOFF_SECONDS, "stopped": str(stopped)})
+                if priority == "normal":
+                    # Only a checkout that failed stops a requested build;
+                    # it is not retried at once.
+                    pause(WATCH_SECONDS * 6)
                 continue
             write_json(store.root / "state.json", {})
             # Bundled or failed, as its waiter then sees.
@@ -555,7 +567,7 @@ def main():
             else:
                 pin.unlink(missing_ok=True)
         return 0
-    return wait(store, sha, args.timeout)
+    return wait(store, args.sentinel_state, sha, args.timeout)
 
 
 def start_service():
@@ -563,7 +575,7 @@ def start_service():
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def wait(store, sha, timeout):
+def wait(store, sentinel, sha, timeout):
     """Blocks until `sha` is bundled, starting the service again whenever it
     is not building it, as when a request reached it as it was ending."""
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -579,6 +591,10 @@ def wait(store, sha, timeout):
         building = read_json(store.root / "building.json")
         if building and not Path(f"/proc/{building.get('pid')}").exists():
             building = None
+        if (building or {}).get("sha") != sha and sha not in store.requested() \
+                and sha != sentinel_target(sentinel):
+            say(f"{sha} is neither requested nor main's newest compiled commit; request it")
+            return 1
         if building and building.get("sha") == sha:
             line = f"building, {(time.time() - building['started_at']) / 60:.0f} min so far"
         else:

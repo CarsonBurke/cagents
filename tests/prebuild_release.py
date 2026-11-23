@@ -48,6 +48,14 @@ if [[ -n ${PREBUILD_HOLD:-} ]]; then
     touch "$PREBUILD_FIXTURE/started-$ref"
     while [[ ! -e $PREBUILD_FIXTURE/release-$ref ]]; do sleep 0.02; done
 fi
+if [[ -e $PREBUILD_FIXTURE/admission ]]; then
+    echo 'cargo-gate: build admission timed out'
+    exit 124
+fi
+if [[ -e $PREBUILD_FIXTURE/smoke-hangs ]]; then
+    echo 'smoke check timed out'
+    exit 124
+fi
 if [[ -e $PREBUILD_FIXTURE/fail ]]; then
     rm -f "$PREBUILD_FIXTURE/fail-once"
     echo 'the build broke'
@@ -366,11 +374,48 @@ class Prebuild(unittest.TestCase):
         self.assertTrue(prebuild.share_waiter())
 
     def test_wait_gives_up_at_its_timeout_and_starts_the_service_meanwhile(self):
-        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root)]
+        self.compiled(self.first)
+        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root),
+                     "--sentinel-state", str(self.sentinel)]
         with patch.object(prebuild, "pause", lambda seconds: None), \
                 patch.object(sys, "argv", [*arguments, "wait", self.first, "--timeout", "0.2"]):
             self.assertEqual(prebuild.main(), 124)
         self.assertIn(f"start --no-block {prebuild.SERVICE}", (self.root / "systemctl").read_text())
+
+    def test_only_the_gates_admission_timeout_is_a_stop_and_a_smoke_timeout_a_failure(self):
+        self.compiled(self.first)
+        (self.root / "admission").touch()
+        self.assertEqual(self.run_once(), "waited")
+        self.assertIsNone(self.store.failure(self.first))
+        self.assertIn("admission", json.loads((self.store.root / "state.json").read_text())["stopped"])
+        (self.root / "admission").unlink()
+        (self.store.root / "state.json").unlink()
+        (self.root / "smoke-hangs").touch()
+        self.assertEqual(self.run_once(), 0)
+        self.assertIn("status 124", self.store.failure(self.first)["status"])
+
+    def test_requesting_the_commit_building_in_the_background_restarts_it_at_normal_priority(self):
+        self.compiled(self.first)
+        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root)]
+        with patch.dict(os.environ, PREBUILD_HOLD="1"):
+            thread, outcome = self.start()
+            self.wait_for(lambda: (self.root / f"started-{self.first}").exists(), "the background build")
+            with patch.object(sys, "argv", [*arguments, "request", self.first]):
+                prebuild.main()
+            self.wait_for(lambda: (self.root / f"stopped-{self.first}").exists(), "the background build to stop")
+            (self.root / f"release-{self.first}").touch()
+            thread.join(HANG_GUARD)
+        self.assertEqual(outcome, [0])
+        self.assertEqual([build[2] for build in self.builds()], ["1", "normal"])
+        self.assertEqual(json.loads((self.store.bundle(self.first) / "bundle.json").read_text())["priority"],
+                         "normal")
+
+    def test_wait_for_a_commit_nothing_will_build_says_so(self):
+        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root),
+                     "--sentinel-state", str(self.sentinel)]
+        with patch.object(prebuild, "pause", lambda seconds: None), \
+                patch.object(sys, "argv", [*arguments, "wait", self.first]):
+            self.assertEqual(prebuild.main(), 1)
 
     def test_another_run_holding_the_store_leaves_it_alone(self):
         self.compiled(self.first)

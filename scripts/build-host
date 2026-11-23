@@ -476,7 +476,10 @@ def prepare_slice(name=BUILD_SLICE):
     memory first, and for the idle slice making it idle, where they differ."""
     if os.environ.get("CAGENTS_BUILD_SCOPE") == "0":
         return False
-    wanted = [f"MemoryHigh={budget() // 4096 * 4096}", *(IDLE_SLICE_SETTINGS if name == IDLE_SLICE else ())]
+    # The idle slice throttles itself at half the builds' memory, before it
+    # could squeeze the build slice beside it.
+    cap = budget() // (2 if name == IDLE_SLICE else 1) // 4096 * 4096
+    wanted = [f"MemoryHigh={cap}", *(IDLE_SLICE_SETTINGS if name == IDLE_SLICE else ())]
     try:
         shown = systemctl("show", name, *(f"--property={setting.split('=')[0]}" for setting in wanted))
         if shown.returncode != 0:
