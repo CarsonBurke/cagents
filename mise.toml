@@ -106,9 +106,11 @@ usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-t
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.dictate}} "$@"'
 
 [tasks.check]
-description = "Type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
+description = "Check that each lane resolves only its own graph, then type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
 usage = 'arg "[unexpected]..." var=#true hide=#true'
-run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["check:cli", "check:host", "check:ui"] }]
+# The isolation check compiles nothing and takes seconds, so a leaked graph
+# fails before three builds start.
+run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { task = "check:isolation" }, { tasks = ["check:cli", "check:host", "check:ui"] }]
 
 [tasks."check:isolation"]
 description = "Check without compiling that each lane resolves only its own dependency graph"

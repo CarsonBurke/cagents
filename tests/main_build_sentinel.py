@@ -629,6 +629,81 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertTrue(sentinel.require_tests(self.repo, self.state, tip)["passed"])
 
+    def with_isolation_check(self):
+        """Commits a lane-isolation check that records its runs and fails
+        where the checkout has `leaky`, as when a lane resolves another's graph."""
+        script = self.origin / "scripts/check-lane-isolation"
+        script.write_text('''#!/usr/bin/python3
+import json, os, subprocess, sys
+from pathlib import Path
+sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+with open(os.environ['SENTINEL_CALLS'], 'a') as out:
+    out.write(json.dumps(['check-lane-isolation', sha]) + '\\n')
+if Path('leaky').exists():
+    print('check-lane-isolation: the ui lane resolves Ghostty (libghostty-vt)', file=sys.stderr)
+    sys.exit(1)
+print('check-lane-isolation: 6 lanes resolve only their own graphs')
+''')
+        script.chmod(0o755)
+        return self.commit("check lane isolation")
+
+    def isolation_runs(self):
+        return [entry for entry in self.recorded() if entry[0] == "check-lane-isolation"]
+
+    def test_a_commit_with_the_isolation_check_runs_it_after_its_lanes(self):
+        self.tick()
+        # One from before the check has nothing to run.
+        self.assertEqual(self.isolation_runs(), [])
+        tip = self.with_isolation_check()
+        self.now += 120
+        self.tick()
+        runs = [entry[:2] for entry in self.recorded() if tip in entry[:2]]
+        self.assertEqual(runs, [[tip, lane] for lane in sentinel.LANES] + [["check-lane-isolation", tip]])
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertEqual(state["last_good"], tip)
+        self.assertIn("6 lanes resolve only their own graphs",
+                      (self.state / "logs" / f"{tip}-isolation.log").read_text())
+
+    def test_a_commit_resolving_another_lanes_graph_fails_but_is_still_built_and_tested(self):
+        self.tick()
+        self.with_isolation_check()
+        (self.origin / "leaky").touch()
+        leaky = self.commit("ghostty in the ui")
+        self.now += 120
+        self.tick()
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertEqual((state["checked"], state["compiled"], state["last_good"]), (leaky, leaky, self.first))
+        body = (self.state / "issue.md").read_text()
+        self.assertIn("- isolation: exit 1", body)
+        self.assertIn("the ui lane resolves Ghostty", body)
+        # It compiled, so its tests still run.
+        self.assertIn([leaky, "cli"], self.tested())
+        (self.origin / "leaky").unlink()
+        fixed = self.commit("ghostty back in the host")
+        self.now += 120
+        self.tick()
+        self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and f"Recovered at `{fixed}`" in entry[4]
+                            for entry in self.recorded()))
+
+    def test_a_leak_is_bisected_like_a_lane_to_the_commit_that_made_it(self):
+        self.tick()
+        # A commit from before the check, between the passing one and the tip.
+        before = self.commit("merge one")
+        self.with_isolation_check()
+        self.commit("merge three")
+        (self.origin / "leaky").touch()
+        leaky = self.commit("ghostty in the ui")
+        self.commit("merge five")
+        self.commit("merge six")
+        self.now += 120
+        self.tick()
+        [comment] = [entry for entry in self.recorded() if entry[:3] == ["issue", "comment", "42"]]
+        self.assertIn(f"- `{leaky}` (ghostty in the ui): isolation", comment[4])
+        # Bisecting runs only the isolation check, compiling nothing again, and
+        # treats a commit without it as passing.
+        self.assertEqual(len([entry for entry in self.recorded() if len(entry) == 4]), 2 * len(sentinel.LANES))
+        self.assertNotIn(before, [entry[1] for entry in self.isolation_runs()])
+
     def with_evidence_tool(self):
         """Gives main a native-evidence that builds stand-in executables."""
         tool = self.origin / "scripts" / "native-evidence"

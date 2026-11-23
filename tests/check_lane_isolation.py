@@ -81,9 +81,13 @@ class LaneIsolationTests(unittest.TestCase):
         (self.root / "mise.toml").write_text("[vars]\n" + "".join(
             f'{lane} = "{selection}"\n' for lane, selection in variables.items()))
 
-    def run_check(self):
+    def run_check(self, lock=True):
         environment = dict(os.environ, CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=str(self.root / "target"),
                            RUSTC=real_tool("rustc"))
+        if lock:
+            # The real checkout's lock is current, as its lanes require.
+            subprocess.run([CARGO, "generate-lockfile", "--offline"], cwd=self.root, env=environment, check=True,
+                           capture_output=True, timeout=60)
         return subprocess.run([str(SCRIPT), "--cargo", CARGO, "--root", str(self.root)], capture_output=True, text=True,
                               env=environment, timeout=120)
 
@@ -133,6 +137,14 @@ class LaneIsolationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("the dictate lane cargo tree failed", result.stderr)
         self.assertIn("no-such-package", result.stderr)
+
+    def test_dependencies_it_cannot_fetch_fail_before_any_lane_is_resolved(self):
+        # Fetching is locked, so a stale or missing Cargo.lock is never rewritten.
+        result = self.run_check(lock=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not fetch the dependencies Cargo.lock names", result.stderr)
+        self.assertNotRegex(result.stderr, r"the \w+ lane")
+        self.assertFalse((self.root / "Cargo.lock").exists())
 
     def test_a_lane_missing_from_mise_is_refused(self):
         self.write_vars({lane: selection for lane, selection in VARS.items() if lane != "dictate"})
