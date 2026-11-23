@@ -4,7 +4,8 @@ only signs and publishes what is already built and smoke-tested.
 
 Run with no command, as the cagents-prebuild user service that main's
 sentinel starts after each check, it bundles the newest main commit that
-compiled, unless that commit's tests failed or it is bundled already. Each
+compiled, unless that commit's tests failed, it is bundled already, or the
+version it declares is released already, before main's version bump. Each
 bundle is what `scripts/build-release-linux` makes of the commit with its own
 scripts, smoke checks included, kept by commit under the store with the
 metadata that lists every file's size and digest. Bundles are built in a
@@ -31,6 +32,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -283,12 +285,42 @@ def sentinel_target(sentinel):
     return sha
 
 
+# By commit, whether the version it declares is tagged on origin.
+RELEASED = {}
+
+
+def released(repository, sha):
+    """Whether SHA declares a version origin has tagged already: no bundle of
+    it could be released. A tag lookup that fails counts as unreleased."""
+    if sha in RELEASED:
+        return RELEASED[sha]
+    if subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"{sha}^{{commit}}"],
+                      stderr=subprocess.DEVNULL).returncode:
+        git(repository, "fetch", "--no-tags", "origin", "main", check=False)
+    manifest = git(repository, "show", f"{sha}:Cargo.toml", check=False)
+    match = re.search(r'^\[package\]\n(?:(?!\[).*\n)*?version = "([^"]+)"$', manifest, re.M)
+    if not match:
+        RELEASED[sha] = False
+        return False
+    try:
+        tags = subprocess.run(["git", "-C", str(repository), "ls-remote", "--tags", "--refs", "origin",
+                               f"refs/tags/v{match[1]}"], text=True, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False
+    if tags.returncode:
+        return False
+    RELEASED[sha] = bool(tags.stdout.strip())
+    if RELEASED[sha]:
+        say(f"{sha} declares {match[1]}, released already; waiting for main's version bump")
+    return RELEASED[sha]
+
+
 def verdict_failed(sentinel, sha):
     verdict = read_json(sentinel / "verdicts" / f"{sha}.json")
     return verdict is not None and not verdict.get("passed") and not verdict.get("outside_code")
 
 
-def choose(store, sentinel):
+def choose(repository, store, sentinel):
     """The commit to build next and its priority, or (None, None)."""
     for sha in store.requested():
         if store.built(sha) or store.final_failure(sha) is not None:
@@ -296,7 +328,7 @@ def choose(store, sentinel):
             continue
         return sha, "normal"
     sha = sentinel_target(sentinel)
-    if sha and not store.built(sha) and store.final_failure(sha) is None:
+    if sha and not store.built(sha) and store.final_failure(sha) is None and not released(repository, sha):
         return sha, "background"
     return None, None
 
@@ -453,7 +485,7 @@ def run(repository, store, sentinel, cache, keep):
             return 0
         store.evict(keep)
         while True:
-            sha, priority = choose(store, sentinel)
+            sha, priority = choose(repository, store, sentinel)
             if sha is None:
                 return 0
             state = read_json(store.root / "state.json") or {}
