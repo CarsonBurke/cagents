@@ -973,6 +973,57 @@ Rust or change real issues. Remove old logs under the sentinel's state directory
 when their evidence is no longer needed; leave `state.json` in place to preserve
 its checked cursor and issue number.
 
+### Prebuilding release bundles
+
+A release signs and publishes a bundle fw16 has already built and checked
+([Releasing](releasing.md)). `scripts/prebuild-release`, run as the
+`cagents-prebuild` user service, makes those bundles. The sentinel starts the
+service, without waiting for it, before it runs a commit's tests and again at
+every tick. The service bundles the newest main commit that compiled, unless
+that commit's tests failed. Each bundle is exactly what
+`scripts/build-release-linux` makes of the commit with the commit's own scripts,
+including the artifact smoke checks and the metadata that lists every file's
+size and digest. It is built in a `.partial` directory and renamed into
+`~/.local/state/cagents-prebuilt/bundles/SHA` only once it is complete. The
+three newest bundles are kept (`--keep N`), plus any that a release has pinned
+in the past day. The build cache is
+`~/.cache/cagents-prebuild/ubuntu-22.04-amd64`, separate from the one
+`scripts/release build` uses.
+
+A background prebuild never delays the sentinel's verdicts or anyone else's
+build:
+
+- **CPU:** its gate scope runs with `CAGENTS_BUILD_IDLE=1`, so it gets CPU time
+  only when no other process wants it. It runs its own Cargo jobs and holds
+  none of the shared jobserver's tokens.
+- **Memory:** it starts only with at least 16 GiB available, no memory
+  pressure, and no build waiting for build memory shares. It stops when any of
+  those changes for two checks in a row. It tries again ten minutes later,
+  resuming from its warm build directory.
+
+`prebuild-release request SHA` builds a commit next at normal priority,
+interrupting a background prebuild of another commit. `wait SHA` blocks until
+the commit is bundled, and `status` lists bundles, the build running and any
+failures. A failed build is not retried until it is requested again. Its log
+is under `failures/` in the store.
+
+Install the service on fw16 beside the sentinel, in
+`~/.config/systemd/user/cagents-prebuild.service`:
+
+```ini
+[Unit]
+Description=Prebuild cagents release bundles of main
+
+[Service]
+Type=oneshot
+ExecStart=/absolute/path/to/cagents/scripts/prebuild-release --repository /absolute/path/to/cagents
+TimeoutStartSec=infinity
+```
+
+Then run `systemctl --user daemon-reload`; it needs no timer. The service owns
+the detached `.worktrees/.prebuild` checkout. Its offline regression is
+`python3 -I -B tests/prebuild_release.py -v`.
+
 ### Building on another host
 
 Rust compiles on the build host named by `CAGENTS_BUILD_REMOTE` (default

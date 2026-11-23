@@ -8,6 +8,7 @@ verdict, which a release of that commit requires.
 With --require-tests SHA it records that commit's verdict, testing it first
 if it has none, and exits 0 only when its tests pass."""
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -75,6 +76,8 @@ TEST_ENVIRONMENT_IGNORED = re.compile(r"CAGENTS_TEST_|RUST_TEST_|RUSTFLAGS$|RUST
 EXCERPT_CHARACTERS = 12000
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
+# Bundles releases of what compiled; see scripts/prebuild-release.
+PREBUILD_SERVICE = "cagents-prebuild.service"
 # native-evidence's task for these builds: its path must be short, for sockets.
 EVIDENCE_TASK = Path.home() / ".local/state/cev-main-sentinel"
 
@@ -526,6 +529,15 @@ def require_tests(repository, directory, revision):
         return verdict
 
 
+def start_prebuild():
+    """Starts the release prebuild service, where it is installed, without
+    waiting for it. It bundles the newest commit that compiled while that
+    commit's tests run, only on CPU time and memory nothing else needs."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["systemctl", "--user", "start", "--no-block", PREBUILD_SERVICE], timeout=30,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def tick(repository, directory, github_repository):
     # The checkout is shared even when callers select different state directories.
     worktrees = repository / ".worktrees"
@@ -536,6 +548,8 @@ def tick(repository, directory, github_repository):
         except BlockingIOError:
             return
         tick_locked(repository, directory, github_repository)
+    # And on every tick, for a prebuild that waited for memory and gave up.
+    start_prebuild()
 
 
 def tick_locked(repository, directory, github_repository):
@@ -610,6 +624,8 @@ def tick_locked(repository, directory, github_repository):
         # After bisecting, which names the commit that broke a check sooner.
         if state.get("bisect"):
             bisect(repository, directory, state)
+        # Before the tests, which take long enough to bundle the commit beside.
+        start_prebuild()
         test_main(repository, directory, state)
 
 

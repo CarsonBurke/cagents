@@ -1,0 +1,486 @@
+#!/usr/bin/python3 -I
+"""Prebuild release bundles of main on the build host, so that a release
+only signs and publishes what is already built and smoke-tested.
+
+Run with no command, as the cagents-prebuild user service that main's
+sentinel starts after each check, it bundles the newest main commit that
+compiled, unless that commit's tests failed or it is bundled already. Each
+bundle is what `scripts/build-release-linux` makes of the commit with its own
+scripts, smoke checks included, kept by commit under the store with the
+metadata that lists every file's size and digest. Bundles are built in a
+.partial directory and renamed only once complete; the oldest are evicted.
+
+A background prebuild never delays main's checks or tests, or anyone else's
+build: its build scope runs only on CPU time nothing else wants, with Cargo
+jobs of its own, it starts only while memory is plentiful, and it stops, to
+resume from its warm build directory later, once any build waits for build
+memory shares or memory runs short. A commit requested with `request` builds
+at normal priority, ahead of the background prebuild.
+
+  (none)            prebuild until nothing is left to do
+  status [--json]   bundles, the build running, and the failures
+  request SHA       build SHA at normal priority next, starting the service
+  wait SHA          block until SHA is bundled; exit 1 if its build failed
+  pin SHA / unpin SHA
+                    keep SHA's bundle from eviction for a day, while a
+                    release copies it
+"""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+PROGRAM = "prebuild-release"
+SERVICE = "cagents-prebuild.service"
+STORE = Path.home() / ".local/state/cagents-prebuilt"
+SENTINEL_STATE = Path.home() / ".local/state/cagents-main-sentinel"
+# Apart from the cache `scripts/release build` uses, which allows one build at a time.
+CACHE = Path.home() / ".cache/cagents-prebuild/ubuntu-22.04-amd64"
+CHECKOUT = ".worktrees/.prebuild"
+# Bundles kept, newest first; a pinned one is kept besides.
+KEEP = 3
+PIN_SECONDS = 24 * 3600
+# A background prebuild starts only with this much available, and stops below
+# the floor: a release build's links each take several GiB.
+START_GIB = 16
+FLOOR_GIB = 6
+# Memory pressure (pressure/memory `some avg10`) above which it neither
+# starts nor keeps running.
+PRESSURE_LIMIT = 10.0
+# How often the running build is watched, and how many watches in a row a
+# reason to stop must last, so that a build only passing through admission
+# does not stop it.
+WATCH_SECONDS = 5
+SUSTAINED = 2
+# How long a stopped background prebuild waits before it looks again.
+BACKOFF_SECONDS = 600
+# A build's whole admission wait: a background one that cannot start at once
+# gives up and tries again later rather than queue ahead of others.
+ADMISSION_SECONDS = {"background": 60, "normal": None}
+GRACE_SECONDS = 60
+
+
+def pause(seconds):
+    time.sleep(seconds)
+
+
+def say(message):
+    print(f"{PROGRAM}: {message}", flush=True)
+
+
+def git(repository, *args, check=True):
+    return subprocess.run(["git", "-C", str(repository), *args], check=check, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, value):
+    temporary = path.with_name(f".{path.name}.new")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def proc():
+    return Path(os.environ.get("CAGENTS_PREBUILD_PROC", "/proc"))
+
+
+def available_gib():
+    for line in (proc() / "meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 2**20
+    return 0.0
+
+
+def memory_pressure():
+    """pressure/memory's `some avg10`, or 0 where the kernel has none."""
+    try:
+        text = (proc() / "pressure/memory").read_text()
+    except OSError:
+        return 0.0
+    for line in text.splitlines():
+        if line.startswith("some "):
+            return float(dict(field.split("=") for field in line.split()[1:])["avg10"])
+    return 0.0
+
+
+def share_waiter():
+    """Whether a build is waiting for build memory shares: the gate's waiters
+    hold its queue lock until they are admitted."""
+    queue = Path(os.environ.get("CAGENTS_BUILD_LOCK", "/var/tmp/cagents-cargo.lock") + ".queue")
+    try:
+        found = queue.stat()
+    except OSError:
+        return False
+    for line in (proc() / "locks").read_text().splitlines():
+        fields = line.split()
+        if "FLOCK" not in fields:
+            continue
+        index = fields.index("FLOCK")
+        try:
+            major, minor, inode = fields[index + 4].split(":")
+        except (IndexError, ValueError):
+            continue
+        if ((int(major, 16), int(minor, 16), int(inode))
+                == (os.major(found.st_dev), os.minor(found.st_dev), found.st_ino)):
+            return True
+    return False
+
+
+def busy_reason():
+    """Why a background prebuild should not run now, or None."""
+    if share_waiter():
+        return "a build is waiting for build memory shares"
+    if available_gib() < FLOOR_GIB:
+        return f"less than {FLOOR_GIB} GiB of memory is available"
+    if memory_pressure() > PRESSURE_LIMIT:
+        return "memory is under pressure"
+    return None
+
+
+def start_reason():
+    """Why a background prebuild should not start now, or None."""
+    reason = busy_reason()
+    if reason is None and available_gib() < START_GIB:
+        reason = f"less than {START_GIB} GiB of memory is available"
+    return reason
+
+
+class Store:
+    def __init__(self, root):
+        self.root = root
+        self.bundles = root / "bundles"
+        self.failures = root / "failures"
+
+    def prepare(self):
+        old = os.umask(0o077)
+        try:
+            for directory in (self.root, self.bundles, self.failures):
+                directory.mkdir(parents=True, exist_ok=True)
+        finally:
+            os.umask(old)
+
+    def bundle(self, sha):
+        return self.bundles / sha
+
+    def built(self, sha):
+        return (self.bundle(sha) / "bundle.json").is_file()
+
+    def failure(self, sha):
+        return read_json(self.failures / f"{sha}.json")
+
+    def request(self):
+        return read_json(self.root / "request.json")
+
+    def kept(self):
+        """Complete bundles, newest first."""
+        found = [path for path in self.bundles.iterdir() if not path.name.startswith(".")
+                 and (path / "bundle.json").is_file()] if self.bundles.is_dir() else []
+        return sorted(found, key=lambda path: (read_json(path / "bundle.json") or {}).get("built_at", 0),
+                      reverse=True)
+
+    def evict(self, keep):
+        now = time.time()
+        for index, path in enumerate(self.kept()):
+            pinned = path / "pinned"
+            if index < keep or pinned.exists() and now - pinned.stat().st_mtime < PIN_SECONDS:
+                continue
+            say(f"evicting {path.name}")
+            shutil.rmtree(path, ignore_errors=True)
+        # What a stopped build left behind; the store lock is held.
+        for partial in self.bundles.glob(".*.partial"):
+            shutil.rmtree(partial, ignore_errors=True)
+
+
+def sentinel_target(sentinel):
+    """The newest main commit that compiled, unless its tests failed."""
+    state = read_json(sentinel / "state.json") or {}
+    sha = state.get("compiled")
+    if not sha:
+        return None
+    verdict = read_json(sentinel / "verdicts" / f"{sha}.json")
+    if verdict is not None and not verdict.get("passed") and not verdict.get("outside_code"):
+        return None
+    return sha
+
+
+def verdict_failed(sentinel, sha):
+    verdict = read_json(sentinel / "verdicts" / f"{sha}.json")
+    return verdict is not None and not verdict.get("passed") and not verdict.get("outside_code")
+
+
+def choose(store, sentinel):
+    """The commit to build next and its priority, or (None, None)."""
+    request = store.request()
+    if request and not store.built(request["sha"]) and store.failure(request["sha"]) is None:
+        return request["sha"], "normal"
+    sha = sentinel_target(sentinel)
+    if sha and not store.built(sha) and store.failure(sha) is None:
+        return sha, "background"
+    return None, None
+
+
+def prepare_checkout(repository, sha):
+    """The commit's own scripts build it, from a checkout this owns."""
+    if subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"{sha}^{{commit}}"],
+                      stderr=subprocess.DEVNULL).returncode:
+        git(repository, "fetch", "--no-tags", "origin", "main")
+    checkout = repository / CHECKOUT
+    if checkout.exists():
+        git(checkout, "checkout", "--quiet", "--force", "--detach", sha)
+    else:
+        git(repository, "worktree", "add", "--quiet", "--detach", str(checkout), sha)
+    return checkout
+
+
+class Stopped(Exception):
+    """The build was stopped to make way, and is to be tried again."""
+
+
+def build(repository, store, sentinel, cache, sha, priority):
+    """Builds `sha`'s bundle into the store. Returns True once it is bundled,
+    False once its build failed, and raises Stopped if it was stopped."""
+    checkout = prepare_checkout(repository, sha)
+    partial = store.bundles / f".{sha}.partial"
+    shutil.rmtree(partial, ignore_errors=True)
+    partial.mkdir(mode=0o700)
+    environment = dict(os.environ, CAGENTS_RELEASE_CACHE=str(cache))
+    if priority == "background":
+        environment["CAGENTS_BUILD_IDLE"] = "1"
+    seconds = ADMISSION_SECONDS[priority]
+    if seconds is not None:
+        environment["CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS"] = str(seconds)
+    # The release writes the notes it signs; these only keep the builder from
+    # reading every commit since a tag this repository may not have fetched.
+    (partial / "notes.md").write_text("Prebuilt bundle; the release writes its notes.\n")
+    command = [str(checkout / "scripts/cargo-gate"), "exec", str(checkout / "scripts/build-release-linux"),
+               "--ref", sha, "--output", str(partial / "dist"), "--notes", str(partial / "notes.md")]
+    write_json(store.root / "building.json",
+               {"sha": sha, "priority": priority, "started_at": time.time(), "pid": os.getpid()})
+    started = time.monotonic()
+    say(f"building {sha} ({priority})")
+    with (partial / "build.log").open("w") as log:
+        child = subprocess.Popen(command, cwd=checkout, env=environment, stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    reason, count = None, 0
+    try:
+        while True:
+            try:
+                status = child.wait(timeout=WATCH_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = why_stop(store, sentinel, sha, priority)
+            count = count + 1 if now and now == reason else 1 if now else 0
+            reason = now
+            if count >= SUSTAINED:
+                say(f"stopping {sha}: {reason}")
+                stop(child)
+                if verdict_failed(sentinel, sha):
+                    write_json(store.failures / f"{sha}.json",
+                               {"sha": sha, "status": "tests failed", "failed_at": time.time()})
+                    shutil.rmtree(partial, ignore_errors=True)
+                    return False
+                raise Stopped(reason)
+    except BaseException:
+        if child.poll() is None:
+            stop(child)
+        raise
+    finally:
+        (store.root / "building.json").unlink(missing_ok=True)
+    if status == 124:
+        raise Stopped("its admission waited too long")
+    if status:
+        tail = (partial / "build.log").read_text(errors="replace")[-4000:]
+        write_json(store.failures / f"{sha}.json",
+                   {"sha": sha, "status": status, "failed_at": time.time(), "log_tail": tail})
+        shutil.move(partial / "build.log", store.failures / f"{sha}.log")
+        shutil.rmtree(partial, ignore_errors=True)
+        say(f"{sha} failed with status {status}; its log is {store.failures / f'{sha}.log'}")
+        return False
+    metadata = read_json(partial / "dist/release-metadata.json") or {}
+    if metadata.get("source_commit") != sha:
+        raise RuntimeError(f"the bundle of {sha} names another source commit")
+    size = sum(path.stat().st_size for path in (partial / "dist").iterdir())
+    write_json(partial / "bundle.json", {
+        "schema": 1, "sha": sha, "version": metadata["version"], "protocol": metadata["protocol"],
+        "built_at": time.time(), "seconds": round(time.monotonic() - started), "priority": priority,
+        "bytes": size, "builder": f"scripts/build-release-linux at {sha}",
+    })
+    partial.replace(store.bundle(sha))
+    say(f"bundled {sha} ({metadata['version']}, {size / 2**30:.2f} GiB) in "
+        f"{(time.monotonic() - started) / 60:.0f} min")
+    return True
+
+
+def why_stop(store, sentinel, sha, priority):
+    if verdict_failed(sentinel, sha):
+        return "its tests failed"
+    if priority == "normal":
+        return None
+    request = store.request()
+    if request and request["sha"] != sha and not store.built(request["sha"]):
+        return f"{request['sha']} was requested"
+    return busy_reason()
+
+
+def stop(child):
+    """Stops the gate, which interrupts its build and then stops its scope."""
+    with contextlib.suppress(ProcessLookupError):
+        child.send_signal(signal.SIGTERM)
+    try:
+        child.wait(timeout=GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+
+
+def run(repository, store, sentinel, cache, keep):
+    store.prepare()
+    with (store.root / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        store.evict(keep)
+        while True:
+            sha, priority = choose(store, sentinel)
+            if sha is None:
+                return 0
+            state = read_json(store.root / "state.json") or {}
+            if priority == "background":
+                waiting = state.get("retry_after", 0) - time.time()
+                reason = start_reason() if waiting <= 0 else "it was stopped to make way"
+                if reason:
+                    # The service stays, looking again shortly, so that a
+                    # request does not wait out the backoff.
+                    pause(WATCH_SECONDS * 6)
+                    continue
+            try:
+                done = build(repository, store, sentinel, cache, sha, priority)
+            except Stopped as stopped:
+                write_json(store.root / "state.json",
+                           {"retry_after": time.time() + BACKOFF_SECONDS, "stopped": str(stopped)})
+                continue
+            write_json(store.root / "state.json", {})
+            request = store.request()
+            if request and request["sha"] == sha:
+                (store.root / "request.json").unlink(missing_ok=True)
+            if done:
+                store.evict(keep)
+
+
+def status(store, sentinel, as_json):
+    store.prepare()
+    building = read_json(store.root / "building.json")
+    if building and building.get("pid") and not Path(f"/proc/{building['pid']}").exists():
+        building = None
+    report = {
+        "bundles": [read_json(path / "bundle.json") for path in store.kept()],
+        "building": building,
+        "request": store.request(),
+        "target": sentinel_target(sentinel),
+        "failures": sorted((read_json(path) or {}).get("sha", path.stem)
+                           for path in store.failures.glob("*.json")),
+        "state": read_json(store.root / "state.json") or {},
+    }
+    if building:
+        log = store.bundles / f".{building['sha']}.partial/build.log"
+        with contextlib.suppress(OSError):
+            lines = log.read_text(errors="replace").splitlines()
+            report["building"]["last_line"] = lines[-1] if lines else ""
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return 0
+    for bundle in report["bundles"]:
+        print(f"bundled  {bundle['sha']}  {bundle['version']}  "
+              f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(bundle['built_at']))}  "
+              f"{bundle['bytes'] / 2**30:.2f} GiB")
+    if building:
+        print(f"building {building['sha']}  {building['priority']}, for "
+              f"{(time.time() - building['started_at']) / 60:.0f} min")
+    for sha in report["failures"]:
+        print(f"failed   {sha}")
+    return 0
+
+
+def resolve(repository, revision):
+    sha = git(repository, "rev-parse", "--quiet", "--verify", f"{revision}^{{commit}}", check=False)
+    if not sha:
+        git(repository, "fetch", "--no-tags", "origin", "main")
+        sha = git(repository, "rev-parse", "--verify", f"{revision}^{{commit}}")
+    return sha
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--repository", type=Path, required=True)
+    parser.add_argument("--store", type=Path, default=STORE)
+    parser.add_argument("--sentinel-state", type=Path, default=SENTINEL_STATE)
+    parser.add_argument("--cache", type=Path, default=CACHE)
+    parser.add_argument("--keep", type=int, default=KEEP)
+    parser.add_argument("command", nargs="?", choices=("status", "request", "wait", "pin", "unpin"))
+    parser.add_argument("sha", nargs="?")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    repository = args.repository.resolve()
+    store = Store(args.store)
+    if args.command in ("request", "wait", "pin", "unpin"):
+        if not args.sha:
+            parser.error(f"{args.command} needs a SHA")
+        sha = resolve(repository, args.sha)
+    if args.command is None:
+        return run(repository, store, args.sentinel_state, args.cache, args.keep)
+    if args.command == "status":
+        return status(store, args.sentinel_state, args.json)
+    store.prepare()
+    if args.command == "request":
+        (store.failures / f"{sha}.json").unlink(missing_ok=True)
+        write_json(store.root / "request.json", {"sha": sha, "requested_at": time.time()})
+        if not store.built(sha):
+            subprocess.run(["systemctl", "--user", "start", "--no-block", SERVICE], check=False)
+        print(sha)
+        return 0
+    if args.command in ("pin", "unpin"):
+        if not store.built(sha):
+            say(f"{sha} is not bundled")
+            return 1
+        pin = store.bundle(sha) / "pinned"
+        if args.command == "pin":
+            pin.touch()
+        else:
+            pin.unlink(missing_ok=True)
+        return 0
+    # wait
+    last = None
+    while not store.built(sha):
+        failure = store.failure(sha)
+        if failure is not None:
+            say(f"{sha} failed with status {failure['status']}; see {store.failures / f'{sha}.log'}")
+            return 1
+        building = read_json(store.root / "building.json")
+        line = (f"building, {(time.time() - building['started_at']) / 60:.0f} min so far"
+                if building and building.get("sha") == sha else "waiting for the build to start")
+        if line != last:
+            say(line)
+            last = line
+        time.sleep(WATCH_SECONDS * 6)
+    print(sha)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -103,6 +103,7 @@ JOBS = (
               sources=("scripts/cargo-host-test-helper.py", "scripts/cargo_artifacts.py")),
         Suite("main build sentinel", "tests/main_build_sentinel.py",
               sources=("scripts/main-build-sentinel", "scripts/cargo_warnings.py")),
+        Suite("release prebuild", "tests/prebuild_release.py", sources=("scripts/prebuild-release",)),
     )),
     Job("tooling", suites=(
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
