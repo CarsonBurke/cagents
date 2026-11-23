@@ -1012,7 +1012,9 @@ A release signs and publishes a bundle fw16 has already built and checked
 `cagents-prebuild` user service, makes those bundles. The sentinel starts the
 service, without waiting for it, before it runs a commit's tests and again at
 every tick. The service bundles the newest main commit that compiled, unless
-that commit's tests failed. Each bundle is exactly what
+that commit's tests failed or the version it declares is already tagged on
+origin (between a release and main's version bump; `status` shows it as
+skipped, and a request still builds it). Each bundle is exactly what
 `scripts/build-release-linux` makes of the commit with the commit's own scripts,
 including the artifact smoke checks and the metadata that lists every file's
 size and digest. It is built in a `.partial` directory and renamed into
