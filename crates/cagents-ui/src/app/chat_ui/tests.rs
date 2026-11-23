@@ -26093,6 +26093,7 @@ fn window_with_a_named_runtime_attached_since_reconciliation() -> (
         shared: true,
         cards: vec![card],
         focused: Some(card),
+        checkout: None,
     }];
     Arc::make_mut(&mut app.durable).active_channel = Some(id);
     let pane = Pane::from_card(
@@ -26115,6 +26116,7 @@ fn window_with_a_named_runtime_attached_since_reconciliation() -> (
             title: String::new(),
             title_source: ChannelTitleSource::Manual,
             ordinal: 1,
+            checkout: None,
         }],
         views: vec![view.clone()],
         ..Default::default()
