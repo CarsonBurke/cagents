@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/cagents-ui", "crates/cagents-dictate", "crates/ceditor", "crates/browser-import", "crates/iced-contracts", "crates/cosmic-text-contracts"]
+members = [".", "crates/cagents-ui", "crates/cagents-dictate", "crates/ceditor", "crates/browser-import", "crates/iced-contracts", "crates/cosmic-text-contracts", "crates/mobile-api"]
 # Existing root build lanes keep their isolated feature graphs.
 default-members = ["."]
 resolver = "3"
@@ -162,6 +162,8 @@ name = "repository_git_contract"
 required-features = ["ui"]
 
 [dependencies]
+# The phone's stable API, which `cagents daemon bridge --mobile` serves.
+cagents-mobile-api = { path = "crates/mobile-api" }
 yaml-rust = { version = "0.4.5", optional = true }
 unicode-width = "0.2.2"
 unicode-casefold = { version = "0.2", optional = true }
