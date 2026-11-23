@@ -82,6 +82,49 @@ const CHILD_SHUTDOWN_CONFIRMATION_RESERVE: Duration = CHILD_HANGUP_GRACE;
 const CHILD_SHUTDOWN_CENSUS_RESERVE: Duration = Duration::from_millis(250);
 /// Actual OS joins happen off-caller; ordinary shutdown shares this deadline.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The wall-clock budget ordinary shutdown gives a terminal's family, and
+/// itself, to end and confirm that end. The product always runs with
+/// [`ShutdownBudget::PRODUCT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ShutdownBudget {
+    /// Total for hangup, escalation and an authoritative holder exit report.
+    deadline: Duration,
+    /// How long the family may run its hangup handlers before it is stopped.
+    hangup_grace: Duration,
+    /// The tail of `deadline` kept to confirm the exact child's exit and the
+    /// PTY session's end.
+    confirmation_reserve: Duration,
+    /// Within that tail, what the final session census keeps for itself.
+    census_reserve: Duration,
+    /// How long a caller of [`TerminalHandle::shutdown`] waits for the worker.
+    join: Duration,
+}
+
+impl ShutdownBudget {
+    const PRODUCT: Self = Self {
+        deadline: CHILD_SHUTDOWN_DEADLINE,
+        hangup_grace: CHILD_HANGUP_GRACE,
+        confirmation_reserve: CHILD_SHUTDOWN_CONFIRMATION_RESERVE,
+        census_reserve: CHILD_SHUTDOWN_CENSUS_RESERVE,
+        join: WORKER_JOIN_TIMEOUT,
+    };
+
+    /// For a test of what shutdown decides rather than how fast a shared,
+    /// loaded host runs it. Each wait in shutdown ends as soon as its
+    /// condition holds, so only a step that never finishes can exhaust these
+    /// budgets. The hangup grace stays the product's, since it decides when a
+    /// family that ignores its hangup is stopped.
+    #[cfg(test)]
+    pub(super) const PATIENT: Self = Self {
+        deadline: Duration::from_secs(30),
+        hangup_grace: CHILD_HANGUP_GRACE,
+        confirmation_reserve: Duration::from_secs(15),
+        census_reserve: Duration::from_secs(5),
+        join: Duration::from_secs(45),
+    };
+}
+
 /// How long shutdown waits for the PTY reader to leave its blocking read
 /// before abandoning the thread. Closing its wake pipe releases the read
 /// immediately in every case we can construct; this only bounds the ones we
@@ -516,7 +559,7 @@ struct PublishedState {
     #[cfg(test)]
     shutdown_census_delay: Mutex<Option<Sender<Instant>>>,
     #[cfg(test)]
-    shutdown_census_instant: AtomicBool,
+    shutdown_budget: Mutex<ShutdownBudget>,
     #[cfg(test)]
     test_holder_reservation: Mutex<Option<crate::daemon::child_reaper::Reservation>>,
     interrupt_requested: AtomicBool,
@@ -630,7 +673,7 @@ impl PublishedState {
             #[cfg(test)]
             shutdown_census_delay: Mutex::new(None),
             #[cfg(test)]
-            shutdown_census_instant: AtomicBool::new(false),
+            shutdown_budget: Mutex::new(ShutdownBudget::PRODUCT),
             #[cfg(test)]
             test_holder_reservation: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
@@ -713,6 +756,16 @@ impl PublishedState {
             ticket: None,
             command: Box::new(command),
         })
+    }
+
+    fn shutdown_budget(&self) -> ShutdownBudget {
+        #[cfg(test)]
+        return *self
+            .shutdown_budget
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        #[cfg(not(test))]
+        ShutdownBudget::PRODUCT
     }
 
     fn request_shutdown(&self) {
@@ -1184,6 +1237,17 @@ impl TerminalHandle {
     /// never rediscovered by a reusable terminal ID.
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
         self.inner.published.holder_identity.get()
+    }
+    /// Run this terminal's ordinary shutdown within `budget` instead of the
+    /// product's. Set it before shutdown starts.
+    #[cfg(test)]
+    pub(super) fn set_shutdown_budget_for_test(&self, budget: ShutdownBudget) {
+        *self
+            .inner
+            .published
+            .shutdown_budget
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = budget;
     }
     #[cfg(test)]
     pub(crate) fn original_root_pidfd_for_test(&self) -> std::io::Result<File> {
@@ -2280,7 +2344,7 @@ impl TerminalHandle {
             self.request_shutdown();
             if !joins::wait_until(
                 &self.inner.worker,
-                Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT),
+                Some(std::time::Instant::now() + self.inner.published.shutdown_budget().join),
                 true,
             ) {
                 return TerminalCloseResult::Unknown(
@@ -2308,7 +2372,7 @@ impl TerminalHandle {
     }
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
-        self.shutdown_until(std::time::Instant::now() + WORKER_JOIN_TIMEOUT)
+        self.shutdown_until(std::time::Instant::now() + self.inner.published.shutdown_budget().join)
     }
 
     pub(crate) fn shutdown_until(
@@ -3735,14 +3799,7 @@ impl Worker {
             self.capture_when_ready(false);
         }
         let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
-            #[cfg(test)]
-            if self
-                .published
-                .shutdown_census_instant
-                .load(Ordering::Acquire)
-            {
-                close_processes::instant_census_for_test();
-            }
+            let budget = self.published.shutdown_budget();
             if exited {
                 let cleanup = if self.checked_shutdown {
                     Ok(())
@@ -3750,7 +3807,8 @@ impl Worker {
                     confirm_exited_family(
                         &self.child,
                         &self.master,
-                        Instant::now() + CHILD_SHUTDOWN_DEADLINE,
+                        Instant::now() + budget.deadline,
+                        budget.census_reserve,
                     )
                 };
                 match cleanup {
@@ -3780,6 +3838,7 @@ impl Worker {
                     self.child_identity.as_ref(),
                     &self.child_exit_rx,
                     self.checked_shutdown,
+                    budget,
                 );
                 let confirmed = result.is_ok();
                 self.handle_child_exit(&mut exited, result);
@@ -6052,13 +6111,14 @@ fn shutdown_child_exit(
     identity: Option<&RootIdentity>,
     exits: &Receiver<ChildExit>,
     checked: bool,
+    budget: ShutdownBudget,
 ) -> ChildExit {
-    let deadline = Instant::now() + CHILD_SHUTDOWN_DEADLINE;
+    let deadline = Instant::now() + budget.deadline;
     let report = exits.try_recv().ok();
     if !checked {
         // Capture must leave both the full HUP grace and time to confirm KILL.
-        let kill_deadline = deadline - CHILD_SHUTDOWN_CONFIRMATION_RESERVE;
-        let capture_deadline = kill_deadline - CHILD_HANGUP_GRACE;
+        let kill_deadline = deadline - budget.confirmation_reserve;
+        let capture_deadline = kill_deadline - budget.hangup_grace;
         let captured = identity
             .ok_or_else(|| "Child identity unavailable".to_owned())
             .and_then(|root| FrozenFamily::capture(root, capture_deadline));
@@ -6067,7 +6127,7 @@ fn shutdown_child_exit(
                 if let Err(error) = family.hangup(child) {
                     tracing::warn!(%error, "could not hang up the complete terminal family");
                 }
-                let grace = (Instant::now() + CHILD_HANGUP_GRACE).min(deadline);
+                let grace = (Instant::now() + budget.hangup_grace).min(deadline);
                 if !family.wait_until(grace).unwrap_or(false) {
                     if !child.exited_within(Duration::ZERO).unwrap_or(false) {
                         // Re-census while the exact root still lives, retaining
@@ -6108,7 +6168,8 @@ fn shutdown_child_exit(
                     }
                     if !child
                         .exited_within(
-                            CHILD_HANGUP_GRACE
+                            budget
+                                .hangup_grace
                                 .min(deadline.saturating_duration_since(Instant::now())),
                         )
                         .map_err(|error| format!("observe child exit: {error}"))?
@@ -6126,7 +6187,7 @@ fn shutdown_child_exit(
                 }
             }
         }
-        confirm_exited_family(child, master, deadline)?;
+        confirm_exited_family(child, master, deadline, budget.census_reserve)?;
     }
     if let Some(report) = report {
         return report;
@@ -6146,6 +6207,7 @@ fn confirm_exited_family(
     child: &holder::HeldChild,
     master: &holder::PtyMaster,
     deadline: Instant,
+    census_reserve: Duration,
 ) -> Result<(), String> {
     let ended = |deadline| -> Result<bool, String> {
         Ok(child
@@ -6157,9 +6219,7 @@ fn confirm_exited_family(
     // the session, such as `setsid -f`) may keep the PTY open indefinitely;
     // cleanup never claims or depends on it, so its PTY is no reason to wait.
     // A first census that fails or runs late defers to the final one below.
-    let drained = deadline
-        .checked_sub(CHILD_SHUTDOWN_CENSUS_RESERVE)
-        .unwrap_or(deadline);
+    let drained = deadline.checked_sub(census_reserve).unwrap_or(deadline);
     if ended(drained).unwrap_or(false) {
         return Ok(());
     }
