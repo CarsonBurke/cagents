@@ -69,4 +69,6 @@ once, so the subscription spun and logged five errors per pass (about 6,000
 passes while an application shut down after its session ended). It now waits
 before reconnecting, one second after a working connection ends and doubling
 after each consecutive failure up to a minute, as it already did when the
-proxy could not be created. A received setting resets the wait.
+proxy could not be created. Reading a setting resets the wait. Without the
+`tokio` feature there is no timer, so the subscription stops there instead, as
+the proxy failure path already did.

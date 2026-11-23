@@ -27,12 +27,14 @@ pub fn desktop_settings() -> iced_futures::Subscription<Desktop> {
                     match settings.color_scheme().await {
                         Ok(color_scheme) => {
                             let _ = tx.send(Desktop::ColorScheme(color_scheme)).await;
+                            attempts = 0;
                         }
                         Err(err) => error!("Failed to get the color scheme {err:?}"),
                     };
                     match settings.contrast().await {
                         Ok(contrast) => {
                             let _ = tx.send(Desktop::Contrast(contrast)).await;
+                            attempts = 0;
                         }
                         Err(err) => error!("Failed to get the contrast {err:?}"),
                     };
