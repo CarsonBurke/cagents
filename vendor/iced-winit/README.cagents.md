@@ -120,3 +120,13 @@ every listener's queue on every batch. Widgets still receive it. Resize
 requests from a surface configure are broadcast as before. The vendored
 `iced_futures` makes those queues keep every event; see
 `vendor/iced-futures/README.cagents.md`.
+
+The SCTK thread stops once its Wayland connection is lost. A failed connection
+fails every later dispatch at once, so the upstream loop spun at full speed and
+logged a flush error and a dispatch error on each pass (about 60,000 pairs in
+the two seconds an application took to shut down after its compositor exited).
+After a dispatch error the thread flushes the connection; anything but
+`WouldBlock` means the connection is gone, and the thread logs one line and
+returns. Surfaces dropped after that no longer panic on the closed action
+channel. Remove this backport when the pinned dependency stops on a lost
+connection.
