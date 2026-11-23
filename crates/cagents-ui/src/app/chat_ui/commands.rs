@@ -279,6 +279,17 @@ pub(super) struct Outgoing {
     /// What the provider is told this message is called, the same each time
     /// it is sent, so that it is delivered at most once.
     pub(super) delivery: chat::DeliveryKey,
+    /// Where this message was sent again from not confirmed, which it goes
+    /// back to, not to the composer, if it is withdrawn or abandoned before
+    /// the provider answers: its first sending may still arrive.
+    again: Option<Again>,
+}
+
+/// What a message sent again had been, not confirmed: whether it could be
+/// sent again, and over which connection.
+struct Again {
+    retry: bool,
+    connection: std::sync::Weak<ClientHandle>,
 }
 
 impl Outgoing {
@@ -302,6 +313,7 @@ impl Outgoing {
             written: 0,
             stopped: false,
             delivery: chat::DeliveryKey::new_v4(),
+            again: None,
         };
         outgoing.leaves_after(snapshot);
         outgoing
@@ -686,18 +698,40 @@ impl Commands {
     }
 
     /// Withdraws the waiting messages, which must not reach the provider
-    /// ahead of one it refused. Other waiting commands still go.
+    /// ahead of one it refused. Other waiting commands still go. A message
+    /// being sent again goes back to those not confirmed, as
+    /// [`Outgoing::again`] says.
     pub(super) fn withdraw_messages(&mut self) -> Vec<Outgoing> {
         let mut withdrawn = Vec::new();
+        let mut again = Vec::new();
         self.waiting
-            .retain_mut(|(pending, _)| match pending.outgoing.take() {
+            .retain_mut(|(pending, command)| match pending.outgoing.take() {
+                Some(outgoing) if outgoing.again.is_some() => {
+                    again.push((outgoing, command.clone()));
+                    false
+                }
                 Some(outgoing) => {
                     withdrawn.push(outgoing);
                     false
                 }
                 None => true,
             });
+        for (outgoing, command) in again {
+            self.return_unconfirmed(outgoing, command);
+        }
         withdrawn
+    }
+
+    /// Puts `outgoing`, sent again by `command`, back among the messages
+    /// not confirmed, as it was before it was sent again.
+    fn return_unconfirmed(&mut self, mut outgoing: Outgoing, command: Command) {
+        let again = outgoing.again.take();
+        self.unconfirmed.push(Unconfirmed {
+            outgoing,
+            command,
+            retry: again.as_ref().is_some_and(|again| again.retry),
+            connection: again.map(|again| again.connection).unwrap_or_default(),
+        });
     }
 
     /// Forgets every command, as when the connection they went over is
@@ -709,16 +743,32 @@ impl Commands {
     /// no longer be sent again over another connection.
     pub(super) fn abandon(&mut self) -> Vec<Outgoing> {
         self.settling.clear();
-        self.in_flight
+        let pending = self
+            .in_flight
             .take()
+            .map(|mut pending| {
+                let command = pending.message.take();
+                (pending, command)
+            })
             .into_iter()
             .chain(
                 std::mem::take(&mut self.waiting)
                     .into_iter()
-                    .map(|(pending, _)| pending),
-            )
-            .filter_map(|mut pending| pending.take_unsent())
-            .collect()
+                    .map(|(pending, command)| (pending, Some(command))),
+            );
+        let mut unsent = Vec::new();
+        for (mut pending, command) in pending.collect::<Vec<_>>() {
+            let Some(outgoing) = pending.take_unsent() else {
+                continue;
+            };
+            match command {
+                Some(command) if outgoing.again.is_some() => {
+                    self.return_unconfirmed(outgoing, command)
+                }
+                _ => unsent.push(outgoing),
+            }
+        }
+        unsent
     }
 
     /// Keeps what an accepted command changed shown until `snapshot`, or a
@@ -796,11 +846,12 @@ impl Commands {
     /// conversation shows it, as [`Self::unconfirmed`] says.
     pub(super) fn hold_unconfirmed(
         &mut self,
-        outgoing: Outgoing,
+        mut outgoing: Outgoing,
         command: Command,
         retry: bool,
         connection: Option<&Arc<ClientHandle>>,
     ) {
+        outgoing.again = None;
         self.unconfirmed.push(Unconfirmed {
             outgoing,
             command,
@@ -829,6 +880,8 @@ impl Commands {
     }
 
     /// Takes the unconfirmed message sent under `key`, with its command.
+    /// Sent again, it remembers where it came from until the provider
+    /// answers, as [`Outgoing::again`] says.
     pub(super) fn take_unconfirmed(
         &mut self,
         key: chat::DeliveryKey,
@@ -838,8 +891,12 @@ impl Commands {
             .iter()
             .position(|unconfirmed| unconfirmed.outgoing.delivery == key)?;
         let Unconfirmed {
-            outgoing, command, ..
+            mut outgoing,
+            command,
+            retry,
+            connection,
         } = self.unconfirmed.remove(index);
+        outgoing.again = Some(Again { retry, connection });
         Some((outgoing, command))
     }
 
@@ -1691,6 +1748,76 @@ mod tests {
         );
         commands.forget_unconfirmed();
         assert!(commands.unconfirmed().is_empty());
+    }
+
+    /// A message sent again from not confirmed goes back there, rather than
+    /// to the composer, when it is withdrawn behind a refused message or
+    /// its connection is lost before the provider answers: its first
+    /// sending may still arrive, and written again it could arrive twice.
+    #[test]
+    fn a_message_sent_again_goes_back_to_unconfirmed_not_the_composer() {
+        let snapshot = Snapshot::default();
+        let prompt = |text: &str| Command::Prompt {
+            text: text.into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        let outgoing =
+            |text: &str| Outgoing::new(text.into(), Vec::new(), PromptMode::Send, &snapshot);
+        let send = |commands: &mut Commands, id, outgoing, command: Command| {
+            let mut pending = PendingCommand::new(id, &command);
+            pending.outgoing = Some(outgoing);
+            commands.push(pending, command, &snapshot)
+        };
+        let unconfirmed = |commands: &mut Commands| {
+            let first = outgoing("Only once");
+            let key = first.delivery;
+            commands.hold_unconfirmed(first, prompt("Only once"), false, None);
+            commands.take_unconfirmed(key).unwrap()
+        };
+
+        // Waiting behind another message the provider then refuses.
+        let mut commands = Commands::default();
+        let (again, command) = unconfirmed(&mut commands);
+        let key = again.delivery;
+        assert!(send(&mut commands, 1, outgoing("Later"), prompt("Later")).is_some());
+        assert!(send(&mut commands, 2, again, command).is_none());
+        let withdrawn = commands.withdraw_messages();
+        assert!(
+            withdrawn.is_empty(),
+            "nothing waiting but the one sent again"
+        );
+        let [back] = commands.unconfirmed() else {
+            panic!("it is not confirmed again");
+        };
+        assert_eq!(back.outgoing.delivery, key);
+        assert!(back.outgoing.again.is_none());
+
+        // In flight, or waiting, when the connection is lost.
+        for waiting in [false, true] {
+            let mut commands = Commands::default();
+            let (again, command) = unconfirmed(&mut commands);
+            if waiting {
+                assert!(send(&mut commands, 1, outgoing("Later"), prompt("Later")).is_some());
+            }
+            let _ = send(&mut commands, 2, again, command);
+            let unsent = commands.abandon();
+            assert_eq!(
+                unsent
+                    .iter()
+                    .map(|outgoing| outgoing.prompt.text())
+                    .collect::<Vec<_>>(),
+                if waiting { vec!["Later"] } else { vec![] },
+            );
+            let [back] = commands.unconfirmed() else {
+                panic!("it is not confirmed again");
+            };
+            assert!(matches!(
+                &back.command,
+                Command::Prompt { text, .. } if text == "Only once"
+            ));
+            assert!(!back.retry);
+        }
     }
 
     /// The reader may let go of a message the provider never confirmed; it

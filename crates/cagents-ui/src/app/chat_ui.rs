@@ -15527,7 +15527,8 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                // Taken out only where it goes at once, so it is never lost.
+                // Taken out only where it can go. Should it wait and be
+                // withdrawn or abandoned, it comes back as not confirmed.
                 if !runtime
                     .commands
                     .find_unconfirmed(key)
