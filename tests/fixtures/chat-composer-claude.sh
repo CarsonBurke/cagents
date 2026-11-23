@@ -492,6 +492,39 @@ seconds_microseconds() {
 }
 stream_delay_us=$(seconds_microseconds "$stream_delay")
 
+# Optional Send now: while fixture-send-now exists, each turn's init
+# advertises interrupt_send_now_v1, as Claude Code 2.1.296 does, and an
+# interrupt asking to send the queue now hands the messages queued during the
+# busy turn to it rather than stopping it. The file's first line is the answer
+# (delivering, the default; stopped; or nothing_waiting) and its second the
+# seconds to wait after answering before the turn makes way, so the state in
+# between can be seen.
+send_now=0
+send_now_answer=delivering
+send_now_delay=0
+if [ -e "$config/fixture-send-now" ]; then
+    send_now=1
+    if [ -s "$config/fixture-send-now" ]; then
+        send_now_answer=$(sed -n 1p "$config/fixture-send-now")
+        send_now_delay=$(sed -n 2p "$config/fixture-send-now")
+        send_now_answer=${send_now_answer:-delivering}
+        send_now_delay=${send_now_delay:-0}
+    fi
+    case $send_now_answer in
+        delivering | stopped | nothing_waiting) ;;
+        *)
+            printf '%s\n' "fixture: fixture-send-now must answer delivering, stopped or nothing_waiting, not '$send_now_answer'" >&2
+            exit 2
+            ;;
+    esac
+    if ! [[ $send_now_delay =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+        printf '%s\n' "fixture: fixture-send-now's second line must hold seconds, such as 2 or 0.5, not '$send_now_delay'" >&2
+        exit 2
+    fi
+fi
+# The user frames queued during the busy turn, in order, one per line.
+queued_frames=()
+
 # Optional slow start: while fixture-slow-start exists, a conversation's
 # provider waits before it reads anything, as a cold start does: the file's
 # first line in seconds, or 5. The account check is not held up.
@@ -582,11 +615,18 @@ read_frame() {
 }
 
 handle_control() {
-    local frame=$1 id subtype metadata requested uuid task tool
+    local frame=$1 id subtype metadata requested uuid task tool answer=
     id=$(printf '%s' "$frame" | jq -r '.request_id')
     subtype=$(printf '%s' "$frame" | jq -r '.request.subtype')
     metadata='{}'
-    if [ "$subtype" = initialize ]; then
+    if [ "$subtype" = interrupt ] && [ "$send_now" = 1 ] &&
+        [ "$(printf '%s' "$frame" | jq -r '.request.send_now // false')" = true ]; then
+        subtype=send_now
+        answer=$send_now_answer
+        if [ "$busy" = false ] || [ "${#queued_frames[@]}" -eq 0 ]; then answer=nothing_waiting; fi
+        metadata=$(printf '%s\n' "${queued_frames[@]}" | jq -sc --arg answer "$answer" \
+            '{still_queued: map(select(type == "object") | .uuid), send_now: $answer}')
+    elif [ "$subtype" = initialize ]; then
         metadata='{"claude_code_version":"2.1.286","current_permission_mode":"default","models":[{"value":"haiku","displayName":"Claude Haiku"}]}'
         if [ "$fast_fixture" = 1 ]; then
             metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
@@ -626,6 +666,7 @@ handle_control() {
     case $subtype in
         cancel_async_message)
             uuid=$(printf '%s' "$frame" | jq -r '.request.message_uuid')
+            forget_queued "$uuid"
             jq -cn --arg uuid "$uuid" \
                 '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
             ;;
@@ -643,13 +684,65 @@ handle_control() {
             esac
             ;;
         interrupt)
+            queued_frames=()
             for tool in $background_agents; do stop_agent "$tool"; done
             if [ "$busy" = true ]; then
                 busy=false
                 record_stop
             fi
             ;;
+        send_now)
+            # Subagents keep running: only the main turn makes way.
+            [ "$answer" = nothing_waiting ] && return 0
+            sleep "$send_now_delay"
+            busy=false
+            settle_at=
+            if [ "$answer" = stopped ]; then
+                record_stop
+            else
+                # Claude Code 2.1.296 ends the turn it cut short as a success, as it
+                # does when a running call is moved to the background.
+                jq -cn --arg session "$session" --arg turn "$turn" \
+                    '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,
+                      terminal_reason:"aborted_streaming",stop_reason:"tool_use",session_id:$session}'
+                session_idle
+            fi
+            deliver_queued
+            ;;
     esac
+}
+
+forget_queued() {
+    local kept=() queued
+    for queued in "${queued_frames[@]}"; do
+        [ "$(printf '%s' "$queued" | jq -r '.uuid')" = "$1" ] || kept+=("$queued")
+    done
+    queued_frames=("${kept[@]}")
+}
+
+# The next turn takes every queued message at once, as Claude Code does after
+# a Send now: each is replayed and started, and one answer completes them.
+deliver_queued() {
+    local queued uuid uuids=()
+    turn=$((turn + 1))
+    for queued in "${queued_frames[@]}"; do
+        uuid=$(printf '%s' "$queued" | jq -r '.uuid')
+        uuids+=("$uuid")
+        persist_record "$queued"
+        printf '%s' "$queued" | jq -c '. + {isReplay: true}'
+        jq -cn --arg uuid "$uuid" '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
+    done
+    queued_frames=()
+    assistant=$(jq -cn --arg turn "$turn" \
+        '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:"Got it. Your note reached me while the last step was still running, so I\u2019m picking it up now."}],usage:{input_tokens:4200,output_tokens:40}}}')
+    persist_record "$assistant"
+    printf '%s\n' "$assistant"
+    for uuid in "${uuids[@]}"; do
+        jq -cn --arg uuid "$uuid" '{type:"command_lifecycle",command_uuid:$uuid,state:"completed"}'
+    done
+    jq -cn --arg session "$session" --arg turn "$turn" \
+        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,terminal_reason:"completed",session_id:$session}'
+    session_idle
 }
 
 # With home/.claude/fixture-session-idle, a main turn's result is followed by
@@ -689,6 +782,7 @@ record_stop() {
 queue_user() {
     local uuid
     uuid=$(printf '%s' "$1" | jq -r '.uuid')
+    queued_frames+=("$1")
     jq -cn --arg uuid "$uuid" \
         '{type:"command_lifecycle",command_uuid:$uuid,state:"queued"}'
 }
@@ -753,6 +847,8 @@ stream_reply_turn() {
 # Ends the busy first turn as finished, unless an interrupt ended it first.
 settle_first_turn() {
     settle_at=
+    # This fixture does not start what was queued; it is gone with the turn.
+    queued_frames=()
     if [ "$busy" = true ]; then
         busy=false
         jq -cn --arg session "$session" --arg turn "$turn" \
@@ -799,8 +895,9 @@ while next_frame; do
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
                 model_report=true
                 if [ -f "$config/fixture-unconfirmed-model" ]; then model_report=false; fi
-                jq -cn --arg session "$session" --arg model "$(resolved_model)" --argjson reported "$model_report" \
-                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286"} + (if $reported then {model:$model} else {} end)'
+                jq -cn --arg session "$session" --arg model "$(resolved_model)" --argjson reported "$model_report" --argjson send_now "$send_now" \
+                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286"} + (if $reported then {model:$model} else {} end)
+                    + (if $send_now == 1 then {capabilities:["interrupt_send_now_v1"]} else {} end)'
                 if [ -n "$task_scene" ]; then
                     task_receipt_turn
                     busy=false
