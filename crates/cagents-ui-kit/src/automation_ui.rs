@@ -3744,7 +3744,7 @@ impl State {
     /// loaded.
     pub fn show_automation_for_test(&mut self) {
         self.pending = None;
-        self.selected = Some(test_support::automation());
+        self.selected = Some(tests::automation());
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
@@ -3762,13 +3762,20 @@ pub fn state_label(state: crate::automations::FiringState) -> &'static str {
     }
 }
 
-/// Fixtures the application's tests share with this module's.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
 #[doc(hidden)]
-pub mod test_support {
+pub mod tests {
     use super::*;
 
-    pub fn automation() -> Automation {
+    pub(super) fn automation() -> Automation {
         Automation {
             id: Uuid::new_v4(),
             revision: 4,
@@ -3810,12 +3817,6 @@ pub mod test_support {
             blocked: None,
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::test_support::*;
-    use super::*;
 
     #[test]
     fn automation_draft_dirty_baseline_tracks_values_and_restored_edits() {

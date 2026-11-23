@@ -2606,7 +2606,7 @@ mod tests {
     /// lists.
     fn worktree_app() -> (Cagents, CardId) {
         let mut app = super::super::tests::context_inspector_test_app(true);
-        app.sidebar_model = crate::sidebar::test_support::panel_model();
+        app.sidebar_model = crate::sidebar::tests::panel_model();
         let terminal = app.workspace.focused().unwrap();
         let CardKind::Terminal(session) = &mut app.card_state_mut(terminal).unwrap().kind else {
             unreachable!("the test app's pane is a terminal")

@@ -7139,8 +7139,8 @@ fn inspector_open_header_reserves_a_standard_gap_before_its_toggle() {
         }
     }
     let (mut app, card) = inspector_chat_fixture(1440.0);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     // Without the activity block the toggle ends the first section's header.
     app.settings.inspector_show_activity = false;
     app.open_pane_inspector_now(card);

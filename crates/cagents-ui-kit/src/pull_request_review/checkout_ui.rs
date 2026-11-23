@@ -348,14 +348,23 @@ impl State {
     }
 }
 
-/// Fixtures the application's tests share with this module's.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
 #[doc(hidden)]
-pub mod test_support {
+pub mod tests {
     use super::*;
+    use crate::repository::test_fixture::isolated_fixture_case;
     use crate::repository::{ExistingPrCheckoutRequest, PrCheckoutTracking, ValidatedRefName};
+    use cosmic::iced::futures::StreamExt as _;
 
-    pub fn git(directory: &Path, args: &[&str]) -> String {
+    fn git(directory: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(directory)
@@ -385,15 +394,15 @@ pub mod test_support {
     /// A repository whose `existing` worktree already holds pull request
     /// #7's branch, `feature`, at the reviewed head but tracks nothing: the
     /// checkout a review of #7 offers to reconcile by setting its upstream.
-    /// Its plan runs Git, so its test runs under [`isolated_fixture_case`](crate::repository::test_fixture::isolated_fixture_case).
+    /// Its plan runs Git, so its test runs under [`isolated_fixture_case`].
     pub struct ExistingCheckout {
         /// Holds the repositories until the fixture is dropped.
-        pub _directory: tempfile::TempDir,
-        pub repository: PathBuf,
-        pub remote: PathBuf,
-        pub worktree: PathBuf,
-        pub head: Oid,
-        pub key: GitHubRepoKey,
+        _directory: tempfile::TempDir,
+        repository: PathBuf,
+        remote: PathBuf,
+        worktree: PathBuf,
+        head: Oid,
+        key: GitHubRepoKey,
     }
 
     impl ExistingCheckout {
@@ -497,7 +506,7 @@ pub mod test_support {
             }
         }
 
-        pub fn pull_request(&self) -> PullRequest {
+        fn pull_request(&self) -> PullRequest {
             serde_json::from_value(serde_json::json!({
                 "number": 7,
                 "title": "Fixture",
@@ -513,7 +522,7 @@ pub mod test_support {
             .unwrap()
         }
 
-        pub fn range(&self) -> crate::repository::PullRequestRange {
+        fn range(&self) -> crate::repository::PullRequestRange {
             crate::repository::PullRequestRange {
                 number: 7,
                 base_branch: ValidatedBranchName::parse("main").unwrap(),
@@ -533,22 +542,13 @@ pub mod test_support {
                 worktree: self.repository.clone(),
                 pull_request: Arc::new(self.pull_request()),
             })));
-            let mut loaded = super::super::test_support::loaded(Vec::new(), Vec::new());
+            let mut loaded = super::super::tests::loaded(Vec::new(), Vec::new());
             loaded.pull_request = self.pull_request();
             loaded.context.head_oid = self.head.as_str().to_owned();
             loaded.range = self.range();
-            super::super::test_support::finish_load(state, loaded);
+            super::super::tests::finish_load(state, loaded);
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::test_support::*;
-    use super::*;
-    use crate::repository::test_fixture::isolated_fixture_case;
-    use crate::repository::{ExistingPrCheckoutRequest, PrCheckoutTracking, ValidatedRefName};
-    use cosmic::iced::futures::StreamExt as _;
 
     #[test]
     fn existing_checkout_tracking_changes_only_after_confirmation_and_opens_only_after_verified_receipt()

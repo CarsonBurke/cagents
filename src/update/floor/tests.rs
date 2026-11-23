@@ -416,8 +416,9 @@ fn fixture() -> FakeSource {
             labels: Default::default(),
         },
         inventory: Inventory {
+            chats: Vec::new(),
+            chat_states: BTreeMap::new(),
             terminals: vec![terminal],
-            ..Inventory::default()
         },
         events: Arc::new(Mutex::new(Vec::new())),
         observations: Arc::new(AtomicUsize::new(0)),

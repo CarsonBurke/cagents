@@ -535,7 +535,7 @@ mod tests {
         current.base_oid = "c".repeat(40);
         let base = "b".repeat(40);
         *api.merge_base.lock().unwrap() = Some(base.clone());
-        let target = super::super::test_support::target(1);
+        let target = super::super::tests::target(1);
         let key = PullRequestKey::new(target.repository.clone(), 1).unwrap();
         let authority = Authority {
             target,

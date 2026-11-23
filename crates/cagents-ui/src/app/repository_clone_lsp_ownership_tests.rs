@@ -192,7 +192,7 @@ async fn dirty_repository_clone_cannot_replace_original_language_source_on_load_
     let fixture = CloneLspFixture::new().await;
     // This existing fixture supplies a finite in-process protocol transport;
     // the manager still performs real registration, discovery and versioning.
-    let (manager, holder) = crate::lsp::test_support::progress_fixture().await;
+    let (manager, holder) = crate::lsp::tests::progress_fixture().await;
     let (mut app, source) = fixture.app(manager, holder.doc.0 + 1).await;
     let original_runtime = runtime(&app, source) as *const RepositoryRuntime;
     prefix(&mut app, source, "🌲🌲");
@@ -256,7 +256,7 @@ async fn dirty_repository_clone_cannot_replace_original_language_source_on_load_
 #[tokio::test]
 async fn clean_clones_diverge_without_sharing_language_edits_and_retry_after_owner_release() {
     let fixture = CloneLspFixture::new().await;
-    let (manager, holder) = crate::lsp::test_support::progress_fixture().await;
+    let (manager, holder) = crate::lsp::tests::progress_fixture().await;
     let (mut app, source) = fixture.app(manager, holder.doc.0 + 1).await;
     let doc = app.lsp_document(source).unwrap();
     let initial_version = app.lsp.document_version(doc).unwrap();
@@ -464,7 +464,7 @@ fn cross_file_jump_uses_loaded_clone_buffer_without_taking_its_language_owner() 
         .unwrap();
     let fixture = executor.block_on(CloneLspFixture::new());
     std::fs::write(fixture.root.join("other.rs"), TARGET_TEXT).unwrap();
-    let (manager, holder) = executor.block_on(crate::lsp::test_support::progress_fixture());
+    let (manager, holder) = executor.block_on(crate::lsp::tests::progress_fixture());
     let (mut app, source) = executor.block_on(fixture.app(manager, holder.doc.0 + 1));
     let task = app.clone_focused_pane();
     let owner = app.workspace.focused().unwrap();

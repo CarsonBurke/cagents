@@ -905,7 +905,7 @@ fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
         let mut app = context_inspector_test_app(false);
         app.settings.default_native_pane_fraction = 0.5;
         if with_project {
-            app.sidebar_model = sidebar::test_support::panel_model();
+            app.sidebar_model = sidebar::tests::panel_model();
         }
         app.workspace.resize_viewport(seed);
         drop(app.resize_main_window(window, 900.0));
@@ -1238,7 +1238,7 @@ fn prepared_pr_checkout_rechecks_original_branch_source_and_update_admission() {
         let (mut app, project) = pull_request_test_app(&[]);
         let (card, task) = app.add_pull_requests_card("/repo".into());
         drop(task);
-        let mut loaded = crate::pull_request_review::test_support::loaded(Vec::new(), Vec::new());
+        let mut loaded = crate::pull_request_review::tests::loaded(Vec::new(), Vec::new());
         loaded.pull_request.head_repository =
             Some(crate::github::GitHubHeadRepository { name: "r".into() });
         loaded.pull_request.head_repository_owner = Some(crate::github::GitHubActor {
@@ -1246,7 +1246,7 @@ fn prepared_pr_checkout_rechecks_original_branch_source_and_update_admission() {
             name: None,
             is_bot: false,
         });
-        let mut review = crate::pull_request_review::test_support::target(1);
+        let mut review = crate::pull_request_review::tests::target(1);
         review.pull_request = Arc::new(loaded.pull_request.clone());
         let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
             panic!("review card")
@@ -1986,8 +1986,8 @@ fn toggling_pane_inspectors_leaves_every_widget_id_naming_one_node() {
         card,
         CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
     );
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     app.context_sections
         .set_open(context_sections::Section::Workspace, true);
     // A second pane with an inspector of its own.
@@ -2035,8 +2035,8 @@ fn inspector_sections_leave_every_widget_id_naming_one_node() {
         card,
         CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
     );
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     app.open_pane_inspector_now(card);
     assert!(
         sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).is_some(),
@@ -2598,7 +2598,7 @@ fn presentation_settings_request_the_comparison_on_screen_again() {
 
 #[test]
 fn resetting_settings_restores_autosave_for_an_already_open_editor() {
-    if crate::repository_widget::test_support::isolated_test(
+    if crate::repository_widget::retained_save_tests::isolated_test(
         "app::tests::resetting_settings_restores_autosave_for_an_already_open_editor",
     ) {
         return;
@@ -3875,7 +3875,7 @@ fn moving_between_repository_surfaces_repaints_the_window() {
 fn a_failed_save_repaints_the_dirty_close_dialog() {
     use cosmic::iced::advanced::widget::Tree;
 
-    if crate::repository_widget::test_support::isolated_test(
+    if crate::repository_widget::retained_save_tests::isolated_test(
         "app::tests::a_failed_save_repaints_the_dirty_close_dialog",
     ) {
         return;
@@ -3952,7 +3952,7 @@ fn card_close_still_discards_ordinary_editor_dirtiness() {
 
 #[test]
 fn application_close_advances_only_after_current_durability_fence_resolves() {
-    if crate::repository_widget::test_support::isolated_test(
+    if crate::repository_widget::retained_save_tests::isolated_test(
         "app::tests::application_close_advances_only_after_current_durability_fence_resolves",
     ) {
         return;
@@ -4021,7 +4021,7 @@ fn application_close_advances_only_after_current_durability_fence_resolves() {
 
 #[test]
 fn card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
-    if crate::repository_widget::test_support::isolated_test(
+    if crate::repository_widget::retained_save_tests::isolated_test(
         "app::tests::card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds",
     ) {
         return;
@@ -4080,7 +4080,7 @@ fn card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
 
 #[test]
 fn window_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
-    if crate::repository_widget::test_support::isolated_test(
+    if crate::repository_widget::retained_save_tests::isolated_test(
         "app::tests::window_close_stays_fenced_after_post_persist_failure_until_retry_succeeds",
     ) {
         return;
@@ -9386,7 +9386,7 @@ fn resource_updates_clear_refusals_without_a_registered_document() {
 
 #[tokio::test]
 async fn resource_updates_preserve_cap_refusal_and_retry_after_edit_and_holder_close() {
-    let (manager, holder) = crate::lsp::test_support::progress_fixture().await;
+    let (manager, holder) = crate::lsp::tests::progress_fixture().await;
     let mut app = lsp_test_app();
     app.lsp = manager.with_lifecycle(600, 1);
     app.settings.language_servers = app.lsp.servers().to_vec();
@@ -10620,7 +10620,7 @@ fn a_cancelled_request_is_not_reported() {
 
 #[tokio::test]
 async fn a_queued_ready_cannot_replace_starting_after_restart() {
-    let (manager, publisher) = crate::lsp::test_support::progress_fixture().await;
+    let (manager, publisher) = crate::lsp::tests::progress_fixture().await;
     let mut app = lsp_test_app();
     app.lsp = manager;
     let card = repository_card(&mut app, "/repo");
@@ -10696,7 +10696,7 @@ fn a_current_unbacked_refusal_keeps_its_reason_and_a_closed_one_is_ignored() {
 /// Progress occupies the notice slot until its producer marks it done.
 #[tokio::test]
 async fn progress_occupies_the_notice_slot_until_it_is_done() {
-    let (manager, publisher) = crate::lsp::test_support::progress_fixture().await;
+    let (manager, publisher) = crate::lsp::tests::progress_fixture().await;
     let mut app = lsp_test_app();
     app.lsp = manager;
     let card = repository_card(&mut app, "/repo");
@@ -10793,8 +10793,8 @@ fn a_jump_into_another_file_parks_until_it_is_open() {
 #[test]
 fn a_confirmed_git_retry_resolves_its_failed_commit_notice() {
     let mut app = context_inspector_test_app(false);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     let key = app.sidebar_state.active_worktree().unwrap().clone();
     app.active_workspace = Some(key.canonical_path.clone());
     let notice_key = NoticeKey::GitCommit(key.clone());
@@ -10863,8 +10863,8 @@ fn a_confirmed_git_retry_resolves_its_failed_commit_notice() {
 #[test]
 fn git_notice_resolution_keeps_other_worktrees_and_mutation_kinds() {
     let mut app = context_inspector_test_app(false);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     let key = app.sidebar_state.active_worktree().unwrap().clone();
     let sibling = app
         .sidebar_model
@@ -10930,8 +10930,8 @@ fn git_notice_resolution_keeps_other_worktrees_and_mutation_kinds() {
 #[test]
 fn a_stale_git_completion_cannot_clear_or_replace_a_newer_owners_notice() {
     let mut app = context_inspector_test_app(false);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     let key = app.sidebar_state.active_worktree().unwrap().clone();
     app.active_workspace = Some(key.canonical_path.clone());
     let notice_key = NoticeKey::GitCommit(key.clone());
@@ -11028,8 +11028,8 @@ fn successful_stage_of_another_selection_keeps_unkeyed_failure_partial_and_unkno
         },
     ] {
         let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::test_support::panel_model();
-        app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let key = app.sidebar_state.active_worktree().unwrap().clone();
         app.active_workspace = Some(key.canonical_path.clone());
 
@@ -11116,8 +11116,8 @@ fn successful_stage_of_another_selection_keeps_unkeyed_failure_partial_and_unkno
 #[test]
 fn git_mutation_ownership_survives_navigation_and_fences_old_completions() {
     let mut app = context_inspector_test_app(false);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     let key = app.sidebar_state.active_worktree().unwrap().clone();
     let sibling = app
         .sidebar_model
@@ -11179,8 +11179,8 @@ fn git_mutation_ownership_survives_navigation_and_fences_old_completions() {
 #[test]
 fn git_commit_completion_preserves_later_edits_and_settles_parked_drafts() {
     let mut app = context_inspector_test_app(false);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     let key = app.sidebar_state.active_worktree().unwrap().clone();
     let sibling = app
         .sidebar_model
@@ -11264,8 +11264,8 @@ fn files_result_changes_reset_scroll_and_reject_departed_worktrees() {
         widget::{Operation, Tree, operation},
     };
     let mut app = context_inspector_test_app(false);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     let key = app.sidebar_state.active_worktree().unwrap().clone();
     let actions = [
         SidebarAction::FilesPage {
@@ -11814,7 +11814,7 @@ fn a_parked_jump_does_not_survive_a_different_file_opening() {
 /// their hover, locations and completions were thrown away.
 #[tokio::test]
 async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
-    let (manager, publisher) = crate::lsp::test_support::progress_fixture().await;
+    let (manager, publisher) = crate::lsp::tests::progress_fixture().await;
     let mut app = lsp_test_app();
     app.lsp = manager;
     let card = repository_card(&mut app, "/repo");
@@ -14158,7 +14158,7 @@ fn notification_activation_keeps_actual_wayland_token_and_refusal_semantics() {
 
 #[test]
 fn save_and_close_prepares_original_read_custody_without_prior_save() {
-    if crate::repository_widget::test_support::isolated_test(
+    if crate::repository_widget::retained_save_tests::isolated_test(
         "app::tests::save_and_close_prepares_original_read_custody_without_prior_save",
     ) {
         return;
@@ -14867,8 +14867,8 @@ fn control_tab_uses_history_and_respects_blocking_surfaces() {
 #[test]
 fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     let mut app = context_inspector_test_app(true);
-    app.sidebar_model = sidebar::test_support::panel_model();
-    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
     let worktree = app.sidebar_state.active_worktree().unwrap().clone();
     let card = app.workspace.focused().unwrap();
     let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
@@ -15838,7 +15838,7 @@ pub(super) fn pull_request_test_app(numbers: &[u64]) -> (Cagents, ProjectId) {
                 .iter()
                 .map(|number| {
                     (
-                        crate::pull_request_review::test_support::pull_request(*number),
+                        crate::pull_request_review::tests::pull_request(*number),
                         Vec::new(),
                     )
                 })
@@ -15884,7 +15884,7 @@ fn a_visible_pull_request_browser_refreshes_beside_the_focused_chat() {
     app.active_workspace = Some("/repo".into());
     let (browser, _) = app.add_pull_requests_card("/repo".into());
     if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&browser) {
-        crate::pull_request_review::test_support::ready_due_browser(&mut pane.review);
+        crate::pull_request_review::tests::ready_due_browser(&mut pane.review);
     }
     drop(app.new_native_chat(crate::agent::Provider::Codex, Some("/repo".into())));
     assert_ne!(app.workspace.focused(), Some(browser));
@@ -16108,7 +16108,7 @@ fn a_restored_review_can_read_its_cache_when_the_sidebar_list_is_offline() {
 /// that strands a named node; see the repository surface test above.
 #[test]
 fn moving_through_the_pull_request_pane_repaints_the_window() {
-    use crate::pull_request_review::{Action, test_support as review};
+    use crate::pull_request_review::{Action, tests as review};
     use crate::repository::ChangeKind;
     use cosmic::iced::advanced::widget::Tree;
 
@@ -16154,7 +16154,7 @@ fn moving_through_the_pull_request_pane_repaints_the_window() {
 
 #[test]
 fn thousand_file_review_mounts_a_bounded_tree_and_draws_repeated_frames() {
-    use crate::pull_request_review::{Action, test_support as review};
+    use crate::pull_request_review::{Action, tests as review};
     use cosmic::iced::advanced::widget::Tree;
     let (mut app, project) = pull_request_test_app(&[1]);
     drop(app.update(open_pull_request(project, 1)));

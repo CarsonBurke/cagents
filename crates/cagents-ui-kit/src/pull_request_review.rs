@@ -3971,15 +3971,67 @@ impl GitHubReviewApi for ScriptedApi {
     }
 }
 
-/// Fixtures the application's tests share with this module's.
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
+    )
+)]
 #[doc(hidden)]
-pub mod test_support {
+pub mod tests {
     use super::*;
     use crate::github::{PullRequestFile, RemoteValue};
     use crate::repository::ValidatedRefName;
 
-    pub fn path(value: &str) -> RepoPath {
+    #[test]
+    fn summary_title_ellipsis_preserves_ordinary_word_wrap_geometry() {
+        use cosmic::iced::advanced::graphics::text::cosmic_text::{
+            Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
+            ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
+        };
+
+        // Exercise the text engine reexported by the UI, so removing or
+        // bypassing the temporary dependency patch also fails an app test.
+        let mut db = fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../../../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+        );
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow.";
+        let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        let layout = |ellipsize| {
+            let mut lines = Vec::new();
+            shaped.layout_to_buffer(
+                &mut ShapeBuffer::default(),
+                18.0,
+                Some(110.0),
+                Wrap::WordOrGlyph,
+                ellipsize,
+                None,
+                &mut lines,
+                None,
+                Hinting::Disabled,
+            );
+            lines
+        };
+        let ordinary = layout(Ellipsize::None);
+        let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
+            SUMMARY_TITLE_LINES,
+        )));
+        assert!(ordinary.len() > SUMMARY_TITLE_LINES);
+        assert_eq!(limited.len(), SUMMARY_TITLE_LINES);
+        let expected = &ordinary[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        let actual = &limited[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        assert_eq!(actual.start, expected.start);
+        assert_eq!(actual.x, expected.x);
+        assert!(!text[actual.start..actual.end].starts_with(' '));
+    }
+
+    fn path(value: &str) -> RepoPath {
         RepoPath::parse(value).unwrap()
     }
 
@@ -4054,78 +4106,6 @@ pub mod test_support {
         let api = Arc::new(ScriptedApi::new());
         let state = State::new(api.clone(), RepositoryService::system("git"));
         (state, api)
-    }
-
-    /// Answers the load the state is waiting on, as the worker would.
-    pub fn finish_load(state: &mut State, loaded: Loaded) {
-        drop(state.update(Action::Loaded {
-            generation: state.generation,
-            load: state.load_generation,
-            result: Ok(Arc::new(loaded)),
-        }));
-    }
-
-    pub fn ready_due_browser(state: &mut State) {
-        drop(state.update(Action::ListLoaded {
-            generation: state.list_request.generation,
-            result: Ok(PullRequestPage {
-                pull_requests: Vec::new(),
-                next_cursor: None,
-            }),
-        }));
-        state.list_request.last_refresh = Some(Instant::now() - Duration::from_secs(31));
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::test_support::*;
-    use super::*;
-    use crate::github::RemoteValue;
-
-    #[test]
-    fn summary_title_ellipsis_preserves_ordinary_word_wrap_geometry() {
-        use cosmic::iced::advanced::graphics::text::cosmic_text::{
-            Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
-            ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
-        };
-
-        // Exercise the text engine reexported by the UI, so removing or
-        // bypassing the temporary dependency patch also fails an app test.
-        let mut db = fontdb::Database::new();
-        db.load_font_data(
-            include_bytes!("../../../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
-        );
-        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
-        let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow.";
-        let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
-        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
-        let layout = |ellipsize| {
-            let mut lines = Vec::new();
-            shaped.layout_to_buffer(
-                &mut ShapeBuffer::default(),
-                18.0,
-                Some(110.0),
-                Wrap::WordOrGlyph,
-                ellipsize,
-                None,
-                &mut lines,
-                None,
-                Hinting::Disabled,
-            );
-            lines
-        };
-        let ordinary = layout(Ellipsize::None);
-        let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
-            SUMMARY_TITLE_LINES,
-        )));
-        assert!(ordinary.len() > SUMMARY_TITLE_LINES);
-        assert_eq!(limited.len(), SUMMARY_TITLE_LINES);
-        let expected = &ordinary[SUMMARY_TITLE_LINES - 1].glyphs[0];
-        let actual = &limited[SUMMARY_TITLE_LINES - 1].glyphs[0];
-        assert_eq!(actual.start, expected.start);
-        assert_eq!(actual.x, expected.x);
-        assert!(!text[actual.start..actual.end].starts_with(' '));
     }
 
     fn open_with(state: &mut State, loaded: Loaded) {
@@ -4766,6 +4746,26 @@ pub(crate) mod tests {
         drop(state.update(Action::ToggleViewedAndAdvance));
         assert_eq!(state.selected, Some(path("src/main.rs")));
         assert!(!state.files[0].viewed);
+    }
+
+    /// Answers the load the state is waiting on, as the worker would.
+    pub fn finish_load(state: &mut State, loaded: Loaded) {
+        drop(state.update(Action::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Ok(Arc::new(loaded)),
+        }));
+    }
+
+    pub fn ready_due_browser(state: &mut State) {
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_request.generation,
+            result: Ok(PullRequestPage {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            }),
+        }));
+        state.list_request.last_refresh = Some(Instant::now() - Duration::from_secs(31));
     }
 
     #[test]

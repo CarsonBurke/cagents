@@ -376,7 +376,7 @@ async fn unavailable_symlink_target_stays_watched_after_a_failed_explicit_reload
 
 #[tokio::test]
 async fn unavailable_read_and_same_baseline_recovery_keep_a_newer_save_failure() {
-    if test_support::isolated_test(
+    if retained_save_tests::isolated_test(
         "repository_widget::live_tests::unavailable_read_and_same_baseline_recovery_keep_a_newer_save_failure",
     ) {
         return;

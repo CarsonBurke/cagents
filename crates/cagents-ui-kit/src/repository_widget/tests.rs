@@ -80,12 +80,12 @@ fn save_warning_fixture(card: CardId) -> (Checkout, RepositoryRuntime) {
 }
 
 async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
-    drop(super::test_support::finish(runtime, task).await);
+    drop(super::retained_save_tests::finish(runtime, task).await);
 }
 
 #[tokio::test]
 async fn folder_editor_navigation_survives_saved_file_and_sqlite_restart() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::folder_editor_navigation_survives_saved_file_and_sqlite_restart",
     ) {
         return;
@@ -428,7 +428,7 @@ fn retargeted_file_panes_reject_old_reads_even_after_returning_to_the_same_path(
 
 #[tokio::test]
 async fn unavailable_explicit_file_protection_replaces_pixels_and_fences_old_reads() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::unavailable_explicit_file_protection_replaces_pixels_and_fences_old_reads",
     ) {
         return;
@@ -1123,7 +1123,7 @@ fn a_pull_request_basis_survives_status_refresh_and_retries() {
 
 #[test]
 fn branch_navigation_cannot_discard_an_unsaved_or_saving_native_buffer() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::branch_navigation_cannot_discard_an_unsaved_or_saving_native_buffer",
     ) {
         return;
@@ -2568,7 +2568,7 @@ fn pre_persist_failure_keeps_original_baseline_and_unsaved_buffer_dirty() {
 
 #[test]
 fn failed_retry_keeps_post_persist_warning_visible_and_navigation_fenced() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::failed_retry_keeps_post_persist_warning_visible_and_navigation_fenced",
     ) {
         return;
@@ -3047,7 +3047,7 @@ fn failed_reload_releases_obsolete_diagram_work_without_forgetting_the_buffer() 
 
 #[test]
 fn reload_and_overwrite_resolve_post_persist_durability_warning_explicitly() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::reload_and_overwrite_resolve_post_persist_durability_warning_explicitly",
     ) {
         return;
@@ -3596,7 +3596,7 @@ fn file_list_refresh_does_not_obsolete_an_active_save() {
 
 #[test]
 fn starting_a_save_preserves_the_diff_review_surface() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::starting_a_save_preserves_the_diff_review_surface",
     ) {
         return;
@@ -3619,7 +3619,7 @@ fn starting_a_save_preserves_the_diff_review_surface() {
 
 #[test]
 fn autosave_ignores_stale_edits_and_preserves_the_current_surface() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::autosave_ignores_stale_edits_and_preserves_the_current_surface",
     ) {
         return;
@@ -3666,7 +3666,7 @@ fn autosave_ignores_stale_edits_and_preserves_the_current_surface() {
 
 #[tokio::test]
 async fn autosave_preserves_a_selection_replacement_typing_group_but_explicit_save_seals_it() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::autosave_preserves_a_selection_replacement_typing_group_but_explicit_save_seals_it",
     ) {
         return;
@@ -3783,7 +3783,7 @@ async fn autosave_preserves_a_selection_replacement_typing_group_but_explicit_sa
 
 #[test]
 fn explicit_save_seals_typing_when_autosave_is_clean_or_in_flight() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::explicit_save_seals_typing_when_autosave_is_clean_or_in_flight",
     ) {
         return;
@@ -3866,7 +3866,7 @@ fn explicit_save_seals_typing_when_autosave_is_clean_or_in_flight() {
 
 #[test]
 fn disabling_autosave_invalidates_an_already_scheduled_save() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::disabling_autosave_invalidates_an_already_scheduled_save",
     ) {
         return;
@@ -3894,7 +3894,7 @@ fn disabling_autosave_invalidates_an_already_scheduled_save() {
 
 #[test]
 fn editing_after_an_autosave_conflict_keeps_explicit_recovery_required() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::editing_after_an_autosave_conflict_keeps_explicit_recovery_required",
     ) {
         return;
@@ -4497,9 +4497,9 @@ async fn cached_offline_gutter_waits_for_verified_review_authority() {
         &cache::WriteOrder::capture().unwrap(),
     )
     .unwrap();
-    let (review, _) = pull_request_review::test_support::state();
+    let (review, _) = pull_request_review::tests::state();
     let mut review = review.with_cache(Some(store));
-    let open = review.update(Action::Open(pull_request_review::test_support::target(1)));
+    let open = review.update(Action::Open(pull_request_review::tests::target(1)));
     let mut stream = iced::runtime::task::into_stream(open).unwrap();
     let Some(iced::runtime::Action::Output(cached @ Action::Cached { .. })) = stream.next().await
     else {
@@ -4559,10 +4559,10 @@ async fn cached_offline_gutter_waits_for_verified_review_authority() {
     );
     assert!(!review.has_annotation(path, None, Some(1), false));
 
-    pull_request_review::test_support::finish_load(
+    pull_request_review::tests::finish_load(
         &mut review,
-        pull_request_review::test_support::loaded(
-            vec![pull_request_review::test_support::entry(
+        pull_request_review::tests::loaded(
+            vec![pull_request_review::tests::entry(
                 path,
                 ChangeKind::Modified,
             )],
@@ -6309,7 +6309,7 @@ fn loading_an_editable_file_opens_it_at_the_first_version() {
 /// chrome names it, and a save goes there rather than over the link.
 #[test]
 fn a_link_opens_edits_and_saves_its_target() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::a_link_opens_edits_and_saves_its_target",
     ) {
         return;
@@ -6429,7 +6429,7 @@ fn a_linked_buffer_compares_and_stages_the_target() {
 /// the list is asked again rather than the selected row marked modified.
 #[test]
 fn a_save_through_a_link_refreshes_the_list_instead_of_marking_the_link() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::a_save_through_a_link_refreshes_the_list_instead_of_marking_the_link",
     ) {
         return;
@@ -7036,7 +7036,7 @@ fn an_exhausted_version_stops_reporting_changes_rather_than_rewinding() {
 
 #[test]
 fn submitting_a_save_and_hitting_a_conflict_both_tell_the_server_nothing() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::submitting_a_save_and_hitting_a_conflict_both_tell_the_server_nothing",
     ) {
         return;
@@ -7070,7 +7070,7 @@ fn submitting_a_save_and_hitting_a_conflict_both_tell_the_server_nothing() {
 
 #[test]
 fn a_completed_save_reports_what_reached_disk() {
-    if super::test_support::isolated_test(
+    if super::retained_save_tests::isolated_test(
         "repository_widget::tests::a_completed_save_reports_what_reached_disk",
     ) {
         return;
