@@ -352,9 +352,8 @@ mod older_clients;
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
     ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN,
-    PLAN_AND_RESET_READINGS, USAGE_COMPACT_LIMIT, WAIT_KINDS, WAITING_TOOL_STATUS,
-    decoding_before, decoding_from,
-    encoding_before,
+    PLAN_AND_RESET_READINGS, USAGE_COMPACT_LIMIT, WAIT_KINDS, WAITING_TOOL_STATUS, decoding_before,
+    decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
