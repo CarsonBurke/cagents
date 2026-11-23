@@ -1018,15 +1018,21 @@ fn hover_and_activation_focus_keep_a_control_the_person_is_using() {
             let mut other = Focus(held == Some(&other_id));
             let mut editor = Focus(false);
             let task = if activation {
-                focus_if_unheld::<()>(target.clone())
+                focus_if_unheld::<bool>(target.clone())
             } else {
-                focus_unless_held_outside::<()>(workspace.clone(), target.clone())
+                focus_unless_held_outside(workspace.clone(), target.clone(), Some(true))
             };
+            let mut reported = false;
             let mut stream = cosmic::iced::runtime::task::into_stream(task)
                 .expect("the handoff must issue a widget operation");
             while let Some(action) = block_on(stream.next()) {
-                let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
-                    continue;
+                let mut operation = match action {
+                    cosmic::iced::runtime::Action::Widget(operation) => operation,
+                    cosmic::iced::runtime::Action::Output(held_outside) => {
+                        reported = held_outside;
+                        continue;
+                    }
+                    _ => continue,
                 };
                 loop {
                     let bounds = Rectangle::default();
@@ -1060,6 +1066,11 @@ fn hover_and_activation_focus_keep_a_control_the_person_is_using() {
                 sidebar.0,
                 held == Some(&sidebar_id),
                 "an outside field keeps the keyboard"
+            );
+            assert_eq!(
+                reported,
+                !activation && held == Some(&sidebar_id),
+                "hover entry reports only a field outside the strip keeping the keyboard"
             );
             if !mounted {
                 assert_eq!(other.0, held == Some(&other_id), "nothing is blurred");

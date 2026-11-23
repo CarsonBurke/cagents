@@ -734,23 +734,28 @@ pub fn focus_card_if_outside<Message: Send + 'static>(
 /// the strip, such as sidebar search, keeps what is being typed into it.
 /// Nothing happens while `target` is not in the widget tree, because a focus
 /// operation that finds no target blurs every widget instead.
-pub fn focus_unless_held_outside<Message: Send + 'static>(
+///
+/// When such a field keeps the keyboard the task yields `held_outside`, so
+/// the caller knows typing that follows is not meant for the pane.
+pub fn focus_unless_held_outside<Message: Clone + Send + 'static>(
     workspace: widget::Id,
     target: widget::Id,
+    held_outside: Option<Message>,
 ) -> Task<Message> {
     use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
     use cosmic::iced::core::id::IdEq;
 
-    struct Probe {
+    struct Probe<Message> {
         workspace: widget::Id,
         target: widget::Id,
         current: Option<widget::Id>,
         inside: bool,
         held_outside: bool,
         target_mounted: bool,
+        report: Option<Message>,
     }
 
-    impl<Message: Send + 'static> Operation<Message> for Probe {
+    impl<Message: Clone + Send + 'static> Operation<Message> for Probe<Message> {
         fn container(&mut self, id: Option<&widget::Id>, _bounds: Rectangle) {
             self.current = id.cloned();
         }
@@ -780,7 +785,9 @@ pub fn focus_unless_held_outside<Message: Send + 'static>(
         }
 
         fn finish(&self) -> Outcome<Message> {
-            if self.target_mounted && !self.held_outside {
+            if self.held_outside {
+                self.report.clone().map_or(Outcome::None, Outcome::Some)
+            } else if self.target_mounted {
                 Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
             } else {
                 Outcome::None
@@ -795,6 +802,7 @@ pub fn focus_unless_held_outside<Message: Send + 'static>(
         inside: false,
         held_outside: false,
         target_mounted: false,
+        report: held_outside,
     })
 }
 
