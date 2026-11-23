@@ -8,9 +8,10 @@
 //! connection, the device sends a nonce, this computer's daemon signs it for
 //! the caller's live session lineage when the grant allows, and the device then
 //! issues a capability for that peer lineage which lasts as long as the
-//! connection. On the device that capability has a session's scope: its own
-//! children and terminals, listings and messaging, never accounts, lifecycle,
-//! installs or device files.
+//! connection. On the device that capability has a session's scope: through
+//! cagents requests it reaches its own children and terminals, listings and
+//! messaging, never accounts, lifecycle, installs or device links. Like a
+//! session there, a terminal it starts runs commands as the device's user.
 
 use serde::{Deserialize, Serialize};
 

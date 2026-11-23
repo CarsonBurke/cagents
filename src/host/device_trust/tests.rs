@@ -214,6 +214,36 @@ fn a_proof_answers_one_challenge_and_its_capability_ends_with_the_connection() {
     };
     assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
 
+    // Nor can another connection present it in a request without
+    // authenticating, as if any connection could hold it.
+    let foreign = [
+        crate::terminal::ipc::ClientRequest::Agent {
+            authority: authority.clone(),
+            operation: crate::agent_execution::Operation::List,
+        },
+        crate::terminal::ipc::ClientRequest::Automation {
+            authority: authority.clone(),
+            operation: crate::automations::Request::List {
+                after: None,
+                limit: 1,
+            },
+        },
+    ];
+    for request in &foreign {
+        let Err(error) =
+            super::super::agent_execution::terminals::admit(&host, client + 1, request)
+        else {
+            panic!("an unbound connection must not act with another's capability");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    }
+    // The connection it was issued to still may.
+    let own = crate::terminal::ipc::ClientRequest::Agent {
+        authority: authority.clone(),
+        operation: crate::agent_execution::Operation::List,
+    };
+    super::super::agent_execution::terminals::admit(&host, client, &own).unwrap();
+
     // Another connection cannot act with it.
     let elsewhere =
         super::super::agent_execution::terminals::authenticate(&host, client + 1, &authority)

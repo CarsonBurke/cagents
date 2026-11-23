@@ -203,6 +203,11 @@ pub(in crate::host) fn admit(
     client_id: ClientId,
     request: &ClientRequest,
 ) -> Result<(), ProtocolError> {
+    if carries_foreign_peer_capability(host, client_id, request) {
+        return Err(denied(
+            "A device capability acts only on the connection that proved it",
+        ));
+    }
     let Some(lineage) = acting_for(host, client_id) else {
         return Ok(());
     };
@@ -394,6 +399,23 @@ fn own_peer_request(host: &SharedHost, client_id: ClientId, request: &ClientRequ
             .peers
             .issued_to(token, client_id)
     })
+}
+
+/// Whether `request` presents a peer capability issued to another
+/// connection. Only the connection a proof was answered on may act with the
+/// capability it earned, whether or not this one has authenticated.
+fn carries_foreign_peer_capability(
+    host: &SharedHost,
+    client_id: ClientId,
+    request: &ClientRequest,
+) -> bool {
+    let (ClientRequest::Agent { authority, .. } | ClientRequest::Automation { authority, .. }) =
+        request
+    else {
+        return false;
+    };
+    super::super::device_trust::is_peer_capability(authority)
+        && !own_peer_request(host, client_id, request)
 }
 
 fn acting_for(host: &SharedHost, client_id: ClientId) -> Option<Lineage> {
