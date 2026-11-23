@@ -44,11 +44,12 @@ struct RemovalCard {
 /// Terminal status and authenticated host evidence evolve while deletion waits
 /// for sessions to close. The terminal ID identifies that source incarnation;
 /// the card generation, document, scope and channel fences are checked separately.
+/// A model another window chooses for a draft meanwhile is not a new source.
 /// Other descriptor contracts remain exact until they define a stable identity.
 fn same_removal_source(captured: &CardKind, current: &CardKind) -> bool {
     match (captured, current) {
         (CardKind::Terminal(captured), CardKind::Terminal(current)) => captured.id == current.id,
-        _ => captured == current,
+        _ => crate::workspace_model::views::same_source_kind(captured, current),
     }
 }
 

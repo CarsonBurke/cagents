@@ -635,7 +635,7 @@ impl View {
                         existing.width_fraction = pane.width_fraction;
                     }
                     if before.kind != pane.kind {
-                        existing.kind = pane.kind.clone();
+                        existing.kind = merged_kind(&before.kind, &pane.kind, &existing.kind);
                     }
                     if before.scope != pane.scope {
                         existing.scope = pane.scope.clone();
@@ -687,11 +687,107 @@ impl View {
 
 /// Compare two local projections. This is invoked only for local changes;
 /// adopting a host snapshot resets the projection baseline first.
-/// Whether going from `before` to `pane` changes more than presentation.
+/// Whether going from `before` to `pane` changes more than presentation. A
+/// chat draft's chosen model and effort are not its source: they decide
+/// nothing the draft runs until its first message, and are merged on their own.
 pub fn updates_source(before: &Pane, pane: &Pane) -> bool {
-    before.kind != pane.kind
+    !same_source_kind(&before.kind, &pane.kind)
         || before.pending_terminal_start != pane.pending_terminal_start
         || before.scope != pane.scope
+}
+
+/// Whether `a` and `b` are the same source, apart from a chat draft's chosen
+/// model and effort.
+pub fn same_source_kind(a: &CardKind, b: &CardKind) -> bool {
+    match (a, b) {
+        (CardKind::Chat(a), CardKind::Chat(b)) => same_chat_source(a, b),
+        (a, b) => a == b,
+    }
+}
+
+/// Whether `a` and `b` are the same chat apart from the model and effort
+/// chosen for its draft. Destructured so that a new field has to be placed
+/// on one side or the other.
+fn same_chat_source(a: &crate::chat::Session, b: &crate::chat::Session) -> bool {
+    let crate::chat::Session {
+        id,
+        launch:
+            crate::chat::Launch {
+                provider,
+                recipe,
+                session_id,
+                draft_model: _,
+            },
+        proof,
+        terminal,
+        owned_codex_listener,
+        native_continuity,
+    } = a;
+    *id == b.id
+        && *provider == b.launch.provider
+        && *recipe == b.launch.recipe
+        && *session_id == b.launch.session_id
+        && *proof == b.proof
+        && *terminal == b.terminal
+        && *owned_codex_listener == b.owned_codex_listener
+        && *native_continuity == b.native_continuity
+}
+
+/// The kind a pane holds after an update from `before` to `pane` reaches it
+/// holding `current`.
+///
+/// Another window may have changed `current` since the writer saw `before`,
+/// and only a source the writer did not change is free to have moved on (see
+/// [`View::source_update_conflicts`]). A chat draft's chosen model and effort
+/// are merged apart from the rest of its launch, the latest writer of each
+/// winning, so a window that changes the draft's permissions or account
+/// without having seen another window's choice yet keeps that choice, and a
+/// choice made meanwhile keeps the other window's permissions.
+fn merged_kind(before: &CardKind, pane: &CardKind, current: &CardKind) -> CardKind {
+    let (CardKind::Chat(before), CardKind::Chat(pane)) = (before, pane) else {
+        return pane.clone();
+    };
+    let chosen = &pane.launch.draft_model;
+    if same_chat_source(before, pane) {
+        // Only the choice changed. It is made for the draft the pane still
+        // holds, whatever else changed meanwhile, or for nothing: not for a
+        // conversation that started or replaced it, nor a pane that is no
+        // longer a chat.
+        let CardKind::Chat(current) = current else {
+            return current.clone();
+        };
+        let mut merged = current.clone();
+        if chosen
+            .as_ref()
+            .map_or(current.id == pane.id, |chosen| chosen.applies_to(current))
+        {
+            merged.launch.draft_model = chosen.clone();
+        }
+        return CardKind::Chat(merged);
+    }
+    let mut merged = pane.clone();
+    // A choice that applies to nothing is no choice: one the writer dropped
+    // as moot is no change of its own.
+    fn applicable(session: &crate::chat::Session) -> Option<&crate::model::ChatDraftModel> {
+        session
+            .launch
+            .draft_model
+            .as_deref()
+            .filter(|chosen| chosen.applies_to(session))
+    }
+    if applicable(before) == applicable(pane)
+        && let CardKind::Chat(current) = current
+    {
+        // The writer did not change the choice, so the pane keeps the one it
+        // holds now, unless that was made for another draft than this still
+        // is. The writer's own is then as good: a clone's copied choice,
+        // which applies to nothing, stays as saved.
+        match &current.launch.draft_model {
+            Some(theirs) if !theirs.applies_to(&merged) => {}
+            theirs => merged.launch.draft_model = theirs.clone(),
+        }
+    }
+    CardKind::Chat(merged)
 }
 
 /// Presentation edits do not renew Close consent. An original terminal may
@@ -713,6 +809,8 @@ pub fn same_removal_source(before: &Pane, current: &Pane) -> bool {
             (CardKind::Chat(before), CardKind::Chat(current)) => {
                 let mut comparable = current.clone();
                 comparable.native_continuity = before.native_continuity.clone();
+                // A model chosen for the draft meanwhile is not a new source.
+                comparable.launch.draft_model = before.launch.draft_model.clone();
                 comparable == *before
             }
             (before, current) => shared_kind(before) == shared_kind(current),
@@ -1850,5 +1948,158 @@ mod managed_display_tests {
             managed_display(&model, &agent).is_none(),
             "legacy aliases must not manufacture a second canonical managed pane"
         );
+    }
+}
+
+#[cfg(test)]
+mod draft_choice_merge_tests {
+    use super::*;
+    use crate::{agent::Provider, model::*};
+
+    fn draft_pane() -> Pane {
+        let id = TerminalId::new();
+        Pane {
+            id: CardId::new(),
+            title: "Claude".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.,
+            kind: CardKind::Chat(crate::chat::Session {
+                id,
+                launch: crate::chat::Launch {
+                    provider: Provider::Claude,
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: vec![],
+                        working_directory: "/repo".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: None,
+                    draft_model: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            }),
+            scope: None,
+        }
+    }
+
+    fn session(pane: &mut Pane) -> &mut crate::chat::Session {
+        let CardKind::Chat(session) = &mut pane.kind else {
+            unreachable!()
+        };
+        session
+    }
+
+    fn chosen(pane: &Pane, model: &str) -> Pane {
+        let mut pane = pane.clone();
+        let session = session(&mut pane);
+        session.launch.draft_model = Some(Box::new(ChatDraftModel {
+            session: session.id,
+            provider: session.launch.provider,
+            model: Some(model.into()),
+            reasoning: Some("low".into()),
+        }));
+        pane
+    }
+
+    fn permitted(pane: &Pane, mode: &str) -> Pane {
+        let mut pane = pane.clone();
+        session(&mut pane).launch.recipe.arguments = vec!["--permission-mode".into(), mode.into()];
+        pane
+    }
+
+    /// Applies each window's update, built from the pane as `before` it, in
+    /// order, the way the daemon admits them.
+    fn admitted(before: &Pane, updates: &[&Pane]) -> Pane {
+        let mut view = View {
+            panes: vec![before.clone()],
+            ..View::empty(Scope::Channel(ChannelId::new()))
+        };
+        for pane in updates {
+            assert!(!view.source_update_conflicts(before, pane));
+            view.apply(&Change::Update {
+                before: before.clone(),
+                pane: (*pane).clone(),
+            })
+            .unwrap();
+        }
+        view.panes.pop().unwrap()
+    }
+
+    #[test]
+    fn a_launch_change_that_missed_a_draft_choice_keeps_it_in_either_order() {
+        let draft = draft_pane();
+        let choice = chosen(&draft, "haiku");
+        let permission = permitted(&draft, "plan");
+        let both = chosen(&permission, "haiku");
+        assert_eq!(admitted(&draft, &[&choice, &permission]), both);
+        assert_eq!(admitted(&draft, &[&permission, &choice]), both);
+    }
+
+    #[test]
+    fn the_latest_of_two_draft_choices_wins() {
+        let draft = draft_pane();
+        let first = chosen(&draft, "haiku");
+        let second = chosen(&draft, "opus");
+        assert_eq!(admitted(&draft, &[&first, &second]), second);
+        assert_eq!(admitted(&draft, &[&second, &first]), first);
+    }
+
+    #[test]
+    fn two_launch_changes_from_one_draft_still_conflict() {
+        let draft = draft_pane();
+        let view = View {
+            panes: vec![permitted(&draft, "plan")],
+            ..View::empty(Scope::Channel(ChannelId::new()))
+        };
+        assert!(view.source_update_conflicts(&draft, &permitted(&draft, "acceptEdits")));
+        // Restating a launch another window already saved is no conflict, nor
+        // is a choice made over it.
+        assert!(!view.source_update_conflicts(&draft, &permitted(&draft, "plan")));
+        assert!(!view.source_update_conflicts(&draft, &chosen(&draft, "haiku")));
+    }
+
+    #[test]
+    fn a_choice_that_reaches_a_started_or_replaced_draft_is_moot() {
+        let draft = draft_pane();
+        let mut started = draft.clone();
+        session(&mut started).launch.session_id = Some("native".into());
+        assert_eq!(
+            admitted(&draft, &[&started, &chosen(&draft, "haiku")]),
+            started
+        );
+        // A replacement built without the choice does not inherit it.
+        let mut replaced = draft.clone();
+        session(&mut replaced).id = TerminalId::new();
+        assert_eq!(
+            admitted(&draft, &[&chosen(&draft, "haiku"), &replaced]),
+            replaced
+        );
+        // Nor does a choice turn a pane that is no longer a chat back into one.
+        let mut browser = draft.clone();
+        browser.kind = CardKind::Browser(BrowserSession {
+            id: BrowserId::new(),
+            current_url: "https://example.com".parse().unwrap(),
+            history: vec![],
+            history_index: 0,
+            scroll_x: 0.,
+            scroll_y: 0.,
+            fidelity: BrowserRestoreFidelity::UrlOnly,
+        });
+        assert_eq!(
+            admitted(&draft, &[&browser, &chosen(&draft, "haiku")]),
+            browser
+        );
+    }
+
+    #[test]
+    fn a_choice_made_meanwhile_does_not_refuse_a_close() {
+        let draft = draft_pane();
+        assert!(same_removal_source(&draft, &chosen(&draft, "haiku")));
+        assert!(!same_removal_source(&draft, &permitted(&draft, "plan")));
     }
 }
