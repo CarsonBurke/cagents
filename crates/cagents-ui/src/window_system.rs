@@ -12,8 +12,11 @@ pub fn stopped_reason(error: &(dyn std::error::Error + 'static)) -> String {
     };
     match inner.downcast_ref::<EventLoopError>() {
         // The application asks winit to exit with status 0, so a failing
-        // status comes from the backend: it exits when the display connection
-        // fails, with the failed call's errno when it has one and 1 otherwise.
+        // status comes from the backend. On Wayland it exits when flushing or
+        // dispatching the display connection fails, with the failed call's
+        // errno when it has one and 1 otherwise (see #3753 for a flush that
+        // would only block). On X11 a lost server usually ends the process in
+        // Xlib before this, so there the status means the poll failed.
         Some(EventLoopError::ExitFailure(code)) => {
             let lost = "the connection to the display server was lost";
             if *code > 1 {
