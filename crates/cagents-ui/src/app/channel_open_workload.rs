@@ -1105,3 +1105,58 @@ fn projection_tail_timing() {
         drop(app.refresh_chat_limit_accounts())
     });
 }
+
+/// The edges an agent spawn elsewhere brings, as the observer reports them:
+/// agents changed, with nothing else for this window to install.
+fn agent_edges(app: &Cagents, count: usize) -> Vec<workspace_model_sync::ModelUpdate> {
+    let identity = app.workspace_model.identity;
+    let sequence = app
+        .workspace_model
+        .sequence
+        .max(app.shared_views.snapshot_sequence);
+    (1..=count as u64)
+        .map(|offset| workspace_model_sync::ModelUpdate::Changed {
+            sequence: sequence + offset,
+            edit: crate::workspace_model::ModelEdit::AgentsChanged,
+            changes: workspace_model_sync::EdgeChanges {
+                identity: Some(identity),
+                ..Default::default()
+            },
+        })
+        .collect()
+}
+
+/// A burst of shared model edges, such as a spawn's or a startup's, met by a
+/// window the size of a long-lived installation: each edge as its own
+/// update, as the observer delivered them before, and the same edges as one
+/// run.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn observed_edge_burst_timing() {
+    super::projection_oracle::disable();
+    let (mut app, _channels, directory) = large_workspace(&Scale::LARGE);
+    app.shared_views.skip_rediscovery_check();
+    settle_seeds(&mut app);
+    const BURST: usize = 8;
+    let mut apart = Vec::new();
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        for edge in agent_edges(&app, BURST) {
+            let started = Instant::now();
+            drop(app.update(Message::WorkspaceModelObserved(edge)));
+            apart.push(started.elapsed());
+        }
+        let edges = agent_edges(&app, BURST);
+        let started = Instant::now();
+        drop(app.apply_workspace_model_updates(edges));
+        runs.push(started.elapsed());
+    }
+    summary("update per edge, one edge per update", &mut apart);
+    summary(&format!("update per run of {BURST} edges"), &mut runs);
+    let phases = save_phases(&directory, || {
+        for edge in agent_edges(&app, BURST) {
+            drop(app.update(Message::WorkspaceModelObserved(edge)));
+        }
+    });
+    report_phases(phases);
+}

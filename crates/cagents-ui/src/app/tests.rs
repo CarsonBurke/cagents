@@ -12149,6 +12149,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         replica_capture: ReplicaCapture::default(),
         navigation_save_generation: 0,
         pending_repository_reconciliation: Vec::new(),
+        observed_run: None,
         released_repository_navigation: HashMap::new(),
         keyboard_owed: None,
         hover_focus: None,

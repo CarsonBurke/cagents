@@ -19,6 +19,7 @@ mod device_ui;
 pub(crate) mod dialog_ui;
 #[cfg(test)]
 mod dispatch_tests;
+mod ingress;
 mod inspector_activity;
 mod inspector_rail;
 use crate::file_manager;
@@ -1404,7 +1405,7 @@ impl SnapshotCaptureParent {
             return Self(None);
         }
         let parent = match message {
-            Message::WorkspaceModelObserved(_) => "observer",
+            Message::WorkspaceModelObserved(_) | Message::WorkspaceModelArrived(_) => "observer",
             Message::ReplicaCaptureDue(_) => "replica_timer",
             _ => "other_update",
         };
@@ -1476,19 +1477,20 @@ impl std::hash::Hash for WorkspaceModelSource {
     }
 }
 
+/// The shared model updates, a run at a time: a burst such as an agent
+/// spawn's edges, sent while the window applied the one before, arrives as one
+/// update and is reconciled once rather than once per edge. See [`ingress`].
 fn workspace_model_stream(
     source: &WorkspaceModelSource,
 ) -> Pin<
     Box<
-        dyn cosmic::iced::futures::Stream<Item = workspace_model_sync::ModelUpdate>
-            + Send
+        dyn cosmic::iced::futures::Stream<
+                Item = ingress::Arrival<workspace_model_sync::ModelUpdate>,
+            > + Send
             + 'static,
     >,
 > {
-    Box::pin(cosmic::iced::futures::stream::unfold(
-        source.0.clone(),
-        |receiver| async move { receiver.recv().await.ok().map(|update| (update, receiver)) },
-    ))
+    ingress::gated(source.0.clone())
 }
 
 #[derive(Clone)]
@@ -3510,6 +3512,14 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
     )
 }
 
+/// A shared model update, alone or in a run.
+fn observes_workspace_model(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::WorkspaceModelObserved(_) | Message::WorkspaceModelArrived(_)
+    )
+}
+
 /// Messages that may run while background repository loads wait for their
 /// shared reconciliation: further loads, which join it, and the reconciliation.
 fn defers_repository_reconciliation(message: &Message) -> bool {
@@ -5092,6 +5102,10 @@ pub enum Message {
     },
     /// One shared sidebar model update, from the daemon observer or publisher.
     WorkspaceModelObserved(workspace_model_sync::ModelUpdate),
+    /// The first of the shared model updates waiting for the window. The
+    /// update takes the rest from the observer's channel, applies them in
+    /// order and reconciles once; see [`Cagents::apply_workspace_model_updates`].
+    WorkspaceModelArrived(ingress::Arrival<workspace_model_sync::ModelUpdate>),
     Repository(RepositoryAction),
     OperationRecovery(crate::operation_recovery::Action),
     ResolvedDiffBasis {
@@ -6020,6 +6034,10 @@ pub struct Cagents {
     /// load order. Any message other than another background load reconciles
     /// them first.
     pending_repository_reconciliation: Vec<PathBuf>,
+    /// While a run of shared model updates is applied, what its edges have
+    /// left owed so far. `None` outside a run, where every update
+    /// reconciles as it is applied.
+    observed_run: Option<workspace_model_sync::ObservedRun>,
     /// Where editors were when a save last dropped them from durable: a
     /// closed editor, or one still loading. A shared view reopening the same
     /// pane, or a retried attach, puts the editor back there.
@@ -16796,6 +16814,7 @@ impl Application for Cagents {
             replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
             pending_repository_reconciliation: Vec::new(),
+            observed_run: None,
             released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             hover_focus: None,
@@ -16972,7 +16991,7 @@ impl Application for Cagents {
                 WorkspaceModelSource(self.workspace_model_rx.clone()),
                 workspace_model_stream,
             )
-            .map(Message::WorkspaceModelObserved),
+            .map(Message::WorkspaceModelArrived),
             Subscription::run_with(
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
@@ -17758,8 +17777,7 @@ impl Application for Cagents {
         // an ordinary update does not read the clock or allocate.
         let _capture_parent = SnapshotCaptureParent::enter(&message);
         let timer_update = matches!(&message, Message::ReplicaCaptureDue(_));
-        let _workspace_timing = ((matches!(&message, Message::WorkspaceModelObserved(_))
-            || timer_update)
+        let _workspace_timing = ((observes_workspace_model(&message) || timer_update)
             && tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG))
         .then(|| {
             WorkspaceUpdateTiming(
@@ -17995,6 +18013,7 @@ impl Cagents {
                 | Message::AttachedWorktreePrsResolved { .. }
                 | Message::GitUi(_)
                 | Message::WorkspaceModelObserved(_)
+                | Message::WorkspaceModelArrived(_)
                 | Message::ProjectUi(_)
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
@@ -18005,7 +18024,7 @@ impl Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized { .. }
         );
-        let model_update = matches!(&message, Message::WorkspaceModelObserved(_));
+        let model_update = observes_workspace_model(&message);
         let mut projection = if repaint_tick(&message)
             || background_poll(&message)
             || matches!(message, Message::ReplicaCaptureDue(_))
@@ -18086,7 +18105,13 @@ impl Cagents {
                 self.observe_hosted_descriptors(terminals)
             }
             Message::WorkspaceModelObserved(update) => {
-                let (task, model_projection) = self.apply_workspace_model_update_projection(update);
+                let (task, model_projection) = self.apply_workspace_model_updates(vec![update]);
+                projection = model_projection;
+                task
+            }
+            Message::WorkspaceModelArrived(arrival) => {
+                let updates = arrival.drain(&self.workspace_model_rx);
+                let (task, model_projection) = self.apply_workspace_model_updates(updates);
                 projection = model_projection;
                 task
             }
