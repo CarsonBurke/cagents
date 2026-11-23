@@ -12,6 +12,12 @@ fn item(body: &str) -> Arc<chat::Item> {
         },
     })
 }
+/// The one input `state` hands over, as a chat with one staged message does.
+fn settle_one(state: &mut State, target: Target, budget: Duration) -> Settled {
+    let mut settled = state.settle_staged(target, budget);
+    assert_eq!(settled.len(), 1, "one staged input is handed over");
+    settled.pop().unwrap()
+}
 fn target() -> Target {
     Target {
         card: CardId::new(),
@@ -272,7 +278,9 @@ fn the_growing_tail_leaves_a_parser_for_the_rest() {
 fn the_tail_takes_a_free_parser_at_once_only_when_nobody_waits() {
     current_thread().block_on(async {
         let pool = Arc::new(Pool::new(2));
-        let first = pool.try_acquire_tail().expect("a free parser and no queue");
+        let first = pool
+            .try_acquire_free(true)
+            .expect("a free parser and no queue");
         assert_eq!(pool.lock().tail_held, 1);
         let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
         let (_history, history_release) = waiter(&pool, 9, None, &granted);
@@ -281,7 +289,7 @@ fn the_tail_takes_a_free_parser_at_once_only_when_nobody_waits() {
         assert_eq!(pool.lock().waiting.len(), 1);
         assert_eq!(pool.permits.available_permits(), 1);
         assert!(
-            pool.try_acquire_tail().is_none(),
+            pool.try_acquire_free(true).is_none(),
             "history queued for the free parser is not overtaken"
         );
         assert_eq!(order.recv().await, Some(9));
@@ -307,12 +315,14 @@ fn the_update_that_stages_a_streamed_publication_can_install_it() {
     state.set_provider(Provider::Claude);
     // Without a rank the input is history and parses in its turn.
     state.stage(&first, true, theme, |_, _| false);
-    assert!(matches!(
-        state.settle_tail(target, Duration::from_secs(10)),
-        Settled::Idle
-    ));
+    assert!(
+        state
+            .settle_staged(target, Duration::from_secs(10))
+            .is_empty()
+    );
     state.rank("message", TAIL);
-    let Settled::Ready(id, run, ready) = state.settle_tail(target, Duration::from_secs(10)) else {
+    let Settled::Ready(id, run, ready) = settle_one(&mut state, target, Duration::from_secs(10))
+    else {
         panic!("a free parser prepares the tail within the budget");
     };
     assert_eq!(id, "message");
@@ -328,14 +338,15 @@ fn the_update_that_stages_a_streamed_publication_can_install_it() {
     let second = item("The answer grows");
     state.stage(&second, true, theme, |_, _| true);
     let held = hold_retirement();
-    let Settled::Pending(task) = state.settle_tail(target, Duration::from_millis(1)) else {
+    let Settled::Pending(task) = settle_one(&mut state, target, Duration::from_millis(1)) else {
         panic!("the held reclaimer keeps the parse past the budget");
     };
     assert!(state.subscriptions(target).is_empty());
-    assert!(matches!(
-        state.settle_tail(target, Duration::from_millis(1)),
-        Settled::Idle
-    ));
+    assert!(
+        state
+            .settle_staged(target, Duration::from_millis(1))
+            .is_empty()
+    );
     drop(held);
     let message = executor.block_on(async {
         iced::runtime::task::into_stream(task)
@@ -363,13 +374,105 @@ fn the_update_that_stages_a_streamed_publication_can_install_it() {
     assert_eq!(state.subscriptions(target).len(), 1);
     let fourth = item("The answer grows again, and again");
     state.stage(&fourth, true, theme, |_, _| true);
-    assert!(matches!(
-        state.settle_tail(target, Duration::from_secs(10)),
-        Settled::Idle
-    ));
+    assert!(
+        state
+            .settle_staged(target, Duration::from_secs(10))
+            .is_empty()
+    );
     assert_eq!(state.subscriptions(target).len(), 1);
     drop(state);
     retirement_barrier();
+}
+
+#[test]
+fn the_update_that_stages_a_step_installs_every_message_it_brought() {
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = executor.enter();
+    let target = target();
+    let theme = crate::settings::EditorSyntaxTheme::Auto;
+    let named = |id: &str, body: &str| {
+        let mut item = (*item(body)).clone();
+        item.id = id.into();
+        Arc::new(item)
+    };
+    // A step's message is no longer the newest row once its tool call
+    // arrives in the same publication, so it is ranked behind the tail.
+    let message = named("message", "## Step 3\n\nThe cache keeps its cursor.");
+    let earlier = named("earlier", "The step before it.");
+    let history = named("history", "Long ago.");
+    // Too long to parse within the budget: waiting would only hold the
+    // update.
+    let long = named("long", &"A long finished message. ".repeat(1024));
+    let mut state = State::default();
+    state.context(
+        target,
+        Some("session"),
+        None,
+        &[
+            history.clone(),
+            long.clone(),
+            earlier.clone(),
+            message.clone(),
+        ],
+    );
+    state.set_provider(Provider::Claude);
+    for staged in [&message, &earlier, &long, &history] {
+        state.stage(staged, false, theme, |_, _| false);
+    }
+    state.rank("message", 3);
+    state.rank("long", 4);
+    state.rank("earlier", 6);
+    // `history` keeps no rank: it parses in its turn.
+    let settled = state.settle_staged(target, Duration::from_secs(10));
+    let mut installed = Vec::new();
+    for settled in settled {
+        let Settled::Ready(id, run, ready) = settled else {
+            panic!("free parsers prepare both within the budget");
+        };
+        let prepared = state.accept(target, &id, run, ready).expect("current run");
+        installed.push(prepared.item().id.clone());
+        prepared.discard();
+    }
+    assert_eq!(installed, ["message", "earlier"], "best rank first");
+    let subscriptions = state.subscriptions(target);
+    assert_eq!(
+        subscriptions.len(),
+        2,
+        "the long message and the unranked history wait for their subscriptions"
+    );
+    drop(subscriptions);
+    drop(state);
+    retirement_barrier();
+}
+
+#[test]
+fn a_staged_message_does_not_overtake_one_queued_for_a_parser() {
+    current_thread().block_on(async {
+        let pool = Arc::new(Pool::new(2));
+        let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+        let held = pool.try_acquire_free(false).expect("a free parser");
+        assert_eq!(
+            pool.lock().tail_held,
+            0,
+            "only the tail counts toward its share"
+        );
+        let (_queued, release) = waiter(&pool, 4, None, &granted);
+        // It joins the queue, then yields before it contends.
+        tokio::task::yield_now().await;
+        assert_eq!(pool.lock().waiting.len(), 1);
+        assert_eq!(pool.permits.available_permits(), 1);
+        assert!(
+            pool.try_acquire_free(false).is_none(),
+            "an input already queued keeps its turn"
+        );
+        assert_eq!(order.recv().await, Some(4));
+        drop(held);
+        let _ = release.send(());
+    });
 }
 
 #[test]
@@ -390,7 +493,8 @@ fn a_handover_the_chat_declines_parses_again_through_its_subscription() {
         |_, _| false,
     );
     state.rank("message", TAIL);
-    let Settled::Ready(id, run, ready) = state.settle_tail(target, Duration::from_secs(10)) else {
+    let Settled::Ready(id, run, ready) = settle_one(&mut state, target, Duration::from_secs(10))
+    else {
         panic!("a free parser prepares the tail within the budget");
     };
     assert!(state.subscriptions(target).is_empty());
@@ -407,10 +511,9 @@ fn a_handover_the_chat_declines_parses_again_through_its_subscription() {
         "the declined run is parsed again rather than left unprepared"
     );
     assert!(
-        matches!(
-            state.settle_tail(target, Duration::from_secs(10)),
-            Settled::Idle
-        ),
+        state
+            .settle_staged(target, Duration::from_secs(10))
+            .is_empty(),
         "a run its subscription has seen is not handed over again"
     );
     drop(state);
@@ -439,7 +542,7 @@ fn pending_handoffs_reject_replaced_sources_and_contexts() {
         let pool = shared.workers.clone();
         let capacity = pool.permits.available_permits();
         let held = hold_retirement();
-        let Settled::Pending(task) = state.settle_tail(target, Duration::ZERO) else {
+        let Settled::Pending(task) = settle_one(&mut state, target, Duration::ZERO) else {
             panic!("the held reclaimer keeps the handoff pending");
         };
         assert_eq!(pool.permits.available_permits(), capacity - 1);
@@ -488,7 +591,8 @@ fn pending_handoffs_reject_replaced_sources_and_contexts() {
         assert_eq!(pool.permits.available_permits(), capacity);
 
         state.rank("message", TAIL);
-        let Settled::Ready(id, run, ready) = state.settle_tail(target, Duration::from_secs(10))
+        let Settled::Ready(id, run, ready) =
+            settle_one(&mut state, target, Duration::from_secs(10))
         else {
             panic!("the replacement can use the released parser");
         };
@@ -526,7 +630,7 @@ fn dropping_a_pending_handoff_task_retires_its_output_and_releases_its_parser() 
     let capacity = pool.permits.available_permits();
     drop(shared);
     let held = hold_retirement();
-    let Settled::Pending(task) = state.settle_tail(target, Duration::ZERO) else {
+    let Settled::Pending(task) = settle_one(&mut state, target, Duration::ZERO) else {
         panic!("the held reclaimer keeps the handoff pending");
     };
     drop(task);

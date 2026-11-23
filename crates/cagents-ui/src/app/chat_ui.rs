@@ -6439,7 +6439,7 @@ impl Runtime {
         retired_metadata
     }
 
-    /// Install the answer being written in the update that staged it, so
+    /// Install what a publication brought in the update that staged it, so
     /// each streamed chunk costs one frame rather than two. Waiting for the
     /// parse, rather than drawing the old text meanwhile, costs the UI
     /// thread less than that frame would.
@@ -6451,14 +6451,14 @@ impl Runtime {
         if !self.presents() || !self.visible.load(Ordering::Relaxed) {
             return Task::none();
         }
-        match self.preparation.settle_tail(self.target, BUDGET) {
-            preparation::Settled::Idle => Task::none(),
+        let settled = self.preparation.settle_staged(self.target, BUDGET);
+        Task::batch(settled.into_iter().map(|settled| match settled {
             preparation::Settled::Ready(id, run, ready) => {
                 self.markdown_prepared(self.target, &id, run, ready);
                 Task::none()
             }
             preparation::Settled::Pending(task) => task,
-        }
+        }))
     }
 
     fn markdown_prepared(&mut self, target: Target, id: &str, run: u64, ready: preparation::Ready) {
