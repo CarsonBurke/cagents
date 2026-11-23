@@ -89,7 +89,7 @@ impl Registry {
         for (scope, home) in &homes {
             adopt(&transaction, scope, home, &mut adopted)?;
         }
-        if adopted != Adopted::default() {
+        if adopted.strips > 0 {
             transaction
                 .execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
                 .map_err(|error| error.to_string())?;
@@ -138,7 +138,12 @@ fn adopt(
     let Scope::Worktree { repository, path } = scope else {
         return Ok(());
     };
-    let channel = home_channel(transaction, repository, home, adopted)?;
+    // A strip none of whose panes or agents can move leaves no channel
+    // behind, or each start would make another.
+    transaction
+        .execute_batch("SAVEPOINT adopt_strip")
+        .map_err(|error| error.to_string())?;
+    let (channel, created) = home_channel(transaction, repository, home)?;
     let destination = Scope::Channel(channel);
     let mut recorder = views::Recorder::default();
     let strip = views::read(transaction, scope)?;
@@ -168,10 +173,20 @@ fn adopt(
         .iter()
         .map(|pane| pane.id)
         .collect();
-    place_agents(transaction, scope, &destination, &left)?;
+    let placed = place_agents(transaction, scope, &destination, &left)?;
+    if moved == 0 && placed == 0 {
+        transaction
+            .execute_batch("ROLLBACK TO adopt_strip; RELEASE adopt_strip")
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     place_in_navigation(transaction, repository, path, channel)?;
+    transaction
+        .execute_batch("RELEASE adopt_strip")
+        .map_err(|error| error.to_string())?;
     adopted.strips += 1;
     adopted.panes += moved;
+    adopted.created_channels += usize::from(created);
     Ok(())
 }
 
@@ -182,8 +197,7 @@ fn home_channel(
     transaction: &Transaction<'_>,
     repository: &Path,
     home: &Home,
-    adopted: &mut Adopted,
-) -> Result<ChannelId, String> {
+) -> Result<(ChannelId, bool), String> {
     let key = repository_key(repository)?;
     if let Some(checkout) = &home.checkout {
         let existing: Option<String> = transaction
@@ -196,7 +210,7 @@ fn home_channel(
             .optional()
             .map_err(|error| error.to_string())?;
         if let Some(id) = existing {
-            return super::parse_channel_id(&id);
+            return Ok((super::parse_channel_id(&id)?, false));
         }
     }
     let id = ChannelId::new();
@@ -215,8 +229,7 @@ fn home_channel(
             ],
         )
         .map_err(|error| error.to_string())?;
-    adopted.created_channels += 1;
-    Ok(id)
+    Ok((id, true))
 }
 
 /// Agents still placed in the strip move with it, unless their own card stayed
@@ -226,9 +239,9 @@ fn place_agents(
     scope: &Scope,
     destination: &Scope,
     left: &[crate::model::CardId],
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let Scope::Worktree { repository, path } = scope else {
-        return Ok(());
+        return Ok(0);
     };
     let placed: Vec<String> = transaction
         .prepare(
@@ -247,6 +260,7 @@ fn place_agents(
         })
         .map_err(|error| error.to_string())?;
     let placement = serde_json::to_string(destination).map_err(|error| error.to_string())?;
+    let mut moved = 0;
     for id in placed {
         let agent = id
             .parse::<uuid::Uuid>()
@@ -260,8 +274,9 @@ fn place_agents(
                 params![id, placement],
             )
             .map_err(|error| error.to_string())?;
+        moved += 1;
     }
-    Ok(())
+    Ok(moved)
 }
 
 /// A project arranged by hand shows the channel where its worktree was.
