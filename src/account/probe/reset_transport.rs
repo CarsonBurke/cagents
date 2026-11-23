@@ -615,6 +615,8 @@ fn passwd_home() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    // Fixture clients exist only in builds with debug assertions.
+    #[cfg_attr(not(debug_assertions), ignore = "reset fixtures need debug assertions")]
     #[tokio::test]
     async fn fixture_marker_never_loads_real_credentials_or_accepts_nonloopback_urls() {
         let root = tempfile::tempdir().unwrap();

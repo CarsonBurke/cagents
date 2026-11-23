@@ -1335,19 +1335,35 @@ pub fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
             return Ok(false);
         }
         let window = locate(&std::env::current_exe()?)?;
-        let failed = fs::symlink_metadata(window.prefix.join(".update/status.json"))?;
-        let current = fs::symlink_metadata(window.prefix.join("current"))?;
-        let switched_after_failure = current.file_type().is_symlink()
-            && (current.ctime(), current.ctime_nsec()) > (failed.ctime(), failed.ctime_nsec());
         let served = served_version_root(&window)?;
         let daemon = installed_daemon_owner(&window)?;
-        if !failed_job_is_superseded(
-            &job,
-            &window,
-            &served,
-            daemon.as_ref(),
-            switched_after_failure,
-        ) {
+        let resolved = if job.version == window.version {
+            // An older worker can record a failure after its target already
+            // took over: e8bbb84f2 re-checks the successor with its own client,
+            // which cannot speak a newer protocol. The job's own recovery
+            // receipt, written by the target's verifier, decides it.
+            // The receipt must describe the daemon serving now, not one that
+            // has since restarted.
+            failed_job_reached_its_target(&job, &window, &served, daemon.as_ref())
+                && recovery::verified_complete(&window.prefix.join(".update"), &job.id)?
+                    .is_some_and(|proof| {
+                        source::inspect_identity(Some(&proof))
+                            .is_ok_and(|(_, serving)| serving.as_ref() == Some(&proof))
+                    })
+        } else {
+            let failed = fs::symlink_metadata(window.prefix.join(".update/status.json"))?;
+            let current = fs::symlink_metadata(window.prefix.join("current"))?;
+            let switched_after_failure = current.file_type().is_symlink()
+                && (current.ctime(), current.ctime_nsec()) > (failed.ctime(), failed.ctime_nsec());
+            failed_job_is_superseded(
+                &job,
+                &window,
+                &served,
+                daemon.as_ref(),
+                switched_after_failure,
+            )
+        };
+        if !resolved {
             return Ok(false);
         }
         let socket = crate::terminal_ipc::daemon_socket_path()?;
@@ -1392,6 +1408,23 @@ fn failed_job_is_superseded(
                 let root = window.prefix.join("versions").join(&job.version);
                 root.is_dir() && !is_unverified_candidate(&root)
             })
+}
+
+/// A failed job whose target is the build this window runs, served by its own
+/// daemon. Its recovery receipt must still show every session usable.
+#[cfg(any(feature = "ui", test))]
+fn failed_job_reached_its_target(
+    job: &UpdateJob,
+    window: &InstallLayout,
+    served: &Path,
+    daemon: Option<&InstallLayout>,
+) -> bool {
+    job.phase == UpdatePhase::Failed
+        && job.version == window.version
+        && window.version_root == served
+        && daemon.is_some_and(|owner| {
+            owner.prefix == window.prefix && owner.version_root == window.version_root
+        })
 }
 
 /// The installed UI executable, when the installation this window runs from has
@@ -4744,6 +4777,58 @@ finally:
             !failed_job_is_superseded(&job, &old_owner, &served, Some(&owner), true),
             "an old window still needs replacing"
         );
+    }
+
+    #[test]
+    fn a_failed_job_reached_its_target_only_when_this_build_serves_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let old = "0.1.3+local.e8bbb84f2";
+        let target = "0.2.2";
+        install_tree(root, &[old, target], target);
+        let window = locate(&root.join("current/bin/cagents-ui")).unwrap();
+        let owner = locate(&root.join("current/bin/cagentsd")).unwrap();
+        let old_owner = locate(&root.join("versions").join(old).join("bin/cagentsd")).unwrap();
+        let served = served_version_root(&window).unwrap();
+        let mut job = UpdateJob {
+            id: "late-successor-check".into(),
+            version: target.into(),
+            phase: UpdatePhase::Failed,
+            message: "could not configure the daemon connection".into(),
+            log_path: root.join(".update/late-successor-check.log"),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+        };
+        assert!(failed_job_reached_its_target(
+            &job,
+            &window,
+            &served,
+            Some(&owner)
+        ));
+        assert!(
+            !failed_job_reached_its_target(&job, &window, &served, Some(&old_owner)),
+            "the previous daemon still serving is an unresolved replacement"
+        );
+        assert!(!failed_job_reached_its_target(&job, &window, &served, None));
+        let old_window = locate(&root.join("versions").join(old).join("bin/cagents-ui")).unwrap();
+        assert!(
+            !failed_job_reached_its_target(&job, &old_window, &served, Some(&owner)),
+            "a window of another build is not the target"
+        );
+        job.phase = UpdatePhase::Installing;
+        assert!(
+            !failed_job_reached_its_target(&job, &window, &served, Some(&owner)),
+            "never filter a live operation"
+        );
+        job.phase = UpdatePhase::Failed;
+        job.version = "0.2.3".into();
+        assert!(!failed_job_reached_its_target(
+            &job,
+            &window,
+            &served,
+            Some(&owner)
+        ));
     }
 
     #[test]

@@ -12730,6 +12730,10 @@ fn every_timeline_row_is_a_line_by_the_one_rhythm_rule() {
 /// rows' words, the agents' names, their states and the reply are set at one
 /// size.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "its widths assume the development host's fonts, not the release sandbox's"
+)]
 fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
     use iced::advanced::{
         Layout, layout,
