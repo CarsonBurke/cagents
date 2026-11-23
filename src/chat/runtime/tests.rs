@@ -5086,11 +5086,14 @@ fn startup_frames_extend_the_deadline_only_within_the_overall_limit() {
 #[test]
 fn claude_frames_keep_a_slow_startup_alive_through_the_real_pipe() {
     let _budget = QUICK_STARTUP.scope();
-    // Each gap fits within one renewal; both together do not.
+    // Each gap between frames fits within one renewal; both together do
+    // not. The first frame arrives before either gap, so the time the
+    // fixture takes to start is not part of them.
     let gap = QUICK_STARTUP.renewal * 5 / 8;
     assert!(gap < QUICK_STARTUP.renewal && gap * 2 > QUICK_STARTUP.renewal);
     let (_directory, handle) = claude_initialization_pipe(&format!(
         "import time\n\
+             print(json.dumps({{'type': 'keep_alive'}}), flush=True)\n\
              time.sleep({gap})\n\
              print(json.dumps({{'type': 'future_advisory'}}), flush=True)\n\
              time.sleep({gap})\n\

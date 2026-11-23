@@ -2559,6 +2559,7 @@ impl StartupBudget {
     /// Apply this budget to protocol actors started on this thread until
     /// the guard drops.
     #[cfg(test)]
+    #[must_use = "the budget applies only while the guard lives"]
     pub(super) fn scope(self) -> impl Drop {
         struct Restore(StartupBudget);
         impl Drop for Restore {
