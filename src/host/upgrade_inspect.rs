@@ -3710,7 +3710,7 @@ mod tests {
         assert_eq!(
             judge.look_again(
                 starting_in(processes.path(), &[4242, 4243]),
-                Instant::now() + 3 * STARTING_RETRY,
+                Instant::now() + Duration::from_millis(500),
                 None,
                 &mut unreadable
             ),
@@ -3736,7 +3736,7 @@ mod tests {
         assert_eq!(
             judge.look_again(
                 starting_in(processes.path(), &[4243]),
-                Instant::now() + 3 * STARTING_RETRY,
+                Instant::now() + Duration::from_millis(500),
                 None,
                 &mut unreadable
             ),
