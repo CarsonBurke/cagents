@@ -11977,6 +11977,14 @@ impl Cagents {
             .any(|observation| observation.pending && observation.title.is_some())
     }
 
+    /// Samples channel name suggestions and restores names held back for a
+    /// channel's arrival, as the end of a reconciliation does.
+    pub(super) fn refresh_channel_naming(&mut self) -> Task<Message> {
+        let task = self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
+        task
+    }
+
     pub(super) fn refresh_channel_title_suggestions(&mut self) -> Task<Message> {
         for target in self
             .chat_ui

@@ -7288,10 +7288,14 @@ fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
         } else {
             drop(app.apply_workspace_model_update(first));
         }
-        assert!(
-            !reconciles(&mut app, echo),
+        let before = complete_reconciliations();
+        let (_, projected) = app.apply_workspace_model_update_effect(echo);
+        assert_eq!(
+            complete_reconciliations(),
+            before,
             "{kind}: an edge that changes nothing skips the reconciliation"
         );
+        assert!(!projected, "{kind}: and the projection after it");
     }
     // Work only a complete reconciliation finishes is not skipped, even for
     // an edge that changed nothing.
@@ -7308,6 +7312,30 @@ fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
         ),
     ));
     assert!(app.pending_repository_reconciliation.is_empty());
+    // Nor is a worktree discovered since the last reconciliation, which
+    // decides where a card in it belongs.
+    app.known_worktree_roots
+        .insert(repository.join(".worktrees/feature"));
+    assert!(reconciles(
+        &mut app,
+        changed_edge(
+            identity,
+            18,
+            ModelEdit::AgentsChanged,
+            EditEffects::default(),
+            vec![]
+        ),
+    ));
+    assert!(!reconciles(
+        &mut app,
+        changed_edge(
+            identity,
+            19,
+            ModelEdit::AgentsChanged,
+            EditEffects::default(),
+            vec![]
+        ),
+    ));
     // An edge older than the last complete snapshot, holding a view revision
     // the window already passed, changes nothing either. (The snapshot
     // sequence is set by hand: only the fence matters here.)

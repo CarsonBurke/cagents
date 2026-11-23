@@ -2,8 +2,8 @@
 //! window as that reconciliation would.
 //!
 //! [`Cagents::apply_changed_edge`] skips
-//! [`Cagents::reconcile_workspace_model`] for an edge that changed nothing it
-//! reads. That claims the window is already what the reconciliation makes it.
+//! [`Cagents::reconcile_workspace_model`], and the projection after it, for
+//! an edge that changed nothing it reads. That claims the window is already what the reconciliation makes it.
 //! In unit tests built with debug assertions, each such skip captures what the
 //! reconciliation writes, runs it, and fails on any difference, including any
 //! edit it would publish or task it would start. The reconciliation's result
@@ -69,8 +69,9 @@ pub(super) fn check_skipped(app: &mut Cagents, kind: &str) {
     if !super::projection_oracle::enabled() {
         return;
     }
-    // The skipping update still ends with the full projection; settle the
-    // derived state as it will, so only the reconciliation's own work shows.
+    // Settle what earlier updates in the same message owe the projection,
+    // so only the reconciliation's own work shows. That the skip itself owes
+    // none is the projection oracle's check.
     VERIFYING.set(true);
     drop(app.project_workspace(false));
     let skipped = Snapshot::capture(app);
