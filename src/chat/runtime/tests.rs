@@ -4597,6 +4597,15 @@ fn claude_initialization_pipe(body: &str) -> (tempfile::TempDir, LocalHandle) {
     (directory, handle)
 }
 
+/// The real-pipe deadline tests' initialization deadline: short enough to
+/// finish in seconds, and long enough for a busy host to start the fixture
+/// well within it. The arithmetic of the production budget is pinned by
+/// `startup_frames_extend_the_deadline_only_within_the_overall_limit`.
+const QUICK_STARTUP: StartupBudget = StartupBudget {
+    renewal: Duration::from_secs(4),
+    limit: STARTUP_LIMIT,
+};
+
 /// Wait for the fixture's initialization to end, however it ends. The
 /// error says which deadline or failure ended it, so how long it took is
 /// not part of any assertion.
@@ -4615,6 +4624,7 @@ fn finish_initialization_pipe(handle: &LocalHandle) -> Snapshot {
 
 #[test]
 fn claude_advisories_do_not_disable_the_real_pipe_initialization_deadline() {
+    let _budget = QUICK_STARTUP.scope();
     let (_directory, handle) = claude_initialization_pipe(
         "print(json.dumps({'type': 'keep_alive'}), flush=True)\n\
              print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
@@ -5061,30 +5071,36 @@ fn a_backlog_beyond_the_frame_budget_drains_after_eof() {
 fn startup_frames_extend_the_deadline_only_within_the_overall_limit() {
     let started = Instant::now();
     let at = |seconds| started + Duration::from_secs(seconds);
+    let expired = |progress, now| StartupBudget::PRODUCTION.expired(started, progress, now);
     // No progress: the original 30 seconds.
-    assert!(!startup_expired(started, started, at(30)));
-    assert!(startup_expired(started, started, at(31)));
+    assert!(!expired(started, at(30)));
+    assert!(expired(started, at(31)));
     // A frame earns another 30 seconds from when it arrived.
-    assert!(!startup_expired(started, at(29), at(59)));
-    assert!(startup_expired(started, at(29), at(60)));
+    assert!(!expired(at(29), at(59)));
+    assert!(expired(at(29), at(60)));
     // Frames forever cannot outlast the overall limit.
-    assert!(!startup_expired(started, at(299), at(300)));
-    assert!(startup_expired(started, at(300), at(301)));
+    assert!(!expired(at(299), at(300)));
+    assert!(expired(at(300), at(301)));
 }
 
 #[test]
 fn claude_frames_keep_a_slow_startup_alive_through_the_real_pipe() {
-    let (_directory, handle) = claude_initialization_pipe(
+    let _budget = QUICK_STARTUP.scope();
+    // Each gap fits within one renewal; both together do not.
+    let gap = QUICK_STARTUP.renewal * 5 / 8;
+    assert!(gap < QUICK_STARTUP.renewal && gap * 2 > QUICK_STARTUP.renewal);
+    let (_directory, handle) = claude_initialization_pipe(&format!(
         "import time\n\
-             time.sleep(20)\n\
-             print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
-             time.sleep(20)\n\
-             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
+             time.sleep({gap})\n\
+             print(json.dumps({{'type': 'future_advisory'}}), flush=True)\n\
+             time.sleep({gap})\n\
+             print(json.dumps({{'type': 'control_response', 'response': {{'subtype': 'success', 'request_id': request['request_id'], 'response': {{}}}}}}), flush=True)\n\
              sys.stdin.read()\n",
-    );
-    // The fixture alone takes 40 seconds; a deadline it failed to renew
-    // ends the loop early with an error.
-    let deadline = Instant::now() + Duration::from_secs(40) + crate::test_timing::EVENTUALLY;
+        gap = gap.as_secs_f64(),
+    ));
+    // A deadline the fixture failed to renew ends the loop early with an
+    // error.
+    let deadline = Instant::now() + gap * 2 + crate::test_timing::EVENTUALLY;
     let snapshot = loop {
         let snapshot = handle.snapshot(None).unwrap();
         if snapshot.ready || snapshot.error.is_some() || Instant::now() > deadline {
@@ -5098,11 +5114,13 @@ fn claude_frames_keep_a_slow_startup_alive_through_the_real_pipe() {
 
 #[test]
 fn claude_garbage_only_startup_still_fails_at_the_first_deadline_with_its_preview() {
-    // Wrapper output never stops, so a deadline that it renewed would
-    // never expire.
+    let _budget = QUICK_STARTUP.scope();
+    // Wrapper output never stops and arrives several times per renewal, so
+    // a deadline that it renewed would never expire. It stays well under the
+    // eight consecutive ignored lines that end startup on their own.
     let (_directory, handle) = claude_initialization_pipe(
         "import time\n\
-             while True:\n    print('wrapper diagnostic', flush=True)\n    time.sleep(7)\n",
+             while True:\n    print('wrapper diagnostic', flush=True)\n    time.sleep(1)\n",
     );
     let snapshot = finish_initialization_pipe(&handle);
     let error = snapshot.error.as_deref().unwrap();
