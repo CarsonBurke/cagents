@@ -13274,6 +13274,35 @@ fn attention_keeps_channels_the_user_dealt_with_until_hidden() {
     );
 }
 
+/// A wait that changes what it waits for is still the one wait: it is not
+/// news again once read. Answering a wait of any kind settles it as
+/// answering an unnamed one does.
+#[test]
+fn a_wait_changing_its_kind_stays_one_wait_and_any_kind_is_answered() {
+    use crate::agent::ActivityState;
+
+    let (mut app, card, channel) = attention_channel_test_app();
+    drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+        sidebar::SidebarFilter::Attention,
+    ))));
+    app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Approval));
+    assert!(app.sidebar_state.has_card_update(card));
+    app.read_card_update(card);
+    app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Question));
+    assert!(
+        !app.sidebar_state.has_card_update(card),
+        "a question after a permission is the same wait"
+    );
+    app.refresh_sidebar_channels();
+    assert!(attention_lists_channel(&app, channel));
+    app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Working));
+    app.refresh_sidebar_channels();
+    assert!(
+        attention_lists_channel(&app, channel),
+        "answering the question keeps its channel"
+    );
+}
+
 /// A waiting agent that disconnects, or whose chat goes away, was not
 /// answered: its row leaves the Attention list with the wait.
 #[test]

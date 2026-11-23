@@ -817,6 +817,41 @@ mod tests {
         assert_eq!(encode(ToolStatus::Waiting), waiting);
     }
 
+    /// What a waiting agent waits for reaches a client that knows the kinds,
+    /// and an older one is told it waits, as it was before.
+    #[test]
+    fn a_wait_kind_reaches_an_older_client_as_waiting() {
+        use crate::agent::ActivityState;
+        let encode = |state: ActivityState| postcard::to_stdvec(&state).unwrap();
+        // Encoded as derived: by declaration position, and by name in JSON.
+        for state in [
+            ActivityState::Unknown,
+            ActivityState::Idle,
+            ActivityState::Working,
+            ActivityState::Waiting,
+            ActivityState::Approval,
+            ActivityState::Question,
+        ] {
+            let encoded = encode(state);
+            assert_eq!(
+                postcard::from_bytes::<ActivityState>(&encoded).unwrap(),
+                state
+            );
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, format!("\"{state:?}\""));
+            assert_eq!(serde_json::from_str::<ActivityState>(&json).unwrap(), state);
+        }
+        assert_eq!(encode(ActivityState::Approval), [4]);
+        assert_eq!(encode(ActivityState::Question), [5]);
+        for state in [ActivityState::Approval, ActivityState::Question] {
+            assert_eq!(
+                encoding_for(WAIT_KINDS - 1, || encode(state)),
+                encode(ActivityState::Waiting)
+            );
+            assert_eq!(encoding_for(WAIT_KINDS, || encode(state)), encode(state));
+        }
+    }
+
     /// A file change crosses the protocol that added its line origin both
     /// ways: an older client is sent the fields it decodes, and one read
     /// from an older update source, which never said where its lines are, is

@@ -1123,8 +1123,8 @@ pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
     }
 }
 
-/// The row that closes a working transcript: a small muted spinner, or the
-/// waiting glyph, beside what the agent is doing. Without a glyph its place
+/// The row that closes a working transcript: the working spinner, or the
+/// glyph of what the agent waits for, beside what the agent is doing. Without a glyph its place
 /// stays empty, so the words keep their position.
 fn activity_row<'a>(
     glyph: Option<Icon>,

@@ -9188,7 +9188,9 @@ impl Cagents {
             let placement = self.attention_placement(card, &listed);
             self.sidebar_state.settle_waiting_agent(card, &placement);
         }
-        if (next.is_some_and(crate::agent::ActivityState::waits_on_user) && previous != next)
+        // A wait that changes what it waits for is still the one wait.
+        if (next.is_some_and(crate::agent::ActivityState::waits_on_user)
+            && !previous.is_some_and(crate::agent::ActivityState::waits_on_user))
             || (previous == Some(crate::agent::ActivityState::Working)
                 && next == Some(crate::agent::ActivityState::Idle))
         {
@@ -16479,6 +16481,8 @@ impl Application for Cagents {
                 "Could not enable opt-in chat stage measurements");
         }
         std::thread::spawn(chat_ui::prune_pasted_images);
+        // Before any system theme is applied, so none shows the stock warning.
+        cosmic::theme::adjust_system_themes(crate::settings::attention_in_yellow);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]

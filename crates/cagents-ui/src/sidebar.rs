@@ -632,7 +632,16 @@ impl SidebarChannel {
         // unread news, a failure, or an agent the members leave out.
         let described = AttentionSummary {
             working: self.members.agents_in(ChannelMemberState::Working),
-            waiting: self.members.agents_in(ChannelMemberState::Waiting),
+            waiting: [
+                ChannelMemberState::Approval,
+                ChannelMemberState::Question,
+                ChannelMemberState::Waiting,
+            ]
+            .map(|state| self.members.agents_in(state))
+            .iter()
+            .sum(),
+            approval: self.members.agents_in(ChannelMemberState::Approval),
+            question: self.members.agents_in(ChannelMemberState::Question),
             limited: self.members.agents_in(ChannelMemberState::Limited),
             ..AttentionSummary::default()
         };
@@ -6128,7 +6137,7 @@ fn header<'a>(
         let attention = state.filter == SidebarFilter::Attention;
         actions.push(crate::interaction::tooltip(
             crate::interaction::pressed(
-                centered_icon_button(Icon::Inbox, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+                centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
                     .class(sidebar_button_style(attention))
                     .id(filter_id(SidebarFilter::Attention))
                     .name("Show projects needing attention")
@@ -7184,12 +7193,12 @@ fn compact_operation_rows(
 }
 
 /// The leading glyph: the worktree icon the row will keep, muted, while the
-/// creation runs; a warning once it has failed. The spinner is the status
+/// creation runs; the error glyph once it has failed. The spinner is the status
 /// slot's in a row, and a corner badge's in the rail.
 fn operation_icon(phase: WorktreeOperationPhase, size: u16) -> Element<'static, SidebarAction> {
     match phase {
         WorktreeOperationPhase::Working => worktree_glyph_muted(size).into(),
-        WorktreeOperationPhase::Failed => toned_icon_sized(Icon::Warning, BadgeTone::Warning, size),
+        WorktreeOperationPhase::Failed => toned_icon_sized(Icon::Error, BadgeTone::Danger, size),
     }
 }
 
@@ -9166,9 +9175,12 @@ fn worktree_accessible_name(
     if unread {
         name.to_mut().push_str(", unread agent update");
     }
+    // The row's own wait is said below, by its kind.
     let news = AttentionSummary {
         working: 0,
         waiting: 0,
+        approval: 0,
+        question: 0,
         ..attention
     }
     .description();

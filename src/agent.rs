@@ -138,9 +138,9 @@ impl ActivityState {
             Self::Unknown => "unknown",
             Self::Idle => "idle",
             Self::Working => "working",
-            Self::Waiting => "waiting",
-            Self::Approval => "waiting for approval",
-            Self::Question => "waiting for an answer",
+            // One word for every wait, as listings have always read it; what
+            // a wait is for is the request's to say (`cagents agent requests`).
+            Self::Waiting | Self::Approval | Self::Question => "waiting",
         }
     }
 }

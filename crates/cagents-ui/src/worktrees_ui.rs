@@ -784,8 +784,8 @@ impl<'a> View<'a> {
         let glyph: Element<'a, Action> = if failed {
             // As the sidebar draws the same failed creation.
             crate::sidebar::toned_icon_sized(
-                Icon::Warning,
-                crate::sidebar::BadgeTone::Warning,
+                Icon::Error,
+                crate::sidebar::BadgeTone::Danger,
                 design::ROW_ICON_SIZE,
             )
         } else {

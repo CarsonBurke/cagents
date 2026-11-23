@@ -12,7 +12,7 @@ use cosmic_config::{CosmicConfigEntry, config_subscription};
 use cosmic_theme::{Component, LayeredTheme, Spacing, ThemeMode};
 use iced_futures::Subscription;
 use iced_runtime::{Appearance, DefaultStyle};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 pub use style::*;
 
 pub type CosmicColor = ::palette::rgb::Srgba;
@@ -50,6 +50,18 @@ pub(crate) static THEME: Mutex<Theme> = Mutex::new(Theme {
     transparent: false,
     list_item_position: None,
 });
+
+/// What an application changes in every system theme before it is applied.
+static SYSTEM_THEME_ADJUSTMENT: OnceLock<fn(CosmicTheme) -> CosmicTheme> = OnceLock::new();
+
+/// Has every system theme pass through `adjust` before it is applied: the
+/// first one, and each the desktop sends later, including those rebuilt for
+/// a portal accent. An application that only set an adjusted theme itself
+/// would lose its adjustment at the desktop's next theme change. The first
+/// adjustment registered is kept.
+pub fn adjust_system_themes(adjust: fn(CosmicTheme) -> CosmicTheme) {
+    let _ = SYSTEM_THEME_ADJUSTMENT.set(adjust);
+}
 
 /// Currently-defined theme.
 #[inline]
@@ -266,7 +278,13 @@ impl Theme {
     #[inline]
     /// set the theme
     pub fn set_theme(&mut self, theme: ThemeType) {
-        self.theme_type = theme;
+        self.theme_type = match (theme, SYSTEM_THEME_ADJUSTMENT.get()) {
+            (ThemeType::System { prefer_dark, theme }, Some(adjust)) => ThemeType::System {
+                prefer_dark,
+                theme: Arc::new(adjust(Arc::unwrap_or_clone(theme))),
+            },
+            (theme, _) => theme,
+        };
     }
 
     #[inline]

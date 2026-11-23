@@ -238,10 +238,11 @@ pub fn activity_color(theme: &Theme) -> Color {
     accent_color(theme)
 }
 
-/// Something needs the user before it can go on: an agent waiting for input,
-/// a usage limit, a failure to act on. Never routine progress or a durable
-/// fact such as uncommitted changes; on many themes this is close enough to
-/// [`destructive_color`] that a row full of it reads as an alarm.
+/// Something needs the user before it can go on: an agent waiting for
+/// permission, an answer or input, or stopped by a usage limit; or a caution
+/// the user should weigh. A failure is [`destructive_color`]. Never routine
+/// progress or a durable fact such as uncommitted changes. The stock themes
+/// paint it yellow (`settings::attention_in_yellow`).
 pub fn warning_color(theme: &Theme) -> Color {
     theme.cosmic().warning.base.into()
 }

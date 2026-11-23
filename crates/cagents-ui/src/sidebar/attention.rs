@@ -256,14 +256,22 @@ impl Summary {
 
     /// What `self` counts beyond `other`: the news of a total that rows
     /// drawn on their own do not show. Never below nothing.
+    /// What this summary says that `other` does not. The kinds of wait
+    /// stay a part of the waits left, so a wait `other` names without its
+    /// kind is not said again by its kind.
     pub(super) fn without(self, other: Self) -> Self {
+        let waiting = self.waiting.saturating_sub(other.waiting);
+        let approval = self.approval.saturating_sub(other.approval).min(waiting);
         Self {
             unread: self.unread.saturating_sub(other.unread),
             working: self.working.saturating_sub(other.working),
             failed: self.failed.saturating_sub(other.failed),
-            waiting: self.waiting.saturating_sub(other.waiting),
-            approval: self.approval.saturating_sub(other.approval),
-            question: self.question.saturating_sub(other.question),
+            waiting,
+            approval,
+            question: self
+                .question
+                .saturating_sub(other.question)
+                .min(waiting - approval),
             limited: self.limited.saturating_sub(other.limited),
         }
     }
@@ -286,8 +294,6 @@ impl Summary {
         if self.question != 0 {
             parts.push(format!("{} waiting for an answer", self.question));
         }
-        // Saturating: a summary with the waits already described taken out
-        // may keep the kinds of the waits it no longer counts.
         let unnamed = self.waiting.saturating_sub(self.approval + self.question);
         if unnamed != 0 {
             parts.push(format!("{unnamed} waiting for input"));
@@ -463,5 +469,35 @@ mod tests {
         );
         worktree.remove(approval);
         assert_eq!(worktree.state(), Some(State::Question));
+    }
+
+    /// A wait said elsewhere without its kind is not said again by its kind.
+    #[test]
+    fn taking_out_waits_takes_their_kinds_with_them() {
+        let mut channel = Summary::default();
+        channel.add(Summary::card(Some(ActivityState::Approval), false, false));
+        channel.add(Summary::card(Some(ActivityState::Question), false, false));
+        let unnamed = Summary {
+            waiting: 2,
+            ..Summary::default()
+        };
+        assert_eq!(channel.without(unnamed).description(), "");
+        let one = Summary {
+            waiting: 1,
+            ..Summary::default()
+        };
+        assert_eq!(
+            channel.without(one).description(),
+            "1 waiting for permission"
+        );
+        let named = Summary {
+            waiting: 1,
+            question: 1,
+            ..Summary::default()
+        };
+        assert_eq!(
+            channel.without(named).description(),
+            "1 waiting for permission"
+        );
     }
 }

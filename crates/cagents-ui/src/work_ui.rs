@@ -1034,7 +1034,9 @@ impl State {
                 let state = match session.state {
                     ActivityState::Idle | ActivityState::Unknown => "idle",
                     ActivityState::Waiting => "waiting for you",
-                    state => state.label(),
+                    ActivityState::Approval => "waiting for your permission",
+                    ActivityState::Question => "waiting for your answer",
+                    ActivityState::Working => "working",
                 };
                 crate::interaction::tooltip(
                     widget::button::custom(glyph)

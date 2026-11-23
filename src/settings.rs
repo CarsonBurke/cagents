@@ -103,10 +103,11 @@ impl AppTheme {
             palette::{Srgb, Srgba},
         };
         let palette = match self {
+            // Applying it passes it through `attention_in_yellow`, which
+            // `cosmic::theme::adjust_system_themes` registers, as it does each
+            // theme the desktop sends later.
             Self::System => {
-                return cosmic::Theme::system(std::sync::Arc::new(attention_in_yellow(
-                    system.cosmic().clone(),
-                )));
+                return cosmic::Theme::system(std::sync::Arc::new(system.cosmic().clone()));
             }
             Self::Dark => {
                 return cosmic::Theme::custom(std::sync::Arc::new(attention_in_yellow(
@@ -3613,26 +3614,47 @@ mod tests {
             let (a, b) = (luminance(a), luminance(b));
             (a.max(b) + 0.05) / (a.min(b) + 0.05)
         }
+        // The desktop's theme, light or dark, as libcosmic applies it, both
+        // when the app first sets it and whenever the desktop sends another.
+        cosmic::theme::adjust_system_themes(attention_in_yellow);
+        let applied_system = |dark: bool| {
+            let desktop = if dark {
+                cosmic::cosmic_theme::Theme::dark_default()
+            } else {
+                cosmic::cosmic_theme::Theme::light_default()
+            };
+            let mut applied = cosmic::Theme::default();
+            applied.set_theme(
+                AppTheme::System
+                    .resolve(&cosmic::Theme::system(std::sync::Arc::new(desktop)))
+                    .theme_type,
+            );
+            applied
+        };
         let system = cosmic::Theme::dark();
-        for theme in [AppTheme::Dark, AppTheme::Light] {
-            let resolved = theme.resolve(&system);
+        for (theme, resolved) in [
+            ("Dark", AppTheme::Dark.resolve(&system)),
+            ("Light", AppTheme::Light.resolve(&system)),
+            ("System dark", applied_system(true)),
+            ("System light", applied_system(false)),
+        ] {
             let cosmic = resolved.cosmic();
             let warning = cosmic.warning.base;
             // Yellow: red and green both well above blue, and close together.
             assert!(
                 warning.blue < warning.green * 0.5 && (warning.red - warning.green).abs() < 0.3,
-                "{theme:?} warning {warning:?} is not yellow"
+                "{theme} warning {warning:?} is not yellow"
             );
             for surface in [cosmic.bg_color(), cosmic.primary_container_color()] {
                 assert!(
                     contrast(warning, surface) >= 4.5,
-                    "{theme:?} warning is illegible on {surface:?}"
+                    "{theme} warning is illegible on {surface:?}"
                 );
             }
             let red = cosmic.destructive.base;
             assert!(
                 (warning.green - red.green).abs() > 0.2,
-                "{theme:?} warning reads as the destructive red"
+                "{theme} warning reads as the destructive red"
             );
             assert!(contrast(cosmic.warning.on, warning) >= 4.5);
         }
