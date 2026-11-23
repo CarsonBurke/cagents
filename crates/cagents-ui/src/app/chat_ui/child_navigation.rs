@@ -352,13 +352,23 @@ const ROW_HEIGHT: f32 = 56.0;
 const OVERSCAN: f32 = 4.0 * ROW_HEIGHT;
 /// The viewport assumed before the list has reported its own.
 const FIRST_VIEWPORT: f32 = 900.0;
+/// A list this tall or shorter is built whole: about fifty rows, cheap to
+/// build, and taller than any pane the list could fit in.
+const WHOLE_LIST: f32 = 3.0 * FIRST_VIEWPORT;
 
 /// The span of the list, in its own offsets, whose rows are built: the
-/// viewport and `OVERSCAN` either side. The scrollable reports nothing
-/// while its content fits, so a stale offset (from opening on a section, or
-/// from before the window grew) is held to the furthest the list can
-/// scroll; a list that fits is built whole.
+/// viewport and `OVERSCAN` either side.
+///
+/// The scrollable reports its offset and height only while its content
+/// overflows, so once a list fits (the pane grew, or the chooser opened on
+/// a section of a short list) both may be stale for good. A list short
+/// enough to fit any pane is therefore built whole, and a longer one, which
+/// overflows and so reports, has its offset held to the furthest it can
+/// scroll.
 fn built_span(total: f32, scroll: f32, viewport: Option<f32>) -> (f32, f32) {
+    if total <= WHOLE_LIST {
+        return (f32::NEG_INFINITY, f32::INFINITY);
+    }
     let viewport = viewport.unwrap_or(FIRST_VIEWPORT);
     let scroll = scroll.clamp(0.0, (total - viewport).max(0.0));
     (scroll - OVERSCAN, scroll + viewport + OVERSCAN)
@@ -1758,11 +1768,17 @@ mod tests {
     /// the rows above it unbuilt.
     #[test]
     fn a_stale_scroll_still_builds_every_row_in_view() {
-        let fits = HEADING_HEIGHT + 10.0 * ROW_HEIGHT;
-        let (top, bottom) = built_span(fits, 400.0, Some(1_000.0));
-        assert!(top <= 0.0 && bottom >= fits, "{top}..{bottom}");
-        let (top, bottom) = built_span(fits, 400.0, None);
-        assert!(top <= 0.0 && bottom >= fits, "{top}..{bottom}");
+        // The pane grew to hold a list it had scrolled to the end of: the
+        // list last reported a short viewport and the offset at its end.
+        let fits = 2.0 * HEADING_HEIGHT + 30.0 * ROW_HEIGHT;
+        for (scroll, viewport) in [
+            (fits - 500.0, Some(500.0)),
+            (400.0, Some(1_000.0)),
+            (fits / 2.0, None),
+        ] {
+            let (top, bottom) = built_span(fits, scroll, viewport);
+            assert!(top <= 0.0 && bottom >= fits, "{top}..{bottom}");
+        }
         // A long list scrolled past its end shows its last rows.
         let long = 1_000.0 * ROW_HEIGHT;
         let (top, bottom) = built_span(long, 2.0 * long, Some(500.0));
