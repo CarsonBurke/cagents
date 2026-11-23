@@ -37,7 +37,18 @@ grep -qx 'ID=ubuntu' "$BASE_ROOT/etc/os-release" || fail 'rootfs must be Ubuntu'
 grep -qx 'VERSION_ID="24.04"' "$BASE_ROOT/etc/os-release" || fail 'rootfs must be Ubuntu 24.04'
 DIST_DIR=$(realpath -- "$DIST_DIR")
 WORK=$(mktemp -d "${CAGENTS_SMOKE_WORK_DIR:-/var/tmp}/cagents-artifact-smoke.XXXXXX")
-cleanup() { rm -rf -- "$WORK"; }
+# The smokes running at once, by index; each is its `timeout`, which passes a
+# signal on to its sandbox.
+pids=()
+cleanup() {
+    local pid running=()
+    for pid in "${pids[@]}"; do [[ -z $pid ]] || running+=("$pid"); done
+    if ((${#running[@]})); then
+        kill -TERM "${running[@]}" 2>/dev/null || :
+        wait "${running[@]}" 2>/dev/null || :
+    fi
+    rm -rf -- "$WORK"
+}
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 cp -- "$ROOT_DIR/packaging/smoke-release-artifact" "$WORK/smoke"
@@ -52,13 +63,16 @@ artifacts=(
 for artifact in "${artifacts[@]}"; do
     [[ -f $DIST_DIR/$artifact && ! -L $DIST_DIR/$artifact ]] || fail "missing regular artifact: $artifact"
 done
-for artifact in "${artifacts[@]}"; do
-    mkdir "$WORK/rootfs" "$WORK/scratch"
-    cp -a --reflink=auto -- "$BASE_ROOT/." "$WORK/rootfs/"
+# Each artifact runs in its own disposable root and namespaces, so they run at
+# once; each one's output is shown whole, after it finishes.
+smoke() {
+    local artifact=$1 run=$2
+    mkdir "$run/rootfs" "$run/scratch"
+    cp -a --reflink=auto -- "$BASE_ROOT/." "$run/rootfs/"
     # Even an interrupted developer build must not provide persisted user data
     # to shipped executables. These paths are empty private mounts, not host data.
-    timeout --signal=TERM --kill-after=5s 120s bwrap --unshare-all --uid 0 --gid 0 --die-with-parent --new-session --clearenv \
-        --bind "$WORK/rootfs" / --proc /proc --dev /dev --bind "$WORK/scratch" /tmp --tmpfs /run \
+    exec timeout --signal=TERM --kill-after=5s 120s bwrap --unshare-all --uid 0 --gid 0 --die-with-parent --new-session --clearenv \
+        --bind "$run/rootfs" / --proc /proc --dev /dev --bind "$run/scratch" /tmp --tmpfs /run \
         --tmpfs /root --tmpfs /home \
         --ro-bind "$DIST_DIR/$artifact" /artifact --ro-bind "$WORK/smoke" /smoke \
         --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin --setenv LANG C.UTF-8 \
@@ -67,6 +81,25 @@ for artifact in "${artifacts[@]}"; do
         --setenv XDG_CACHE_HOME /root/cache --setenv XDG_STATE_HOME /root/state \
         --setenv XDG_RUNTIME_DIR /run/fixture --chdir / \
         -- /bin/bash /smoke "$artifact" "$VERSION"
-    rm -rf -- "$WORK/rootfs" "$WORK/scratch"
-    printf 'Artifact smoke passed: %s\n' "$artifact"
+}
+for index in "${!artifacts[@]}"; do
+    mkdir "$WORK/$index"
+    smoke "${artifacts[index]}" "$WORK/$index" > "$WORK/$index/log" 2>&1 &
+    pids+=("$!")
 done
+failed=0
+for index in "${!artifacts[@]}"; do
+    status=0
+    wait "${pids[index]}" || status=$?
+    pids[index]=
+    if ((status == 0)); then
+        cat -- "$WORK/$index/log"
+        printf 'Artifact smoke passed: %s\n' "${artifacts[index]}"
+    else
+        cat -- "$WORK/$index/log" >&2
+        printf '%s: %s failed (exit %s)\n' "$PROGRAM" "${artifacts[index]}" "$status" >&2
+        failed=1
+    fi
+    rm -rf -- "$WORK/$index"
+done
+((failed == 0)) || exit 1

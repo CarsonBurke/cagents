@@ -47,8 +47,10 @@ class SmokeBoundary(unittest.TestCase):
             "import json,os,pathlib,sys\n"
             "p=pathlib.Path(os.environ['SMOKE_CONTRACT_CALLS'])\n"
             "with p.open('a') as output: output.write(json.dumps(sys.argv[1:])+'\\n')\n"
-            "count=len(p.read_text().splitlines())\n"
-            "sys.exit(17 if count==int(os.environ.get('SMOKE_CONTRACT_FAIL_AT','0')) else 0)\n"
+            "if os.environ.get('SMOKE_CONTRACT_HANG'):\n"
+            "    pathlib.Path(os.environ['SMOKE_CONTRACT_HANG'], str(os.getpid())).touch()\n"
+            "    import time; time.sleep(600)\n"
+            "sys.exit(17 if sys.argv[-2]==os.environ.get('SMOKE_CONTRACT_FAIL_ARTIFACT') else 0)\n"
         )
         boundary.chmod(0o755)
         downloader = self.bin / "curl"
@@ -97,11 +99,33 @@ class SmokeBoundary(unittest.TestCase):
         self.assertEqual((self.base / "base-sentinel").read_text(), "untouched\n")
         self.assertFalse(self.network_calls.exists())
 
+    def test_an_interrupted_smoke_stops_every_run_before_removing_their_roots(self):
+        running = self.directory / "running"
+        running.mkdir()
+        smoke = subprocess.Popen(
+            [str(SMOKE), "--dist", str(self.dist), "--version", VERSION, "--rootfs", str(self.base)],
+            env=self.environment | {"SMOKE_CONTRACT_HANG": str(running)},
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + HANG_GUARD
+        while len(list(running.iterdir())) < len(ARTIFACTS):
+            self.assertLess(time.monotonic(), deadline, "the smokes did not all start")
+            time.sleep(0.05)
+        smoke.send_signal(signal.SIGTERM)
+        self.assertNotEqual(smoke.wait(timeout=HANG_GUARD), 0)
+        for pid in (int(path.name) for path in running.iterdir()):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            self.fail(f"sandbox {pid} outlived the interrupted smoke")
+        self.assert_clean()
+
     def test_each_artifact_gets_private_offline_namespace_and_read_only_inputs(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.recorded()
-        self.assertEqual(len(calls), len(ARTIFACTS))
+        # The artifacts run at once, so their calls arrive in any order.
+        calls = sorted(self.recorded(), key=lambda arguments: ARTIFACTS.index(arguments[-2]))
+        self.assertEqual([arguments[-2] for arguments in calls], list(ARTIFACTS))
         for arguments, artifact in zip(calls, ARTIFACTS):
             for flag in ("--unshare-all", "--clearenv", "--die-with-parent", "--new-session"):
                 self.assertIn(flag, arguments)
@@ -135,10 +159,13 @@ class SmokeBoundary(unittest.TestCase):
             self.assertEqual(arguments[-4:], ["/bin/bash", "/smoke", artifact, VERSION])
         self.assert_clean()
 
-    def test_failed_artifact_stops_the_sequence_and_cleans_only_disposable_state(self):
-        result = self.invoke(SMOKE_CONTRACT_FAIL_AT="2")
+    def test_a_failed_artifact_fails_the_smoke_and_cleans_only_disposable_state(self):
+        result = self.invoke(SMOKE_CONTRACT_FAIL_ARTIFACT=ARTIFACTS[1])
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.recorded()), 2)
+        self.assertIn(f"{ARTIFACTS[1]} failed (exit 17)", result.stderr)
+        self.assertNotIn(f"Artifact smoke passed: {ARTIFACTS[1]}\n", result.stdout)
+        for artifact in (*ARTIFACTS[:1], *ARTIFACTS[2:]):
+            self.assertIn(f"Artifact smoke passed: {artifact}\n", result.stdout)
         self.assert_clean()
 
     def test_missing_and_symlink_artifacts_reject_before_any_execution(self):
