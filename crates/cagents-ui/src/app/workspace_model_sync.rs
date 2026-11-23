@@ -1175,8 +1175,13 @@ impl Cagents {
         let Some(departure) = departure else {
             return (task, projection);
         };
+        // The departure reads where the edit put the pane, which only the
+        // reconciliation the edge owes writes into the window's channels; in
+        // a run that reconciliation would otherwise wait for the run's end.
+        let mut tasks = vec![task];
+        let projection = projection.widen(self.settle_observed_run(&mut tasks));
         let active = self.durable.active_channel;
-        let followed = self.pane_departed(departure);
+        tasks.push(self.pane_departed(departure));
         // Following changes which channel the window shows, which only the
         // full projection carries through to the sidebar and chrome.
         let projection = if self.durable.active_channel == active {
@@ -1184,7 +1189,7 @@ impl Cagents {
         } else {
             Projection::Full
         };
-        (Task::batch([task, followed]), projection)
+        (Task::batch(tasks), projection)
     }
 
     fn project_workspace_model_update(
