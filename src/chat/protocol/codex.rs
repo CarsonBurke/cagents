@@ -2272,6 +2272,7 @@ impl Adapter for Codex {
                 self.call(&mut step, method, json!({"threadId":self.thread,"queuedSubmissionId":id}), pending)?;
             }
             Command::SetInterruptMode { .. } => return Err("Codex uses explicit steer and queue operations".into()),
+            Command::SendQueuedNow => return Err("Codex cannot hand its queue to the running turn".into()),
             Command::ListBranches => self.history(&mut step, None)?,
             Command::Branch { id } => {
                 if self.busy || !self.direct_input { return Err("Fork requires an idle writable Codex conversation".into()); }

@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 197,
+    proven_at: 200,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -124,6 +124,67 @@ pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
 /// is read as an excerpt, whose numbers place nothing.
 pub(crate) const PATCH_LINE_ORIGIN: u16 = 195;
 
+/// The first protocol whose chat snapshots say whether the provider can send
+/// what is queued early, and how a request to do so stands. A client from
+/// before it is sent both without; one read from a source before it has
+/// neither (see [`WithoutTrailing`]).
+pub(crate) const SEND_QUEUED_NOW: u16 = 200;
+
+/// Whether a field [`SEND_QUEUED_NOW`] added is left out of the value being
+/// encoded, as `skip_serializing_if` asks. It is only ever a struct's last
+/// field, since postcard's positional encoding then leaves the fields before
+/// it as the older client reads them.
+pub(crate) fn before_send_queued_now<T>(_: &T) -> bool {
+    encoding_before(SEND_QUEUED_NOW)
+}
+
+/// Reads a struct whose last `omitted` fields a source from before the
+/// protocol that added them never encoded. Postcard reads a struct as a tuple
+/// of its fields, so the struct is read as a tuple of the fields that source
+/// did encode, and its derived visitor gives the rest their defaults: each
+/// omitted field must be `#[serde(default)]`.
+pub(crate) struct WithoutTrailing<D> {
+    inner: D,
+    omitted: usize,
+}
+
+impl<D> WithoutTrailing<D> {
+    pub(crate) fn new(inner: D, omitted: usize) -> Self {
+        Self { inner, omitted }
+    }
+}
+
+impl<'de, D: serde::Deserializer<'de>> serde::Deserializer<'de> for WithoutTrailing<D> {
+    type Error = D::Error;
+
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.inner
+            .deserialize_tuple(fields.len().saturating_sub(self.omitted), visitor)
+    }
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.inner.deserialize_any(visitor)
+    }
+
+    fn is_human_readable(&self) -> bool {
+        self.inner.is_human_readable()
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map enum identifier ignored_any
+    }
+}
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
 /// added them. The wire format proof accepts exactly these.
@@ -140,6 +201,12 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
         &["lines"],
         PATCH_LINE_ORIGIN,
     ),
+    ("cagents::chat::Snapshot", &["send_now"], SEND_QUEUED_NOW),
+    (
+        "cagents::chat::Capabilities",
+        &["send_queued_now"],
+        SEND_QUEUED_NOW,
+    ),
 ];
 
 /// Fields a later protocol added to a struct that this side reads a message
@@ -154,6 +221,12 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
         "cagents::chat::FileChangePatch",
         &["lines"],
         PATCH_LINE_ORIGIN,
+    ),
+    ("cagents::chat::Snapshot", &["send_now"], SEND_QUEUED_NOW),
+    (
+        "cagents::chat::Capabilities",
+        &["send_queued_now"],
+        SEND_QUEUED_NOW,
     ),
 ];
 

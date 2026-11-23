@@ -1093,3 +1093,47 @@ fn actual_main_187_receives_invalid_request_for_a_refusal_before_any_effect() {
         encode(ProtocolErrorCode::InvalidRequest)
     );
 }
+
+/// A client from before Send now reads a snapshot without its fields, and a
+/// snapshot from a source before it reads as one with nothing to send early,
+/// whatever follows it in the message.
+#[test]
+fn send_now_is_left_out_for_older_clients_and_absent_from_older_sources() {
+    use crate::chat::{Capabilities, SendNow, Snapshot};
+    let older = SEND_QUEUED_NOW - 1;
+    let snapshot = Snapshot {
+        generation: 3,
+        capabilities: Capabilities {
+            steer: true,
+            send_queued_now: true,
+            ..Capabilities::default()
+        },
+        send_now: Some(SendNow::Delivering),
+        ..Snapshot::default()
+    };
+    let message = (snapshot.clone(), 7u8);
+    let current = postcard::to_stdvec(&message).unwrap();
+    let sent = encoding_for(older, || postcard::to_stdvec(&message)).unwrap();
+    // One byte for the capability, two for the request.
+    assert_eq!(sent.len() + 3, current.len());
+    let (read, after): (Snapshot, u8) =
+        decoding_from(older, || postcard::from_bytes(&sent)).unwrap();
+    assert_eq!(after, 7);
+    assert_eq!(
+        read,
+        Snapshot {
+            capabilities: Capabilities {
+                send_queued_now: false,
+                ..snapshot.capabilities.clone()
+            },
+            send_now: None,
+            ..snapshot.clone()
+        }
+    );
+    // The current protocol carries both.
+    let (read, _): (Snapshot, u8) = postcard::from_bytes(&current).unwrap();
+    assert_eq!(read, snapshot);
+    // JSON, as a saved page holds it, is never encoded for an older client.
+    let saved: Snapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    assert_eq!(saved, snapshot);
+}
