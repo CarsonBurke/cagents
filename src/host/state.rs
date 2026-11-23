@@ -292,6 +292,9 @@ pub(crate) struct HostState {
     /// The transcript each spawning terminal's worker opens, kept with its
     /// reservation until the terminal's record carries it.
     spawning_transcripts: BTreeMap<TerminalId, PathBuf>,
+    /// What each terminal still spawning will run, so a Close can tell one
+    /// about to start a Codex CLI on its conversation.
+    spawning_terminals: BTreeMap<TerminalId, TerminalSession>,
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
@@ -507,6 +510,7 @@ impl HostState {
             terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             spawning_transcripts: BTreeMap::new(),
+            spawning_terminals: BTreeMap::new(),
             startup_custody: BTreeSet::new(),
             publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
@@ -1548,7 +1552,7 @@ impl HostState {
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view_reserved(terminal_id, paired, None, None)
+        self.reserve_spawn_for_view_reserved(terminal_id, paired, None, None, None)
     }
 
     /// A reservation for a spawn whose worker will open `transcript`.
@@ -1558,7 +1562,16 @@ impl HostState {
         terminal_id: TerminalId,
         transcript: &std::path::Path,
     ) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view_reserved(terminal_id, None, None, Some(transcript))
+        self.reserve_spawn_for_view_reserved(terminal_id, None, None, Some(transcript), None)
+    }
+
+    /// A reservation for a spawn of `terminal`, checked as a real one is.
+    #[cfg(test)]
+    pub(crate) fn reserve_spawn_of(
+        &mut self,
+        terminal: &TerminalSession,
+    ) -> Result<(), ProtocolError> {
+        self.reserve_spawn_for_view_reserved(terminal.id, None, None, None, Some(terminal))
     }
 
     /// Reserves `terminal_id` for a spawn whose worker will open `transcript`.
@@ -1570,6 +1583,7 @@ impl HostState {
         paired: Option<&TerminalSession>,
         transition: Option<&super::chat::TerminalViewReservation<'_>>,
         transcript: Option<&std::path::Path>,
+        spawned: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
         let owns_transition = transition.is_some_and(|transition| {
             paired.is_some_and(|source| source.id == terminal_id)
@@ -1605,6 +1619,33 @@ impl HostState {
                 false,
             ));
         }
+        // A Codex CLI on a conversation another pane has claimed would be a
+        // second writer of it, and a Close of that pane proves none can start
+        // while it reads (see `settle_lost_execution`). A pane's own claim
+        // covers its terminal view and its paired console.
+        if let Some(spawned) = spawned
+            && self.chat_spawning.iter().any(|(id, claim)| {
+                *id != terminal_id
+                    && claim
+                        .terminal
+                        .as_ref()
+                        .is_none_or(|terminal| terminal.id != terminal_id)
+                    && claim.launch.provider == crate::agent::Provider::Codex
+                    && claim
+                        .launch
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|conversation| {
+                            super::chat::terminal_runs_codex_conversation(spawned, conversation)
+                        })
+            })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "This conversation is starting or closing elsewhere in Cagents; open it in a terminal once that finishes",
+                true,
+            ));
+        }
         if self.terminals.len() + self.spawning.len() >= MAX_TERMINALS {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
@@ -1622,6 +1663,9 @@ impl HostState {
         if let Some(transcript) = transcript {
             self.spawning_transcripts
                 .insert(terminal_id, transcript.to_owned());
+        }
+        if let Some(spawned) = spawned {
+            self.spawning_terminals.insert(terminal_id, spawned.clone());
         }
         self.inventory_generation += 1;
         Ok(())
@@ -1659,9 +1703,21 @@ impl HostState {
             || self.historical_chat_retirements.contains_key(id)
     }
 
+    /// A terminal still spawning that will run Codex's CLI on
+    /// `conversation`.
+    pub(super) fn spawning_codex_conversation(&self, conversation: &str) -> Option<TerminalId> {
+        self.spawning_terminals
+            .iter()
+            .find(|(_, terminal)| {
+                super::chat::terminal_runs_codex_conversation(terminal, conversation)
+            })
+            .map(|(id, _)| *id)
+    }
+
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
         self.browser_logins_spawning.remove(&terminal_id);
         self.spawning_transcripts.remove(&terminal_id);
+        self.spawning_terminals.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
             self.inventory_generation += 1;
         }
@@ -5020,6 +5076,7 @@ fn start_terminal_view_owned_reserved(
             paired.then_some(&session),
             transition,
             session.transcript_path.as_deref(),
+            Some(&session),
         )?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {

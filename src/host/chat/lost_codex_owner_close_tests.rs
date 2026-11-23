@@ -399,40 +399,70 @@ fn a_start_holding_the_allocation_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
 }
 
-/// Another pane starting the same conversation launches a writer of it,
-/// which the process scan cannot see before it exists. One admitted before
-/// this Close claimed the conversation holds the Close until it finishes;
-/// the claim refuses any admitted after (see `settle_lost_execution`).
+/// A terminal about to run Codex's CLI on the conversation launches a writer
+/// of it, which the process scan cannot see before it exists. One already
+/// spawning holds the Close; while the Close holds its claim, none can
+/// spawn (see `settle_lost_execution`).
 #[test]
-fn another_pane_starting_the_conversation_keeps_the_refusal() {
-    let Some(root) = isolated("another_pane_starting_the_conversation_keeps_the_refusal") else {
+fn a_terminal_spawning_codex_on_the_conversation_keeps_the_refusal() {
+    let Some(root) = isolated("a_terminal_spawning_codex_on_the_conversation_keeps_the_refusal")
+    else {
         return;
     };
     let fixture = Fixture::new(&root);
-    let other = Session {
+    let conversation = fixture.source.launch.session_id.clone().unwrap();
+    let terminal = crate::model::TerminalSession {
         id: TerminalId::new(),
         owned_codex_listener: None,
-        ..fixture.source.clone()
+        recovery_origin: None,
+        predecessor: None,
+        launch: crate::model::LaunchRecipe {
+            program: "codex".into(),
+            arguments: vec!["resume".into(), conversation],
+            working_directory: root.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("lost-codex-owner"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        },
     };
-    let starting = {
-        let mut state = fixture.host.lock().unwrap();
-        capacity::Reservation::closing(&fixture.host, &mut state, &other).unwrap()
-    };
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .reserve_spawn_of(&terminal)
+        .unwrap();
     let refusal = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(refusal.contains("elsewhere in Cagents"), "{refusal}");
     assert!(fixture.socket().parent().unwrap().exists());
-    // While this Close holds its claim, the other pane's start is refused.
-    {
+    fixture.host.lock().unwrap().cancel_spawn(terminal.id);
+    // Under the Close's claim, the terminal cannot spawn.
+    let closing = {
         let mut state = fixture.host.lock().unwrap();
-        let closing =
-            capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap();
-        drop(state);
-        drop(starting);
-        assert!(capacity::Reservation::new(&fixture.host, &other).is_err());
-        drop(closing);
-    }
+        capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap()
+    };
+    let refused = fixture
+        .host
+        .lock()
+        .unwrap()
+        .reserve_spawn_of(&terminal)
+        .unwrap_err();
+    assert!(refused.retryable, "{refused:?}");
+    drop(closing);
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
     fixture.assert_settled();
+    // Once it closed, the terminal may resume the conversation.
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .reserve_spawn_of(&terminal)
+        .unwrap();
 }
 
 /// The evidence proves nothing of a Close that does not hold its claim on

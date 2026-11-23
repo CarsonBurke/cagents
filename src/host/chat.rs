@@ -1224,21 +1224,24 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
 /// would have with a receipt: a person closing the pane closes the agent.
 ///
 /// The evidence proves an absence only if nothing Cagents runs can launch a
-/// writer of this conversation while it is read; the process scan judges
-/// only processes that exist when it reads them. The owner itself is gone
-/// ([`what_holds`] reads its holder record). The caller's claim on the
-/// conversation, its `chat_spawning` entry, refuses everything else that
-/// could launch one:
-/// - a Start or Resume of this pane, or of any pane naming the same
-///   conversation, and the retained actor startup it makes: refused at
-///   admission ([`capacity::Reservation`]) and again as it installs (see
-///   `start_publishing`);
-/// - another pane of the same conversation returning to a terminal, which
-///   runs a CLI naming the conversation (`ChatReturnTerminal`).
+/// writer of this conversation while it is read: the process scan judges
+/// only processes that exist as it reads them. A writer is a provider
+/// process naming this pane's listener allocation or the conversation.
+/// - This pane's own helper is gone: [`what_holds`] reads its holder record
+///   and refuses for a launch, startup, handoff or cleanup of the pane.
+/// - The caller's claim on the pane, its `chat_spawning` entry, refuses every
+///   Start, Resume, restore or terminal view of the pane (admission in
+///   [`capacity::Reservation`], `start_publishing` and
+///   `reserve_spawn_for_view_reserved`), so none launches its provider.
+/// - A native chat of another pane runs its provider with only its own
+///   listener in its arguments (`codex app-server --listen`), which names
+///   neither, so it launches no writer of this one.
+/// - A terminal running Codex's CLI on the conversation does name it. The
+///   claim refuses such a terminal's spawn from any other pane, and one
+///   already spawning or running holds the Close ([`codex_terminal_owner`]).
 ///
-/// Those admitted before the claim and still under way hold the Close in
-/// [`what_holds`]. A program started outside Cagents is no launch of it,
-/// and no fence can hold one back.
+/// A program started outside Cagents is no launch of it, and no fence can
+/// hold one back.
 fn settle_lost_execution(
     host: &SharedHost,
     session: &Session,
@@ -1604,25 +1607,10 @@ fn what_holds(
     // below does.
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        // Another pane starting this same conversation launches a writer of
-        // it. One admitted before the caller's claim may still be launching;
-        // the claim refuses any admitted after it (see
-        // [`settle_lost_execution`]).
-        let launching = |other: &Session| {
-            other.id != session.id && same_conversation(&other.launch, &session.launch)
-        };
         if codex_terminal_owner(&state, session).is_some()
             || state.chat_handoffs.contains_key(&session.id)
-            || state
-                .chat_handoffs
-                .values()
-                .any(|handoff| launching(&handoff.source))
-            || state.chat_spawning.values().any(launching)
             || state.native_actor_startups.values().any(|startup| {
-                startup.source.id == session.id
-                    || startup.requested.id == session.id
-                    || launching(&startup.source)
-                    || launching(&startup.requested)
+                startup.source.id == session.id || startup.requested.id == session.id
             })
         {
             return Ok(Some(Holds::InProgress));
@@ -1674,27 +1662,39 @@ fn what_holds(
 }
 
 /// A recorded terminal conversation is writer evidence even without a pane
-/// marker (for example, a CLI resumed against the shared Codex daemon).
+/// marker (for example, a CLI resumed against the shared Codex daemon). A
+/// terminal still spawning counts: its CLI may start at any moment.
 fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<TerminalId> {
-    let id = session.launch.session_id.as_ref()?;
-    state.terminals.iter().find_map(|(terminal_id, record)| {
-        if record.handle.is_completed() {
-            return None;
-        }
-        let observed = record
-            .session
-            .resume_hint
-            .as_deref()
-            .and_then(crate::model::agent_recovery::observed_launch_from_hint);
-        let recipe = observed.as_ref().unwrap_or(&record.session.launch);
-        ((Provider::from_program(&recipe.program) == Some(Provider::Codex)
-            || Provider::recognize_launch(recipe) == Some(Provider::Codex))
-            && recipe
-                .arguments
-                .iter()
-                .any(|arg| arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id)))
-        .then_some(*terminal_id)
-    })
+    let id = session.launch.session_id.as_deref()?;
+    state
+        .terminals
+        .iter()
+        .filter(|(_, record)| !record.handle.is_completed())
+        .find_map(|(terminal_id, record)| {
+            terminal_runs_codex_conversation(&record.session, id).then_some(*terminal_id)
+        })
+        .or_else(|| state.spawning_codex_conversation(id))
+}
+
+/// Whether `terminal` runs Codex's CLI on `conversation`, by its observed
+/// launch or, before one is observed, its recipe.
+pub(super) fn terminal_runs_codex_conversation(
+    terminal: &crate::model::TerminalSession,
+    conversation: &str,
+) -> bool {
+    let observed = terminal
+        .resume_hint
+        .as_deref()
+        .and_then(crate::model::agent_recovery::observed_launch_from_hint);
+    let recipe = observed.as_ref().unwrap_or(&terminal.launch);
+    (Provider::from_program(&recipe.program) == Some(Provider::Codex)
+        || Provider::recognize_launch(recipe) == Some(Provider::Codex))
+        && recipe.arguments.iter().any(|arg| {
+            arg == conversation
+                || arg
+                    .split_once('=')
+                    .is_some_and(|(_, value)| value == conversation)
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4543,20 +4543,8 @@ fn process_inner(
                         "Too many unacknowledged terminal handoffs; save existing replacements before converting another chat",
                     ));
                 }
-                let record = attached(&state, client, chat_id)?;
-                // The terminal runs a CLI naming the conversation: a writer
-                // that another pane's Close, proving none can start, refuses
-                // (see `settle_lost_execution`).
-                let mut launch = record.session.launch.clone();
-                launch.session_id = record.handle.session_id();
-                if state.chat_spawning.iter().any(|(id, pending)| {
-                    *id != chat_id && same_conversation(&pending.launch, &launch)
-                }) {
-                    return Err(retryable_unavailable(
-                        "This conversation is starting or closing in another pane; return it to the terminal once that finishes",
-                    ));
-                }
-                let owners = paired_close::Owners::capture(&state, record)?;
+                let owners =
+                    paired_close::Owners::capture(&state, attached(&state, client, chat_id)?)?;
                 let closing =
                     capacity::Reservation::closing(host, &mut state, &owners.target.source)?;
                 (owners, closing)
