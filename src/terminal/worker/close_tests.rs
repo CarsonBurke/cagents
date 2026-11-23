@@ -490,6 +490,11 @@ fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits()
         "a HUP-ignoring job must receive the existing grace before escalation"
     );
     assert!(
+        started.elapsed()
+            < ShutdownBudget::PATIENT.deadline - ShutdownBudget::PATIENT.confirmation_reserve,
+        "escalation must follow the hangup grace, not wait for the deadline"
+    );
+    assert!(
         holder::exits_within(&child.0, Duration::from_secs(1)).unwrap(),
         "ordinary shutdown reported success but left its HUP-ignoring background job running"
     );

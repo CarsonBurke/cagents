@@ -124,6 +124,7 @@ impl ShutdownBudget {
         join: Duration::from_secs(45),
     };
 }
+
 /// How long shutdown waits for the PTY reader to leave its blocking read
 /// before abandoning the thread. Closing its wake pipe releases the read
 /// immediately in every case we can construct; this only bounds the ones we
@@ -2343,7 +2344,7 @@ impl TerminalHandle {
             self.request_shutdown();
             if !joins::wait_until(
                 &self.inner.worker,
-                Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT),
+                Some(std::time::Instant::now() + self.inner.published.shutdown_budget().join),
                 true,
             ) {
                 return TerminalCloseResult::Unknown(

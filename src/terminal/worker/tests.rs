@@ -3425,7 +3425,9 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
             budget,
         )
         .unwrap();
-        assert!(started.elapsed() < budget.deadline);
+        // Escalation follows the hangup grace, long before the deadline's
+        // confirmation tail would force it.
+        assert!(started.elapsed() < budget.deadline - budget.confirmation_reserve);
         match expected_code {
             Some(code) => assert_eq!(status.exit_code(), code),
             None => assert!(status.signal().is_some()),
