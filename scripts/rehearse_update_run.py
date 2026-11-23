@@ -1003,7 +1003,7 @@ class Rehearsal:
                 reference = sidebar_channel_ref(navigation,title)
                 self.call('drive','click','--stale-ok',reference,timeout=30)
                 # Keep hover labels away from subsequent navigation and shots.
-                self.call('drive','move','850,750',timeout=30)
+                self.call('drive','hover','850,750',timeout=30)
                 required_thread = None
                 if side != 'before':
                     previous = next(view for view in originals
@@ -1110,7 +1110,7 @@ class Rehearsal:
             if observation['window']['id'] != window['id']:
                 raise RuntimeError('console navigation selected another window')
             self.call('drive','click','--stale-ok',sidebar_channel_ref(observation,title),timeout=30)
-            self.call('drive','move','850,750',timeout=30)
+            self.call('drive','hover','850,750',timeout=30)
             data = self.root/'home/.local/share/cagents'
             database = data/'sessions.sqlite3' if slot=='main' else data/'windows'/slot/'sessions.sqlite3'
             deadline = time.monotonic()+15
@@ -1414,7 +1414,7 @@ class Rehearsal:
             evidence['activity_after']=provider_activity(self.root)
             save()
             evidence['verified']=terminal_restart_failure_contract(evidence,version_root)
-            self.call('drive','move','850,750',timeout=30)
+            self.call('drive','hover','850,750',timeout=30)
             self.call('shot','new-terminal-failed',timeout=45)
             save()
             return
@@ -1437,7 +1437,7 @@ class Rehearsal:
         evidence['events'].append({'event':'new_terminal_output_and_ready_owner_verified','monotonic':time.monotonic()})
         save()
         evidence['verified']=new_terminal_action_contract(evidence,version_root)
-        self.call('drive','move','850,750',timeout=30)
+        self.call('drive','hover','850,750',timeout=30)
         self.call('shot','new-terminal-working',timeout=45)
         save()
 
