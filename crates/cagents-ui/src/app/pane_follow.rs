@@ -154,10 +154,14 @@ impl Cagents {
         let text = if departure.follow {
             format!("Moved to {place}")
         } else {
+            // The pane's own name: a chat leading a named channel is shown
+            // by that channel's title, which here would read as the
+            // destination moving into itself.
             let pane = self
                 .card_state(departure.card)
-                .map(|card| self.card_display_title(card))
-                .unwrap_or_else(|| "A pane");
+                .map(|card| self.card_display_title_with_chat_title(card, || None))
+                .filter(|title| !title.is_empty())
+                .unwrap_or("A pane");
             format!("{pane} moved to {place}")
         };
         self.pane_follow = Some(Notice {

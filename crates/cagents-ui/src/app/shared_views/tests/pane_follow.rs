@@ -146,11 +146,8 @@ fn a_window_reading_another_pane_stays_and_offers_the_moved_one() {
     assert!(holds(&app, destination, moved.id));
     assert_eq!(app.durable.active_channel, Some(source));
     assert_eq!(app.workspace.focused(), Some(stays.id));
-    let title = app.card_display_title(app.card_state(moved.id).unwrap());
-    assert_eq!(
-        notice(&app),
-        Some(format!("{title} moved to Release notes").as_str())
-    );
+    // The pane by its own name, not by the channel it now leads.
+    assert_eq!(notice(&app), Some("Browser moved to Release notes"));
 
     drop(app.update(Message::MovedPane(pane_follow::Action::Open)));
     assert_eq!(app.durable.active_channel, Some(destination));
