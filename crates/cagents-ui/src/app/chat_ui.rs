@@ -12198,6 +12198,7 @@ impl Cagents {
         runtime.snapshot = Arc::new(snapshot);
         runtime.forget_transcript();
         let unsent = runtime.commands.abandon();
+        runtime.commands.forget_unconfirmed();
         runtime.restore_outgoing(unsent);
         runtime.disconnected = false;
         runtime.error = error;
@@ -15444,6 +15445,14 @@ impl Cagents {
                                 .retain(|followup| !pending.followups.contains(&followup.id));
                             followups_sent = runtime.followups.len() != before;
                             let _ = runtime.present();
+                        }
+                        // The reader can still find it to write again,
+                        // whatever becomes of it here.
+                        if let Some(sent) = pending.sent.take() {
+                            runtime.remember_with_attachments(
+                                sent,
+                                std::mem::take(&mut pending.sent_attachments),
+                            );
                         }
                         let connection = runtime.handle().cloned();
                         runtime.commands.hold_unconfirmed(

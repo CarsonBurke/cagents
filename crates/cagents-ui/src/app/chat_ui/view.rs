@@ -6777,14 +6777,17 @@ impl Runtime {
         let mut controls = Vec::new();
         if retry {
             controls.push(
-                crate::ui_controls::icon_button(Icon::Refresh, "Send again")
-                    .compact()
-                    .on_press(action(Action::RetryUnconfirmed(self.target, key)))
-                    .into(),
+                crate::ui_controls::icon_button(
+                    Icon::Refresh,
+                    "Send again. It won't arrive twice.",
+                )
+                .compact()
+                .on_press(action(Action::RetryUnconfirmed(self.target, key)))
+                .into(),
             );
         }
         controls.push(
-            crate::ui_controls::icon_button(Icon::Close, "Dismiss")
+            crate::ui_controls::icon_button(Icon::Close, "Stop showing this. It may still arrive.")
                 .compact()
                 .on_press(action(Action::DismissUnconfirmed(self.target, key)))
                 .into(),

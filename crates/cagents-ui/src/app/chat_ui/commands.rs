@@ -700,13 +700,15 @@ impl Commands {
         withdrawn
     }
 
-    /// Forgets every command, as when the conversation they were for is
+    /// Forgets every command, as when the connection they went over is
     /// gone. Returns the messages that had not been accepted, in order.
+    ///
+    /// A message never confirmed stays as it is: returned to the composer,
+    /// it could be sent twice, and forgotten, one that never arrived would
+    /// be lost. The conversation lets go of it once it shows it, and it can
+    /// no longer be sent again over another connection.
     pub(super) fn abandon(&mut self) -> Vec<Outgoing> {
         self.settling.clear();
-        // Whether these arrived, the conversation shows once it is back;
-        // returned to the composer, they could be sent twice.
-        self.unconfirmed.clear();
         self.in_flight
             .take()
             .into_iter()
@@ -805,6 +807,12 @@ impl Commands {
             retry: retry && connection.is_some(),
             connection: connection.map(Arc::downgrade).unwrap_or_default(),
         });
+    }
+
+    /// Forgets the messages never confirmed, as when the conversation they
+    /// were sent to is gone.
+    pub(super) fn forget_unconfirmed(&mut self) {
+        self.unconfirmed.clear();
     }
 
     /// The messages whose outcome the provider never confirmed, in the
@@ -1656,6 +1664,33 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert!(runtime.commands.unconfirmed().is_empty());
         assert!(runtime.composer.text().trim().is_empty());
+    }
+
+    /// A message never confirmed outlives the connection it went over, as
+    /// it may still arrive or never have: it is neither returned to the
+    /// composer nor lost, and it cannot go again over another connection.
+    /// It is forgotten with the conversation.
+    #[test]
+    fn an_unconfirmed_message_outlives_its_connection() {
+        let mut commands = Commands::default();
+        let snapshot = Snapshot::default();
+        let outgoing = Outgoing::new("Only once".into(), Vec::new(), PromptMode::Send, &snapshot);
+        let command = Command::Prompt {
+            text: "Only once".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        commands.hold_unconfirmed(outgoing, command, true, None);
+        assert!(commands.abandon().is_empty());
+        let [unconfirmed] = commands.unconfirmed() else {
+            panic!("the unconfirmed message is kept");
+        };
+        assert!(
+            !unconfirmed.retry,
+            "no connection it went over to ask again"
+        );
+        commands.forget_unconfirmed();
+        assert!(commands.unconfirmed().is_empty());
     }
 
     /// The reader may let go of a message the provider never confirmed; it
