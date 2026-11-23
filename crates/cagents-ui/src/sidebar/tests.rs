@@ -8297,6 +8297,10 @@ fn attention_search_finds_pane_rows_by_their_checkout() {
 /// The title is what tells two rows apart, so the place beside it gives
 /// way first, a search highlight in the title included.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "its widths assume the development host's fonts, not the release sandbox's"
+)]
 fn a_highlighted_title_keeps_its_width_and_its_place_gives_way() {
     let (font, emphasis) = search_label_fonts(false);
     let title = "Review agent";

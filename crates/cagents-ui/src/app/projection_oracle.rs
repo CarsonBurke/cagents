@@ -676,6 +676,7 @@ mod tests {
     /// leaves something derived stale is reported as it returns rather than
     /// repaired by the next update.
     #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "the projection oracle runs only with debug assertions")]
     fn a_handler_returning_before_its_projection_is_reported() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
@@ -709,6 +710,7 @@ mod tests {
     /// An update that returned before projecting from state that was not
     /// settled is named when the next settled update finds stale state.
     #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "the projection oracle runs only with debug assertions")]
     fn stale_state_after_an_unsettled_early_return_names_that_update() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
