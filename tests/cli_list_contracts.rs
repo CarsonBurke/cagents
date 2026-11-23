@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 const ACCOUNT_DETAIL_SENTINEL: &str = "fixture-account-detail-must-stay-out-of-listings-4f58c12e";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Listing {
     Accounts,
     Agents,
@@ -55,6 +55,10 @@ impl Listing {
 
     fn reply(self, request: ClientRequest, populated: bool) -> ServerResponse {
         match (self, request) {
+            // The fixture session is in no channel, so no pane shows it.
+            (Self::Sessions, ClientRequest::ReadWorkspaceModel) => ServerResponse::WorkspaceModel {
+                model: Default::default(),
+            },
             (
                 Self::Sessions,
                 ClientRequest::Agent {
@@ -457,8 +461,10 @@ fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) ->
             loop {
                 assert_eq!(request.proof.as_ref(), Some(&proof));
                 // A read that only chooses what a Work listing covers
-                // precedes it on the same connection, and a populated agent
-                // listing follows with one that names its projects.
+                // precedes it on the same connection, a populated agent
+                // listing follows with one that names its projects, and a
+                // populated session listing with the model, to mark a chat no
+                // pane shows.
                 let preliminary = match listing {
                     Listing::Work => {
                         matches!(request.request, ClientRequest::ReadWorkspaceMetadata { .. })
@@ -469,6 +475,16 @@ fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) ->
                                 request.request,
                                 ClientRequest::Agent {
                                     operation: Operation::List,
+                                    ..
+                                }
+                            )
+                    }
+                    Listing::Sessions => {
+                        populated
+                            && matches!(
+                                request.request,
+                                ClientRequest::Agent {
+                                    operation: Operation::Context { .. },
                                     ..
                                 }
                             )
@@ -490,7 +506,11 @@ fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) ->
                 match next {
                     Some(next) if preliminary => request = next,
                     next => {
-                        assert!(next.is_none());
+                        assert!(
+                            next.is_none(),
+                            "{listing:?} sent a request after its reply: {:?}",
+                            next.map(|next| next.request)
+                        );
                         return;
                     }
                 }
@@ -1094,7 +1114,8 @@ fn session_listings_report_compact_rows_and_selected_fields() {
         serde_json::from_str(&output(Listing::Sessions, true, true)).unwrap();
     assert_eq!(value["command"], "sessions");
     // The checkout is the directory, the project its name, and nothing
-    // unknown or default is spelled out.
+    // unknown or default is spelled out. No pane shows the session;
+    // `channel move` would give it one.
     assert_eq!(
         value["data"],
         serde_json::json!({
@@ -1105,7 +1126,8 @@ fn session_listings_report_compact_rows_and_selected_fields() {
                 "state": "working",
                 "title": "Fixture session",
                 "project": "Fixture",
-                "directory": "/fixture"
+                "directory": "/fixture",
+                "no_pane": true
             }]
         })
     );
