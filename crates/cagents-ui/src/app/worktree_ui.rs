@@ -1560,17 +1560,19 @@ impl Cagents {
     }
 
     /// Where a new pane goes in the strip and in the saved cards: directly
-    /// after the focused pane, or at the end when nothing is focused.
+    /// after the pane last clicked, typed in or focused by a command, or at
+    /// the end when the strip has no such pane.
     ///
     /// A pane opened from another pane (a Source control row, a link, a
-    /// pull request) opens beside it rather than at the far end of the strip;
-    /// a press anywhere in a pane focuses it before its controls act, so the
-    /// focused pane is the one the request came from.
+    /// pull request) opens beside it, since a press anywhere in a pane
+    /// chooses it before its controls act. One opened from the sidebar or a
+    /// menu opens beside the pane the person was working in, not one the
+    /// pointer crossed on its way there; see [`Self::placement_anchor`].
     pub(super) fn pane_insertion_indices(&self) -> (usize, usize) {
         insertion_indices(
             self.workspace.cards(),
             &self.durable.cards,
-            self.workspace.focused(),
+            self.placement_anchor(),
         )
     }
 }

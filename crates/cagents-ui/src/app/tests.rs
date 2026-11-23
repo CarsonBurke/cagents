@@ -12151,6 +12151,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         pending_repository_reconciliation: Vec::new(),
         released_repository_navigation: HashMap::new(),
         keyboard_owed: None,
+        hover_focus: None,
         reported_title_save: ReportedTitleSave::default(),
         lifecycle_sweep_destination: None,
         input_trace: crate::input_trace::InputTrace::default(),
@@ -14302,6 +14303,129 @@ fn failed_terminal_hydration_frees_budget_for_an_immediate_sweep() {
             |action| matches!(action, LifecycleAction::Hydrate { card, .. } if *card == waiting)
         )
     );
+}
+
+/// Four terminal panes with the first focused, as the window restores them.
+fn four_terminals() -> (Cagents, Vec<CardId>) {
+    let mut app = context_inspector_test_app(false);
+    let cards: Vec<CardState> = (0..4).map(|_| terminal_card_state()).collect();
+    let ids: Vec<CardId> = cards.iter().map(|card| card.id).collect();
+    app.durable = Arc::new(WorkspaceState {
+        cards: cards.into_iter().collect(),
+        focused: Some(ids[0]),
+        ..WorkspaceState::default()
+    });
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.workspace.resize_viewport(1_000.0);
+    for id in &ids {
+        app.cards.insert(*id, CardRuntime::Loading);
+    }
+    assert_eq!(app.workspace.focused(), Some(ids[0]));
+    (app, ids)
+}
+
+fn viewport(app: &mut Cagents, event: WorkspaceViewportEvent) {
+    drop(app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event,
+    }));
+}
+
+fn type_key(app: &mut Cagents, key: keyboard::Key, modifiers: keyboard::Modifiers) {
+    drop(app.update(Message::KeyEvent {
+        event: keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        },
+        captured: true,
+    }));
+}
+
+/// A pane opened from the sidebar or a menu opens after the pane last
+/// clicked or typed in, never after one the pointer crossed on its way to
+/// the sidebar, however many it crossed.
+#[test]
+fn a_pane_opened_without_an_opener_follows_the_chosen_pane_not_the_hovered_one() {
+    let (mut app, ids) = four_terminals();
+    app.settings.focus_follows_mouse = true;
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[2]));
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[3]));
+    assert_eq!(app.workspace.focused(), Some(ids[3]), "hover focuses");
+
+    let (review, _) = app.add_pull_requests_card("/repo".into());
+    assert_eq!(
+        app.workspace.order().collect::<Vec<_>>(),
+        [ids[0], review, ids[1], ids[2], ids[3]]
+    );
+    assert_eq!(app.durable.cards[1].id, review);
+
+    // A shortcut typed while hovering chooses nothing; typing does.
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[2]));
+    type_key(
+        &mut app,
+        keyboard::Key::Named(keyboard::key::Named::Shift),
+        keyboard::Modifiers::SHIFT,
+    );
+    assert_eq!(app.placement_anchor(), Some(review));
+    type_key(
+        &mut app,
+        keyboard::Key::Character("a".into()),
+        keyboard::Modifiers::empty(),
+    );
+    assert_eq!(app.placement_anchor(), Some(ids[2]));
+
+    // So does a press, even in the pane hover already focused.
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[1]));
+    assert_eq!(app.placement_anchor(), Some(ids[2]));
+    viewport(
+        &mut app,
+        WorkspaceViewportEvent::PointerFocused {
+            card: ids[1],
+            primary: true,
+        },
+    );
+    assert_eq!(app.placement_anchor(), Some(ids[1]));
+}
+
+/// When no pane in the strip was chosen, because the chosen one closed
+/// while the pointer held focus elsewhere, a pane opened from the sidebar
+/// goes at the end.
+#[test]
+fn a_pane_opened_without_a_chosen_pane_goes_at_the_end() {
+    let (mut app, ids) = four_terminals();
+    app.settings.focus_follows_mouse = true;
+    viewport(&mut app, WorkspaceViewportEvent::PointerEntered(ids[2]));
+    let _ = app.update(Message::CloseCard(ids[0]));
+    let _ = app.update(Message::CommitClose(ids[0]));
+    assert!(app.workspace.card(ids[0]).is_none());
+    assert_eq!(app.workspace.focused(), Some(ids[2]));
+    let (review, _) = app.add_pull_requests_card("/repo".into());
+    assert_eq!(app.workspace.order().last(), Some(review));
+    assert_eq!(app.durable.cards.last().map(|card| card.id), Some(review));
+}
+
+/// A browser opens beside the pane it was opened from, like every other
+/// pane.
+#[cfg(feature = "integrated-browser")]
+#[test]
+fn a_browser_opens_after_the_focused_pane() {
+    let (mut app, ids) = four_terminals();
+    drop(app.update(Message::FocusCard(ids[1])));
+    let _ = app.add_browser(Url::parse("https://example.com").unwrap());
+    let browser = app.workspace.focused().unwrap();
+    assert!(!ids.contains(&browser));
+    assert_eq!(
+        app.workspace.order().collect::<Vec<_>>(),
+        [ids[0], ids[1], browser, ids[2], ids[3]]
+    );
+    assert_eq!(app.durable.cards[2].id, browser);
 }
 
 #[cfg(feature = "integrated-browser")]

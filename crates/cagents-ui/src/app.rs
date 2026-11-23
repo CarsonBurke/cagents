@@ -5926,6 +5926,16 @@ struct SourceControlMutation {
     commit_revision: Option<u64>,
 }
 
+/// Focus that the pointer passing over a pane gave it. The person has not
+/// chosen that pane, so it does not decide where a new pane opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HoverFocus {
+    /// The pane holding focus because the pointer entered it.
+    card: CardId,
+    /// The pane last focused by a click, a keystroke or a command, if any.
+    explicit: Option<CardId>,
+}
+
 pub struct Cagents {
     startup_gate: startup_gate::State,
     device_ui: device_ui::State,
@@ -6003,6 +6013,9 @@ pub struct Cagents {
     /// was focused, which takes the keyboard once it is; see
     /// [`Cagents::focus_pane_keyboard`].
     keyboard_owed: Option<CardId>,
+    /// The pane focus-follows-mouse gave focus to, and the pane the person
+    /// last clicked or typed in before it; see [`Cagents::placement_anchor`].
+    hover_focus: Option<HoverFocus>,
     /// See [`REPORTED_TITLE_SAVE_DELAY`].
     reported_title_save: ReportedTitleSave,
     /// Where the camera was heading when the last sweep found cards on screen
@@ -10621,6 +10634,73 @@ impl Cagents {
     /// reads projects nothing: a key nothing took, a key a dialog's or the
     /// palette's own field answers, a step with nowhere to go. Typing
     /// reaches those at input rate.
+    /// Typing in the pane the pointer focused chooses it: from then on it is
+    /// where a new pane opens. A shortcut, or a modifier pressed on its way
+    /// to one, chooses nothing.
+    fn note_typing(&mut self, event: &keyboard::Event) {
+        let keyboard::Event::KeyPressed { key, .. } = event else {
+            return;
+        };
+        if self.hover_focus.is_none()
+            || self.workspace_inputs_blocked()
+            || matches!(
+                key,
+                keyboard::Key::Named(
+                    keyboard::key::Named::Shift
+                        | keyboard::key::Named::Control
+                        | keyboard::key::Named::Alt
+                        | keyboard::key::Named::Super
+                        | keyboard::key::Named::Meta
+                        | keyboard::key::Named::Hyper
+                )
+            )
+            || workspace_widget::global_shortcut(
+                event,
+                &self.settings.keyboard_shortcuts,
+                self.focused_pane(),
+            )
+            .is_some()
+        {
+            return;
+        }
+        if self
+            .hover_focus
+            .is_some_and(|hover| self.workspace.focused() == Some(hover.card))
+        {
+            self.hover_focus = None;
+        }
+    }
+
+    /// Records whether a pane event's focus was chosen. The pointer entering
+    /// a pane focuses it without choosing it, keeping the pane chosen before;
+    /// a press in a pane chooses it.
+    fn note_viewport_focus(&mut self, event: WorkspaceViewportEvent, previous: Option<CardId>) {
+        match event {
+            WorkspaceViewportEvent::PointerEntered(card)
+                if self.workspace.focused() == Some(card) && previous != Some(card) =>
+            {
+                let explicit = match self.hover_focus {
+                    Some(hover) if Some(hover.card) == previous => hover.explicit,
+                    _ => previous,
+                };
+                self.hover_focus = Some(HoverFocus { card, explicit });
+            }
+            WorkspaceViewportEvent::PointerFocused { .. } => self.hover_focus = None,
+            _ => {}
+        }
+    }
+
+    /// The pane a new pane opens after when nothing more specific opened it:
+    /// the pane last clicked, typed in or focused by a command, never one
+    /// the pointer only passed over.
+    fn placement_anchor(&self) -> Option<CardId> {
+        let focused = self.workspace.focused();
+        match self.hover_focus {
+            Some(hover) if Some(hover.card) == focused => hover.explicit,
+            _ => focused,
+        }
+    }
+
     fn key_event(&mut self, event: keyboard::Event, captured: bool) -> (Task<Message>, Projection) {
         // A held chord copies once, so its repeats must not cancel the
         // copy its first press started.
@@ -10654,6 +10734,7 @@ impl Cagents {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.keyboard_modifiers = *modifiers;
         }
+        self.note_typing(&event);
         // Letting go of a dictation shortcut held down ends push-to-talk,
         // whatever has the keyboard now.
         if let keyboard::Event::KeyReleased { physical_key, .. } = &event
@@ -11248,6 +11329,13 @@ impl Cagents {
         // drawn squeezed.
         self.sync_pane_inspectors();
         let focused = self.workspace.focused();
+        // Focus moved by anything but the pointer entering a pane was chosen.
+        if self
+            .hover_focus
+            .is_some_and(|hover| Some(hover.card) != focused)
+        {
+            self.hover_focus = None;
+        }
         // Every focus move converges here, including tab cycling and closing a
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
@@ -16681,6 +16769,7 @@ impl Application for Cagents {
             pending_repository_reconciliation: Vec::new(),
             released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
+            hover_focus: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
@@ -18974,8 +19063,10 @@ impl Cagents {
                     return Task::none();
                 }
                 let previous_width = self.workspace.viewport_width();
+                let previous_focus = self.workspace.focused();
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
+                self.note_viewport_focus(event, previous_focus);
                 // The pointer passing over a pane on its way elsewhere focuses
                 // it, but has not read it: its update is read once it stays
                 // visible for the attention dwell, like any other pane.
