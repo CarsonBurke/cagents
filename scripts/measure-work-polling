@@ -9,10 +9,9 @@
 # BIN_DIR holds a matched `cagents` and `cagentsd`. The fixture project has
 # WORKTREES (default 250) worktrees of DIRECTORIES (default 40) tracked
 # directories each, more than the watcher's directory budget. ACTIVE (default
-# 3) of them have a fresh edit and ten more an edit outside the active window.
-# The fixture runs no agent in those checkouts, so it measures the important
-# idle-after-edit case rather than treating a historical dirty timestamp as a
-# live session.
+# 3) of them have an edit from ten minutes ago, Active on the board, and ten
+# more an edit outside the active window. The fixture runs no agent and edits
+# nothing while it measures, so it measures the idle-after-edit case.
 # It reports the first load: how long the board took to read every worktree,
 # plan and register all of its watches and settle, and which Git commands the
 # daemon ran. Then it counts the Git commands and `git status` reads the
@@ -115,9 +114,11 @@ for index in $(seq $((active + 1)) $((active + 10))); do
     printf 'old\n' >> "$project/.worktrees/w$index/src/d$first/file.txt"
     touch -d '2 days ago' "$project/.worktrees/w$index/src/d$first/file.txt"
 done
-# Fresh edits: the project, and these worktrees, are active.
+# Recent edits: the project, and these worktrees, are Active, but the edits
+# stopped ten minutes ago, past the window that keeps the short poll.
 for index in $(seq 1 "$active"); do
     printf 'edit\n' >> "$project/.worktrees/w$index/src/d$first/file.txt"
+    touch -d '10 minutes ago' "$project/.worktrees/w$index/src/d$first/file.txt"
 done
 fixture "$bin/cagents" project open "$project" >/dev/null
 daemon=$(fixture_processes | while read -r pid; do
