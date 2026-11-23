@@ -1165,8 +1165,10 @@ impl Cagents {
         };
         let scope = self.active_workspace_destination();
         let (card, saved_scope) = self.recently_closed[index].clone();
+        // A conversation still stopping, or whose stop was refused, reopens
+        // through its stop even before its provider named it.
         if let CardKind::Chat(session) = &card.kind
-            && session.launch.session_id.is_some()
+            && (session.launch.session_id.is_some() || self.has_background_close(session))
         {
             let task = self.resume_saved_conversation(crate::persistence::SavedConversation {
                 card: card.id,
@@ -1283,7 +1285,7 @@ impl Cagents {
                 let Some(id) = self.workspace.focused() else {
                     return Task::none();
                 };
-                let order: Vec<_> = self.workspace.order().collect();
+                let order: Vec<_> = self.workspace.shown().collect();
                 let Some(index) = order.iter().position(|candidate| *candidate == id) else {
                     return Task::none();
                 };
@@ -1335,7 +1337,7 @@ impl Cagents {
                     Command::FocusPane8 => 7,
                     _ => 8,
                 };
-                let card = self.workspace.order().nth(index);
+                let card = self.workspace.shown().nth(index);
                 card.map_or_else(Task::none, |id| self.dispatch(Message::FocusCard(id)))
             }
             Command::ReviewToggleViewed

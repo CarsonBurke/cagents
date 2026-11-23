@@ -290,6 +290,7 @@ pub struct WorkspaceManifest {
     pub chat_draft_models: HashMap<CardId, crate::model::ChatDraftModel>,
     pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
     pub kept_chat_drafts: HashMap<CardId, crate::model::KeptChatDraft>,
+    pub stopping_chats: Vec<crate::model::StoppingChat>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -2298,6 +2299,7 @@ impl StateStore {
             chat_draft_models: manifest.chat_draft_models,
             chat_waiting_messages: manifest.chat_waiting_messages,
             kept_chat_drafts: manifest.kept_chat_drafts,
+            stopping_chats: manifest.stopping_chats,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -4638,6 +4640,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:stopping_chats"),
+        &to_json(&state.stopping_chats)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
         &ordered_map_json(&state.repository_navigation)?,
     )?;
@@ -6409,6 +6416,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace closed chat drafts", &value))
         .transpose()?
         .unwrap_or_default(),
+        stopping_chats: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:stopping_chats"),
+        )?
+        .map(|value| from_json("closed chats still stopping", &value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -7118,6 +7132,7 @@ mod tests {
             chat_draft_models: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
             kept_chat_drafts: HashMap::new(),
+            stopping_chats: Vec::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -8647,6 +8662,53 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .kept_chat_drafts
+                .is_empty()
+        );
+    }
+
+    /// A chat closed before the daemon answered for it, or that the daemon
+    /// refused to stop, is still known after a restart, so its outcome is
+    /// reported then rather than lost with the window.
+    #[test]
+    fn chats_still_stopping_survive_a_restart() {
+        use crate::model::StoppingChat;
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("stopping.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Claude);
+        let pending = StoppingChat {
+            session: chat.clone(),
+            card: CardId::new(),
+            title: "Plan the release".into(),
+            refused: None,
+            dismissed: false,
+            stopped: false,
+        };
+        let refused = StoppingChat {
+            refused: Some("the provider did not exit".into()),
+            dismissed: true,
+            card: CardId::new(),
+            ..pending.clone()
+        };
+        let stopped = StoppingChat {
+            stopped: true,
+            card: CardId::new(),
+            ..pending.clone()
+        };
+        workspace.stopping_chats = vec![pending, refused, stopped];
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.stopping_chats, workspace.stopping_chats);
+
+        workspace.stopping_chats.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .stopping_chats
                 .is_empty()
         );
     }

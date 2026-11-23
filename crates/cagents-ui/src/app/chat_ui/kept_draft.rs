@@ -121,7 +121,7 @@ impl Cagents {
     /// Whether there was one.
     pub(in crate::app) fn reclaim_kept_draft(&mut self, closed: CardId) -> bool {
         if !self.durable.kept_chat_drafts.contains_key(&closed) {
-            return false;
+            return self.reclaim_returned_unsent(closed);
         }
         let Some(draft) = Arc::make_mut(&mut self.durable)
             .kept_chat_drafts
@@ -158,6 +158,27 @@ impl Cagents {
             );
         }
         true
+    }
+
+    /// Takes what the closed pane `closed`, which a shared view put back and
+    /// keeps out of sight until it goes, holds of what its close kept, to be
+    /// moved as a kept draft is. One awaiting admission holds it in its
+    /// composer. Whether there was any.
+    fn reclaim_returned_unsent(&mut self, closed: CardId) -> bool {
+        if !self.returned_close_is_hidden(closed) {
+            return false;
+        }
+        if let Some(CardRuntime::Chat(_)) = self.cards.get(&closed) {
+            self.stash_unsent_chat(closed);
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&closed) {
+                runtime.replace_draft(text_editor::Content::new());
+                runtime.replace_attachments(Vec::new());
+            }
+        }
+        self.chat_ui.drafts.contains_key(&closed)
+            || self.chat_ui.draft_attachments.contains_key(&closed)
+            || self.chat_ui.waiting.contains_key(&closed)
+            || self.chat_ui.sending_on_close.contains_key(&closed)
     }
 
     /// Gives `card` the unsent draft `source` holds without a runtime.
@@ -303,11 +324,22 @@ mod tests {
         {
             let target = *target;
             let source = app.chat_return_session(card).unwrap();
-            drop(app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            drop(app.update(Message::ChatUi(Action::HeldCloseFinished(
                 target,
                 source,
                 Ok(()),
             ))));
+        }
+        // A close running in the background, which the daemon now confirms.
+        let stopping = app
+            .chat_ui
+            .background_closes
+            .keys()
+            .copied()
+            .filter(|target| target.card == card)
+            .collect::<Vec<_>>();
+        for target in stopping {
+            drop(app.update(Message::ChatUi(Action::Retired(target, Ok(())))));
         }
         assert!(!app.workspace.order().any(|id| id == card));
         assert!(!app.card_state(card).unwrap().existence.is_open());
@@ -862,6 +894,30 @@ mod tests {
         drop(app.begin_chat_close(live));
         finish_close(&mut app, live);
         assert_eq!(app.durable.kept_chat_drafts[&live].text, "keep me");
+    }
+
+    /// A chat closed before its provider names its conversation is listed to
+    /// reopen with what it had not sent, though another new chat beside it
+    /// runs the same provider in the same directory: neither has a
+    /// conversation yet, so they don't share one.
+    #[test]
+    fn a_new_chat_closed_beside_another_is_listed_to_reopen() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = tempfile::tempdir().unwrap();
+        let other = live_chat_in(&mut app, Provider::Claude, project.path(), None);
+        let card = live_chat_in(&mut app, Provider::Claude, project.path(), None);
+        write(&mut app, card, "not sent yet");
+        close(&mut app, card);
+        assert!(
+            app.card_state(other)
+                .is_some_and(|state| state.existence.is_open())
+        );
+        assert!(
+            app.recently_closed
+                .iter()
+                .any(|(closed, _)| closed.id == card)
+        );
+        assert_eq!(app.durable.kept_chat_drafts[&card].text, "not sent yet");
     }
 
     /// The edge case #2944's review left open: a first message still being

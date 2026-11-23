@@ -408,7 +408,7 @@ fn rollback_stopped_candidate(
     Ok(true)
 }
 
-fn selected_candidate(prefix: &Path, candidate: &Path) -> Result<(), UpdateError> {
+pub(super) fn selected_candidate(prefix: &Path, candidate: &Path) -> Result<(), UpdateError> {
     let current = prefix.join("current");
     if current.canonicalize()? != candidate
         || !fs::symlink_metadata(&current)?.file_type().is_symlink()
@@ -418,7 +418,11 @@ fn selected_candidate(prefix: &Path, candidate: &Path) -> Result<(), UpdateError
     Ok(())
 }
 
-fn restore_current(prefix: &Path, candidate: &Path, previous: &Path) -> Result<(), UpdateError> {
+pub(super) fn restore_current(
+    prefix: &Path,
+    candidate: &Path,
+    previous: &Path,
+) -> Result<(), UpdateError> {
     selected_candidate(prefix, candidate)?;
     let current = prefix.join("current");
     // Both roots came from the authenticated installation layout. Keep a new

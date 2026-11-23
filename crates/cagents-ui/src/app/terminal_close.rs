@@ -59,6 +59,16 @@ impl CloseIntent {
     }
 }
 
+/// A hidden pane's close answer, delivered once no other dialog is open.
+#[derive(Debug)]
+pub(super) struct HeldCloseAnswer {
+    card: CardId,
+    terminal: TerminalId,
+    proof: HostSessionProof,
+    generation: u64,
+    outcome: CloseOutcome,
+}
+
 #[derive(Debug, Clone)]
 pub enum CloseOutcome {
     Closed,
@@ -138,14 +148,59 @@ impl Cagents {
         {
             self.abandon_removal(card);
         }
-        if self.queued_card_closes.is_empty() {
-            Task::none()
+        // A pane hidden for a close that ended some other way, or was
+        // dropped, comes back.
+        let stranded: Vec<_> = self
+            .hidden_closes
+            .iter()
+            .copied()
+            .filter(|card| {
+                !self.removal_owner_running(*card) && !self.closed_terminal_cards.contains(card)
+            })
+            .collect();
+        for card in stranded {
+            self.bring_back_closing_pane(card);
+        }
+        // An answer held behind another dialog is heard once that closes.
+        let held = if self.modal_beside_terminal_close_is_open() {
+            None
         } else {
-            self.next_queued_card_close()
+            self.held_close_answer.take()
+        };
+        let held = held.map_or_else(Task::none, |answer| {
+            self.terminal_close_finished(
+                answer.card,
+                answer.terminal,
+                answer.proof,
+                answer.generation,
+                answer.outcome,
+            )
+        });
+        // A hidden pane whose terminal closed while another removal held the
+        // strip is removed once the strip is free.
+        let waiting = self
+            .workspace
+            .pending_close()
+            .is_none()
+            .then(|| {
+                self.hidden_closes
+                    .iter()
+                    .copied()
+                    .find(|card| self.closed_terminal_cards.contains(card))
+            })
+            .flatten();
+        let removal = waiting.map_or_else(Task::none, |card| self.request_card_removal(card));
+        let returns = self.take_away_returns_after_removal();
+        let kept = Task::batch([held, self.return_kept_panes(), removal, returns]);
+        if self.queued_card_closes.is_empty() {
+            kept
+        } else {
+            Task::batch([kept, self.next_queued_card_close()])
         }
     }
 
-    /// Gives up removing `card`, which stays open and can be closed again.
+    /// Gives up removing `card`, which stays open, comes back to its place,
+    /// and can be closed again.
     pub(super) fn abandon_removal(&mut self, card: CardId) {
         self.shared_views.removals.remove(&card);
         if self
@@ -155,11 +210,94 @@ impl Cagents {
         {
             let _ = self.workspace.cancel_close(card);
         }
+        self.bring_back_closing_pane(card);
         if self.close_commit_delivered == Some(card) {
             self.close_commit_delivered = None;
         }
         self.closed_terminal_cards.remove(&card);
         self.proven_gone_cards.remove(&card);
+    }
+
+    /// Brings the rest of the window up to date with panes that came back:
+    /// what they show, the saved focus, and the keyboard.
+    pub(super) fn return_kept_panes(&mut self) -> Task<Message> {
+        if self.kept_panes.is_empty() {
+            return Task::none();
+        }
+        // A dialog that came back with the pane keeps the keyboard; the pane
+        // takes it back when the dialog closes.
+        if self.modal_is_open() {
+            self.workspace.take_widget_focus_request();
+        }
+        let kept = std::mem::take(&mut self.kept_panes);
+        let tasks: Vec<_> = kept
+            .into_iter()
+            .map(|update| self.apply_viewport(update, false, DurableChange::None))
+            .collect();
+        Task::batch(tasks)
+    }
+
+    /// Takes a terminal pane out of the strip while the daemon closes its
+    /// terminal, so the pane goes as soon as the reader closes it. Only a
+    /// close that cannot come back to ask whether to stop what still runs
+    /// hides its pane; one that may ask stays in sight until the daemon
+    /// answers (#2068). Nothing is removed or reserved: the pane, its terminal
+    /// and everything saved about them stay until the daemon has closed the
+    /// terminal, and come back if it doesn't. Other panes close meanwhile as
+    /// they always do.
+    fn hide_closing_pane(&mut self, card: CardId) -> Task<Message> {
+        if self.hidden_closes.contains(&card) {
+            return Task::none();
+        }
+        let Ok(update) = self.workspace.hide_card(card) else {
+            return Task::none();
+        };
+        self.hidden_closes.insert(card);
+        let viewport = self.apply_viewport(update, false, DurableChange::None);
+        match self.workspace.focused() {
+            // The keyboard went to the pane beside it, or is owed to a chat
+            // still starting there until its input is drawn.
+            Some(next) if next != card => {
+                self.keyboard_owed = self.owes_chat_input(next).then_some(next);
+                viewport
+            }
+            // With no pane left in sight, the toolbar has it.
+            _ => Task::batch([
+                viewport,
+                iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                    .map(cosmic::Action::App),
+            ]),
+        }
+    }
+
+    /// Whether `card` is out of sight while its close is decided: a terminal
+    /// whose close the daemon is asked for, or a closed chat a shared view
+    /// put back while its conversation stops. As far as the reader knows it
+    /// is gone, so nothing may focus it or list it.
+    pub(super) fn closes_out_of_sight(&self, card: CardId) -> bool {
+        self.hidden_closes.contains(&card) || self.returned_close_is_hidden(card)
+    }
+
+    /// Re-hides the panes still closing after the strip was rebuilt, as a
+    /// worktree or project switch does.
+    pub(super) fn rehide_closing_panes(&mut self) {
+        let returned = self.returned_closes();
+        for card in self.hidden_closes.iter().chain(&returned) {
+            // A pane in another strip is hidden again when its strip is built.
+            let _ = self.workspace.hide_card(*card);
+        }
+    }
+
+    /// Returns a pane hidden for a close that didn't complete. The strip
+    /// changes now; the rest of the window catches up at the end of the
+    /// update.
+    fn bring_back_closing_pane(&mut self, card: CardId) {
+        if !self.hidden_closes.remove(&card) {
+            return;
+        }
+        if let Some(update) = self.workspace.show_card(card) {
+            self.kept_panes.push(update);
+        }
     }
 
     /// Whether something is still working towards removing `card` once its
@@ -200,8 +338,24 @@ impl Cagents {
     /// Whether a close of a pane other than `card` has to finish first. The
     /// workspace removes one pane at a time, so a second started beside it would
     /// be refused at the end of its own close.
+    ///
+    /// A pane hidden while the daemon closes its terminal holds no removal,
+    /// so only another terminal, whose close needs the same daemon request,
+    /// waits for it; a chat or any other pane closes beside it.
     pub(super) fn another_close_under_way(&self, card: CardId) -> bool {
-        self.closes_under_way().any(|running| running != card)
+        let terminal = matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Terminal(_))
+        );
+        // Once it holds the strip's removal, it is waited for like any other.
+        let reserved = self
+            .workspace
+            .pending_close()
+            .map(|pending| pending.unmounting);
+        self.closes_under_way().any(|running| {
+            running != card
+                && (terminal || reserved == Some(running) || !self.hidden_closes.contains(&running))
+        })
     }
 
     /// Whether the next queued pane has to wait: for a close under way, or for
@@ -464,7 +618,10 @@ impl Cagents {
         }
         // This pane's own close is already running or asking, or the daemon has
         // answered and only its removal is left.
-        if self.terminal_close.is_some()
+        if self
+            .terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.card == card)
             || self.completed_release == Some(card)
             || self.closed_terminal_cards.contains(&card)
         {
@@ -476,7 +633,12 @@ impl Cagents {
         if let Some(session) = self.ended_terminal(card).cloned() {
             let authority = self.terminal_cleanup_authority(card);
             self.completed_release = Some(card);
-            return cosmic::task::future(async move {
+            let out_of_sight = if allow_active {
+                self.hide_closing_pane(card)
+            } else {
+                Task::none()
+            };
+            let release = cosmic::task::future(async move {
                 let source = session.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let mut client = crate::terminal::connect_ready_daemon()
@@ -539,6 +701,7 @@ impl Cagents {
                     result,
                 }
             });
+            return Task::batch([out_of_sight, release]);
         }
         if self.pending_terminal_spawn(card) {
             self.status = Some(TransientNotice::warning(
@@ -597,6 +760,9 @@ impl Cagents {
         if self.completed_release == Some(card) {
             self.completed_release = None;
         }
+        if !matches!(&result, Ok(CompletedCloseOutcome::ClosedWithBasis(_))) {
+            self.bring_back_closing_pane(card);
+        }
         if !self.card_state(card).is_some_and(|state| {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Terminal(current) if current == &session)
@@ -619,6 +785,9 @@ impl Cagents {
             }
             outcome => Ok(outcome),
         });
+        if !matches!(&result, Ok(CompletedCloseOutcome::Closed)) {
+            self.bring_back_closing_pane(card);
+        }
         match result {
             Ok(CompletedCloseOutcome::ClosedWithBasis(_)) => unreachable!(),
             Ok(CompletedCloseOutcome::SourceChanged) => {
@@ -682,6 +851,17 @@ impl Cagents {
             self.abandon_removal(card);
             return self.next_queued_card_close();
         }
+        // A hidden pane whose terminal has closed reserved nothing while it
+        // waited, so another pane's removal may hold the strip now. It stays
+        // hidden and takes its turn once that one settles.
+        if self.hidden_closes.contains(&card)
+            && self
+                .workspace
+                .pending_close()
+                .is_some_and(|pending| pending.unmounting != card)
+        {
+            return Task::none();
+        }
         let reservation = match self.workspace.pending_close() {
             Some(handoff) if handoff.unmounting == card => Ok(handoff),
             _ => self.workspace.request_close(card),
@@ -742,6 +922,7 @@ impl Cagents {
             {
                 let _ = self.workspace.cancel_close(id);
             }
+            self.bring_back_closing_pane(id);
             self.status = Some(TransientNotice::warning(reason));
             return None;
         }
@@ -753,7 +934,13 @@ impl Cagents {
         }
         let closed_descriptor = (!replacing).then(|| self.card_state(id).cloned()).flatten();
         let update = match self.workspace.commit_close(id) {
-            Ok(update) => update,
+            Ok(update) => {
+                self.hidden_closes.remove(&id);
+                if !replacing {
+                    self.forget_stop_of_removed(id);
+                }
+                update
+            }
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 return None;
@@ -768,10 +955,28 @@ impl Cagents {
         };
         // Nothing of a terminal proven gone is left to bring back. Reopening
         // could only run its saved command again, unasked. Nor of a pane
-        // that gave way to another holding its conversation.
-        if let Some(card) = closed_descriptor
-            .filter(|_| !self.proven_gone_cards.remove(&id) && !self.reopen_superseded(id))
-        {
+        // that gave way to another holding its conversation, or that goes
+        // while another holds it, as a closed pane a shared view put back
+        // does once its conversation has reopened.
+        if let Some(card) = closed_descriptor.filter(|card| {
+            !self.proven_gone_cards.remove(&id)
+                && !self.reopen_superseded(id)
+                && !matches!(&card.kind, CardKind::Chat(session)
+                    if session.launch.session_id.is_some()
+                        && self.existing_conversation_card(session, Some(id)).is_some())
+        }) {
+            // A pane closed again holding the same conversation, as one a
+            // shared view put back is, is listed once, where it closed last.
+            let again = |closed: &CardState| {
+                closed.id == id
+                    && match (&closed.kind, &card.kind) {
+                        (CardKind::Chat(earlier), CardKind::Chat(now)) => {
+                            super::chat_ui::shares_conversation(earlier, now)
+                        }
+                        (earlier, now) => earlier == now,
+                    }
+            };
+            self.recently_closed.retain(|(closed, _)| !again(closed));
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
             if self.recently_closed.len() > 32 {
@@ -997,7 +1202,15 @@ impl Cagents {
         intent.generation = self.terminal_close_generation;
         let intent = intent.clone();
         let authority = self.terminal_cleanup_authority(intent.card);
-        cosmic::task::future(async move {
+        // A close that won't stop to ask lets the pane leave now; the
+        // daemon's answer either removes it for good or brings it back with
+        // what happened.
+        let out_of_sight = if allow_active {
+            self.hide_closing_pane(intent.card)
+        } else {
+            Task::none()
+        };
+        let close = cosmic::task::future(async move {
             let card = intent.card;
             let terminal = intent.terminal;
             let proof = intent.proof.clone();
@@ -1016,7 +1229,8 @@ impl Cagents {
                 generation,
                 outcome,
             }
-        })
+        });
+        Task::batch([out_of_sight, close])
     }
 
     pub(super) fn terminal_close_finished(
@@ -1055,15 +1269,46 @@ impl Cagents {
             }
             outcome => outcome,
         };
-        let intent = self.terminal_close.as_ref().unwrap();
-        let identity_matches = target_matches(intent, self.card_state(card))
-            || exited_target_matches(intent, self.card_state(card));
-        let still_saved = intent
-            .saved_source
-            .as_ref()
-            .or(intent.completed_source.as_ref())
-            .is_some_and(|saved| terminal_session(self.card_state(card)) == Some(saved));
+        let (identity_matches, still_saved) = {
+            let intent = self.terminal_close.as_ref().unwrap();
+            let identity_matches = target_matches(intent, self.card_state(card))
+                || exited_target_matches(intent, self.card_state(card));
+            let still_saved = intent
+                .saved_source
+                .as_ref()
+                .or(intent.completed_source.as_ref())
+                .is_some_and(|saved| terminal_session(self.card_state(card)) == Some(saved));
+            (identity_matches, still_saved)
+        };
         let starting = self.terminal_start_in_flight(card);
+        // A close that ends with nothing to say: every other outcome brings
+        // the pane back with a question or a report.
+        let settles_quietly = match outcome {
+            CloseOutcome::NotHosted => identity_matches && still_saved && !starting,
+            CloseOutcome::Closed => identity_matches,
+            _ => false,
+        };
+        // A hidden pane that has to come back with a question or a report
+        // waits for another pane's open dialog, rather than open beneath it.
+        // Its own close's dialog, still open after the person confirmed
+        // closing beside an active process, is where that report goes. What
+        // decides is the outcome once its basis and identity are checked: a
+        // close of a terminal another window has replaced since comes back as
+        // a report.
+        if self.hidden_closes.contains(&card)
+            && self.modal_beside_terminal_close_is_open()
+            && !settles_quietly
+        {
+            self.held_close_answer = Some(HeldCloseAnswer {
+                card,
+                terminal,
+                proof,
+                generation,
+                outcome,
+            });
+            return Task::none();
+        }
+        let intent = self.terminal_close.as_ref().unwrap();
         match outcome {
             CloseOutcome::NotHosted if identity_matches && still_saved && !starting => {
                 if intent.shows_dialog() {
@@ -1091,6 +1336,7 @@ impl Cagents {
                 // The owner positively declined to close: a later explicit Close
                 // may issue a fresh, independently fenced request.
                 self.terminal_close_attempts.remove(&terminal);
+                self.bring_back_closing_pane(card);
                 let intent = self.terminal_close.as_mut().unwrap();
                 intent.restore_card = self.workspace.focused();
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
@@ -1107,6 +1353,7 @@ impl Cagents {
                 if !matches!(outcome, CloseOutcome::Unreachable(_)) {
                     self.terminal_close_attempts.remove(&terminal);
                 }
+                self.bring_back_closing_pane(card);
                 let intent = self.terminal_close.as_mut().unwrap();
                 intent.restore_card = self.workspace.focused();
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
@@ -2001,6 +2248,546 @@ pub(in crate::app) mod tests {
         );
     }
 
+    /// Whether `card` is in sight: taking room in the strip and mounted.
+    fn in_sight(app: &Cagents, card: CardId) -> bool {
+        app.workspace
+            .geometry()
+            .card(card)
+            .is_some_and(|geometry| geometry.width() > 0.0)
+            && app
+                .workspace
+                .visibility(card)
+                .is_some_and(crate::workspace::VisibilityClass::is_mounted)
+    }
+
+    /// The app's own fixture of a pane whose close won't stop to ask.
+    fn closing_unasked() -> (Cagents, CardId) {
+        let (mut app, card) = retry_close_fixture();
+        app.settings.confirm_terminal_close = false;
+        (app, card)
+    }
+
+    /// Closing a terminal pane that won't stop to ask takes it away before
+    /// the daemon has answered, and reserves nothing while it waits; the pane
+    /// and its terminal are removed for good only once the daemon has
+    /// answered.
+    #[test]
+    fn a_closed_terminal_pane_leaves_before_the_daemon_answers() {
+        let (mut app, card) = closing_unasked();
+        let neighbour = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        assert!(in_sight(&app, card));
+
+        drop(app.update(Message::CloseCard(card)));
+        let intent = app.terminal_close.clone().expect("the close is running");
+        assert!(intent.pending, "the daemon has not answered");
+        assert!(!in_sight(&app, card), "the pane has gone");
+        assert_eq!(
+            app.workspace.pending_close(),
+            None,
+            "waiting holds no removal another pane needs"
+        );
+        let next = app
+            .workspace
+            .focused()
+            .expect("another pane has the keyboard");
+        assert_ne!(next, card, "with the keyboard");
+        assert_eq!(app.durable.focused, Some(next), "saved with it");
+        assert!(in_sight(&app, next));
+        assert!(in_sight(&app, neighbour));
+        assert!(
+            app.card_state(card).unwrap().existence.is_open(),
+            "nothing is removed until the daemon answers"
+        );
+        assert!(!app.terminal_close_dialog_visible());
+
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Closed,
+        }));
+        drop(app.update(Message::CommitClose(card)));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.card(card).is_none());
+        assert!(app.hidden_closes.is_empty());
+        assert_eq!(app.workspace.focused(), Some(next));
+        assert!(
+            app.notices.entries.is_empty() && app.status.is_none(),
+            "a close is not news"
+        );
+    }
+
+    /// A close that may stop to ask whether to end what still runs keeps its
+    /// pane in sight until the daemon answers, so an active terminal never
+    /// vanishes and comes back with the question (#2068).
+    #[test]
+    fn a_terminal_close_that_may_ask_keeps_its_pane_until_the_daemon_answers() {
+        let (mut app, card) = retry_close_fixture();
+        assert!(app.asks(QUESTION));
+        let _neighbour = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::CloseCard(card)));
+        let intent = app.terminal_close.clone().expect("the close is running");
+        assert!(intent.pending);
+        assert!(in_sight(&app, card), "the pane stays while it may ask");
+        assert_eq!(app.workspace.focused(), Some(card));
+
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Active,
+        }));
+        assert!(in_sight(&app, card));
+        assert!(app.terminal_close_dialog_visible(), "it asks");
+        assert_eq!(
+            app.terminal_close.as_ref().unwrap().restore_card,
+            Some(card)
+        );
+    }
+
+    /// A close that won't ask but doesn't complete brings the pane back where
+    /// it was, with the keyboard, and the dialog that says what happened and
+    /// what can be done.
+    #[test]
+    fn a_terminal_close_that_does_not_complete_brings_its_pane_back_with_why() {
+        let outcomes: [fn() -> CloseOutcome; 3] = [
+            || CloseOutcome::Unreachable("reply lost".into()),
+            || CloseOutcome::Stale,
+            || {
+                CloseOutcome::Kept(KeptPane {
+                    reason: "a process could not be read".into(),
+                    unreadable: Vec::new(),
+                })
+            },
+        ];
+        for outcome in outcomes {
+            let (mut app, card) = closing_unasked();
+            let neighbour = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            drop(app.update(Message::CloseCard(card)));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            assert!(!in_sight(&app, card));
+
+            let outcome = outcome();
+            let label = format!("{outcome:?}");
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome,
+            }));
+            assert!(in_sight(&app, card), "{label}: the pane is back");
+            assert_eq!(app.workspace.pending_close(), None, "{label}");
+            assert!(app.hidden_closes.is_empty(), "{label}");
+            assert_eq!(app.workspace.focused(), Some(card), "{label}");
+            assert!(app.terminal_close_dialog_visible(), "{label}: it says why");
+            assert!(app.card_state(card).unwrap().existence.is_open(), "{label}");
+            assert!(app.workspace.card(neighbour).is_some(), "{label}");
+            assert_eq!(
+                app.terminal_close.as_ref().unwrap().restore_card,
+                Some(card),
+                "{label}: dismissing the dialog returns to the pane"
+            );
+        }
+    }
+
+    /// A close given up some other way, with nothing left to answer for it,
+    /// still brings its pane back.
+    #[test]
+    fn a_pane_hidden_for_a_close_that_was_dropped_comes_back() {
+        let (mut app, card) = closing_unasked();
+        let _neighbour = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::CloseCard(card)));
+        assert!(!in_sight(&app, card));
+        app.terminal_close = None;
+        drop(app.update(Message::DismissStatus));
+        assert!(in_sight(&app, card));
+        assert!(app.hidden_closes.is_empty());
+        assert_eq!(app.workspace.focused(), Some(card));
+    }
+
+    /// An ended terminal's pane goes at once too when its release won't ask,
+    /// and comes back if the release fails; one that may ask stays.
+    #[test]
+    fn an_ended_terminal_pane_leaves_before_its_release_is_confirmed() {
+        for released in [true, false] {
+            let (mut app, card) = closing_unasked();
+            let neighbour = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            app.retire_ended_terminal(card, 0, None, true);
+            drop(app.update(Message::CloseCard(card)));
+            assert_eq!(app.completed_release, Some(card));
+            assert!(!in_sight(&app, card), "the pane has gone");
+            assert_ne!(app.workspace.focused(), Some(card));
+            assert!(in_sight(&app, neighbour));
+
+            let session = terminal_source(&app, card);
+            drop(app.update(Message::CompletedTerminalClosed {
+                card,
+                session,
+                result: if released {
+                    Ok(CompletedCloseOutcome::Closed)
+                } else {
+                    Err("the daemon went away".into())
+                },
+            }));
+            if released {
+                drop(app.update(Message::CommitClose(card)));
+                assert!(!app.card_state(card).unwrap().existence.is_open());
+                assert!(app.workspace.card(card).is_none());
+            } else {
+                assert!(in_sight(&app, card), "the pane is back");
+                assert_eq!(app.workspace.focused(), Some(card));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(
+                    app.notices
+                        .entries
+                        .iter()
+                        .any(|entry| entry.notice.message.contains("Try Close again")),
+                    "it says why"
+                );
+            }
+        }
+
+        let (mut app, card) = retry_close_fixture();
+        let _neighbour = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        app.retire_ended_terminal(card, 0, None, true);
+        drop(app.update(Message::CloseCard(card)));
+        assert_eq!(app.completed_release, Some(card));
+        assert!(
+            in_sight(&app, card),
+            "a release that may ask keeps its pane"
+        );
+    }
+
+    /// A chat closed while a terminal's close waits on the daemon leaves at
+    /// once: the hidden terminal holds no removal the chat has to wait for.
+    /// The terminal's own close still finishes afterwards.
+    #[test]
+    fn a_chat_closed_while_a_terminal_closes_leaves_at_once() {
+        let (mut app, terminal) = closing_unasked();
+        // In the terminal's own strip.
+        let directory = terminal_source(&app, terminal).launch.working_directory;
+        let chat = crate::app::chat_ui::tests::live_chat_in(
+            &mut app,
+            crate::agent::Provider::Codex,
+            &directory,
+            Some("thread-beside-a-closing-terminal"),
+        );
+        assert!(
+            app.workspace.order().any(|id| id == chat),
+            "beside the terminal"
+        );
+        drop(app.update(Message::FocusCard(terminal)));
+        assert!(in_sight(&app, terminal));
+        drop(app.update(Message::CloseCard(terminal)));
+        let intent = app.terminal_close.clone().expect("the close is running");
+        assert!(intent.pending);
+        assert!(!in_sight(&app, terminal));
+
+        drop(app.update(Message::CloseCard(chat)));
+        assert!(app.workspace.card(chat).is_none(), "the chat left at once");
+        assert!(!app.card_state(chat).unwrap().existence.is_open());
+        assert!(
+            app.queued_card_closes
+                .iter()
+                .all(|queued| queued.card != chat),
+            "nothing waits for the terminal"
+        );
+        assert!(!in_sight(&app, terminal), "the terminal is still hidden");
+        assert!(app.workspace.is_hidden(terminal));
+
+        drop(app.update(Message::TerminalCloseFinished {
+            card: terminal,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Closed,
+        }));
+        drop(app.update(Message::CommitClose(terminal)));
+        assert!(app.workspace.card(terminal).is_none());
+        assert!(!app.card_state(terminal).unwrap().existence.is_open());
+        assert!(app.hidden_closes.is_empty());
+    }
+
+    /// A hidden pane whose terminal closes while another pane's removal holds
+    /// the strip stays hidden, and is removed once that removal settles; it
+    /// never comes back for a refusal of its own making. Once it holds the
+    /// strip's removal itself, other panes wait for it as for any other.
+    #[test]
+    fn a_hidden_pane_whose_terminal_closed_waits_for_the_strip() {
+        let (mut app, card) = closing_unasked();
+        let other = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::CloseCard(card)));
+        let intent = app.terminal_close.clone().expect("the close is running");
+        assert!(app.workspace.is_hidden(card));
+        // Another removal takes the strip meanwhile.
+        app.workspace.request_close(other).unwrap();
+
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Closed,
+        }));
+        assert!(app.workspace.is_hidden(card), "it stays out of sight");
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.status.is_none(), "{:?}", app.status);
+
+        let _ = app.workspace.cancel_close(other);
+        drop(app.settle_close_queue());
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|pending| pending.unmounting),
+            Some(card),
+            "its removal goes ahead once the strip is free"
+        );
+        assert!(
+            app.another_close_under_way(other),
+            "and is waited for like any other"
+        );
+        drop(app.update(Message::CommitClose(card)));
+        assert!(app.workspace.card(card).is_none());
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.hidden_closes.is_empty());
+    }
+
+    /// A hidden pane whose close comes back with something to say waits for
+    /// a dialog another pane opened meanwhile, so the two never open
+    /// together; it comes back with its own once that one closes. That
+    /// includes a close the daemon carried out on a terminal another window
+    /// has since put in the pane, which keeps the pane and says so.
+    #[test]
+    fn a_hidden_pane_brings_its_report_back_after_another_dialog() {
+        for replaced in [false, true] {
+            let (mut app, card) = closing_unasked();
+            let _other = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            drop(app.update(Message::CloseCard(card)));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            app.resume_ui.open = true;
+            assert!(app.modal_is_open());
+            let outcome = if replaced {
+                if let Some(CardKind::Terminal(session)) =
+                    app.card_state_mut(card).map(|state| &mut state.kind)
+                {
+                    session.id = TerminalId::new();
+                }
+                CloseOutcome::Closed
+            } else {
+                CloseOutcome::Unreachable("reply lost".into())
+            };
+
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome,
+            }));
+            assert!(
+                app.workspace.is_hidden(card),
+                "replaced={replaced}: it waits out of sight"
+            );
+            assert!(!app.terminal_close_dialog_visible(), "replaced={replaced}");
+
+            app.resume_ui.open = false;
+            drop(app.settle_close_queue());
+            assert!(
+                !app.workspace.is_hidden(card),
+                "replaced={replaced}: it is back"
+            );
+            assert!(
+                app.terminal_close_dialog_visible(),
+                "replaced={replaced}: with what happened"
+            );
+            assert!(app.held_close_answer.is_none(), "replaced={replaced}");
+        }
+    }
+
+    /// A hidden pane whose close ended as asked has nothing to bring back, so
+    /// it goes while another dialog is open rather than wait behind it.
+    #[test]
+    fn a_hidden_pane_closed_as_asked_goes_beside_another_dialog() {
+        let (mut app, card) = closing_unasked();
+        let _other = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::CloseCard(card)));
+        let intent = app.terminal_close.clone().expect("the close is running");
+        app.resume_ui.open = true;
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Closed,
+        }));
+        assert!(app.held_close_answer.is_none(), "nothing waits");
+        assert!(app.terminal_close.is_none(), "the close is over");
+        assert!(
+            app.closed_terminal_cards.contains(&card),
+            "and the pane goes"
+        );
+    }
+
+    /// A pane closed beside an active process, once the person confirmed it,
+    /// leaves while its own dialog shows the close under way. A close that
+    /// then fails brings it back with the report in that dialog at once: the
+    /// dialog it is shown in is not one it waits behind.
+    #[test]
+    fn a_confirmed_active_close_that_fails_comes_back_with_its_report() {
+        for outcome in [
+            CloseOutcome::Unreachable("reply lost".into()),
+            CloseOutcome::Stale,
+        ] {
+            let (mut app, card) = retry_close_fixture();
+            app.settings.confirm_terminal_close = true;
+            let _other = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            drop(app.update(Message::CloseCard(card)));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            assert!(in_sight(&app, card), "it stays while the daemon checks");
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome: CloseOutcome::Active,
+            }));
+            assert!(app.terminal_close_dialog_visible(), "it asks");
+
+            drop(app.update(Message::ConfirmTerminalClose));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            assert!(intent.pending);
+            assert!(app.workspace.is_hidden(card), "{outcome:?}: it leaves");
+            assert!(
+                app.terminal_close_dialog_visible(),
+                "with the close under way"
+            );
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome: outcome.clone(),
+            }));
+            drop(app.settle_close_queue());
+            assert!(
+                app.held_close_answer.is_none(),
+                "{outcome:?}: nothing waits"
+            );
+            assert!(!app.workspace.is_hidden(card), "{outcome:?}: it is back");
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(
+                app.terminal_close
+                    .as_ref()
+                    .is_some_and(|intent| !intent.pending && intent.detail.is_some()),
+                "{outcome:?}: with what happened"
+            );
+        }
+    }
+
+    /// Nothing that leads to a pane reaches one hidden while it closes:
+    /// Ctrl+Tab passes over it, and a request to focus it, from the sidebar
+    /// or anywhere else, does nothing and says nothing.
+    #[test]
+    fn a_hidden_pane_is_not_a_place_to_go() {
+        let (mut app, card) = closing_unasked();
+        let other = queued_terminal(&mut app, card);
+        let third = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::FocusCard(other)));
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::CloseCard(card)));
+        assert!(app.workspace.is_hidden(card));
+        let focused = app.workspace.focused().unwrap();
+        assert_ne!(focused, card);
+
+        let ctrl_tab = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        };
+        let mut reached = HashSet::new();
+        for _ in 0..4 {
+            drop(app.update(Message::KeyEvent {
+                event: ctrl_tab.clone(),
+                captured: false,
+            }));
+            let now = app.workspace.focused().unwrap();
+            assert_ne!(now, card, "Ctrl+Tab passes over it");
+            reached.insert(now);
+        }
+        assert_eq!(
+            reached,
+            HashSet::from([other, third]),
+            "and every press still goes somewhere"
+        );
+
+        let before = app.workspace.focused();
+        drop(app.update(Message::FocusCard(card)));
+        assert_eq!(app.workspace.focused(), before);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card })));
+        assert_eq!(app.workspace.focused(), before);
+        assert!(
+            app.status.is_none() && app.notices.entries.is_empty(),
+            "nothing says a closed pane is pending removal"
+        );
+
+        // Shown another strip, as another worktree's, it is still closing and
+        // still no place to go.
+        let _ = app.workspace.remove_cards(&HashSet::from([card]));
+        assert!(!app.workspace.is_hidden(card));
+        let before = app.workspace.focused();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card })));
+        drop(app.update(Message::FocusCard(card)));
+        assert_eq!(app.workspace.focused(), before);
+        assert!(
+            app.status.is_none() && app.notices.entries.is_empty(),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// A chat beside a closing terminal that is still starting is owed the
+    /// keyboard the terminal gave up, until its input is drawn.
+    #[test]
+    fn a_hidden_terminal_owes_the_keyboard_to_a_chat_still_starting() {
+        let (mut app, card) = closing_unasked();
+        let directory = terminal_source(&app, card).launch.working_directory;
+        let (chat, _) = crate::app::chat_ui::tests::starting_chat_in(
+            &mut app,
+            crate::agent::Provider::Codex,
+            &directory,
+        );
+        drop(app.update(Message::FocusCard(card)));
+        let order: Vec<_> = app.workspace.shown().collect();
+        let index = order.iter().position(|id| *id == card).unwrap();
+        let neighbour = order
+            .get(index + 1)
+            .or_else(|| order.get(index.wrapping_sub(1)))
+            .copied();
+        assert_eq!(neighbour, Some(chat), "the chat takes over");
+        assert!(app.owes_chat_input(chat));
+        drop(app.update(Message::CloseCard(card)));
+        assert_eq!(app.workspace.focused(), Some(chat));
+        assert_eq!(app.keyboard_owed, Some(chat));
+    }
+
     /// Each takes the workspace's only removal once the daemon has answered, so
     /// two asked at once would have one refused.
     #[test]
@@ -2850,7 +3637,8 @@ pub(in crate::app) mod tests {
             "a later explicit cancellation upgrades a queued ordinary close"
         );
         app.terminal_close = None;
-        drop(app.next_queued_card_close());
+        // Its pane comes back, and the queue moves on.
+        drop(app.settle_close_queue());
         assert!(app.queued_card_closes.is_empty());
         let next = app.terminal_close.as_ref().unwrap();
         assert_eq!((next.card, next.terminal), (login, login_terminal));
