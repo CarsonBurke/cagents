@@ -36,6 +36,10 @@ impl Drop for UnpublishedOriginal {
     }
 }
 
+#[cfg_attr(
+    not(any(debug_assertions, feature = "development")),
+    ignore = "needs a development build's instance identity"
+)]
 #[test]
 fn lifecycle_idle_exit_drains_a_late_original_before_releasing_listener_and_lease() {
     const NAME: &str = "host::exit_drain_tests::lifecycle_retention_tests::lifecycle_idle_exit_drains_a_late_original_before_releasing_listener_and_lease";

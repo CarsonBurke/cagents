@@ -13,6 +13,8 @@ impl Drop for Server {
     }
 }
 
+// Fixture clients exist only in builds with debug assertions.
+#[cfg_attr(not(debug_assertions), ignore = "reset fixtures need debug assertions")]
 #[tokio::test]
 async fn reads_consumes_refreshes_and_reuses_keys_against_fake_providers() {
     if std::env::var_os(CHILD).is_none() {

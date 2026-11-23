@@ -4559,6 +4559,10 @@ fn selected_account_removals_win_in_fresh_and_returned_pty_children() {
 /// A shell in a development instance runs `cagents` against that
 /// instance's daemon, whatever environment it was handed; outside one it
 /// never inherits a stale instance.
+#[cfg_attr(
+    not(any(debug_assertions, feature = "development")),
+    ignore = "development instances exist only in development builds"
+)]
 #[test]
 fn terminals_keep_their_development_instance_and_only_theirs() {
     const CHILD: &str = "CAGENTS_TERMINAL_INSTANCE_TEST";
