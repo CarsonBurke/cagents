@@ -757,6 +757,36 @@ pub fn canonical_checkout(repository: &Path, checkout: &Path) -> Result<Option<P
     }
 }
 
+/// The branch checked out at `checkout`, a checkout of `repository` (its common
+/// Git directory), read from Git's own files. A worktree removed from disk
+/// keeps its administrative directory until `git worktree prune`, so its branch
+/// is still found there. `None` for a detached HEAD, a folder or an unreadable
+/// checkout.
+pub fn checkout_branch(repository: &Path, checkout: &Path) -> Option<String> {
+    let dot_git = checkout.join(".git");
+    let administrative = if dot_git.is_dir() {
+        Some(dot_git.clone())
+    } else {
+        gitdir_line(&dot_git)
+    }
+    .or_else(|| {
+        // The checkout is gone: find the administrative directory whose
+        // `gitdir` still names it.
+        std::fs::read_dir(repository.join("worktrees"))
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|administrative| {
+                gitdir_line(&administrative.join("gitdir")).is_some_and(|named| named == dot_git)
+            })
+    })?;
+    let head = std::fs::read_to_string(administrative.join("HEAD")).ok()?;
+    head.trim_end()
+        .strip_prefix("ref: refs/heads/")
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+}
+
 /// The path a small Git pointer file names: a checkout's `.git` file
 /// (`gitdir: PATH`) or a worktree's administrative `gitdir` file (`PATH`).
 /// A relative path is relative to the checkout or administrative directory

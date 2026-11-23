@@ -67,6 +67,7 @@ mod view_cost_bench;
 mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
+mod worktree_repair;
 
 const SCHEMA_VERSION: u32 = 30;
 

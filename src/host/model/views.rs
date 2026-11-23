@@ -258,6 +258,10 @@ fn project(db: &Connection, scope: &Scope) -> Result<PathBuf, String> {
     }
 }
 
+/// The refusal of a new pane in a worktree strip.
+pub(crate) const WORKTREE_VIEW_CLOSED: &str =
+    "A worktree's panes now open in its channel; open the worktree again to work there";
+
 /// Permanent transfer refusals are caller errors, distinct from storage
 /// failures. This same predicate runs before publication and inside the write
 /// transaction; a rejected edit never acknowledges an unchanged placement.
@@ -266,12 +270,23 @@ pub(super) fn refusal(
     scope: &Scope,
     change: &Change,
 ) -> Result<Option<String>, String> {
+    if let Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } = change {
+        // A worktree strip keeps the panes it holds until the startup repair
+        // moves them, but takes no new one: a worktree's work is in its
+        // checkout's channel.
+        return Ok((matches!(scope, Scope::Worktree { .. })
+            && !read(db, scope)?.panes.iter().any(|held| held.id == pane.id))
+        .then(|| WORKTREE_VIEW_CLOSED.into()));
+    }
     let Change::Transfer {
         id, destination, ..
     } = change
     else {
         return Ok(None);
     };
+    if matches!(destination, Scope::Worktree { .. }) {
+        return Ok(Some(WORKTREE_VIEW_CLOSED.into()));
+    }
     if !exists(db, scope)? {
         return Ok(Some("The source view is no longer open".into()));
     }
@@ -721,6 +736,11 @@ pub(super) fn apply_recorded(
                         store::move_pane(transaction, *id, destination_row)?;
                         view.apply(&Change::Remove { id: *id })?
                     }
+                }
+                Change::Insert { .. } | Change::InsertIfEmpty { .. }
+                    if let Some(reason) = refusal(transaction, scope, change)? =>
+                {
+                    return Err(reason);
                 }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
                     if resource_owner(transaction, pane)?.is_some() =>

@@ -517,10 +517,25 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
-        Ok(registry) => host
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .install_model(registry),
+        Ok(mut registry) => {
+            // Before any client reads the model: a window must never see a
+            // worktree's panes outside its checkout's channel.
+            match registry.adopt_worktree_views() {
+                Ok(adopted) if adopted.strips > 0 => tracing::info!(
+                    strips = adopted.strips,
+                    panes = adopted.panes,
+                    channels = adopted.created_channels,
+                    kept = adopted.kept,
+                    "moved worktree strips into their checkouts' channels"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "worktree strips were not moved into \
+                                                     channels; they still open as strips"),
+            }
+            host.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .install_model(registry)
+        }
         Err(error) => {
             tracing::error!(%error, "the shared workspace model is unavailable; channels will \
                                     not be shared between windows")
