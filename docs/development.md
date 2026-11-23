@@ -889,8 +889,10 @@ gives the shared library its `full` identity and browser paths), `-p ceditor`
 and the dictation helper: at least what each `mise run test:*` lane runs. The
 UI and browser lanes run two test threads (#2058), the others one per CPU, and
 a caller's `CAGENTS_TEST_*`, `RUST_TEST_*` and compiler-flag variables are
-not passed on. These are the test targets a release once ran itself, now
-unoptimized and with debug assertions on; the release smoke checks the packaged
+not passed on. These are the test targets a release once ran itself, now in
+the test profile, with debug assertions on and workspace crates unoptimized
+(Cargo.toml optimizes the few dependencies tests spend their time in); the
+release smoke checks the packaged
 artifacts' production identity.
 `verdicts/SHA.json` in the state directory records each lane's exit status and
 time, and `logs/SHA-test-LANE.log` its output. Main moves faster than the tests

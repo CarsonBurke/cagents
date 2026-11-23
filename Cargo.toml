@@ -286,8 +286,45 @@ debug = 0
 [profile.test.package.sha2]
 opt-level = 3
 
+# Tests spend most of their time inside a few dependencies, which an
+# unoptimized build makes several times slower than what ships: terminal
+# emulation, SQLite, regular expressions and syntax highlighting, and text
+# shaping. Optimize those alone; workspace code keeps its debug assertions.
+# libghostty-vt-sys builds Zig in Debug whenever it has debug info, and in
+# ReleaseFast, as releases do, without it. Its dev-profile setting would
+# otherwise win over the wildcard above, so turn it off by name.
 [profile.test.package."libghostty-vt-sys"]
-debug = "line-tables-only"
+debug = 0
+
+[profile.test.package.libsqlite3-sys]
+opt-level = 2
+
+[profile.test.package.regex-automata]
+opt-level = 2
+
+[profile.test.package.regex-syntax]
+opt-level = 2
+
+[profile.test.package.fancy-regex]
+opt-level = 2
+
+[profile.test.package.syntect]
+opt-level = 2
+
+[profile.test.package.cosmic-text]
+opt-level = 2
+
+[profile.test.package.swash]
+opt-level = 2
+
+[profile.test.package.harfrust]
+opt-level = 2
+
+[profile.test.package.skrifa]
+opt-level = 2
+
+[profile.test.package.read-fonts]
+opt-level = 2
 
 [patch."https://github.com/pop-os/winit.git"]
 winit-wayland = { path = "vendor/winit-wayland" }
