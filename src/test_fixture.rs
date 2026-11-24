@@ -84,7 +84,9 @@ fn validate_root(root: &Path, protected: &[(PathBuf, &'static str)]) -> io::Resu
                 format!("cannot inspect {}: {error}", ancestor.display()),
             )
         })?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        let sealed = metadata.file_type().is_symlink()
+            && crate::secure_file::is_sealed_system_link(&ancestor, &metadata);
+        if !sealed && (!metadata.is_dir() || metadata.file_type().is_symlink()) {
             return Err(refusal(
                 root,
                 format!(
@@ -341,7 +343,12 @@ mod tests {
         let link = fixture.path().join("link");
         symlink(&actual, &link).unwrap();
         let protected = resolve_protected(&link.join("missing/home")).unwrap();
-        assert_eq!(protected, actual.join("missing/home"));
+        // Resolution is canonical, as is the macOS temporary directory only
+        // once its /var link is resolved.
+        assert_eq!(
+            protected,
+            fs::canonicalize(&actual).unwrap().join("missing/home")
+        );
         fs::create_dir_all(&protected).unwrap();
         assert!(create_in(&protected, "case-", &[(protected.clone(), "HOME")]).is_err());
     }
@@ -354,7 +361,10 @@ mod tests {
         let link = fixture.path().join("link");
         symlink(destination.join("child"), &link).unwrap();
         let protected = resolve_protected(&link.join("../missing-home")).unwrap();
-        assert_eq!(protected, destination.join("missing-home"));
+        assert_eq!(
+            protected,
+            fs::canonicalize(&destination).unwrap().join("missing-home")
+        );
     }
 
     #[test]

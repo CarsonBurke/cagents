@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd},
         unix::{
@@ -45,6 +45,7 @@ const DAEMON_FD: i32 = 196;
 const ORIGINAL_WORKER_FD: i32 = 198;
 const LIMIT: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const SEALS: i32 = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
 static INHERITED: OnceLock<io::Result<Mutex<Option<Inherited>>>> = OnceLock::new();
 
@@ -792,7 +793,6 @@ fn persist_bound_capture(checkpoint: &Path, capture: &CapturedCensus) -> Result<
     if bytes.len() as u64 > LIMIT {
         return Err("Bound recovery census exceeds its private size limit".into());
     }
-    use std::os::unix::ffi::OsStrExt;
     let parent = path.parent().ok_or("Recovery capture has no parent")?;
     let temporary = parent.join(format!(".bound-recovery-capture-{}", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -806,26 +806,10 @@ fn persist_bound_capture(checkpoint: &Path, capture: &CapturedCensus) -> Result<
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|e| e.to_string())?;
-        let from =
-            std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        let to = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
         // Publish complete bytes atomically without ever replacing a prior
         // binding. A failed write cannot strand a partial bound-census file.
-        if unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } != 0
-        {
-            return Err(format!(
-                "Could not publish immutable recovery census: {}",
-                io::Error::last_os_error()
-            ));
-        }
+        rename_noreplace(&temporary, &path)
+            .map_err(|error| format!("Could not publish immutable recovery census: {error}"))?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|e| e.to_string())
@@ -2141,6 +2125,18 @@ fn executable_hash(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// A receipt's immutability rests on memfd seals, which Darwin lacks; see
+/// `update::anonymous_file`.
+#[cfg(not(target_os = "linux"))]
+fn sealed_receipt(_: &Authority) -> io::Result<File> {
+    Err(io::Error::other("self-update requires Linux"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_sealed_descriptor(_: i32) -> io::Result<()> {
+    Err(io::Error::other("self-update requires Linux"))
+}
+
 fn clone_descriptor(fd: i32) -> io::Result<File> {
     if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
         return Err(io::Error::last_os_error());
@@ -2191,7 +2187,9 @@ fn validate_lock_mode(file: &File, path: &Path, access: &str) -> io::Result<()> 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn sealed_receipt(authority: &Authority) -> io::Result<File> {
+    use std::io::{Seek, SeekFrom};
     let bytes = serde_json::to_vec(authority).map_err(io::Error::other)?;
     if bytes.len() as u64 > LIMIT {
         return Err(io::Error::other("Recovery receipt exceeds its byte limit"));
@@ -2216,6 +2214,7 @@ fn sealed_receipt(authority: &Authority) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
 fn validate_sealed_descriptor(fd: i32) -> io::Result<()> {
     let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
     if seals < 0 {
@@ -3444,7 +3443,9 @@ fn sweep_archive_temporaries_at(directory: &Path, proc_root: &Path) {
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
     let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
-    if unsafe {
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    #[cfg(target_os = "linux")]
+    let renamed = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
             from.as_ptr(),
@@ -3452,8 +3453,19 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
-    } == 0
-    {
+    };
+    // SAFETY: as above; RENAME_EXCL is Darwin's no-replace rename.
+    #[cfg(target_os = "macos")]
+    let renamed = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if renamed == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -3887,6 +3899,7 @@ impl RecoveryRecord {
 
 #[cfg(feature = "host")]
 pub fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
+    use std::io::{Seek, SeekFrom};
     let Some(mut inherited) = inherited()
         .map_err(|e| e.to_string())?
         .lock()

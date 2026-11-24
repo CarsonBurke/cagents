@@ -409,7 +409,7 @@ fn listener_before_restore(
     paths: &RuntimePaths,
     restore: impl FnOnce() -> Result<(), HostError>,
 ) -> Result<UnixListener, HostError> {
-    let listener = UnixListener::bind(&paths.socket)?;
+    let listener = crate::descriptor::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     restore()?;
@@ -927,7 +927,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             // A pending drain must keep accepting inspection and checked Close.
             continue;
         }
-        let fatal = match listener.accept() {
+        let fatal = match crate::descriptor::accept(&listener) {
             Ok((stream, _address)) => {
                 match daemon::peer_uid(&stream) {
                     Ok(uid) if uid == daemon::current_uid() => {}

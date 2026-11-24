@@ -96,13 +96,8 @@ struct ResultPipe {
 
 impl ResultPipe {
     fn new() -> io::Result<Self> {
-        let mut fds = [-1; 2];
-        // SAFETY: pipe2 initializes both owned descriptors atomically.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let reader = unsafe { File::from_raw_fd(fds[0]) };
-        let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+        let (reader, writer) = crate::descriptor::pipe(true)?;
+        let (reader, mut writer) = (File::from(reader), File::from(writer));
         if matches!(writer.as_raw_fd(), 197 | 198) {
             // These slots belong to UI/worker leases. Keep our descriptor
             // outside them before the child installs its launch-fence lease.
@@ -608,7 +603,8 @@ fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<(
         let from = std::ffi::CString::new(next.as_os_str().as_bytes())?;
         let to = std::ffi::CString::new(current.as_os_str().as_bytes())?;
         // SAFETY: both paths are NUL-terminated and outlive the call.
-        if unsafe {
+        #[cfg(target_os = "linux")]
+        let exchanged = unsafe {
             libc::renameat2(
                 libc::AT_FDCWD,
                 from.as_ptr(),
@@ -616,8 +612,19 @@ fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<(
                 to.as_ptr(),
                 libc::RENAME_EXCHANGE,
             )
-        } == -1
-        {
+        };
+        // SAFETY: as above; RENAME_SWAP is Darwin's atomic exchange.
+        #[cfg(target_os = "macos")]
+        let exchanged = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_SWAP,
+            )
+        };
+        if exchanged == -1 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -1254,13 +1261,12 @@ mod tests {
 
     #[test]
     fn daemon_start_reports_actual_failure_and_spawn_failure_without_success() {
-        wait_daemon_start(&mut Command::new("/bin/true"), Duration::from_secs(5)).unwrap();
-        let elapsed =
-            wait_daemon_start(&mut Command::new("/bin/true"), Duration::ZERO).unwrap_err();
+        wait_daemon_start(&mut Command::new("true"), Duration::from_secs(5)).unwrap();
+        let elapsed = wait_daemon_start(&mut Command::new("true"), Duration::ZERO).unwrap_err();
         assert!(elapsed.spawned);
         assert_eq!(elapsed.error.kind(), io::ErrorKind::TimedOut);
         let error =
-            wait_daemon_start(&mut Command::new("/bin/false"), Duration::from_secs(5)).unwrap_err();
+            wait_daemon_start(&mut Command::new("false"), Duration::from_secs(5)).unwrap_err();
         assert!(error.spawned);
         assert_eq!(error.error.kind(), io::ErrorKind::Other);
         assert_eq!(
@@ -1442,18 +1448,21 @@ mod tests {
 
     #[test]
     fn repeated_staging_keeps_the_running_version_even_when_current_is_newer() {
-        let root = tempfile::tempdir().unwrap();
-        let old = root.path().join("versions/old/bin");
-        let staged = root.path().join("versions/staged/bin");
+        let temporary = tempfile::tempdir().unwrap();
+        // The owner is reported as its canonical path, which differs from
+        // the temporary one where that path crosses a link, as on Darwin.
+        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let old = root.join("versions/old/bin");
+        let staged = root.join("versions/staged/bin");
         for bin in [&old, &staged] {
             std::fs::create_dir_all(bin).unwrap();
             for executable in ["cagents", "cagentsd", "cagents-ui"] {
                 std::fs::write(bin.join(executable), "fixture").unwrap();
             }
         }
-        std::os::unix::fs::symlink("versions/staged", root.path().join("current")).unwrap();
+        std::os::unix::fs::symlink("versions/staged", root.join("current")).unwrap();
         assert_eq!(
-            running_owner_bin(root.path(), &old.join("cagentsd")).unwrap(),
+            running_owner_bin(&root, &old.join("cagentsd")).unwrap(),
             old
         );
         let unrelated = tempfile::tempdir().unwrap();

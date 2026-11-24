@@ -1530,7 +1530,7 @@ fn ensure_daemon_ready_at(
     application: crate::notifications::Application,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     let started = Instant::now();
-    match UnixStream::connect(socket) {
+    match crate::descriptor::connect(socket) {
         Ok(stream) => {
             return verify_existing_startup_stream(socket, stream, started);
         }
@@ -1609,11 +1609,12 @@ fn start_and_verify_daemon_at(
     start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     // Another launcher can win the daemon lease while we wait for readiness;
     // it must satisfy the same protocol contract as an existing daemon.
-    let stream =
-        UnixStream::connect(socket).map_err(|source| HostedTerminalStartError::HostSocket {
+    let stream = crate::descriptor::connect(socket).map_err(|source| {
+        HostedTerminalStartError::HostSocket {
             path: socket.to_owned(),
             source,
-        })?;
+        }
+    })?;
     verify_startup_stream(socket, stream, |stream| {
         crate::control::ControlClient::from_stream_until(stream, deadline)
     })
@@ -2166,7 +2167,7 @@ fn serve_connection(
     if stop.is_requested() {
         return ConnectionEnd::Stop;
     }
-    let mut stream = match UnixStream::connect(socket) {
+    let mut stream = match crate::descriptor::connect(socket) {
         Ok(stream) => stream,
         Err(_) => return ConnectionEnd::Retry,
     };
@@ -3480,7 +3481,7 @@ mod tests {
                 Duration::from_secs(125),
                 Path::new("fixture-daemon"),
                 false,
-                |_| Command::new("/bin/false").spawn(),
+                |_| Command::new("false").spawn(),
             );
             assert!(matches!(
                 result,
@@ -3698,7 +3699,7 @@ mod tests {
                     if !scoped {
                         listener = Some(UnixListener::bind(&socket).unwrap());
                     }
-                    Command::new("/bin/false").spawn()
+                    Command::new("false").spawn()
                 },
             )
             .unwrap();
@@ -3718,7 +3719,7 @@ mod tests {
             true,
             |scoped| {
                 attempts.push(scoped);
-                Command::new("/bin/false").spawn()
+                Command::new("false").spawn()
             },
         );
         assert!(matches!(
@@ -3741,7 +3742,7 @@ mod tests {
             true,
             |scoped| {
                 attempts.push(scoped);
-                Command::new("/bin/false").spawn()
+                Command::new("false").spawn()
             },
         );
         assert!(matches!(
@@ -3938,7 +3939,7 @@ mod tests {
                     return;
                 }
             });
-            Command::new("/bin/true").spawn()
+            Command::new("true").spawn()
         }
     }
 
@@ -4022,7 +4023,7 @@ mod tests {
                         }
                     }
                 });
-                Command::new("/bin/true").spawn()
+                Command::new("true").spawn()
             },
         )
         .unwrap();
@@ -4052,7 +4053,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(200));
                     drop(listener);
                 });
-                Command::new("/bin/true").spawn()
+                Command::new("true").spawn()
             },
         );
         assert!(
@@ -4261,7 +4262,7 @@ mod tests {
         ready_read
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut command = Command::new("/bin/true");
+        let mut command = Command::new("true");
         // SAFETY: the forked child uses only async-signal-safe syscalls and
         // initialized stack buffers until exec. Bound its wait even if the
         // parent test fails before releasing it.
@@ -4585,7 +4586,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match listener.accept() {
+            match crate::descriptor::accept(listener) {
                 Ok((stream, _)) => {
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))

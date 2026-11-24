@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -1080,18 +1080,8 @@ pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<Unix
                 "daemon socket connection deadline elapsed",
             ));
         }
-        // SAFETY: socket returns a new descriptor transferred to this stream.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let stream = UnixStream::from(crate::descriptor::unix_socket(libc::SOCK_STREAM, true)?);
+        let fd = stream.as_raw_fd();
         // SAFETY: address is initialized with its valid length and the
         // descriptor belongs exclusively to this connection attempt.
         let result = unsafe {
@@ -1244,6 +1234,8 @@ impl ControlClient {
         protocol: u16,
         extend: Option<impl FnOnce() -> Instant>,
     ) -> Result<Self, ControlError> {
+        crate::descriptor::keep_options_after_shutdown(std::os::fd::AsFd::as_fd(&stream))
+            .map_err(ControlError::Configure)?;
         stream
             .set_read_timeout(Some(Self::handshake_timeout()))
             .map_err(ControlError::Configure)?;
@@ -6720,7 +6712,7 @@ mod tests {
         }
         // A reaped source supplies genuine exit evidence before any descriptor
         // is opened; no unrelated fixture can inherit the reservation.
-        let mut source = Command::new("/bin/true").spawn().unwrap();
+        let mut source = Command::new("true").spawn().unwrap();
         let source_pid = source.id();
         source.wait().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -6774,6 +6766,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn inherited_daemon_lease_is_not_a_serving_daemon() {
         #[cfg(target_os = "linux")]
         if crate::retained_fixture::run_isolated() {
@@ -6816,7 +6812,7 @@ mod tests {
                 assert_eq!(unsafe { libc::dup2(unrelated.as_raw_fd(), 199) }, 199);
                 let reserved = unsafe { std::fs::File::from_raw_fd(199) };
                 let error = crate::daemon::lease_handoff::inherit_daemon_lease(
-                    &mut std::process::Command::new("/bin/true"),
+                    &mut std::process::Command::new("true"),
                 )
                 .unwrap_err();
                 assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
@@ -7181,6 +7177,10 @@ mod tests {
     /// as `scripts/run-development --stop-instance` does, unless that daemon
     /// hosts it. The daemon here is a process holding the instance's lock.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the fixture holds its lock with util-linux flock(1)"
+    )]
     fn hosted_stop_for_rebuild_ends_only_a_development_daemon_that_does_not_host_it() {
         use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
         const CHILD: &str = "CAGENTS_TEST_HOSTED_STOP_FOR_REBUILD";
@@ -7418,7 +7418,7 @@ mod tests {
         }
         let socket = daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let before = std::fs::symlink_metadata(&socket).unwrap();
         let pinned = proof("fixture-host", "fixture-boot", "fixture-incarnation");
@@ -7446,7 +7446,7 @@ mod tests {
                 revents: 0,
             };
             assert_eq!(unsafe { libc::poll(&mut event, 1, 5000) }, 1);
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(listener).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -7525,7 +7525,7 @@ mod tests {
                 let peer = thread::spawn(move || {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        match observed.accept() {
+                        match crate::descriptor::accept(&observed) {
                             Ok((stream, _)) => {
                                 drop(stream);
                                 return true;
@@ -8157,6 +8157,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
+    )]
     fn control_socket_backlog_pressure_times_out_without_replacing_the_endpoint() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
@@ -8173,6 +8177,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
+    )]
     fn control_socket_retry_connects_and_handshakes_when_the_backlog_drains() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
@@ -8218,6 +8226,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "Darwin cannot shut down a listener another descriptor still holds"
+    )]
     fn control_socket_connection_preserves_missing_and_refused_error_classification() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
@@ -8563,7 +8575,10 @@ mod tests {
         assert_eq!(error.kind, "repository");
         assert_eq!(
             error.message,
-            format!("`{}` is not a directory", file.display())
+            format!(
+                "`{}` is not a directory",
+                std::fs::canonicalize(&file).unwrap().display()
+            )
         );
 
         if Command::new("git").arg("--version").output().is_err() {

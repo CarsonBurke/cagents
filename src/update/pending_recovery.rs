@@ -332,8 +332,8 @@ fn reserve_worker_descriptor(worker: &File) -> Result<File, UpdateError> {
             "The reserved recovery worker descriptor is already occupied",
         ));
     }
-    if unsafe { libc::dup3(worker.as_raw_fd(), WORKER_LOCK_FD, libc::O_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(unsafe { File::from_raw_fd(WORKER_LOCK_FD) })
+    Ok(File::from(crate::descriptor::duplicate_to(
+        std::os::fd::AsFd::as_fd(worker),
+        WORKER_LOCK_FD,
+    )?))
 }

@@ -186,17 +186,6 @@ fn write_ready(
     None
 }
 
-fn cancellation_descriptor() -> io::Result<Arc<OwnedFd>> {
-    // SAFETY: eventfd returns a fresh, close-on-exec owned descriptor. Its
-    // nonblocking counter coalesces notifications and cannot stall cancel().
-    let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if raw < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
-    }
-}
-
 fn timeout_milliseconds(deadline: Option<Instant>, now: Instant) -> i32 {
     deadline.map_or(-1, |deadline| {
         let remaining = deadline.saturating_duration_since(now);
@@ -257,7 +246,7 @@ pub(super) fn execute(
         if let Some(stdin) = &stdin {
             set_nonblocking(stdin.as_fd())?;
         }
-        Ok::<_, io::Error>((stdout, stderr, stdin, cancellation_descriptor()?))
+        Ok::<_, io::Error>((stdout, stderr, stdin, identity::wake()?))
     })();
     let (stdout, stderr, mut stdin, wake) = match setup {
         Ok(pipes) => pipes,
@@ -286,7 +275,7 @@ pub(super) fn execute(
     };
     let mut child = PolledChild::new(child, identity);
     let _registration =
-        cancellation.register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake)));
+        cancellation.register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake.notify)));
     let mut stdout = PipeCapture::new(stdout, spec.stdout_limit);
     let mut stderr = PipeCapture::new(stderr, spec.stderr_limit);
     let input = spec.stdin.as_deref().unwrap_or_default();
@@ -361,7 +350,7 @@ pub(super) fn execute(
             ),
             descriptor(
                 if terminal_kind.is_none() {
-                    wake.as_raw_fd()
+                    wake.watch.as_raw_fd()
                 } else {
                     -1
                 },
@@ -551,6 +540,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "Darwin has no ETXTBSY: an executable open for writing still runs"
+    )]
     fn an_executable_held_open_for_writing_fails_to_start_after_bounded_retries() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("run");
@@ -618,6 +611,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the fixture reaches the retained directory through /proc"
+    )]
     fn polled_io_uses_the_retained_directory_after_its_path_is_replaced() {
         let temporary = tempfile::tempdir().unwrap();
         let selected = temporary.path().join("selected");
@@ -668,6 +665,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the census counts threads through /proc"
+    )]
     fn git_calls_do_not_create_helper_threads() {
         const CHILD: &str = "CAGENTS_PROCESS_THREAD_CENSUS";
         if std::env::var_os(CHILD).is_none() {
@@ -798,12 +799,12 @@ mod tests {
     #[test]
     fn cancellation_descriptor_registration_is_nonblocking_and_deregistered() {
         let cancellation = CancellationToken::new();
-        let descriptor = cancellation_descriptor().unwrap();
+        let wake = identity::wake().unwrap();
         let registration = cancellation
-            .register_notifier(CancellationNotifier::Descriptor(Arc::clone(&descriptor)));
+            .register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake.notify)));
         cancellation.cancel();
         let mut watched = libc::pollfd {
-            fd: descriptor.as_raw_fd(),
+            fd: wake.watch.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };

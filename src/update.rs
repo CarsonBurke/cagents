@@ -28,7 +28,6 @@ mod signature;
 #[cfg(feature = "ui")]
 pub mod startup;
 use std::{
-    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::{
@@ -3575,13 +3574,7 @@ struct StreamingChild {
 impl StreamingChild {
     fn new(child: std::process::Child) -> io::Result<Self> {
         // Capture before the freshly spawned child can be reaped or handed off.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
-        let identity = if raw < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: successful pidfd_open returns a new owned descriptor.
-            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-        };
+        let identity = crate::process::identity::child_identity(&child);
         Self::with_identity(child, identity)
     }
 
@@ -3625,48 +3618,9 @@ impl StreamingChild {
         })
     }
 
+    /// Only finish omits WNOWAIT, after its last possible group signal.
     fn status(&self, flags: i32) -> io::Result<Option<std::process::ExitStatus>> {
-        use std::os::unix::process::ExitStatusExt;
-        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: the captured original pidfd cannot select a recycled PID.
-            // Only finish omits WNOWAIT, after its last possible group signal.
-            if unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.identity.as_raw_fd() as libc::id_t,
-                    &mut information,
-                    flags,
-                )
-            } == 0
-            {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        let (pid, status) = unsafe { (information.si_pid(), information.si_status()) };
-        if pid == 0 {
-            return Ok(None);
-        }
-        if pid as u32 != self.child.id() {
-            return Err(io::Error::other(
-                "streaming child observation returned another process",
-            ));
-        }
-        let raw = match information.si_code {
-            libc::CLD_EXITED => status << 8,
-            libc::CLD_KILLED => status,
-            libc::CLD_DUMPED => status | 0x80,
-            _ => {
-                return Err(io::Error::other(
-                    "streaming child observation returned an unexpected status",
-                ));
-            }
-        };
-        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+        crate::process::identity::child_exit_status(&self.identity, self.child.id(), flags)
     }
 
     fn observed_exit_status(&self) -> io::Result<Option<std::process::ExitStatus>> {
@@ -3736,7 +3690,7 @@ impl Drop for StreamingChild {
 
 #[cfg(target_os = "linux")]
 fn anonymous_file() -> io::Result<File> {
-    let name = CString::new("cagents-verified-update").expect("literal has no nul");
+    let name = std::ffi::CString::new("cagents-verified-update").expect("literal has no nul");
     let fd =
         unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd == -1 {
@@ -3830,6 +3784,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn recovery_installer_shell_requires_high_descriptor_support_before_shutdown() {
         preflight_recovery_shell(Path::new("/bin/bash")).unwrap();
         for shell in ["/bin/false", "/missing-cagents-recovery-shell"] {
@@ -3841,6 +3799,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn replacement_requires_retained_candidate_support_before_shutdown() {
         let root = tempfile::tempdir().unwrap();
         let installer = root.path().join("install.sh");
@@ -3929,6 +3891,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn recovery_daemon_digest_uses_the_exact_verified_archive_member() {
         let directory = tempfile::tempdir().unwrap();
         let release = release("9.8.7");
@@ -3994,6 +3960,7 @@ mod tests {
         assert!(review_answer("maybe", true).is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_lock_distinguishes_contention_from_a_descriptor_error() {
         let directory = tempfile::tempdir().unwrap();
@@ -4024,6 +3991,7 @@ mod tests {
         drop(held);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {
         let child = Command::new("/bin/sleep")
@@ -4061,6 +4029,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn bounded_stream_preserves_success_and_size_failure() {
         let mut file = bounded_command(
             Command::new("/bin/sh").args(["-c", "printf fixture"]),
@@ -4088,6 +4060,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn bounded_stream_keeps_live_timeout_and_cancellation_cleanup() {
         // The children outlive the test's wait, so a command that waited for
         // them instead of its timeout or cancellation never returns.
@@ -4121,6 +4097,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn streaming_child_observation_keeps_leader_until_final_cleanup() {
         let child = Command::new("/bin/sh")
             .args(["-c", "exit 7"])
@@ -4145,9 +4125,10 @@ mod tests {
         assert!(child.finish(true).is_ok(), "completion remains disarmed");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn streaming_signal_error_reaps_exited_leader_and_refuses_live_wait() {
-        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let child = Command::new("true").process_group(0).spawn().unwrap();
         let mut child = StreamingChild::new(child).unwrap();
         crate::test_timing::eventually("the child's exit", || {
             child.observed_exit_status().unwrap().is_some()
@@ -4231,6 +4212,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bounded_failed_stream_cleans_owned_descendants_after_exit() {
         const MARKER: &str = "CAGENTS_UPDATE_DESCENDANT_CHILD";
@@ -4328,6 +4310,7 @@ sys.exit(7)
         println!("owned failed update stream descendant cleaned");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an owned user/PID namespace and namespace-local PID allocation control"]
     fn streaming_child_refuses_a_kernel_reused_original_pid() {
@@ -4373,7 +4356,7 @@ sys.exit(7)
             std::env::var_os(NS).unwrap()
         );
         fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
-        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let child = Command::new("true").process_group(0).spawn().unwrap();
         assert_eq!(child.id(), 200);
         let mut original = StreamingChild::new(child).unwrap();
         original.child.wait().unwrap(); // Deliberately violate sole-reaper ownership.
@@ -4473,7 +4456,6 @@ sys.exit(7)
             ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
             read_frame, write_frame,
         };
-        use std::os::unix::net::UnixListener;
         let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         assert!(
@@ -4510,7 +4492,7 @@ sys.exit(7)
         )
         .unwrap();
         lease.sync_all().unwrap();
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let id = crate::model::TerminalId::new();
         let expected = impact::DaemonImpact {
@@ -4546,7 +4528,7 @@ sys.exit(7)
                     Instant::now() < deadline,
                     "private source fixture did not finish"
                 );
-                let (mut stream, _) = match listener.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&listener) {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         match completion.recv_timeout(Duration::from_millis(10)) {
@@ -4639,6 +4621,10 @@ sys.exit(7)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn installed_entry_admits_supported_sources_and_uses_the_candidate_worker() {
         const CASE: &str = "CAGENTS_TEST_INSTALLED_ENTRY_OWNER";
         let selector = thread::current().name().unwrap().to_owned();
@@ -5136,6 +5122,10 @@ finally:
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn tampered_bytes_fail_and_verified_bytes_cannot_change() {
         let mut file = anonymous_file().unwrap();
         file.write_all(b"trusted archive").unwrap();
@@ -5620,7 +5610,7 @@ finally:
                     .unwrap(),
             )
             .unwrap();
-            let socket = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let socket = crate::descriptor::bind(&paths.socket).unwrap();
             socket.set_nonblocking(true).unwrap();
             fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600)).unwrap();
             fs::write(root.join("daemon-ready"), b"listener").unwrap();
@@ -5629,7 +5619,7 @@ finally:
                 ServerResponse, StartupState, read_frame, write_frame,
             };
             while !root.join("daemon-exit").exists() {
-                let (mut stream, _) = match socket.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&socket) {
                     Ok(c) => c,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));

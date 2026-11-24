@@ -204,7 +204,7 @@ fn trace_worker_stack(role: &'static str) {
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
-    let result = UnixStream::connect(path);
+    let result = crate::descriptor::connect(path);
     #[cfg(feature = "ui")]
     crate::daemon_health::connection_io(path, &result, health_request);
     result

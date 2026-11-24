@@ -1728,7 +1728,7 @@ fn await_successor(
             }
         }
         if targets[0].revents != 0
-            && let Ok((successor, _)) = listener.accept()
+            && let Ok((successor, _)) = crate::descriptor::accept(listener)
             && hand_over(
                 &successor,
                 master,

@@ -31,10 +31,24 @@ pub struct Process {
 }
 
 impl Process {
+    /// `start` is the kernel's start time for the process: clock ticks
+    /// since boot on Linux, microseconds since the epoch on Darwin. Records
+    /// carry their boot, so neither is compared across boots or systems.
+    #[cfg(target_os = "linux")]
     pub fn read(pid: i32) -> io::Result<Self> {
         let stat = fs::read(format!("/proc/{pid}/stat")).map_err(exited_as_absent)?;
         let (_, start) = crate::model::agent_recovery::process_identity(&stat)
             .ok_or_else(|| io::Error::other("invalid process identity"))?;
+        Ok(Self { pid, start })
+    }
+
+    /// Darwin keeps no record for a zombie, so one reads as absent before
+    /// its parent reaps it, where Linux still names it.
+    #[cfg(target_os = "macos")]
+    pub fn read(pid: i32) -> io::Result<Self> {
+        let number = u32::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        let start = crate::pinned_process::started_microseconds_of(number)?;
         Ok(Self { pid, start })
     }
     pub fn is_current(&self) -> bool {
@@ -61,6 +75,7 @@ impl Process {
 
 /// A process reaped between opening and reading its stat file fails the read
 /// with ESRCH. It is as absent as one whose entry is already gone.
+#[cfg(any(target_os = "linux", feature = "host"))]
 pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::ESRCH) {
         io::Error::new(io::ErrorKind::NotFound, error)
@@ -292,16 +307,12 @@ pub fn with_socket_address<T>(
 
 #[cfg(feature = "host")]
 pub fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
-    with_socket_address(path, |address| {
-        std::os::unix::net::UnixListener::bind(address)
-    })
+    with_socket_address(path, crate::descriptor::bind)
 }
 
 #[cfg(feature = "host")]
 pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
-    with_socket_address(path, |address| {
-        std::os::unix::net::UnixStream::connect(address)
-    })
+    with_socket_address(path, crate::descriptor::connect)
 }
 
 impl Record {
@@ -322,6 +333,22 @@ impl Record {
         if !self.holder.is_current() {
             return Err(io::Error::other("holder process identity changed"));
         }
+        let zombies = self.zombie_count()?;
+        if !self.holder.is_current() {
+            return Err(io::Error::other("holder process identity changed"));
+        }
+        Ok(zombies)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn zombie_count(&self) -> io::Result<usize> {
+        let pid = u32::try_from(self.holder.pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        crate::pinned_process::zombie_children_of(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn zombie_count(&self) -> io::Result<usize> {
         // Linux records children on the thread that created them, even though
         // their stat parent is the process leader. Inspect every live thread.
         let mut children = std::collections::BTreeSet::new();
@@ -354,9 +381,6 @@ impl Record {
                     .unwrap_or(false)
             })
             .count();
-        if !self.holder.is_current() {
-            return Err(io::Error::other("holder process identity changed"));
-        }
         Ok(zombies)
     }
 
@@ -696,9 +720,11 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Linux only: Darwin has no stat file to hold open across the reap.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_process_reaped_while_its_stat_is_read_is_absent() {
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
         let mut stat = fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
         child.wait().unwrap();
         let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
@@ -1343,7 +1369,7 @@ mod tests {
 
     #[test]
     fn zombie_count_observes_children_without_consuming_status() {
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };

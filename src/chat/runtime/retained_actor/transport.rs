@@ -4097,7 +4097,7 @@ impl Server {
             }
             child_exited = exits.is_some_and(|index| events[index].revents != 0);
             while accepting && connections.has_capacity() {
-                match self.listener.accept() {
+                match crate::descriptor::accept(&self.listener) {
                     Ok((control, _)) => connections.admit(control),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}

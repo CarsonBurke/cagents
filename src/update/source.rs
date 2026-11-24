@@ -11,11 +11,15 @@ use super::{UpdateError, impact, invalid};
 use crate::{
     control::{ControlClient, ControlError},
     model::HostSessionProof,
+    pinned_process::{PinnedProcess, peer_credentials},
 };
+#[cfg(test)]
 use std::{
     fs::{self, File},
+    os::fd::AsRawFd,
+};
+use std::{
     io,
-    os::fd::{AsRawFd, FromRawFd},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -185,8 +189,9 @@ fn prepare_reply(reply: Result<(u64, u64), ControlError>) -> Result<(u64, u64), 
 
 pub(crate) struct Peer {
     pid: u32,
-    start: String,
-    process: File,
+    /// Pinned from the socket's kernel-recorded peer, so a later process
+    /// reusing the number cannot authenticate this connection.
+    process: PinnedProcess,
     socket: PathBuf,
 }
 
@@ -209,39 +214,19 @@ impl Peer {
     }
 
     pub(super) fn observe(stream: &UnixStream, socket: &Path) -> Result<Self, UpdateError> {
-        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: both buffers have the exact initialized kernel ABI layout.
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credentials as *mut libc::ucred).cast(),
-                &mut length,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-        if length as usize != std::mem::size_of::<libc::ucred>()
-            || credentials.uid != crate::daemon::current_uid()
-            || credentials.pid <= 1
-        {
+        let credentials = peer_credentials(stream)?;
+        if credentials.uid != crate::daemon::current_uid() || credentials.pid <= 1 {
             return Err(invalid("The upgrade source is not an owned local daemon"));
         }
-        // Pin the original socket peer before observing its process epoch.
-        // A later reused numeric PID cannot authenticate this connection.
-        // SAFETY: pidfd_open takes scalar arguments and returns a new owned FD.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, credentials.pid, 0) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: successful pidfd_open returned a fresh descriptor owned here.
-        let process = unsafe { File::from_raw_fd(descriptor as i32) };
+        let process = PinnedProcess::open(credentials.pid).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                invalid("The original upgrade source has exited or changed")
+            } else {
+                error.into()
+            }
+        })?;
         let peer = Self {
-            pid: credentials.pid as u32,
-            start: process_start(credentials.pid as u32)?,
+            pid: credentials.pid,
             process,
             socket: socket.to_owned(),
         };
@@ -265,31 +250,25 @@ impl Peer {
 
     pub(super) fn executable(&self) -> Result<PathBuf, UpdateError> {
         self.alive()?;
-        let executable = fs::read_link(format!("/proc/{}/exe", self.pid))?;
-        self.alive()?;
-        Ok(executable)
+        self.process
+            .executable()
+            .map_err(|error| self.vanished(error))
     }
 
     fn alive(&self) -> Result<(), UpdateError> {
-        let mut poll = libc::pollfd {
-            fd: self.process.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll points to one initialized writable pollfd.
-        if unsafe { libc::poll(&mut poll, 1, 0) } != 0 || process_start(self.pid)? != self.start {
+        if self.process.exited()? {
             return Err(invalid("The original upgrade source has exited or changed"));
         }
         Ok(())
     }
-}
 
-fn process_start(pid: u32) -> Result<String, UpdateError> {
-    let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    raw.rsplit_once(')')
-        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
-        .map(str::to_owned)
-        .ok_or_else(|| invalid("The upgrade source process epoch is unavailable"))
+    fn vanished(&self, error: io::Error) -> UpdateError {
+        if error.kind() == io::ErrorKind::NotFound {
+            invalid("The original upgrade source has exited or changed")
+        } else {
+            error.into()
+        }
+    }
 }
 
 impl Client {
@@ -603,8 +582,7 @@ impl InstalledIdentity {
             (Some(before), Some(current), Some(proof), Some(after_proof))
                 if self.protocol == after.protocol
                     && proof == after_proof
-                    && before.pid == current.pid
-                    && before.start == current.start
+                    && matches!(before.process.is_same_process(&current.process), Ok(true))
                     && before.socket == current.socket =>
             {
                 before.verify(proof)?;
@@ -624,7 +602,7 @@ impl InstalledIdentity {
         match (&self.peer, &self.proof, executable) {
             (Some(peer), Some(proof), Some(expected)) => {
                 peer.verify(proof)?;
-                let current = fs::read_link(format!("/proc/{}/exe", peer.pid))?;
+                let current = peer.executable()?;
                 if current != expected {
                     return Err(invalid(
                         "The installed source owner changed before worker selection",

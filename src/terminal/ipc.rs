@@ -404,15 +404,12 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
 
 /// This computer's daemon socket, even while another device is selected.
 pub fn local_daemon_socket_path() -> io::Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "XDG_RUNTIME_DIR is not set to an absolute path",
-            )
-        })?;
+    let runtime = instance::runtime_base()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR is not set to an absolute path",
+        )
+    })?;
     Ok(runtime
         .join(instance::runtime_subdirectory())
         .join(SOCKET_FILE_NAME))

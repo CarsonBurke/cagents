@@ -23,6 +23,8 @@ struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    /// `started_ticks` is the start time in clock ticks since boot on Linux.
+    #[cfg(target_os = "linux")]
     fn read(pid: u32) -> io::Result<Self> {
         let root = Path::new("/proc").join(pid.to_string());
         let stat = fs::read_to_string(root.join("stat"))?;
@@ -32,6 +34,29 @@ impl ProcessIdentity {
             .and_then(|value| value.parse().ok())
             .ok_or_else(|| io::Error::other("window process start identity is unavailable"))?;
         let executable = fs::metadata(root.join("exe"))?;
+        Ok(Self {
+            pid,
+            started_ticks,
+            boot_id: crate::daemon::read_boot_id()?,
+            executable_device: executable.dev(),
+            executable_inode: executable.ino(),
+        })
+    }
+
+    /// `started_ticks` is the start time in microseconds since the epoch on
+    /// Darwin, which reports no tick count; identities are only compared.
+    /// Darwin names the executable by path, so replacing it on disk changes
+    /// the identity, unlike Linux's `exe` link; self-update, the one flow that
+    /// replaces a running window's executable, is refused there.
+    #[cfg(target_os = "macos")]
+    fn read(pid: u32) -> io::Result<Self> {
+        let process = crate::pinned_process::PinnedProcess::open(pid)?;
+        let executable = fs::metadata(process.executable()?)?;
+        let started_ticks = process.started_microseconds();
+        // The executable was read while the pin's process still ran.
+        if process.exited()? {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
         Ok(Self {
             pid,
             started_ticks,
@@ -289,10 +314,7 @@ fn fence_holder(runtime: &Path) -> io::Result<FenceHolder> {
 /// with an update. A daemon admission remains waitable; only authenticated
 /// inherited authority may start a daemon through an update's own fence.
 pub(crate) fn daemon_launch_is_updating(socket: &Path) -> io::Result<bool> {
-    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    else {
+    let Some(runtime) = runtime_base()? else {
         return Ok(false);
     };
     if socket
@@ -379,8 +401,19 @@ fn validate_fence(file: &File) -> io::Result<()> {
             "daemon inherited a different launch fence",
         ));
     }
+    if !holds_flock(file, actual.ino())? {
+        return Err(io::Error::other(
+            "daemon inherited an unheld launch fence description",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether this exact open description holds a whole-file flock on `inode`.
+#[cfg(target_os = "linux")]
+fn holds_flock(file: &File, inode: u64) -> io::Result<bool> {
     let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
-    let owns = info
+    Ok(info
         .lines()
         .filter_map(|line| line.strip_prefix("lock:"))
         .any(|line| {
@@ -393,14 +426,18 @@ fn validate_fence(file: &File) -> io::Result<()> {
                     .rsplit(':')
                     .next()
                     .and_then(|inode| inode.parse::<u64>().ok())
-                    == Some(actual.ino())
-        });
-    if !owns {
-        return Err(io::Error::other(
-            "daemon inherited an unheld launch fence description",
-        ));
-    }
-    Ok(())
+                    == Some(inode)
+        }))
+}
+
+/// Darwin cannot tell which description holds a flock. Only the self-update
+/// handoff, which Darwin refuses, forwards a fence, so none is trusted.
+#[cfg(not(target_os = "linux"))]
+fn holds_flock(_: &File, _: u64) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "an inherited launch fence can be verified only on Linux",
+    ))
 }
 
 fn inherited_fence() -> io::Result<Option<(File, i32)>> {
@@ -539,6 +576,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "inherited launch fences are verified through /proc/self/fdinfo"
+    )]
     fn update_launch_probe_requires_selected_socket_and_authenticated_inherited_authority() {
         const CHILD: &str = "CAGENTS_TEST_UPDATE_LAUNCH_AUTHORITY";
         if let Ok(mode) = env::var(CHILD) {
@@ -798,6 +839,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "inherited launch fences are verified through /proc/self/fdinfo"
+    )]
     fn production_guards_tell_daemon_startup_from_an_update() {
         const CHILD: &str = "CAGENTS_TEST_PRODUCTION_LAUNCH_GUARDS";
         if env::var_os(CHILD).is_none() {
@@ -1051,6 +1096,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the fixture reads the lock through /proc/self/fdinfo"
+    )]
     fn descriptor_sealing_preserves_only_explicit_forwarded_authority() {
         const CHILD: &str = "CAGENTS_TEST_DAEMON_FENCE_FORWARDING";
         if env::var_os(CHILD).is_none() {
@@ -1119,7 +1168,7 @@ mod tests {
         // SAFETY: successful dup2 transferred ownership of this new descriptor.
         let reserved = unsafe { File::from_raw_fd(DAEMON_FENCE_FD) };
         let error = forward_fence(
-            &mut process::Command::new("/bin/true"),
+            &mut process::Command::new("true"),
             parent.try_clone().unwrap(),
             None,
         )
@@ -1139,8 +1188,12 @@ mod tests {
         let competing = owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).unwrap();
         assert!(upgrade_fence(&parent).is_err());
         drop(competing);
-        // Linux drops the original shared lock during a failed conversion.
-        // Startup must stop on the error rather than perform protected writes.
-        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+        // Linux drops the original shared lock during a failed conversion;
+        // Darwin keeps it. Either way startup must stop on the error rather
+        // than perform protected writes.
+        assert_eq!(
+            owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok(),
+            cfg!(target_os = "linux")
+        );
     }
 }

@@ -1158,7 +1158,7 @@ impl Residence {
             {
                 return false;
             }
-            let (control, _) = match self.listener.socket.accept() {
+            let (control, _) = match crate::descriptor::accept(&self.listener.socket) {
                 Ok(pair) => pair,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => return false,
