@@ -120,6 +120,7 @@ icons! {
     Open => "open",
     OpenFile => "open-file",
     OpenFolder => "open-folder",
+    PartlyFailed => "partly-failed",
     Permission => "permission",
     Plus => "plus",
     PopOut => "pop-out",

@@ -2474,9 +2474,9 @@ impl Runtime {
     /// background command, carries it unless the closing line already
     /// spins. A strip that does not keeps its kind glyph, and its caption and
     /// counting time still say it is working.
-    pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<chat::ToolStatus> {
+    pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<disclosure::Status> {
         let status = turn.glyph();
-        if status != Some(chat::ToolStatus::Running) {
+        if status != Some(chat::ToolStatus::Running.into()) {
             return status;
         }
         let snapshot = &self.snapshot;
@@ -2489,7 +2489,7 @@ impl Runtime {
         } else {
             turn.newest_running && !self.closing_spins()
         };
-        carries.then_some(chat::ToolStatus::Running)
+        carries.then_some(chat::ToolStatus::Running.into())
     }
 
     /// The glyph and words of the line that closes a working transcript.
@@ -6261,11 +6261,7 @@ impl Runtime {
             }
             TurnPart::Steps => {
                 1u8.hash(&mut hasher);
-                (
-                    &turn.summary,
-                    self.strip_status(turn).map(|status| status as u8),
-                )
-                    .hash(&mut hasher);
+                (&turn.summary, self.strip_status(turn)).hash(&mut hasher);
                 self.opened.get(&turn.key).hash(&mut hasher);
                 self.tool_groups_expanded.hash(&mut hasher);
                 (turn.thinking, &turn.pauses).hash(&mut hasher);
@@ -7584,7 +7580,7 @@ impl Runtime {
                 heading.clone()
             },
             glyph,
-            failed.then_some(chat::ToolStatus::Failed),
+            failed.then_some(chat::ToolStatus::Failed.into()),
             outcome.map(|outcome| disclosure::Trailing::Outcome(outcome.into_owned())),
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
@@ -7835,7 +7831,7 @@ impl Runtime {
                 label,
                 name,
                 Icon::Reasoning,
-                (!finished).then_some(chat::ToolStatus::Running),
+                (!finished).then_some(chat::ToolStatus::Running.into()),
                 elapsed,
                 has_text.then_some(expanded),
                 has_text.then(|| Action::Toggle(target, item.id.clone())),

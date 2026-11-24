@@ -1808,7 +1808,7 @@ fn contentless_thinking_draws_no_row_and_leaves_the_working_indicator_in_place()
     assert_eq!(placed(&runtime), [1, 3]);
     assert_eq!(
         runtime.strip_status(&runtime.turns[0]),
-        Some(chat::ToolStatus::Running)
+        Some(chat::ToolStatus::Running.into())
     );
 }
 
@@ -1882,7 +1882,7 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     // A command still running while the agent thinks: the thought is the
     // newest work, so the strip keeps its glyph and the closing line
     // keeps its place empty.
-    assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running));
+    assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running.into()));
     assert!(turn.summary.ends_with(" · working"));
     assert_eq!(runtime.strip_status(turn), None);
     assert!(runtime.work_shown(None));
@@ -1934,9 +1934,12 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     regroup(&mut runtime);
     assert_eq!(runtime.turns.len(), 2);
     let (older, newer) = (&runtime.turns[0], &runtime.turns[1]);
-    assert_eq!(older.glyph(), Some(chat::ToolStatus::Running));
+    assert_eq!(older.glyph(), Some(chat::ToolStatus::Running.into()));
     assert_eq!(runtime.strip_status(older), None);
-    assert_eq!(runtime.strip_status(newer), Some(chat::ToolStatus::Running));
+    assert_eq!(
+        runtime.strip_status(newer),
+        Some(chat::ToolStatus::Running.into())
+    );
     assert_eq!(closing(&runtime), blank);
 
     // Between steps nothing in the transcript is live, so the closing
@@ -1949,7 +1952,7 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
         runtime
             .turns
             .iter()
-            .all(|turn| runtime.strip_status(turn) != Some(chat::ToolStatus::Running))
+            .all(|turn| runtime.strip_status(turn) != Some(chat::ToolStatus::Running.into()))
     );
     assert_eq!(
         closing(&runtime),
@@ -1961,11 +1964,11 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     Arc::make_mut(&mut runtime.snapshot).busy = false;
     assert_eq!(
         runtime.strip_status(&runtime.turns[0]),
-        Some(chat::ToolStatus::Running)
+        Some(chat::ToolStatus::Running.into())
     );
     assert_eq!(
         runtime.strip_status(&runtime.turns[1]),
-        Some(chat::ToolStatus::Succeeded)
+        Some(chat::ToolStatus::Succeeded.into())
     );
 
     // Once subagents work after the lead has finished, the closing line
@@ -9982,7 +9985,7 @@ fn a_kept_strip_stops_spinning_when_a_message_follows_its_step() {
     };
     assert_eq!(
         runtime.strip_status(&runtime.turns[0]),
-        Some(chat::ToolStatus::Running)
+        Some(chat::ToolStatus::Running.into())
     );
     let before = row_fingerprints(&runtime, 0);
     publish_working(&mut runtime, &handle, |snapshot| {

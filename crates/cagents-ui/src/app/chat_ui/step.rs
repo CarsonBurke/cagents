@@ -583,7 +583,12 @@ impl Runtime {
         cached: &CachedItem,
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
-        self.step_row(item, cached, settings, self.step_status(item))
+        self.step_row(
+            item,
+            cached,
+            settings,
+            self.step_status(item).map(Into::into),
+        )
     }
 
     /// A group's only step, drawn in place of the group. A strip over one
@@ -599,7 +604,7 @@ impl Runtime {
         // Thinking after the step leaves it as it ended; the closing line
         // says the agent is still at work.
         let status = if turn.thinking {
-            turn.outcome
+            turn.outcome.map(Into::into)
         } else {
             self.strip_status(turn)
         };
@@ -611,7 +616,7 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
         settings: markdown::Settings,
-        status: Option<ToolStatus>,
+        status: Option<disclosure::Status>,
     ) -> Element<'static, Message> {
         // Where the turn was stopped: a marker with nothing to disclose and
         // no time of its own.
@@ -656,7 +661,7 @@ impl Runtime {
         cached: &CachedItem,
         open: bool,
     ) -> Element<'static, Message> {
-        self.step_button(item, cached, open, self.step_status(item))
+        self.step_button(item, cached, open, self.step_status(item).map(Into::into))
     }
 
     /// The verb and file of a step on one file, the file named the way the
@@ -687,7 +692,7 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
-        status: Option<ToolStatus>,
+        status: Option<disclosure::Status>,
     ) -> Element<'static, Message> {
         let target = self.target;
         // A step that worked with another agent says what it did in the
@@ -723,7 +728,7 @@ impl Runtime {
             said.push_str(&format!(" · {word}"));
         } else if coordinated.is_some()
             && item.content.status() == Some(ToolStatus::Running)
-            && status != Some(ToolStatus::Running)
+            && status != Some(ToolStatus::Running.into())
         {
             // A coordinating step says what it did in the past tense, so
             // one still working without the spinner says so in words.
