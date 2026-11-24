@@ -293,6 +293,8 @@ sealed interface ItemBody {
     data class Delivery(
         val delivery: DeliveryKind = DeliveryKind.Unknown,
         val from: String = "",
+        /** Tells two senders of one name apart; never shown. A message's short session ID. */
+        val sender: String = "",
         val summary: String = "",
         val body: String = "",
         val clipped: Boolean = false,
