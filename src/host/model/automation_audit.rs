@@ -29,7 +29,7 @@ pub(super) fn record(
     automation: &Automation,
     cause: LifecycleCause,
     firing: Option<Uuid>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     let event = LifecycleEvent {
         sequence: 0, // The committed row supplies its unique monotonic sequence.
         automation: automation.id,
@@ -50,13 +50,14 @@ pub(super) fn record(
         ],
     )
     .map_err(|error| error.to_string())?;
+    let sequence = tx.last_insert_rowid();
     tx.execute(
         "DELETE FROM automation_lifecycle WHERE automation=?1 AND sequence NOT IN
          (SELECT sequence FROM automation_lifecycle WHERE automation=?1 ORDER BY sequence DESC LIMIT ?2)",
         params![automation.id.to_string(), MAX_LIFECYCLE_EVENTS],
     )
     .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(sequence)
 }
 
 impl Registry {

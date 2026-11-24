@@ -1,5 +1,6 @@
 //! One daemon broker: provider callbacks only coalesce bounded semantic records.
 //! The broker alone touches SQLite and the desktop portal, outside HostState.
+mod automation_attention;
 mod batching;
 mod journal;
 #[cfg(test)]
@@ -142,6 +143,7 @@ struct Pending {
     preferences: Option<Preferences>,
     /// Requesters waiting on a test notification, each answered once.
     tests: Vec<std::sync::mpsc::Sender<TestOutcome>>,
+    automations: automation_attention::Pending,
     stopped: bool,
 }
 
@@ -181,6 +183,7 @@ impl Pending {
             self.reload = true;
             self.preferences = newer.preferences;
         }
+        self.automations.merge(newer.automations);
         self.tests.extend(newer.tests);
         self.stopped |= newer.stopped;
         self
@@ -199,6 +202,7 @@ impl Pending {
             presence_changed: self.presence_changed,
             reload: self.reload,
             preferences: self.preferences,
+            automations: self.automations,
             ..Pending::default()
         }
     }
@@ -346,6 +350,14 @@ impl Handle {
                 pending.acknowledged.insert(id);
             }
         });
+    }
+
+    pub(in crate::host) fn automation_attention_changed(&self, id: Uuid) {
+        self.change(|pending| pending.automations.lifecycle_changed(id));
+    }
+
+    pub(in crate::host) fn viewed_automation_run(&self, run: &crate::agent_execution::Run) {
+        self.change(|pending| pending.automations.viewed(run));
     }
 
     pub fn reload(&self, preferences: Option<Preferences>) {
@@ -1169,8 +1181,16 @@ async fn run(
         diagnostic: settings_error.clone(),
         ..Default::default()
     };
+    let mut automation_retry = None;
     match store.journal() {
-        Ok(journal) => restore(journal, &policy, &mut snapshot, &mut withdrawals),
+        Ok(journal) => {
+            restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            deferred.automations.scan_all();
+            automation_retry =
+                deferred
+                    .automations
+                    .apply(&host, journal, &mut snapshot, &mut withdrawals);
+        }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
     publish(&shared, &host, snapshot.clone());
@@ -1188,6 +1208,7 @@ async fn run(
             delivery_schedule.deadline()
         }
         .into_iter()
+        .chain(automation_retry)
         .chain(store.retry_at())
         .min(),
     )
@@ -1225,6 +1246,7 @@ async fn run(
                 snapshot.diagnostic.clone_from(&settings_error);
             }
             restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            pending.automations.scan_all();
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -1254,6 +1276,7 @@ async fn run(
                     }
                 }
                 deferred = pending.deferred();
+                automation_retry = None;
                 continue;
             }
         };
@@ -1386,6 +1409,18 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
+            if let Target::Automation { id, sequence } = event.target {
+                pending.automations.lifecycle_changed(id);
+                match automation_attention::is_resolved(&host, id, sequence) {
+                    Ok(false) => {}
+                    already_resolved => {
+                        if let Some(receipt) = receipt {
+                            receipt.finish(already_resolved.map(|_| ()));
+                        }
+                        continue;
+                    }
+                }
+            }
             match record_attention_committed_policy(journal, event, suppressed, receipt, &policy) {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
@@ -1412,9 +1447,19 @@ async fn run(
             }
         }
         match journal.list() {
-            Ok(notices) => snapshot.notices = notices,
-            Err(error) => snapshot.diagnostic = Some(error),
+            Ok(notices) => {
+                snapshot.notices = notices;
+                automation_retry =
+                    pending
+                        .automations
+                        .apply(&host, journal, &mut snapshot, &mut withdrawals);
+            }
+            Err(error) => {
+                snapshot.diagnostic = Some(error);
+                automation_retry = pending.automations.retry_at();
+            }
         }
+        deferred.automations = pending.automations;
         if !policy.message_previews {
             for notice in &mut snapshot.notices {
                 notice.event.content = None;
@@ -1440,6 +1485,7 @@ async fn run(
         let retained = snapshot
             .notices
             .iter()
+            .filter(|notice| !notice.acknowledged)
             .map(|notice| notice.id)
             .collect::<BTreeSet<_>>();
         delivery.retain(|_, notice| retained.contains(&notice.id));

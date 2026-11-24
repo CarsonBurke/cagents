@@ -11,6 +11,8 @@ use uuid::Uuid;
 use crate::automations::{Automation, LifecycleActor, LifecycleCause, LifecycleEvent};
 
 pub(super) const PAGE_SIZE: usize = 100;
+/// Private metadata in the saved automation record, alongside its public definition.
+pub(super) const RESOLUTION_PATH: &str = "$.attention_resolution_sequence";
 const MAX_RECORD_BYTES: usize = 2048;
 
 /// No fixed global row cap can prevent a safety disable/project close. Storage
@@ -268,6 +270,23 @@ pub(super) fn acknowledge(tx: &Transaction<'_>, committed: &[Entry]) -> Result<u
     Ok(removed)
 }
 
+/// Capture the exact management event in the same transaction. Journal
+/// recovery needs this sequence even after the audit event has been pruned.
+pub(super) fn resolve(tx: &Transaction<'_>, automation: Uuid, sequence: i64) -> Result<(), String> {
+    let automation = automation.to_string();
+    tx.execute(
+        "UPDATE automations SET record=json_set(record, ?2, ?3) WHERE id=?1",
+        params![automation, RESOLUTION_PATH, sequence],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM automation_notifications WHERE automation=?1",
+        [automation],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Causal resolution, not delivery ACK. Suppress only this firing's older,
 /// still-pending precheck interruption after its exact recovered audit receipt.
 /// Already-selected/enqueued/committed snapshots cannot be retracted by this
@@ -311,6 +330,28 @@ pub(super) fn suppress_precheck(
 }
 
 impl super::Registry {
+    pub(in crate::host) fn automation_notice_resolved(
+        &self,
+        automation: Uuid,
+        sequence: u64,
+    ) -> Result<bool, String> {
+        // Older stores have only the bounded audit history. Compare exact
+        // sequences so a pause after a management change can still alert.
+        self.db
+            .query_row(
+                "SELECT a.enabled OR a.deleted_ms IS NOT NULL OR COALESCE(
+                    json_extract(a.record, ?3) > ?2,
+                    EXISTS(SELECT 1 FROM automation_lifecycle l WHERE l.automation=a.id
+                    AND l.sequence>?2 AND json_extract(l.record, '$.cause') IN ('enabled', 'edited', 'removed'))
+                 ) FROM automations a WHERE a.id=?1",
+                params![automation.to_string(), sequence, RESOLUTION_PATH],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|resolved| resolved.unwrap_or(false))
+            .map_err(|error| error.to_string())
+    }
+
     pub(in crate::host) fn pending_automation_notifications(
         &self,
         limit: usize,
@@ -449,6 +490,58 @@ mod tests {
         queue(&tx, automation, cause, firing).unwrap();
         tx.commit().unwrap();
         current(&registry.db, automation.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn resolution_survives_audit_pruning_and_reopen() {
+        let (mut registry, directory, mut automation) = fixture();
+        let pause = emit(
+            &mut registry,
+            &mut automation,
+            LifecycleCause::ProjectClosed,
+            None,
+            101,
+        );
+        let mut definition = automation.definition.clone();
+        definition.name = "Renamed".into();
+        automation = registry
+            .edit_automation(
+                automation.id,
+                automation.revision,
+                definition,
+                102,
+                automation.target_identity,
+            )
+            .unwrap();
+        for index in 0..crate::automations::MAX_LIFECYCLE_EVENTS {
+            automation = registry
+                .set_automation_enabled(
+                    automation.id,
+                    automation.revision,
+                    None,
+                    false,
+                    103 + index as u64,
+                )
+                .unwrap();
+        }
+        let path = directory.path().join("model.sqlite3");
+        drop(registry);
+        let reopened = Registry::at(&path).unwrap();
+        let still_in_audit: bool = reopened
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_lifecycle WHERE automation=?1
+                 AND json_extract(record, '$.cause')='edited')",
+                [automation.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!still_in_audit);
+        assert!(
+            reopened
+                .automation_notice_resolved(automation.id, pause.event().sequence)
+                .unwrap()
+        );
     }
 
     #[test]

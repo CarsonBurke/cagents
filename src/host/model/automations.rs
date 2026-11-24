@@ -996,7 +996,8 @@ impl Registry {
         }
         write_revision(&tx, &automation)?;
         write_automation(&tx, &automation)?;
-        automation_audit::record(&tx, &automation, LifecycleCause::Edited, None)?;
+        let sequence = automation_audit::record(&tx, &automation, LifecycleCause::Edited, None)?;
+        automation_notifications::resolve(&tx, automation.id, sequence)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(automation)
     }
@@ -1036,7 +1037,7 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_revision(&tx, &automation)?;
         write_automation(&tx, &automation)?;
-        automation_audit::record(
+        let sequence = automation_audit::record(
             &tx,
             &automation,
             if automation.enabled {
@@ -1046,6 +1047,9 @@ impl Registry {
             },
             None,
         )?;
+        if automation.enabled {
+            automation_notifications::resolve(&tx, automation.id, sequence)?;
+        }
         history::prune(
             &tx,
             Some(automation.id),
@@ -1084,7 +1088,8 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_revision(&tx, &automation)?;
         write_automation(&tx, &automation)?;
-        automation_audit::record(&tx, &automation, LifecycleCause::Removed, None)?;
+        let sequence = automation_audit::record(&tx, &automation, LifecycleCause::Removed, None)?;
+        automation_notifications::resolve(&tx, automation.id, sequence)?;
         tx.execute(
             "UPDATE automations SET deleted_ms=?2 WHERE id=?1",
             params![id.to_string(), now_ms],
@@ -1261,9 +1266,28 @@ fn write_automation(tx: &Transaction<'_>, automation: &Automation) -> Result<(),
     let last_state = last
         .map(|record| decode::<Firing>(&record).map(|firing| firing.state))
         .transpose()?;
-    tx.execute("UPDATE automations SET revision=?2,record=?3,summary=?4,enabled=?5,next_due_ms=?6,updated_ms=?7,active_firing=?8,repository=?9 WHERE id=?1 AND deleted_ms IS NULL",
-        params![automation.id.to_string(), automation.revision, encode(automation)?, encode(&automation.summary(last_state))?, automation.enabled, automation.next.as_ref().map(|next| next.due_ms), automation.updated_ms, automation.active_firing.map(|id| id.to_string()), super::repository_key(&automation.definition.agent.target.repository)?])
-        .map_err(|error| error.to_string())?;
+    // Rewrite the public automation fields without discarding the private
+    // sequence used to retire lifecycle notices after journal restart.
+    tx.execute(
+        "UPDATE automations SET revision=?2,
+            record=CASE WHEN json_extract(record,?10) IS NULL THEN ?3
+                        ELSE json_set(?3,?10,json_extract(record,?10)) END,
+            summary=?4,enabled=?5,next_due_ms=?6,updated_ms=?7,active_firing=?8,repository=?9
+          WHERE id=?1 AND deleted_ms IS NULL",
+        params![
+            automation.id.to_string(),
+            automation.revision,
+            encode(automation)?,
+            encode(&automation.summary(last_state))?,
+            automation.enabled,
+            automation.next.as_ref().map(|next| next.due_ms),
+            automation.updated_ms,
+            automation.active_firing.map(|id| id.to_string()),
+            super::repository_key(&automation.definition.agent.target.repository)?,
+            automation_notifications::RESOLUTION_PATH
+        ],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 

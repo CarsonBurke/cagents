@@ -172,9 +172,8 @@ impl Registry {
         Ok(result)
     }
 
-    /// A journal commit for A must not acknowledge a later replacement B.
-    /// The broker calls this only for its original successful commit receipt.
-    #[cfg(test)]
+    /// Consume the exact run revision the user inspected. A newer pending edge
+    /// is still eligible for delivery.
     pub(in crate::host) fn ack_automation_attention(
         &self,
         receipt: AutomationAttentionReceipt,

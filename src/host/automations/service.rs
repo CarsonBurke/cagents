@@ -177,25 +177,25 @@ fn process_user(
                 .map(Response::Audit);
         }
         Request::ShowFiring { id } => {
-            return registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .automation_run_detail(id)
-                .map(|detail| Response::Detail(Box::new(detail)));
+            return view_run(host, &registry, |registry| {
+                registry.automation_run_detail(id)
+            });
         }
         Request::ShowRun { run } => {
-            return registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .automation_detail_for_run(run)
-                .map(|detail| Response::Detail(Box::new(detail)));
+            return view_run(host, &registry, |registry| {
+                registry.automation_detail_for_run(run)
+            });
         }
         Request::Create { definition } => Response::Automation(Box::new(create(host, definition)?)),
         Request::Edit {
             id,
             revision,
             definition,
-        } => Response::Automation(Box::new(edit(host, id, revision, definition)?)),
+        } => {
+            let automation = edit(host, id, revision, definition)?;
+            attention_changed(host, id);
+            Response::Automation(Box::new(automation))
+        }
         Request::SetEnabled {
             id,
             revision,
@@ -205,10 +205,15 @@ fn process_user(
             if value {
                 handle()?;
             }
-            Response::Automation(Box::new(enabled(host, id, revision, value, confirmed)?))
+            let automation = enabled(host, id, revision, value, confirmed)?;
+            if automation.enabled {
+                attention_changed(host, id);
+            }
+            Response::Automation(Box::new(automation))
         }
         Request::Remove { id, revision } => {
             remove(host, id, revision)?;
+            attention_changed(host, id);
             Response::Removed
         }
         Request::RunNow {
@@ -224,6 +229,43 @@ fn process_user(
     };
     super::wake(host);
     Ok(response)
+}
+
+fn attention_changed(host: &SharedHost, id: Uuid) {
+    if let Some(notifications) = &host.lock().unwrap_or_else(|p| p.into_inner()).notifications {
+        notifications.automation_attention_changed(id);
+    }
+}
+
+fn view_run(
+    host: &SharedHost,
+    registry: &agent_execution::SharedRegistry,
+    detail: impl FnOnce(&crate::host::model::Registry) -> Result<crate::automations::RunDetail, String>,
+) -> Result<crate::automations::Response, String> {
+    let detail = {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let detail = detail(&registry)?;
+        if let Some(run) = &detail.run
+            && let Err(error) =
+                registry.ack_automation_attention(crate::host::model::AutomationAttentionReceipt {
+                    run: run.id,
+                    revision: run.revision,
+                })
+        {
+            tracing::warn!(%error, "could not acknowledge the pending automation run receipt");
+        }
+        detail
+    };
+    if let Some(run) = &detail.run
+        && let Some(notifications) = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notifications
+            .as_ref()
+    {
+        notifications.viewed_automation_run(run);
+    }
+    Ok(crate::automations::Response::Detail(Box::new(detail)))
 }
 
 /// Inspection and proposal ownership follow authenticated session lineage.
