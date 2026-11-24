@@ -14,6 +14,7 @@ use rusqlite::{
     Connection, Row, TransactionBehavior, params,
     types::{ToSql, ToSqlOutput},
 };
+use std::collections::BTreeMap;
 
 // Preserve SQLite's primary error class before its diagnostic becomes text.
 // Busy snapshots and shared-cache locks have extended codes in these classes.
@@ -213,6 +214,50 @@ impl ToSql for Recipient {
 const COLUMNS: &str = "id, sender_lineage, sender_session, sender_title, recipient_lineage,
      delivered_session, reply_to, body, wait_until_ms, state, created_ms";
 
+// Group only the pending index. An index ordered by recipient across all states
+// can satisfy GROUP BY but reads settled mail too.
+const ELIGIBLE_ATTENTION: &str =
+    "SELECT p.recipient_lineage AS lineage, MAX(p.rowid) AS message_rowid
+    FROM messages p INDEXED BY messages_pending LEFT JOIN messages asked ON asked.id = p.reply_to
+    WHERE p.state = 'pending' AND p.recipient_lineage IS NOT NULL
+      AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
+    GROUP BY p.recipient_lineage";
+
+fn attention_heads(
+    db: &Connection,
+    now: u64,
+) -> Result<(BTreeMap<Lineage, MessageId>, bool), String> {
+    let mut query = db
+        .prepare_cached(&format!(
+            "SELECT eligible.lineage,
+                 CASE WHEN eligible.message_rowid <= COALESCE(previous.rowid, 0)
+                      THEN h.message END
+             FROM ({ELIGIBLE_ATTENTION}) eligible
+             LEFT JOIN mailbox_attention_heads h ON h.lineage = eligible.lineage
+             LEFT JOIN messages previous ON previous.id = h.message"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = query
+        .query_map([now as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut heads = BTreeMap::new();
+    let mut needs_advance = false;
+    for row in rows {
+        let (lineage, message) = row.map_err(|e| e.to_string())?;
+        if let Some(message) = message {
+            heads.insert(
+                Lineage(lineage.parse().map_err(|e: uuid::Error| e.to_string())?),
+                message.parse().map_err(|e: uuid::Error| e.to_string())?,
+            );
+        } else {
+            needs_advance = true;
+        }
+    }
+    Ok((heads, needs_advance))
+}
+
 fn message(row: &Row<'_>) -> rusqlite::Result<Message> {
     fn id<T: std::str::FromStr>(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<T>> {
         row.get::<_, Option<String>>(column)?
@@ -406,7 +451,13 @@ impl Registry {
     pub(crate) fn pending_message_lineages(
         &self,
     ) -> Result<std::collections::BTreeSet<Lineage>, String> {
-        let mut query = self.db.prepare_cached("SELECT DISTINCT recipient_lineage FROM messages WHERE state='pending' AND recipient_lineage IS NOT NULL").map_err(|e| e.to_string())?;
+        let mut query = self
+            .db
+            .prepare_cached(
+                "SELECT DISTINCT recipient_lineage FROM messages INDEXED BY messages_pending
+                 WHERE state = 'pending' AND recipient_lineage IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
         query
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?
@@ -426,41 +477,32 @@ impl Registry {
     pub(crate) fn reconcile_message_attention(
         &mut self,
         now: u64,
-    ) -> Result<std::collections::BTreeMap<Lineage, MessageId>, String> {
-        self.db
-            .execute(
-                "INSERT INTO mailbox_attention_heads(lineage,message)
-            SELECT recipient_lineage,id FROM messages WHERE rowid IN (
-                SELECT MAX(p.rowid) FROM messages p LEFT JOIN messages asked ON asked.id=p.reply_to
-                WHERE p.recipient_lineage IS NOT NULL AND p.state='pending'
-                  AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
-                GROUP BY p.recipient_lineage
-            )
-            ON CONFLICT(lineage) DO UPDATE SET message=excluded.message
-            WHERE (SELECT rowid FROM messages WHERE id=excluded.message) >
-                COALESCE((SELECT rowid FROM messages WHERE id=mailbox_attention_heads.message),0)",
-                [now as i64],
-            )
+    ) -> Result<BTreeMap<Lineage, MessageId>, String> {
+        let (heads, needs_advance) = attention_heads(&self.db, now)?;
+        if !needs_advance {
+            return Ok(heads);
+        }
+
+        // Recompute eligibility after reserving the writer. A competing inbox
+        // read may have settled a released reply since the read above.
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        let mut query = self.db.prepare_cached("SELECT h.lineage,h.message FROM mailbox_attention_heads h
-            WHERE EXISTS(SELECT 1 FROM messages pending LEFT JOIN messages asked ON asked.id=pending.reply_to
-                WHERE pending.recipient_lineage=h.lineage AND pending.state='pending'
-                  AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1))").map_err(|e| e.to_string())?;
-        query
-            .query_map([now as i64], |row| {
-                let lineage: String = row.get(0)?;
-                let message: String = row.get(1)?;
-                Ok((lineage, message))
-            })
-            .map_err(|e| e.to_string())?
-            .map(|row| {
-                let (lineage, message) = row.map_err(|e| e.to_string())?;
-                Ok((
-                    Lineage(lineage.parse().map_err(|e: uuid::Error| e.to_string())?),
-                    message.parse().map_err(|e: uuid::Error| e.to_string())?,
-                ))
-            })
-            .collect()
+        tx.prepare_cached(&format!(
+            "INSERT INTO mailbox_attention_heads(lineage,message)
+             SELECT recipient_lineage,id FROM messages WHERE rowid IN (
+                 SELECT message_rowid FROM ({ELIGIBLE_ATTENTION})
+             )
+             ON CONFLICT(lineage) DO UPDATE SET message=excluded.message
+             WHERE (SELECT rowid FROM messages WHERE id=excluded.message) >
+                 COALESCE((SELECT rowid FROM messages WHERE id=mailbox_attention_heads.message),0)"
+        ))
+        .and_then(|mut query| query.execute([now as i64]))
+        .map_err(|e| e.to_string())?;
+        let (heads, _) = attention_heads(&tx, now)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(heads)
     }
 
     /// The message `recipient` received whose ID begins with `handle`.
@@ -513,7 +555,7 @@ impl Registry {
                              PARTITION BY m.recipient_lineage, {RETURNED}
                              ORDER BY m.created_ms, m.rowid
                          ) AS position
-                         FROM messages m
+                         FROM messages m INDEXED BY messages_pending
                          LEFT JOIN messages asked ON asked.id = m.reply_to
                          WHERE m.state = 'pending' AND m.recipient_lineage IS NOT NULL
                            AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
@@ -1022,6 +1064,41 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn only_an_attention_advance_needs_the_writer() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let retired = Lineage(TerminalId::new());
+        let first = message(Party::user(), party(recipient), 1);
+        let old = message(Party::user(), party(retired), 2);
+        let mut ask = message(party(recipient), Party::user(), 3);
+        ask.wait_until_ms = Some(100);
+        let mut reply = message(Party::user(), party(recipient), 4);
+        reply.reply_to = Some(ask.id);
+        for entry in [&first, &old, &ask, &reply] {
+            registry.post_message(entry).unwrap();
+        }
+        registry
+            .acknowledge_messages(Some(retired), None, &Receipt { ids: vec![old.id] }, 5)
+            .unwrap();
+
+        registry.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mut rival = Connection::open(&registry.path).unwrap();
+        let writer = rival
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(99).unwrap(),
+            BTreeMap::from([(recipient, first.id)])
+        );
+        assert!(registry.reconcile_message_attention(100).is_err());
+        writer.commit().unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(100).unwrap(),
+            BTreeMap::from([(recipient, reply.id)])
+        );
     }
 
     #[test]
