@@ -33,6 +33,8 @@ pub(crate) struct SourceInspectionRequest {
     pub(crate) require_resumable: bool,
     #[serde(default)]
     pub(crate) reconcile_retained: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) report_only: bool,
 }
 
 pub(crate) fn preflight_source_panes(

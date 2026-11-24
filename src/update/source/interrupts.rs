@@ -33,6 +33,8 @@ struct Observation {
     activity: Activity,
     interrupted_generation: Option<u64>,
     stopped_children: BTreeSet<String>,
+    // A settled child leaves stopped_children, but its accepted stop still counts.
+    issued: bool,
     late_turn: bool,
 }
 
@@ -227,35 +229,33 @@ fn check_scope(
     consent: &impact::DaemonImpact,
     observed: &impact::DaemonImpact,
 ) -> Result<(), UpdateError> {
-    let old: BTreeMap<_, _> = consent
-        .sessions
-        .iter()
-        .map(|item| ((item.kind, item.id), item))
-        .collect();
-    let fresh: BTreeMap<_, _> = observed
-        .sessions
-        .iter()
-        .map(|item| ((item.kind, item.id), item))
-        .collect();
+    // This driver can issue commands only to the accepted interruption rows.
+    // Other panes and their activity do not participate in their proof.
     if consent.policy != impact::Policy::Interrupt
         || observed.policy != consent.policy
         || consent.capability.proof != observed.capability.proof
-        || consent.blockers != observed.blockers
-        || old.len() != consent.sessions.len()
-        || fresh.len() != observed.sessions.len()
-        || old.len() != fresh.len()
-        || old.iter().any(|(key, before)| {
-            fresh.get(key).is_none_or(|after| {
-                before.identity != after.identity
-                    || !(before.disposition == after.disposition
-                        || before.disposition == impact::Disposition::Interrupted
-                            && after.disposition == impact::Disposition::Resumes)
-                    || after
-                        .interrupted_subagents
-                        .iter()
-                        .any(|id| !before.interrupted_subagents.contains(id))
+        || consent
+            .sessions
+            .iter()
+            .filter(|item| item.disposition == impact::Disposition::Interrupted)
+            .any(|before| {
+                let mut matching = observed
+                    .sessions
+                    .iter()
+                    .filter(|after| before.kind == after.kind && before.id == after.id);
+                matching.next().is_none_or(|after| {
+                    matching.next().is_some()
+                        || before.identity != after.identity
+                        || !matches!(
+                            after.disposition,
+                            impact::Disposition::Interrupted | impact::Disposition::Resumes
+                        )
+                        || after
+                            .interrupted_subagents
+                            .iter()
+                            .any(|id| !before.interrupted_subagents.contains(id))
+                })
             })
-        })
     {
         return Err(invalid(
             "Source ownership or interruption scope changed; review the update again",
@@ -320,6 +320,13 @@ impl Interrupts {
 
     pub(in crate::update) fn current_impact(&self) -> &impact::DaemonImpact {
         &self.current
+    }
+
+    pub(in crate::update) fn issued_interruptions(&self) -> Vec<TerminalId> {
+        self.observations
+            .iter()
+            .filter_map(|(id, observed)| observed.issued.then_some(*id))
+            .collect()
     }
 
     pub(in crate::update) fn late_turns(&self) -> Vec<TerminalId> {
@@ -389,6 +396,7 @@ fn begin_with(
             },
             interrupted_generation: None,
             stopped_children: BTreeSet::new(),
+            issued: false,
             late_turn: false,
         };
         observed.project(snapshot, true)?;
@@ -462,6 +470,7 @@ fn issue(
                     ));
                 }
             }
+            observed.issued = true;
             match command {
                 Command::Interrupt => {
                     observed.interrupted_generation = Some(observed.turn_generation)
@@ -536,15 +545,6 @@ fn poll_with(
         }
         if !pending.is_empty() {
             return Ok((pending, None));
-        }
-        // This observer settles only the approved interruptions. Unchanged
-        // blocked owners and blockers still need the floor's explicit stop
-        // review; they are not evidence that these target turns remain busy.
-        // check_scope above rejects any new blocker or unrelated work.
-        if !idle.ready() && !consent.blocked() {
-            return Err(invalid(
-                "The source cannot confirm an idle preparation boundary; inspect its conversations before updating",
-            ));
         }
         Some(idle)
     } else {
@@ -689,6 +689,7 @@ mod tests {
             },
             interrupted_generation: None,
             stopped_children: BTreeSet::new(),
+            issued: false,
             late_turn: false,
         };
         observed.project(snapshot(session, 0), true).unwrap();
@@ -1041,6 +1042,8 @@ mod tests {
         assert!(error.to_string().contains("unreviewed background"));
         assert_eq!(guarded_refusals.load(Ordering::SeqCst), 1);
         assert!(observations[&session.id].interrupted_generation.is_none());
+        assert!(observations[&session.id].stopped_children.is_empty());
+        assert!(observations[&session.id].issued);
         drop(client);
         server.join().unwrap();
     }

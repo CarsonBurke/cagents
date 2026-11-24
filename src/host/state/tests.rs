@@ -1305,7 +1305,6 @@ for line in sys.stdin:
             .ready()
     );
 
-    let owners = crate::upgrade::recovery::checkpointed_owners(&impact);
     let store = Store::open(&cwd.join("checkpoint")).unwrap();
     prepare_upgrade_with(&host, impact.capability, || Ok(store)).unwrap();
     finish_upgrade(&host).unwrap();
@@ -1316,32 +1315,6 @@ for line in sys.stdin:
     // window reopens the ended one from its saved descriptor.
     assert_eq!(saved.chats.len(), 1);
     assert_eq!(saved.chats[0].source, idle);
-    // The update worker refuses a checkpoint that omits an owner it
-    // requires. The ended conversation is reviewed but not carried, so the
-    // worker must require only what this checkpoint names.
-    use crate::update::impact::SessionKind;
-    let named: BTreeSet<_> = (saved
-        .chats
-        .iter()
-        .map(|chat| (SessionKind::NativeChat, chat.source.id)))
-    .chain(
-        saved
-            .terminals
-            .iter()
-            .map(|terminal| (SessionKind::Terminal, terminal.source.id)),
-    )
-    .chain(
-        saved
-            .carried
-            .iter()
-            .map(|terminal| (SessionKind::Terminal, terminal.source.id)),
-    )
-    .collect();
-    assert!(
-        owners.iter().all(|owner| named.contains(owner)),
-        "the worker requires {owners:?}, but the checkpoint names only {named:?}"
-    );
-    assert!(!owners.iter().any(|(_, id)| *id == ended.id));
     let empty_proc = cwd.join("proc");
     fs::create_dir(&empty_proc).unwrap();
     let replacement = Arc::new(crate::host::state::HostLock::new(
@@ -3582,7 +3555,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         elsewhere.sessions[0].identity,
         interrupt.sessions[0].identity
     );
-    assert!(interrupt.preserves_consent(&elsewhere));
+    assert!(interrupt.covers_interruptions(&elsewhere));
     // Messages accepted for it but not yet delivered cannot survive a restart:
     // the update waits for them under either policy, attributed to this
     // conversation rather than to an anonymous blocker.
@@ -3601,7 +3574,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
     assert_eq!(capability.background_subagents, 1);
     handle.command(Command::Compact).unwrap();
     let changed = state.upgrade_impact(Policy::Interrupt).unwrap();
-    assert!(!interrupt.preserves_consent(&changed));
+    assert!(!interrupt.covers_interruptions(&changed));
     assert_eq!(changed.capability.background_subagents, 1);
     assert_ne!(
         changed.capability.background_identity,

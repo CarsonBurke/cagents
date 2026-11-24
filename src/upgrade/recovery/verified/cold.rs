@@ -378,7 +378,7 @@ mod tests {
     use crate::{
         agent::Provider,
         model::TerminalContinuity,
-        update::recovery::{Outcome, compare_with_recovery},
+        update::recovery::{Outcome, compare_partition},
     };
 
     fn adopted(
@@ -457,9 +457,10 @@ mod tests {
                     "the original B descriptor is an exact authenticated alias"
                 );
                 assert!(
-                    matches!(compare_with_recovery(&expected, &serving, &terminals, &chats, &Default::default(), Some(&view), None),
-                    Outcome::Usable { terminals:1, chats:1, paused_chats, paused_terminals, .. }
-                        if paused_chats == fixture.record.paused_chats && paused_terminals.is_empty())
+                    matches!(compare_partition(&expected, &serving, &terminals, &chats, &Default::default(), Some(&view), None),
+                        Ok(Outcome::Usable { terminals:1, chats:1, paused_chats, paused_terminals, .. }
+                                   ) if paused_chats == fixture.record.paused_chats && paused_terminals.is_empty()
+                    )
                 );
                 assert_eq!(fs::read(&fixture.checkpoint).unwrap(), original_checkpoint);
                 assert_eq!(fs::read(&original_path).unwrap(), original_record);
@@ -547,8 +548,8 @@ mod tests {
         assert_eq!(observation.terminals, terminals);
         assert!(observation.chats.is_empty());
         assert!(fixture.load_current(&serving, &terminals, &[]).is_err());
-        assert!(matches!(
-            compare_with_recovery(
+        assert!(
+            compare_partition(
                 &root_census(&fixture),
                 &serving,
                 &terminals,
@@ -556,12 +557,9 @@ mod tests {
                 &Default::default(),
                 None,
                 None
-            ),
-            Outcome::Unverified {
-                surviving_terminals: 1,
-                ..
-            }
-        ));
+            )
+            .is_err()
+        );
         assert_eq!(
             settled.paused_chats, fixture.record.paused_chats,
             "missing accepted native was not relabeled paused"
@@ -597,8 +595,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(
-                matches!(compare_with_recovery(&root_census(&fixture), &serving, &terminals, &chats, &Default::default(), Some(&view), None),
-                Outcome::Usable { terminals:1, chats:1, paused_chats, .. } if paused_chats == fixture.record.paused_chats)
+                matches!(compare_partition(&root_census(&fixture), &serving, &terminals, &chats, &Default::default(), Some(&view), None),
+                    Ok(Outcome::Usable { terminals:1, chats:1, paused_chats, .. }) if paused_chats == fixture.record.paused_chats
+                )
             );
             settled
                 .archive_completed(

@@ -2899,7 +2899,7 @@ exit 0
             .upgrade_impact(crate::update::impact::Policy::WhenIdle)
             .unwrap();
         assert_eq!(host.lock().unwrap().inventory_generation, generation);
-        assert!(before.preserves_consent(&after));
+        assert!(before.covers_interruptions(&after));
         assert!(!handle.is_completed());
         assert!(view.is_connected());
         assert_eq!(view.session(), source);

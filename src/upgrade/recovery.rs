@@ -14,7 +14,10 @@ use crate::{
     daemon::lease_handoff::LeaseHandoff,
     instance::UiUpdateGuard,
     model::{HostSessionProof, TerminalId, TerminalSession},
-    update::impact::{DaemonImpact, SessionKind},
+    update::{
+        impact::{DaemonImpact, SessionKind},
+        ledger::{self, Disposition, Item, Ledger, Reason, Stage},
+    },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -432,7 +435,6 @@ struct Authority {
     census: Census,
     #[serde(default)]
     windows: Vec<String>,
-    expected: Vec<(SessionKind, TerminalId)>,
     checkpoint_path: PathBuf,
     checkpoint_hash: String,
     worker_path: PathBuf,
@@ -603,7 +605,6 @@ impl Authority {
             source: source.clone(),
             census: census.clone(),
             windows: windows.to_vec(),
-            expected: checkpointed_owners(reviewed),
             checkpoint_path: path(),
             checkpoint_hash: hash(),
             worker_path: path(),
@@ -1041,7 +1042,7 @@ impl PendingRecovery {
                     .into(),
             );
         }
-        if validate_checkpoint(&self.authority(), bytes)? != "Prepared"
+        if validate_checkpoint(&self.source, &self.census, bytes, None)? != "Prepared"
             || digest(bytes) != self.checkpoint_hash
         {
             return Err(
@@ -1064,7 +1065,6 @@ impl PendingRecovery {
             source: self.source.clone(),
             census: self.census.clone(),
             windows: self.windows.clone(),
-            expected: Vec::new(),
             checkpoint_path: self.checkpoint_path.clone(),
             checkpoint_hash: self.checkpoint_hash.clone(),
             worker_path: PathBuf::new(),
@@ -1402,7 +1402,6 @@ impl Preparation {
                 source: daemon.capability.proof.clone(),
                 census,
                 windows: guard.prepared_window_slots().to_vec(),
-                expected: checkpointed_owners(daemon),
                 checkpoint_path: store.path,
                 checkpoint_hash: String::new(),
                 worker_path,
@@ -1436,7 +1435,7 @@ impl Preparation {
         self.validate_continuity()?;
         let bytes = read_checkpoint(&self.authority.checkpoint_path)?
             .ok_or("The acknowledged preparation has no checkpoint")?;
-        validate_checkpoint(&self.authority, &bytes)?;
+        validate_checkpoint(&self.authority.source, &self.authority.census, &bytes, None)?;
         let request_path = self
             .authority
             .worker_path
@@ -1483,8 +1482,9 @@ impl CapturedPreparation {
         self,
         target_daemon: &Path,
         handoff: &LeaseHandoff,
+        ledger: Option<&mut Ledger>,
     ) -> Result<Option<Receipt>, String> {
-        let result = self.make_receipt(target_daemon, None, handoff);
+        let result = self.make_receipt(target_daemon, None, handoff, ledger);
         if let Err(error) = &result {
             eprintln!(
                 "The acknowledged preparation could not authorize successor recovery: {error}"
@@ -1500,8 +1500,10 @@ impl CapturedPreparation {
         target_daemon: &Path,
         verified_daemon_sha256: &str,
         handoff: &LeaseHandoff,
+        ledger: Option<&mut Ledger>,
     ) -> Result<Option<Receipt>, String> {
-        let result = self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff);
+        let result =
+            self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff, ledger);
         if let Err(error) = &result {
             eprintln!(
                 "The acknowledged preparation could not authorize successor recovery: {error}"
@@ -1515,12 +1517,18 @@ impl CapturedPreparation {
         target_daemon: &Path,
         verified_digest: Option<&str>,
         handoff: &LeaseHandoff,
+        ledger: Option<&mut Ledger>,
     ) -> Result<Option<Receipt>, String> {
         let mut preparation = self.0;
         preparation.validate_continuity()?;
         let bytes = read_checkpoint(&preparation.authority.checkpoint_path)?
             .ok_or("The acknowledged checkpoint disappeared before recovery")?;
-        let phase = validate_checkpoint(&preparation.authority, &bytes)?;
+        let phase = validate_checkpoint(
+            &preparation.authority.source,
+            &preparation.authority.census,
+            &bytes,
+            ledger,
+        )?;
         if phase == "Ready" {
             // The same acknowledged source may finish Prepared -> Ready while
             // this worker continuously owns its fences. Retain the full
@@ -1616,6 +1624,28 @@ impl Receipt {
             Some(&self.authority),
             Some(&self.authority.target_hash),
             serving,
+            true,
+        )?;
+        Ok(RecoveryOutcome {
+            paused_terminals: record.paused_terminals,
+            paused_chats: record.paused_chats,
+        })
+    }
+
+    pub(crate) fn verify_ledger_successor(
+        &self,
+        serving: &HostSessionProof,
+    ) -> Result<RecoveryOutcome, String> {
+        let record = read_verified_record_identity(
+            &self.authority.checkpoint_path,
+            &self.authority.checkpoint_hash,
+            &self.authority.source,
+            &self.authority.census,
+            &self.authority.target,
+            Some(&self.authority),
+            Some(&self.authority.target_hash),
+            serving,
+            false,
         )?;
         Ok(RecoveryOutcome {
             paused_terminals: record.paused_terminals,
@@ -1659,6 +1689,7 @@ fn read_verified_record_identity(
     request: Option<&Authority>,
     target_hash: Option<&str>,
     serving: &HostSessionProof,
+    strict_inventory: bool,
 ) -> Result<RecoveryRecord, String> {
     let path = checkpoint_path.with_file_name(recovery_name(checkpoint_hash));
     let bytes = read_checkpoint(&path)?.ok_or("The recovery daemon has no durable outcome")?;
@@ -1672,8 +1703,9 @@ fn read_verified_record_identity(
                 || record.request_identity != authority.request_identity
                 || record.origin != authority.origin
                 || record.job_request_hash != authority.job_request_hash
-                || record.reviewed != authority.reviewed
-                || record.windows != authority.windows
+                || (strict_inventory
+                    && (record.reviewed != authority.reviewed
+                        || record.windows != authority.windows))
         })
         || &record.source != source
         || record.checkpoint_hash != checkpoint_hash
@@ -1681,11 +1713,14 @@ fn read_verified_record_identity(
         || target_hash.is_some_and(|hash| record.target_hash != hash)
         || record.target.as_deref() != Some(target)
         || executable_hash(target)? != record.target_hash
-        || &record.census != census
+        || (strict_inventory && &record.census != census)
         || record.successor.as_ref() != Some(serving)
         || !serving.is_complete()
     {
         return Err("The serving daemon has not verified this exact recovery outcome".into());
+    }
+    if !strict_inventory {
+        return Ok(record);
     }
     let evidence = PendingRecovery {
         source: source.clone(),
@@ -1712,6 +1747,7 @@ fn read_verified_record(
     serving: &HostSessionProof,
     live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
     live_chats: &[Session],
+    strict_inventory: bool,
 ) -> Result<RecoveryRecord, String> {
     let record = read_verified_record_identity(
         checkpoint_path,
@@ -1722,7 +1758,11 @@ fn read_verified_record(
         request,
         target_hash,
         serving,
+        strict_inventory,
     )?;
+    if !strict_inventory {
+        return Ok(record);
+    }
     let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
     let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
     if terminals.len() != live_terminals.len()
@@ -1928,97 +1968,126 @@ fn recovered_chat_owner(
 
 /// A failed or ineligible recovery capture must still check Ready before any
 /// ordinary successor starts. A matching proof alone never waives Prepared.
-pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<(), String> {
-    let authority = Authority {
-        version: 1,
-        origin: Origin::AcknowledgedPrepare,
-        job: String::new(),
-        request_identity: String::new(),
-        job_request_hash: String::new(),
-        reviewed: Some(daemon.clone()),
-        source: daemon.capability.proof.clone(),
-        census: census.clone(),
-        windows: Vec::new(),
-        expected: checkpointed_owners(daemon),
-        checkpoint_path: PathBuf::new(),
-        checkpoint_hash: String::new(),
-        worker_path: PathBuf::new(),
-        fence_path: PathBuf::new(),
-        legacy_path: PathBuf::new(),
-        daemon_path: PathBuf::new(),
-        target: PathBuf::new(),
-        target_hash: String::new(),
-    };
+pub(crate) fn require_ready(
+    daemon: &DaemonImpact,
+    census: &Census,
+    ledger: Option<&mut Ledger>,
+) -> Result<(), String> {
     let bytes = super::handoff::Store::discover()?
         .read_bytes()?
         .ok_or("The acknowledged source has no Ready checkpoint")?;
-    if validate_checkpoint(&authority, &bytes)? != "Ready" {
+    if validate_checkpoint(&daemon.capability.proof, census, &bytes, ledger)? != "Ready" {
         return Err("The acknowledged preparation is still Prepared; previous provider shutdown is unconfirmed and ordinary startup is refused".into());
     }
     Ok(())
 }
 
-/// The reviewed owners the source's checkpoint must name. A conversation
-/// whose provider already ended is reviewed, so the user sees it reopen, but
-/// the source has nothing of it to checkpoint and leaves it out.
-pub(crate) fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, TerminalId)> {
-    reviewed
-        .sessions
-        .iter()
-        .filter(|item| item.checkpointed())
-        .map(|item| (item.kind, item.id))
-        .collect()
-}
-
-fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, String> {
+fn validate_checkpoint(
+    source_proof: &HostSessionProof,
+    census: &Census,
+    bytes: &[u8],
+    ledger: Option<&mut Ledger>,
+) -> Result<String, String> {
     let checkpoint: CheckpointIndex = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if !(1..=5).contains(&checkpoint.version)
-        || checkpoint.proof != authority.source
+        || &checkpoint.proof != source_proof
         || !matches!(checkpoint.phase.as_str(), "Prepared" | "Ready")
     {
         return Err("The checkpoint is not this update's acknowledged source preparation".into());
     }
     let mut terminals = BTreeSet::new();
     for item in checkpoint.terminals.iter().chain(&checkpoint.carried) {
-        let source = &item.source;
-        if !terminals.insert(source.id)
-            || source.continuity.live_proof().as_ref() != Some(&authority.source)
-            || !authority
-                .census
-                .terminals
-                .iter()
-                .any(|known| same_terminal(known, source))
+        if !terminals.insert(item.source.id)
+            || item.source.continuity.live_proof().as_ref() != Some(source_proof)
         {
-            return Err(
-                "The prepared terminal inventory does not match the acknowledged source census"
-                    .into(),
-            );
+            return Err("The checkpoint has duplicate or foreign terminal ownership".into());
         }
     }
     let mut chats = BTreeSet::new();
     for item in &checkpoint.chats {
-        let source = &item.source;
-        if !chats.insert(source.id)
-            || source.proof.as_ref() != Some(&authority.source)
-            || !authority
-                .census
-                .chats
-                .iter()
-                .any(|known| same_chat(known, source, &item.launch))
-        {
-            return Err(
-                "The prepared conversation inventory does not match the acknowledged source census"
-                    .into(),
-            );
+        if !chats.insert(item.source.id) || item.source.proof.as_ref() != Some(source_proof) {
+            return Err("The checkpoint has duplicate or foreign conversation ownership".into());
         }
     }
-    if authority.expected.iter().any(|(kind, id)| match kind {
-        SessionKind::Terminal => !terminals.contains(id),
-        SessionKind::NativeChat => !chats.contains(id),
-    }) {
-        return Err("The acknowledged checkpoint omitted a reviewed source owner".into());
+    if let Some(ledger) = ledger {
+        record_checkpoint_rows(ledger, census, &checkpoint);
     }
     Ok(checkpoint.phase)
+}
+
+fn record_checkpoint_rows(ledger: &mut Ledger, census: &Census, checkpoint: &CheckpointIndex) {
+    for index in 0..ledger.rows().len() {
+        let row = &ledger.rows()[index];
+        if !row.expects_owner() {
+            continue;
+        }
+        let item = row.item().clone();
+        let disposition = row.disposition();
+        let matching = match item {
+            Item::Terminal(id) => checkpoint
+                .terminals
+                .iter()
+                .chain(&checkpoint.carried)
+                .find(|item| item.source.id == id)
+                .map(|item| census.matches_checkpoint_terminal(&item.source)),
+            Item::NativeChat(id) => checkpoint
+                .chats
+                .iter()
+                .find(|item| item.source.id == id)
+                .map(|item| census.matches_checkpoint_chat(&item.source, &item.launch)),
+            _ => continue,
+        };
+        match (matching, disposition) {
+            (Some(false), _) => ledger.set_aside(&item, Stage::Release, Reason::CheckpointChanged),
+            (None, Disposition::Carry) => {
+                ledger.set_aside(&item, Stage::Release, Reason::CheckpointOmitted);
+            }
+            // Some sources leave an already ended process to the reopening
+            // window. Check actual continuity after panes can reconnect.
+            (None, Disposition::Resume | Disposition::Restart) => {
+                ledger.note(&item, Stage::Release, Reason::CheckpointOmitted);
+            }
+            _ => {}
+        }
+    }
+    for terminal in &checkpoint.terminals {
+        ledger.observe_late(
+            Item::Terminal(terminal.source.id),
+            ledger::Continuity::Restart,
+        );
+    }
+    for terminal in &checkpoint.carried {
+        ledger.observe_late(
+            Item::Terminal(terminal.source.id),
+            ledger::Continuity::Carry,
+        );
+    }
+    for chat in &checkpoint.chats {
+        let continuity = if chat.source.native_continuity.retains_provider() {
+            ledger::Continuity::Carry
+        } else {
+            ledger::Continuity::Resume
+        };
+        ledger.observe_late(Item::NativeChat(chat.source.id), continuity);
+    }
+}
+
+impl Census {
+    pub(crate) fn matches_checkpoint_terminal(&self, source: &TerminalSession) -> bool {
+        self.terminals
+            .iter()
+            .any(|known| same_terminal(known, source))
+    }
+
+    pub(crate) fn matches_checkpoint_chat(
+        &self,
+        source: &Session,
+        launch: &crate::chat::Launch,
+    ) -> bool {
+        self.chats
+            .iter()
+            .any(|known| same_chat(known, source, launch))
+    }
 }
 
 fn same_terminal(known: &TerminalSession, source: &TerminalSession) -> bool {
@@ -2452,7 +2521,7 @@ fn validate_settled_record(
         return Err("Settled recovery does not match the exact Prepared checkpoint".into());
     }
     let authority = validate_settled_identity(record, checkpoint_path, target)?;
-    if validate_checkpoint(&authority, checkpoint)? != "Prepared" {
+    if validate_checkpoint(&authority.source, &authority.census, checkpoint, None)? != "Prepared" {
         return Err("Settled recovery no longer names a Prepared checkpoint".into());
     }
     Ok(())
@@ -2507,11 +2576,6 @@ fn validate_settled_identity(
         source: record.source.clone(),
         census: record.census.clone(),
         windows: record.windows.clone(),
-        expected: record
-            .reviewed
-            .as_ref()
-            .map(checkpointed_owners)
-            .unwrap_or_default(),
         checkpoint_path: checkpoint_path.to_owned(),
         checkpoint_hash: record.checkpoint_hash.clone(),
         worker_path: PathBuf::new(),
@@ -3113,6 +3177,53 @@ impl AlreadyRecovered {
             paused_terminals,
             paused_chats,
         )
+    }
+
+    /// Move an immutable settled checkpoint out of the next update's path.
+    /// The caller authenticates the current Ready target. The original
+    /// recovery witness stays unchanged when that target has restarted.
+    pub(crate) fn archive_settled_with(
+        &self,
+        guard: &RetirementGuard,
+        serving: &HostSessionProof,
+    ) -> Result<(), String> {
+        guard.matches(&self.checkpoint_path)?;
+        if !serving.is_complete() || serving == &self.source {
+            return Err("Settled archival requires a complete successor proof".into());
+        }
+        let current = pending_retirement(&self.checkpoint_path, &self.daemon_binary)?
+            .ok_or("Settled recovery disappeared before archival")?;
+        if current.checkpoint_hash != self.checkpoint_hash
+            || current.outcome_hash != self.outcome_hash
+            || current.source != self.source
+            || current.witness.successor != self.witness.successor
+        {
+            return Err("The settled recovery changed before archival".into());
+        }
+        let sidecar = self
+            .checkpoint_path
+            .with_file_name(recovery_name(&self.checkpoint_hash));
+        let bytes = read_checkpoint(&sidecar)?
+            .ok_or("Settled recovery record disappeared before archival")?;
+        if digest(&bytes) != self.outcome_hash {
+            return Err("Original settled outcome changed before archival".into());
+        }
+        let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let checkpoint = read_settled_checkpoint(
+            &self.checkpoint_path,
+            &self.checkpoint_hash,
+            &self.outcome_hash,
+        )?;
+        validate_settled_record(
+            &record,
+            &checkpoint,
+            &self.checkpoint_path,
+            &self.daemon_binary,
+        )?;
+        let mut additional = current.adopted_chat_descriptors;
+        additional.retain(|chat| !record.adopted_chat_descriptors.contains(chat));
+        record.validate_additional_issued_chats(&additional)?;
+        commit_archive(guard, &self.checkpoint_path, &record, &bytes, additional)
     }
 
     pub(crate) fn archive_completed_with(
@@ -3937,7 +4048,7 @@ pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
     let checkpoint =
         read_checkpoint(&authority.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
     super::handoff::validate_checkpoint_bytes(&checkpoint)?;
-    if validate_checkpoint(&authority, &checkpoint)? != "Prepared"
+    if validate_checkpoint(&authority.source, &authority.census, &checkpoint, None)? != "Prepared"
         || digest(&checkpoint) != authority.checkpoint_hash
     {
         return Err(

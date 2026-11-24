@@ -278,6 +278,9 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     // This route must never call normal restore_upgrade: its terminal and
     // nonretained chat entries are recipe/replay authority only after Ready.
     for terminal in &checkpoint.carried {
+        if !record.census.matches_checkpoint_terminal(&terminal.source) {
+            continue;
+        }
         record.validate_continuity()?;
         if state::adopt_prepared_terminal(host, terminal) {
             record.adopted_terminals.push(terminal.source.id);
@@ -285,6 +288,9 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
         ensure_no_ambiguous_adoption(host)?;
     }
     for terminal in &checkpoint.terminals {
+        if !record.census.matches_checkpoint_terminal(&terminal.source) {
+            continue;
+        }
         record.validate_continuity()?;
         let original = Carried {
             source: terminal.source.clone(),
@@ -298,10 +304,14 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
         ensure_no_ambiguous_adoption(host)?;
     }
     for chat in &checkpoint.chats {
-        record.validate_continuity()?;
-        if !chat.source.native_continuity.retains_provider() {
+        if !chat.source.native_continuity.retains_provider()
+            || !record
+                .census
+                .matches_checkpoint_chat(&chat.source, &chat.launch)
+        {
             continue;
         }
+        record.validate_continuity()?;
         // restore_upgrade's retained branch authenticates and adopts the exact
         // still-running holder. It has no replacement-provider fallback.
         match super::chat::restore_upgrade(host, chat) {

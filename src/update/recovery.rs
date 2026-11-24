@@ -4,7 +4,12 @@ use super::*;
 use crate::{
     model::{HostSessionProof, TerminalContinuity, TerminalSession},
     terminal_ipc::{StartupState, TerminalDescriptor},
+    upgrade::{
+        handoff::RecoveredChats,
+        recovery::verified::{VerifiedView, ready::ReadyView},
+    },
 };
+use ledger::{Disposition, Ending, Item, Ledger, Reason, Stage};
 use source::BusyPatience;
 use std::collections::BTreeSet;
 
@@ -27,8 +32,8 @@ pub(crate) struct Census {
     version: u8,
     pub transaction: String,
     pub source: Option<HostSessionProof>,
-    terminals: Vec<TerminalSession>,
-    chats: Vec<crate::chat::Session>,
+    pub(super) terminals: Vec<TerminalSession>,
+    pub(super) chats: Vec<crate::chat::Session>,
     #[serde(default)]
     checkpoint_before: Option<String>,
 }
@@ -326,64 +331,41 @@ impl Census {
             detail,
         })
     }
-    /// Reads the serving inventory, asking a busy daemon again within `busy`.
+    /// Prove the exact owner partition before reusing custody or retiring replay
+    /// evidence. Read-only completion uses the ledger through `verify_read`.
     pub(crate) fn verify(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
         match observe_with(busy, |proof, terminals, chats, target| {
             // Evidence failure must not discard the independently observed
             // serving owner or skip the closing readiness/inventory fences.
-            let evidence = (|| -> Result<_, UpdateError> {
-                let lineage = crate::upgrade::handoff::Store::existing()
-                    .and_then(|store| {
-                        store
-                            .map_or_else(|| Ok(Default::default()), |store| store.recovered_chats())
-                    })
-                    .map_err(invalid)?;
-                let original_source = self.source.as_ref().filter(|source| *source != proof);
-                let prepared = if let Some(original_source) = original_source {
-                    crate::upgrade::recovery::verified::VerifiedView::load_for_source(
-                        original_source,
-                        proof,
-                        target,
-                        terminals,
-                        chats,
-                    )
-                    .map_err(invalid)?
-                } else {
-                    None
-                };
-                let paused_ready =
-                    if let Some(original_source) = original_source.filter(|_| prepared.is_none()) {
-                        crate::upgrade::recovery::verified::ready::ReadyView::load_for_source(
-                            original_source,
-                            proof,
-                            target,
-                            terminals,
-                            chats,
-                        )
-                        .map_err(invalid)?
-                    } else {
-                        None
-                    };
-                Ok((lineage, prepared, paused_ready))
-            })();
-            Ok(evidence)
+            Ok(RecoveryEvidence::load(
+                self.source.as_ref(),
+                proof,
+                terminals,
+                chats,
+                target,
+                true,
+            ))
         }) {
-            Ok(((proof, terminals, chats, readiness), Ok((lineage, prepared, paused_ready)))) => {
-                let mut outcome = compare_with_recovery(
+            Ok(((proof, terminals, chats, readiness), Ok(evidence))) => {
+                if readiness != StartupState::Ready {
+                    return self.receipt(unverified_evidence(
+                        self,
+                        (proof, terminals, chats, readiness),
+                        invalid("The daemon has not finished restoring its saved owners"),
+                    ));
+                }
+                let outcome = compare_partition(
                     self,
                     &proof,
                     &terminals,
                     &chats,
-                    &lineage,
-                    prepared.as_ref(),
-                    paused_ready.as_ref(),
-                );
-                if readiness != StartupState::Ready {
-                    outcome=match outcome {
-                        Outcome::Unverified {surviving_terminals,expected_terminals,missing,unexpected,changed,..}=>Outcome::Unverified {serving:Some(proof),readiness:Some(readiness),surviving_terminals,expected_terminals,missing,unexpected,changed,detail:"The daemon answered but is not Ready; retained or pending restoration is not usable recovery".into()},
-                        _=>Outcome::Unverified {serving:Some(proof),readiness:Some(readiness),surviving_terminals:self.terminals.len(),expected_terminals:self.terminals.len(),missing:vec![],unexpected:vec![],changed:vec![],detail:"The listed inventory matches but the daemon is not Ready; recovery is unverified".into()},
-                    };
-                }
+                    &evidence.lineage,
+                    evidence.prepared.as_ref(),
+                    evidence.paused_ready.as_ref(),
+                )
+                .unwrap_or_else(|error| {
+                    unverified_evidence(self, (proof, terminals, chats, readiness), error)
+                });
                 self.receipt(outcome)
             }
             Ok((observation, Err(error))) => {
@@ -391,6 +373,64 @@ impl Census {
             }
             Err(error) => self.unobserved(&error),
         }
+    }
+
+    fn verify_read(
+        &self,
+        ledger: &mut Ledger,
+        busy: BusyPatience,
+        target_daemon: &Path,
+    ) -> Result<Receipt, UpdateError> {
+        let socket = crate::terminal_ipc::daemon_socket_path()?;
+        let mut client = source::Client::connect_matched(&socket)
+            .map_err(|error| invalid(error.to_string()))?
+            .with_busy_patience(busy);
+        if client.serving_executable()? != target_daemon {
+            return Err(invalid(
+                "The serving daemon does not belong to the installed update",
+            ));
+        }
+        // Each list is issued by the same authenticated successor. Separate
+        // observations let unrelated activity continue without invalidating
+        // good evidence for the other kind of pane.
+        let terminals = client
+            .list()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Could not observe the installed daemon's terminals");
+            })
+            .ok();
+        let chats = client
+            .list_chats()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Could not observe the installed daemon's conversations");
+            })
+            .ok();
+        let proof = client.proof().clone();
+        let evidence = RecoveryEvidence::load(
+            self.source.as_ref(),
+            &proof,
+            terminals.as_deref().unwrap_or_default(),
+            chats.as_deref().unwrap_or_default(),
+            target_daemon,
+            false,
+        )?;
+        if client.startup_state()? != StartupState::Ready
+            || client.serving_executable()? != target_daemon
+            || !proof.is_complete()
+        {
+            return Err(invalid("The installed daemon is not serving Ready"));
+        }
+        let outcome = RecoveryView {
+            proof: &proof,
+            terminals: terminals.as_deref().unwrap_or_default(),
+            chats: chats.as_deref().unwrap_or_default(),
+            lineage: &evidence.lineage,
+            prepared: evidence.prepared.as_ref(),
+            paused_ready: evidence.paused_ready.as_ref(),
+        }
+        .compare_with_recovery(self, ledger, terminals.is_some(), chats.is_some());
+        source::Peer::confirm_serving(&socket, target_daemon, &proof)?;
+        self.receipt(outcome)
     }
     /// A release worker may predate the replacement's wire protocol. Ask the
     /// confirmed target CLI for a fresh read-only proof instead of decoding a
@@ -743,35 +783,24 @@ fn read_inventory_with<E>(
 /// Failed durable evidence cannot promote this diagnostic into a usable proof.
 fn unverified_evidence(census: &Census, observation: Observation, error: UpdateError) -> Outcome {
     let (proof, terminals, chats, readiness) = observation;
-    let direct = compare_with_recovery(
-        census,
-        &proof,
-        &terminals,
-        &chats,
-        &Default::default(),
-        None,
-        None,
-    );
-    let (surviving_terminals, missing, unexpected, changed) = match direct {
-        Outcome::Unverified {
-            surviving_terminals,
-            missing,
-            unexpected,
-            changed,
-            ..
-        } => (surviving_terminals, missing, unexpected, changed),
-        Outcome::Usable { terminals, .. } => (terminals, vec![], vec![], vec![]),
-        _ => (
-            0,
-            census
-                .terminals
-                .iter()
-                .map(|terminal| terminal.id)
-                .collect(),
-            vec![],
-            vec![],
-        ),
+    let view = RecoveryView {
+        proof: &proof,
+        terminals: &terminals,
+        chats: &chats,
+        lineage: &Default::default(),
+        prepared: None,
+        paused_ready: None,
     };
+    let mut used = BTreeSet::new();
+    let surviving_terminals = census
+        .terminals
+        .iter()
+        .filter(|expected| match view.terminal(expected, &mut used) {
+            ItemMatch::Present | ItemMatch::Restarted => true,
+            ItemMatch::Gone => matches!(expected.continuity, TerminalContinuity::Exited { .. }),
+            _ => false,
+        })
+        .count();
     let service = match &readiness {
         StartupState::Ready => "Ready and answering".into(),
         StartupState::Restoring { awaiting } => {
@@ -788,9 +817,9 @@ fn unverified_evidence(census: &Census, observation: Observation, error: UpdateE
         readiness: Some(readiness),
         surviving_terminals,
         expected_terminals: census.terminals.len(),
-        missing,
-        unexpected,
-        changed,
+        missing: vec![],
+        unexpected: vec![],
+        changed: vec![],
         detail,
     }
 }
@@ -801,7 +830,7 @@ fn compare(
     proof: &HostSessionProof,
     terminals: &[TerminalDescriptor],
     chats: &[crate::chat::Session],
-) -> Outcome {
+) -> Result<Outcome, UpdateError> {
     compare_with_lineage(census, proof, terminals, chats, &Default::default())
 }
 
@@ -812,135 +841,366 @@ fn compare_with_lineage(
     terminals: &[TerminalDescriptor],
     chats: &[crate::chat::Session],
     lineage: &crate::upgrade::handoff::RecoveredChats,
-) -> Outcome {
-    compare_with_recovery(census, proof, terminals, chats, lineage, None, None)
+) -> Result<Outcome, UpdateError> {
+    compare_partition(census, proof, terminals, chats, lineage, None, None)
 }
 
-pub(crate) fn compare_with_recovery(
-    census: &Census,
-    proof: &HostSessionProof,
-    terminals: &[TerminalDescriptor],
-    chats: &[crate::chat::Session],
-    lineage: &crate::upgrade::handoff::RecoveredChats,
-    prepared: Option<&crate::upgrade::recovery::verified::VerifiedView>,
-    paused_ready: Option<&crate::upgrade::recovery::verified::ready::ReadyView>,
-) -> Outcome {
-    let mut paused_terminals = vec![];
-    let mut paused_chats = vec![];
-    let mut missing = vec![];
-    let mut changed = vec![];
-    let mut unexpected = vec![];
-    let mut used = BTreeSet::new();
-    let mut surviving = 0;
-    for expected in &census.terminals {
-        let matches: Vec<_> = terminals
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| {
-                t.session.id == expected.id
-                    || t.upgrade_sources
-                        .iter()
-                        .any(|s| issued_terminal_matches(expected, s))
-                    || t.upgrade_relaunches
-                        .iter()
-                        .any(|r| issued_terminal_matches(expected, &r.source))
-            })
-            .collect();
-        if matches.is_empty() {
-            if prepared.is_some_and(|view| view.paused_terminal(expected))
-                || paused_ready.is_some_and(|view| view.paused_terminal(expected))
-            {
-                paused_terminals.push(expected.id);
-            } else {
-                missing.push(expected.id);
+#[derive(Default)]
+struct RecoveryEvidence {
+    lineage: RecoveredChats,
+    prepared: Option<VerifiedView>,
+    paused_ready: Option<ReadyView>,
+}
+
+impl RecoveryEvidence {
+    fn load(
+        source: Option<&HostSessionProof>,
+        proof: &HostSessionProof,
+        terminals: &[TerminalDescriptor],
+        chats: &[crate::chat::Session],
+        target: &Path,
+        strict_inventory: bool,
+    ) -> Result<Self, UpdateError> {
+        fn evidence<T: Default>(read: Result<T, String>, required: bool) -> Result<T, UpdateError> {
+            match read {
+                Err(error) if !required => {
+                    tracing::warn!(%error, "Recovery evidence could not verify item continuity");
+                    Ok(T::default())
+                }
+                result => result.map_err(invalid),
             }
-            continue;
         }
-        if matches.len() != 1 {
-            changed.push(expected.id);
-            continue;
+
+        let lineage = evidence(
+            crate::upgrade::handoff::Store::existing().and_then(|store| {
+                store.map_or_else(|| Ok(Default::default()), |store| store.recovered_chats())
+            }),
+            strict_inventory,
+        )?;
+        let Some(source) = source.filter(|source| *source != proof) else {
+            return Ok(Self {
+                lineage,
+                ..Default::default()
+            });
+        };
+        let prepared = evidence(
+            VerifiedView::load_for_source(
+                source,
+                proof,
+                target,
+                terminals,
+                chats,
+                strict_inventory,
+            ),
+            strict_inventory,
+        )?;
+        let paused_ready = if prepared.is_none() {
+            evidence(
+                ReadyView::load_for_source(source, proof, target, terminals, chats),
+                strict_inventory,
+            )?
+        } else {
+            None
+        };
+        Ok(Self {
+            lineage,
+            prepared,
+            paused_ready,
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemMatch {
+    Present,
+    Restarted,
+    Gone,
+    Paused,
+    Missing,
+    Changed,
+}
+
+struct RecoveryView<'a> {
+    proof: &'a HostSessionProof,
+    terminals: &'a [TerminalDescriptor],
+    chats: &'a [crate::chat::Session],
+    lineage: &'a RecoveredChats,
+    prepared: Option<&'a VerifiedView>,
+    paused_ready: Option<&'a ReadyView>,
+}
+
+impl RecoveryView<'_> {
+    fn terminal(&self, expected: &TerminalSession, used: &mut BTreeSet<usize>) -> ItemMatch {
+        let mut matches = self.terminals.iter().enumerate().filter(|(_, current)| {
+            current.session.id == expected.id
+                || current
+                    .upgrade_sources
+                    .iter()
+                    .any(|source| issued_terminal_matches(expected, source))
+                || current
+                    .upgrade_relaunches
+                    .iter()
+                    .any(|relaunch| issued_terminal_matches(expected, &relaunch.source))
+        });
+        let Some((index, current)) = matches.next() else {
+            return if self
+                .prepared
+                .is_some_and(|view| view.paused_terminal(expected))
+                || self
+                    .paused_ready
+                    .is_some_and(|view| view.paused_terminal(expected))
+            {
+                ItemMatch::Paused
+            } else {
+                ItemMatch::Missing
+            };
+        };
+        if matches.next().is_some() {
+            return ItemMatch::Changed;
         }
-        let (index, current) = matches[0];
+        let relaunch = current.upgrade_relaunches.iter().any(|relaunch| {
+            issued_terminal_matches(expected, &relaunch.source)
+                && relaunch.recipe == current.session.launch
+        });
         let issued = current
             .upgrade_sources
             .iter()
-            .any(|s| issued_terminal_matches(expected, s))
+            .any(|source| issued_terminal_matches(expected, source))
             || current
                 .upgrade_relaunches
                 .iter()
-                .any(|r| issued_terminal_matches(expected, &r.source));
+                .any(|relaunch| issued_terminal_matches(expected, &relaunch.source));
         let same_owner =
             expected.continuity.live_proof() == current.session.continuity.live_proof();
+        if matches!(
+            current.session.continuity,
+            TerminalContinuity::Exited { .. }
+        ) && (issued || expected == &current.session)
+            && used.insert(index)
+        {
+            return ItemMatch::Gone;
+        }
         if !used.insert(index)
             || (expected.continuity.live_proof().is_some() && !same_owner && !issued)
-            || (current.session.launch != expected.launch
-                && !current.upgrade_relaunches.iter().any(|r| {
-                    issued_terminal_matches(expected, &r.source)
-                        && r.recipe == current.session.launch
-                }))
-            || !continuity_matches(&expected.continuity, &current.session.continuity, proof)
+            || (current.session.launch != expected.launch && !relaunch)
+            || !continuity_matches(
+                &expected.continuity,
+                &current.session.continuity,
+                self.proof,
+            )
         {
-            changed.push(expected.id);
+            ItemMatch::Changed
+        } else if relaunch {
+            ItemMatch::Restarted
         } else {
-            surviving += 1;
+            ItemMatch::Present
         }
     }
-    for (i, t) in terminals.iter().enumerate() {
-        if !used.contains(&i) {
-            unexpected.push(t.session.id);
-        }
-    }
-    let mut surviving_chats = 0;
-    for expected in &census.chats {
-        let same: Vec<_> = chats.iter().filter(|c| c.id == expected.id).collect();
-        if same.is_empty() {
-            if prepared.is_some_and(|view| view.paused_chat(expected))
-                || paused_ready.is_some_and(|view| view.paused_chat(expected))
+
+    fn chat(&self, expected: &crate::chat::Session, verify_resume: bool) -> ItemMatch {
+        let mut matches = self
+            .chats
+            .iter()
+            .filter(|current| current.id == expected.id);
+        let Some(current) = matches.next() else {
+            return if self.prepared.is_some_and(|view| view.paused_chat(expected))
+                || self
+                    .paused_ready
+                    .is_some_and(|view| view.paused_chat(expected))
             {
-                paused_chats.push(expected.id);
+                ItemMatch::Paused
             } else {
-                missing.push(expected.id);
-            }
-        } else if same.len() != 1
-            || !(same_owner_chat_matches(expected, same[0], proof)
-                || lineage.proves(expected, same[0], proof)
-                || prepared.is_some_and(|view| view.proves_chat(expected, same[0])))
+                ItemMatch::Missing
+            };
+        };
+        if matches.next().is_some()
+            || !(same_owner_chat_matches(expected, current, self.proof)
+                || self.lineage.proves(expected, current, self.proof)
+                || self
+                    .prepared
+                    .is_some_and(|view| view.proves_chat(expected, current))
+                || (verify_resume && resumed_chat_matches(expected, current, self.proof)))
         {
-            changed.push(expected.id);
+            ItemMatch::Changed
         } else {
-            surviving_chats += 1;
+            ItemMatch::Present
         }
     }
-    for current in chats {
-        if !census.chats.iter().any(|c| c.id == current.id) {
-            unexpected.push(current.id);
+
+    fn compare_with_recovery(
+        &self,
+        census: &Census,
+        ledger: &mut Ledger,
+        terminals_available: bool,
+        chats_available: bool,
+    ) -> Outcome {
+        let mut used = BTreeSet::new();
+        let mut paused_terminals = Vec::new();
+        let mut paused_chats = Vec::new();
+        for index in 0..ledger.rows().len() {
+            let row = &ledger.rows()[index];
+            let item = row.item().clone();
+            let disposition = row.disposition();
+            let expects_owner = row.expects_owner();
+            let checked = match item {
+                Item::Terminal(id) => census
+                    .terminals
+                    .iter()
+                    .find(|terminal| terminal.id == id)
+                    .map(|expected| {
+                        terminals_available.then(|| self.terminal(expected, &mut used))
+                    }),
+                Item::NativeChat(id) => {
+                    census
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == id)
+                        .map(|expected| {
+                            chats_available
+                                .then(|| self.chat(expected, disposition == Disposition::Resume))
+                        })
+                }
+                Item::WindowState(_) => continue,
+            };
+            let observed = checked.flatten();
+            if observed == Some(ItemMatch::Paused) {
+                match item {
+                    Item::Terminal(id) => paused_terminals.push(id),
+                    Item::NativeChat(id) => paused_chats.push(id),
+                    _ => unreachable!(),
+                }
+            }
+            if checked.is_some() || expects_owner {
+                finish_ledger_row(ledger, &item, disposition, observed);
+            }
         }
-    }
-    if !proof.is_complete() || !missing.is_empty() || !changed.is_empty() || !unexpected.is_empty()
-    {
-        Outcome::Unverified {
-            serving: Some(proof.clone()),
-            readiness: Some(StartupState::Ready),
-            surviving_terminals: surviving,
-            expected_terminals: census.terminals.len(),
-            missing,
-            unexpected,
-            changed,
-            detail: format!(
-                "The ready daemon's identity or inventory differs from the pre-update census; {surviving_chats} of {} original native chats have exact issued lineage to the serving owner",
-                census.chats.len()
-            ),
+        for (index, terminal) in self.terminals.iter().enumerate() {
+            if !used.contains(&index) {
+                ledger.observe_successor(Item::Terminal(terminal.session.id));
+            }
         }
-    } else {
+        for chat in self.chats {
+            ledger.observe_successor(Item::NativeChat(chat.id));
+        }
         Outcome::Usable {
-            serving: proof.clone(),
-            terminals: terminals.len(),
-            chats: chats.len(),
+            serving: self.proof.clone(),
+            terminals: self.terminals.len(),
+            chats: self.chats.len(),
             paused_terminals,
             paused_chats,
         }
     }
 }
+
+fn finish_ledger_row(
+    ledger: &mut Ledger,
+    item: &Item,
+    disposition: Disposition,
+    observed: Option<ItemMatch>,
+) {
+    use ledger::Outcome as RowOutcome;
+    let outcome = match (disposition, observed) {
+        (_, Some(ItemMatch::Gone)) => {
+            ledger.mark_gone(item, Stage::Verify, Ending::Exited);
+            return;
+        }
+        (Disposition::End(_), _) => return,
+        (Disposition::SetAside(reason), _) => RowOutcome::SetAside(reason),
+        (Disposition::Carry, Some(ItemMatch::Present)) => RowOutcome::Carried,
+        (Disposition::Resume, Some(ItemMatch::Present)) => RowOutcome::Resumed,
+        (Disposition::Restart, Some(ItemMatch::Present)) => RowOutcome::Restarted,
+        (_, Some(ItemMatch::Restarted)) => {
+            if disposition != Disposition::Restart {
+                ledger.note(item, Stage::Verify, Reason::VerificationChanged);
+            }
+            RowOutcome::Restarted
+        }
+        (_, Some(ItemMatch::Paused)) => RowOutcome::SetAside(Reason::Paused),
+        (_, Some(ItemMatch::Missing)) => RowOutcome::SetAside(Reason::VerificationMissing),
+        (_, Some(ItemMatch::Changed)) => RowOutcome::SetAside(Reason::VerificationChanged),
+        (_, None) => RowOutcome::SetAside(Reason::VerificationUnavailable),
+    };
+    ledger.record_outcome(item, Stage::Verify, outcome);
+}
+
+pub(crate) fn compare_partition(
+    census: &Census,
+    proof: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+    chats: &[crate::chat::Session],
+    lineage: &RecoveredChats,
+    prepared: Option<&VerifiedView>,
+    paused_ready: Option<&ReadyView>,
+) -> Result<Outcome, UpdateError> {
+    // Custody and replay retirement require an exact inventory partition.
+    let view = RecoveryView {
+        proof,
+        terminals,
+        chats,
+        lineage,
+        prepared,
+        paused_ready,
+    };
+    let mut paused_terminals = vec![];
+    let mut paused_chats = vec![];
+    let mut used = BTreeSet::new();
+    let mut complete = proof.is_complete();
+    for expected in &census.terminals {
+        complete &= match view.terminal(expected, &mut used) {
+            ItemMatch::Present | ItemMatch::Restarted => true,
+            ItemMatch::Gone => matches!(expected.continuity, TerminalContinuity::Exited { .. }),
+            ItemMatch::Paused => {
+                paused_terminals.push(expected.id);
+                true
+            }
+            ItemMatch::Missing | ItemMatch::Changed => false,
+        };
+    }
+    complete &= used.len() == terminals.len();
+    for expected in &census.chats {
+        complete &= match view.chat(expected, false) {
+            ItemMatch::Present | ItemMatch::Restarted | ItemMatch::Gone => true,
+            ItemMatch::Paused => {
+                paused_chats.push(expected.id);
+                true
+            }
+            ItemMatch::Missing | ItemMatch::Changed => false,
+        };
+    }
+    complete &= chats
+        .iter()
+        .all(|current| census.chats.iter().any(|chat| chat.id == current.id));
+    if !complete {
+        return Err(invalid(
+            "The current owners do not prove the complete recovery partition",
+        ));
+    }
+    Ok(Outcome::Usable {
+        serving: proof.clone(),
+        terminals: terminals.len(),
+        chats: chats.len(),
+        paused_terminals,
+        paused_chats,
+    })
+}
+
+/// A planned provider restart can reconnect from storage after Ready, with
+/// no issued owner lineage. The daemon's own adoption proof is authoritative;
+/// the worker checks only that the recorded conversation is present.
+fn resumed_chat_matches(
+    expected: &crate::chat::Session,
+    current: &crate::chat::Session,
+    serving: &HostSessionProof,
+) -> bool {
+    current.proof.as_ref() == Some(serving)
+        && expected
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| !id.trim().is_empty())
+        && expected.launch == current.launch
+}
+
 fn same_owner_chat_matches(
     expected: &crate::chat::Session,
     current: &crate::chat::Session,
@@ -1062,7 +1322,7 @@ fn inspect_pending_source_inner(
         return Ok(None);
     };
     match serving_prepared(&pending, busy) {
-        PreparedService::HandledVerified { serving } => return Ok(Some(serving)),
+        PreparedService::SettledReady { serving } => return Ok(Some(serving)),
         PreparedService::RetainedUnverified(detail) => {
             return Err(invalid(format!(
                 "Current daemon readiness and the original inventory are unverified: {detail}. Keep all evidence and inspect the private update log before manual recovery. A partial claim without a settled record intentionally cannot be retried because custody may already have transferred; the claim never permits replay. Any serving daemon was left running. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` to inspect what survives"
@@ -1114,16 +1374,21 @@ fn inspect_pending_source_inner(
 
 enum PreparedService {
     Unresolved,
-    HandledVerified { serving: HostSessionProof },
+    SettledReady { serving: HostSessionProof },
     RetainedUnverified(String),
 }
 
-/// Read settled history only through the actual kernel-authenticated serving
-/// executable. The history classifier supplies no replay or adoption authority.
+/// Read settled history only through the actual kernel-authenticated Ready
+/// target. Archival preserves the original witness across target restarts.
 fn serving_prepared(
     pending: &crate::upgrade::recovery::PendingRecovery,
     busy: BusyPatience,
 ) -> PreparedService {
+    match archive_serving_prepared(pending, busy) {
+        Ok(Some(serving)) => return PreparedService::SettledReady { serving },
+        Ok(None) => (),
+        Err(error) => return PreparedService::RetainedUnverified(error.to_string()),
+    }
     let claim_before = match pending.has_recovery_claim() {
         Ok(present) => present,
         Err(error) => return PreparedService::RetainedUnverified(error),
@@ -1169,6 +1434,47 @@ fn serving_prepared(
     }
 }
 
+fn archive_serving_prepared(
+    pending: &crate::upgrade::recovery::PendingRecovery,
+    busy: BusyPatience,
+) -> Result<Option<HostSessionProof>, UpdateError> {
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let Ok(mut client) = inventory_client(&socket, busy) else {
+        return Ok(None);
+    };
+    let target = client.serving_executable()?;
+    let Some(store) = crate::upgrade::handoff::Store::existing().map_err(invalid)? else {
+        return Ok(None);
+    };
+    let settled = match crate::upgrade::recovery::classify_retained_prepared(&store.path, &target) {
+        Ok(Some(settled)) => settled,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    if settled.source != pending.source
+        || settled.witness.checkpoint_hash != pending.checkpoint_hash
+        || settled.witness.target != target
+    {
+        return Err(invalid(
+            "The settled history belongs to a different source checkpoint",
+        ));
+    }
+    let serving = client.proof().clone();
+    if !serving.is_complete()
+        || serving == pending.source
+        || client.startup_state()? != StartupState::Ready
+    {
+        return Ok(None);
+    }
+    match archive_settled_service_with(&mut client, &serving, &target)? {
+        RetirementStatus::Completed | RetirementStatus::AlreadyCompleted => Ok(Some(serving)),
+        RetirementStatus::NotRequired => Ok(None),
+        RetirementStatus::Busy => Err(UpdateError::SourceBusy {
+            serving: Box::new(serving),
+            message: "Settled update history is being archived by another verifier; retry after it finishes".into(),
+        }),
+    }
+}
+
 fn prepared_service_outcome(
     source: &HostSessionProof,
     observed: HostSessionProof,
@@ -1193,7 +1499,7 @@ fn prepared_service_outcome(
         && readiness == StartupState::Ready
         && matches!(&receipt.outcome, Outcome::Usable { serving, .. } if *serving == observed)
     {
-        PreparedService::HandledVerified { serving: observed }
+        PreparedService::SettledReady { serving: observed }
     } else {
         PreparedService::RetainedUnverified(if receipt.usable() {
             "The serving identity or readiness changed during verification".into()
@@ -1221,6 +1527,69 @@ fn require_captured_owner(
 /// finishing another operation is asked again within `busy`.
 pub(crate) fn retire_current_service(busy: BusyPatience) -> Result<RetirementStatus, UpdateError> {
     retire_service(RetirementTrigger::CurrentJob, busy)
+}
+
+/// Preserve immutable settled evidence as history after authenticating the
+/// Ready target, including a later incarnation. The original witness is kept.
+pub(super) fn archive_settled_service(
+    serving: &HostSessionProof,
+    target: &Path,
+) -> Result<RetirementStatus, UpdateError> {
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let mut client = source::Client::connect_matched(&socket)
+        .map_err(|error| invalid(error.to_string()))?
+        .with_busy_patience(BusyPatience::PerRequest(Duration::ZERO));
+    archive_settled_service_with(&mut client, serving, target)
+}
+
+fn archive_settled_service_with(
+    client: &mut source::Client,
+    serving: &HostSessionProof,
+    target: &Path,
+) -> Result<RetirementStatus, UpdateError> {
+    if !serving.is_complete()
+        || client.proof() != serving
+        || client.serving_executable()? != target
+        || client.startup_state()? != StartupState::Ready
+    {
+        return Err(invalid(
+            "The settled recovery successor is not the Ready installed target",
+        ));
+    }
+    let Some(store) = crate::upgrade::handoff::Store::existing().map_err(invalid)? else {
+        return Ok(RetirementStatus::NotRequired);
+    };
+    let guard = match crate::upgrade::recovery::RetirementGuard::acquire(&store.path)
+        .map_err(invalid)?
+    {
+        crate::upgrade::recovery::RetirementAcquisition::Acquired(guard) => guard,
+        crate::upgrade::recovery::RetirementAcquisition::Busy => return Ok(RetirementStatus::Busy),
+    };
+    let Some(settled) =
+        crate::upgrade::recovery::pending_retirement(&store.path, target).map_err(invalid)?
+    else {
+        return Ok(RetirementStatus::NotRequired);
+    };
+    if client.startup_state()? != StartupState::Ready
+        || client.serving_executable()? != target
+        || client.proof() != serving
+    {
+        return Err(invalid(
+            "The installed target changed before settled recovery archival",
+        ));
+    }
+    settled
+        .archive_settled_with(&guard, serving)
+        .map_err(invalid)?;
+    if client.startup_state()? != StartupState::Ready
+        || client.serving_executable()? != target
+        || client.proof() != serving
+    {
+        return Err(invalid(
+            "The installed target changed during settled recovery archival",
+        ));
+    }
+    Ok(RetirementStatus::Completed)
 }
 
 /// Run by the daemon itself, through its own socket, once it serves. A busy
@@ -1657,9 +2026,9 @@ pub(crate) fn verify_file_with_candidate(
     verify_file(census, outcome, true, false, false, false)
 }
 
-/// One verifier run, as `verify-update-census` performs it. Every inventory
-/// fence shares one [`VERIFIER_BUSY_PATIENCE`] deadline, so a busy daemon
-/// cannot keep the run from writing its receipt within [`VERIFIER_LIMIT`].
+/// One read-only verifier run, as `verify-update-census` performs it. Requests
+/// share one [`VERIFIER_BUSY_PATIENCE`] deadline, so a busy daemon cannot keep
+/// the run from writing its receipt within [`VERIFIER_LIMIT`].
 pub(crate) fn verify_file(
     census: &Path,
     outcome: &Path,
@@ -1703,6 +2072,9 @@ fn verify_file_within(
             Err(e) => census.unverified(e.to_string())?,
         }
     } else {
+        // Standalone installers and older workers still use this receipt to
+        // check exact preservation. The installed worker verifies its ledger
+        // separately and reports item-level outcomes itself.
         census.verify(busy)?
     };
     if require_original {
@@ -1813,6 +2185,29 @@ impl Context {
         self.census = Some(census);
         Ok(())
     }
+
+    pub(super) fn verify_ledger(
+        &self,
+        ledger: &mut Ledger,
+        target_daemon: &Path,
+        state: &Path,
+        job: &UpdateJob,
+    ) -> Result<HostSessionProof, UpdateError> {
+        let census = self
+            .census
+            .as_ref()
+            .ok_or_else(|| invalid("The installed update has no source observation"))?;
+        let receipt = census.verify_read(
+            ledger,
+            BusyPatience::shared_for(VERIFIER_BUSY_PATIENCE),
+            target_daemon,
+        )?;
+        receipt.save(&outcome_path(state, &job.id))?;
+        match receipt.outcome {
+            Outcome::Usable { serving, .. } => Ok(serving),
+            _ => Err(receipt.failure()),
+        }
+    }
 }
 pub(super) fn census_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.census.json"))
@@ -1849,6 +2244,7 @@ pub(super) fn checkpoint_status()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledger::Continuity;
     use std::os::unix::fs::PermissionsExt;
     fn proof() -> HostSessionProof {
         HostSessionProof {
@@ -1919,7 +2315,7 @@ mod tests {
         let expected = census(&original);
         assert!(matches!(
             compare(&expected, &proof(), std::slice::from_ref(&original), &[]),
-            Outcome::Usable { .. }
+            Ok(Outcome::Usable { .. })
         ));
         for actual in [
             vec![],
@@ -1927,17 +2323,11 @@ mod tests {
             vec![original.clone(), original.clone()],
             vec![original.clone(), terminal()],
         ] {
-            assert!(matches!(
-                compare(&expected, &proof(), &actual, &[]),
-                Outcome::Unverified { .. }
-            ));
+            assert!(compare(&expected, &proof(), &actual, &[]).is_err());
         }
         let mut changed = original.clone();
         changed.session.launch.arguments.push("changed".into());
-        assert!(matches!(
-            compare(&expected, &proof(), &[changed], &[]),
-            Outcome::Unverified { .. }
-        ));
+        assert!(compare(&expected, &proof(), &[changed], &[]).is_err());
         let mut ended = original.clone();
         ended.session.continuity = TerminalContinuity::Exited {
             last_exit: crate::model::TerminalExit {
@@ -1946,10 +2336,7 @@ mod tests {
                 occurred_at_unix_ms: 1,
             },
         };
-        assert!(matches!(
-            compare(&expected, &proof(), &[ended], &[]),
-            Outcome::Unverified { .. }
-        ));
+        assert!(compare(&expected, &proof(), &[ended], &[]).is_err());
     }
     #[test]
     fn update_recovery_accepts_only_issued_lineage_and_exact_relaunch_receipt() {
@@ -1964,13 +2351,10 @@ mod tests {
         }];
         assert!(matches!(
             compare(&expected, &proof(), &[successor.clone()], &[]),
-            Outcome::Usable { .. }
+            Ok(Outcome::Usable { .. })
         ));
         successor.upgrade_relaunches[0].source.id = crate::model::TerminalId::new();
-        assert!(matches!(
-            compare(&expected, &proof(), &[successor], &[]),
-            Outcome::Unverified { .. }
-        ));
+        assert!(compare(&expected, &proof(), &[successor], &[]).is_err());
     }
     #[test]
     fn update_recovery_same_id_and_launch_without_issued_source_is_not_continuity() {
@@ -1984,14 +2368,11 @@ mod tests {
             boot_id: new_proof.boot_id.clone(),
             host_incarnation: new_proof.host_incarnation.clone(),
         };
-        assert!(matches!(
-            compare(&expected, &new_proof, &[recreated.clone()], &[]),
-            Outcome::Unverified { .. }
-        ));
+        assert!(compare(&expected, &new_proof, &[recreated.clone()], &[]).is_err());
         recreated.upgrade_sources.push(original.session.clone());
         assert!(matches!(
             compare(&expected, &new_proof, &[recreated], &[]),
-            Outcome::Usable { .. }
+            Ok(Outcome::Usable { .. })
         ));
     }
     fn chat() -> crate::chat::Session {
@@ -2014,6 +2395,195 @@ mod tests {
     }
 
     #[test]
+    fn installed_recovery_records_items_that_are_still_reconnecting() {
+        use ledger::Outcome as RowOutcome;
+        let ready = terminal();
+        let slow = terminal();
+        let original = chat();
+        let mut census = census(&ready);
+        census.terminals.push(slow.session.clone());
+        census.chats.push(original.clone());
+        let mut serving = proof();
+        serving.host_incarnation = "replacement".into();
+        let adopt = |mut terminal: TerminalDescriptor| {
+            terminal.upgrade_sources.push(terminal.session.clone());
+            terminal.session.continuity = TerminalContinuity::Live {
+                host_session_id: serving.host_session_id.clone(),
+                boot_id: serving.boot_id.clone(),
+                host_incarnation: serving.host_incarnation.clone(),
+            };
+            terminal
+        };
+        let mut resumed = original.clone();
+        resumed.proof = Some(serving.clone());
+        resumed.native_continuity = Default::default();
+        let late = chat();
+        for (reconnected, chats_available) in [(false, true), (true, true), (true, false)] {
+            let mut ledger = Ledger::new(
+                census.transaction.clone(),
+                census.source.clone(),
+                "target".into(),
+                impact::Policy::WhenIdle,
+            );
+            let chat_item = Item::NativeChat(original.id);
+            ledger.observe_late(chat_item.clone(), Continuity::Resume);
+            ledger.observe_census(&census);
+            ledger.release();
+            // A source can omit a stopped provider from its checkpoint. The
+            // saved conversation still opens after the windows reconnect.
+            ledger.note(&chat_item, Stage::Release, Reason::CheckpointOmitted);
+            let mut terminals = vec![adopt(ready.clone())];
+            if reconnected {
+                terminals.push(adopt(slow.clone()));
+            }
+            let chats = if chats_available {
+                vec![resumed.clone(), late.clone()]
+            } else {
+                Vec::new()
+            };
+            let view = RecoveryView {
+                proof: &serving,
+                terminals: &terminals,
+                chats: &chats,
+                lineage: &Default::default(),
+                prepared: None,
+                paused_ready: None,
+            };
+            assert!(matches!(
+                view.compare_with_recovery(&census, &mut ledger, true, chats_available),
+                Outcome::Usable { .. }
+            ));
+            let row_outcome = |item| {
+                ledger
+                    .rows()
+                    .iter()
+                    .find(|row| row.item() == &item)
+                    .unwrap()
+                    .outcome()
+            };
+            assert_eq!(
+                row_outcome(Item::Terminal(ready.session.id)),
+                Some(RowOutcome::Carried)
+            );
+            assert_eq!(
+                row_outcome(chat_item),
+                Some(if chats_available {
+                    RowOutcome::Resumed
+                } else {
+                    RowOutcome::SetAside(Reason::VerificationUnavailable)
+                })
+            );
+            assert_eq!(
+                row_outcome(Item::Terminal(slow.session.id)),
+                Some(if reconnected {
+                    RowOutcome::Carried
+                } else {
+                    RowOutcome::SetAside(Reason::VerificationMissing)
+                })
+            );
+            if chats_available {
+                assert_eq!(
+                    row_outcome(Item::NativeChat(late.id)),
+                    Some(RowOutcome::Observed)
+                );
+            }
+            assert_eq!(ledger.rows().len(), 3 + usize::from(chats_available));
+        }
+    }
+
+    #[test]
+    fn read_verification_reuses_row_outcomes_while_custody_stays_strict() {
+        use ledger::Outcome as RowOutcome;
+
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let terminal = terminal();
+        let census = census(&terminal);
+        let item = Item::Terminal(terminal.session.id);
+        let path = directory.path().join(ledger::FILE_NAME);
+        let mut ledger = Ledger::new(
+            census.transaction.clone(),
+            census.source.clone(),
+            "target".into(),
+            impact::Policy::WhenIdle,
+        );
+        ledger.observe_census(&census);
+        ledger.release();
+        let view = RecoveryView {
+            proof: &proof(),
+            terminals: &[],
+            chats: &[],
+            lineage: &Default::default(),
+            prepared: None,
+            paused_ready: None,
+        };
+        let receipt = census
+            .receipt(view.compare_with_recovery(&census, &mut ledger, true, true))
+            .unwrap();
+        assert!(receipt.usable());
+        assert!(matches!(
+            receipt.outcome,
+            Outcome::Usable { paused_terminals, paused_chats, .. }
+                if paused_terminals.is_empty() && paused_chats.is_empty()
+        ));
+        assert_eq!(
+            ledger.rows()[0].outcome(),
+            Some(RowOutcome::SetAside(Reason::VerificationMissing))
+        );
+        assert!(
+            compare_partition(&census, &proof(), &[], &[], &Default::default(), None, None)
+                .is_err()
+        );
+        ledger.save(&path).unwrap();
+
+        let mut resumed = Ledger::load(&path).unwrap();
+        assert_eq!(resumed.rows().len(), 1);
+        let returning = RecoveryView {
+            proof: &proof(),
+            terminals: &[terminal],
+            chats: &[],
+            lineage: &Default::default(),
+            prepared: None,
+            paused_ready: None,
+        };
+        returning.compare_with_recovery(&census, &mut resumed, true, true);
+        assert_eq!(
+            resumed.rows()[0].outcome(),
+            Some(RowOutcome::SetAside(Reason::VerificationMissing))
+        );
+        assert_eq!(resumed.rows()[0].item(), &item);
+    }
+
+    #[test]
+    fn planned_set_aside_rows_have_a_final_verification_outcome() {
+        let terminal = terminal();
+        let census = census(&terminal);
+        let mut ledger = Ledger::new(
+            census.transaction.clone(),
+            census.source.clone(),
+            "target".into(),
+            impact::Policy::WhenIdle,
+        );
+        ledger.observe_late(
+            Item::Terminal(terminal.session.id),
+            Continuity::SetAside(Reason::SourceBlocked),
+        );
+        ledger.release();
+        let view = RecoveryView {
+            proof: &proof(),
+            terminals: &[],
+            chats: &[],
+            lineage: &Default::default(),
+            prepared: None,
+            paused_ready: None,
+        };
+        view.compare_with_recovery(&census, &mut ledger, true, true);
+        assert_eq!(
+            ledger.rows()[0].outcome(),
+            Some(ledger::Outcome::SetAside(Reason::SourceBlocked))
+        );
+    }
+
+    #[test]
     fn update_recovery_chat_requires_exact_issued_session_and_serving_owner() {
         let original = chat();
         let mut expected = census(&terminal());
@@ -2021,7 +2591,7 @@ mod tests {
         expected.chats.push(original.clone());
         assert!(matches!(
             compare(&expected, &proof(), &[], std::slice::from_ref(&original)),
-            Outcome::Usable { .. }
+            Ok(Outcome::Usable { .. })
         ));
         let mut changed_owner = proof();
         changed_owner.host_incarnation = crate::model::HostIncarnation::new("replacement");
@@ -2032,9 +2602,7 @@ mod tests {
             (changed_owner.clone(), recreated),
             (changed_owner, original.clone()),
         ] {
-            assert!(
-                matches!(compare(&expected, &serving, &[], &[current]), Outcome::Unverified { changed, .. } if changed == [original.id])
-            );
+            assert!(compare(&expected, &serving, &[], &[current]).is_err());
         }
         let mut no_proof = original.clone();
         no_proof.proof = None;
@@ -2043,14 +2611,9 @@ mod tests {
         let mut changed_continuity = original.clone();
         changed_continuity.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
         for current in [no_proof, changed_pair, changed_continuity] {
-            assert!(
-                matches!(compare(&expected, &proof(), &[], &[current]), Outcome::Unverified { changed, .. } if changed == [original.id])
-            );
+            assert!(compare(&expected, &proof(), &[], &[current]).is_err());
         }
-        assert!(matches!(
-            compare(&expected, &proof(), &[], &[original.clone(), original]),
-            Outcome::Unverified { .. }
-        ));
+        assert!(compare(&expected, &proof(), &[], &[original.clone(), original]).is_err());
     }
 
     #[test]
@@ -2076,10 +2639,7 @@ mod tests {
                 chat
             })
             .collect();
-        assert!(matches!(
-            compare(&expected, &serving, &[], &current),
-            Outcome::Unverified { .. }
-        ));
+        assert!(compare(&expected, &serving, &[], &current).is_err());
         let entries: Vec<_> = expected
             .chats
             .iter()
@@ -2100,7 +2660,7 @@ mod tests {
         let lineage = store.recovered_chats().unwrap();
         assert!(matches!(
             compare_with_lineage(&expected, &serving, &[], &current, &lineage),
-            Outcome::Usable { chats: 2, .. }
+            Ok(Outcome::Usable { chats: 2, .. })
         ));
         for mutation in 0..4 {
             let mut different = current.clone();
@@ -2115,10 +2675,7 @@ mod tests {
                 _ => different.push(current[0].clone()),
             }
             assert!(
-                matches!(
-                    compare_with_lineage(&expected, &serving, &[], &different, &lineage),
-                    Outcome::Unverified { .. }
-                ),
+                compare_with_lineage(&expected, &serving, &[], &different, &lineage).is_err(),
                 "mutation {mutation}"
             );
         }
@@ -2216,7 +2773,7 @@ mod tests {
         let original = terminal();
         let expected = census(&original);
         let same_owner = expected
-            .receipt(compare(&expected, &proof(), &[original], &[]))
+            .receipt(compare(&expected, &proof(), &[original], &[]).unwrap())
             .unwrap();
         assert!(same_owner.usable());
         assert!(matches!(
@@ -2237,8 +2794,8 @@ mod tests {
             ),
             PreparedService::RetainedUnverified(_)
         ));
-        // The serving incarnation can be the first replacement or a later
-        // cold owner. Both require their own verified current inventory.
+        // The strict custody fallback verifies the current inventory even
+        // when the serving incarnation is a later cold owner.
         for incarnation in ["replacement", "cold-replacement"] {
             let mut serving = proof();
             serving.host_incarnation = incarnation.into();
@@ -2259,7 +2816,7 @@ mod tests {
                     Some(verified.clone()),
                     true,
                 ),
-                PreparedService::HandledVerified { serving: accepted } if accepted == serving
+                PreparedService::SettledReady { serving: accepted } if accepted == serving
             ));
             for (observed, readiness, receipt) in [
                 (proof(), StartupState::Ready, verified.clone()),
@@ -2513,7 +3070,7 @@ mod tests {
         );
         assert!(
             matches!(&outcome, Outcome::Unverified { serving:Some(owner), readiness:Some(StartupState::Ready), surviving_terminals:1, expected_terminals:1, missing:absent, changed, detail, .. }
-            if owner == &serving && absent == &[missing.id] && changed.is_empty()
+            if owner == &serving && absent.is_empty() && changed.is_empty()
                 && detail.contains("1 of 1 original terminals") && detail.contains("--no-start daemon status"))
         );
         assert!(!expected.receipt(outcome).unwrap().usable());
@@ -2574,7 +3131,7 @@ mod tests {
         let original = terminal();
         let expected = census(&original);
         let receipt = expected
-            .receipt(compare(&expected, &proof(), &[original], &[]))
+            .receipt(compare(&expected, &proof(), &[original], &[]).unwrap())
             .unwrap();
         assert!(receipt.usable());
         assert!(receipt.matches(&expected).is_ok());

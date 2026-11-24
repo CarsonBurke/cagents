@@ -1902,7 +1902,7 @@ fn process_admitted_request(
             relaunch_agents,
         } => {
             let current = super::state::update::inspect(host, impact.policy, true)?;
-            if !impact.preserves_consent(&current) || !current.ready() {
+            if !impact.covers_interruptions(&current) || !current.ready() {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::InvalidRequest,
                     "Update impact changed or sessions are not ready; review the current update preview",

@@ -108,46 +108,6 @@ pub struct SourceInspection {
 }
 
 impl SourceInspection {
-    pub fn preserves_consent(&self, observed: &Self) -> bool {
-        self.details.console_capabilities == observed.details.console_capabilities
-            && Self::same_outcomes(
-                &self.stopped,
-                &self.stopped_windows,
-                &observed.stopped,
-                &observed.stopped_windows,
-            )
-    }
-
-    pub fn same_outcomes(
-        previous_panes: &[StoppedPane],
-        previous_windows: &[StoppedWindow],
-        current_panes: &[StoppedPane],
-        current_windows: &[StoppedWindow],
-    ) -> bool {
-        fn panes(panes: &[StoppedPane]) -> BTreeMap<(TerminalId, StoppedKind), &str> {
-            panes
-                .iter()
-                .map(|pane| ((pane.pane, pane.kind), pane.reason.as_str()))
-                .collect()
-        }
-        fn windows(windows: &[StoppedWindow]) -> BTreeMap<usize, &str> {
-            windows
-                .iter()
-                .map(|window| (window.window, window.reason.as_str()))
-                .collect()
-        }
-        let previous = panes(previous_panes);
-        let current = panes(current_panes);
-        let before_windows = windows(previous_windows);
-        let after_windows = windows(current_windows);
-        previous.len() == previous_panes.len()
-            && current.len() == current_panes.len()
-            && previous == current
-            && before_windows.len() == previous_windows.len()
-            && after_windows.len() == current_windows.len()
-            && before_windows == after_windows
-    }
-
     #[cfg(feature = "host")]
     pub(crate) fn record_console_outcome(
         &mut self,
@@ -330,7 +290,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn console_capability_receipts_default_for_old_readers_and_bind_consent() {
+    fn console_capability_receipts_default_for_old_readers() {
         let mut before: SourceInspection =
             serde_json::from_str(r#"{"details":{"panes":{}}}"#).unwrap();
         assert!(before.details.console_capabilities.is_empty());
@@ -345,17 +305,6 @@ mod tests {
         let after: SourceInspection =
             serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
         assert_eq!(before, after);
-        assert!(before.preserves_consent(&after));
-        for capability in [ConsoleCapability::Reconnects, ConsoleCapability::Blocked] {
-            let mut changed = after.clone();
-            changed
-                .details
-                .console_capabilities
-                .get_mut(&id)
-                .unwrap()
-                .capability = capability;
-            assert!(!before.preserves_consent(&changed));
-        }
         assert_eq!(ConsoleCapability::from(true), ConsoleCapability::Reconnects);
         assert_eq!(ConsoleCapability::from(false), ConsoleCapability::Blocked);
     }

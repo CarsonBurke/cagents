@@ -443,6 +443,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         &saved,
         &checked_saved,
         &current_boot,
+        !request.report_only,
     )
 }
 
@@ -452,15 +453,14 @@ fn finish_live_inspection(
     saved: &[(crate::model::CardId, CardKind)],
     checked_saved: &HashSet<crate::model::TerminalId>,
     current_boot: &crate::model::BootId,
+    refuse_unqualified_consoles: bool,
 ) -> Result<SourceInspection, String> {
-    // Refusal is derived from the exact reviewed capability, never another
-    // argv, provider, path or protocol eligibility check. A future qualified
-    // reconnect producer changes review and preflight together.
-    if inspection
-        .details
-        .console_capabilities
-        .values()
-        .any(|review| review.capability == ConsoleCapability::Blocked)
+    if refuse_unqualified_consoles
+        && inspection
+            .details
+            .console_capabilities
+            .values()
+            .any(|review| review.capability == ConsoleCapability::Blocked)
     {
         return Err(CONSOLE_REFUSAL.into());
     }
@@ -2164,6 +2164,7 @@ mod tests {
                 proof: None,
                 require_resumable: true,
                 reconcile_retained: false,
+                report_only: false,
             };
             // Qualified sources reach the ownership check. Unqualified sources
             // are refused before reading any service namespace or opening a socket.
@@ -2314,6 +2315,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &current_boot(),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -2371,7 +2373,8 @@ mod tests {
             let mut inspection = SourceInspection::default();
             record_console_outcome(&mut inspection, id, capability);
             let inspection =
-                finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot).unwrap();
+                finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot, true)
+                    .unwrap();
             assert_eq!(
                 inspection.details.console_capabilities[&id].capability,
                 capability
@@ -2386,7 +2389,9 @@ mod tests {
         // the same producer; no independent admission rule needs updating.
         let mut qualified = SourceInspection::default();
         record_console_outcome(&mut qualified, id, true);
-        assert!(finish_live_inspection(qualified, Ok(()), &[], &HashSet::new(), &boot).is_ok());
+        assert!(
+            finish_live_inspection(qualified, Ok(()), &[], &HashSet::new(), &boot, true).is_ok()
+        );
         let mut blocked = SourceInspection::default();
         record_console_outcome(&mut blocked, id, false);
         assert_eq!(
@@ -2396,8 +2401,14 @@ mod tests {
         assert!(!blocked.details.panes.contains_key(&id));
         assert!(blocked.stopped.is_empty());
         assert_eq!(
-            finish_live_inspection(blocked, Ok(()), &[], &HashSet::new(), &boot).unwrap_err(),
+            finish_live_inspection(blocked.clone(), Ok(()), &[], &HashSet::new(), &boot, true)
+                .unwrap_err(),
             CONSOLE_REFUSAL
+        );
+        assert_eq!(
+            finish_live_inspection(blocked.clone(), Ok(()), &[], &HashSet::new(), &boot, false)
+                .unwrap(),
+            blocked,
         );
     }
 
@@ -2441,7 +2452,7 @@ mod tests {
                 // replace Blocked policy and restore the correct presentation.
                 record_console_outcome(&mut inspection, id, true);
                 let inspection =
-                    finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot)
+                    finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot, true)
                         .unwrap();
                 assert_eq!(inspection.details.console_capabilities[&id].kind, kind);
                 assert_eq!(
@@ -2497,6 +2508,7 @@ mod tests {
                     &[],
                     &HashSet::new(),
                     &proof.boot_id,
+                    true,
                 );
                 if requires_migration {
                     assert_eq!(result.unwrap_err(), CONSOLE_REFUSAL);
@@ -2533,9 +2545,15 @@ mod tests {
         let mut inspection = SourceInspection::default();
         record_live_panes(&mut inspection, &[], &roster, &proof, true);
         record_live_console_outcomes(&mut inspection, &roster, &proof, true);
-        let inspected =
-            finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &proof.boot_id)
-                .unwrap();
+        let inspected = finish_live_inspection(
+            inspection,
+            Ok(()),
+            &[],
+            &HashSet::new(),
+            &proof.boot_id,
+            true,
+        )
+        .unwrap();
         assert!(inspected.details.console_capabilities.is_empty());
         assert_eq!(
             inspected.details.panes[&console.session.id].outcome,

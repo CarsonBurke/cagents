@@ -12,8 +12,7 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
-#[cfg(test)]
-mod ledger;
+pub(crate) mod ledger;
 mod pending_recovery;
 pub(crate) mod recovery;
 mod retention;
@@ -810,8 +809,7 @@ fn drive_terminal_review_with(
     let mut waiting = None;
     let mut policy_requested = None;
     let mut reviewed = None;
-    // The review the person confirmed. A renewal it still covers, by the same
-    // rule the worker uses to keep an approval, needs no second answer.
+    // Keep ordinary policy approval across updates to the displayed inventory.
     let mut confirmed: Option<impact::Preview> = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     let mut finishing_message_shown = false;
@@ -949,10 +947,10 @@ fn drive_terminal_review_with(
                     submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
-                if confirmed
-                    .as_ref()
-                    .is_some_and(|approved| approved.preserves_consent(&confirmation.preview))
-                {
+                if confirmed.as_ref().is_some_and(|approved| {
+                    approved.same_target(&confirmation.preview)
+                        && confirmation::covers_interruptions(approved, &confirmation.preview)
+                }) {
                     if submit_current_choice(
                         terminal,
                         &job.id,
@@ -1792,7 +1790,7 @@ fn perform_update(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
-    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    guard.prepare_windows(Duration::from_secs(45))?;
     // The build these windows run, to return to if the new one cannot open.
     let previous = installation.prefix.join("current").canonicalize()?;
     // The daemon serving these windows; one still serving after the install
@@ -1815,9 +1813,11 @@ fn perform_update(
         )
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
-        if !confirmed.preserves_consent(&context.apply(latest)) {
+        if !confirmed.same_target(&latest)
+            || !confirmation::covers_interruptions(&confirmed, &latest)
+        {
             return Err(invalid(
-                "Session ownership changed during pane inspection; existing windows were kept open",
+                "The source or the work approved for interruption changed; existing windows were kept open",
             ));
         }
     }
@@ -1857,7 +1857,8 @@ fn perform_update(
             |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
             handoff,
             survivors,
-            &guard,
+            &mut guard,
+            None,
         )?;
         let target_daemon = installation
             .prefix
@@ -1869,9 +1870,11 @@ fn perform_update(
                 &target_daemon,
                 Some(&daemon_digest),
                 handoff.as_ref(),
+                None,
             )?;
         }
         confirmation::prepared(state, job)?;
+        let windows = guard.prepared_window_slots().to_vec();
         guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         Installation::detect()?;
         set_phase(
@@ -2134,7 +2137,7 @@ pub(crate) fn inspect_source_panes(
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
 ) -> Result<source_inspection::SourceInspection, UpdateError> {
-    inspect_source_panes_mode(guard, proof, require_resumable, false)
+    inspect_source_panes_mode(guard, proof, require_resumable, false, false)
 }
 
 // Recover only already-owned providers before publishing the inventory the
@@ -2150,6 +2153,7 @@ fn reconcile_saved_sources(
         proof,
         protocol != destination_protocol || replaces_compatible_daemon,
         true,
+        false,
     )
 }
 
@@ -2158,6 +2162,7 @@ fn inspect_source_panes_mode(
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
     reconcile_retained: bool,
+    report_only: bool,
 ) -> Result<source_inspection::SourceInspection, UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
@@ -2175,6 +2180,7 @@ fn inspect_source_panes_mode(
         proof,
         require_resumable,
         reconcile_retained,
+        report_only,
     };
     let mut command = Command::new(&helper);
     crate::install_guard::sanitize_child_environment(&mut command);

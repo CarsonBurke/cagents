@@ -466,7 +466,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let proof = client.proof().clone();
-    let approved = ready_preview(&mut client, &socket, &args)?;
+    ready_preview(&mut client, &socket, &args)?;
     eprintln!("Idle preview ready; saving windows before final fenced recheck");
     let mut guard = UiUpdateGuard::acquire()?;
     // The target matched UI supports this daemon's protocol and carries the
@@ -477,9 +477,9 @@ fn main() -> Result<()> {
         verify_target(&args.target_version_root, &pins)?;
         verify_old(&mut client, &socket, &args)?;
         let current = client.upgrade_impact(Policy::WhenIdle)?;
-        if client.proof() != &proof || !approved.preserves_consent(&current) || !current.ready() {
+        if client.proof() != &proof || !current.ready() {
             return Err(fail(
-                "approved owners or readiness changed after closing windows; no checkpoint requested",
+                "source daemon changed or became busy after closing windows; no checkpoint requested",
             ));
         }
         if reconnect_only_working(&mut client, &socket)? {

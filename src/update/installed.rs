@@ -1,4 +1,4 @@
-//! A locally installed matched set uses the same review and checkpoint flow.
+//! Apply a staged installation using the target version's update ledger.
 use super::*;
 
 const BINARIES: [&str; 3] = ["cagents", "cagents-ui", "cagentsd"];
@@ -76,7 +76,7 @@ pub(super) fn perform(
     terminal: bool,
 ) -> Result<Completion, UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
-    let (source_protocol, _) = source::inspect_identity(None)?;
+    let (source_protocol, source_proof) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
     let source_owner = installed_daemon_owner(&layout)?;
     if served_version_root(&layout)? != root {
@@ -127,11 +127,33 @@ pub(super) fn perform(
         .is_some_and(|owner| owner.version_root != root);
     let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, terminal, |policy| {
+    let confirmed = confirmation::wait_with_policy(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
+    let mut ledger = ledger::Ledger::new(
+        job.id.clone(),
+        source_proof.clone(),
+        job.version.clone(),
+        confirmed
+            .daemon
+            .as_ref()
+            .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+    )
+    .with_source_build(context.from_version.clone(), source_protocol);
+    ledger.observe_preview(&confirmed);
     let mut recovery = recovery::Context::default();
     recovery.capture(state, job)?;
+    let census = recovery.census.as_ref().expect("census captured above");
+    if census.source != source_proof {
+        return Err(invalid(
+            "The source daemon changed before window preparation",
+        ));
+    }
+    ledger.observe_census(census);
+    let ledger_dir = state.join(&job.id);
+    fs::DirBuilder::new().mode(0o700).create(&ledger_dir)?;
+    let ledger_path = ledger_dir.join(ledger::FILE_NAME);
+    ledger.save(&ledger_path)?;
     set_phase(
         state,
         job,
@@ -140,32 +162,28 @@ pub(super) fn perform(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
+    ledger.freeze();
     let windows = guard.prepare_windows(Duration::from_secs(45))?;
-    {
-        let inspected = crate::install_guard::preflight_source_panes(
-            &guard,
-            confirmed
-                .daemon
-                .as_ref()
-                .map(|daemon| daemon.capability.proof.clone()),
-            confirmed.replaces_daemon,
-        )?;
-        let latest = observe(
-            confirmed
-                .daemon
-                .as_ref()
-                .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-        )
-        .map_err(io::Error::other)?
-        .with_inspection(&inspected);
-        if !confirmed.preserves_consent(&context.apply(latest))
-            || digest(root).map_err(io::Error::other)? != staged.identity.digest
-        {
-            return Err(invalid(
-                "The installed build or session ownership changed during pane inspection; existing windows were kept open",
-            ));
-        }
+    let inspected = inspect_source_panes_mode(
+        &guard,
+        confirmed
+            .daemon
+            .as_ref()
+            .map(|daemon| daemon.capability.proof.clone()),
+        confirmed.replaces_daemon,
+        false,
+        true,
+    )?;
+    ledger.observe_saved(&inspected);
+    for slot in &windows {
+        ledger.observe_window(slot.clone());
     }
+    if digest(root)? != staged.identity.digest {
+        return Err(invalid(
+            "The installed application changed; existing windows were kept open",
+        ));
+    }
+    ledger.save(&ledger_path)?;
     confirmation::check_cancelled(state, job)?;
     let output = StartupOutput::create(state)?;
     let mut startup_attempted = false;
@@ -193,23 +211,38 @@ pub(super) fn perform(
             previous = (owner.version_root != root).then_some(owner.version_root);
         }
         recovery.shutdown_requested = confirmed.replaces_daemon;
-        floor::quiesce(
+        let released = floor::quiesce(
             state,
             job,
             &confirmed,
             terminal,
-            |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
+            |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspected))),
             handoff,
             survivors,
-            &guard,
-        )?;
+            &mut guard,
+            Some(&mut ledger),
+        );
+        if let Err(error) = ledger.save(&ledger_path) {
+            eprintln!("Could not record released update items: {error}");
+        }
+        released?;
         if previous.is_some()
             && let Some(lease) = handoff.as_ref()
         {
             original_schema = Some(stopped_store_schema(root, &guard, lease)?);
         }
-        survivors.authorize_successor(&root.join("bin/cagentsd"), None, handoff.as_ref())?;
+        let authorized = survivors.authorize_successor(
+            &root.join("bin/cagentsd"),
+            None,
+            handoff.as_ref(),
+            Some(&mut ledger),
+        );
+        if let Err(error) = ledger.save(&ledger_path) {
+            eprintln!("Could not record update checkpoint results: {error}");
+        }
+        authorized?;
         confirmation::prepared(state, job)?;
+        let windows = guard.prepared_window_slots().to_vec();
         guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         set_phase(
             state,
@@ -293,23 +326,71 @@ pub(super) fn perform(
     // Any reopen, including the guard's own after a failed recovery, uses
     // the UI matched to the daemon chosen above, never this worker's own.
     guard.set_fallback_executable(reopen.join("bin/cagents-ui"));
-    let recovery_result = finish_handoff(
-        installation,
-        state,
-        job,
-        &result,
-        handoff,
-        &recovery,
-        survivors,
-        &guard,
-    );
-    recovery_result?;
+    if result.is_err() {
+        finish_handoff(
+            installation,
+            state,
+            job,
+            &result,
+            handoff,
+            &recovery,
+            survivors,
+            &guard,
+        )?;
+        let reopened = guard
+            .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
+            .map_err(UpdateError::from);
+        return finish_reopening_windows(state, job, result, Handoff::Served, reopened);
+    }
+    drop(handoff.take());
+    survivors.release_recovery_reservation();
+    let slots = guard.reopened_slots();
     let reopened = guard
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    let handoff_kind =
-        verify_reopened_service(&recovery, state, job, result.is_ok().then_some(&*survivors))?;
-    finish_reopening_windows(state, job, result, handoff_kind, reopened)
+    // A reopened window can still have panes reconnecting. The launch notes
+    // describe their attachments separately from the restored window state.
+    let windows_opened = reopened.is_ok();
+    for slot in slots {
+        let item = ledger::Item::WindowState(slot);
+        if windows_opened {
+            ledger.record_outcome(&item, ledger::Stage::Verify, ledger::Outcome::Carried);
+        } else {
+            ledger.set_aside(
+                &item,
+                ledger::Stage::Verify,
+                ledger::Reason::WindowRecoveryPending,
+            );
+        }
+    }
+    let verified = recovery
+        .verify_ledger(&mut ledger, &reopen.join("bin/cagentsd"), state, job)
+        .and_then(|proof| {
+            survivors.verify_ledger_successor(&proof)?;
+            Ok(proof)
+        });
+    ledger.finish_saved_rows(windows_opened);
+    ledger.save(&ledger_path)?;
+    let serving = verified?;
+    let attention = ledger.attention_count();
+    if let Err(error) = recovery::archive_settled_service(&serving, &reopen.join("bin/cagentsd")) {
+        tracing::warn!(%error, "Retaining update recovery evidence");
+    }
+    let reopened = reopened.map(|notes| {
+        if attention == 0 {
+            return notes;
+        }
+        let summary = if attention == 1 {
+            "1 saved item needs attention after the update.".to_owned()
+        } else {
+            format!("{attention} saved items need attention after the update.")
+        };
+        Some(match notes {
+            Some(notes) => format!("{summary}\n\n{notes}"),
+            None => summary,
+        })
+    });
+    finish_reopening_windows(state, job, result, Handoff::Served, reopened)
 }
 
 /// Store maintenance receives the reservation intentionally; status probes

@@ -1684,6 +1684,17 @@ impl UiUpdateGuard {
         Ok(slots)
     }
 
+    /// Let a person use prepared windows while the update waits for live work.
+    /// The caller repeats preparation before it releases the source daemon.
+    pub(crate) fn resume_prepared_windows(&mut self) -> io::Result<()> {
+        for slot in &self.prepared {
+            update_window(&self.runtime, slot, "update-cancel", Duration::from_secs(2))?;
+        }
+        self.prepared.clear();
+        self.close.pinned.clear();
+        Ok(())
+    }
+
     /// Human review has no window-RPC deadline. Closing gets its own budget.
     pub(crate) fn close_prepared_windows(
         &mut self,
@@ -4388,6 +4399,64 @@ mod tests {
         assert!(WindowLease::acquire_in(runtime.path(), true, None).is_err());
         drop(older);
         assert!(WindowLease::acquire_in(runtime.path(), true, None).is_ok());
+    }
+
+    #[test]
+    fn resuming_prepared_windows_requires_a_new_save_before_closing() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let lease = owned_lock(
+            &runtime.path().join(slot_lock_name(PRIMARY_WINDOW)),
+            libc::LOCK_EX,
+        )
+        .unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(
+            runtime.path().join(slot_socket_name(PRIMARY_WINDOW)),
+        )
+        .unwrap();
+        let worker = std::thread::spawn(move || {
+            let _lease = lease;
+            let mut actions = Vec::new();
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().unwrap();
+                actions.push(read_capped_line(&stream).unwrap());
+                writeln!(&stream, "ok").unwrap();
+            }
+            actions
+        });
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            _legacy_fence: legacy,
+            runtime: runtime.path().into(),
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            close: CloseEvidence::default(),
+            fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
+        };
+        guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        guard.resume_prepared_windows().unwrap();
+        assert!(guard.prepared_window_slots().is_empty());
+        guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        assert_eq!(guard.prepared_window_slots(), &[PRIMARY_WINDOW.to_owned()]);
+        drop(guard);
+        assert_eq!(
+            worker.join().unwrap(),
+            [
+                "update-prepare",
+                "update-cancel",
+                "update-prepare",
+                "update-cancel"
+            ]
+        );
     }
 
     #[test]

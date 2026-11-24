@@ -1,5 +1,6 @@
 //! Candidate-owned fallback for source daemons that cannot checkpoint work.
 use super::floor_display::{StopList, chat_item_with_state, terminal_item};
+use super::ledger::{EndRequest, Item, Ledger, Stage};
 use super::*;
 use crate::model::TerminalId;
 use crate::terminal_ipc::{ShutdownCapability, ShutdownOutcome, TerminalDescriptor};
@@ -230,6 +231,12 @@ fn descriptor_impact<T: Serialize>(
 trait FloorSource {
     fn observe(&mut self) -> Result<impact::Preview, UpdateError>;
     fn observe_policy(&mut self, policy: impact::Policy) -> Result<impact::Preview, UpdateError>;
+    fn resume_windows_for_review(&mut self) -> Result<(), UpdateError> {
+        Ok(())
+    }
+    fn prepare_windows_after_review(&mut self) -> Result<(), UpdateError> {
+        Ok(())
+    }
     fn inventory(
         &mut self,
         daemon: &impact::DaemonImpact,
@@ -258,6 +265,10 @@ trait FloorSource {
         deadline: Instant,
     ) -> Result<(), UpdateError>;
     fn pending_interrupts(&mut self) -> Result<Vec<TerminalId>, UpdateError>;
+    fn issued_interruptions(&self) -> Vec<TerminalId> {
+        Vec::new()
+    }
+
     fn interrupt_impact(&self) -> Result<impact::DaemonImpact, UpdateError>;
     fn close_chat(
         &mut self,
@@ -325,7 +336,8 @@ struct NativeSource<'a, O> {
     handoff: &'a mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &'a mut Survivors,
     reviewed: &'a impact::Preview,
-    guard: &'a crate::instance::UiUpdateGuard,
+    guard: &'a mut crate::instance::UiUpdateGuard,
+    windows_resumed: bool,
     interrupts: Option<source::Interrupts>,
     interrupt_reviewed: Option<impact::DaemonImpact>,
     preparing_client: Option<source::Client>,
@@ -337,11 +349,31 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
     for NativeSource<'_, O>
 {
     fn observe(&mut self) -> Result<impact::Preview, UpdateError> {
-        (self.observe)(self.policy)
+        let preview = (self.observe)(self.policy)?;
+        if preview
+            .daemon
+            .as_ref()
+            .is_none_or(|daemon| daemon.capability.proof != self.proof)
+        {
+            return Err(invalid("The pinned source daemon changed before release"));
+        }
+        Ok(preview)
     }
     fn observe_policy(&mut self, policy: impact::Policy) -> Result<impact::Preview, UpdateError> {
         self.policy = policy;
         self.observe()
+    }
+    fn resume_windows_for_review(&mut self) -> Result<(), UpdateError> {
+        self.guard.resume_prepared_windows()?;
+        self.windows_resumed = true;
+        Ok(())
+    }
+    fn prepare_windows_after_review(&mut self) -> Result<(), UpdateError> {
+        if self.windows_resumed {
+            self.guard.prepare_windows(Duration::from_secs(45))?;
+            self.windows_resumed = false;
+        }
+        Ok(())
     }
     fn inventory(
         &mut self,
@@ -521,6 +553,12 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         self.survivors.late_turns.extend(interrupts.late_turns());
         Ok(pending)
     }
+    fn issued_interruptions(&self) -> Vec<TerminalId> {
+        self.interrupts
+            .as_ref()
+            .map_or_else(Vec::new, source::Interrupts::issued_interruptions)
+    }
+
     fn interrupt_impact(&self) -> Result<impact::DaemonImpact, UpdateError> {
         self.interrupts
             .as_ref()
@@ -663,7 +701,8 @@ pub(super) fn quiesce(
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut Survivors,
-    guard: &crate::instance::UiUpdateGuard,
+    guard: &mut crate::instance::UiUpdateGuard,
+    ledger: Option<&mut Ledger>,
 ) -> Result<(), UpdateError> {
     let Some(initial) = &confirmed.daemon else {
         return Ok(());
@@ -683,13 +722,14 @@ pub(super) fn quiesce(
         survivors,
         reviewed: confirmed,
         guard,
+        windows_resumed: false,
         interrupts: None,
         interrupt_reviewed: None,
         preparing_client: None,
         preparation: None,
         original_census: None,
     };
-    quiesce_source(state, job, confirmed, terminal, &mut source)
+    quiesce_source(state, job, confirmed, terminal, &mut source, ledger)
 }
 
 fn reviewed_inventory(
@@ -766,6 +806,7 @@ fn quiesce_source(
     confirmed: &impact::Preview,
     terminal: bool,
     source: &mut impl FloorSource,
+    ledger: Option<&mut Ledger>,
 ) -> Result<(), UpdateError> {
     let mut completed = Vec::new();
     let mut service_stopped = false;
@@ -779,6 +820,7 @@ fn quiesce_source(
         &mut completed,
         &mut service_stopped,
         &mut background_tasks,
+        ledger,
     );
     result.map_err(|error| completed_error(error, &completed, service_stopped, background_tasks))
 }
@@ -792,6 +834,7 @@ fn quiesce_inner(
     completed: &mut Vec<super::floor_display::StopItem>,
     service_stopped: &mut bool,
     background_tasks: &mut u64,
+    mut ledger: Option<&mut Ledger>,
 ) -> Result<(), UpdateError> {
     let Some(initial) = &confirmed.daemon else {
         return Ok(());
@@ -799,48 +842,94 @@ fn quiesce_inner(
     confirmation::check_cancelled(state, job)?;
     let mut preview = source.observe()?;
     confirmation::check_cancelled(state, job)?;
-    if !confirmed.preserves_consent(&preview) {
+    if !confirmed.same_target(&preview) {
         return Err(invalid(
-            "Session ownership changed before stopping the source; review the update again",
+            "The source daemon or installed target changed before release",
         ));
     }
-    // Finish the ordinary, cancellable wait before collecting destructive consent.
-    if preview.daemon.as_ref().is_some_and(|daemon| {
-        daemon
-            .sessions
-            .iter()
-            .any(|item| item.disposition == impact::Disposition::WaitsForIdle)
-    }) {
-        preview = confirmation::wait_approved(state, job, terminal, preview, |policy| {
-            source.observe_policy(policy)
-        })?;
+    if let Some(ledger) = ledger.as_deref_mut() {
+        ledger.observe_preview(&preview);
+        for request in EndRequest::interruptions(initial) {
+            ledger.accept_end(request);
+        }
     }
-    // Interrupted is a consented outcome, not a provider receipt. Old sources
-    // prepare their checkpoint before attempting interruption during shutdown;
-    // settle it while they can still serve, before crossing that boundary.
+    if !confirmation::covers_interruptions(confirmed, &preview) {
+        if ledger.is_some() {
+            source.resume_windows_for_review()?;
+        }
+        let observe = |policy| source.observe_policy(policy);
+        preview = if let Some(ledger) = ledger.as_deref_mut() {
+            confirmation::wait_with_ledger(state, job, terminal, preview, false, ledger, observe)?
+        } else {
+            confirmation::wait_reviewed(state, job, terminal, preview, observe)?
+        };
+    }
+    preview = wait_until_idle(state, job, terminal, preview, source, ledger.as_deref_mut())?;
+
+    // An accepted interrupt is not a settlement receipt. Let the source
+    // confirm its effects before asking it to prepare.
+    let interruptions = preview
+        .daemon
+        .iter()
+        .flat_map(EndRequest::interruptions)
+        .collect::<Vec<_>>();
+    if let Some(ledger) = ledger.as_deref_mut() {
+        ledger.observe_preview(&preview);
+        for request in &interruptions {
+            ledger.accept_end(request.clone());
+        }
+    }
     preview = settle_interrupts(state, job, preview, source, Duration::from_secs(30))?;
+    let mut interrupted_work = false;
+    if let Some(ledger) = ledger.as_deref_mut() {
+        ledger.observe_preview(&preview);
+        let issued = source.issued_interruptions();
+        for request in &interruptions {
+            if let Item::NativeChat(id) = request.item()
+                && issued.contains(id)
+            {
+                interrupted_work = true;
+                ledger.record_ended(request, Stage::Release);
+            } else {
+                ledger.settle_unused_end(request, Stage::Release);
+            }
+        }
+    }
+    if !interrupted_work {
+        preview = wait_until_idle(state, job, terminal, preview, source, ledger.as_deref_mut())?;
+    }
     let daemon = preview
         .daemon
         .as_ref()
         .ok_or_else(|| invalid("The source disappeared during update review"))?;
+    source.prepare_windows_after_review()?;
     // Retain the full original census before any floor action can remove a
     // conversation. A later Ready checkpoint contains only its surviving subset.
     source.capture_before_floor(state, job, daemon)?;
     let mut service = needs_service_stop(daemon);
+    let mut retry_busy_preparation = interrupted_work;
     // With no known ends, prepare itself determines whether the service can
     // checkpoint. A refusal has not ended anything and precedes the one stop list.
-    if !daemon.blocked() {
+    if !daemon.blocked() && (!interrupted_work || daemon.ready()) {
         source.begin_preparation(state, job, daemon)?;
         confirmation::prepared(state, job)?;
         match source.prepare(daemon) {
-            Ok(()) => return source.stopped(state, job, false),
+            Ok(()) => {
+                if let Some(ledger) = ledger.as_deref_mut() {
+                    ledger.release();
+                }
+                return source.stopped(state, job, false);
+            }
             Err(source::PrepareError::Refused(error)) => {
                 confirmation::resume_cancellation(state, job)?;
                 eprintln!("The source could not checkpoint its work: {error}");
                 service = true;
             }
-            // A source still busy after retrying has ended nothing either, but
-            // a later update can succeed without stopping sessions.
+            Err(source::PrepareError::Busy(_)) if ledger.is_some() => {
+                confirmation::resume_cancellation(state, job)?;
+                retry_busy_preparation = true;
+            }
+            // Legacy callers keep the existing bounded refusal behavior.
             Err(error) => return Err(error.into()),
         }
     }
@@ -848,29 +937,97 @@ fn quiesce_inner(
         let inventory = source.inventory(daemon, true)?;
         service = source.predict_service(&preview, &inventory)?;
     }
+    let mut accepted_background = None;
+    let waits_for_safe_prepare = ledger.is_some();
     'review: loop {
-        let (reviewed, listed) = confirmation::wait_stop(state, job, terminal, || {
-            let current = source.observe()?;
-            if current
-                .daemon
-                .as_ref()
-                .is_none_or(|daemon| daemon.capability.proof != initial.capability.proof)
-            {
-                return Err(invalid("The source changed during stop review"));
-            }
-            let (_, _, inventory) = reviewed_inventory(source, current.clone(), true)?;
-            service |= needs_service_stop(current.daemon.as_ref().unwrap())
-                || source.predict_service(&current, &inventory)?;
-            // Mint the service capability before asking, then validate it again
-            // against a fresh descriptor/job digest immediately before the action.
-            if service {
-                source.preflight(current.daemon.as_ref().unwrap())?;
-            }
-            let list = stop_list(&current, &inventory, service)?;
-            Ok((current, list))
-        })?;
-        let current = source.observe()?;
+        if retry_busy_preparation {
+            job.confirmation = None;
+            set_phase(
+                state,
+                job,
+                UpdatePhase::WaitingForIdle,
+                "Waiting for the terminal service to finish its current operation",
+            )?;
+        }
+        if ledger.is_some() {
+            source.resume_windows_for_review()?;
+        }
+        let consent = ledger
+            .as_deref_mut()
+            .map(|ledger| confirmation::StopConsent {
+                ledger,
+                background: &mut accepted_background,
+            });
+        let wait_only = waits_for_safe_prepare && (!terminal || retry_busy_preparation);
+        let (reviewed, listed) = confirmation::wait_stop(
+            state,
+            job,
+            terminal && !retry_busy_preparation,
+            consent,
+            || {
+                let current = if retry_busy_preparation {
+                    source.observe_policy(impact::Policy::WhenIdle)?
+                } else {
+                    source.observe()?
+                };
+                if !confirmed.same_target(&current) {
+                    return Err(invalid("The source changed during stop review"));
+                }
+                let (_, _, inventory) = reviewed_inventory(source, current.clone(), true)?;
+                if wait_only && current.daemon.as_ref().unwrap().ready() {
+                    return Ok((current.clone(), stop_list(&current, &inventory, false)?));
+                }
+                service |= needs_service_stop(current.daemon.as_ref().unwrap())
+                    || source.predict_service(&current, &inventory)?;
+                // Mint the service capability before asking, then validate it again
+                // against a fresh descriptor/job digest immediately before the action.
+                if service && !wait_only {
+                    source.preflight(current.daemon.as_ref().unwrap())?;
+                }
+                let list = stop_list(&current, &inventory, service)?;
+                Ok((current, list))
+            },
+        )?;
+        source.prepare_windows_after_review()?;
+        let current = if retry_busy_preparation {
+            source.observe_policy(impact::Policy::WhenIdle)?
+        } else {
+            source.observe()?
+        };
         let (latest, latest_list, inventory) = reviewed_inventory(source, current, service)?;
+        if wait_only {
+            if !confirmed.same_target(&latest) {
+                return Err(invalid(
+                    "The source daemon or installed target changed while saving windows",
+                ));
+            }
+            let daemon = latest.daemon.as_ref().unwrap();
+            if !daemon.ready() {
+                continue;
+            }
+            if let Some(ledger) = ledger.as_deref_mut() {
+                ledger.observe_preview(&latest);
+            }
+            source.capture_before_floor(state, job, daemon)?;
+            source.begin_preparation(state, job, daemon)?;
+            confirmation::prepared(state, job)?;
+            match source.prepare(daemon) {
+                Ok(()) => {
+                    ledger.as_deref_mut().unwrap().release();
+                    return source.stopped(state, job, false);
+                }
+                Err(error @ (source::PrepareError::Refused(_) | source::PrepareError::Busy(_))) => {
+                    retry_busy_preparation = interrupted_work
+                        || !completed.is_empty()
+                        || matches!(error, source::PrepareError::Busy(_));
+                    confirmation::resume_cancellation(state, job)?;
+                    source.resume_windows_for_review()?;
+                    thread::sleep(DECISION_RETRY);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         if !service
             && (needs_service_stop(latest.daemon.as_ref().unwrap())
                 || source.predict_service(&latest, &inventory)?)
@@ -878,10 +1035,14 @@ fn quiesce_inner(
             service = true;
             continue;
         }
-        if !reviewed.preserves_stop_consent(&latest) || listed.digest() != latest_list.digest() {
+        if !reviewed.same_target(&latest) || !listed.covers(&latest_list) {
             continue;
         }
         let daemon = latest.daemon.as_ref().unwrap();
+        if let Some(ledger) = ledger.as_deref_mut() {
+            ledger.observe_preview(&latest);
+        }
+        let listed = latest_list;
         let ending: Vec<_> = inventory
             .chats
             .iter()
@@ -916,7 +1077,7 @@ fn quiesce_inner(
             service = true;
             continue;
         }
-        if !latest.preserves_stop_consent(&fresh) || listed.digest() != fresh_list.digest() {
+        if !latest.same_target(&fresh) || !listed.covers(&fresh_list) {
             continue;
         }
         let daemon = fresh.daemon.as_ref().unwrap();
@@ -924,16 +1085,32 @@ fn quiesce_inner(
             let capability = source.preflight(daemon)?;
             let observed = source.observe()?;
             let (last, last_list, _) = reviewed_inventory(source, observed, true)?;
-            if !fresh.preserves_stop_consent(&last) || listed.digest() != last_list.digest() {
+            if !fresh.same_target(&last) || !listed.covers(&last_list) {
                 continue;
+            }
+            if let Some(ledger) = ledger.as_deref_mut() {
+                ledger.settle_unused_stops(
+                    &daemon.capability.proof,
+                    &last_list.items,
+                    Stage::Release,
+                );
             }
             confirmation::prepared(state, job)?;
             match source.shutdown(last.daemon.as_ref().unwrap(), capability)? {
                 ShutdownOutcome::Accepted { .. } => {
                     *service_stopped = true;
-                    *background_tasks = listed.background_tasks;
-                    completed.extend(listed.items.clone());
-                    source.ended(&listed.items, true, *background_tasks);
+                    *background_tasks = last_list.background_tasks;
+                    completed.extend(last_list.items.clone());
+                    source.ended(&last_list.items, true, *background_tasks);
+                    if let Some(ledger) = ledger.as_deref_mut() {
+                        ledger.release();
+                        for item in &last_list.items {
+                            ledger.record_ended(
+                                &EndRequest::stop(&daemon.capability.proof, item),
+                                Stage::Release,
+                            );
+                        }
+                    }
                     // Accepted invalidates the old checkpoint even when waiting
                     // for exit or writing the recovery record subsequently fails.
                     let archived = source.archive();
@@ -967,7 +1144,15 @@ fn quiesce_inner(
                 }
             }
         }
-        for chat in ending {
+        if let Some(ledger) = ledger.as_deref_mut() {
+            ledger.settle_unused_stops(&daemon.capability.proof, &fresh_list.items, Stage::Release);
+        }
+        for chat in ending.into_iter().filter(|chat| {
+            fresh_list
+                .items
+                .iter()
+                .any(|item| item.kind == impact::SessionKind::NativeChat && item.id == chat.id)
+        }) {
             if completed.is_empty() {
                 confirmation::prepared(state, job)?;
             }
@@ -979,9 +1164,7 @@ fn quiesce_inner(
                     // same confirmation flow when its exact list changed.
                     let observed = source.observe()?;
                     let (current, current_list, _) = reviewed_inventory(source, observed, service)?;
-                    if !fresh.preserves_stop_consent(&current)
-                        || listed.digest() != current_list.digest()
-                    {
+                    if !fresh.same_target(&current) || !listed.covers(&current_list) {
                         confirmation::resume_cancellation(state, job)?;
                         continue 'review;
                     }
@@ -1010,6 +1193,15 @@ fn quiesce_inner(
                 })
                 .map_or(0, |session| session.interrupted_subagents.len() as u64);
             source.ended(&ended_items, false, *background_tasks);
+            if let Some(ledger) = ledger.as_deref_mut() {
+                ledger.release();
+                for item in &ended_items {
+                    ledger.record_ended(
+                        &EndRequest::stop(&daemon.capability.proof, item),
+                        Stage::Release,
+                    );
+                }
+            }
             let mut ended = record.clone();
             ended.chats.retain(|source| source.id == chat.id);
             ended.aliases.retain(|source| source.id == chat.id);
@@ -1038,6 +1230,11 @@ fn quiesce_inner(
             .iter()
             .any(|item| item.disposition == impact::Disposition::Interrupted)
         {
+            if ledger.is_some() {
+                confirmation::resume_cancellation(state, job)?;
+                retry_busy_preparation = true;
+                continue;
+            }
             return Err(invalid(
                 "A conversation started working again; review the update before preparing it",
             ));
@@ -1048,7 +1245,18 @@ fn quiesce_inner(
             confirmation::prepared(state, job)?;
         }
         match source.prepare(daemon) {
-            Ok(()) => (),
+            Ok(()) => {
+                if let Some(ledger) = ledger.as_deref_mut() {
+                    ledger.release();
+                }
+            }
+            Err(source::PrepareError::Busy(_)) if ledger.is_some() => {
+                confirmation::resume_cancellation(state, job)?;
+                retry_busy_preparation = true;
+                source.resume_windows_for_review()?;
+                thread::sleep(DECISION_RETRY);
+                continue;
+            }
             // The busy refusal says nothing was stopped, which is only true
             // before the first end; the ended conversations are listed after.
             Err(source::PrepareError::Busy(_)) if !completed.is_empty() => {
@@ -1059,6 +1267,14 @@ fn quiesce_inner(
         return source.stopped(state, job, false);
     }
 }
+
+/// A refused ordinary preparation changes no owners. Keep windows usable
+/// while waiting before the next attempt.
+const DECISION_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_millis(500)
+};
 
 /// How long the update pauses between checks that the confirmed
 /// interruptions have ended; tests settle at once, so they check sooner.
@@ -1071,6 +1287,34 @@ const INTERRUPT_POLL: Duration = if cfg!(test) {
 /// A preparation still refused as busy after the reviewed conversations ended.
 /// The terminal service and its terminals kept running.
 const PREPARE_BUSY_AFTER_ENDS: &str = "The source daemon stayed busy finishing another operation, so it did not checkpoint. The terminal service and its terminals were not stopped; the conversations below had already ended. Retry the update once it finishes.";
+
+fn wait_until_idle(
+    state: &Path,
+    job: &mut UpdateJob,
+    terminal: bool,
+    preview: impact::Preview,
+    source: &mut impl FloorSource,
+    ledger: Option<&mut Ledger>,
+) -> Result<impact::Preview, UpdateError> {
+    if preview.daemon.as_ref().is_some_and(|daemon| {
+        daemon
+            .sessions
+            .iter()
+            .any(|item| item.disposition == impact::Disposition::WaitsForIdle)
+    }) {
+        if ledger.is_some() {
+            source.resume_windows_for_review()?;
+        }
+        let observe = |policy| source.observe_policy(policy);
+        return match ledger {
+            Some(ledger) => {
+                confirmation::wait_with_ledger(state, job, terminal, preview, true, ledger, observe)
+            }
+            None => confirmation::wait_approved(state, job, terminal, preview, observe),
+        };
+    }
+    Ok(preview)
+}
 
 fn settle_interrupts(
     state: &Path,
@@ -1153,22 +1397,14 @@ fn settle_interrupts(
             // the bound or allow Interrupt preparation of newly busy work.
             let mut current = preview.clone();
             current.daemon = Some(source.interrupt_impact()?);
-            let mut expected = preview.clone();
-            let idle = expected.daemon.as_mut().unwrap();
-            idle.policy = impact::Policy::WhenIdle;
-            for item in &mut idle.sessions {
-                if interrupted.contains_key(&item.id) {
-                    item.disposition = impact::Disposition::Resumes;
-                }
-            }
             confirmation::check_cancelled(state, job)?;
-            if !expected.preserves_consent(&current)
+            if !preview.same_target(&current)
                 || current.daemon.as_ref().is_none_or(|daemon| {
                     daemon.policy != impact::Policy::WhenIdle
-                        || daemon.sessions.iter().any(|item| {
-                            interrupted.contains_key(&item.id)
-                                && item.disposition != impact::Disposition::Resumes
-                        })
+                        || daemon
+                            .sessions
+                            .iter()
+                            .any(|item| item.disposition == impact::Disposition::Interrupted)
                 })
             {
                 return Err(invalid(
@@ -1271,8 +1507,8 @@ struct PreparationEvidence {
 }
 
 impl PreparationEvidence {
-    fn require_ready(&self) -> Result<(), String> {
-        crate::upgrade::recovery::require_ready(&self.daemon, &self.census)
+    fn require_ready(&self, ledger: Option<&mut Ledger>) -> Result<(), String> {
+        crate::upgrade::recovery::require_ready(&self.daemon, &self.census, ledger)
     }
 }
 
@@ -1291,6 +1527,7 @@ impl Survivors {
         target_daemon: &Path,
         verified_digest: Option<&str>,
         handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
+        mut ledger: Option<&mut Ledger>,
     ) -> Result<(), UpdateError> {
         self.successor_target = Some(target_daemon.to_owned());
         if !self.source_prepared {
@@ -1305,8 +1542,13 @@ impl Survivors {
         })?;
         if let Some(captured) = self.captured_preparation.take() {
             let receipt = match verified_digest {
-                Some(digest) => captured.receipt_with_digest(target_daemon, digest, handoff),
-                None => captured.receipt(target_daemon, handoff),
+                Some(digest) => captured.receipt_with_digest(
+                    target_daemon,
+                    digest,
+                    handoff,
+                    ledger.as_deref_mut(),
+                ),
+                None => captured.receipt(target_daemon, handoff, ledger.as_deref_mut()),
             };
             match receipt {
                 Ok(receipt) => {
@@ -1316,7 +1558,7 @@ impl Survivors {
                 Err(error) => self.recovery_capture_error = Some(error),
             }
         }
-        evidence.require_ready().map_err(|error| {
+        evidence.require_ready(ledger).map_err(|error| {
             invalid(match &self.recovery_capture_error {
                 Some(capture) => format!("{error}. Automatic recovery was refused: {capture}"),
                 None => error,
@@ -1362,6 +1604,20 @@ impl Survivors {
         Ok(())
     }
 
+    /// Bind this worker's sealed recovery receipt to the serving proof
+    /// authenticated by the installed target's ledger verifier.
+    pub(super) fn verify_ledger_successor(
+        &mut self,
+        serving: &crate::model::HostSessionProof,
+    ) -> Result<(), UpdateError> {
+        if let Some(receipt) = &self.receipt {
+            self.recovery_outcome =
+                Some(receipt.verify_ledger_successor(serving).map_err(invalid)?);
+        }
+        self.successor_serving = true;
+        Ok(())
+    }
+
     pub(super) fn release_recovery_reservation(&mut self) {
         if let Some(receipt) = &mut self.receipt {
             receipt.release_daemon_reservation();
@@ -1379,7 +1635,7 @@ impl Survivors {
             .prepared_source
             .as_ref()
             .ok_or_else(|| invalid("The acknowledged source has no captured preparation census"))?;
-        evidence.require_ready().map_err(invalid)
+        evidence.require_ready(None).map_err(invalid)
     }
 
     pub(super) fn paused_report(&self) -> String {

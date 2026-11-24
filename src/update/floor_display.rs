@@ -21,6 +21,8 @@ pub struct StopItem {
     pub kind: impact::SessionKind,
     pub label: String,
     pub identity: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interrupted_subagents: Vec<String>,
     pub running: String,
     pub recovery: String,
 }
@@ -36,8 +38,26 @@ pub struct StopList {
 }
 
 impl StopList {
-    /// Consent binds owners, source descriptors and recovery, never a count.
-    /// Working/idle text is display-only; foreground jobs are in the identity.
+    pub(super) fn covers(&self, observed: &Self) -> bool {
+        (observed.background_tasks == 0
+            || (self.background_tasks == observed.background_tasks
+                && self.background_identity == observed.background_identity))
+            && observed.items.iter().all(|current| {
+                self.items.iter().any(|accepted| {
+                    accepted.id == current.id
+                        && accepted.kind == current.kind
+                        && !accepted.identity.is_empty()
+                        && accepted.identity == current.identity
+                        && current
+                            .interrupted_subagents
+                            .iter()
+                            .all(|task| accepted.interrupted_subagents.contains(task))
+                })
+            })
+    }
+
+    /// The legacy decision echoes this token for the list sent with its nonce.
+    /// Re-observation uses the concrete owners and tasks in covers().
     pub fn digest(&self) -> String {
         let mut items: Vec<_> = self.items.iter().collect();
         items.sort_by_key(|item| (item.kind, item.id));
@@ -125,7 +145,8 @@ pub(super) fn chat_item_with_state(
         id: impact.id,
         kind: impact::SessionKind::NativeChat,
         label: label.into(),
-        identity: identity(&(&impact.identity, &impact.interrupted_subagents, chat)),
+        identity: identity(&(&impact.identity, chat)),
+        interrupted_subagents: impact.interrupted_subagents.clone(),
         running: format!(
             "{} chat, {state}{}",
             match chat.launch.provider {
@@ -155,6 +176,7 @@ pub(super) fn terminal_item(
         kind: impact::SessionKind::Terminal,
         label: label.into(),
         identity: identity(&(&impact.identity, &terminal.session, &foreground)),
+        interrupted_subagents: Vec::new(),
         running: foreground
             .map(|job| job.description)
             .unwrap_or_else(|| "terminal process unavailable".into()),
@@ -433,6 +455,7 @@ mod tests {
             kind,
             label: label.into(),
             identity: "reviewed owner".into(),
+            interrupted_subagents: Vec::new(),
             running: running.into(),
             recovery: recovery.into(),
         }
@@ -513,6 +536,24 @@ mod tests {
             read_stop_choice(&mut b"stop\n".as_slice(), false, &list).unwrap(),
             UpdateChoice::Cancel
         ));
+    }
+
+    #[test]
+    fn stopping_covers_only_the_accepted_owners_and_tasks() {
+        let mut accepted = representative();
+        accepted.items[0].interrupted_subagents = vec!["first".into(), "second".into()];
+        let mut observed = accepted.clone();
+        observed.items.truncate(1);
+        observed.items[0].label = "renamed pane".into();
+        observed.items[0].interrupted_subagents.remove(0);
+        assert!(accepted.covers(&observed));
+        observed.items[0]
+            .interrupted_subagents
+            .push("replacement".into());
+        assert!(!accepted.covers(&observed));
+        observed.items[0].interrupted_subagents.clear();
+        observed.items[0].identity = "replacement owner".into();
+        assert!(!accepted.covers(&observed));
     }
 
     #[test]

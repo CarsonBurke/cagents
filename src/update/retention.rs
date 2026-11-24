@@ -122,6 +122,9 @@ fn collect(root: &Root, current: Option<&str>, now: SystemTime) -> Result<(), Up
                 .map_err(|error| invalid(error.to_string()))?;
         }
     }
+    for job in &expired {
+        collect_ledger(root, job)?;
+    }
     // Make artifact removal durable before removing the proof needed to
     // retry it after a crash.
     fs_safety::sync_directory(root)?;
@@ -130,6 +133,42 @@ fn collect(root: &Root, current: Option<&str>, now: SystemTime) -> Result<(), Up
             .map_err(|error| invalid(error.to_string()))?;
     }
     fs_safety::sync_directory(root)?;
+    Ok(())
+}
+
+fn collect_ledger(root: &Root, job: &str) -> Result<(), UpdateError> {
+    let path = Path::new(job);
+    let metadata = match fs_safety::metadata_beneath(root, path) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && metadata.uid() == crate::daemon::current_uid()
+                && metadata.mode() & 0o077 == 0 =>
+        {
+            metadata
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.is_not_found() => return Ok(()),
+        Err(error) => return Err(invalid(error.to_string())),
+    };
+    let directory = fs_safety::open_directory_beneath(root, path)
+        .map_err(|error| invalid(error.to_string()))?;
+    let held = directory.metadata()?;
+    if (held.dev(), held.ino()) != (metadata.dev(), metadata.ino()) {
+        return Err(invalid("The update job directory changed during retention"));
+    }
+    if private_metadata(&directory, ledger::FILE_NAME)?.is_some() {
+        fs_safety::unlink_within(&directory, OsStr::new(ledger::FILE_NAME))
+            .map_err(|error| invalid(error.to_string()))?;
+    }
+    fs_safety::sync_directory(&directory)?;
+    if fs::read_dir(directory.process_path())?
+        .next()
+        .transpose()?
+        .is_none()
+    {
+        fs_safety::remove_directory_within(root, OsStr::new(job))
+            .map_err(|error| invalid(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -197,5 +236,42 @@ mod tests {
                 assert!(state.join(format!("{job}.{artifact}")).exists());
             }
         }
+    }
+
+    #[test]
+    fn collects_expired_ledgers_without_following_links_or_removing_unrecognized_files() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let root = Root::open(state).unwrap();
+        let expired = uuid::Uuid::new_v4().to_string();
+        let with_notes = uuid::Uuid::new_v4().to_string();
+        let current = uuid::Uuid::new_v4().to_string();
+        let unfinished = uuid::Uuid::new_v4().to_string();
+        let linked = uuid::Uuid::new_v4().to_string();
+        for job in [&expired, &with_notes, &current, &unfinished] {
+            let path = state.join(job);
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            private_create(&path.join(ledger::FILE_NAME)).unwrap();
+        }
+        let notes = state.join(&with_notes).join("notes");
+        private_create(&notes).unwrap();
+        std::os::unix::fs::symlink(state.join(&unfinished), state.join(&linked)).unwrap();
+        for job in [&expired, &with_notes, &current, &linked] {
+            remember_success(state, job, &UpdatePhase::Complete);
+        }
+
+        let now = SystemTime::now();
+        collect(&root, Some(&current), now).unwrap();
+        assert!(state.join(&expired).join(ledger::FILE_NAME).exists());
+        let expiry = now + KEEP + Duration::from_secs(1);
+        for _ in 0..2 {
+            collect(&root, Some(&current), expiry).unwrap();
+        }
+        assert!(!state.join(&expired).exists());
+        assert!(!state.join(&with_notes).join(ledger::FILE_NAME).exists());
+        assert!(notes.exists());
+        assert!(state.join(&current).join(ledger::FILE_NAME).is_file());
+        assert!(state.join(&unfinished).join(ledger::FILE_NAME).is_file());
+        assert!(state.join(&linked).is_symlink());
     }
 }

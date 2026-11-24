@@ -89,7 +89,6 @@ fn preparation(root: &Path) -> Preparation {
             job_request_hash: digest(request),
             reviewed: Some(reviewed),
             source,
-            expected: vec![(SessionKind::Terminal, terminal.id)],
             windows: Vec::new(),
             census: Census {
                 terminals: vec![terminal],
@@ -383,87 +382,87 @@ fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
 }
 
 #[test]
-fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
+fn acknowledged_prepare_binds_source_and_records_changed_or_missing_rows() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
+    let authority = &preparation.authority;
     let bytes = checkpoint(&preparation, "Prepared");
-    assert_eq!(
-        validate_checkpoint(&preparation.authority, &bytes).unwrap(),
-        "Prepared"
+    let reviewed = authority.reviewed.as_ref().unwrap();
+    let mut ledger = Ledger::new(
+        authority.job.clone(),
+        Some(authority.source.clone()),
+        "candidate".into(),
+        reviewed.policy,
     );
+    ledger.observe_impact(reviewed);
+    ledger.release();
+    let check = |bytes: &[u8], ledger: &mut Ledger| {
+        validate_checkpoint(&authority.source, &authority.census, bytes, Some(ledger))
+    };
+    assert_eq!(check(&bytes, &mut ledger).unwrap(), "Prepared");
     let mut foreign: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     foreign["proof"]["host_incarnation"] = "unrelated-daemon".into();
-    assert!(
-        validate_checkpoint(
-            &preparation.authority,
-            &serde_json::to_vec(&foreign).unwrap()
-        )
-        .is_err()
+    assert!(check(&serde_json::to_vec(&foreign).unwrap(), &mut ledger).is_err());
+    let mut omitted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    omitted["carried"] = serde_json::json!([]);
+    assert_eq!(
+        check(&serde_json::to_vec(&omitted).unwrap(), &mut ledger).unwrap(),
+        "Prepared"
     );
+    assert!(ledger.rows()[0].has_note(Stage::Release, Reason::CheckpointOmitted));
     let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     changed["carried"][0]["source"]["launch"]["arguments"] =
         serde_json::json!(["-c", "different writer"]);
-    assert!(
-        validate_checkpoint(
-            &preparation.authority,
-            &serde_json::to_vec(&changed).unwrap()
-        )
-        .is_err()
+    assert_eq!(
+        check(&serde_json::to_vec(&changed).unwrap(), &mut ledger).unwrap(),
+        "Prepared"
     );
-    changed["carried"] = serde_json::json!([]);
-    assert!(
-        validate_checkpoint(
-            &preparation.authority,
-            &serde_json::to_vec(&changed).unwrap()
-        )
-        .is_err()
+    assert_eq!(
+        ledger.rows()[0].disposition(),
+        Disposition::SetAside(Reason::CheckpointChanged)
     );
 }
 
 #[test]
 fn a_reviewed_conversation_whose_provider_ended_need_not_be_checkpointed() {
-    use crate::update::impact::{Disposition, PROVIDER_ENDED, SessionImpact};
+    use crate::update::impact::{Disposition as ImpactDisposition, SessionImpact};
     let root = crate::test_fixture::tempdir().unwrap();
-    let mut preparation = preparation(root.path());
-    let bytes = checkpoint(&preparation, "Prepared");
-    let chat = |reason: &str| SessionImpact {
-        id: TerminalId::new(),
+    let preparation = preparation(root.path());
+    let authority = &preparation.authority;
+    let mut reviewed = authority.reviewed.clone().unwrap();
+    let (source, snapshot, _, _) = scale_chat(&preparation, 1, 0, 0);
+    let mut capture = SnapshotCapture::default();
+    capture.push(source.clone(), snapshot).unwrap();
+    let mut census = authority.census.clone();
+    census.chats.push(source.clone());
+    census.snapshots = capture.finish();
+    let ended = SessionImpact {
+        id: source.id,
         kind: SessionKind::NativeChat,
         title: String::new(),
         identity: "ended-owner".into(),
-        disposition: Disposition::Resumes,
-        reason: reason.into(),
+        disposition: ImpactDisposition::Resumes,
+        reason: "Presentation text from the installed source".into(),
         interrupted_subagents: Vec::new(),
     };
-    let check = |preparation: &mut Preparation, row: SessionImpact| {
-        let mut reviewed = preparation.authority.reviewed.clone().unwrap();
-        reviewed.sessions.push(row);
-        preparation.authority.expected = checkpointed_owners(&reviewed);
-        validate_checkpoint(&preparation.authority, &bytes)
-    };
-    // The source skips a conversation with nothing left to carry; its
-    // window restarts the saved conversation.
-    assert_eq!(
-        check(&mut preparation, chat(PROVIDER_ENDED)).unwrap(),
-        "Prepared"
+    let key = Item::NativeChat(ended.id);
+    reviewed.sessions.push(ended);
+    let mut ledger = Ledger::new(
+        authority.job.clone(),
+        Some(authority.source.clone()),
+        "candidate".into(),
+        reviewed.policy,
     );
-    // Any other reviewed conversation must still be in the checkpoint.
+    ledger.observe_impact(&reviewed);
+    ledger.release();
+    let bytes = checkpoint(&preparation, "Ready");
     assert_eq!(
-        check(
-            &mut preparation,
-            chat("The saved conversation will reopen with a new provider process.")
-        )
-        .unwrap_err(),
-        "The acknowledged checkpoint omitted a reviewed source owner"
+        validate_checkpoint(&authority.source, &census, &bytes, Some(&mut ledger)).unwrap(),
+        "Ready"
     );
-    // Only a reopening conversation is exempt, not a terminal or an owner
-    // that carries or waits, whatever its reason says.
-    let mut terminal = chat(PROVIDER_ENDED);
-    terminal.kind = SessionKind::Terminal;
-    assert!(check(&mut preparation, terminal).is_err());
-    let mut continues = chat(PROVIDER_ENDED);
-    continues.disposition = Disposition::Continues;
-    assert!(check(&mut preparation, continues).is_err());
+    let row = ledger.rows().iter().find(|row| row.item() == &key).unwrap();
+    assert!(row.has_note(Stage::Release, Reason::CheckpointOmitted));
+    assert_eq!(row.disposition(), Disposition::Resume);
 }
 
 #[test]
@@ -828,10 +827,6 @@ fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issue
         };
         let mut issued = listed.clone();
         issued.launch.session_id = original_id;
-        preparation
-            .authority
-            .expected
-            .push((SessionKind::NativeChat, listed.id));
         preparation.authority.census.chats.push(listed.clone());
         let mut captured_page = SnapshotCapture::default();
         captured_page
@@ -856,32 +851,23 @@ fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issue
         checkpoint["phase"] = "Ready".into();
         assert_eq!(
             validate_checkpoint(
-                &captured.0.authority,
-                &serde_json::to_vec(&checkpoint).unwrap()
+                &captured.0.authority.source,
+                &captured.0.authority.census,
+                &serde_json::to_vec(&checkpoint).unwrap(),
+                None,
             )
             .unwrap(),
             "Ready"
         );
-        checkpoint["chats"][0]["launch"]["session_id"] = uuid::Uuid::new_v4().to_string().into();
-        assert!(
-            validate_checkpoint(
-                &captured.0.authority,
-                &serde_json::to_vec(&checkpoint).unwrap()
-            )
-            .is_err(),
-            "a different effective conversation is never recovery authority"
-        );
-        checkpoint["chats"][0]["launch"]["session_id"] = confirmed.into();
-        checkpoint["chats"][0]["launch"]["recipe"]["arguments"] =
-            serde_json::json!(["--different-provider-target"]);
-        assert!(
-            validate_checkpoint(
-                &captured.0.authority,
-                &serde_json::to_vec(&checkpoint).unwrap()
-            )
-            .is_err(),
-            "normalization cannot change any other launch option"
-        );
+        let mut indexed: CheckpointIndex = serde_json::from_value(checkpoint).unwrap();
+        let chat = &mut indexed.chats[0];
+        let census = &captured.0.authority.census;
+        assert!(census.matches_checkpoint_chat(&chat.source, &chat.launch));
+        chat.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(!census.matches_checkpoint_chat(&chat.source, &chat.launch));
+        chat.launch.session_id = Some(confirmed);
+        chat.launch.recipe.arguments = vec!["--different-provider-target".into()];
+        assert!(!census.matches_checkpoint_chat(&chat.source, &chat.launch));
     }
 }
 
@@ -1025,7 +1011,7 @@ fn scale_chat(
 
 /// `chats` chats captured as the update captures them, each page shaped
 /// by `page(index)` as (entries, bytes per entry). The reviewed impact
-/// and expected owners of `preparation` include every chat.
+/// of `preparation` includes every chat.
 fn scale_census(
     preparation: &mut Preparation,
     chats: usize,
@@ -1055,11 +1041,6 @@ fn scale_census(
     census.snapshots = captured.finish();
     let reviewed = preparation.authority.reviewed.as_mut().unwrap();
     reviewed.sessions.extend(sessions);
-    preparation.authority.expected = reviewed
-        .sessions
-        .iter()
-        .map(|item| (item.kind, item.id))
-        .collect();
     census
 }
 
@@ -1411,7 +1392,7 @@ fn a_changed_prepared_checkpoint_is_neither_reinterpreted_nor_modified() {
     save(&captured.0.authority.checkpoint_path, &changed);
     assert!(
         captured
-            .receipt(Path::new("/unused"), &handoff(root.path()))
+            .receipt(Path::new("/unused"), &handoff(root.path()), None)
             .is_err()
     );
     assert_eq!(
@@ -1433,7 +1414,7 @@ fn source_finishing_ready_keeps_normal_restore_and_preserves_checkpoint_bytes() 
     save(&captured.0.authority.checkpoint_path, &ready);
     assert!(
         captured
-            .receipt(Path::new("/unused"), &handoff(root.path()))
+            .receipt(Path::new("/unused"), &handoff(root.path()), None)
             .unwrap()
             .is_none()
     );
@@ -1473,10 +1454,9 @@ fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
     );
     let captured = preparation.acknowledged().unwrap();
     let handoff = handoff(root.path());
-    let mut receipt = captured
-        .receipt(&fs::canonicalize("/bin/sh").unwrap(), &handoff)
-        .unwrap()
-        .unwrap();
+    let target = root.path().join("cagentsd");
+    fs::copy("/bin/sh", &target).unwrap();
+    let mut receipt = captured.receipt(&target, &handoff, None).unwrap().unwrap();
     let path = descriptor_path(receipt.daemon.as_ref().unwrap()).unwrap();
     let probe = OpenOptions::new()
         .read(true)
@@ -2260,12 +2240,12 @@ fn settled_prepared_is_read_only_history_without_active_update_authority() {
         windows: authority.windows,
         source: authority.source,
         checkpoint_hash: digest(&checkpoint_bytes),
+        paused_terminals: vec![authority.census.terminals[0].id],
         census: authority.census,
         adopted_terminals: Vec::new(),
         adopted_chats: Vec::new(),
         adopted_chat_descriptors: Vec::new(),
         adopted_terminal_descriptors: Vec::new(),
-        paused_terminals: vec![authority.expected[0].1],
         paused_chats: Vec::new(),
         settled: true,
         successor: Some(successor),
@@ -2669,12 +2649,12 @@ fn settled_files() -> SettledFiles {
         windows: authority.windows,
         source: authority.source,
         checkpoint_hash: digest(&checkpoint_bytes),
+        paused_terminals: vec![authority.census.terminals[0].id],
         census: authority.census,
         adopted_terminals: Vec::new(),
         adopted_chats: Vec::new(),
         adopted_chat_descriptors: Vec::new(),
         adopted_terminal_descriptors: Vec::new(),
-        paused_terminals: vec![authority.expected[0].1],
         paused_chats: Vec::new(),
         settled: true,
         successor: Some(successor),
@@ -2712,6 +2692,54 @@ fn complete_files(files: &SettledFiles) {
             &[],
         )
         .unwrap();
+}
+
+#[test]
+fn settled_archival_preserves_evidence_without_claiming_current_inventory() {
+    let files = settled_files();
+    let recovered = pending_retirement(&files.checkpoint, &files.target)
+        .unwrap()
+        .unwrap();
+    let RetirementAcquisition::Acquired(guard) =
+        RetirementGuard::acquire(&files.checkpoint).unwrap()
+    else {
+        panic!("private retirement guard was busy");
+    };
+    let capture = capture_path(&files.checkpoint, &files.record.source).unwrap();
+    let captured = b"original recovery capture stays available";
+    save(&capture, captured);
+    let mut serving = files.record.successor.clone().unwrap();
+    serving.host_incarnation = HostIncarnation::new("later-successor");
+    let mut incomplete = serving.clone();
+    incomplete.host_incarnation = HostIncarnation::new("");
+    for invalid in [&files.record.source, &incomplete] {
+        assert!(recovered.archive_settled_with(&guard, invalid).is_err());
+        assert_eq!(fs::read(&files.checkpoint).unwrap(), files.checkpoint_bytes);
+    }
+    assert!(
+        recovered
+            .archive_completed_with(&guard, &serving, &[], &[], &[], &[])
+            .is_err(),
+        "no current inventory preservation was established"
+    );
+
+    recovered.archive_settled_with(&guard, &serving).unwrap();
+    let proof = archived_proof(&files.checkpoint, &files.target)
+        .unwrap()
+        .unwrap();
+    assert!(!files.checkpoint.exists());
+    assert_eq!(
+        fs::read(&proof.archive_path).unwrap(),
+        files.checkpoint_bytes
+    );
+    assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+    assert_eq!(fs::read(&capture).unwrap(), captured);
+    let pointer = fs::read(files.checkpoint.with_file_name(ACTIVE_RECOVERY)).unwrap();
+    recovered.archive_settled_with(&guard, &serving).unwrap();
+    assert_eq!(
+        fs::read(files.checkpoint.with_file_name(ACTIVE_RECOVERY)).unwrap(),
+        pointer
+    );
 }
 
 #[test]
@@ -3590,7 +3618,7 @@ mod forwarding_tests {
             let mut receipt = preparation
                 .acknowledged()
                 .unwrap()
-                .receipt(&case.join("bin/cagentsd"), &lease)
+                .receipt(&case.join("bin/cagentsd"), &lease, None)
                 .unwrap()
                 .unwrap();
             if mode == "bad-hash" {

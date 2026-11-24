@@ -18,10 +18,13 @@ struct FakeSource {
     events: Arc<Mutex<Vec<String>>>,
     observations: Arc<AtomicUsize>,
     settled: Arc<AtomicBool>,
+    ending_when_settled: Option<TerminalId>,
+    windows_resumed: bool,
     records: Arc<Mutex<Vec<Record>>>,
     outcomes: VecDeque<ShutdownOutcome>,
     prepare_refusals: usize,
     prepare_busy: bool,
+    prepare_busy_attempts: usize,
     shutdown_busy: bool,
     lose_prepare_ack: bool,
     predicted_service: bool,
@@ -30,6 +33,7 @@ struct FakeSource {
     close_attempts: usize,
     fail_close_at: Option<usize>,
     change_on_first_close: bool,
+    working_after_close: Option<TerminalId>,
     retain_attempts: usize,
     fail_retain_at: Option<usize>,
     fail_stopped: bool,
@@ -75,6 +79,24 @@ impl FloorSource for FakeSource {
     fn observe(&mut self) -> Result<impact::Preview, UpdateError> {
         self.observations.fetch_add(1, Ordering::Release);
         if self.settled.load(Ordering::Acquire) {
+            if let Some(ended) = self.ending_when_settled.take() {
+                self.inventory.chats.retain(|chat| chat.id != ended);
+                self.preview
+                    .daemon
+                    .as_mut()
+                    .unwrap()
+                    .sessions
+                    .retain_mut(|item| {
+                        if item.id != ended {
+                            return true;
+                        }
+                        if item.kind == impact::SessionKind::Terminal {
+                            item.disposition = impact::Disposition::Continues;
+                            return true;
+                        }
+                        false
+                    });
+            }
             for item in &mut self.preview.daemon.as_mut().unwrap().sessions {
                 if item.disposition == impact::Disposition::WaitsForIdle {
                     item.disposition = impact::Disposition::Resumes;
@@ -86,6 +108,13 @@ impl FloorSource for FakeSource {
     fn observe_policy(&mut self, policy: impact::Policy) -> Result<impact::Preview, UpdateError> {
         let daemon = self.preview.daemon.as_mut().unwrap();
         daemon.policy = policy;
+        if policy == impact::Policy::WhenIdle
+            && let Some(id) = self.working_after_close
+            && let Some(item) = daemon.sessions.iter_mut().find(|item| item.id == id)
+            && item.disposition == impact::Disposition::Interrupted
+        {
+            item.disposition = impact::Disposition::WaitsForIdle;
+        }
         if policy == impact::Policy::Interrupt && needs_service_stop(daemon) {
             for session in &mut daemon.sessions {
                 if session.disposition == impact::Disposition::WaitsForIdle {
@@ -95,6 +124,18 @@ impl FloorSource for FakeSource {
             }
         }
         self.observe()
+    }
+    fn resume_windows_for_review(&mut self) -> Result<(), UpdateError> {
+        self.event("resume prepared windows");
+        self.windows_resumed = true;
+        Ok(())
+    }
+    fn prepare_windows_after_review(&mut self) -> Result<(), UpdateError> {
+        if self.windows_resumed {
+            self.event("save prepared windows");
+            self.windows_resumed = false;
+        }
+        Ok(())
     }
     fn inventory(&mut self, _: &impact::DaemonImpact, _: bool) -> Result<Inventory, UpdateError> {
         if self.fail_inventory {
@@ -124,7 +165,8 @@ impl FloorSource for FakeSource {
                 "connection closed",
             )));
         }
-        if self.prepare_busy {
+        if self.prepare_busy || self.prepare_busy_attempts > 0 {
+            self.prepare_busy_attempts = self.prepare_busy_attempts.saturating_sub(1);
             self.event("PrepareConfirmedUpgrade busy");
             return Err(source::PrepareError::Busy(invalid(
                 "The source daemon stayed busy; nothing was stopped",
@@ -220,6 +262,11 @@ impl FloorSource for FakeSource {
         let daemon = self.preview.daemon.as_mut().unwrap();
         daemon.sessions.retain(|item| item.id != chat.id);
         daemon.capability.inventory_generation += 1;
+        if let Some(id) = self.working_after_close
+            && let Some(item) = daemon.sessions.iter_mut().find(|item| item.id == id)
+        {
+            item.disposition = impact::Disposition::Interrupted;
+        }
         if let Some(state) = &self.cancel_after_close {
             let job: UpdateJob = serde_json::from_slice(&fs::read(state.join("status.json"))?)?;
             assert!(!confirmation::cancel_at(state, &job.id)?);
@@ -422,10 +469,13 @@ fn fixture() -> FakeSource {
         events: Arc::new(Mutex::new(Vec::new())),
         observations: Arc::new(AtomicUsize::new(0)),
         settled: Arc::new(AtomicBool::new(false)),
+        ending_when_settled: None,
+        windows_resumed: false,
         records: Arc::new(Mutex::new(Vec::new())),
         outcomes: VecDeque::new(),
         prepare_refusals: 1,
         prepare_busy: false,
+        prepare_busy_attempts: 0,
         shutdown_busy: false,
         lose_prepare_ack: false,
         predicted_service: false,
@@ -434,6 +484,7 @@ fn fixture() -> FakeSource {
         close_attempts: 0,
         fail_close_at: None,
         change_on_first_close: false,
+        working_after_close: None,
         retain_attempts: 0,
         fail_retain_at: None,
         fail_stopped: false,
@@ -546,7 +597,7 @@ fn interrupted_unblocked_source_waits_for_provider_and_inactive_run_before_prepa
     source.interrupt_polls = 2;
     let preview = source.preview.clone();
     assert!(!preview.daemon.as_ref().unwrap().blocked());
-    quiesce_source(path, &mut job(path), &preview, true, &mut source).unwrap();
+    quiesce_source(path, &mut job(path), &preview, true, &mut source, None).unwrap();
     let events = source.events.lock().unwrap();
     let confirmed = events
         .iter()
@@ -580,7 +631,7 @@ fn lost_prepare_ack_does_not_reach_stop_review_or_automatic_recovery() {
     source.lose_prepare_ack = true;
     let preview = source.preview.clone();
     let mut current_job = job(path);
-    let error = quiesce_source(path, &mut current_job, &preview, true, &mut source)
+    let error = quiesce_source(path, &mut current_job, &preview, true, &mut source, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("preparation was not confirmed"), "{error}");
@@ -892,25 +943,21 @@ fn unconfirmed_interrupt_times_out_before_prepare_and_keeps_panes_running() {
 }
 
 #[test]
-fn changed_owner_after_interrupt_never_prepares_or_stops_service() {
+fn a_new_incarnation_after_confirmed_interruption_can_prepare() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
     let (mut source, _) = interrupt_fixture();
     source.change_after_interrupt = true;
     let preview = source.preview.clone();
-    let error = quiesce_source(path, &mut job(path), &preview, true, &mut source)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("Conversations changed"), "{error}");
+    quiesce_source(path, &mut job(path), &preview, true, &mut source, None).unwrap();
     assert!(
-        !source
+        source
             .events
             .lock()
             .unwrap()
             .iter()
-            .any(|event| event.contains("Prepare") || event.contains("shutdown"))
+            .any(|event| event == "PrepareConfirmedUpgrade accepted")
     );
-    source.assert_running_panes_are_unmarked();
 }
 
 #[test]
@@ -921,7 +968,8 @@ fn interrupt_settlement_remains_cancellable_before_prepare() {
     source.never_confirm_interrupts = true;
     source.cancel_on_interrupt = Some(path.into());
     let preview = source.preview.clone();
-    let error = quiesce_source(path, &mut job(path), &preview, true, &mut source).unwrap_err();
+    let error =
+        quiesce_source(path, &mut job(path), &preview, true, &mut source, None).unwrap_err();
     assert!(matches!(error, UpdateError::Cancelled));
     assert!(
         !source
@@ -1024,7 +1072,14 @@ fn spawn_source(
     let path = directory.to_owned();
     thread::spawn(move || {
         let preview = source.preview.clone();
-        let result = quiesce_source(&path, &mut job(&path), &preview, terminal, &mut source);
+        let result = quiesce_source(
+            &path,
+            &mut job(&path),
+            &preview,
+            terminal,
+            &mut source,
+            None,
+        );
         (result, source)
     })
 }
@@ -1092,6 +1147,7 @@ fn survivor_report_finds_late_reparented_scope_and_origin_members_without_shared
             kind: impact::SessionKind::Terminal,
             label: "build".into(),
             identity: "reviewed".into(),
+            interrupted_subagents: Vec::new(),
             running: "terminal session".into(),
             recovery: "Restart".into(),
         }],
@@ -1670,7 +1726,7 @@ fn cancel_at_ordinary_review_wait_policy_review_or_stop_ends_nothing() {
                 .map(|_| ())
             } else {
                 let preview = source.preview.clone();
-                quiesce_source(&path, &mut current_job, &preview, true, &mut source)
+                quiesce_source(&path, &mut current_job, &preview, true, &mut source, None)
             };
             (result, source)
         });
@@ -1986,6 +2042,243 @@ fn changed_stop_list_after_consent_requires_a_new_list_before_any_action() {
 }
 
 #[test]
+fn a_ledger_update_retries_an_acknowledged_busy_prepare_without_stopping_work() {
+    for terminal in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = fixture();
+        source.prepare_refusals = 0;
+        source.prepare_busy_attempts = 1;
+        let preview = source.preview.clone();
+        let mut ledger = Ledger::new(
+            "job".into(),
+            preview
+                .daemon
+                .as_ref()
+                .map(|daemon| daemon.capability.proof.clone()),
+            preview.candidate.version.clone(),
+            impact::Policy::WhenIdle,
+        );
+        ledger.observe_preview(&preview);
+        ledger.freeze();
+        quiesce_source(
+            directory.path(),
+            &mut job(directory.path()),
+            &preview,
+            terminal,
+            &mut source,
+            Some(&mut ledger),
+        )
+        .unwrap();
+        let events = source.events.lock().unwrap();
+        let busy = events
+            .iter()
+            .position(|event| event == "PrepareConfirmedUpgrade busy")
+            .unwrap();
+        let resumed = events
+            .iter()
+            .position(|event| event == "resume prepared windows")
+            .unwrap();
+        let saved = events
+            .iter()
+            .position(|event| event == "save prepared windows")
+            .unwrap();
+        let prepared = events
+            .iter()
+            .position(|event| event == "PrepareConfirmedUpgrade accepted")
+            .unwrap();
+        assert!(busy < resumed && resumed < saved && saved < prepared);
+        assert_eq!(source.close_attempts, 0);
+        assert_eq!(source.retain_attempts, 0);
+        assert!(!events.iter().any(|event| event == "ShutdownV1 Confirm"));
+        assert!(
+            !ledger
+                .rows()
+                .iter()
+                .any(|row| matches!(row.outcome(), Some(super::super::ledger::Outcome::Ended)))
+        );
+    }
+}
+
+#[test]
+fn a_ledger_update_finishes_waiting_after_an_accepted_end_without_more_destructive_consent() {
+    for new_turn in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = fixture();
+        source.prepare_refusals = 0;
+        source.prepare_busy_attempts = 1;
+        let ending = add_chat(&mut source, impact::Disposition::Blocked, true);
+        let ongoing = add_chat(&mut source, impact::Disposition::Resumes, true);
+        if new_turn {
+            source.working_after_close = Some(ongoing);
+        }
+        let settled = source.settled.clone();
+        let path = directory.path().to_owned();
+        let worker = thread::spawn(move || {
+            let preview = source.preview.clone();
+            let mut ledger = Ledger::new(
+                "job".into(),
+                preview
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| daemon.capability.proof.clone()),
+                preview.candidate.version.clone(),
+                impact::Policy::WhenIdle,
+            );
+            ledger.observe_preview(&preview);
+            ledger.freeze();
+            let result = quiesce_source(
+                &path,
+                &mut job(&path),
+                &preview,
+                true,
+                &mut source,
+                Some(&mut ledger),
+            );
+            assert_eq!(
+                ledger
+                    .rows()
+                    .iter()
+                    .filter(|row| matches!(
+                        row.outcome(),
+                        Some(super::super::ledger::Outcome::Ended)
+                    ))
+                    .count(),
+                1,
+            );
+            assert!(
+                ledger
+                    .rows()
+                    .iter()
+                    .any(|row| row.item() == &Item::NativeChat(ending)
+                        && matches!(row.outcome(), Some(super::super::ledger::Outcome::Ended)))
+            );
+            (result, source)
+        });
+        let first = await_stop(directory.path());
+        confirm_stop(directory.path(), &first);
+        if new_turn {
+            let waiting = await_prompt(directory.path(), |confirmation| {
+                confirmation.stop.is_none()
+                    && confirmation.preview.daemon.as_ref().is_some_and(|daemon| {
+                        daemon.sessions.iter().any(|item| {
+                            item.id == ongoing
+                                && item.disposition == impact::Disposition::WaitsForIdle
+                        })
+                    })
+            });
+            assert_eq!(waiting.phase, UpdatePhase::WaitingForIdle);
+            assert!(!worker.is_finished());
+            settled.store(true, Ordering::Release);
+        }
+        let (result, source) = finish(worker);
+        result.unwrap();
+        assert_eq!(source.close_attempts, 1);
+        assert_eq!(source.retain_attempts, 1);
+        assert_eq!(source.inventory.chats.len(), 1);
+        assert_eq!(source.inventory.chats[0].id, ongoing);
+        let events = source.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_str() == "PrepareConfirmedUpgrade busy")
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event == "ShutdownV1 Confirm" || event.starts_with("Interrupt"))
+        );
+    }
+}
+
+#[test]
+fn a_window_update_waits_for_new_loss_with_usable_windows_then_saves_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = fixture();
+    source.prepare_refusals = 0;
+    let terminal = source.preview.daemon.as_ref().unwrap().sessions[0].id;
+    source.preview.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Blocked;
+    add_chat(&mut source, impact::Disposition::Resumes, true);
+    source.ending_when_settled = Some(terminal);
+    let settled = source.settled.clone();
+    let events = source.events.clone();
+    let path = directory.path().to_owned();
+    let worker = thread::spawn(move || {
+        let preview = source.preview.clone();
+        let mut ledger = Ledger::new(
+            "job".into(),
+            preview
+                .daemon
+                .as_ref()
+                .map(|daemon| daemon.capability.proof.clone()),
+            preview.candidate.version.clone(),
+            impact::Policy::WhenIdle,
+        );
+        ledger.observe_preview(&preview);
+        ledger.freeze();
+        let result = quiesce_source(
+            &path,
+            &mut job(&path),
+            &preview,
+            false,
+            &mut source,
+            Some(&mut ledger),
+        );
+        assert!(
+            !ledger
+                .rows()
+                .iter()
+                .any(|row| matches!(row.outcome(), Some(super::super::ledger::Outcome::Ended)))
+        );
+        (result, source)
+    });
+    let waiting = await_prompt(directory.path(), |confirmation| {
+        confirmation.stop.is_none() && confirmation.expires_at_unix_ms == u64::MAX
+    });
+    assert_eq!(waiting.phase, UpdatePhase::WaitingForIdle);
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "resume prepared windows")
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "save prepared windows")
+    );
+    assert!(!worker.is_finished());
+    settled.store(true, Ordering::Release);
+    let (result, source) = finish(worker);
+    result.unwrap();
+    assert_eq!(source.close_attempts, 0);
+    assert_eq!(source.retain_attempts, 0);
+    assert!(
+        source
+            .inventory
+            .terminals
+            .iter()
+            .any(|item| item.session.id == terminal)
+    );
+    assert_eq!(source.inventory.chats.len(), 1);
+    let events = events.lock().unwrap();
+    let saved = events
+        .iter()
+        .position(|event| event == "save prepared windows")
+        .unwrap();
+    let prepared = events
+        .iter()
+        .position(|event| event == "PrepareConfirmedUpgrade accepted")
+        .unwrap();
+    assert!(saved < prepared);
+    assert!(!events.iter().any(|event| event == "ShutdownV1 Confirm"));
+}
+
+#[test]
 fn stop_review_keeps_consent_when_only_chat_activity_changes() {
     let directory = tempfile::tempdir().unwrap();
     let mut source = fixture();
@@ -1995,7 +2288,7 @@ fn stop_review_keeps_consent_when_only_chat_activity_changes() {
     let path = directory.path().to_owned();
     let worker = thread::spawn(move || {
         let mut current_job = job(&path);
-        confirmation::wait_stop(&path, &mut current_job, true, || {
+        confirmation::wait_stop(&path, &mut current_job, true, None, || {
             if change.load(Ordering::Acquire) {
                 source
                     .preview
@@ -2099,6 +2392,7 @@ fn ordinary_prepare_reads_no_floor_inventory() {
         &preview,
         true,
         &mut source,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -2120,7 +2414,7 @@ fn preexisting_checkpoint_refuses_before_prepare_or_destructive_fallback() {
     source.existing_checkpoint = true;
     let preview = source.preview.clone();
     let mut current = job(path);
-    let error = quiesce_source(path, &mut current, &preview, true, &mut source)
+    let error = quiesce_source(path, &mut current, &preview, true, &mut source, None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("checkpoint already exists"), "{error}");
@@ -2385,6 +2679,17 @@ fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
         source.preview.daemon.as_mut().unwrap().sessions[0].disposition =
             impact::Disposition::Blocked;
         let working = add_chat(&mut source, impact::Disposition::WaitsForIdle, false);
+        source
+            .preview
+            .daemon
+            .as_mut()
+            .unwrap()
+            .sessions
+            .iter_mut()
+            .find(|item| item.id == working)
+            .unwrap()
+            .interrupted_subagents
+            .push("reviewed-background-task".into());
         let idle = add_chat(&mut source, impact::Disposition::Resumes, true);
         for (id, title) in [
             (
@@ -2404,7 +2709,7 @@ fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
                 let reviewed = confirmation::wait(&path, &mut worker_job, true, |policy| {
                     source.observe_policy(policy)
                 })?;
-                quiesce_source(&path, &mut worker_job, &reviewed, true, &mut source)
+                quiesce_source(&path, &mut worker_job, &reviewed, true, &mut source, None)
             })();
             worker_job.phase = if result.is_ok() {
                 UpdatePhase::Complete

@@ -341,7 +341,7 @@ pub fn render_review(preview: &Preview) -> String {
 }
 
 /// The expected result of choosing `i`, used only to explain a renewed review.
-/// Actual authorization remains with the worker's exact ownership comparison.
+/// The worker authorizes each interruption for its observed owner and tasks.
 pub(super) fn interruption_review(preview: &Preview) -> Preview {
     let mut selected = preview.clone();
     if let Some(daemon) = &mut selected.daemon {
@@ -1256,48 +1256,6 @@ mod tests {
             review.contains("Close this conversation before updating"),
             "{review}"
         );
-    }
-
-    #[test]
-    fn native_session_content_stays_part_of_consent_when_cli_uses_a_saved_label() {
-        let mut preview = preview();
-        let live = session(
-            "native title",
-            Disposition::Blocked,
-            "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
-        );
-        preview.labels.names.insert(live.id, "saved label".into());
-        preview.daemon.as_mut().unwrap().sessions.push(live);
-        let mut changed = preview.clone();
-        changed.daemon.as_mut().unwrap().sessions[0].title = "changed native title".into();
-        assert_eq!(render_review(&preview), render_review(&changed));
-        assert!(!preview.preserves_consent(&changed));
-        changed = preview.clone();
-        changed.daemon.as_mut().unwrap().sessions[0].reason =
-            super::super::impact::STOPPED_WITH_UNSETTLED_WORK.into();
-        assert!(!preview.preserves_consent(&changed));
-    }
-
-    #[test]
-    fn capability_renewal_keeps_consent_but_context_and_recovery_changes_do_not() {
-        let preview = representative();
-        let mut changed = preview.clone();
-        let capability = &mut changed.daemon.as_mut().unwrap().capability;
-        capability.token = "renewed".into();
-        capability.expires_at_unix_ms += 100;
-        assert!(preview.preserves_consent(&changed));
-        changed = preview.clone();
-        changed.from_version = "different source version".into();
-        assert!(!preview.preserves_consent(&changed));
-        changed = preview.clone();
-        changed.windows += 1;
-        assert!(!preview.preserves_consent(&changed));
-        changed = preview.clone();
-        changed.stopped[0].recovery = "Use a different recovery control".into();
-        assert!(!preview.preserves_consent(&changed));
-        changed = preview.clone();
-        changed.stopped_windows[0].recovery = "Recover this window separately".into();
-        assert!(!preview.preserves_consent(&changed));
     }
 
     #[test]

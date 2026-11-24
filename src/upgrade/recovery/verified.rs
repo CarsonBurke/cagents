@@ -145,6 +145,7 @@ impl VerifiedView {
         target: &Path,
         terminals: &[TerminalDescriptor],
         chats: &[Session],
+        strict_inventory: bool,
     ) -> Result<Option<Self>, String> {
         let Some(store) = super::super::handoff::Store::existing()? else {
             return Ok(None);
@@ -156,6 +157,7 @@ impl VerifiedView {
             target,
             terminals,
             chats,
+            strict_inventory,
             Retention::load,
         )
     }
@@ -167,6 +169,7 @@ impl VerifiedView {
         target: &Path,
         terminals: &[TerminalDescriptor],
         chats: &[Session],
+        strict_inventory: bool,
         read_retention: impl FnOnce(&HostSessionProof) -> Result<Retention, String>,
     ) -> Result<Option<Self>, String> {
         let settled = match expected_source {
@@ -214,6 +217,7 @@ impl VerifiedView {
             record_serving,
             record_terminals,
             record_chats,
+            strict_inventory,
         )?;
         if checkpoint_bytes(checkpoint_path, target, &settled)? != bytes {
             return Err(
@@ -591,7 +595,7 @@ pub(super) mod tests {
         pub(super) fn archive(&self) -> ArchiveProof {
             let current = self.record.adopted_chat_descriptors.clone();
             let view = self.load(&current).unwrap().unwrap();
-            let outcome = crate::update::recovery::compare_with_recovery(
+            let outcome = crate::update::recovery::compare_partition(
                 &root_census(self),
                 &proof("successor"),
                 &self.record.adopted_terminal_descriptors,
@@ -602,7 +606,7 @@ pub(super) mod tests {
             );
             assert!(matches!(
                 outcome,
-                crate::update::recovery::Outcome::Usable { .. }
+                Ok(crate::update::recovery::Outcome::Usable { .. })
             ));
             let settled = pending_retirement(&self.checkpoint, &self.target)
                 .unwrap()
@@ -633,6 +637,7 @@ pub(super) mod tests {
                 &self.target,
                 terminals,
                 chats,
+                true,
                 |_| Ok(self.retained.clone()),
             )
         }
@@ -650,6 +655,7 @@ pub(super) mod tests {
                 &self.target,
                 terminals,
                 chats,
+                true,
                 |_| Ok(self.retained.clone()),
             )
         }
@@ -822,7 +828,7 @@ pub(super) mod tests {
             .unwrap();
         assert!(view.proves_chat(&fixture.source, &fixture.current));
         assert!(view.paused_chat(&fixture.record.census.chats[1]));
-        let outcome = crate::update::recovery::compare_with_recovery(
+        let outcome = crate::update::recovery::compare_partition(
             &root_census(&fixture),
             &proof("successor"),
             &fixture.record.adopted_terminal_descriptors,
@@ -833,8 +839,8 @@ pub(super) mod tests {
         );
         assert!(matches!(
             outcome,
-            crate::update::recovery::Outcome::Usable { terminals: 1, chats: 1, paused_chats, .. }
-                if paused_chats == fixture.record.paused_chats
+            Ok(crate::update::recovery::Outcome::Usable { terminals: 1, chats: 1, paused_chats, .. }
+               ) if paused_chats == fixture.record.paused_chats
         ));
     }
 
@@ -946,9 +952,16 @@ pub(super) mod tests {
         assert!(!view.paused_chat(&paused));
         assert!(view.proves_chat(&fixture.source, &fixture.current));
         assert!(
-            matches!(crate::update::recovery::compare_with_recovery(&root_census(&fixture), &proof("successor"), &fixture.record.adopted_terminal_descriptors,
-            &[fixture.current.clone()], &Default::default(), Some(&view), None),
-            crate::update::recovery::Outcome::Unverified { serving:Some(_), surviving_terminals:1, missing, .. } if missing.contains(&paused.id))
+            crate::update::recovery::compare_partition(
+                &root_census(&fixture),
+                &proof("successor"),
+                &fixture.record.adopted_terminal_descriptors,
+                &[fixture.current.clone()],
+                &Default::default(),
+                Some(&view),
+                None
+            )
+            .is_err()
         );
         assert_eq!(
             fs::read(
@@ -991,9 +1004,16 @@ pub(super) mod tests {
         let view = fixture.load(&[fixture.current.clone()]).unwrap().unwrap();
         assert!(!view.paused_terminal(&terminal));
         assert!(
-            matches!(crate::update::recovery::compare_with_recovery(&root_census(&fixture), &proof("successor"), &[],
-            &[fixture.current.clone()], &Default::default(), Some(&view), None),
-            crate::update::recovery::Outcome::Unverified { missing, .. } if missing.contains(&terminal.id))
+            crate::update::recovery::compare_partition(
+                &root_census(&fixture),
+                &proof("successor"),
+                &[],
+                &[fixture.current.clone()],
+                &Default::default(),
+                Some(&view),
+                None
+            )
+            .is_err()
         );
     }
 
@@ -1053,8 +1073,9 @@ pub(super) mod tests {
             "matching A still needs strict actual evidence"
         );
         assert!(
-            matches!(crate::update::recovery::compare_with_recovery(&expected, &serving, &[terminal], &[current], &own_lineage, unrelated.as_ref(), None),
-            crate::update::recovery::Outcome::Usable { terminals:1,chats:1,paused_chats,.. } if paused_chats.is_empty())
+            matches!(crate::update::recovery::compare_partition(&expected, &serving, &[terminal], &[current], &own_lineage, unrelated.as_ref(), None),
+                Ok(crate::update::recovery::Outcome::Usable { terminals:1,chats:1,paused_chats,.. }) if paused_chats.is_empty()
+            )
         );
     }
 }
