@@ -140,7 +140,7 @@ impl RequestRaceFixture {
     }
 
     pub fn with_input_failure(fail_after_input: bool) -> Self {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
         std::fs::create_dir(&home).unwrap();
