@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 """Squash-merge a reviewed pull request once its CI is green.
 
-  scripts/land-pr PR [-R OWNER/REPO] [--update] [--dry-run] [--timeout MINUTES]
+  scripts/land-pr PR [-R OWNER/REPO] [--update] [--dry-run] [--allow-restore]
+                  [--timeout MINUTES]
 
 The merge is pinned to the head CI passed on, and the merge with the current
 main must also pass scripts/check-older-clients. Its message is built from the
@@ -9,7 +10,11 @@ PR's commit messages with AI attribution removed; the landing is refused if
 attribution remains. The branch is brought up to date with main only when
 GitHub reports a conflict that Git merges cleanly, or with --update when its CI
 is stale against a change it depends on: by a merge commit made without
-touching any checkout and a plain push, never a rebase or force-push. CI is
+touching any checkout and a plain push, never a rebase or force-push. A PR
+that would put back a file's content from main's recent history, or delete a
+file main recently added, is refused unless --allow-restore says the revert is
+intended: that is what a branch squashed or copied from a stale snapshot does
+to everything main changed since. CI is
 read through scripts/gh-pr-status, whose shared cache allows one GitHub read
 per PR every two minutes.
 
@@ -29,6 +34,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +47,8 @@ BASE = "main"
 REFRESH = 120  # gh-pr-status shares one read per PR in this interval.
 MINIMUM_WAIT = 15
 SYNC_ROUNDS = 3
+# How far back in main's history a PR's content counts as a restore.
+RESTORE_WINDOW = 300
 CONFLICT, HEAD_MOVED, REFUSED, CI_FAILED, TIMED_OUT = 3, 4, 5, 6, 7
 # Variables that would point git at another repository than the one asked for.
 GIT_LOCATION = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
@@ -245,6 +253,106 @@ def landing_lock(root, repository, number):
         except BlockingIOError:
             raise Stop(REFUSED, f"another landing of #{number} is running") from None
         yield
+
+
+# ---- Reverted work -----------------------------------------------------------
+
+def restorations(root, head):
+    """What HEAD's squash would undo of main's last RESTORE_WINDOW commits.
+
+    A branch whose tree came from an older main, through a soft reset onto a
+    moved ref or copied files, undoes everything main changed since, however
+    its commits are arranged. Each path the squash changes is checked against
+    its own history on main in that window. Undone are:
+
+    - content main has since replaced coming back;
+    - a change main made that the base has and HEAD lacks, though HEAD also
+      edited the file, as when the PR's own edits sit on the older copy;
+    - a file main added deleted, when that wholly undoes the commit that added
+      it. Removing a recent file is otherwise routine.
+
+    Content from before the window is not considered.
+    """
+    base = git(root, "merge-base", f"refs/remotes/origin/{BASE}", head).stdout.strip()
+    recent = git(root, "rev-list", f"--max-count={RESTORE_WINDOW + 1}", base).stdout.split()
+    span = [f"{recent[-1]}..{base}"] if len(recent) > RESTORE_WINDOW else [base]
+    # A moved file is not a deleted one; its new path is checked as any other.
+    fields = iter(git(root, "diff", "--find-renames", "--name-status", "-z", base, head).stdout.split("\0"))
+    changed = [(status[0], next(fields) if status[0] in "RC" else None, next(fields))
+               for status in fields if status]
+    found, undone, deletions = [], set(), []
+    for status, _, path in changed:
+        blob = None if status == "D" else git(root, "rev-parse", f"{head}:{path}").stdout.strip()
+        log = git(root, "--literal-pathspecs", "log", "--no-renames", "--raw", "--no-abbrev",
+                  "--format=%x01%H %s", *span, "--", path).stdout
+        history = []
+        for entry in log.split("\1")[1:]:
+            title, *lines = entry.strip("\n").split("\n")
+            commit, _, subject = title.partition(" ")
+            # ":old-mode new-mode old-blob new-blob status\tpath"
+            history.append((commit, subject, [line.split("\t", 1)[0].split()
+                                              for line in lines if line.startswith(":")]))
+        for commit, subject, changes in history:
+            if blob and any(change[2] == blob for change in changes):
+                found.append(f"{path} returns to its content before {commit[:12]} ({subject})")
+                undone.add(path)
+                break
+            if not blob and any(change[4] == "A" for change in changes):
+                deletions.append((path, commit, subject))
+                undone.add(path)
+                break
+        else:
+            # Only a file the base has can hold a change the base made.
+            if status == "M" and history:
+                missing = lacks_change(root, base, head, path, history)
+                if missing:
+                    commit, subject = missing
+                    found.append(f"{path} lacks {commit[:12]}'s change ({subject})")
+                    undone.add(path)
+    for path, commit, subject in deletions:
+        touched = git(root, "--literal-pathspecs", "show", "--no-renames", "--name-only", "--format=",
+                      commit).stdout.splitlines()
+        if set(touched) <= undone:
+            found.append(f"{path} is deleted, undoing {commit[:12]} ({subject}), which added it")
+    return found
+
+
+def lacks_change(root, base, head, path, history):
+    """The newest commit in HISTORY whose change to PATH BASE has and HEAD lacks.
+
+    Its patch must apply to HEAD's file and not to the base's: a change a later
+    commit took out again applies to both and is not missing.
+    """
+    with tempfile.TemporaryDirectory(prefix="land-pr-") as directory:
+        trees = {}
+        # Each copy is a plain directory: apply checks it, not some repository above it.
+        outside = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION}
+        outside["GIT_CEILING_DIRECTORIES"] = directory
+        for name, revision in (("head", head), ("base", base)):
+            copy = Path(directory, name, path)
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{revision}:{path}"],
+                                            capture_output=True, check=True).stdout)
+            trees[name] = copy.parents[len(Path(path).parts) - 1]
+        for commit, subject, changes in history:
+            if len(changes) != 1 or changes[0][4] != "M":
+                continue
+            patch = git(root, "--literal-pathspecs", "diff", "--no-renames", f"{commit}^", commit,
+                        "--", path).stdout
+            applies = {name: subprocess.run(["git", "apply", "--check", "-"], cwd=tree, input=patch,
+                                            capture_output=True, text=True, env=outside).returncode == 0
+                       for name, tree in trees.items()}
+            if applies["head"] and not applies["base"]:
+                return commit, subject
+    return None
+
+
+def check_restorations(root, number, head):
+    found = restorations(root, head)
+    if found:
+        raise Stop(REFUSED, f"#{number} would undo work already on {BASE}, as a branch built from an "
+                   f"older {BASE} does: {listing(found, 6)}. Check `git diff --stat origin/{BASE}...HEAD` "
+                   "lists only your files and push the fix, or pass --allow-restore if the revert is intended")
 
 
 # ---- Bringing the branch up to date -----------------------------------------
@@ -455,7 +563,7 @@ def merge_after_base_moved(root, repository, number, head, title, body, error):
 DRY_RUN_STATUS = {"failed": CI_FAILED, "moved": HEAD_MOVED, "closed": REFUSED, "conflict": CONFLICT}
 
 
-def land(root, repository, number, update=False, dry_run=False, timeout=60):
+def land(root, repository, number, update=False, dry_run=False, timeout=60, allow_restore=False):
     deadline = time.time() + timeout * 60
     superseded = set()
     with landing_lock(root, repository, number):
@@ -465,6 +573,9 @@ def land(root, repository, number, update=False, dry_run=False, timeout=60):
             since = int(time.time())  # gh-pr-status reports whole seconds.
             fetch(root, branch, head)
             check_local(root, branch, head)
+            # Before sync can push anything for a branch that would be refused.
+            if not allow_restore:
+                check_restorations(root, number, head)
             target = sync(root, branch, head, update or pr.get("mergeable_state") == "dirty", dry_run)
             if target != head:
                 superseded.add(head)
@@ -516,6 +627,8 @@ def main(argv=None, root=ROOT):
     parser.add_argument("--update", action="store_true",
                         help=f"merge {BASE} in even without a conflict, when CI is stale against a change")
     parser.add_argument("--dry-run", action="store_true", help="check and report; push and merge nothing")
+    parser.add_argument("--allow-restore", action="store_true",
+                        help="land even though it puts back content main replaced or deletes what main added")
     parser.add_argument("--timeout", type=int, default=60, metavar="MINUTES", help="CI wait (default 60)")
     args = parser.parse_args(argv)
     if args.number < 1 or args.timeout < 1:
@@ -529,7 +642,8 @@ def main(argv=None, root=ROOT):
             raise Stop(2, "use -R OWNER/REPO")
         if origin and origin.lower() != repository.lower():
             raise Stop(REFUSED, f"origin is {origin}, not {repository}; run from a checkout of {repository}")
-        return land(root, repository, args.number, args.update, args.dry_run, args.timeout)
+        return land(root, repository, args.number, args.update, args.dry_run, args.timeout,
+                    args.allow_restore)
     except Stop as stop:
         print(f"land-pr: {stop}", file=sys.stderr, flush=True)
         return stop.status

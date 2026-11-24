@@ -227,6 +227,110 @@ class LandTests(unittest.TestCase):
         self.assertEqual(self.remote_head(), head)
         self.assertIn("landed #7", self.output)
 
+    def squash_onto_moved_main(self):
+        """Squash with `reset --soft` onto a main that moved since the branch began.
+
+        The index keeps the branch's older tree, so the one commit also carries
+        the older copy of everything main changed meanwhile (#3875).
+        """
+        self.advance_main("shared.txt", "two\n")
+        self.advance_main("added.txt", "main's new file\n")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "reset", "-q", "--soft", "origin/main")
+        self.commit("feat: add a feature")
+        self.git(self.repo, "push", "-q", "-f", "origin", "feature")
+
+    def test_a_branch_squashed_onto_a_moved_main_is_refused_for_what_it_reverts(self):
+        self.squash_onto_moved_main()
+        self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertIn("would undo work already on main", self.output)
+        self.assertIn("shared.txt returns to its content before", self.output)
+        self.assertIn("(chore: move main)", self.output)
+        self.assertIn("added.txt is deleted", self.output)
+        self.assertNotIn("feature.txt", self.output)
+        self.assertIsNone(self.merged())
+        self.assertEqual(self.run_land("--dry-run"), land.REFUSED, self.output)
+
+    def test_an_intended_revert_lands_with_allow_restore(self):
+        self.squash_onto_moved_main()
+        head = self.remote_head()
+        self.assertEqual(self.run_land("--allow-restore"), 0, self.output)
+        self.assertEqual(self.merged()["sha"], head)
+
+    def lines(self, changed=None):
+        return "".join(changed.get(n, f"line {n}\n") if changed else f"line {n}\n" for n in range(1, 13))
+
+    def test_a_stale_squash_that_also_edits_a_file_main_changed_is_refused(self):
+        # The branch starts after a long file exists, then main edits its top.
+        self.advance_main("long.txt", self.lines())
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "merge", "-q", "--no-edit", "origin/main")
+        self.git(self.repo, "push", "-q", "origin", "feature")
+        self.advance_main("long.txt", self.lines({2: "main's line 2\n"}))
+        # The PR edits the bottom of its older copy, then squashes onto the moved main.
+        (self.repo / "long.txt").write_text(self.lines({11: "feature's line 11\n"}))
+        self.commit("feat: edit the bottom")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "reset", "-q", "--soft", "origin/main")
+        self.commit("feat: edit the bottom")
+        self.git(self.repo, "push", "-q", "-f", "origin", "feature")
+        self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertIn("long.txt lacks", self.output)
+
+    def test_a_change_main_took_out_again_is_not_missing(self):
+        self.advance_main("long.txt", self.lines())
+        self.advance_main("long.txt", self.lines({6: "line 6\nadded then removed\n"}))
+        self.advance_main("long.txt", self.lines())
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "merge", "-q", "--no-edit", "origin/main")
+        (self.repo / "long.txt").write_text(self.lines({11: "feature's line 11\n"}))
+        self.commit("feat: edit the bottom")
+        self.git(self.repo, "push", "-q", "origin", "feature")
+        self.assertEqual(self.run_land(), 0, self.output)
+
+    def test_removing_one_file_of_a_recent_larger_change_lands(self):
+        other = self.root / "other"
+        self.git(self.root, "clone", "-q", str(self.origin), str(other))
+        (other / "recent.txt").write_text("recent\n")
+        (other / "shared.txt").write_text("two\n")
+        self.commit("feat: add two things", other)
+        self.git(other, "push", "-q", "origin", "main")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "merge", "-q", "--no-edit", "origin/main")
+        (self.repo / "recent.txt").unlink()
+        self.commit("chore: drop the recent file")
+        self.git(self.repo, "push", "-q", "origin", "feature")
+        self.assertEqual(self.run_land(), 0, self.output)
+
+    def test_a_refused_branch_is_not_pushed_even_when_asked_to_update(self):
+        self.squash_onto_moved_main()
+        self.advance_main("later.txt", "x\n")  # --update would otherwise merge this in and push.
+        head = self.remote_head()
+        self.assertEqual(self.run_land("--update"), land.REFUSED, self.output)
+        self.assertEqual(self.remote_head(), head)
+
+    def test_moving_a_file_main_recently_added_is_not_a_deletion(self):
+        self.advance_main("added.txt", "main's new file\nwith enough lines\nto be recognised\n")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "merge", "-q", "--no-edit", "origin/main")
+        (self.repo / "moved").mkdir()
+        self.git(self.repo, "mv", "added.txt", "moved/added.txt")
+        self.commit("refactor: move the new file")
+        self.git(self.repo, "push", "-q", "origin", "feature")
+        self.assertEqual(self.run_land(), 0, self.output)
+
+    def test_new_content_for_a_file_main_changed_is_not_a_restore(self):
+        self.advance_main("shared.txt", "two\n")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "merge", "-q", "--no-edit", "origin/main")
+        (self.repo / "shared.txt").write_text("three\n")
+        (self.repo / "obsolete.txt").write_text("x\n")
+        self.commit("feat: change shared")
+        (self.repo / "obsolete.txt").unlink()
+        self.commit("chore: drop a file this branch added")
+        self.git(self.repo, "push", "-q", "origin", "feature")
+        self.assertEqual(self.run_land(), 0, self.output)
+
     def test_a_protocol_bump_on_main_after_ci_refuses_the_landing(self):
         self.protocol_feature()
         head = self.remote_head()
