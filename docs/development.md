@@ -59,7 +59,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `install` | [Install your checkout](#installing-your-checkout) |
 | `package`, `package:smoke` | Build Linux packages; exercise package upgrades in a networkless root |
 | `release:build`, `release:verify` | [Build a release](releasing.md#building-a-release) from a tag; verify a bundle without publishing |
-| `mobile:test`, `mobile:build`, `mobile:install` | Test, build or install the [Android app](../mobile/README.md) with Gradle on this host; it compiles no Rust |
+| `mobile:test`, `mobile:build`, `mobile:install` | Test, build or install the [Android app](../mobile/README.md): Gradle runs on the build host through `scripts/gradle-remote`, and installing runs `adb` here |
 
 Arguments for a task go after `--`. A lane task's arguments replace its default
 target selection, so naming a target narrows the lane rather than adding to it,

@@ -61,8 +61,14 @@ app:
 - `androidApp/` is the Android app: SSH (sshj), the phone's key, and the
   screens.
 
-It needs JDK 21 (Gradle provisions it when missing) and the Android SDK, at
-`ANDROID_HOME` or `~/Android/Sdk`. From the repository root:
+Like Rust, it builds on the build host (`CAGENTS_BUILD_REMOTE`, default
+`fw16`): the tasks below mirror `mobile/` there with `scripts/gradle-remote`,
+run one Gradle build that leaves no daemon behind, and bring back the test
+reports and APKs. A Gradle build takes several gigabytes and every core for
+minutes, so don't run `./gradlew` on a laptop someone is using. The build host
+needs JDK 21 (Gradle provisions it when missing) and the Android SDK, at
+`ANDROID_HOME` or `~/Android/Sdk`; installing needs only `adb` here. From the
+repository root:
 
 ```sh
 mise run mobile:test      # protocol and unit tests
