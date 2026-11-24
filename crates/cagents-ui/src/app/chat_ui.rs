@@ -12272,9 +12272,10 @@ impl Cagents {
             // (never `Conflict`, which the writer retries itself), so neither
             // an edit of the draft nor Send or Retry save repairs it: each
             // offers storage the same move from the same identity. A new chat
-            // starts from no identity at all, so nothing is moved.
+            // starts from no identity at all, so nothing is moved. The
+            // remedy comes first: the notice shows its first lines only.
             PaneSaveRefusal::Identity { category, .. } => format!(
-                "{LEAD} Storage would not record the new conversation for this pane ({}), and sending here again would be refused the same way. Copy your draft into a new chat and send it there.",
+                "{LEAD} Copy it into a new conversation and send it there: storage won't record a new conversation for this pane ({}), so sending here fails again.",
                 category.label()
             ),
             PaneSaveRefusal::Refused { pane, category, .. } => {

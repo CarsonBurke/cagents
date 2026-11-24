@@ -357,7 +357,9 @@ fn refused_or_unavailable_first_start_checkpoint_preserves_draft_and_never_start
             );
             assert!(
                 app.draft_start_save_failure(card, result.as_ref().unwrap_err())
-                    .contains("Copy your draft into a new chat")
+                    .contains(
+                        "Your draft is retained. Copy it into a new conversation and send it there:"
+                    )
             );
         }
         drop(app.draft_start_checkpointed(target, attempt, result));
