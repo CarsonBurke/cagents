@@ -1194,6 +1194,14 @@ impl RenderStreamFixture {
         self.handle.inner.published.emit_event(&self.events, event);
     }
 
+    pub(crate) fn acknowledged_generation(&self) -> u64 {
+        self.handle
+            .inner
+            .published
+            .acknowledged_generation
+            .load(Ordering::Acquire)
+    }
+
     pub(crate) fn queued_commands(&self) -> usize {
         self.commands.len()
     }
