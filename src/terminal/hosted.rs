@@ -3900,24 +3900,24 @@ mod tests {
     }
 
     #[test]
-    fn launched_daemon_handshake_waits_out_restoration_beyond_the_ordinary_budget() {
+    fn launched_daemon_handshake_waits_out_restoration_beyond_five_seconds() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         // The #2400 rehearsal restored 34 sessions in 5.48 s; the CLI's ordinary
         // handshake gave up at 5 s while the startup allowance was far larger.
-        // The ordinary budget is lowered here so that waiting it out is cheap.
-        let _budget = crate::control::ordinary_budget::quick();
-        let restore = crate::control::ordinary_budget::QUICK + Duration::from_millis(600);
+        // This one test keeps the production budget, so it also fails a
+        // handshake bounded by any fixed five seconds, not only by the
+        // ordinary budget that the existing-listener test lowers.
         let started = Instant::now();
         start_and_verify_daemon_at(
             &socket,
             Duration::from_secs(30),
             Path::new("fixture-daemon"),
             false,
-            restoring_daemon(&socket, restore),
+            restoring_daemon(&socket, Duration::from_millis(5_600)),
         )
         .unwrap();
-        assert!(started.elapsed() >= restore);
+        assert!(started.elapsed() >= Duration::from_millis(5_600));
     }
 
     /// Readiness hands over the connection whose handshake proved it, so
