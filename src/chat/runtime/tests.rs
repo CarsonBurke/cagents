@@ -846,6 +846,42 @@ fn usage_keeps_the_compaction_point_each_reading_states() {
     assert_eq!(state.usage.context_budget(), 1_000_000);
 }
 
+/// A request to send what is queued now is the provider's to report, and
+/// lasts no longer than the provider or the conversation it was made in.
+#[test]
+fn send_now_follows_the_provider_and_ends_with_it() {
+    let mut state = Snapshot::default();
+    let mut indices = BTreeMap::new();
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Delivering)),
+    );
+    assert_eq!(state.send_now, Some(crate::chat::SendNow::Delivering));
+    apply_event(&mut state, &mut indices, Event::SendNow(None));
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Reset {
+            reason: "reset".into(),
+        },
+    );
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(&mut state, &mut indices, Event::Exited { code: None });
+    assert_eq!(state.send_now, None);
+}
+
 #[test]
 fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
     let mut state = Snapshot::default();

@@ -1141,6 +1141,7 @@ pub(crate) fn retain_reader_fields(snapshot: &mut crate::chat::Snapshot) {
     take(&mut snapshot.subagents);
     take(&mut snapshot.queued_messages);
     take(&mut snapshot.queue_removals);
+    take(&mut snapshot.send_now);
     take(&mut snapshot.branch_points);
     take(&mut snapshot.file_changes);
 }

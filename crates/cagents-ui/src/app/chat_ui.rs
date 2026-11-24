@@ -550,6 +550,9 @@ pub enum Action {
     /// named, or the newest that can be taken back.
     TakeBackQueued(Target, Option<QueueEntry>),
     RemoveQueued(Target, QueueEntry),
+    /// Hands everything the provider holds queued to the running turn now,
+    /// without stopping its subagents.
+    SendQueuedNow(Target),
     /// Puts away the notice that messages a provider was holding when it
     /// stopped are back in the composer.
     DismissRestoredWaiting(Target),
@@ -1058,6 +1061,7 @@ impl Action {
             Self::Latest(..) => "Latest",
             Self::TakeBackQueued(..) => "TakeBackQueued",
             Self::RemoveQueued(..) => "RemoveQueued",
+            Self::SendQueuedNow(..) => "SendQueuedNow",
             Self::DismissRestoredWaiting(..) => "DismissRestoredWaiting",
             Self::DismissComposerNote(..) => "DismissComposerNote",
             Self::ComposerActions(..) => "ComposerActions",
@@ -1249,6 +1253,7 @@ impl Action {
             | Self::ComposerUndo(target, _)
             | Self::TakeBackQueued(target, _)
             | Self::RemoveQueued(target, _)
+            | Self::SendQueuedNow(target)
             | Self::Model(target, _)
             | Self::Reasoning(target, _, _)
             | Self::PermissionMode(target, _)
@@ -15901,6 +15906,15 @@ impl Cagents {
                 // the turn ends as it begins.
                 runtime.withdraw_before_turn();
                 return self.chat_send(target, Command::Interrupt, false);
+            }
+            Action::SendQueuedNow(target) => {
+                if !self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.can_send_now())
+                {
+                    return Task::none();
+                }
+                return self.chat_send(target, Command::SendQueuedNow, false);
             }
             Action::DisarmInterrupt(target, at) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)

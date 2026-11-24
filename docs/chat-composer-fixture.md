@@ -253,6 +253,21 @@ Explore 3 and Explore 4), and Builder keeps its number, the selection and the
 keyboard focus while the strip re-sorts. The scene covers Claude's Agent
 calls only; it does not exercise Codex nicknames.
 
+To check Send now, create `fixture-send-now`. Each turn's init then
+advertises `interrupt_send_now_v1`, as Claude Code 2.1.296 does, so a prompt
+sent during the busy first turn shows **Send now** beside the queue heading
+(**Send 2 now** for two). Pressing it sends the interrupt with `send_now` and
+the first queued message's UUID. The file's first line is the fixture's
+answer: `delivering` (the default) ends the busy turn as a success cut short
+(`terminal_reason: aborted_streaming`) without stopping subagents, then
+replays every message still queued into one new turn that answers and
+completes them; `stopped` records the stop as an interrupt does, then starts
+the queue the same way; `nothing_waiting` leaves the turn running and the
+queue where it is. The second line is the seconds to wait after answering
+before the turn makes way (default `0`), so the queue heading's "sending now"
+state can be seen. A message taken back before the press is not sent. `python3
+tests/chat_composer_provider.py` checks each answer without the app.
+
 For a chosen set of tool calls, write `fixture-tools.jsonl`: one call per
 line, as `{"name":"Bash","input":{"command":"cargo test","description":"Run
 the tests"},"result":"error[E0308]: mismatched types","is_error":true}`.

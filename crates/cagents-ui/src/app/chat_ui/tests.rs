@@ -10504,6 +10504,38 @@ fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
 }
 
 #[test]
+fn send_now_goes_to_the_provider_only_when_the_turn_can_take_the_queue() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.queued_messages = vec![chat::QueuedMessage::new("a".into(), "Next".into())];
+    let busy = (*runtime.snapshot).clone();
+    show_chat_snapshot_for_test(&mut app, card, busy.clone());
+    // A provider that cannot take its queue early is not asked to.
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    assert!(chat_runtime(&app, card).commands.is_idle());
+
+    let mut able = busy;
+    able.capabilities.send_queued_now = true;
+    show_chat_snapshot_for_test(&mut app, card, able.clone());
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.commands.in_flight().is_some());
+    assert!(runtime.commands.repeats(&Command::SendQueuedNow));
+    settle(&mut app, card, Ok(()));
+
+    // Once the provider has it, a second press waits for its answer.
+    let mut requested = able;
+    requested.send_now = Some(chat::SendNow::Requested);
+    show_chat_snapshot_for_test(&mut app, card, requested);
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    assert!(chat_runtime(&app, card).commands.is_idle());
+}
+
+#[test]
 fn cancel_confirmation_does_not_cross_a_coalesced_turn_boundary() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = live_chat(&mut app, Some(KNOWN_THREAD));
