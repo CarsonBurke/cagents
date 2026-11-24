@@ -185,8 +185,7 @@ build() {
         || fail "tag $TAG does not exist here; create it on the merged version bump first"
     bundle=$BUNDLES/$VERSION
     [[ ! -e $bundle ]] || fail "$bundle exists; remove it to build $VERSION again"
-    relative=${ROOT_DIR#"$HOME"/}
-    [[ $relative != "$ROOT_DIR" ]] || fail 'the repository must be under $HOME to locate it on the build host'
+    relative=$(host_repository)
     # The build runs the tag's own scripts from a checkout this command owns.
     # This checkout's tag is authoritative and replaces any other there.
     repository_git push --quiet --force "ssh://$BUILD_HOST/~/$relative" "refs/tags/$TAG:refs/tags/$TAG"
@@ -277,10 +276,17 @@ EOF
     printf '  ssh-keygen -Y sign -n cagents-release -f KEY %q\n' "$bundle/release-metadata.json"
 }
 
-# The build host's checkout of this repository, relative to its home.
+# The build host's checkout of this repository, relative to its home. The
+# host keeps one checkout, at the main worktree's path, so a linked worktree
+# here (.worktrees/NAME) resolves to that main checkout rather than its own
+# path, which the host does not have.
 host_repository() {
-    local relative=${ROOT_DIR#"$HOME"/}
-    [[ $relative != "$ROOT_DIR" ]] || fail 'the repository must be under $HOME to locate it on the build host'
+    local common root relative
+    common=$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir) \
+        || fail 'cannot find the repository this checkout belongs to'
+    root=$(dirname -- "$common")
+    relative=${root#"$HOME"/}
+    [[ $relative != "$root" ]] || fail 'the repository must be under $HOME to locate it on the build host'
     printf '%s' "$relative"
 }
 
