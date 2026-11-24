@@ -8,10 +8,18 @@ mod private_cli_capture;
 #[path = "support/retained_fixture.rs"]
 mod retained_fixture;
 
+use cagents::{
+    chat::Session,
+    model::HostSessionProof,
+    terminal::ipc::{
+        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+        ServerResponse, read_frame, write_frame,
+    },
+};
 use serde_json::Value;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::Path,
     process::{Child, Command, Output, Stdio},
     thread,
@@ -94,30 +102,51 @@ impl Fixture {
         let provider = root.path().join("bin/claude");
         fs::write(&provider, script).unwrap();
         fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
-        let log = fs::File::create(root.path().join("daemon.log")).unwrap();
-        let daemon = Self::command(root.path(), Path::new(env!("CARGO_BIN_EXE_cagentsd")))
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+        let daemon = Self::spawn_daemon(root.path());
         let fixture = Self {
             root,
             daemon,
             agents: Default::default(),
         };
+        fixture.wait_for_daemon();
+        fixture
+    }
+
+    fn spawn_daemon(root: &Path) -> Child {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("daemon.log"))
+            .unwrap();
+        Self::command(root, Path::new(env!("CARGO_BIN_EXE_cagentsd")))
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for_daemon(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let output = fixture.output_until(&["daemon", "status"], deadline);
+            let output = self.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
             {
-                break;
+                return;
             }
             assert!(Instant::now() < deadline, "fixture daemon did not start");
             thread::sleep(Duration::from_millis(20));
         }
-        fixture
+    }
+
+    fn restart_daemon(&mut self) {
+        use std::os::unix::process::ExitStatusExt;
+
+        self.daemon.kill().unwrap();
+        assert_eq!(self.daemon.wait().unwrap().signal(), Some(libc::SIGKILL));
+        self.daemon = Self::spawn_daemon(self.root.path());
+        self.wait_for_daemon();
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
@@ -261,6 +290,197 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+struct ChatWire {
+    stream: UnixStream,
+    proof: Option<HostSessionProof>,
+    sequence: u64,
+}
+
+impl ChatWire {
+    fn connect(socket: &Path) -> Self {
+        let stream = UnixStream::connect(socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut wire = Self {
+            stream,
+            proof: None,
+            sequence: 0,
+        };
+        assert!(matches!(
+            wire.request(ClientRequest::Connect {
+                expected_host: None,
+                resume: Vec::new(),
+            }),
+            ServerResponse::Connected { .. }
+        ));
+        wire
+    }
+
+    fn request(&mut self, request: ClientRequest) -> ServerResponse {
+        self.sequence += 1;
+        write_frame(
+            &mut self.stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: self.sequence,
+                proof: self.proof.clone(),
+                request,
+            },
+        )
+        .unwrap();
+        loop {
+            let envelope: ServerEnvelope = read_frame(&mut self.stream).unwrap().unwrap();
+            if let Some(expected) = &self.proof {
+                assert_eq!(&envelope.proof, expected);
+            } else {
+                self.proof = Some(envelope.proof.clone());
+            }
+            if envelope.request_id == Some(self.sequence) {
+                let ServerMessage::Response { response } = envelope.message else {
+                    panic!("unexpected private daemon response: {:?}", envelope.message);
+                };
+                return response;
+            }
+        }
+    }
+
+    fn attach_visible(&mut self, session: Session) {
+        let chat_id = session.id;
+        assert!(matches!(
+            self.request(ClientRequest::ChatAttach { session }),
+            ServerResponse::ChatAttached { .. }
+        ));
+        assert!(matches!(
+            self.request(ClientRequest::ChatVisibility {
+                chat_id,
+                visible: true,
+            }),
+            ServerResponse::Accepted
+        ));
+    }
+}
+
+#[test]
+fn chat_delivery_survives_daemon_restart() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    use cagents::chat::{Command, ItemContent, NativeContinuity, PromptMode};
+
+    let mut fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--surface",
+        "chat",
+        "--prompt",
+        "Initialize the conversation",
+        "--idempotency-key",
+        "chat-delivery-restart",
+    ]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    let run = accepted["run"]["id"].as_str().unwrap();
+    fixture.wait(&["agent", "wait", run, "--timeout", "10"], 5);
+    fixture.cli(&["agent", "answer", agent, "console-approval", "allow"]);
+    fixture.wait(&["agent", "wait", run, "--timeout", "10"], 0);
+
+    let status = fixture.cli(&["daemon", "status"]);
+    let socket = Path::new(status["socket"].as_str().unwrap());
+    let attach = || {
+        let mut wire = ChatWire::connect(socket);
+        let ServerResponse::ChatListed { mut sessions } = wire.request(ClientRequest::ChatList)
+        else {
+            panic!("expected the private daemon's chat inventory");
+        };
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        let session = sessions.pop().unwrap();
+        assert!(matches!(
+            &session.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ));
+        wire.attach_visible(session.clone());
+        (wire, session)
+    };
+    let (mut wire, original) = attach();
+    let chat_id = original.id;
+    let deliver = |wire: &mut ChatWire, delivery, text: &str| {
+        assert!(matches!(
+            wire.request(ClientRequest::ChatDeliver {
+                chat_id,
+                command: Command::Prompt {
+                    text: text.into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                },
+                delivery,
+            }),
+            ServerResponse::Accepted
+        ));
+    };
+    let wait_for_answer = |wire: &mut ChatWire, marker: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            } = wire.request(ClientRequest::ChatRead {
+                chat_id,
+                after_generation: None,
+            })
+            else {
+                panic!("expected a retained conversation snapshot");
+            };
+            if !snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. } if text == marker)
+                })
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing provider answer {marker}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let key = uuid::Uuid::new_v4();
+    deliver(&mut wire, key, "Send this once");
+    fixture.restart_daemon();
+    drop(wire);
+    let (mut wire, restored) = attach();
+    assert_ne!(original.proof, restored.proof);
+    assert_eq!(original.id, restored.id);
+    assert!(original.launch.session_id.is_some());
+    assert_eq!(original.launch.session_id, restored.launch.session_id);
+    wait_for_answer(&mut wire, "CONSOLE_RESULT_2");
+    deliver(&mut wire, key, "Send this once");
+    // The next prompt and result establish that the retained provider is
+    // responsive and has already had a chance to consume any duplicate.
+    deliver(&mut wire, uuid::Uuid::new_v4(), "Send the next message");
+    wait_for_answer(&mut wire, "CONSOLE_RESULT_3");
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("prompts")).unwrap(),
+        "prompt\nprompt\nprompt\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("spawns")).unwrap(),
+        "spawn\n"
+    );
 }
 
 #[test]
@@ -547,10 +767,6 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         agent_execution::{Agent, Run},
         chat::{ItemContent, NativeContinuity},
         control::ControlClient,
-        terminal::ipc::{
-            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
-            ServerResponse, read_frame, write_frame,
-        },
     };
     let fixture = Fixture::with_provider(include_str!("fixtures/chat-composer-claude.sh"));
     let config = fixture.root.path().join("home/.claude");
@@ -644,66 +860,16 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         "{session:?}"
     );
     let chat_id = session.id;
-    let mut observer = std::os::unix::net::UnixStream::connect(socket).unwrap();
-    observer
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    observer
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut proof = None;
-    let mut sequence = 0;
-    let mut request = |value| {
-        sequence += 1;
-        write_frame(
-            &mut observer,
-            &ClientEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id: sequence,
-                proof: proof.clone(),
-                request: value,
-            },
-        )
-        .unwrap();
-        loop {
-            let envelope: ServerEnvelope = read_frame(&mut observer).unwrap().unwrap();
-            if let Some(expected) = &proof {
-                assert_eq!(&envelope.proof, expected);
-            } else {
-                proof = Some(envelope.proof.clone());
-            }
-            if envelope.request_id == Some(sequence) {
-                let ServerMessage::Response { response } = envelope.message else {
-                    panic!("unexpected private daemon response");
-                };
-                break response;
-            }
-        }
-    };
-    assert!(matches!(
-        request(ClientRequest::Connect {
-            expected_host: None,
-            resume: Vec::new(),
-        }),
-        ServerResponse::Connected { .. }
-    ));
-    assert!(matches!(
-        request(ClientRequest::ChatAttach { session }),
-        ServerResponse::ChatAttached { .. }
-    ));
-    assert!(matches!(
-        request(ClientRequest::ChatVisibility {
-            chat_id,
-            visible: true,
-        }),
-        ServerResponse::Accepted
-    ));
+    let mut observer = ChatWire::connect(socket);
+    observer.attach_visible(session);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let ServerResponse::ChatSnapshot { snapshot, .. } = request(ClientRequest::ChatRead {
-            chat_id,
-            after_generation: None,
-        }) else {
+        let ServerResponse::ChatSnapshot { snapshot, .. } =
+            observer.request(ClientRequest::ChatRead {
+                chat_id,
+                after_generation: None,
+            })
+        else {
             panic!("expected the actual retained actor snapshot");
         };
         let snapshot = snapshot.unwrap();

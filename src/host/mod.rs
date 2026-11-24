@@ -548,6 +548,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut initial = HostState::new(proof);
     initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
+    match crate::chat::runtime::Deliveries::open() {
+        Ok(deliveries) => initial.chat_deliveries = Some(Arc::new(deliveries)),
+        Err(error) => tracing::error!(%error, "cannot open the message delivery ledger"),
+    }
     initial.prompt_cache = Arc::new(agent_execution::prompt_cache::Calibration::installation());
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()

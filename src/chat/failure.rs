@@ -686,6 +686,12 @@ delivery_outcomes! {
     /// A stop whose outcome is still unknown when its caller stops waiting.
     unknown send UNACKNOWLEDGED_STOP: "Claude hasn't confirmed the stop yet.",
         "It may still take effect, so check the conversation before trying again.";
+    /// A delivery whose acknowledgement was lost before it could be saved.
+    unknown send LOST_DELIVERY_OUTCOME: "The outcome of this message could not be confirmed.",
+        "It may have gone through. Check the conversation before sending it again.";
+    /// Reading or recording a keyed delivery failed before admission could be decided.
+    unknown send DELIVERY_HISTORY_UNAVAILABLE: "Message delivery history is unavailable.",
+        "Check the conversation before sending this message again.";
     /// A new input while an earlier one is still unconfirmed.
     refused send UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
         "Try again in a moment.";
@@ -861,6 +867,8 @@ mod tests {
             UNACKNOWLEDGED_INPUT,
             UNACKNOWLEDGED_ANSWER,
             UNACKNOWLEDGED_STOP,
+            LOST_DELIVERY_OUTCOME,
+            DELIVERY_HISTORY_UNAVAILABLE,
             UNSETTLED_INPUT,
             RECONNECTING_INPUT,
             CROWDED_INPUT,

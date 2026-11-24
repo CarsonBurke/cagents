@@ -217,6 +217,9 @@ pub(crate) struct Resident {
     pub prompt_cache: chat::prompt_cache::Activity,
     next_input: u64,
     acknowledged_input_count: usize,
+    /// A helper that can retire unknown outcomes also publishes them here.
+    #[serde(default)]
+    terminal_input_count: Option<usize>,
     pub continuity_loss: Option<ContinuityLoss>,
     pub retained_runs: Vec<crate::model::RunId>,
     pub outbox_ack: u64,
@@ -224,6 +227,12 @@ pub(crate) struct Resident {
     changed: u64,
 }
 impl Resident {
+    fn has_retirable_inputs(&self) -> bool {
+        self.terminal_input_count
+            .unwrap_or(self.acknowledged_input_count)
+            > 0
+    }
+
     /// What holds the conversation. A helper that predates names reports its
     /// background subagents only as running ones it cannot name; it never
     /// reports one waiting.
@@ -376,8 +385,6 @@ struct Remote {
     /// When the reader is next asked to read the conversation again, after a
     /// read failed while the helper was alive.
     reread_at: Mutex<Option<Instant>>,
-    /// What became of the messages sent under a key.
-    deliveries: super::super::delivery::Deliveries,
 }
 struct StartupOwner {
     control: Mutex<Option<UnixStream>>,
@@ -550,6 +557,7 @@ impl RemoteActor {
             prompt_cache: Default::default(),
             next_input: 1,
             acknowledged_input_count: 0,
+            terminal_input_count: Some(0),
             continuity_loss: None,
             retained_runs: Vec::new(),
             outbox_ack: 0,
@@ -607,7 +615,6 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(None),
             reread_at: Mutex::new(None),
-            deliveries: Default::default(),
         }))
     }
     /// Complete the actual proxy's pending envelope without any external
@@ -1270,7 +1277,7 @@ impl RemoteActor {
         socket: PathBuf,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let recovering_inputs = attached.resident.acknowledged_input_count > 0;
+        let recovering_inputs = attached.resident.has_retirable_inputs();
         let remote = Self(Arc::new(Remote {
             close_only: attached.close_only,
             source: attached.source,
@@ -1304,7 +1311,6 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
             reread_at: Mutex::new(None),
-            deliveries: Default::default(),
         }));
         let watch = remote.watch()?;
         let wake = remote.0.wake.clone();
@@ -1385,7 +1391,7 @@ impl RemoteActor {
                     {
                         break;
                     }
-                    retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
+                    retry_housekeeping |= actor.reconcile_terminal_inputs().is_err();
                     let identities: Vec<_> = actor
                         .0
                         .pending
@@ -1440,7 +1446,7 @@ impl RemoteActor {
         // failed, or has a scheduled retransmission, needs a timer.
         if failed
             || self.0.recovering_inputs.load(Ordering::Acquire)
-            || self.state().acknowledged_input_count > 0
+            || self.state().has_retirable_inputs()
             || self.0.desired_observe.load(Ordering::Acquire)
             || self
                 .0
@@ -2220,6 +2226,7 @@ impl RemoteActor {
         self.answer("input", json!([identity, payload]))
     }
     fn apply_receipts(&self, receipts: &[InputReceipt]) {
+        let retire_unknown = self.state().terminal_input_count.is_some();
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
         let mut uncertain = self
             .0
@@ -2240,53 +2247,62 @@ impl RemoteActor {
             {
                 *uncertain = None;
             }
-            match &receipt.state {
+            let (result, retire) = match &receipt.state {
+                InputState::Accepted => return true,
                 InputState::Acknowledged(result) => {
-                    if let Some(reply) = pending.reply.take() {
-                        let _ = reply.send(result.clone().map_err(Rejection::Refused));
-                    }
-                    completed.push(pending.identity.clone());
-                    false
+                    (result.clone().map_err(Rejection::Refused), true)
                 }
-                InputState::Unknown(error) => {
-                    if let Some(reply) = pending.reply.take() {
-                        let _ = reply.send(Err(Rejection::Unacknowledged(error.clone())));
-                    }
-                    true
-                }
-                InputState::Accepted => true,
+                InputState::Unknown(error) => (
+                    Err(Rejection::Unacknowledged(error.clone())),
+                    retire_unknown,
+                ),
+            };
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(result);
             }
+            if retire {
+                completed.push(pending.identity.clone());
+            }
+            false
         });
         if uncertain.is_none() {
             self.0.input_settled.notify_all();
         }
         drop(uncertain);
+        if completed.is_empty() {
+            return;
+        }
         let mut retiring = self
             .0
             .retiring_inputs
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if !completed.is_empty() {
-            self.0.wake.notify();
-        }
         for identity in completed {
             if !retiring.contains(&identity) {
                 retiring.push(identity);
             }
         }
+        self.0.wake.notify();
     }
 
-    fn reconcile_acknowledged_inputs(&self) -> Result<(), String> {
-        if self.state().acknowledged_input_count == 0
-            && !self.0.recovering_inputs.load(Ordering::Acquire)
-        {
+    fn reconcile_terminal_inputs(&self) -> Result<(), String> {
+        let state = self.state();
+        if !state.has_retirable_inputs() && !self.0.recovering_inputs.load(Ordering::Acquire) {
             return Ok(());
         }
-        let receipts: Vec<InputReceipt> = self.call("acknowledged_inputs", Value::Null)?;
+        let retire_unknown = state.terminal_input_count.is_some();
+        let method = if retire_unknown {
+            "terminal_inputs"
+        } else {
+            "acknowledged_inputs"
+        };
+        let receipts: Vec<InputReceipt> = self.call(method, Value::Null)?;
         if receipts.len() > 64
-            || receipts
-                .iter()
-                .any(|receipt| !matches!(&receipt.state, InputState::Acknowledged(_)))
+            || receipts.iter().any(|receipt| match &receipt.state {
+                InputState::Accepted => true,
+                InputState::Acknowledged(_) => false,
+                InputState::Unknown(_) => !retire_unknown,
+            })
         {
             return Err("Helper returned an invalid terminal receipt page".into());
         }
@@ -2344,16 +2360,23 @@ impl RemoteActor {
             .recv_timeout(ACKNOWLEDGEMENT_WAIT)
             .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
-    /// Sends `command` once under `key`, as
-    /// [`delivery`](super::super::delivery) describes: asked again, it waits
-    /// on the input already admitted under that key rather than admitting
-    /// another, which the helper would run as well.
-    pub fn deliver(&self, command: Command, key: chat::DeliveryKey) -> Result<(), Rejection> {
-        self.0.deliveries.deliver(
+    pub fn deliver(
+        &self,
+        deliveries: &super::super::Deliveries,
+        chat: crate::model::TerminalId,
+        command: Command,
+        key: chat::DeliveryKey,
+        given_work: impl FnOnce(),
+    ) -> Result<(), Rejection> {
+        deliveries.deliver(
+            chat,
             key,
             ACKNOWLEDGEMENT_WAIT,
             || Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()),
-            || self.enqueue(None, command).map_err(Rejection::Refused),
+            || {
+                given_work();
+                self.enqueue(None, command).map_err(Rejection::Refused)
+            },
         )
     }
     /// The courier tries again later on its own, so it does not wait behind
@@ -2584,6 +2607,7 @@ fn close_only_method(method: &str) -> bool {
             | "input_receipt"
             | "input_receipts"
             | "acknowledged_inputs"
+            | "terminal_inputs"
             | "retire_acknowledged_inputs"
             | "ack_inputs"
             | "update_source"
@@ -3064,6 +3088,7 @@ impl Server {
             prompt_cache: self.actor.prompt_cache(),
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
+            terminal_input_count: Some(journal.terminal_input_count()),
             continuity_loss,
             retained_runs: journal.retained_runs()?,
             outbox_ack: journal.acknowledged()?,
@@ -3476,12 +3501,18 @@ impl Server {
                     .unwrap_or_else(|p| p.into_inner())
                     .acknowledged_input_page()?
             ),
+            "terminal_inputs" => value!(
+                self.journal
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .terminal_input_page()?
+            ),
             "retire_acknowledged_inputs" => {
                 let (identities,) = decode!((Vec<InputIdentity>,));
                 self.journal
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .retire_acknowledged_inputs(&identities)?;
+                    .retire_terminal_inputs(&identities)?;
                 self.changed.fetch_add(1, Ordering::Release);
                 Ok(Value::Null)
             }
