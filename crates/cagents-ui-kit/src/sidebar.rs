@@ -18,7 +18,7 @@ use std::{
 
 use cosmic::{
     Element,
-    iced::{Alignment, Length, Padding, advanced::text::EllipsizeHeightLimit, id::Id},
+    iced::{Alignment, Length, Padding, id::Id},
     theme,
     widget::{self, button, icon},
 };
@@ -87,6 +87,10 @@ const ROW_ICON_WIDTH: f32 = 20.0;
 const ROW_ICON_SIZE: u16 = design::LEADING_ICON_SIZE;
 const CHILD_ROW_ICON_SIZE: u16 = ROW_ICON_SIZE;
 const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
+/// The line box a navigation row's label is centred in: libcosmic's body
+/// preset's, which the rows' heights were chosen around, so a label lands on
+/// whole pixels whether or not a search highlights it.
+const ROW_TEXT_LINE: f32 = 21.0;
 // Controls and status indicators retain the shared workspace chrome sizes.
 
 /// Horizontal step between one row slot and the next, and the unit the rest of
@@ -108,7 +112,7 @@ const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
 const ROW_DELETE_STATUS_WIDTH: f32 = ICON_CONTROL_SIZE - 2.0 * ROW_GUTTER;
 const _: () = assert!(ROW_DELETE_STATUS_WIDTH >= ROW_STATUS_WIDTH);
 /// The project header's hover-revealed commands: disclose, new channel, new
-/// worktree. Reserved inside the header row so a long project name ellipsizes
+/// worktree. Reserved inside the header row so a long project name fades
 /// instead of running under them, and read by `row_interaction::header_at` so
 /// the same three controls stay out of the group's drag region.
 const HEADER_ACTION_WIDTH: f32 = 3.0 * ICON_CONTROL_SIZE;
@@ -1938,13 +1942,13 @@ impl ChangeRow {
             .conflict
             .map(conflict_label)
             .unwrap_or_else(|| change_kind_label(entry.kind));
-        // Which end of the label the row may throw away, decided once.
+        // Which end of the label the row may let fade, decided once.
         //
-        // A repository path is elided from the front, because its tail is the
-        // file and `…/src/lib.rs` still names one; so is a rename, whose tail
+        // A repository path fades at its front, because its tail is the
+        // file and `src/lib.rs` still names one; so is a rename, whose tail
         // is the name the file now has. A file in the worktree root is nothing
         // but its name and has no head to spare.
-        let ellipsize_start = entry.old_path.is_some() || label.contains('/');
+        let fade_start = entry.old_path.is_some() || label.contains('/');
         let chrome = ChangeRowChrome {
             accessible_name: if counts.is_empty() {
                 format!("{status} {label}")
@@ -1959,7 +1963,7 @@ impl ChangeRow {
             status: status.into_boxed_str(),
             counts_split: counts.find(' '),
             counts: counts.into_boxed_str(),
-            ellipsize_start,
+            fade_start,
             stage_id: stable_id(format!("panel.change.stage.{key}")),
             unstage_id: stable_id(format!("panel.change.unstage.{key}")),
             discard_id: stable_id(format!("panel.change.discard.{key}")),
@@ -1992,7 +1996,7 @@ struct ChangeRowChrome {
     counts_split: Option<usize>,
     /// True when the label's tail is what identifies it; see
     /// [`ChangeRow::new`].
-    ellipsize_start: bool,
+    fade_start: bool,
     stage_id: Id,
     unstage_id: Id,
     discard_id: Id,
@@ -7000,7 +7004,7 @@ pub fn project_primary_action(project: &SidebarProject) -> Option<SidebarAction>
     })
 }
 
-/// The project's name, on one line, ellipsized rather than wrapped so a long
+/// The project's name, on one line, fading rather than wrapping so a long
 /// name cannot change a header's height.
 fn project_name_label(project: &SidebarProject, query: &str) -> Element<'static, SidebarAction> {
     search_label(
@@ -7025,12 +7029,8 @@ fn operation_rows(
 ) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(false);
     project.operations.iter().map(move |operation| {
-        let label = design::body(operation.label.to_string())
+        let label = crate::ui_controls::fade_text(operation.label.to_string())
             .class(theme::Text::Custom(design::muted_text))
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
             .width(Length::Fill)
             .into();
         let content = grid.content(
@@ -8605,7 +8605,7 @@ fn child_glyph(icon: Icon, tone: GlyphTone, compact: bool) -> Element<'static, S
 /// A row's title followed by where it is, dimmed: "Codex chat · fix-sidebar".
 /// The title keeps the width it needs and the place gives way first, since
 /// the title is what tells two rows apart. Only once the place is gone does
-/// the title itself truncate.
+/// the title itself fade.
 fn titled_label(
     title: &str,
     place: Option<&str>,
@@ -8615,64 +8615,21 @@ fn titled_label(
     let Some(place) = place else {
         return search_label(title, query, CHILD_ROW_TEXT_SIZE, ink.text_class(), false);
     };
-    let ellipsized = |text: widget::Text<'static, cosmic::Theme>| {
-        text.size(CHILD_ROW_TEXT_SIZE)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
+    // The title shrinks to its text and is laid out before the filling
+    // place, so it fades only if the row cannot hold even that.
+    widget::row::with_children(vec![
+        search_text(title, query, CHILD_ROW_TEXT_SIZE, ink.text_class(), false).into(),
+        crate::ui_controls::fade_text(format!(" · {place}"))
+            .size(CHILD_ROW_TEXT_SIZE)
+            .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+                ROW_TEXT_LINE.into(),
             ))
-    };
-    let place = format!(" · {place}");
-    let place = move || -> Element<'static, SidebarAction> {
-        ellipsized(widget::text::body(place.clone()))
             .class(theme::Text::Custom(design::secondary_text))
             .width(Length::Fill)
-            .into()
-    };
-    if search_highlight_ranges(title, query).is_empty() {
-        // A shrinking text takes its natural width before the filling place
-        // is laid out, and ellipsizes only if the row cannot hold even that.
-        return widget::row::with_children(vec![
-            ellipsized(widget::text::body(title.to_owned()))
-                .class(ink.text_class())
-                .into(),
-            place(),
-        ])
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .into();
-    }
-    // A highlighted title is a fitting label that fills whatever slot it is
-    // given, so it is given its natural width, measured once, or the whole
-    // row when that is narrower.
-    let title = title.to_owned();
-    let query = query.to_owned();
-    let natural = std::cell::OnceCell::new();
-    crate::ui_controls::responsive(move |slot| {
-        let natural = *natural.get_or_init(|| {
-            let (font, emphasis) = search_label_fonts(false);
-            search_spans_width(&title, &query, CHILD_ROW_TEXT_SIZE, font, emphasis).ceil()
-        });
-        widget::row::with_children(vec![
-            widget::container(search_label(
-                &title,
-                &query,
-                CHILD_ROW_TEXT_SIZE,
-                ink.text_class(),
-                false,
-            ))
-            .width(Length::Fixed(natural.min(slot.width)))
             .into(),
-            place(),
-        ])
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .into()
-    })
-    // As tall as the title's text, as a title on its own is, so the
-    // two share a pixel row; a height of their own would centre them
-    // between two and blur them.
-    .height(Length::Shrink)
+    ])
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
     .into()
 }
 
@@ -10271,12 +10228,10 @@ fn source_control_header<'a>(
             activity.unwrap_or("Worktree"),
         ),
         widget::container(crate::interaction::tooltip(
-            design::heading(worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label))
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill),
+            crate::ui_controls::FadeText::heading(
+                worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label),
+            )
+            .width(Length::Fill),
             worktree.map_or(&*chrome.subheading, |row| &*row.chrome.tooltip),
         ))
         .width(Length::Fill)
@@ -10674,11 +10629,7 @@ fn panel_section<'a>(
             widget::container(parts.icon.handle().icon().size(ROW_ICON_SIZE))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
-            design::heading(parts.title)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
+            crate::ui_controls::FadeText::heading(parts.title)
                 .width(Length::Fill)
                 .into(),
         ])
@@ -10838,7 +10789,7 @@ fn files_section<'a>(
                 widget::container(file_icon)
                     .center_x(Length::Fixed(ROW_ICON_WIDTH))
                     .into(),
-                design::body(if flat || page > 0 {
+                crate::ui_controls::fade_text(if flat || page > 0 {
                     row.path.display()
                 } else {
                     Cow::Borrowed(&*chrome.label)
@@ -10848,10 +10799,6 @@ fn files_section<'a>(
                 } else {
                     theme::Text::Default
                 })
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
                 .width(Length::Fill)
                 .into(),
             ])
@@ -11352,11 +11299,10 @@ fn branch_changes_section<'a>(
             &*row.label, if flat { 0 } else { file.depth },
             widget::row::with_children(vec![
                 crate::file_icon::icon(row.entry.path.as_path()).into(),
-                design::body(if !flat && row.entry.old_path.is_none() {
+                crate::ui_controls::fade_text(if !flat && row.entry.old_path.is_none() {
                     row.entry.path.file_name()
                 } else { Cow::Borrowed(&*row.label) })
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1)))
+                    .edge(crate::ui_controls::FadeEdge::Start)
                     .width(Length::Fill).into(),
                 semantic_caption(&*row.status, tone),
                 design::caption(&*row.counts).into(),
@@ -11517,16 +11463,15 @@ fn change_row_view<'a>(
             widget::container(crate::file_icon::icon(row.entry.path.as_path()))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
-            design::body(if tree && row.entry.old_path.is_none() {
+            crate::ui_controls::fade_text(if tree && row.entry.old_path.is_none() {
                 row.entry.path.file_name()
             } else {
                 Cow::Borrowed(&*chrome.label)
             })
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(if chrome.ellipsize_start {
-                cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1))
+            .edge(if chrome.fade_start {
+                crate::ui_controls::FadeEdge::Start
             } else {
-                cosmic::iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(1))
+                crate::ui_controls::FadeEdge::End
             })
             .width(Length::Fill)
             .into(),
@@ -12272,12 +12217,9 @@ fn commit_changes_section<'a>(
                     0,
                     widget::row::with_children(vec![
                         crate::file_icon::icon(entry.path.as_path()).into(),
-                        design::body(label)
+                        crate::ui_controls::fade_text(label)
+                            .edge(crate::ui_controls::FadeEdge::Start)
                             .width(Length::Fill)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
                             .into(),
                         semantic_caption(change_kind_label(entry.kind), tone),
                         design::caption(crate::repository::line_change_counts(
@@ -12353,18 +12295,10 @@ fn history_section<'a>(
                         .center_x(Length::Fixed(ROW_ICON_WIDTH))
                         .into(),
                     widget::column::with_children(vec![
-                        design::body(&*chrome.subject)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
+                        crate::ui_controls::fade_text(&*chrome.subject)
                             .width(Length::Fill)
                             .into(),
-                        design::caption(&*chrome.metadata)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
+                        crate::ui_controls::FadeText::caption(&*chrome.metadata)
                             .width(Length::Fill)
                             .into(),
                     ])
@@ -13602,6 +13536,30 @@ fn search_highlight_ranges(label: &str, query: &str) -> Vec<std::ops::Range<usiz
     merged
 }
 
+/// A row's label, fading where its row runs out of room, with the search's
+/// match in it set in bold and the accent colour. It shrinks to its text, so
+/// whatever follows it in the row takes the room that is left.
+fn search_text(
+    label: &str,
+    query: &str,
+    size: f32,
+    class: theme::Text,
+    heading: bool,
+) -> crate::ui_controls::FadeText<'static> {
+    crate::ui_controls::fade_text(label.to_owned())
+        .size(size)
+        .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+            ROW_TEXT_LINE.into(),
+        ))
+        .font(search_label_font(heading))
+        .class(class)
+        .highlight(
+            &search_highlight_ranges(label, query),
+            theme::Text::Custom(design::accent_text),
+        )
+}
+
+/// [`search_text`] filling its row.
 fn search_label(
     label: &str,
     query: &str,
@@ -13609,150 +13567,21 @@ fn search_label(
     class: theme::Text,
     heading: bool,
 ) -> Element<'static, SidebarAction> {
-    let (font, emphasis) = search_label_fonts(heading);
-    let highlights = search_highlight_ranges(label, query);
-    if highlights.is_empty() {
-        return widget::text::body(label.to_owned())
-            .size(size)
-            .font(font)
-            .class(class)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into();
-    }
-    let label = label.to_owned();
-    let query = query.to_owned();
-    let fitted = std::cell::RefCell::new(None::<(u32, String)>);
-    crate::ui_controls::responsive(move |slot| {
-        // Measure the exact span/font partition before truncation: the pinned
-        // renderer cannot ellipsize spans. Reuse the fit until the slot changes.
-        let label = {
-            let mut fitted = fitted.borrow_mut();
-            if fitted
-                .as_ref()
-                .is_none_or(|(width, _)| *width != slot.width.to_bits())
-            {
-                *fitted = Some((
-                    slot.width.to_bits(),
-                    ellipsize_search_label(&label, slot.width, |candidate| {
-                        search_spans_width(candidate, &query, size, font, emphasis)
-                    }),
-                ));
-            }
-            fitted.as_ref().expect("fitted label").1.clone()
-        };
-        let spans = search_label_spans(&label, &query, emphasis);
-        widget::container(
-            cosmic::iced::widget::rich_text(spans)
-                .size(size)
-                .font(font)
-                .class(class)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .width(Length::Fill),
-        )
+    search_text(label, query, size, class, heading)
         .width(Length::Fill)
-        .clip(true)
         .into()
-    })
-    .width(Length::Fill)
-    // As tall as its text, so a highlighted title sits on the same pixel
-    // row as a plain one rather than blurred between two.
-    .height(Length::Shrink)
-    .into()
 }
 
-/// A search label's font, and the one its matches are drawn in.
-fn search_label_fonts(heading: bool) -> (cosmic::iced::Font, cosmic::iced::Font) {
-    let font = cosmic::font::Font {
+/// A search label's font; its matches are set in its bold.
+fn search_label_font(heading: bool) -> cosmic::iced::Font {
+    cosmic::font::Font {
         weight: if heading {
             cosmic::iced::font::Weight::Medium
         } else {
             cosmic::iced::font::Weight::Normal
         },
         ..cosmic::font::default()
-    };
-    let emphasis = cosmic::font::Font {
-        weight: cosmic::iced::font::Weight::Bold,
-        ..font
-    };
-    (font, emphasis)
-}
-
-fn search_label_spans(
-    label: &str,
-    query: &str,
-    emphasis: cosmic::iced::Font,
-) -> Vec<cosmic::iced::widget::text::Span<'static, ()>> {
-    use cosmic::iced::widget::text::Span;
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    for range in search_highlight_ranges(label, query) {
-        if cursor < range.start {
-            spans.push(Span::new(label[cursor..range.start].to_owned()));
-        }
-        spans.push(
-            Span::new(label[range.clone()].to_owned())
-                .font(emphasis)
-                .color(design::accent_color(&cosmic::theme::active())),
-        );
-        cursor = range.end;
     }
-    if cursor < label.len() {
-        spans.push(Span::new(label[cursor..].to_owned()));
-    }
-    spans
-}
-
-fn search_spans_width(
-    label: &str,
-    query: &str,
-    size: f32,
-    font: cosmic::iced::Font,
-    emphasis: cosmic::iced::Font,
-) -> f32 {
-    use cosmic::iced::{
-        Pixels, Size,
-        advanced::text::{self, Paragraph as _},
-    };
-    let spans = search_label_spans(label, query, emphasis);
-    let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_spans(text::Text {
-        content: &spans,
-        bounds: Size::new(f32::INFINITY, f32::INFINITY),
-        size: Pixels(size),
-        line_height: text::LineHeight::Relative(1.5),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: cosmic::iced::alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
-        wrapping: text::Wrapping::None,
-        ellipsize: text::Ellipsize::None,
-    });
-    paragraph.min_bounds().width
-}
-
-fn ellipsize_search_label(label: &str, width: f32, measure: impl Fn(&str) -> f32) -> String {
-    if measure(label) <= width {
-        return label.to_owned();
-    }
-    if measure("…") > width {
-        return String::new();
-    }
-    let boundaries: Vec<_> = label.char_indices().map(|(index, _)| index).collect();
-    let mut low = 0;
-    let mut high = boundaries.len();
-    while low < high {
-        let middle = (low + high).div_ceil(2);
-        let candidate = format!("{}…", &label[..boundaries[middle - 1]]);
-        if measure(&candidate) <= width {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
-    format!("{}…", &label[..boundaries[low.saturating_sub(1)]])
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {

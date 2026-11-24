@@ -234,11 +234,10 @@ fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static,
     let searchable = search_label(label, moving);
     let offset = label.len() - searchable.len();
     let matches = matching::highlighted_ranges(searchable, query, offset);
-    widget::container(crate::ui_controls::fade_highlighted(
-        label,
-        &matches,
-        cosmic::theme::Text::Custom(design::accent_text),
-    ))
+    widget::container(
+        crate::ui_controls::fade_text(label.to_owned())
+            .highlight(&matches, cosmic::theme::Text::Custom(design::accent_text)),
+    )
     .width(Length::Fill)
     .clip(true)
     .class(design::transparent())

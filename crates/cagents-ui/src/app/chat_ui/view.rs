@@ -793,6 +793,9 @@ fn history_key(
 
 /// The lines of a waiting message its row shows.
 const QUEUE_PREVIEW_LINES: usize = 2;
+/// How much of a selected agent's task its summary shows, after the `· `
+/// that sets it off: a task can be a whole prompt.
+const TASK_CHARS: usize = 2 + 160;
 
 /// How much of a waiting message is handed to its row to be laid out. Two
 /// lines never show more, and a hundred entries of sixteen kibibytes each
@@ -887,12 +890,9 @@ fn queue_row<'a>(
         ));
     }
     let preview = widget::container(
-        design::heading(preview)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-            .width(Length::Fill)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(QUEUE_PREVIEW_LINES),
-            )),
+        crate::ui_controls::FadeText::heading(preview)
+            .lines(QUEUE_PREVIEW_LINES)
+            .width(Length::Fill),
     )
     .width(Length::Fill)
     .max_height(QUEUE_LINE_HEIGHT * QUEUE_PREVIEW_LINES as f32)
@@ -3339,14 +3339,17 @@ impl Runtime {
             ];
             match Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
                 Some(task) => summary.push(
-                    design::caption(format!("· {}", Self::short_description(task, 160)))
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill)
-                        .into(),
+                    // Only what the budget can show, and a character past
+                    // it to say there is more, is copied on each frame.
+                    crate::ui_controls::FadeText::caption(format!(
+                        "· {}",
+                        task.char_indices()
+                            .nth(TASK_CHARS - 1)
+                            .map_or(task, |(end, _)| &task[..end])
+                    ))
+                    .limit(TASK_CHARS)
+                    .width(Length::Fill)
+                    .into(),
                 ),
                 None => summary.push(widget::Space::new().width(Length::Fill).into()),
             }

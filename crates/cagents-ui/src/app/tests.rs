@@ -16323,3 +16323,51 @@ fn choosing_a_listed_pull_request_in_the_pane_opens_it() {
     );
     let _ = project;
 }
+
+/// A notice's details are held to their lines by the text engine's own
+/// ellipsis, which the vendored patch makes keep ordinary word wrapping up to
+/// the last line. Exercise the engine the UI reexports, so removing or
+/// bypassing that patch fails here.
+#[test]
+fn notice_detail_ellipsis_preserves_ordinary_word_wrap_geometry() {
+    use cosmic::iced::advanced::graphics::text::cosmic_text::{
+        Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
+        ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
+    };
+
+    let mut db = fontdb::Database::new();
+    db.load_font_data(
+        include_bytes!("../../../../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+    );
+    let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+    let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow. \
+                The five boxing wizards jump quickly.";
+    let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+    let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+    let layout = |ellipsize| {
+        let mut lines = Vec::new();
+        shaped.layout_to_buffer(
+            &mut ShapeBuffer::default(),
+            18.0,
+            Some(110.0),
+            Wrap::WordOrGlyph,
+            ellipsize,
+            None,
+            &mut lines,
+            None,
+            Hinting::Disabled,
+        );
+        lines
+    };
+    let ordinary = layout(Ellipsize::None);
+    let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
+        NOTICE_DETAIL_LINES,
+    )));
+    assert!(ordinary.len() > NOTICE_DETAIL_LINES);
+    assert_eq!(limited.len(), NOTICE_DETAIL_LINES);
+    let expected = &ordinary[NOTICE_DETAIL_LINES - 1].glyphs[0];
+    let actual = &limited[NOTICE_DETAIL_LINES - 1].glyphs[0];
+    assert_eq!(actual.start, expected.start);
+    assert_eq!(actual.x, expected.x);
+    assert!(!text[actual.start..actual.end].starts_with(' '));
+}

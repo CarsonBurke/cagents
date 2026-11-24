@@ -249,7 +249,8 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
 }
 
 /// A copy's refusal stays on its control's one line in a narrow pane, so it
-/// never draws over the text it was copying; the tooltip has all of it.
+/// never draws over the text it was copying: it fades at its slot's end and
+/// the tooltip has all of it.
 #[test]
 fn a_copy_refusal_keeps_to_one_line_beside_its_control() {
     use iced::advanced::{Layout, layout, widget::Tree};
@@ -283,14 +284,23 @@ fn a_copy_refusal_keeps_to_one_line_beside_its_control() {
         &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
     );
     let row = Layout::new(&node).bounds();
+    let said = Layout::new(&node)
+        .children()
+        .nth(1)
+        .expect("the refusal's slot")
+        .bounds();
     let shaped = paragraph(&tree).expect("the refusal's text").min_bounds();
     assert!(
         row.height <= super::MESSAGE_ACTION_HEIGHT,
         "the refusal fits the action row: {row:?}, text {shaped:?}"
     );
     assert!(
-        row.width <= width + 0.1 && shaped.width <= width,
-        "the refusal stays inside the pane: {row:?}, text {shaped:?}"
+        row.width <= width + 0.1 && said.x + said.width <= width + 0.1,
+        "the refusal stays inside the pane: {row:?}, slot {said:?}"
+    );
+    assert!(
+        shaped.width > said.width,
+        "the refusal is longer than its slot, so it fades there: slot {said:?}, text {shaped:?}"
     );
 }
 
