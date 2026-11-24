@@ -17,6 +17,7 @@ import re
 import resource
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -89,6 +90,13 @@ TEST_ENVIRONMENT_IGNORED = re.compile(r"CAGENTS_TEST_|RUST_TEST_|RUSTFLAGS$|RUST
 EXCERPT_CHARACTERS = 12000
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
+# Diagnostic files outlive transient failures, with a daily sweep under the watcher lock.
+EVIDENCE_SWEEP_SECONDS = 24 * 60 * 60
+LOG_RETENTION_SECONDS = 30 * EVIDENCE_SWEEP_SECONDS
+SHA_NAME = r"([0-9a-f]{40}|[0-9a-f]{64})"
+LOG_NAME = re.compile(SHA_NAME + rf"-(?:(?:{'|'.join(CHECKS)})(?:-warnings)?"
+                      rf"|test-(?:{'|'.join(TEST_LANES)})|evidence)\.log")
+TEMP_VERDICT_NAME = re.compile(SHA_NAME + r"\.new")
 # Bundles releases of what compiled; see scripts/prebuild-release.
 PREBUILD_SERVICE = "cagents-prebuild.service"
 # native-evidence's task for these builds: its path must be short, for sockets.
@@ -103,6 +111,52 @@ def save(path, state):
     temporary = path.with_suffix(".new")
     temporary.write_text(json.dumps(state, indent=2) + "\n")
     temporary.replace(path)
+
+
+def expire_files(path, names, cutoff, protected=()):
+    """Remove only old sentinel files, relative to the opened directory."""
+    try:
+        directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        root = os.fstat(directory)
+        if root.st_uid != os.geteuid() or root.st_mode & 0o022:
+            return
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                match = names.fullmatch(entry.name)
+                if match is None or match[1] in protected:
+                    continue
+                with contextlib.suppress(OSError):
+                    info = entry.stat(follow_symlinks=False)
+                    if (stat.S_ISREG(info.st_mode) and info.st_uid == root.st_uid
+                            and info.st_nlink == 1 and info.st_mtime < cutoff):
+                        os.unlink(entry.name, dir_fd=directory)
+    except OSError:
+        pass
+    finally:
+        os.close(directory)
+
+
+def prune_evidence(directory, state):
+    """Keep pending reports and current evidence usable under the state lock."""
+    now = time.time()
+    last = state.get("evidence_swept_at")
+    if last is not None and 0 <= now - last < EVIDENCE_SWEEP_SECONDS:
+        return
+    bisecting = state.get("bisect") or {}
+    pending = state.get("pending") or {}
+    protected = {state.get(key) for key in ("checked", "last_good", "compiled", "built",
+                                           "tested", "tests_last_good", "tests_pending")}
+    protected.update([pending.get("sha"), bisecting.get("after"), *bisecting.get("commits", [])])
+    cutoff = now - LOG_RETENTION_SECONDS
+    expire_files(directory / "logs", LOG_NAME, cutoff, protected)
+    # A published verdict is a durable release decision. A .new file was
+    # interrupted before publication and no reader uses it.
+    expire_files(directory / "verdicts", TEMP_VERDICT_NAME, cutoff)
+    state["evidence_swept_at"] = now
+    save(directory / "state.json", state)
 
 
 def git(repository, *args):
@@ -485,12 +539,18 @@ def report_tests(directory, state, verdict):
     for lane, entry in verdict["lanes"].items():
         body += f"- {lane}: exit {entry['status']} in {entry['seconds']} s\n"
     for lane, entry in verdict["lanes"].items():
-        if entry["status"]:
-            log = directory / "logs" / f"{sha}-test-{lane}.log"
-            excerpt = failure_excerpt(log.read_text(errors="replace")).replace("```", "'''")
-            threads = f"RUST_TEST_THREADS={TEST_THREADS[lane]} " if lane in TEST_THREADS else ""
-            body += (f"\n{lane}, as `{threads}{' '.join(test_command(lane))}` "
-                     f"(complete log on fw16 at `{log}`):\n```text\n{excerpt}\n```\n")
+        if not entry["status"]:
+            continue
+        log = directory / "logs" / f"{sha}-test-{lane}.log"
+        threads = f"RUST_TEST_THREADS={TEST_THREADS[lane]} " if lane in TEST_THREADS else ""
+        body += f"\n{lane}, as `{threads}{' '.join(test_command(lane))}` "
+        try:
+            output = log.read_text(errors="replace")
+        except FileNotFoundError:
+            body += "(log unavailable on fw16).\n"
+            continue
+        excerpt = failure_excerpt(output).replace("```", "'''")
+        body += f"(complete log on fw16 at `{log}`):\n```text\n{excerpt}\n```\n"
     body_file = directory / "test-issue.md"
     body_file.write_text(body)
     if not state.get("test_issue"):
@@ -569,9 +629,11 @@ def require_tests(repository, directory, revision):
             verdict = test_commit(repository, directory, sha)
             # Back where the watcher left its checkout, which it builds from.
             path = directory / "state.json"
-            checked = json.loads(path.read_text()).get("checked") if path.exists() else None
+            state = json.loads(path.read_text()) if path.exists() else {}
+            checked = state.get("checked")
             if checked:
                 checkout_commit(repository, checked)
+            prune_evidence(directory, state)
         return verdict
 
 
@@ -610,6 +672,7 @@ def tick_locked(repository, directory, github_repository):
         if state.get("github_repository", github_repository) != github_repository:
             raise RuntimeError("state belongs to another GitHub repository")
         state["github_repository"] = github_repository
+        prune_evidence(directory, state)
         if time.time() < state.get("retry_after", 0):
             return
         # The timestamp also bounds restart/manual invocations and failed Git fetches.

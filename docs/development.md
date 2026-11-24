@@ -1001,9 +1001,12 @@ checking an up-to-date branch before merge.
 
 The offline regression uses disposable Git history and stand-ins for the gate
 and GitHub: `python3 -I -B tests/main_build_sentinel.py -v`. It does not compile
-Rust or change real issues. Remove old logs under the sentinel's state directory
-when their evidence is no longer needed; leave `state.json` in place to preserve
-its checked cursor and issue number.
+Rust or change real issues. The sentinel sweeps its logs once a day, removing
+files older than 30 days except evidence for pending reports, active bisections,
+and the check, test, and build results referenced by the watcher, including its
+last passing commits. It also removes abandoned verdict writes after 30 days.
+Published verdicts record release decisions and can still report failed lanes
+after their logs expire. `state.json` holds the checked cursor and issue number.
 
 ### Prebuilding release bundles
 
