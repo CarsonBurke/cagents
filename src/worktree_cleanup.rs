@@ -531,10 +531,8 @@ fn acquire_with_directory_pin(
     let mut roots = vec![directory.clone()];
     if !exclusive {
         for ancestor in directory.ancestors().skip(1) {
-            match ancestor.join(".git").symlink_metadata() {
-                Ok(_) => roots.push(ancestor.to_owned()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+            if crate::git_marker::present(&ancestor.join(".git"))? {
+                roots.push(ancestor.to_owned());
             }
         }
     }
@@ -1704,9 +1702,15 @@ mod tests {
     fn nested_editors_protect_containing_worktrees() {
         let runtime = fixture_directory();
         let directory = fixture_directory();
-        std::fs::write(directory.path().join(".git"), "gitdir: ignored").unwrap();
+        let marker = directory.path().join(".git");
+        std::fs::create_dir(&marker).unwrap();
         let nested = directory.path().join("nested/folder");
         std::fs::create_dir_all(&nested).unwrap();
+        let editor = acquire(runtime.path(), &nested, false).unwrap();
+        drop(acquire(runtime.path(), directory.path(), true).unwrap());
+        drop(editor);
+
+        std::fs::write(marker.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let editor = acquire(runtime.path(), &nested, false).unwrap();
         assert_eq!(
             acquire(runtime.path(), directory.path(), true)

@@ -470,6 +470,22 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
         self.assertEqual(len(self.calls(calls, 2)), 2)
 
+    def test_a_fresh_schedule_skips_pruner_checkout_discovery(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        (self.root / "pruner.scheduled").touch()
+        queried = self.root / "git-called"
+        git = self.root / "git"
+        git.write_text(f"#!/bin/sh\ntouch '{queried}'\nexit 1\n")
+        git.chmod(0o755)
+        self.env["PATH"] = f"{self.root}{os.pathsep}{os.environ['PATH']}"
+
+        result = self.guard(1, guard=guard)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.reap()
+        self.assertFalse(queried.exists())
+        self.assertFalse(calls.exists())
+
     def test_the_build_does_not_wait_for_the_scheduled_prune(self):
         guard = self.alone()
         pruner = guard.with_name("prune-build-dirs")
@@ -586,7 +602,7 @@ class InstallCargoGate(unittest.TestCase):
         names = ["build-disk-guard", "build-host", "cagents-cargo-gate", "cargo-gate-command.py",
                  "cargo-host-test-helper.py", "cargo_artifacts.py",
                  "cargo-gate-rustc-guard", "cargo-gate-sync.py", "cargo-incremental-retry.py", "cargo-offload",
-                 "memory-capped", "prune-build-dirs", "seed-build-dir"]
+                 "git_ancestry.py", "memory-capped", "prune-build-dirs", "seed-build-dir"]
         self.assertEqual(
             sorted(path.name for path in self.root.iterdir()),
             sorted(names + ["cagents-cargo-gate.d", "cagents-cargo-gate.install.lock",
@@ -631,7 +647,7 @@ class InstallCargoGate(unittest.TestCase):
         for name in ("install-cargo-gate", "cargo-gate", "build-host", "cargo-gate-command.py",
                      "cargo-host-test-helper.py", "cargo_artifacts.py",
                      "cargo-gate-sync.py", "cargo-gate-rustc-guard", "cargo-incremental-retry.py", "cargo-offload",
-                     "seed-build-dir", "memory-capped",
+                     "git_ancestry.py", "seed-build-dir", "memory-capped",
                      "build-disk-guard", "prune-build-dirs"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (scripts / "cargo-gate-command.py").write_text("import sys\nsys.exit(3)\n")

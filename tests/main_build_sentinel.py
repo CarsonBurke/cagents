@@ -611,19 +611,27 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and fixed in str(entry)
                             for entry in self.recorded()))
 
-    def test_a_failed_test_report_is_retried_without_testing_again(self):
+    def test_a_failed_test_report_leaves_evidence_and_bisection_complete(self):
+        self.with_evidence_tool()
         self.tick()
+        warned = self.commit("break a check", warning="host")
         (self.origin / "failing-cli").touch()
-        self.commit("break a test")
+        tip = self.commit("break a test too")
         self.now += 120
-        with patch.object(sentinel, "report_tests", side_effect=RuntimeError("network unavailable")):
-            with self.assertRaisesRegex(RuntimeError, "network"):
+        with patch.object(sentinel, "report_tests", side_effect=RuntimeError("API rate limit exceeded")):
+            with self.assertRaisesRegex(RuntimeError, "rate limit"):
                 self.tick()
+        self.assertTrue((self.state / "builds" / tip).is_dir())
+        self.assertTrue(any(entry[:2] == [warned, "host"] for entry in self.recorded()))
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertNotIn("bisect", state)
+        self.assertEqual(state["tests_pending"], tip)
         before = self.tested()
         self.now += 120
         self.tick()
         self.assertEqual(self.tested(), before)
-        self.assertTrue(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+        self.assertTrue(any(entry[:4] == ["issue", "create", "--title", sentinel.TEST_TITLE]
+                            for entry in self.recorded()))
         self.assertNotIn("tests_pending", json.loads((self.state / "state.json").read_text()))
 
     def test_a_required_commit_is_tested_once_and_its_verdict_returned(self):
@@ -867,6 +875,26 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertTrue(sentinel.require_tests(self.repo, self.state, tip)["passed"])
 
+    def test_a_new_verdict_is_returned_before_the_watcher_releases_its_locks(self):
+        self.tick()
+        tip = self.first
+        verdict = self.state / "verdicts" / f"{tip}.json"
+        saved = verdict.read_text()
+        verdict.unlink()
+        with ((self.repo / ".worktrees" / ".main-build-sentinel.lock").open("a") as checkout_lock,
+              (self.state / "lock").open("a") as lock):
+            fcntl.flock(checkout_lock, fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+
+            def publish(seconds):
+                self.assertEqual(seconds, 1)
+                self.assertFalse(verdict.exists())
+                verdict.write_text(saved)
+
+            with patch.object(sentinel.time, "sleep", side_effect=publish) as sleep:
+                self.assertTrue(sentinel.require_tests(self.repo, self.state, tip)["passed"])
+                sleep.assert_called_once()
+
     def with_isolation_check(self):
         """Commits a lane-isolation check that records its runs and fails
         where the checkout has `leaky`, as when a lane resolves another's graph."""
@@ -974,7 +1002,14 @@ for name in BINS:
 
     def test_the_newest_passing_commit_is_kept_built_for_evidence(self):
         sha = self.with_evidence_tool()
-        self.tick()
+        keep_build = sentinel.keep_main_build
+
+        def keep_after_tests(repo, directory, state):
+            self.assertTrue(sentinel.read_verdict(directory, sha)["passed"])
+            keep_build(repo, directory, state)
+
+        with patch.object(sentinel, "keep_main_build", side_effect=keep_after_tests):
+            self.tick()
         build = self.state / "builds" / sha
         self.assertEqual((build / "cagents-ui").read_text(), sha)
         self.assertEqual((build / "arguments").read_text().splitlines()[-1], "--profile dev-runtime --bin cagents-ui")

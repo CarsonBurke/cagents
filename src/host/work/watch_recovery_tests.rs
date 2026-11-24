@@ -135,6 +135,89 @@ fn coverage(scanner: &mut Scanner, handle: &Handle, id: ProjectId, expected: boo
 }
 
 #[test]
+fn registration_catches_edits_since_the_initial_scan_in_metadata_only_worktrees() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("repository");
+    let linked = directory.path().join("linked");
+    std::fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.name", "Watch fixture"]);
+    git(&root, &["config", "user.email", "watch@example.invalid"]);
+    std::fs::write(root.join("README"), "tracked\n").unwrap();
+    git(&root, &["add", "README"]);
+    git(&root, &["commit", "-qm", "fixture"]);
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let linked = linked.canonicalize().unwrap();
+    let repository = root.canonicalize().unwrap().join(".git");
+    let handle = fixture_handle();
+    let project = handle.shared().track(&repository, "fixture").id;
+    let mut scanner = Scanner {
+        monitor: Some(git_watch::Monitor::start(|| {}).unwrap()),
+        configured: BTreeMap::new(),
+        stamped: HashMap::new(),
+        sessions: Vec::new(),
+        sampled: None,
+        refreshed: None,
+    };
+    let later = now_unix_ms() + crate::work::ACTIVE_WINDOW_MS + 1;
+    complete_scan_at(&mut scanner, &handle, later);
+    let read_linked = || {
+        handle.shared().projects[&repository]
+            .local
+            .as_ref()
+            .unwrap()
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == linked)
+            .unwrap()
+            .clone()
+    };
+    let before = read_linked();
+    assert_eq!(before.dirty.as_ref().unwrap().paths, 0);
+    assert_eq!(
+        handle.shared().projects[&repository]
+            .local
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .unwrap()
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.id == before.id)
+            .unwrap()
+            .interest(),
+        git_watch::Interest::Metadata
+    );
+
+    // This changes neither the index nor HEAD, and this checkout has no
+    // content watches to report the edit.
+    std::fs::write(linked.join("README"), "edited before registration\n").unwrap();
+    scanner.configure(&handle);
+    coverage(&mut scanner, &handle, project, true);
+    handle
+        .shared()
+        .projects
+        .get_mut(&repository)
+        .unwrap()
+        .last_scan = Some(Instant::now() - SCAN_SPACING);
+    complete_scan_at(&mut scanner, &handle, later);
+    let after = read_linked();
+    assert_eq!(after.dirty.as_ref().unwrap().paths, 1);
+    assert!(after.status_read_at > before.status_read_at);
+}
+
+#[test]
 fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("repository");

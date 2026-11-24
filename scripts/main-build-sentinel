@@ -1,9 +1,7 @@
 #!/usr/bin/python3
-"""Check main's newest commit through the fw16 gate whenever it moves, find
-the first-parent commit at which each failing lane first fails when it fails
-after passing, build the newest checked commit that compiles for native
-evidence to start from, then run every lane's tests on it and record their
-verdict, which a release of that commit requires.
+"""Check main's newest commit through the fw16 gate whenever it moves. Run
+every test lane on the newest compiling commit and record its release verdict.
+Keep native evidence executables and bisect lanes that fail after passing.
 
 With --require-tests SHA it records that commit's verdict, testing it first
 if it has none, and exits 0 only when its tests pass."""
@@ -676,27 +674,32 @@ def report_tests(directory, state, verdict):
 
 
 def test_main(repository, directory, state):
-    """Tests the newest checked commit once, if it compiled. A verdict to
-    report survives a failed notification and is retried without testing."""
+    """Test the newest checked commit once, if it compiled, and queue its report."""
     path = directory / "state.json"
     sha = state.get("checked")
-    if not state.get("tests_pending"):
-        if not sha or state.get("compiled") != sha:
-            return
-        # A verdict removed by hand has the commit tested again.
-        if state.get("tested") == sha and read_verdict(directory, sha) is not None:
-            return
-        if time.time() < state.get("tests_retry_after", 0):
-            return
-        verdict = read_verdict(directory, sha) or test_commit(repository, directory, state, sha)
-        if verdict.get("outside_code"):
-            # Not the code's verdict; tested again after a pause.
-            state["tests_retry_after"] = time.time() + 1800
-            save(path, state)
-            return
-        state.pop("tests_retry_after", None)
-        state["tests_pending"] = sha
+    if state.get("tests_pending") or not sha or state.get("compiled") != sha:
+        return
+    # A verdict removed by hand has the commit tested again.
+    if state.get("tested") == sha and read_verdict(directory, sha) is not None:
+        return
+    if time.time() < state.get("tests_retry_after", 0):
+        return
+    verdict = read_verdict(directory, sha) or test_commit(repository, directory, state, sha)
+    if verdict.get("outside_code"):
+        # Not the code's verdict; tested again after a pause.
+        state["tests_retry_after"] = time.time() + 1800
         save(path, state)
+        return
+    state.pop("tests_retry_after", None)
+    state["tests_pending"] = sha
+    save(path, state)
+
+
+def report_pending_tests(directory, state):
+    """Retry a failed notification using the recorded verdict."""
+    if not state.get("tests_pending"):
+        return
+    path = directory / "state.json"
     verdict = read_verdict(directory, state["tests_pending"])
     if verdict is None:
         # Removed by hand to have it tested again.
@@ -714,15 +717,16 @@ def test_main(repository, directory, state):
 
 
 def require_tests(repository, directory, revision):
-    """Blocks until no tick runs, then returns the commit's verdict, testing
-    it first if it has none, and fetching main first if it is not known here."""
+    """Returns as soon as the commit has a verdict. If it needs testing,
+    wait for the sentinel's checkout and fetch main if the commit is unknown."""
     commit = f"{revision}^{{commit}}"
     # A verdict, once written, never changes: one already kept needs no lock,
     # and so does not wait for a tick testing another commit.
     known = subprocess.run(["git", "-C", str(repository), "rev-parse", "--quiet", "--verify", commit],
                            text=True, stdout=subprocess.PIPE)
-    if not known.returncode:
-        verdict = read_verdict(directory, known.stdout.strip())
+    known_sha = known.stdout.strip() if known.returncode == 0 else None
+    if known_sha is not None:
+        verdict = read_verdict(directory, known_sha)
         if verdict is not None:
             return verdict
     worktrees = repository / ".worktrees"
@@ -730,8 +734,21 @@ def require_tests(repository, directory, revision):
     directory.mkdir(parents=True, exist_ok=True)
     with ((worktrees / ".main-build-sentinel.lock").open("a") as checkout_lock,
           (directory / "lock").open("a") as lock):
-        fcntl.flock(checkout_lock, fcntl.LOCK_EX)
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(checkout_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                fcntl.flock(checkout_lock, fcntl.LOCK_UN)
+                # The watcher publishes the verdict before building its native
+                # evidence. An exact commit can return while that work still
+                # holds the checkout and state locks.
+                if known_sha is not None and revision == known_sha:
+                    verdict = read_verdict(directory, known_sha)
+                    if verdict is not None:
+                        return verdict
+                time.sleep(1)
         if subprocess.run(["git", "-C", str(repository), "rev-parse", "--quiet", "--verify", commit],
                           stdout=subprocess.DEVNULL).returncode:
             git(repository, "fetch", "--no-tags", "origin", "main")
@@ -841,14 +858,15 @@ def tick_locked(repository, directory, github_repository):
                 state["last_good"] = pending["sha"]
             state["queue"].pop(0)
             save(path, state)
-        # Before bisecting moves the checkout off the commit it builds.
-        keep_main_build(repository, directory, state)
-        # After bisecting, which names the commit that broke a check sooner.
-        if state.get("bisect"):
-            bisect(repository, directory, state)
         # Before the tests, which take long enough to bundle the commit beside.
         start_prebuild()
         test_main(repository, directory, state)
+        # Neither release gate needs a development-runtime build. Keep it
+        # before bisecting moves the checkout off the checked commit.
+        keep_main_build(repository, directory, state)
+        if state.get("bisect"):
+            bisect(repository, directory, state)
+        report_pending_tests(directory, state)
 
 
 def main():

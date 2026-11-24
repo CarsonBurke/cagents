@@ -2,22 +2,254 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0a0b0d" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#161a24" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f4f0" />
+    <title>cagents: every coding agent and account in one native Linux app</title>
     <meta
       name="description"
-      content="cagents is a native Wayland workspace for coding-agent sessions, repositories, worktrees, terminals, and browsers."
-    />
-    <meta property="og:title" content="cagents — a native workspace for coding agents" />
-    <meta
-      property="og:description"
-      content="Keep agent sessions, Git worktrees, persistent terminals, and browser surfaces together."
+      content="Run several Claude Code and Codex accounts side by side, and keep all your coding agents in one native Linux app, with their terminals, diffs and pull requests."
     />
     <meta property="og:type" content="website" />
-    <title>cagents — a native workspace for coding agents</title>
+    <meta property="og:title" content="cagents: every coding agent and account in one native Linux app" />
+    <meta
+      property="og:description"
+      content="Run several Claude Code and Codex accounts side by side, and keep all your coding agents in one native Linux app, with their terminals, diffs and pull requests."
+    />
+    <meta property="og:url" content="https://carsonburke.github.io/cagents/" />
+    <meta property="og:image" content="https://carsonburke.github.io/cagents/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="preload" href="/fonts/open-sans-regular.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/open-sans-bold.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="nav">
+      <a class="brand" href="#top">
+        <img src="/icon.svg" width="32" height="32" alt="" />
+        <span>cagents</span>
+      </a>
+      <nav aria-label="Primary">
+        <ul>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#install">Install</a></li>
+          <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/user-guide.md">Docs</a></li>
+          <li>
+            <a class="nav-github" href="https://github.com/CarsonBurke/cagents">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.52-1.34-1.28-1.7-1.28-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.57-.29-5.27-1.29-5.27-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.47.11-3.06 0 0 .97-.31 3.16 1.18a10.9 10.9 0 0 1 5.76 0c2.19-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.77.11 3.06.74.81 1.19 1.84 1.19 3.1 0 4.42-2.71 5.39-5.29 5.68.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z" />
+              </svg>
+              GitHub
+            </a>
+          </li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h1 id="hero-title">Every coding agent and every account, in one native Linux app</h1>
+          <p class="lede">
+            Run several Claude Code and Codex accounts side by side, next to
+            Antigravity, Muse and Oh My Pi, each agent with its own terminals,
+            diffs and pull requests.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="#install">Install for Linux</a>
+            <a class="button" href="https://github.com/CarsonBurke/cagents">Source on GitHub</a>
+          </div>
+          <p class="fine">Linux x86_64 on Wayland · MIT licensed · In beta</p>
+        </div>
+        <figure class="shot shot-hero pane pane-coral">
+          <!--screenshot:workspace:eager-->
+        </figure>
+      </section>
+
+      <section class="features" id="features" aria-labelledby="features-title">
+        <h2 id="features-title" class="visually-hidden">Features</h2>
+
+        <article class="feature" id="accounts">
+          <div class="feature-copy">
+            <h3>Every account, side by side</h3>
+            <p>
+              Add each Claude Code and Codex login you have. Every account keeps
+              its own sign-in and shows how much of its allowance is left, and
+              you choose one per conversation, so a personal and a work account
+              can run at the same time.
+            </p>
+            <p>
+              Set a provider to Automatic and new conversations start on a
+              signed-in plan, moving to another when its allowance runs out.
+            </p>
+          </div>
+          <figure class="shot pane pane-teal">
+            <!--screenshot:accounts-->
+          </figure>
+        </article>
+
+        <article class="feature" id="agents">
+          <div class="feature-copy">
+            <h3>All your agents in one window</h3>
+            <p>
+              Conversations from every provider sit together, grouped by project
+              and worktree, in one native interface rather than a separate terminal
+              or app for each.
+            </p>
+            <p>
+              Switch a Claude Code or Codex session between a real terminal and a
+              native chat of the same conversation. Commands, edits and tool
+              calls stay one line each until you open them.
+            </p>
+          </div>
+          <figure class="shot pane pane-slate">
+            <!--screenshot:agents-->
+          </figure>
+        </article>
+
+        <div class="around" aria-labelledby="around-title">
+          <h2 id="around-title">Around the agents</h2>
+          <ul class="cards">
+            <li>
+              <figure class="shot pane pane-slate">
+                <!--screenshot:worktrees-->
+              </figure>
+              <h3>A worktree per task</h3>
+              <p>
+                Create a worktree from a branch name or a Linear issue. The
+                sidebar shows which agents are working, waiting for you, or have
+                output you haven't read.
+              </p>
+            </li>
+            <li>
+              <figure class="shot pane pane-coral">
+                <!--screenshot:review-->
+              </figure>
+              <h3>Review in place</h3>
+              <p>
+                Read the diff, stage and commit, browse history and review pull
+                requests, with GitHub's viewed marks kept in sync.
+              </p>
+            </li>
+            <li>
+              <figure class="shot pane pane-teal">
+                <!--screenshot:editor-->
+              </figure>
+              <h3>An editor beside the chat</h3>
+              <p>
+                Syntax highlighting, autosave and optional language servers. It
+                also ships on its own as <code>ceditor</code>.
+              </p>
+            </li>
+          </ul>
+        </div>
+
+        <ul class="facts" aria-label="More features">
+          <li>
+            <h3>Sessions outlive the window</h3>
+            <p>
+              A per-user daemon owns every terminal and conversation. Restart
+              the app and your agents keep going; compatible updates keep the
+              daemon and your sessions running.
+            </p>
+          </li>
+          <li>
+            <h3>Other machines, same workspace</h3>
+            <p>
+              Connect to another computer's daemon over SSH for its terminals,
+              chats, files, Git and worktrees.
+              <a href="https://github.com/CarsonBurke/cagents/blob/main/docs/devices.md">Device windows</a>
+            </p>
+          </li>
+          <li>
+            <h3>Keyboard first</h3>
+            <p>
+              Chats, terminals, editors and browsers sit in one horizontal
+              strip. Move with <kbd>Ctrl</kbd>+<kbd>PgUp</kbd> and
+              <kbd>Ctrl</kbd>+<kbd>PgDn</kbd>, and resize the focused pane with
+              <kbd>Alt</kbd>+<kbd>R</kbd>.
+            </p>
+          </li>
+          <li class="fact-cli">
+            <h3>Scriptable from the shell</h3>
+            <p>
+              Start agents, send prompts and read structured results without a
+              window, or let sessions message each other.
+              <a href="https://github.com/CarsonBurke/cagents/blob/main/docs/agent-execution.md">Agent execution</a>
+            </p>
+            <pre><code><span class="prompt">$</span> cagents agent spawn --provider claude --wait \
+    "Find out why the e2e suite is flaky"
+<span class="prompt">$</span> cagents --json sessions</code></pre>
+          </li>
+        </ul>
+      </section>
+
+      <section class="install" id="install" aria-labelledby="install-title">
+        <div class="install-copy">
+          <h2 id="install-title">Install</h2>
+          <p>
+            Run this in a system terminal. It looks up the latest release, checks
+            the installer and the archive against the release's SHA-256
+            manifest, and installs cagents for your user without root or a
+            GitHub account.
+          </p>
+          <p>
+            A copy installed this way updates itself: cagents checks for signed
+            releases and offers each one in the app. Compatible updates keep the daemon and
+            your sessions running.
+          </p>
+          <p>
+            Prefer a package? Download the Debian package, with or without the
+            embedded browser, or a portable archive from the
+            <a href="https://github.com/CarsonBurke/cagents/releases/latest">latest release</a>.
+          </p>
+          <p class="fine">
+            Needs Linux x86_64 with Wayland, glibc 2.35 and Git 2.36 or newer.
+            Bring the agent CLIs you use, signed in with your own accounts.
+            <a href="https://github.com/CarsonBurke/cagents/blob/main/docs/installation.md">Installation guide</a>
+          </p>
+        </div>
+        <div class="command pane pane-slate">
+          <div class="command-bar">
+            <span id="command-label">Verified installer</span>
+            <button type="button" class="copy" data-copy-target="install-command" aria-describedby="command-label">
+              Copy
+            </button>
+          </div>
+          <pre tabindex="0"><code id="install-command"><!--install-command--></code></pre>
+          <p class="copy-status" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <a class="brand" href="#top">
+        <img src="/icon.svg" width="28" height="28" alt="" />
+        <span>cagents</span>
+      </a>
+      <nav aria-label="Documentation">
+        <ul>
+          <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/user-guide.md">User guide</a></li>
+          <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/installation.md">Installation</a></li>
+          <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/configuration.md">Configuration</a></li>
+          <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/development.md">Development</a></li>
+          <li><a href="https://github.com/CarsonBurke/cagents/releases">Releases</a></li>
+          <li><a href="https://github.com/CarsonBurke/cagents">GitHub</a></li>
+        </ul>
+      </nav>
+      <p class="fine">
+        MIT licensed. Screenshots show the real app with invented projects.
+        Fonts: Open Sans and Noto Sans Mono, under the
+        <a href="fonts/OpenSans-OFL.txt">SIL Open Font License</a>.
+      </p>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
   </body>
 </html>

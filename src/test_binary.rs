@@ -11,9 +11,8 @@
 #[macro_export]
 macro_rules! test_binary_setup {
     () => {
-        // Sandboxes such as Codex's can leave an empty .git in writable roots, which then
-        // fails unrelated fixtures with "enclosing Git checkout" refusals. Name the cause on
-        // stderr before any test runs, so it is not read as many separate defects.
+        // Name enclosing Git checkout markers before fixtures refuse to run
+        // beneath them, so one fixture-root problem appears as one diagnostic.
         #[cfg(all(test, target_os = "linux"))]
         #[used]
         #[unsafe(link_section = ".init_array")]
@@ -69,7 +68,7 @@ pub fn report_enclosing_git() {
         found.extend(
             root.ancestors()
                 .map(|ancestor| ancestor.join(".git"))
-                .filter(|marker| marker.symlink_metadata().is_ok()),
+                .filter(|marker| crate::git_marker::present(marker).is_ok_and(|present| present)),
         );
     }
     for marker in found {

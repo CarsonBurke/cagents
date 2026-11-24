@@ -62,6 +62,9 @@ libc = "0.2.189"
 lsp-types = "0.95"
 notify = "=9.0.0-rc.8"
 pulldown-cmark = { version = "0.12.2", default-features = false }
+# Draws the code a phone scans to pair. Without default features it has no
+# dependencies; only the UI resolves it.
+qrcode = { version = "0.15", default-features = false, features = ["std"] }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 resvg = { version = "0.45.1", default-features = false, features = ["text"] }
 roxmltree = "0.20"

@@ -111,9 +111,8 @@ impl Handle {
                 None => error,
             });
         }
-        if let Err(error) = compact_removed_view(host, &subject.item.project, &request.path) {
-            tracing::warn!(%error, path = %request.path.display(), "the removed worktree's view was not compacted");
-        }
+        // The reservation protects the Git removal itself. Compaction checks
+        // liveness and rechecks scope ownership in its own transaction.
         drop(reservation);
         let mut removed = Removed {
             project: subject.item.project.clone(),
@@ -137,6 +136,9 @@ impl Handle {
                 Ok(()) => removed.deleted_branch = Some(branch),
                 Err(failure) => removed.branch_error = Some(failure.detail),
             }
+        }
+        if let Err(error) = compact_removed_view(host, &subject.item.project, &request.path) {
+            tracing::warn!(%error, path = %request.path.display(), "the removed worktree's view was not compacted");
         }
         self.rescan(&subject.item.project);
         Ok(removed)

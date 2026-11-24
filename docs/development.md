@@ -59,6 +59,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `install` | [Install your checkout](#installing-your-checkout) |
 | `package`, `package:smoke` | Build Linux packages; exercise package upgrades in a networkless root |
 | `release:build`, `release:verify` | [Build a release](releasing.md#building-a-release) from a tag; verify a bundle without publishing |
+| `mobile:test`, `mobile:build`, `mobile:install` | Test, build or install the [Android app](../mobile/README.md): Gradle runs on the build host through `scripts/gradle-remote`, and installing runs `adb` here |
 
 Arguments for a task go after `--`. A lane task's arguments replace its default
 target selection, so naming a target narrows the lane rather than adding to it,
@@ -736,7 +737,11 @@ shares free starts at once. Waiting builds line up behind a queue lock, and
 the one at its head takes shares as they free, so a build that needs two is
 not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
-the first), and builds offloaded to the host take them too.
+the first), and builds offloaded to the host take them too. A caller that may
+not write there, such as a Codex job whose sandbox mounts `/var/tmp`
+read-only, locks the existing files read-only instead: flock needs no write
+access, so it still excludes every other build. It cannot create a missing
+one, and says which; any build run outside the sandbox creates it.
 
 Builds rarely reach their peaks together: with every share on fw16 held,
 builds' anonymous memory came to about a third of their shares' on average and
@@ -905,16 +910,9 @@ the one main is held to. Its logs hold Cargo's rendered diagnostics, and
 `logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
 compiled, the issue shows those rather than the log's tail.
 
-Once the newest commit it checked, the tip it last saw, compiles, warnings or not, the sentinel also
-builds the three executables [native evidence](#native-evidence) runs for that
-commit and keeps
-them under `builds/` in its state directory, for the six newest such commits,
-about 0.6 GiB each. Evidence of main then copies them instead of compiling. A
-build that fails is logged to `logs/SHA-evidence.log` and not retried; evidence
-of that commit compiles it as before.
-
-Then it runs every lane's tests on that same commit, once, in the ordinary
-test profile on the sentinel's warm build directory:
+Once the newest checked commit compiles, the sentinel starts its release
+prebuild and runs every lane's tests on that commit in the ordinary test
+profile on the sentinel's warm build directory:
 `scripts/cargo-gate test --locked --all-targets --no-fail-fast` for the CLI,
 `--features host`, the shared library and application with `ui`, the same
 with the integrated browser (`cagents-ui/browser-protocol-fixture`, which
@@ -945,11 +943,21 @@ across commits. It records the fourth such failure and names the stray marker
 as a possible cause in the issue. A recorded verdict or a change in the marker
 set starts a new count. Other outside-code stops preserve the count.
 
+After the test lanes finish, the sentinel builds the three executables
+[native evidence](#native-evidence) runs and keeps them under `builds/` for the
+six newest built commits, about 0.6 GiB each. Native evidence copies these
+executables when available. A build that fails is logged to
+`logs/SHA-evidence.log`, and native evidence builds that commit when needed.
+The sentinel builds this evidence and bisects check failures before sending
+test notifications to GitHub.
+
 `scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
 commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a
 lane stopped outside the code and 4 if it could not get a verdict at all. A commit without a verdict, such as a version
 bump that main moved past before it was tested, is tested first, after any
 running check finishes, fetching main first if fw16 does not have it yet.
+When the watcher records that SHA's verdict, a waiting release can read it
+while the watcher still holds the checkout for native evidence.
 A failing verdict is not retested on its own: to test a commit again, such as
 after a flaky failure, remove its `verdicts/SHA.json`. If that commit is the
 newest one tested, the watcher tests it again on its next run.
@@ -1027,18 +1035,20 @@ A release signs and publishes a bundle fw16 has already built and checked
 ([Releasing](releasing.md)). `scripts/prebuild-release`, run as the
 `cagents-prebuild` user service, makes those bundles. The sentinel starts the
 service, without waiting for it, before it runs a commit's tests and again at
-every tick. The service bundles the newest main commit that compiled, unless
-that commit's tests failed or the version it declares is already tagged on
-origin (between a release and main's version bump; `status` shows it as
-skipped, and a request still builds it). Each bundle is exactly what
+every tick. The service bundles the newest main commit that compiled. If that
+commit's tests fail, it looks for a passing first-parent commit of the same
+version. It skips versions already tagged on origin, as happens between a
+release and main's version bump. A request can still build an already released
+version with a passing or pending verdict. Each bundle is exactly what
 `scripts/build-release-linux` makes of the commit with the commit's own scripts,
 including the artifact smoke checks and the metadata that lists every file's
 size and digest. It is built in a `.partial` directory and renamed into
 `~/.local/state/cagents-prebuilt/bundles/SHA` only once it is complete. The
-three newest bundles are kept (`--keep N`), plus any that a release has pinned
-in the past day. Its build cache and smoke runtime image
-are under `~/.cache/cagents-prebuild`, separate from the ones
-`scripts/release build` uses.
+store keeps three bundles (`--keep N`), plus any that a release has pinned in
+the past day. It retains a passing bundle of the current version when
+available and there is room for both it and a newer build. The build cache and
+smoke runtime image live under `~/.cache/cagents-prebuild`. The manual
+`scripts/release build` command uses its own caches.
 
 A background prebuild never delays the sentinel's verdicts or anyone else's
 build:
@@ -1078,12 +1088,14 @@ build:
   is how long that build then took.
 
 `prebuild-release request SHA` builds a commit next at normal priority,
-interrupting a background prebuild of another commit; requests build in the
-order they were made. `wait SHA [--timeout S]` blocks until the commit is
-bundled, and `status` lists bundles, the build running, requests and
-failures. A failed build is tried once more an hour later, in case the host
-rather than the commit failed; after that, or once its tests fail, only a
-request builds it again. Its log is under `failures/` in the store.
+interrupting a background prebuild of another commit. Requests build in the
+order they were made. An already starved build can finish the same commit
+without giving up its build slot. `wait SHA [--timeout S]` blocks until the
+commit is bundled or fails. `status` lists bundles, the build running,
+requests and failures. A failed build is tried once more an hour later, in case the host
+rather than the commit failed. After that, only a request builds it again.
+Both commands refuse a commit with a failing test verdict. Build failure logs
+are under `failures/` in the store.
 
 Install the service on fw16 beside the sentinel, in
 `~/.config/systemd/user/cagents-prebuild.service`:
@@ -1263,15 +1275,16 @@ Before each Cargo command under the slot's running lock, the gate checks the
 incremental state in its configured build directory. Rust 1.93 can overwrite
 hard-linked pre-LTO bitcode and ThinLTO keys in the last finalized session
 while it compiles the next one. If interrupted, the old work-product index
-can then describe inputs from two builds. A newer unfinished session or an
-input newer than the last work-product index causes the gate to move out the
-whole crate cache before Cargo runs. A slot discards its old incremental
-state when adopting this check or after a lease from an older gate, and
-keeps its compiled outputs. For a directory outside the slot's lock, the
+can then describe inputs from two builds. A finalized ThinLTO key file or
+pre-LTO bitcode file newer than that index causes the gate to move out the
+whole crate cache before Cargo runs. Rustc handles unfinished sessions left
+by ordinary compile errors at the next compile. A slot discards its old
+incremental state when adopting this check or after a lease from an older gate,
+and keeps its compiled outputs. For a directory outside the slot's lock, the
 gate disables incremental compilation for the command. When Cargo uses
 the gate's default compiler wrapper, an undefined-symbol link error in a
 workspace crate moves out that crate's incremental cache and retries the
-compiler once. The compiler fix is tracked in
+compiler once, suppressing repeated diagnostics. The compiler fix is tracked in
 [rust-lang/rust#159287](https://github.com/rust-lang/rust/pull/159287).
 
 A checkout's gate defers to the installed one, `/var/tmp/cagents-cargo-gate`
@@ -1314,20 +1327,13 @@ there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR`,
 `$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
 for the Unix sockets tests bind under it and emptied before the next command
-there; a HOST test lane leaves about 12 MB. It follows the ancestry, home and
-socket constraints in the HOST recipe below rather than selecting `/tmp`,
-`/var/tmp`, `~/.cache` or the home directory: agent
-sandboxes create `.git` placeholders in the first three, recovery placement
-deliberately refuses any enclosing `.git`, and fixtures refuse roots inside
-the home directory. The runtime directory exists while the host has a login
-session for the user, which the connection itself provides; without one,
-temporary files fall back to the slot, and `test` stops with status 78 if a
-marker is above it. While a
-`.git` sits in any of its ancestors on the host, `test` stops with status 78
-and names it, since fixtures that check Git ancestry fail under one and
-building here instead would hide the leak. Stop and investigate its ownership;
-do not remove a shared marker to make tests pass. Other commands still run there. Cargo's registry and Git caches and the toolchain on the
-host are shared with anything else built there; Cargo locks its caches itself.
+there. A HOST test lane leaves about 12 MB. The runtime directory meets the
+ancestry, home and socket constraints in the HOST recipe below. It exists
+while the host has a login session for the user, which the connection itself
+provides. Without one, temporary files fall back to the slot. If a Git marker
+encloses the selected temporary directory, `test` stops with status 78 and
+names the marker. Other commands still run there. Cargo shares its locked
+registry and Git caches and the toolchain with other builds on the host.
 
 ### Compilation jobs and shared build directories
 
@@ -1693,6 +1699,20 @@ arguments narrow targets, not packages; for the application's tests alone, run
 `scripts/cargo-gate test --locked -p cagents-ui --all-targets`, and for the kit's,
 `-p cagents-ui-kit`.
 
+The cli, host and ui lanes each build the shared library's tests with their
+own features. A test module whose code never branches on a feature would run
+the same tests in each, so it is declared with
+`#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]` and runs only in
+`test:cli`. `scripts/check-cli-only-tests` refuses that gate when the module,
+its submodules, its tests or any file they include mention a feature, when the
+cli lane does not build the module, or when a test module excludes a lane with
+any other cfg; `--eligible` lists the `#[cfg(test)]` modules that could take
+it. It cannot see a feature branch in code outside the module that the tests
+reach through a call, nor a dependency feature only another lane enables (the
+ui graph turns on serde_json's `preserve_order`), so keep `#[cfg(test)]` for
+tests that depend on either. Test helpers that only such modules use take the
+same gate, or the other lanes report them as dead code.
+
 An SSH login has a soft limit of 1024 open files, and whatever it starts, with
 `nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
 with `Too many open files`, so run `ulimit -n 65536` first.
@@ -1725,8 +1745,9 @@ scripts/cargo-gate test --locked --no-default-features --features host --all-tar
 For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
 private **disk-backed** base with a short, physical absolute path. Verify its
 filesystem with `findmnt -T PATH`; `/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can
-be RAM-backed. Neither the base nor any ancestor may contain a `.git` file,
-directory or symlink. The base must also be outside the account home reported
+be RAM-backed. The base and its ancestors must be outside a Git checkout.
+A `.git` file, symlink or directory with `HEAD` counts as a marker. An empty
+sandbox placeholder is skipped. The base must also be outside the account home reported
 by `getent passwd "$(id -u)"`, even when `HOME` points elsewhere: bundled-skill
 tests deliberately refuse installation beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
@@ -2336,9 +2357,8 @@ mode; CLI and cleanup use the same name. The task keeps that selection across
 starts and refuses a different name. This needs a source runner supporting
 `--in-session`; default unnamed tasks retain compatibility with older runners
 and saved seeds.
-Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
-`/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
-fixtures refuse.
+Each task keeps everything in one directory outside Git ancestry. The
+default keeps the task under `~/.local/state/cev/`.
 
 Build before taking a native slot, and never wait for Cargo while holding one: other native sessions queue behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.6 GiB. A clean checkout of a main commit that the [main build sentinel](#watching-main-after-merges) has built takes its executables instead, without compiling, so build `before` from the newest `origin/main` tip it checked. A build that changes how Rust compiles, with `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or a `CARGO_PROFILE_*` setting as a measurement at another optimization level does, compiles both sides with them, since the sentinel's executables were built without them; through `--remote`, a revision or the integrated lane that the host compiles gets them too. `build SIDE CHECKOUT --executables DIR` takes executables already built elsewhere from exactly that checkout, as the remote route below does. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
@@ -2782,14 +2802,38 @@ runs the whole update, including the checks after NEW starts. Add `--feed DIR`
 to rehearse that path: DIR is a file feed holding NEW's signed bundle
 (`scripts/release feed`), and the feed's archive must match `--new-dir`. OLD's
 own `cagents daemon upgrade --version NEW` then finds NEW in the feed and starts
-the same update worker as the app's Update button. A rehearsal or development
+the update worker the app's Update button starts; the CLI, rather than a window,
+answers its review. A rehearsal or development
 build reads the feed as `CAGENTS_UPDATE_FEED`. An unmodified published build
 ignores that variable and asks github.com, and the private user's curl answers
 those release URLs from the feed, so the published previous release can be the
 OLD side when NEW's bundle carries a signature from a key in
-`src/update/release-keys.pub`; a published build ignores rehearsal keys. Whichever path it takes, an update that exits 0 passes only when its
-status ends `Complete` for NEW with no refusal, because anything else shows a
-failure banner when the windows reopen.
+`src/update/release-keys.pub`; a published build ignores rehearsal keys. On the
+staged path, an update that exits 0 passes only when its status ends `Complete`
+for NEW with no refusal. On the in-app path OLD's worker writes that status and
+OLD's CLI exits on it, and a worker older than NEW may record Failed for an
+update NEW's windows rightly accept (#3877). There NEW must be serving and every
+window must reopen on NEW. No window may show "Update failed" or "Update not
+installed" from reopening until the worker has exited and 12 seconds more.
+After that, the harness hovers each header control to read its tooltip, and
+opens any notices control. An update control asking to retry or reopen fails
+the run, and so do any error notice and any warning about the update. All of
+it is kept in `records/after/update-shown.json`. Only OLD's protocol refusal
+of NEW becomes a note in the report; any other status that is not `Complete`
+still fails the run. The Notes also say whether a window confirmed "Updated to
+cagents NEW". Add `--empty-window` to open a third window holding nothing:
+reopened, it reports ready at once, so its first read of the status races
+OLD's worker still verifying NEW. Add `--restart-after-update` to then close
+every window, stop NEW's daemon and reopen the windows, as after a reboot. It
+runs once the update has passed, and requires new window processes and a new
+daemon. The windows must still show no failure
+(`records/after/update-shown-after-restart.json`); there an error notice
+counts only when it is about the update, since stopping the daemon ends its
+terminals and the windows rightly say so. The update's status
+must then read `Complete` for NEW with no refusal: by then NEW has had its
+chance to settle a Failed record from OLD's worker. The private runtime
+directory is not cleared, as a reboot would clear it. It can't be combined
+with `--ceditor`.
 
 `init` refuses a root with a `.git` in its ancestry, as recovery storage does.
 A sandbox that masks `.git` in its writable roots (Codex's does) leaves an empty

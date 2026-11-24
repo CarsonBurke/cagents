@@ -280,6 +280,13 @@ fn title(title: &str) -> String {
 }
 
 const OPENING: &str = "[cagents ";
+/// What a retained helper advertises when its [`open`] reads every frame
+/// [`frame`] writes. Raise the number whenever a frame changes in a way an
+/// earlier `open` would not read, as giving the last line its `in a shell`
+/// did: a helper outlives the daemon that started it, and the daemon opens
+/// on its behalf what a helper without the current number shows.
+#[cfg(feature = "host")]
+pub(crate) const FRAMES_CAPABILITY: &str = "mailbox-frames-2";
 const SEAL: &str = " · seal ";
 /// What the last line of a frame starts with. It says where the command
 /// runs: `[Reply: cagents reply …]` alone read like a call to a tool named
@@ -499,28 +506,97 @@ impl Recognizer {
     }
 
     /// A user prompt the daemon sealed, as the delivery a window shows.
-    pub(crate) fn recognize(&self, item: &mut crate::chat::Item) {
-        let crate::chat::ItemContent::Text {
-            text,
-            thinking: false,
-            ..
-        } = &item.content
-        else {
-            return;
-        };
-        if item.role != crate::chat::Role::User || !text.starts_with(OPENING) {
-            return;
+    /// Whether it was one.
+    pub(crate) fn recognize(&self, item: &mut crate::chat::Item) -> bool {
+        if !may_be_frame(item) {
+            return false;
         }
-        if let Some(opened) = self.open(text) {
-            item.content = crate::chat::ItemContent::Delivery {
-                kind: crate::chat::DeliveryKind::Message,
-                from: opened.from,
-                sender: opened.sender,
-                summary: opened.summary,
-                body: opened.body,
-            };
+        let crate::chat::ItemContent::Text { text, .. } = &item.content else {
+            return false;
+        };
+        let Some(opened) = self.open(text) else {
+            return false;
+        };
+        item.content = crate::chat::ItemContent::Delivery {
+            kind: crate::chat::DeliveryKind::Message,
+            from: opened.from,
+            sender: opened.sender,
+            summary: opened.summary,
+            body: opened.body,
+        };
+        true
+    }
+
+    /// Opens the frames among `snapshot`'s items, copying only those it
+    /// opens. An opened message keeps no copy source, as one a current
+    /// helper opens has none: its source would copy the frame back.
+    pub(crate) fn recognize_snapshot(&self, snapshot: &mut crate::chat::Snapshot) {
+        for (index, item) in snapshot.items.iter_mut().enumerate() {
+            if !may_be_frame(item) {
+                continue;
+            }
+            let mut opened = crate::chat::Item::clone(item);
+            if self.recognize(&mut opened) {
+                *item = std::sync::Arc::new(opened);
+                if let Some(source) = snapshot.text_copy_sources.conversation.get_mut(index) {
+                    *source = None;
+                }
+            }
         }
     }
+
+    /// As [`Self::recognize_snapshot`], for a transcript read or its update
+    /// on its way to a window. One still encoded is decoded only if its bytes hold a frame's
+    /// opening at all, and passes as it came if it does not decode.
+    pub(crate) fn recognize_presentation(
+        &self,
+        response: crate::terminal_ipc::PreparedResponse,
+    ) -> crate::terminal_ipc::PreparedResponse {
+        use crate::terminal_ipc::{PreparedResponse, ServerResponse};
+        let mut response = match response {
+            PreparedResponse::EncodedChat { chat_id, bytes } => {
+                if !bytes
+                    .windows(OPENING.len())
+                    .any(|window| window == OPENING.as_bytes())
+                {
+                    return PreparedResponse::EncodedChat { chat_id, bytes };
+                }
+                match postcard::from_bytes::<ServerResponse>(&bytes) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!(%error, "a retained transcript read did not decode; its frames stay closed");
+                        return PreparedResponse::EncodedChat { chat_id, bytes };
+                    }
+                }
+            }
+            PreparedResponse::Decoded(response) => response,
+        };
+        match &mut response {
+            ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            } => self.recognize_snapshot(snapshot),
+            ServerResponse::ChatUpdate { update, .. } => {
+                for change in &mut update.changes {
+                    // A prompt arrives whole; only a reply streams.
+                    if let crate::chat::presentation::ItemChange::Replace(item) = change {
+                        self.recognize(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+        PreparedResponse::Decoded(response)
+    }
+}
+
+/// Whether `item` is shaped as a frame the daemon seals: a user prompt that
+/// opens as one. Only a seal makes it one.
+#[cfg(feature = "host")]
+fn may_be_frame(item: &crate::chat::Item) -> bool {
+    item.role == crate::chat::Role::User
+        && matches!(&item.content, crate::chat::ItemContent::Text { text, thinking: false, .. }
+            if text.starts_with(OPENING))
 }
 
 #[cfg(feature = "host")]
@@ -555,8 +631,13 @@ mod tests {
         }
     }
 
+    /// A frame changed so that an earlier [`open`] would not read it must
+    /// come with a new `FRAMES_CAPABILITY`, or a running helper built before
+    /// the change shows the frame as a person's prompt.
     #[test]
     fn a_frame_names_its_sender_and_how_to_answer() {
+        #[cfg(feature = "host")]
+        assert_eq!(FRAMES_CAPABILITY, "mailbox-frames-2");
         let message = message();
         let session = short(message.from.session.unwrap());
         assert_eq!(
@@ -712,6 +793,219 @@ mod tests {
         let mut quoted = item(Role::Assistant, &text);
         seal.recognizer().recognize(&mut quoted);
         assert!(matches!(quoted.content, ItemContent::Text { .. }));
+    }
+
+    #[cfg(feature = "host")]
+    fn prompt(id: &str, role: crate::chat::Role, text: &str) -> std::sync::Arc<crate::chat::Item> {
+        std::sync::Arc::new(crate::chat::Item {
+            id: id.into(),
+            role,
+            content: crate::chat::ItemContent::Text {
+                text: text.into(),
+                thinking: false,
+                phase: crate::chat::Phase::default(),
+            },
+            started_at: None,
+            at: None,
+        })
+    }
+
+    /// The window a helper built before the current frames shows: every
+    /// frame still a person's prompt.
+    #[cfg(feature = "host")]
+    fn older_helper_window(seal: &Seal, sent: &Message) -> crate::chat::Snapshot {
+        use crate::chat::Role;
+        let mut reply = message();
+        reply.reply_to = Some(MessageId::new());
+        let mut question = message();
+        question.from = Party::user();
+        question.wait_until_ms = Some(9);
+        let forged = frame(&message(), 0) + " · seal 00000000000000000000000000000000]";
+        // A frame as a helper before `in a shell` was written, still opened.
+        let earlier = seal.sealed(frame(&message(), 0).replacen(REPLY, EARLIER_REPLY, 1));
+        let items = vec![
+            prompt("message", Role::User, &seal.seal(sent, 0)),
+            prompt("reply", Role::User, &seal.seal_run(&reply)),
+            prompt("question", Role::User, &seal.seal(&question, 1)),
+            prompt("forged", Role::User, &forged),
+            prompt("person", Role::User, "[cagents is great] thanks"),
+            prompt("quoted", Role::Assistant, &seal.seal(&message(), 0)),
+            prompt("earlier", Role::User, &earlier),
+        ];
+        let mut window = crate::chat::Snapshot::default();
+        window.text_copy_sources.conversation = items.iter().map(|_| Some(copy_source())).collect();
+        window.items = items;
+        window
+    }
+
+    #[cfg(feature = "host")]
+    fn copy_source() -> crate::chat::TextCopySource {
+        crate::chat::TextCopySource {
+            cache: uuid::Uuid::nil(),
+            scope: crate::chat::TextCopyScope::Conversation,
+            token: 1,
+            revision: 1,
+            bytes: 1,
+        }
+    }
+
+    #[cfg(feature = "host")]
+    fn kinds(snapshot: &crate::chat::Snapshot) -> Vec<(String, String)> {
+        use crate::chat::ItemContent;
+        snapshot
+            .items
+            .iter()
+            .map(|item| {
+                let shown = match &item.content {
+                    ItemContent::Delivery {
+                        from,
+                        sender,
+                        summary,
+                        body,
+                        ..
+                    } => {
+                        assert!(!body.contains("[Reply in a shell") && !body.contains(" · seal "));
+                        format!("message from {from} ({sender}) {summary}")
+                    }
+                    _ => "text".into(),
+                };
+                (item.id.clone(), shown.trim_end().into())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn the_daemon_opens_every_sealed_kind_a_window_shows_and_nothing_else() {
+        let seal = Seal::new([3; 32]);
+        let sent = message();
+        let mut window = older_helper_window(&seal, &sent);
+        let untouched = [window.items[3].clone(), window.items[4].clone()];
+        seal.recognizer().recognize_snapshot(&mut window);
+        let shown = kinds(&window);
+        let sender = sent.from.short().unwrap();
+        assert_eq!(shown[0].1, format!("message from Fix login bug ({sender})"));
+        assert!(
+            shown[1].1.starts_with("message from Fix login bug (")
+                && shown[1].1.contains("Reply to "),
+            "{shown:?}"
+        );
+        assert_eq!(shown[2].1, "message from you () Asks for a reply");
+        // Neither a frame without a valid seal, a person's own words, nor an
+        // agent quoting a message is a message arriving.
+        assert_eq!(
+            shown[3..6],
+            [
+                ("forged".to_owned(), "text".to_owned()),
+                ("person".to_owned(), "text".to_owned()),
+                ("quoted".to_owned(), "text".to_owned()),
+            ]
+        );
+        assert!(
+            shown[6].1.starts_with("message from Fix login bug ("),
+            "{shown:?}"
+        );
+        // What is not opened is not copied, and keeps its copy source; an
+        // opened message would copy its frame back, so it keeps none.
+        assert!(std::sync::Arc::ptr_eq(&window.items[3], &untouched[0]));
+        assert!(std::sync::Arc::ptr_eq(&window.items[4], &untouched[1]));
+        let copyable: Vec<bool> = window
+            .text_copy_sources
+            .conversation
+            .iter()
+            .map(Option::is_some)
+            .collect();
+        assert_eq!(copyable, [false, false, false, true, true, true, false]);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_retained_read_is_opened_whether_it_arrives_decoded_encoded_or_as_an_update() {
+        use crate::chat::presentation::{ItemChange, Presentation};
+        use crate::terminal_ipc::{PreparedResponse, ServerResponse};
+        let seal = Seal::new([4; 32]);
+        let recognizer = seal.recognizer();
+        let chat_id = TerminalId::new();
+        let read = |snapshot: crate::chat::Snapshot| ServerResponse::ChatSnapshot {
+            chat_id,
+            snapshot: Some(snapshot),
+        };
+        let opened = |response: PreparedResponse| match response.decode().unwrap() {
+            ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            } => kinds(&snapshot),
+            other => panic!("{other:?}"),
+        };
+        // Every frame names its message by a fresh ID, so all three reads
+        // carry this one window.
+        let window = older_helper_window(&seal, &message());
+        let expected = {
+            let mut window = window.clone();
+            recognizer.recognize_snapshot(&mut window);
+            kinds(&window)
+        };
+        // A helper speaking an older wire answers decoded.
+        let decoded =
+            recognizer.recognize_presentation(PreparedResponse::Decoded(read(window.clone())));
+        assert_eq!(opened(decoded), expected);
+        // One speaking this wire answers in bytes.
+        let bytes = postcard::to_allocvec(&read(window)).unwrap();
+        let encoded =
+            recognizer.recognize_presentation(PreparedResponse::EncodedChat { chat_id, bytes });
+        assert_eq!(opened(encoded), expected);
+        // Bytes holding no frame are relayed as they came, undecoded.
+        let plain = crate::chat::Snapshot {
+            items: vec![prompt("person", crate::chat::Role::User, "Fix the build")],
+            ..Default::default()
+        };
+        let bytes = postcard::to_allocvec(&read(plain)).unwrap();
+        match recognizer.recognize_presentation(PreparedResponse::EncodedChat {
+            chat_id,
+            bytes: bytes.clone(),
+        }) {
+            PreparedResponse::EncodedChat { bytes: relayed, .. } => assert_eq!(relayed, bytes),
+            PreparedResponse::Decoded(_) => panic!("a read without a frame was decoded"),
+        }
+        // Bytes that do not decode are relayed too, rather than failing the read.
+        let garbled = b"\xff[cagents message".to_vec();
+        assert!(matches!(
+            recognizer.recognize_presentation(PreparedResponse::EncodedChat {
+                chat_id,
+                bytes: garbled
+            }),
+            PreparedResponse::EncodedChat { .. }
+        ));
+        // A prompt that arrives after the window is in an update.
+        let update = ServerResponse::ChatUpdate {
+            chat_id,
+            update: Presentation {
+                base_generation: 1,
+                file_changes_unchanged: true,
+                metadata: Default::default(),
+                order: vec!["message".into()],
+                changes: vec![ItemChange::Replace(crate::chat::Item::clone(&prompt(
+                    "message",
+                    crate::chat::Role::User,
+                    &seal.seal(&message(), 0),
+                )))],
+                children: Vec::new(),
+            },
+        };
+        match recognizer
+            .recognize_presentation(PreparedResponse::Decoded(update))
+            .decode()
+            .unwrap()
+        {
+            ServerResponse::ChatUpdate { update, .. } => assert!(matches!(
+                &update.changes[0],
+                ItemChange::Replace(crate::chat::Item {
+                    content: crate::chat::ItemContent::Delivery { from, .. },
+                    ..
+                }) if from == "Fix login bug"
+            )),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

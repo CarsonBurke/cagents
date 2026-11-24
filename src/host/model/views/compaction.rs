@@ -108,6 +108,8 @@ impl Registry {
         if dead.is_empty() {
             return Ok(None);
         }
+        #[cfg(test)]
+        super::super::pause(super::super::Pause::BeforeCompactionDelete);
         self.delete_compacted_scopes(&dead)
     }
 
@@ -173,7 +175,7 @@ fn registered_worktrees(repository: &Path) -> Option<HashSet<PathBuf>> {
     // A key can be the common Git directory, a checkout, or a plain folder.
     // Check the markers so a folder that has since acquired Git still counts.
     if !repository.try_exists().ok()?
-        || (!repository.join(".git").try_exists().ok()?
+        || (!crate::git_marker::present(&repository.join(".git")).ok()?
             && !repository.join("HEAD").try_exists().ok()?)
     {
         return Some(HashSet::new());

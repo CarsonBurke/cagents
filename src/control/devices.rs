@@ -253,7 +253,7 @@ fn list(reply: &Reply) -> Result<CommandOutput, AppError> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

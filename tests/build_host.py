@@ -55,7 +55,9 @@ lock = os.environ["CAGENTS_BUILD_LOCK"]
 count = int(os.environ["CAGENTS_BUILD_SLOTS"])
 held = []
 for index, path in enumerate([lock] + [f"{lock}.{n}" for n in range(1, count)]):
-    with open(path, "a") as share:
+    if not os.path.exists(path):
+        continue
+    with open(path, "a" if os.access(path, os.W_OK) else "r") as share:
         try:
             fcntl.flock(share, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -341,6 +343,85 @@ class Admission(BuildHostFixture):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(message, result.stderr)
         self.assertEqual(self.calls(), [])
+
+
+@unittest.skipIf(os.geteuid() == 0, "root writes read-only files")
+class ReadOnlyLocks(BuildHostFixture):
+    """A caller that cannot write the host's lock files, as in an agent's
+    sandbox, locks the same files read-only."""
+
+    def setUp(self):
+        super().setUp()
+        self.locks = self.root / "locks"
+        self.locks.mkdir()
+        self.lock = self.locks / "slot.lock"
+        self.env["CAGENTS_BUILD_LOCK"] = str(self.lock)
+
+    def read_only(self, *paths):
+        for path in paths:
+            Path(path).touch()
+            Path(path).chmod(0o444)
+        self.locks.chmod(0o555)
+        self.addCleanup(self.locks.chmod, 0o755)
+
+    def hold_read_only(self, path):
+        holder = Path(path).open()
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        self.holders.append(holder)
+
+    def test_a_build_takes_a_free_share_it_cannot_write_and_waits_for_one_held(self):
+        self.read_only(self.share(0), self.share(1), f"{self.lock}.queue")
+        self.hold_read_only(self.share(0))
+        build = self.held_build("build", 1)
+        self.wait_for(lambda: self.started("build"), "the build")
+        self.assertEqual(self.calls()[0]["held"], [0, 1])
+        status, _stdout, stderr = self.finish(build, "build")
+        self.assertEqual(status, 0, stderr)
+        self.hold_read_only(self.share(1))
+        waiting = self.held_build("waiting", 1)
+        time.sleep(0.4)
+        self.assertFalse(self.started("waiting"), "both shares were held read-only")
+        self.holders.pop().close()
+        self.wait_for(lambda: self.started("waiting"), "the build after its share freed")
+        status, _stdout, stderr = self.finish(waiting, "waiting")
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("waiting for 1 of the 2 build memory shares", stderr)
+
+    def test_a_share_whose_lock_cannot_be_created_is_passed_over(self):
+        self.read_only(self.share(0), f"{self.lock}.queue")
+        self.hold_read_only(self.share(0))
+        build = self.held_build("build", 1)
+        time.sleep(0.4)
+        self.assertFalse(self.started("build"), "the share that exists was held")
+        self.holders.pop().close()
+        self.wait_for(lambda: self.started("build"), "the build after its share freed")
+        status, _stdout, stderr = self.finish(build, "build")
+        self.assertEqual(status, 0, stderr)
+        self.assertFalse(self.share(1).exists())
+
+    def test_too_few_locks_that_exist_are_named(self):
+        self.read_only(self.share(0), f"{self.lock}.queue")
+        result = self.run_host("build", "--shares", "2", "--", str(self.cargo), "build")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"cannot create the build lock {self.share(1)}", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.is_locked_read_only(self.share(0)), "a share was kept")
+
+    def test_a_queue_that_cannot_be_created_is_named(self):
+        self.read_only(self.share(0), self.share(1))
+        result = self.run_host("build", "--shares", "1", "--", str(self.cargo), "build")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"cannot create the build lock {self.lock}.queue", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def is_locked_read_only(self, path):
+        with Path(path).open() as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
 
 
 class TheBuildsEnvironment(BuildHostFixture):

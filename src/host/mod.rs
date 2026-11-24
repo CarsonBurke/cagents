@@ -513,6 +513,49 @@ fn save_abandoned_identities(host: &SharedHost) {
     }
 }
 
+fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
+    use crate::chat::runtime::Deliveries;
+
+    match Deliveries::open() {
+        Ok(deliveries) => return Some(Arc::new(deliveries)),
+        Err(error) => {
+            tracing::warn!(%error, "cannot open the message delivery ledger; using memory")
+        }
+    }
+    let deliveries = match Deliveries::in_memory() {
+        Ok(deliveries) => Arc::new(deliveries),
+        Err(error) => {
+            tracing::error!(%error, "cannot open an in-memory message delivery ledger");
+            return None;
+        }
+    };
+    let fallback = Arc::downgrade(&deliveries);
+    let interval = std::time::Duration::from_secs(1);
+    let mut backoff = service::Backoff::new(interval);
+    let mut wait = backoff.fail();
+    if let Err(error) = service::spawn("cagents-chat-deliveries", interval, move || {
+        thread::sleep(wait);
+        let Some(deliveries) = fallback.upgrade() else {
+            return service::Next::Stop;
+        };
+        match deliveries.restore_persistence() {
+            Ok(()) => {
+                tracing::info!("the persistent message delivery ledger is available again");
+                service::Next::Stop
+            }
+            Err(error) => {
+                wait = backoff.fail();
+                tracing::warn!(%error, retry_seconds = wait.as_secs(),
+                               "the message delivery ledger is still unavailable; using memory");
+                service::Next::Continue
+            }
+        }
+    }) {
+        tracing::error!(%error, "cannot schedule reopening the message delivery ledger");
+    }
+    Some(deliveries)
+}
+
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("host run entered", None);
@@ -548,6 +591,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut initial = HostState::new(proof);
     initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
+    initial.chat_deliveries = open_chat_deliveries();
     initial.prompt_cache = Arc::new(agent_execution::prompt_cache::Calibration::installation());
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()
@@ -585,6 +629,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                                     not be shared between windows")
         }
     }
+    workspace::titles::install(&host);
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(
@@ -605,6 +650,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // Cache sweeps preserve unretired helper journals and live Store leases.
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
+    }
+    if let Err(error) = daemon::codex_temp::sweep() {
+        tracing::warn!(%error, "stale Codex temporary directories could not be swept");
     }
     if let Err(error) = start_scope_collection() {
         tracing::warn!(%error, "empty session scopes were not collected");
@@ -674,6 +722,14 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("admission released", None);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
+    // An older worker may record the update that started this daemon as
+    // failed; once it finishes, this daemon's own receipt settles that.
+    crate::update::settle_as_successor(
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone(),
+    );
     // After restore, so the first pass covers every conversation it carried.
     if let Err(error) = chat::keep_legacy_codex_listeners_fresh(&host) {
         tracing::warn!(%error, "Codex listeners in the temporary directory will not be kept fresh");
@@ -1052,15 +1108,16 @@ fn finish_terminal_shutdown(
     handles: &[crate::terminal::TerminalHandle],
 ) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
     // Request and register every original before waiting on any one worker.
-    // One absolute deadline bounds the whole batch, including pending joins;
-    // an unfinished owner cannot consume another five seconds per sibling.
-    let deadline = std::time::Instant::now() + crate::terminal::TerminalHandle::SHUTDOWN_TIMEOUT;
+    // Every join budget counts from this one instant, so the batch, including
+    // pending joins, ends within the longest budget: an unfinished owner
+    // cannot consume another join budget per sibling.
+    let started = std::time::Instant::now();
     for handle in handles {
         handle.request_shutdown();
     }
     handles
         .iter()
-        .map(|handle| handle.shutdown_until(deadline))
+        .map(|handle| handle.shutdown_until(started + handle.shutdown_join_budget()))
         .collect()
 }
 

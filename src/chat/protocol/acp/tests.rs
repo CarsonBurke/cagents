@@ -925,8 +925,14 @@ fn a_resumed_conversation_replays_into_one_bounded_history() {
     assert!(step.events.contains(&Event::HistoryLoading(true)));
     let exchanges = history::MAX_ITEMS;
     for index in 0..exchanges {
+        let question = match index {
+            0 => "[Image 236]".into(),
+            1 => "[cagents message from the user]\nFix mailbox-only work\n[Reply in a shell: cagents reply 0 \"…\" · seal 00000000000000000000000000000000]".into(),
+            2 => "[Image 236] Investigate ACP history".into(),
+            _ => format!("question {index}"),
+        };
         for frame in [
-            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": format!("question {index}")}}),
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": question}}),
             json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": format!("answer {index}")}}),
             json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": " continued"}}),
         ] {
@@ -960,13 +966,15 @@ fn a_resumed_conversation_replays_into_one_bounded_history() {
             .any(|event| matches!(event, Event::Plan { .. }))
     );
     let step = acp.receive(reply(&load, muse_new())).unwrap();
-    let Some(Event::History { items, has_earlier }) = step
-        .events
-        .iter()
-        .find(|event| matches!(event, Event::History { .. }))
+    let [
+        Event::OpeningTitle(title),
+        Event::History { items, has_earlier },
+        ..,
+    ] = step.events.as_slice()
     else {
         panic!("{:?}", step.events);
     };
+    assert_eq!(title.text(), "Investigate ACP history");
     assert!(!has_earlier);
     assert_eq!(items.len(), exchanges + 1);
     assert_eq!(items[0].id, history::TRUNCATED_ID);
@@ -1018,7 +1026,8 @@ fn a_replayed_message_keeps_its_attached_file_and_image() {
         acp.receive(update("s", frame)).unwrap();
     }
     replay = acp.replay.take().unwrap();
-    let items = replay.finish();
+    let (items, opening_title) = replay.finish();
+    assert!(opening_title.is_none(), "the full history fits");
     assert_eq!(items.len(), 3);
     assert!(
         matches!(&items[0].content, ItemContent::Text { text, .. } if text == "Look\nAttached file: /work/a b.txt")
@@ -1323,6 +1332,188 @@ fn plans_commands_modes_titles_and_usage_are_published() {
     };
     assert_eq!((usage.context_tokens, usage.context_limit), (53000, 200000));
     assert_eq!(usage.cost_microusd, Some(45000));
+}
+
+#[test]
+fn antigravity_refreshes_the_exact_conversations_listed_title() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let sent = prompt(&mut acp, "Check the build");
+    let ended = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let list = only_write(&ended);
+    assert_eq!(list["method"], "session/list");
+    assert_eq!(list["params"], json!({"cwd": "/work/project"}));
+    let missed = acp
+        .receive(reply(
+            list,
+            json!({"sessions": [{"sessionId": "other", "title": "Another conversation"}],
+                "nextCursor": "opaque-page"}),
+        ))
+        .unwrap();
+    assert!(missed.events.is_empty());
+    let next = only_write(&missed);
+    assert_eq!(next["method"], "session/list");
+    assert_eq!(next["params"]["cursor"], "opaque-page");
+    let listed = |request: &Value, title: &str| {
+        reply(
+            request,
+            json!({"sessions": [{"sessionId": session, "cwd": "/work/project", "title": title}]}),
+        )
+    };
+    let titled = |title: &str| Event::Session {
+        id: session.clone(),
+        title: Some(title.into()),
+    };
+    assert_eq!(
+        acp.receive(listed(next, "  Build setup  ")).unwrap().events,
+        [titled("Build setup")]
+    );
+    let sent = prompt(&mut acp, "/rename Build diagnostics");
+    let ended = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert_eq!(
+        acp.receive(listed(only_write(&ended), "Build diagnostics"))
+            .unwrap()
+            .events,
+        [titled("Build diagnostics")]
+    );
+    // Antigravity's background summary updates can arrive after a turn has
+    // settled and even after the saved metadata was read.
+    let background = update(
+        &session,
+        json!({"sessionUpdate": "session_info_update", "title": "Build diagnostics report"}),
+    );
+    assert_eq!(
+        acp.receive(background).unwrap().events,
+        [titled("Build diagnostics report")]
+    );
+}
+
+#[test]
+fn post_turn_title_listing_stops_after_four_pages() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let sent = prompt(&mut acp, "Check the build");
+    let mut step = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert_eq!(only_write(&step)["params"], json!({"cwd": "/work/project"}));
+    for page in 1..=4 {
+        let request = only_write(&step);
+        assert_eq!(request["method"], "session/list");
+        step = acp
+            .receive(reply(
+                request,
+                json!({"sessions": [{"sessionId": format!("other-{page}")}],
+                    "nextCursor": format!("page-{}", page + 1)}),
+            ))
+            .unwrap();
+        assert!(step.events.is_empty());
+    }
+    assert!(step.writes.is_empty());
+
+    let sent = prompt(&mut acp, "/rename Build diagnostics");
+    let ended = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let request = only_write(&ended);
+    assert_eq!(request["params"], json!({"cwd": "/work/project"}));
+    assert_eq!(
+        acp.receive(reply(
+            request,
+            json!({"sessions": [{"sessionId": session, "title": "Build diagnostics"}]}),
+        ))
+        .unwrap()
+        .events,
+        [Event::Session {
+            id: session,
+            title: Some("Build diagnostics".into()),
+        }]
+    );
+}
+
+#[test]
+fn muse_reads_the_saved_title_and_prefers_later_title_notifications() {
+    let session = muse_new()["sessionId"].as_str().unwrap().to_owned();
+    let mut acp = adapter(&[], Some(&session));
+    let init = acp.initialize().unwrap();
+    let load = acp
+        .receive(reply(only_write(&init), muse_initialize()))
+        .unwrap();
+    let mut listing = acp.receive(reply(only_write(&load), muse_new())).unwrap();
+    // The saved conversation can be older than the post-turn search reaches.
+    for page in 1..=4 {
+        let request = only_write(&listing);
+        assert_eq!(request["method"], "session/list");
+        listing = acp
+            .receive(reply(
+                request,
+                json!({"sessions": [{"sessionId": format!("other-{page}")}],
+                    "nextCursor": format!("page-{}", page + 1)}),
+            ))
+            .unwrap();
+    }
+    let list = only_write(&listing);
+    assert_eq!(list["method"], "session/list");
+    assert_eq!(list["params"]["cursor"], "page-5");
+    let listed = |request: &Value, title: &str| {
+        reply(
+            request,
+            json!({"sessions": [{"sessionId": session, "cwd": "/work/project", "title": title}]}),
+        )
+    };
+    let titled = |title: &str| Event::Session {
+        id: session.clone(),
+        title: Some(title.into()),
+    };
+    assert_eq!(
+        acp.receive(listed(list, "Saved conversation"))
+            .unwrap()
+            .events,
+        [titled("Saved conversation")]
+    );
+    let sent = prompt(&mut acp, "Continue the investigation");
+    let ended = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let notification = |session: &str, title: &str| {
+        update(
+            session,
+            json!({"sessionUpdate": "session_info_update", "title": title}),
+        )
+    };
+    assert!(
+        acp.receive(notification("other", "Foreign title"))
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    assert_eq!(
+        acp.receive(notification(&session, "Updated investigation"))
+            .unwrap()
+            .events,
+        [titled("Updated investigation")]
+    );
+    assert!(
+        acp.receive(listed(only_write(&ended), "Stale title"))
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let sent = prompt(&mut acp, "Confirm the fix");
+    let ended = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert!(ended.writes.is_empty(), "Muse publishes its title changes");
+    assert_eq!(
+        acp.receive(notification(&session, "Investigation complete"))
+            .unwrap()
+            .events,
+        [titled("Investigation complete")]
+    );
 }
 
 #[test]

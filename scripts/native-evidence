@@ -8,6 +8,7 @@ set -euo pipefail
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
+source "$tool_root/scripts/git-ancestry.sh"
 session_name=evidence
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
 # A session holds one of the host's few native slots while it runs, so it is
@@ -180,18 +181,11 @@ select_task() {
     # limited to 108 bytes including the suffixes the daemon and fixtures add.
     [[ $task =~ ^/[A-Za-z0-9._/-]+$ ]] || die "task path has unsupported characters: $task" 2
     [ "${#task}" -le 48 ] || die "task path is over 48 bytes, too long for its sockets: $task" 2
-    # Recovery storage refuses to live inside a Git checkout, so a fixture below
-    # one fails for unrelated-looking reasons. An empty `.git` directory, the
-    # mount point a sandbox leaves for its read-only overlay, is no repository
-    # to Git, which passes over it; a gitfile, a link or a directory with a
-    # HEAD is one.
-    local ancestor=$task
-    while [ "$ancestor" != / ]; do
-        { [ ! -f "$ancestor/.git" ] && [ ! -L "$ancestor/.git" ] && [ ! -e "$ancestor/.git/HEAD" ]; } ||
-            die "task directory must be outside Git ancestry; found $ancestor/.git. Sandboxes can leave one in /tmp, /var/tmp or ~/.cache; ~/.local/state/cev/TASK avoids them." 2
-        ancestor=${ancestor%/*}
-        ancestor=${ancestor:-/}
-    done
+    # Recovery storage refuses to live inside a Git checkout.
+    local marker
+    if marker=$(find_git_marker_in_ancestry "$task"); then
+        die "task directory must be outside Git ancestry; found $marker. Use ~/.local/state/cev/TASK." 2
+    fi
     mkdir -p -- "$task"
     fixture=$task/fixture
     seed=$task/fixture-seed

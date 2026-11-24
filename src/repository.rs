@@ -3846,6 +3846,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         self.git_read(worktree, arguments)
     }
 
+    /// Resolve the current worktree without gathering repository metadata.
+    /// Selecting the Git directory itself still uses full discovery to find
+    /// its registered checkout.
+    pub fn discover_worktree_root(
+        &self,
+        selected_path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PathBuf>, RepositoryError> {
+        match self.invocation_worktree(selected_path, cancellation) {
+            Ok(root) => Ok(Some(root)),
+            Err(error) if cancellation.is_cancelled() => Err(error),
+            Err(_) => Ok(self.discover(selected_path, cancellation)?.worktree_root),
+        }
+    }
+
     pub fn discover(
         &self,
         selected_path: &Path,
@@ -3878,12 +3893,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 &inside_output,
             )?;
             Some(if inside_work_tree {
-                let command = self.worktree_root_command(selected_path);
-                let output = self.run_checked(&command, cancellation)?;
-                attach_repository_process(
-                    parse_path_line(&output.stdout, "worktree_root"),
-                    &output,
-                )?
+                self.invocation_worktree(selected_path, cancellation)?
             } else {
                 // The selected path is the Git directory itself, which has no
                 // current work tree to be asked about. The repository still
@@ -4996,8 +5006,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .iter()
                 .filter(|path| {
                     indexed.contains(*path)
-                        && fs::symlink_metadata(worktree.join(path.as_os_str()).join(".git"))
-                            .is_ok()
+                        && crate::git_marker::present(&worktree.join(path.as_os_str()).join(".git"))
+                            .unwrap_or(false)
                 })
                 .cloned(),
         );
@@ -10206,6 +10216,7 @@ mod tests {
         let root = worktree.path();
         // `b` was a tracked file and is now a nested repository.
         fs::create_dir_all(root.join("b/.git")).unwrap();
+        fs::write(root.join("b/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::create_dir_all(root.join("dir/sub")).unwrap();
         fs::write(root.join("dir/new"), b"new").unwrap();
         fs::write(root.join("dir/sub/new"), b"new").unwrap();

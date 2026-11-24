@@ -85,7 +85,8 @@ const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The wall-clock budget ordinary shutdown gives a terminal's family, and
 /// itself, to end and confirm that end. The product always runs with
-/// [`ShutdownBudget::PRODUCT`].
+/// [`ShutdownBudget::PRODUCT`]; a test terminal starts with
+/// [`ShutdownBudget::PATIENT_PRODUCT_GRACE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ShutdownBudget {
     /// Total for hangup, escalation and an authoritative holder exit report.
@@ -113,15 +114,27 @@ impl ShutdownBudget {
     /// For a test of what shutdown decides rather than how fast a shared,
     /// loaded host runs it. Each wait in shutdown ends as soon as its
     /// condition holds, so only a step that never finishes can exhaust these
-    /// budgets. The hangup grace stays the product's, since it decides when a
-    /// family that ignores its hangup is stopped.
+    /// budgets. That includes the hangup grace: a family that handles its
+    /// hangup and exits ends it early, however long a busy host takes to run
+    /// the handler. A family that ignores its hangup waits out the whole
+    /// grace, so a test with one keeps [`Self::PATIENT_PRODUCT_GRACE`].
     #[cfg(test)]
     pub(super) const PATIENT: Self = Self {
-        deadline: Duration::from_secs(30),
-        hangup_grace: CHILD_HANGUP_GRACE,
+        deadline: Duration::from_secs(45),
+        hangup_grace: Duration::from_secs(15),
         confirmation_reserve: Duration::from_secs(15),
         census_reserve: Duration::from_secs(5),
-        join: Duration::from_secs(45),
+        join: Duration::from_secs(60),
+    };
+
+    /// [`Self::PATIENT`], except that a family that ignores its hangup is
+    /// stopped after the product's grace. Every test terminal starts with it.
+    /// Only a lower bound on that grace is safe to assert, since a busy host
+    /// only makes it last longer.
+    #[cfg(test)]
+    pub(super) const PATIENT_PRODUCT_GRACE: Self = Self {
+        hangup_grace: CHILD_HANGUP_GRACE,
+        ..Self::PATIENT
     };
 }
 
@@ -673,7 +686,10 @@ impl PublishedState {
             #[cfg(test)]
             shutdown_census_delay: Mutex::new(None),
             #[cfg(test)]
-            shutdown_budget: Mutex::new(ShutdownBudget::PRODUCT),
+            // Tests reach most terminals through code that creates and shuts
+            // them down itself, so every test terminal starts patient. A test
+            // that needs another budget sets it before shutdown.
+            shutdown_budget: Mutex::new(ShutdownBudget::PATIENT_PRODUCT_GRACE),
             #[cfg(test)]
             test_holder_reservation: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
@@ -756,6 +772,14 @@ impl PublishedState {
             ticket: None,
             command: Box::new(command),
         })
+    }
+
+    #[cfg(test)]
+    fn use_product_shutdown_for_test(&self) {
+        *self
+            .shutdown_budget
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ShutdownBudget::PRODUCT;
     }
 
     fn shutdown_budget(&self) -> ShutdownBudget {
@@ -1170,6 +1194,14 @@ impl RenderStreamFixture {
         self.handle.inner.published.emit_event(&self.events, event);
     }
 
+    pub(crate) fn acknowledged_generation(&self) -> u64 {
+        self.handle
+            .inner
+            .published
+            .acknowledged_generation
+            .load(Ordering::Acquire)
+    }
+
     pub(crate) fn queued_commands(&self) -> usize {
         self.commands.len()
     }
@@ -1232,6 +1264,9 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
+    /// The product's [`Self::shutdown_join_budget`], which the fixtures built
+    /// to run out a budget keep.
+    #[cfg(test)]
     pub(crate) const SHUTDOWN_TIMEOUT: Duration = WORKER_JOIN_TIMEOUT;
     /// Captured from the authenticated original holder before worker startup;
     /// never rediscovered by a reusable terminal ID.
@@ -1650,6 +1685,9 @@ impl TerminalHandle {
             static BLOCK: RefCell<Option<TlsWait>> = const { RefCell::new(None) };
         }
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        // This fixture exists to run out shutdown's budget; the product's
+        // keeps that short.
+        published.use_product_shutdown_for_test();
         let owner = joins::JoinOwner::new(
             published.clone(),
             joins::reserve().expect("test TLS cleanup admission"),
@@ -1687,6 +1725,9 @@ impl TerminalHandle {
     #[cfg(test)]
     fn spawn_with_blocked_worker_for_test(panic_after_release: bool) -> (Self, Sender<()>) {
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        // This fixture exists to run out shutdown's budget; the product's
+        // keeps that short.
+        published.use_product_shutdown_for_test();
         let owner = joins::JoinOwner::new(
             published.clone(),
             joins::reserve().expect("test worker cleanup admission"),
@@ -1736,6 +1777,9 @@ impl TerminalHandle {
         let (commands, receiver) = command_channel(1);
         let (events, event_receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        // This fixture exists to run out shutdown's budget; the product's
+        // keeps that short.
+        published.use_product_shutdown_for_test();
         let join_owner = joins::JoinOwner::new(
             published.clone(),
             joins::reserve().expect("test worker cleanup admission"),
@@ -2344,7 +2388,7 @@ impl TerminalHandle {
             self.request_shutdown();
             if !joins::wait_until(
                 &self.inner.worker,
-                Some(std::time::Instant::now() + self.inner.published.shutdown_budget().join),
+                Some(std::time::Instant::now() + self.shutdown_join_budget()),
                 true,
             ) {
                 return TerminalCloseResult::Unknown(
@@ -2372,7 +2416,13 @@ impl TerminalHandle {
     }
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
-        self.shutdown_until(std::time::Instant::now() + self.inner.published.shutdown_budget().join)
+        self.shutdown_until(std::time::Instant::now() + self.shutdown_join_budget())
+    }
+
+    /// How long a caller waits for this worker to finish shutting down: five
+    /// seconds in the product.
+    pub(crate) fn shutdown_join_budget(&self) -> Duration {
+        self.inner.published.shutdown_budget().join
     }
 
     pub(crate) fn shutdown_until(
@@ -3240,6 +3290,10 @@ impl Worker {
                 // Before the holder forks, so nothing this launch starts
                 // predates its record.
                 crate::lineage_birth::record_instance_launch(&session)?;
+                let isolate_codex_tmp = matches!(
+                    crate::agent::Provider::launched(&execution),
+                    Some((crate::agent::Provider::Codex, _))
+                );
                 #[cfg(test)]
                 let reservation = published.test_holder_reservation.lock().unwrap().take();
                 #[cfg(test)]
@@ -3249,6 +3303,7 @@ impl Worker {
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        isolate_codex_tmp,
                         reservation,
                     )?
                 } else {
@@ -3257,6 +3312,7 @@ impl Worker {
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        isolate_codex_tmp,
                     )?
                 };
                 #[cfg(not(test))]
@@ -3265,6 +3321,7 @@ impl Worker {
                     pty_size(current_size),
                     child_exit_tx,
                     config.holder_recovery.clone(),
+                    isolate_codex_tmp,
                 )?;
                 (held, Vec::new())
             }

@@ -563,6 +563,17 @@ struct Submission {
     deferred: Option<Vec<Item>>,
     /// Encoded input bounds retained text and image data across the queue.
     deferred_bytes: usize,
+    /// Claude Code has reported this message as queued. Until then it is
+    /// still being admitted, and a request to send it now would find nothing.
+    admitted: bool,
+}
+
+/// A written request to send what is queued now.
+struct SendNowRequest {
+    /// The control request, to tell its answer from another's.
+    id: String,
+    /// The messages it was for. One queued after it waits its own turn.
+    messages: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -646,6 +657,18 @@ struct Claude {
     busy: bool,
     /// Only advertised for a CLI whose async input contract we have verified.
     async_input: bool,
+    /// The CLI's `system/init` advertises `interrupt_send_now_v1`. Any other
+    /// CLI reads the same request as a plain interrupt, which would stop the
+    /// turn and its background agents.
+    send_now_advertised: bool,
+    send_now: Option<chat::SendNow>,
+    /// What was written for the current request. Until every queued message
+    /// has been admitted the request is held back, and this stays empty.
+    send_now_request: Option<SendNowRequest>,
+    /// The notification key of a turn that made way for a Send now, while
+    /// the messages it made way for have yet to start. Their turn carries on
+    /// its run and settles it; should none start, this one settles then.
+    hand_over: Option<String>,
     submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
@@ -912,14 +935,21 @@ impl Claude {
     }
 
     fn observe_title(&mut self, step: &mut Step) {
-        if let Some(id) = self.session_id.clone()
+        if let Some(id) = &self.session_id
             && let Some(titles) = &mut self.titles
-            && let Some(title) = titles.update(&id)
+            && let Some(title) = titles.update(id)
         {
             step.events.push(Event::Session {
-                id,
+                id: id.clone(),
                 title: Some(title),
             });
+        }
+        if let Some(title) = self
+            .history
+            .as_mut()
+            .and_then(|history| history.opening_title.take())
+        {
+            step.events.push(Event::OpeningTitle(title));
         }
     }
 
@@ -1032,8 +1062,155 @@ impl Claude {
             // Headless Claude Code's interrupt aborts the controller its
             // background agents run under, so it stops them with the turn.
             interrupt_stops_background: true,
+            send_queued_now: self.async_input && self.send_now_advertised,
             ..Capabilities::default()
         }
+    }
+    fn set_send_now(&mut self, state: Option<chat::SendNow>, step: &mut Step) {
+        if self.send_now != state {
+            self.send_now = state;
+            step.events.push(Event::SendNow(state));
+        }
+    }
+    /// The person's Send now: hand everything queued to the running turn.
+    fn request_send_now(&mut self) -> Result<Step, String> {
+        if !self.async_input || !self.send_now_advertised {
+            return Err("This Claude version cannot take queued messages early".into());
+        }
+        let mut step = Step::default();
+        if self.send_now.is_some_and(chat::SendNow::in_flight) {
+            return Ok(step);
+        }
+        if self.queued.is_empty() {
+            self.set_send_now(None, &mut step);
+            return Ok(step);
+        }
+        self.send_now_request = None;
+        self.set_send_now(Some(chat::SendNow::Requested), &mut step);
+        self.release_send_now(&mut step);
+        Ok(step)
+    }
+    /// Writes the requested Send now once Claude Code counts every queued
+    /// message as waiting: a request naming one it is still admitting would
+    /// find nothing to send.
+    fn release_send_now(&mut self, step: &mut Step) {
+        if self.send_now != Some(chat::SendNow::Requested) || self.send_now_request.is_some() {
+            return;
+        }
+        let admitted = self.queued.iter().all(|message| {
+            self.submissions
+                .get(&message.id)
+                .is_none_or(|submission| submission.admitted)
+        });
+        if !admitted {
+            return;
+        }
+        // A message on its way back to the composer is not sent.
+        let messages: Vec<String> = self
+            .queued
+            .iter()
+            .map(|message| message.id.clone())
+            .filter(|id| !self.taking_back(id))
+            .collect();
+        // Once the request acts, everything queued goes with the message it
+        // names, so it names the first to be delivered: messages for the
+        // next step wait ahead of those for the turn's end.
+        let Some(first) = messages.first().cloned() else {
+            self.set_send_now(None, step);
+            return;
+        };
+        match self.control(json!({"subtype":"interrupt", "send_now":true, "message_uuid":first})) {
+            Ok(request) => {
+                self.send_now_request = Some(SendNowRequest {
+                    id: string(&request.writes[0], "request_id").into(),
+                    messages,
+                });
+                step.writes.extend(request.writes);
+            }
+            Err(message) => {
+                self.set_send_now(None, step);
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
+        }
+    }
+    /// Whether the queued message `id` has been asked back and not yet left.
+    fn taking_back(&self, id: &str) -> bool {
+        self.controls.values().any(|request| {
+            request["subtype"] == "cancel_async_message" && request["message_uuid"] == id
+        })
+    }
+    /// The queue has changed under the request: it is over once the messages
+    /// it was for have left, and a held request may now be written.
+    fn settle_send_now(&mut self, step: &mut Step) {
+        let done = match &self.send_now_request {
+            // A refusal answered for what was waiting then, not for what
+            // waits now.
+            Some(request) if self.send_now == Some(chat::SendNow::Declined) => !self
+                .queued
+                .iter()
+                .map(|queued| &queued.id)
+                .eq(request.messages.iter()),
+            Some(request) => !self
+                .queued
+                .iter()
+                .any(|queued| request.messages.contains(&queued.id)),
+            None => self.queued.is_empty(),
+        };
+        if done {
+            self.send_now_request = None;
+            self.set_send_now(None, step);
+            return;
+        }
+        self.release_send_now(step);
+    }
+    /// Settles a turn that made way once nothing it made way for is left to
+    /// start: its messages were taken back or dropped first.
+    fn finish_hand_over(&mut self, step: &mut Step) {
+        let Some(key) = self.hand_over.take() else {
+            return;
+        };
+        let outcome = crate::notifications::Kind::Succeeded;
+        let execution = self.execution.take();
+        if let Some(run) = execution {
+            step.events.push(Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Settled,
+            });
+        }
+        step.events.push(Event::TurnFinished {
+            key: Some(key),
+            outcome,
+        });
+        if let Some(run) = execution {
+            step.events.push(Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Finished { outcome },
+            });
+        }
+        let busy = !self.pending.is_empty();
+        self.status(
+            busy,
+            if busy {
+                "Claude turn ended; decisions remain"
+            } else {
+                "Claude turn complete"
+            },
+            step,
+        );
+    }
+    /// Whether a main-turn result is how the turn made way for the person's
+    /// Send now rather than an ending of its own: Claude Code stopped it, or
+    /// cut it short to start the messages as a new turn. A Stop the person
+    /// pressed meanwhile makes it their stop, and a failure with its own
+    /// account of itself is still that failure.
+    fn result_made_way(&self, frame: &Value) -> bool {
+        self.send_now_request.is_some()
+            && self.send_now.is_some_and(chat::SendNow::in_flight)
+            && self.interruption.is_none()
+            && cut_short(frame)
     }
     fn accept_user_prompt(&mut self, id: &str, step: &mut Step) {
         if self.accepted_user_prompts.iter().any(|known| known == id) {
@@ -1407,6 +1584,7 @@ impl Claude {
                     mode,
                     deferred,
                     deferred_bytes,
+                    admitted: false,
                 },
             );
         }
@@ -3672,6 +3850,25 @@ impl Adapter for Claude {
     fn outcome_pending(&self) -> bool {
         !self.deferred_attention.is_empty()
     }
+    fn metadata_wake(&self) -> Option<super::MetadataWake<'_>> {
+        // Result frames account for ordinary writes during a turn. While
+        // idle a title can change without any provider frame to wake us.
+        if self.busy {
+            return None;
+        }
+        self.titles.as_ref()?.metadata_wake()
+    }
+    fn refresh_metadata(&mut self) -> Option<Step> {
+        let id = self.session_id.as_ref()?;
+        let title = self.titles.as_mut()?.refresh(id)?;
+        Some(Step {
+            events: vec![Event::Session {
+                id: id.clone(),
+                title: Some(title),
+            }],
+            ..Step::default()
+        })
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         self.initialize_for_start()
             .map_err(|error| error.to_string())
@@ -3685,15 +3882,12 @@ impl Adapter for Claude {
             ).map_err(super::SetupError::Invalid)?
         };
         if let Some(error) = self.history_error.take() {
-            step.events.push(Event::History {
-                items: vec![history_notice(
-                    "Earlier messages in this conversation could not be shown",
-                    format!(
-                        "cagents could not read this conversation's saved transcript, so its earlier messages are not shown here. Claude Code reads the transcript itself when it resumes, so it may still have the earlier context.\n\nDetails: {error}"
-                    ),
-                )],
-                has_earlier: false,
-            });
+            step.events.push(Event::Item(history_notice(
+                "Earlier messages in this conversation could not be shown",
+                format!(
+                    "cagents could not read this conversation's saved transcript, so its earlier messages are not shown here. Claude Code reads the transcript itself when it resumes, so it may still have the earlier context.\n\nDetails: {error}"
+                ),
+            )));
         }
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
@@ -3703,10 +3897,10 @@ impl Adapter for Claude {
                 history.marked,
                 !self.history_only,
             ) {
-                step.events.push(Event::History {
-                    items: vec![history_notice("Some saved messages are not shown", body)],
-                    has_earlier: false,
-                });
+                step.events.push(Event::Item(history_notice(
+                    "Some saved messages are not shown",
+                    body,
+                )));
             }
             self.history_outcomes = std::mem::take(&mut history.call_outcomes);
             self.background_agents.extend(
@@ -3920,6 +4114,7 @@ impl Adapter for Claude {
                 }
                 self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
+            Command::SendQueuedNow => self.request_send_now(),
             Command::StartQueued { .. }
             | Command::SetInterruptMode { .. }
             | Command::ListBranches
@@ -4112,6 +4307,13 @@ impl Adapter for Claude {
             }
         }
     }
+    fn expendable_write(&self, frame: &Value) -> bool {
+        frame["type"] == "control_request"
+            && frame["request_id"]
+                .as_str()
+                .and_then(|id| self.controls.get(id))
+                .is_some_and(|request| request["_cagents_automatic"] == true)
+    }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
         for event in &mut step.events {
@@ -4280,6 +4482,9 @@ impl Claude {
                 self.started_generation = None;
                 self.session_id = None;
                 self.history = None;
+                if let Some(titles) = &mut self.titles {
+                    titles.reset();
+                }
                 self.pending.clear();
                 self.retired.clear();
                 self.streams.clear();
@@ -4318,6 +4523,9 @@ impl Claude {
                 self.handed_back.clear();
                 self.submissions.clear();
                 self.queued.clear();
+                self.send_now = None;
+                self.send_now_request = None;
+                self.hand_over = None;
                 self.stream_events.clear();
                 self.carrier_items.clear();
                 self.carrier_order.clear();
@@ -4334,6 +4542,7 @@ impl Claude {
                 step.events.push(Event::Reset {
                     reason: "Claude reset the conversation".into(),
                 });
+                step.events.push(Event::OpeningHistoryComplete);
             }
             "control_response" => {
                 let response = &frame["response"];
@@ -4372,7 +4581,15 @@ impl Claude {
                         self.interruption = accepted.then_some(true);
                     }
                 }
+                let send_now = self
+                    .send_now_request
+                    .as_ref()
+                    .is_some_and(|request| request.id == id);
                 if string(response, "subtype") == "error" {
+                    if send_now {
+                        self.send_now_request = None;
+                        self.set_send_now(None, &mut step);
+                    }
                     if string(&request, "subtype") == "cancel_async_message"
                         && let Some(id) = request["message_uuid"].as_str()
                     {
@@ -4397,12 +4614,13 @@ impl Claude {
                     // turns report, which is nothing the reader has to act
                     // on. A refresh the reader asked for still says why not.
                     if request["_cagents_automatic"] != true {
+                        let what = if request["send_now"] == true {
+                            "send now"
+                        } else {
+                            string(&request, "subtype")
+                        };
                         step.events.push(Event::Error {
-                            message: format!(
-                                "Claude {}: {}",
-                                string(&request, "subtype"),
-                                string(response, "error")
-                            ),
+                            message: format!("Claude {what}: {}", string(response, "error")),
                             fatal: string(&request, "subtype") == "initialize",
                         });
                     }
@@ -4430,6 +4648,8 @@ impl Claude {
                             }
                             if self.resumed {
                                 self.observe_title(&mut step);
+                            } else {
+                                step.events.push(Event::OpeningHistoryComplete);
                             }
                             self.metadata(&response["response"], &mut step);
                             self.fast_mode_metadata(&response["response"], &mut step);
@@ -4538,6 +4758,29 @@ impl Claude {
                                     string(&request, "mode")
                                 ),
                             });
+                        }
+                        "interrupt" if request["send_now"] == true => {
+                            // The turn's result or the messages starting say
+                            // how it ended, and may have outrun this answer:
+                            // only the request still in hand is updated.
+                            if send_now {
+                                match response["response"]["send_now"].as_str() {
+                                    Some("delivering") => self
+                                        .set_send_now(Some(chat::SendNow::Delivering), &mut step),
+                                    Some("stopped") => {
+                                        self.set_send_now(Some(chat::SendNow::Stopped), &mut step)
+                                    }
+                                    Some("nothing_waiting") => {
+                                        self.set_send_now(Some(chat::SendNow::Declined), &mut step)
+                                    }
+                                    // A CLI that does not say what it did gives
+                                    // nothing to show; the person may ask again.
+                                    _ => {
+                                        self.send_now_request = None;
+                                        self.set_send_now(None, &mut step);
+                                    }
+                                }
+                            }
                         }
                         "interrupt" => {
                             step.events.push(Event::Status {
@@ -4707,7 +4950,23 @@ impl Claude {
                     )));
                 }
                 self.turn_visible_content = false;
-                let can_suggest = frame["parent_tool_use_id"].is_null()
+                // The turn made way for messages the person asked to send now.
+                // How it ended is that request's doing, not a failure or a
+                // stop of theirs, and the turn it made way for carries on
+                // the work, and so the run that asked for it: that turn's
+                // own result settles both.
+                let made_way = self.result_made_way(&frame);
+                // Until the messages it made way for start, the conversation
+                // is still at work on them.
+                let handing_over = made_way && !self.queued.is_empty();
+                self.send_now_request = None;
+                self.set_send_now(None, &mut step);
+                if made_way {
+                    // Its stop record has already been drawn where it was.
+                    self.stop_marked = false;
+                }
+                let can_suggest = !made_way
+                    && frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
                     && self.interruption.is_none()
@@ -4720,7 +4979,7 @@ impl Claude {
                 // Code's record of the stop or its acknowledgement says the
                 // stop took: a stop still unacknowledged when the turn ends
                 // may yet be refused, so the turn's own failure stands.
-                let stopped = self.stop_marked || interruption == Some(true);
+                let stopped = !made_way && (self.stop_marked || interruption == Some(true));
                 if stopped {
                     self.settle_stopped_calls(None, &mut step);
                     if !std::mem::take(&mut self.stop_marked) {
@@ -4734,6 +4993,16 @@ impl Claude {
                 }
                 if had_turn || frame["uuid"].as_str().is_some() {
                     step.events.push(Event::TurnSettled);
+                }
+                if handing_over {
+                    self.hand_over = Some(format!(
+                        "claude:{}",
+                        frame["uuid"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                    ));
+                } else if had_turn || frame["uuid"].as_str().is_some() {
                     use crate::notifications::Kind;
                     // A delayed interrupt acknowledgement can arrive during
                     // another turn. Allocate its fallback identity now instead
@@ -4748,7 +5017,7 @@ impl Claude {
                     let outcome =
                         if interruption == Some(true) || (interruption.is_none() && stopped) {
                             Kind::Cancelled
-                        } else if frame["is_error"].as_bool() == Some(true) {
+                        } else if frame["is_error"].as_bool() == Some(true) && !made_way {
                             Kind::Failed
                         } else {
                             Kind::Succeeded
@@ -4782,11 +5051,13 @@ impl Claude {
                 });
                 // Background agents have their own status. They must not
                 // prevent new input once the main turn has ended.
-                let busy = !self.pending.is_empty();
+                let busy = !self.pending.is_empty() || handing_over;
                 self.ended_interrupted = stopped;
                 self.status(
                     busy,
-                    if busy {
+                    if handing_over {
+                        "Claude is starting the queued messages"
+                    } else if busy {
                         "Claude turn ended; decisions remain"
                     } else if stopped {
                         chat::TURN_INTERRUPTED
@@ -4837,7 +5108,7 @@ impl Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if frame["is_error"].as_bool() == Some(true) && !stopped {
+                if frame["is_error"].as_bool() == Some(true) && !stopped && !made_way {
                     let errors = content_text(&frame["errors"]);
                     let message = if !errors.is_empty() {
                         errors
@@ -4877,10 +5148,11 @@ impl Claude {
                 let state = required(&frame, "state")?;
                 if let Some(id) = frame["command_uuid"].as_str() {
                     if state == "queued" {
-                        if let Some(message) = self.submissions.get(id)
-                            && !self.queued.iter().any(|queued| queued.id == id)
-                        {
-                            self.queued.push(message.preview.clone());
+                        if let Some(message) = self.submissions.get_mut(id) {
+                            message.admitted = true;
+                            if !self.queued.iter().any(|queued| queued.id == id) {
+                                self.queued.push(message.preview.clone());
+                            }
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
                         if matches!(state, "started" | "completed")
@@ -4889,10 +5161,14 @@ impl Claude {
                             self.accept_user_prompt(id, &mut step);
                         }
                         if state == "started" && self.submissions.contains_key(id) {
+                            self.hand_over = None;
                             self.start_turn(&mut step);
                             self.status(true, "Claude is working", &mut step);
                         }
                         self.queued.retain(|message| message.id != id);
+                        if self.queued.is_empty() {
+                            self.finish_hand_over(&mut step);
+                        }
                         if let Some(submission) = self.submissions.remove(id)
                             && let Some(items) = submission.deferred
                         {
@@ -4910,6 +5186,7 @@ impl Claude {
                         }
                     }
                     step.events.push(Event::QueueChanged(self.queued.clone()));
+                    self.settle_send_now(&mut step);
                 }
                 step.events.push(Event::Status {
                     busy: self.busy,
@@ -5344,6 +5621,57 @@ fn actual_user_prompt(frame: &Value) -> bool {
                     .any(|block| matches!(string(block, "type"), "text" | "image" | "document"))
         });
     prompt && delivery(frame).is_empty()
+}
+
+/// Project just the human text for naming an opening on the saved chain.
+/// Image and document blocks do not contribute a title.
+fn opening_title(frame: &Value) -> Option<crate::chat::OpeningTitle> {
+    if !actual_user_prompt(frame)
+        || frame["isSidechain"] == true
+        || !string(frame, "teamName").is_empty()
+        || !string(frame, "parent_tool_use_id").is_empty()
+        || [
+            "isSynthetic",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ]
+        .iter()
+        .any(|key| frame[*key] == true)
+        || stop_record(&frame["message"])
+    {
+        return None;
+    }
+    let title = |text: &str| {
+        let text = text.trim();
+        if model_only_note(text)
+            || text.starts_with(SKILL_DIRECTORY)
+            || text.starts_with("<local-command-")
+            || hook_feedback(text)
+        {
+            return None;
+        }
+        crate::chat::OpeningTitle::from_text(slash_command_prompt(text).as_deref().unwrap_or(text))
+    };
+    let content = &frame["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return title(text);
+    }
+    let mut fallback = None;
+    for block in content.as_array()? {
+        let candidate = match block["type"].as_str() {
+            Some("text") => block["text"].as_str().and_then(title),
+            Some("image") => Some(crate::chat::OpeningTitle::Image),
+            Some("document") => Some(crate::chat::OpeningTitle::Conversation),
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            if !candidate.provisional() {
+                return Some(candidate);
+            }
+            fallback.get_or_insert(candidate);
+        }
+    }
+    fallback
 }
 
 /// What a user frame Claude Code wrote on another agent's behalf delivers,
@@ -7016,6 +7344,43 @@ fn stop_record(message: &Value) -> bool {
     )
 }
 
+/// Whether a main-turn result says only that the turn was cut short: stopped
+/// while streaming or running tools, as Claude Code ends a turn it interrupts.
+/// Claude Code 2.1.296 words it as `error_during_execution` with nothing but
+/// its own diagnostics, or as a success that stopped for tool use, and names
+/// an abort as the terminal reason where it gives one.
+fn cut_short(frame: &Value) -> bool {
+    if frame
+        .get("terminal_reason")
+        .is_some_and(|reason| reason != "aborted_streaming" && reason != "aborted_tools")
+    {
+        return false;
+    }
+    match string(frame, "subtype") {
+        // A named abort is cut short whatever it stopped for.
+        "success" => {
+            frame["is_error"] != true
+                && (frame["stop_reason"] == "tool_use" || frame.get("terminal_reason").is_some())
+        }
+        // Without an abort named, only Claude Code's own diagnostics say
+        // nothing else went wrong.
+        "error_during_execution" => {
+            let diagnostics = frame["errors"].as_array().is_some_and(|errors| {
+                errors.iter().all(|error| {
+                    error
+                        .as_str()
+                        .is_some_and(|error| error.starts_with("[ede_diagnostic]"))
+                })
+            });
+            match frame.get("terminal_reason") {
+                Some(_) => frame["errors"].is_null() || diagnostics,
+                None => diagnostics && !frame["errors"].as_array().is_some_and(Vec::is_empty),
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Whether a failed result is the call being refused or cut short rather
 /// than failing: the person declined it, or it was interrupted before it
 /// finished. Claude Code reports both as errors, in fixed wording.
@@ -7651,7 +8016,22 @@ impl Claude {
             "permission_denied" => {
                 self.permission_denied(frame["parent_tool_use_id"].as_str(), frame, step)?
             }
-            "init" | "commands_changed" => self.metadata(frame, step),
+            "init" | "commands_changed" => {
+                // The initialize response has a `capabilities` list of its
+                // own, which never names this; only `system/init` speaks for
+                // the input transport.
+                if subtype == "init" {
+                    self.send_now_advertised =
+                        frame["capabilities"]
+                            .as_array()
+                            .is_some_and(|capabilities| {
+                                capabilities
+                                    .iter()
+                                    .any(|capability| capability == "interrupt_send_now_v1")
+                            });
+                }
+                self.metadata(frame, step)
+            }
             "model_refusal_fallback" => {
                 self.retract(&frame["retracted_message_uuids"], step)?;
                 step.events.push(Event::Item(text_item(
@@ -8111,7 +8491,10 @@ fn sidecar_meta(path: &Path) -> Option<Value> {
     {
         return None;
     }
-    serde_json::from_reader(file).ok()
+    // At once: serde_json reads an unbuffered file one byte per read(2).
+    let mut metadata = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, 16 * 1024), &mut metadata).ok()?;
+    serde_json::from_slice(&metadata).ok()
 }
 
 // Port of the official SDK's _build_conversation_chain, with a bounded offset
@@ -8140,6 +8523,7 @@ struct History {
     /// Latest actual user prompt on the displayed chain; provider notices and
     /// tool-result carriers never advance the current failure scope.
     latest_prompt: Option<u64>,
+    opening_title: Option<crate::chat::OpeningTitle>,
     background_agent_tools: HashSet<String>,
     /// How the background work other calls started ended, by call, as the
     /// transcript's notifications recorded it. One entry per notified call,
@@ -9085,6 +9469,7 @@ impl History {
             agent_labels: HashMap::new(),
             agent_status: HashMap::new(),
             latest_prompt,
+            opening_title: None,
             background_agent_tools: HashSet::new(),
             call_outcomes: HashMap::new(),
             result_calls,
@@ -9093,8 +9478,33 @@ impl History {
             oversized,
             marked,
         };
+        history.opening_title = history.find_opening_title(&user_prompts);
         history_branches::index_activity(&mut history, &nodes, &ambiguous, &task_notices)?;
         Ok(history)
+    }
+
+    /// The earliest readable prompt on this conversation's displayed branch,
+    /// including prompts older than the page loaded at startup.
+    fn find_opening_title(&mut self, prompts: &HashSet<u64>) -> Option<crate::chat::OpeningTitle> {
+        let mut fallback = None;
+        for index in 0..self.chain.len() {
+            let Link::Record(offset, len, base) = self.chain[index] else {
+                continue;
+            };
+            if !prompts.contains(&offset) {
+                continue;
+            }
+            let Ok(frame) = self.read_record_for_start(offset, len, base) else {
+                continue;
+            };
+            if let Some(title) = opening_title(&frame) {
+                if !title.provisional() {
+                    return Some(title);
+                }
+                fallback.get_or_insert(title);
+            }
+        }
+        fallback
     }
     /// A transcript records what ran, not proof of a process still running.
     /// Keep confirmed terminal outcomes; unresolved runs have ended for the
@@ -9830,6 +10240,9 @@ mod streamed_input;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod send_now_tests;
 
 #[cfg(test)]
 mod startup_history_retryability_tests {

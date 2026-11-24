@@ -1277,12 +1277,15 @@ fn a_close_refused_after_removing_its_pin_can_retry() {
 fn republishing_a_window_writes_only_new_or_restored_claims() {
     let (host, _directory, session, _handle) = retention_client_host("republish");
     let id = session.id;
+    let stable = TerminalId::new();
+    let mut initial = terminal_presence(id);
+    initial.sessions.push(stable);
     host.lock().unwrap().register_client(7);
     process_request(
         &host,
         7,
         ClientRequest::WatchNotifications {
-            presence: terminal_presence(id),
+            presence: initial.clone(),
         },
     )
     .unwrap();
@@ -1290,19 +1293,21 @@ fn republishing_a_window_writes_only_new_or_restored_claims() {
         process_request(&host, 1, ClientRequest::NotificationPresence { presence }).unwrap();
     };
     let claimed = retention_pin_generation(&host, id);
+    let stable_claim = retention_pin_generation(&host, stable);
     assert!(claimed.as_ref().unwrap().is_some());
-    publish(terminal_presence(id));
+    assert!(stable_claim.as_ref().unwrap().is_some());
+    publish(initial.clone());
     assert_eq!(retention_pin_generation(&host, id), claimed);
 
     // Adding a card leaves the existing claim, so its close can proceed,
     // and dropping that card again claims nothing new.
     let other = TerminalId::new();
-    let mut both = terminal_presence(id);
+    let mut both = initial.clone();
     both.sessions.push(other);
     publish(both);
     assert_eq!(retention_pin_generation(&host, id), claimed);
     assert!(retention_pin_generation(&host, other).unwrap().is_some());
-    publish(terminal_presence(id));
+    publish(initial.clone());
     assert_eq!(retention_pin_generation(&host, id), claimed);
 
     // A close removed this claim while the window still reports the card.
@@ -1312,10 +1317,11 @@ fn republishing_a_window_writes_only_new_or_restored_claims() {
         .unwrap()
         .forget_retention_pin(id, claimed.as_ref().unwrap().as_ref().unwrap())
         .unwrap();
-    publish(terminal_presence(id));
+    publish(initial);
     let restored = retention_pin_generation(&host, id);
     assert!(restored.as_ref().unwrap().is_some());
     assert_ne!(restored, claimed);
+    assert_eq!(retention_pin_generation(&host, stable), stable_claim);
 }
 
 #[test]

@@ -514,7 +514,12 @@ fn attached_mut(
 }
 /// Helper callbacks enqueue durable work; they never refresh or close their
 /// own proxy while its ordered publication fence is held.
-fn changed_owned(host: &Weak<HostLock>, id: TerminalId, instance: uuid::Uuid, update: Update) {
+pub(super) fn changed_owned(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: uuid::Uuid,
+    update: Update,
+) {
     let Some(owner) = host.upgrade() else {
         return;
     };
@@ -615,6 +620,12 @@ fn changed_for_instance(
                 event.content = content.clone();
             }
             notifications.record(event);
+        }
+        return;
+    }
+    if matches!(update, Update::ConversationNameChanged) {
+        if let Some(titles) = &state.channel_titles {
+            titles.offer(super::workspace::titles::Target::Chat(id));
         }
         return;
     }
@@ -3978,12 +3989,17 @@ fn chat_command(
     command: crate::chat::Command,
     delivery: Option<crate::chat::DeliveryKey>,
 ) -> Result<ServerResponse, ProtocolError> {
-    let handle = {
+    let gives_work = command.gives_work();
+    let delivery = delivery.filter(|_| gives_work);
+    let (handle, deliveries, registry) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
         }
-        attached(&state, client, chat_id)?.handle.clone()
+        let handle = attached(&state, client, chat_id)?.handle.clone();
+        let deliveries = delivery.and_then(|_| state.chat_deliveries.clone());
+        let registry = delivery.and_then(|_| state.execution_registry.clone());
+        (handle, deliveries, registry)
     };
     if let crate::chat::Command::ReadTextCopy { source, offset } = &command {
         let page = handle.text_copy(source, *offset).map_err(unavailable)?;
@@ -4004,12 +4020,29 @@ fn chat_command(
             }
         });
     }
-    if command.gives_work() {
-        super::agent_execution::given_work(host, chat_id);
-    }
-    match delivery {
-        Some(key) => handle.deliver(command, key),
-        None => handle.command(command),
+    if let Some(key) = delivery {
+        use chat::failure::delivery::DELIVERY_NOT_SENT;
+        let deliveries = deliveries.ok_or_else(|| unavailable(DELIVERY_NOT_SENT))?;
+        // Explicit resume can allocate a new chat ID for the same lineage.
+        // Look it up outside the host lock, just like the ledger writes.
+        let registry = registry.ok_or_else(|| unavailable(DELIVERY_NOT_SENT))?;
+        let lineage = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .session_lineage(chat_id)
+            .map_err(|error| {
+                tracing::error!(%chat_id, %error, "cannot read the message delivery lineage");
+                unavailable(DELIVERY_NOT_SENT)
+            })?
+            .map_or(chat_id, |lineage| lineage.0);
+        handle.deliver(&deliveries, lineage, command, key, || {
+            super::agent_execution::given_work(host, chat_id);
+        })
+    } else {
+        if gives_work {
+            super::agent_execution::given_work(host, chat_id);
+        }
+        handle.command(command)
     }
     .map_err(unavailable)?;
     Ok(ServerResponse::Accepted)

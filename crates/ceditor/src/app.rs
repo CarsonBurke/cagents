@@ -2,6 +2,7 @@ use cagents::{
     design,
     github::GitHubService,
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
+    process::ProcessExecutor,
     repository::{
         CancellationToken, CommitOutcome, CommitRequest, DiffBasis, MutationOutcome, PathSelection,
         PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryService, RepositorySnapshot,
@@ -61,10 +62,93 @@ pub struct Flags {
 pub struct Opened {
     root: PathBuf,
     file: Option<PathBuf>,
-    snapshot: Option<RepositorySnapshot>,
+    snapshot: Option<Arc<RepositorySnapshot>>,
     /// The language the reader already chose for `file`, in an earlier
     /// session or before saving an untitled note as it.
     language: Option<DocumentLanguage>,
+}
+
+/// Shares worktree snapshots while opening one batch in durable order.
+struct OpenBatch<E> {
+    git: RepositoryService<E>,
+    snapshots: HashMap<PathBuf, Arc<RepositorySnapshot>>,
+}
+
+impl<E: ProcessExecutor> OpenBatch<E> {
+    fn new(git: RepositoryService<E>) -> Self {
+        Self {
+            git,
+            snapshots: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, path: PathBuf) -> Result<Opened, String> {
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let is_directory = path.is_dir();
+        let directory = if is_directory {
+            path.clone()
+        } else {
+            if !path.is_file() {
+                return Err(format!("{} is not a regular file", path.display()));
+            }
+            std::fs::File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            path.parent()
+                .ok_or("File has no parent directory")?
+                .to_path_buf()
+        };
+        let token = CancellationToken::default();
+        // A repository can appear between tabs, even for the same directory.
+        // Failed discovery still permits editing an ordinary directory.
+        let repository_root = self
+            .git
+            .discover_worktree_root(&directory, &token)
+            .ok()
+            .flatten();
+        let snapshot = repository_root
+            .as_ref()
+            .map(|root| {
+                if let Some(snapshot) = self.snapshots.get(root) {
+                    return Ok(Arc::clone(snapshot));
+                }
+                let snapshot = Arc::new(
+                    self.git
+                        .snapshot(root, &token)
+                        .map_err(|error| error.to_string())?,
+                );
+                self.snapshots.insert(root.clone(), Arc::clone(&snapshot));
+                Ok::<_, String>(snapshot)
+            })
+            .transpose()?;
+        let root = repository_root.unwrap_or(directory);
+        let file = (!is_directory)
+            .then(|| path.strip_prefix(&root).map(Path::to_path_buf))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok(Opened {
+            root,
+            file,
+            snapshot,
+            language: None,
+        })
+    }
+
+    fn restore(
+        &mut self,
+        paths: Vec<crate::preferences::StartupPath>,
+    ) -> Vec<(bool, Result<Opened, String>)> {
+        paths
+            .into_iter()
+            .map(|start| {
+                let opened = self.resolve(start.path).map(|opened| Opened {
+                    language: start.language,
+                    ..opened
+                });
+                (start.focus, opened)
+            })
+            .collect()
+    }
 }
 
 /// An untitled note whose Save As chooser is open.
@@ -1315,44 +1399,7 @@ impl Editor {
     }
 
     fn resolve_open(path: PathBuf) -> Result<Opened, String> {
-        let path = path
-            .canonicalize()
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        let directory = if path.is_dir() {
-            path.clone()
-        } else {
-            if !path.is_file() {
-                return Err(format!("{} is not a regular file", path.display()));
-            }
-            std::fs::File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-            path.parent()
-                .ok_or("File has no parent directory")?
-                .to_path_buf()
-        };
-        let service = RepositoryService::system("git");
-        let token = CancellationToken::default();
-        // Discovery failure does not prevent editing an ordinary folder.
-        let repository = service.discover(&directory, &token).ok();
-        let repository_root = repository.and_then(|info| info.worktree_root);
-        let snapshot = repository_root
-            .as_ref()
-            .map(|root| {
-                service
-                    .snapshot(root, &token)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?;
-        let root = repository_root.unwrap_or(directory);
-        let file = (!path.is_dir())
-            .then(|| path.strip_prefix(&root).map(Path::to_path_buf))
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        Ok(Opened {
-            root,
-            file,
-            snapshot,
-            language: None,
-        })
+        OpenBatch::new(RepositoryService::system("git")).resolve(path)
     }
 
     fn open(path: PathBuf, selection_epoch: u64) -> Task<Message> {
@@ -1375,23 +1422,19 @@ impl Editor {
         })
     }
 
-    /// Resolves one file of the last session, set to the language chosen for
-    /// it, with whether it takes focus.
-    fn resolve_startup(start: crate::preferences::StartupPath) -> (bool, Result<Opened, String>) {
-        let language = start.language;
-        let opened = Self::resolve_open(start.path).map(|opened| Opened { language, ..opened });
-        (start.focus, opened)
+    fn resolve_startup(
+        paths: Vec<crate::preferences::StartupPath>,
+    ) -> Vec<(bool, Result<Opened, String>)> {
+        OpenBatch::new(RepositoryService::system("git")).restore(paths)
     }
 
     fn restore_session(paths: Vec<crate::preferences::StartupPath>) -> Task<Message> {
         cosmic::task::future(async move {
             // Resolve in durable order, not background-task completion order.
             // An unavailable entry never prevents the remaining files opening.
-            let opened = tokio::task::spawn_blocking(move || {
-                paths.into_iter().map(Self::resolve_startup).collect()
-            })
-            .await
-            .unwrap_or_else(|error| vec![(false, Err(error.to_string()))]);
+            let opened = tokio::task::spawn_blocking(move || Self::resolve_startup(paths))
+                .await
+                .unwrap_or_else(|error| vec![(false, Err(error.to_string()))]);
             Message::SessionOpened(0, opened)
         })
     }
@@ -1637,7 +1680,7 @@ impl Editor {
             self.settings_path.with_file_name("review.json"),
         ))));
         let review_task = review
-            .set_source(review_source(&descriptor_root, opened.snapshot.as_ref()))
+            .set_source(review_source(&descriptor_root, opened.snapshot.as_deref()))
             .map(move |action| Message::PullRequestReview(id, action))
             .map(cosmic::Action::App);
         self.tabs.push(Tab {
@@ -3053,11 +3096,7 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
                                     widget::button::custom(
                                         widget::row::with_children(vec![
                                     widget::container(icon).center_y(Length::Fill).into(),
-                                    design::body(title.clone())
-                                        .wrapping(iced::widget::text::Wrapping::None)
-                                        .ellipsize(iced::widget::text::Ellipsize::End(
-                                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                        ))
+                                    cagents_ui_kit::ui_controls::fade_text(title.clone())
                                         .width(Length::Fill)
                                         .into(),
                                 ])
@@ -6464,7 +6503,7 @@ mod tests {
             Opened {
                 root: root.to_path_buf(),
                 file: file.map(PathBuf::from),
-                snapshot: Some(snapshot),
+                snapshot: Some(Arc::new(snapshot)),
                 language: None,
             },
             true,
@@ -8886,6 +8925,114 @@ mod tests {
     }
 
     #[test]
+    fn restoring_git_tabs_shares_worktree_snapshots() {
+        use cagents::process::{CommandSpec, ProcessFailure, ProcessOutput, SystemProcessExecutor};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingGit(AtomicUsize);
+
+        impl ProcessExecutor for CountingGit {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                SystemProcessExecutor.execute(command, cancellation)
+            }
+        }
+
+        let repository = git_fixture();
+        let root = repository.path().canonicalize().unwrap();
+        let subdir = root.join("subdir");
+        let nested = root.join("nested");
+        for directory in [&subdir, &nested] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        git(&nested, &["init", "-b", "main"]);
+        let paths = [
+            root.join("tracked.txt"),
+            root.join("other.txt"),
+            subdir.join("file.txt"),
+            nested.join("file.txt"),
+        ];
+        for path in &paths[1..] {
+            std::fs::write(path, "contents\n").unwrap();
+        }
+        let paths = crate::preferences::Session {
+            paths: paths.into(),
+            active: Some(2),
+            ..Default::default()
+        }
+        .startup_paths(Vec::new());
+        let executor = Arc::new(CountingGit::default());
+        let opened =
+            OpenBatch::new(RepositoryService::new("git", Arc::clone(&executor))).restore(paths);
+        let opened: Vec<_> = opened
+            .into_iter()
+            .map(|(focus, opened)| (focus, opened.unwrap()))
+            .collect();
+
+        // One root lookup per file and six snapshot calls per worktree.
+        assert_eq!(executor.0.load(Ordering::Relaxed), 4 + 2 * 6);
+        let snapshot = opened[0].1.snapshot.as_ref().unwrap();
+        for (focus, opened) in &opened[..3] {
+            assert_eq!(opened.root, root);
+            assert!(Arc::ptr_eq(snapshot, opened.snapshot.as_ref().unwrap()));
+            assert_eq!(
+                *focus,
+                opened.file.as_deref() == Some(Path::new("subdir/file.txt"))
+            );
+        }
+        assert_eq!(opened[3].1.root, nested);
+        assert!(!Arc::ptr_eq(
+            snapshot,
+            opened[3].1.snapshot.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn restoring_git_tabs_detects_a_repository_created_mid_batch() {
+        let repository = git_fixture();
+        let root = repository.path().canonicalize().unwrap();
+        let nested = root.join("nested");
+        let directory = nested.join("subdir");
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+
+        let mut batch = OpenBatch::new(RepositoryService::system("git"));
+        let first = batch.resolve(first).unwrap();
+        assert_eq!(first.root, root);
+        assert_eq!(
+            first.file.as_deref(),
+            Some(Path::new("nested/subdir/first.txt"))
+        );
+
+        git(&nested, &["init", "-b", "main"]);
+        let second = batch.resolve(second).unwrap();
+        assert_eq!(second.root, nested);
+        assert_eq!(second.file.as_deref(), Some(Path::new("subdir/second.txt")));
+        assert!(!Arc::ptr_eq(
+            first.snapshot.as_ref().unwrap(),
+            second.snapshot.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn opening_git_metadata_uses_the_registered_worktree() {
+        let repository = git_fixture();
+        let root = repository.path().canonicalize().unwrap();
+        let opened = Editor::resolve_open(root.join(".git")).unwrap();
+        assert_eq!(opened.root, root);
+        assert!(opened.file.is_none());
+        assert!(opened.snapshot.is_some());
+    }
+
+    #[test]
     fn restoring_tabs_skips_missing_files_without_losing_order_or_selection() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -8900,11 +9047,7 @@ mod tests {
             expanded_directories: Default::default(),
             languages: Default::default(),
         };
-        let opened = session
-            .startup_paths(Vec::new())
-            .into_iter()
-            .map(Editor::resolve_startup)
-            .collect();
+        let opened = Editor::resolve_startup(session.startup_paths(Vec::new()));
         let mut app = editor();
         app.restoring_session = true;
         drop(app.update(Message::SessionOpened(0, opened)));
@@ -8947,11 +9090,7 @@ mod tests {
         let saved = crate::preferences::load_session(&app.settings_path).unwrap();
         assert_eq!(saved.paths, vec![normal, raw]);
         assert_eq!(saved.active, Some(1));
-        let opened = saved
-            .startup_paths(Vec::new())
-            .into_iter()
-            .map(Editor::resolve_startup)
-            .collect();
+        let opened = Editor::resolve_startup(saved.startup_paths(Vec::new()));
         let mut restored = configured(&directory);
         restored.restoring_session = true;
         drop(restored.update(Message::SessionOpened(0, opened)));
@@ -10036,11 +10175,7 @@ mod tests {
 
         // The next session reopens the note with the choice, and a new note
         // beside it starts without one.
-        let opened = session
-            .startup_paths(Vec::new())
-            .into_iter()
-            .map(Editor::resolve_startup)
-            .collect();
+        let opened = Editor::resolve_startup(session.startup_paths(Vec::new()));
         let mut restored = configured(&directory);
         restored.restoring_session = true;
         drop(restored.update(Message::SessionOpened(0, opened)));
@@ -10212,7 +10347,7 @@ mod tests {
             Opened {
                 root: root.to_path_buf(),
                 file: file.map(PathBuf::from),
-                snapshot: Some(changes_snapshot(entries)),
+                snapshot: Some(Arc::new(changes_snapshot(entries))),
                 language: None,
             },
             true,

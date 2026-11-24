@@ -2712,14 +2712,18 @@ fn a_recorded_base_turns_a_redraw_edge_into_a_pushed_repaint() {
             .record_sent(1, id, Arc::clone(&base), true);
         (delivery, handle, base)
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while handle.generation() <= base.generation {
-        assert!(Instant::now() < deadline, "the terminal never repainted");
+    // The shell's prompt repaints it, however long a busy host takes to
+    // start the shell.
+    crate::test_timing::eventually("the terminal's repaint", || {
         // The worker withholds the next capture until the presented
         // generation is acknowledged; the UI does this after drawing.
-        handle.acknowledge_redraw(handle.generation());
-        thread::sleep(Duration::from_millis(10));
-    }
+        let generation = handle.generation();
+        if generation > base.generation {
+            return true;
+        }
+        handle.acknowledge_redraw(generation);
+        false
+    });
 
     broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation(), &handle);
     delivery.close_after_drain();

@@ -297,7 +297,7 @@ pub(super) fn perform(
         installation,
         state,
         job,
-        &result,
+        &mut result,
         handoff,
         &recovery,
         survivors,
@@ -745,7 +745,7 @@ fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool
     invalid(parts.join(" "))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 
@@ -1288,6 +1288,7 @@ exit 1"#,
                 confirmation: None,
                 refusal: None,
                 in_flight: Vec::new(),
+                recorded_by: None,
             };
             write_job(&state, &job).unwrap();
             if mode == "write-error" {

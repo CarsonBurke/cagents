@@ -158,6 +158,53 @@ fn direct_completion_actor(
     )
 }
 
+#[test]
+fn a_keyed_send_is_refused_when_its_ledger_or_registry_is_unavailable() {
+    use crate::chat::{failure::delivery::DELIVERY_NOT_SENT, runtime::Deliveries};
+    use std::sync::Mutex;
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = completion_wake_host();
+    let chat = TerminalId::new();
+    let client = 1;
+    let (handle, launch) = direct_completion_actor("exec /bin/cat", directory.path(), |_| {});
+    completion_wake_record(&host, chat, uuid::Uuid::new_v4(), handle.clone(), launch);
+    let registry =
+        super::super::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
+    {
+        let mut state = host.lock().unwrap();
+        state
+            .chats
+            .get_mut(&chat)
+            .unwrap()
+            .subscribers
+            .insert(client, false);
+        state.idle_adoptions.insert(chat);
+        state.execution_registry = Some(Arc::new(Mutex::new(registry)));
+    }
+
+    let send = || {
+        chat_command(
+            &host,
+            client,
+            chat,
+            Command::Compact,
+            Some(uuid::Uuid::new_v4()),
+        )
+    };
+    assert_eq!(send().unwrap_err(), unavailable(DELIVERY_NOT_SENT));
+    assert!(host.lock().unwrap().idle_adoptions.contains(&chat));
+
+    {
+        let mut state = host.lock().unwrap();
+        state.chat_deliveries = Some(Arc::new(Deliveries::in_memory().unwrap()));
+        state.execution_registry = None;
+    }
+    assert_eq!(send().unwrap_err(), unavailable(DELIVERY_NOT_SENT));
+    assert!(host.lock().unwrap().idle_adoptions.contains(&chat));
+    handle.close().unwrap();
+}
+
 fn completion_wait_until(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready() {

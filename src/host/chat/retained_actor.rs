@@ -2107,6 +2107,9 @@ fn restore_actor_inner(
         Handle::adopt_remote_for_close(&owner, requested.clone(), proof.clone(), notify)
             .map_err(SetupError::Unavailable)?
     };
+    if let Some(seal) = &host.lock().unwrap_or_else(|p| p.into_inner()).mailbox_seal {
+        handle.open_frames_for_older_helper(&Arc::new(seal.recognizer()));
+    }
     let identity = handle
         .actor_identity()
         .ok_or("The retained actor did not provide its stable identity")?;

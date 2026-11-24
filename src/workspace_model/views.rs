@@ -1140,7 +1140,7 @@ mod wire_kind {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod wire_tests {
     use super::*;
     use crate::model::*;
@@ -1381,7 +1381,7 @@ pub fn same_resource(left: &CardKind, right: &CardKind) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod managed_display_tests {
     use super::*;
     use crate::{
@@ -1951,7 +1951,7 @@ mod managed_display_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod draft_choice_merge_tests {
     use super::*;
     use crate::{agent::Provider, model::*};

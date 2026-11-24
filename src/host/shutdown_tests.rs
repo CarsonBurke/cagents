@@ -955,8 +955,9 @@ fn unfinished_workers_do_not_starve_healthy(root: &Path, count: usize) {
                 .iter()
                 .all(|worker| !worker.worker_joined_for_test())
         );
-        // With a deadline per worker rather than one for the batch, enough
-        // blocked workers take longer than this.
+        // The blocked fixtures keep the product's join budget. Counted from
+        // each wait's own start rather than the batch's, enough of them take
+        // longer than this.
         let outcomes = result
             .recv_timeout(TerminalHandle::SHUTDOWN_TIMEOUT + crate::test_timing::EVENTUALLY)
             .expect("shutdown exceeded its single shared deadline");

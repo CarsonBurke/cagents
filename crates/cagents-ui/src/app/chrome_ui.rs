@@ -2014,6 +2014,19 @@ impl State {
     pub(super) fn close(&mut self) {
         self.popup = None;
     }
+
+    /// Whether something other than pane `card` is being renamed: another
+    /// pane or a channel. A click elsewhere does not end a rename.
+    pub(super) fn renaming_other_than(&self, card: CardId) -> bool {
+        self.rename
+            .as_ref()
+            .is_some_and(|(target, _)| *target != RenameTarget::Pane(card))
+    }
+
+    /// Drops a rename without applying it.
+    pub(super) fn cancel_rename(&mut self) {
+        self.rename = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2086,7 +2099,7 @@ pub enum Action {
     Launch(NewTab),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenameTarget {
     Pane(CardId),
     Channel(crate::model::ChannelId),
@@ -3875,6 +3888,7 @@ impl Cagents {
         };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.close_waiting_its_turn(id) => Some(("Waiting to close", true)),
             _ if self.terminal_close_in_progress(id) => Some(("Checking before closing", true)),
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.reopen_preparing(id) => Some(("Reopening conversation", true)),
@@ -3963,7 +3977,8 @@ impl Cagents {
                     || card_control_id(id, "close"),
                     |chrome| chrome.close_id.clone(),
                 ),
-                (!self.terminal_close_in_progress(id)).then_some(Message::CloseCard(id)),
+                (!self.terminal_close_in_progress(id) || self.close_waiting_its_turn(id))
+                    .then_some(Message::CloseCard(id)),
             ));
         }
         let tab = crate::tab_strip::middle_click_close(

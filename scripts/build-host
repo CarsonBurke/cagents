@@ -28,6 +28,7 @@ are taken. Otherwise the build waits for its shares as any other.
 """
 import array
 import contextlib
+import errno
 import fcntl
 import os
 import re
@@ -67,7 +68,10 @@ Options:
 
 Environment:
   CAGENTS_BUILD_LOCK   First share's lock file; the others add .1, .2, ...
-                       (default /var/tmp/cagents-cargo.lock)
+                       (default /var/tmp/cagents-cargo.lock). A caller that
+                       cannot write them, such as a sandboxed agent, locks
+                       the existing files read-only, still excluding every
+                       other build
   CAGENTS_BUILD_SLOTS  Shares on this host (default: three quarters of its
                        memory, in shares of 4 GiB, and at least 2)
   CAGENTS_BUILD_EXTRA_SHARES
@@ -360,6 +364,37 @@ def lock_path():
     return os.environ.get("CAGENTS_BUILD_LOCK") or "/var/tmp/cagents-cargo.lock"
 
 
+def open_lock(path, missing_ok=False):
+    """Opens the host's lock file `path` to flock(2), creating it if need be.
+
+    flock needs no write access, so a caller that may not write there, such
+    as an agent whose sandbox mounts /var/tmp read-only, locks the existing
+    file read-only: the same file, so still excluding every other build. One
+    that does not exist and cannot be created is None if `missing_ok`: no
+    build can hold it."""
+    try:
+        return open(path, "a")
+    except OSError as error:
+        if error.errno not in (errno.EROFS, errno.EACCES, errno.EPERM):
+            raise
+        written = error
+    try:
+        return open(path)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise LockUnavailable(f"cannot create the build lock {path} "
+                              f"({os.strerror(written.errno)}); a build run where it "
+                              "can be written creates it") from None
+    except OSError as error:
+        raise LockUnavailable(f"cannot open the build lock {path} "
+                              f"({os.strerror(error.errno)})") from None
+
+
+class LockUnavailable(Exception):
+    """A lock file this caller can neither open nor create."""
+
+
 @contextlib.contextmanager
 def shares(needed, deadline, queue_up=True):
     """Holds `needed` of the host's shares until the block ends. Waiters line
@@ -376,7 +411,7 @@ def shares(needed, deadline, queue_up=True):
     extras = paths[total:]
     slice_memory = build_slice_memory() if extras else None
     held = []
-    with open(f"{lock}.queue", "a") as queue:
+    with open_lock(f"{lock}.queue") as queue:
         announced = False
         short = [False]
         def wait(take):
@@ -402,14 +437,25 @@ def shares(needed, deadline, queue_up=True):
                 f"{os.uname().nodename}; the others are in use")
             announced = True
             flock_until(queue, deadline)
+        # Shares whose lock file this caller can neither open nor create,
+        # as in a sandbox, which it passes over: no build holds them.
+        missing = set()
         def free(candidates):
             """Locks each of `candidates` this does not hold that is free,
             and returns those and how many others hold."""
             taken, busy = [], 0
             for path in candidates:
-                if any(name == path for name, _ in held):
+                if path in missing or any(name == path for name, _ in held):
                     continue
-                share = open(path, "a")
+                share = open_lock(path, missing_ok=True)
+                if share is None:
+                    missing.add(path)
+                    if len(paths) - len(missing) < needed:
+                        raise LockUnavailable(
+                            f"cannot create the build lock {path}, and the {len(paths) - len(missing)} "
+                            f"that exist are fewer than the {needed} this build needs; a build "
+                            "run where they can be written creates them")
+                    continue
                 try:
                     fcntl.flock(share, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -841,7 +887,10 @@ def probe_slot():
     """Holds one of the host's probe slots, or yields None if none is free."""
     lock = lock_path()
     for index in range(max(1, SHARE // PROBE_MEMORY)):
-        with open(f"{lock}.probe.{index}", "a") as slot:
+        slot = open_lock(f"{lock}.probe.{index}", missing_ok=True)
+        if slot is None:
+            continue
+        with slot:
             try:
                 fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -1289,6 +1338,9 @@ def main(arguments):
             return cargo_command(build, command[0], command[1:])
         with build.admitted():
             return status_of(build.run(command))
+    except LockUnavailable as error:
+        say(str(error))
+        return 2
     except Interrupted as interruption:
         for path in remove:
             shutil.rmtree(path, ignore_errors=True)

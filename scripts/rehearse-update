@@ -9,6 +9,7 @@ set -euo pipefail
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
+source "$tool_root/scripts/git-ancestry.sh"
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
 real_home=$HOME
 
@@ -191,16 +192,10 @@ cmd_init() {
         require_init
     fi
     # Recovery storage refuses to live inside a Git checkout.
-    local ancestor=$root
-    while [ "$ancestor" != / ]; do
-        if [ -e "$ancestor/.git" ] || [ -L "$ancestor/.git" ]; then
-            # Sandboxes that mask .git in writable roots leave empty mountpoints behind.
-            [ -n "$(ls -A -- "$ancestor/.git" 2>/dev/null)" ] || [ ! -d "$ancestor/.git" ] ||
-                die "root must be outside Git ancestry; found $ancestor/.git (empty: likely a sandbox's .git mountpoint; choose another root)" 2
-            die "root must be outside Git ancestry; found $ancestor/.git" 2
-        fi
-        ancestor=$(dirname -- "$ancestor")
-    done
+    local marker
+    if marker=$(find_git_marker_in_ancestry "$root"); then
+        die "root must be outside Git ancestry; found $marker" 2
+    fi
     mkdir -p -- "$root"
     chmod 700 "$root"
     printf '%s\n' "$root" >"$root/.rehearse-update"
@@ -245,10 +240,19 @@ cmd_feed() {
     [[ $feed =~ ^/[A-Za-z0-9._/-]+$ ]] || die "feed path has unsupported characters: $feed" 2
     # The updater refuses a release whose SHA256SUMS omits the installer, as
     # an --archive-only package's does; say so before the rehearsal installs.
-    local latest sums
+    # The latest release's own metadata is under its trust generation's name,
+    # the newest one there; older names carry bridges for older builds.
+    local latest sums metadata=$feed/latest/download/release-metadata.json candidate newest=1
+    for candidate in "$feed"/latest/download/release-metadata-*.json; do
+        [[ ${candidate##*/} =~ ^release-metadata-([1-9][0-9]*)\.json$ ]] || continue
+        if ((BASH_REMATCH[1] > newest)); then
+            newest=${BASH_REMATCH[1]}
+            metadata=$candidate
+        fi
+    done
     latest=$(/usr/bin/python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' \
-        "$feed/latest/download/release-metadata.json" 2>/dev/null) ||
-        die "the feed's latest/download/release-metadata.json names no version" 2
+        "$metadata" 2>/dev/null) ||
+        die "the feed's latest/download/${metadata##*/} names no version" 2
     [[ $latest =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "the feed's latest version is not a version name: $latest" 2
     sums=$feed/download/v$latest/SHA256SUMS
     [ -f "$sums" ] || die "the feed's latest release $latest has no SHA256SUMS" 2
@@ -396,7 +400,7 @@ cmd_update() {
             die "the feed serves a different $name than DIR" 2
         [ ! -e "$prefix/versions/$version" ] && [ ! -L "$prefix/versions/$version" ] ||
             die "$prefix/versions/$version exists; the in-app update installs it" 2
-        staged_cli=cagents
+        staged_cli=$user_home/.local/bin/cagents
         upgrade_args=(--version "$version" "${upgrade_args[@]}")
         printf 'updating in the app from the feed to %s\n' "$version" | tee -a "$transcript"
     elif [ "$use_staged" -eq 1 ]; then

@@ -1,0 +1,59 @@
+name: Mobile app
+
+# The Android app's tests decode crates/mobile-api/fixtures/v1.jsonl, the
+# bridge's recording of every mobile API message, so a change to either side
+# that would break the app fails here.
+on:
+  pull_request:
+    paths:
+      - "mobile/**"
+      - "crates/mobile-api/**"
+      - ".github/workflows/mobile.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "mobile/**"
+      - "crates/mobile-api/**"
+      - ".github/workflows/mobile.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Protocol and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # mobile/gradlew runs only where this is set; a runner is a build host.
+    env:
+      CAGENTS_GRADLE_LOCAL: "1"
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Test the shared protocol client and the app
+        run: ./gradlew --console=plain :shared:jvmTest :androidApp:testDebugUnitTest
+
+      # The phone runs the minified build. Building it here catches R8
+      # configuration errors; a missing keep rule shows only at run time.
+      - name: Build the minified preview
+        run: ./gradlew --console=plain :androidApp:assemblePreview

@@ -550,6 +550,9 @@ pub enum Action {
     /// named, or the newest that can be taken back.
     TakeBackQueued(Target, Option<QueueEntry>),
     RemoveQueued(Target, QueueEntry),
+    /// Hands everything the provider holds queued to the running turn now,
+    /// without stopping its subagents.
+    SendQueuedNow(Target),
     /// Puts away the notice that messages a provider was holding when it
     /// stopped are back in the composer.
     DismissRestoredWaiting(Target),
@@ -1058,6 +1061,7 @@ impl Action {
             Self::Latest(..) => "Latest",
             Self::TakeBackQueued(..) => "TakeBackQueued",
             Self::RemoveQueued(..) => "RemoveQueued",
+            Self::SendQueuedNow(..) => "SendQueuedNow",
             Self::DismissRestoredWaiting(..) => "DismissRestoredWaiting",
             Self::DismissComposerNote(..) => "DismissComposerNote",
             Self::ComposerActions(..) => "ComposerActions",
@@ -1249,6 +1253,7 @@ impl Action {
             | Self::ComposerUndo(target, _)
             | Self::TakeBackQueued(target, _)
             | Self::RemoveQueued(target, _)
+            | Self::SendQueuedNow(target)
             | Self::Model(target, _)
             | Self::Reasoning(target, _, _)
             | Self::PermissionMode(target, _)
@@ -2050,6 +2055,17 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
     }
 }
 
+/// `parts` as one copied text, its empty parts left out.
+fn joined(parts: &[&str]) -> Option<String> {
+    let text = parts
+        .iter()
+        .copied()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
 /// What a copy control hands the reader.
 ///
 /// Every step variant answers, because a control that silently does nothing is
@@ -2058,15 +2074,6 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
 /// transcript for them. `Text` is the whole step as a reader would quote it;
 /// `Input` and `Output` are the individual blocks their own headers offer.
 fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
-    fn joined(parts: &[&str]) -> Option<String> {
-        let text = parts
-            .iter()
-            .copied()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        (!text.is_empty()).then_some(text)
-    }
     match (part, content) {
         (CopyPart::Text, ItemContent::Text { text, .. }) => joined(&[text]),
         (
@@ -2101,16 +2108,9 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
                 path, description, ..
             },
         ) => joined(&[description, path]),
-        (
-            CopyPart::Text,
-            ItemContent::Delivery {
-                kind,
-                from,
-                sender,
-                summary,
-                body,
-            },
-        ) => joined(&[&chat::delivery_heading(*kind, from, sender, summary), body]),
+        // A delivery's heading names its sender as this conversation lists
+        // it, which only the runtime knows: see `Runtime::item_copy_text`.
+        (CopyPart::Text, ItemContent::Delivery { .. }) => None,
         // A command has no separate input block, so its header offers the
         // command line under the same name the tool detail uses for one.
         (CopyPart::Input, ItemContent::Command { command, .. }) => joined(&[command]),
@@ -2130,6 +2130,30 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
         }
         (CopyPart::Change(_), _)
         | (CopyPart::Input | CopyPart::Sent | CopyPart::Output | CopyPart::Received, _) => None,
+    }
+}
+
+impl Runtime {
+    /// What a copy control hands the reader for `content`, as [`copy_text`]
+    /// says it, except that a delivery's heading is the one its row shows,
+    /// naming its sender by name rather than by the provider's ID.
+    pub(super) fn item_copy_text(&self, part: CopyPart, content: &ItemContent) -> Option<String> {
+        match (&part, content) {
+            (
+                CopyPart::Text,
+                ItemContent::Delivery {
+                    kind,
+                    from,
+                    sender,
+                    summary,
+                    body,
+                },
+            ) => joined(&[
+                &self.delivery_heading(*kind, from, sender, summary, body),
+                body,
+            ]),
+            _ => copy_text(part, content),
+        }
     }
 }
 
@@ -4019,7 +4043,7 @@ impl Runtime {
             }
         }
         draft_images::forget(&mut self.detached_attachments, &self.attachments);
-        self.thumbnails.sync(&self.attachments);
+        self.sync_thumbnails();
         if self.attachments.len() != before {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -4250,7 +4274,7 @@ impl Runtime {
             self.composer_note = Some(note);
         }
         if reconciled.changed {
-            self.thumbnails.sync(&self.attachments);
+            self.sync_thumbnails();
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -4299,7 +4323,7 @@ impl Runtime {
             self.composer_note = Some(note);
         }
         if changed {
-            self.thumbnails.sync(&self.attachments);
+            self.sync_thumbnails();
         }
         self.cancel_invalid_attachment_jobs();
         self.reconcile_references(inline);
@@ -4559,7 +4583,7 @@ impl Runtime {
             // Like any edit, it makes the message shown the draft.
             self.end_history_walk();
         }
-        self.thumbnails.sync(&self.attachments);
+        self.sync_thumbnails();
         self.revision = self.revision.wrapping_add(1);
         self.settle_restored_notice();
         self.follow_caret_reference();
@@ -4568,18 +4592,39 @@ impl Runtime {
 
     /// The draft's attachments leave with the draft, when it is sent or held,
     /// and so does what the restored-messages notice said about it.
+    /// Their previews stay: the message they leave with shows them until
+    /// the conversation has it, and the next sync lets them go.
     fn take_attachments(&mut self) -> Vec<Attachment> {
         self.composer_note = None;
         self.restored_waiting = None;
-        self.thumbnails.clear();
         std::mem::take(&mut self.attachments)
     }
 
     fn replace_attachments(&mut self, attachments: Vec<Attachment>) -> Vec<Attachment> {
-        self.thumbnails.clear();
         let old = std::mem::replace(&mut self.attachments, attachments);
-        self.thumbnails.sync(&self.attachments);
+        self.sync_thumbnails();
         old
+    }
+
+    /// Previews for the draft's images and for those of the reader's
+    /// messages shown ahead of the conversation, the draft's first.
+    fn sync_thumbnails(&mut self) {
+        let shown = self
+            .queued
+            .iter()
+            .map(|queued| &queued.prompt)
+            .chain(
+                self.commands
+                    .unconfirmed()
+                    .iter()
+                    .map(|unconfirmed| &unconfirmed.outgoing)
+                    .chain(self.commands.outgoing())
+                    .filter(|outgoing| outgoing.in_transcript())
+                    .map(|outgoing| &outgoing.prompt),
+            )
+            .flat_map(|prompt| &prompt.attachments);
+        let attachments: Vec<&Attachment> = shown.chain(&self.attachments).collect();
+        self.thumbnails.sync(attachments);
     }
 
     /// Puts a message that was waiting back in the composer, ahead of
@@ -12267,6 +12312,18 @@ impl Cagents {
                     .unwrap_or_default();
                 format!("{LEAD} {reason}")
             }
+            // Storage would not move the pane to this conversation, as when
+            // it holds another identity for it. Storage refuses that by rule
+            // (never `Conflict`, which the writer retries itself), so neither
+            // an edit of the draft nor Send or Retry save repairs it: each
+            // offers storage the same move from the same identity. A new chat
+            // starts from no identity at all, so nothing is moved. The
+            // remedy comes first: the notice shows its first lines only.
+            // The storage rule and category stay in the log: "saved state is
+            // invalid" would suggest the reader's data is damaged.
+            PaneSaveRefusal::Identity { .. } => format!(
+                "{LEAD} Copy it into a new conversation and send it there. Storage won't let this pane start one, so sending here fails again."
+            ),
             PaneSaveRefusal::Refused { pane, category, .. } => {
                 let label = category.label();
                 match pane {
@@ -12274,14 +12331,10 @@ impl Cagents {
                         "{LEAD} Storage refused this pane's changes ({label}). Change the draft or its options, then send again."
                     ),
                     Some(pane) => {
-                        let what = self
-                            .card_state(*pane)
-                            .map(|state| self.card_display_title(state))
-                            .filter(|title| !title.is_empty())
-                            .map_or_else(
-                                || "another pane".to_owned(),
-                                |title| format!("the pane \u{201c}{title}\u{201d}"),
-                            );
+                        let what = self.pane_notice_title(*pane).map_or_else(
+                            || "another pane".to_owned(),
+                            |title| format!("the pane \u{201c}{title}\u{201d}"),
+                        );
                         format!(
                             "{LEAD} Storage refused changes to {what} ({label}). Close or change {what}, then send again."
                         )
@@ -15875,6 +15928,15 @@ impl Cagents {
                 runtime.withdraw_before_turn();
                 return self.chat_send(target, Command::Interrupt, false);
             }
+            Action::SendQueuedNow(target) => {
+                if !self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.can_send_now())
+                {
+                    return Task::none();
+                }
+                return self.chat_send(target, Command::SendQueuedNow, false);
+            }
             Action::DisarmInterrupt(target, at) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
                     && runtime.interrupt_armed == Some(at)
@@ -16666,10 +16728,10 @@ impl Cagents {
                     match card {
                         // A message read from a file copies as the
                         // command that sent it.
-                        Some(card) if matches!(part, CopyPart::Text) => {
-                            card.copy_text().or_else(|| copy_text(part, &item.content))
-                        }
-                        _ => copy_text(part, &item.content),
+                        Some(card) if matches!(part, CopyPart::Text) => card
+                            .copy_text()
+                            .or_else(|| runtime.item_copy_text(part, &item.content)),
+                        _ => runtime.item_copy_text(part, &item.content),
                     }
                 });
                 if let Some(text) = text {

@@ -116,6 +116,7 @@ pub(crate) fn run(
         confirmation: None,
         refusal: None,
         in_flight: Vec::new(),
+        recorded_by: Some(crate::version().into()),
     };
     write_job(&state, &job)?;
     let result = (|| {

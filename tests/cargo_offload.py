@@ -374,18 +374,33 @@ class SharedConnection(unittest.TestCase):
 
 
 class EnclosingCheckout(unittest.TestCase):
-    def test_a_git_marker_in_any_ancestor_is_found(self):
-        enclosing_checkout = agent_function("enclosing_checkout")
+    def test_empty_directories_are_skipped_and_repository_markers_are_found(self):
+        enclosing_checkout = agent_scope()["enclosing_checkout"]
         with tempfile.TemporaryDirectory() as root:
             deep = Path(root, "a", "b", "c")
             deep.mkdir(parents=True)
+            marker = Path(root, "a", ".git")
+            (deep.parent / ".git").mkdir()
+            marker.mkdir()
             self.assertIsNone(enclosing_checkout(str(deep)))
-            Path(root, "a", ".git").mkdir()
-            self.assertEqual(enclosing_checkout(str(deep)), str(Path(root, "a", ".git")))
+            (marker / "HEAD").touch()
+            self.assertEqual(enclosing_checkout(str(deep)), str(marker))
+            (marker / "HEAD").unlink()
+            marker.rmdir()
+            marker.write_text("gitdir: x")
+            self.assertEqual(enclosing_checkout(str(deep)), str(marker))
+            marker.unlink()
+            marker.symlink_to("missing")
+            self.assertEqual(enclosing_checkout(str(deep)), str(marker))
+            marker.unlink()
             # The directory itself is not its own ancestor.
-            Path(root, "a", ".git").rmdir()
             Path(deep, ".git").write_text("gitdir: x")
             self.assertIsNone(enclosing_checkout(str(deep)))
+
+    def test_an_unreadable_ancestor_is_still_treated_as_a_marker(self):
+        enclosing_checkout = agent_scope()["enclosing_checkout"]
+        with patch.object(os, "lstat", side_effect=PermissionError):
+            self.assertEqual(enclosing_checkout("/fixture/parent/temp"), "/fixture/parent/.git")
 
 
 class Clear(unittest.TestCase):
@@ -650,7 +665,7 @@ if [ "$1" = marked ]; then
     exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$RUSTUP_HOME" \
         CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_LOCK="$HOME/shares.lock" CAGENTS_BUILD_SLOTS="${STAND_IN_SHARES:-4}" \
         CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
-        sh -c "mkdir -p '$HOME/stray/.git'; $*"
+        sh -c "mkdir -p '$HOME/stray/.git' && touch '$HOME/stray/.git/HEAD' && $*"
 fi
 shift
 cd "$HOME"
@@ -686,7 +701,7 @@ class StandInHost(unittest.TestCase):
         python_tools.mkdir()
         (python_tools / "python3").symlink_to(Path(sys.executable).resolve())
         for name in ("build-host", "cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
-                     "cargo-incremental-retry.py", "cargo-offload", "memory-capped"):
+                     "cargo-incremental-retry.py", "cargo-offload", "git_ancestry.py", "memory-capped"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
         (tools / "ssh").write_text(STAND_IN_SSH)
         (tools / "ssh").chmod(0o755)
@@ -2070,8 +2085,18 @@ class RemoteRun(unittest.TestCase):
                     owner.write_text(previous + "\n")
                     (slot / "incremental-epoch").write_text(f"{owner.stat().st_mtime_ns} epoch\n")
                     crate = build / "local/incremental/probe-1"
-                    (crate / "s-a-0-finished").mkdir(parents=True)
-                    (crate / "s-b-0-working").mkdir()
+                    finalized = crate / "s-a-0-finished"
+                    finalized.mkdir(parents=True)
+                    index = finalized / "work-products.bin"
+                    index.touch()
+                    os.utime(index, (1, 1))
+                    working = crate / "s-b-0-working"
+                    working.mkdir()
+                    bitcode = finalized / "probe.pre-lto.bc"
+                    bitcode.write_bytes(b"previous build")
+                    linked = working / bitcode.name
+                    os.link(bitcode, linked)
+                    linked.write_bytes(b"interrupted build")
                     healthy = build / "local/incremental/healthy-1/s-a-0-finished"
                     healthy.mkdir(parents=True, exist_ok=True)
                     host = ("import os\n"
@@ -2513,6 +2538,28 @@ class Trim(unittest.TestCase):
         self.assertTrue(self.repair_incremental(build, "new epoch"))
         self.assertFalse(fresh.exists())
         self.assertEqual(output.read_bytes(), b"compiled")
+
+    def test_incremental_repair_keeps_the_cache_after_a_compile_error(self):
+        build = self.slot / "src/target"
+        self.assertTrue(self.repair_incremental(build))
+        crate = build / "debug/incremental/checked-1"
+        finalized = crate / "s-a-0-finished"
+        finalized.mkdir(parents=True)
+        keys = finalized / "thin-lto-past-keys.bin"
+        keys.write_bytes(b"previous build")
+        os.utime(keys, (1, 1))
+        index = finalized / "work-products.bin"
+        index.touch()
+        # rustc links the previous cache before compiling, and an error can
+        # leave the working session behind without overwriting these files.
+        working = crate / "s-b-0-working"
+        working.mkdir()
+        os.link(keys, working / keys.name)
+        os.link(index, working / index.name)
+
+        self.assertTrue(self.repair_incremental(build))
+        self.assertEqual(keys.read_bytes(), b"previous build")
+        self.assertTrue(working.is_dir())
 
     def test_incremental_repair_evicts_the_crate_with_an_overwritten_finalized_session(self):
         build = self.slot / "src/target"

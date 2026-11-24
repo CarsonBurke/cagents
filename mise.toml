@@ -214,6 +214,37 @@ description = "Run the checks GitHub CI runs: formatting, protocol contracts and
 usage = 'arg "[unexpected]..." var=#true hide=#true'
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["fmt:check", "check:protocol", "test:scripts"] }]
 
+# Mobile ---------------------------------------------------------------------
+# The Android app in mobile/ builds with Gradle on the build host, as Rust
+# does: scripts/gradle-remote mirrors mobile/ there, runs one Gradle build
+# with no daemon left behind, and brings back the test reports and APKs.
+# Installing runs adb here, where the phone is. CAGENTS_BUILD_REMOTE=local
+# builds here instead. See mobile/README.md.
+
+[tasks."mobile:test"]
+description = "Test the Android app on the build host: the protocol against the recorded API, the client against a fake bridge"
+run = 'exec scripts/gradle-remote -- :shared:jvmTest :androidApp:testDebugUnitTest'
+
+[tasks."mobile:build"]
+description = "Build the Android app's debug APK on the build host (mobile/androidApp/build/outputs/apk/debug)"
+run = 'exec scripts/gradle-remote --fetch androidApp/build/outputs/apk/debug -- :androidApp:assembleDebug'
+
+[tasks."mobile:install"]
+description = "Build the minified preview APK on the build host and install it on the connected phone, over the debug build (set ANDROID_SERIAL to choose one)"
+run = """
+set -e
+scripts/gradle-remote --fetch androidApp/build/outputs/apk/preview -- :androidApp:assemblePreview
+exec adb install -r "$(ls mobile/androidApp/build/outputs/apk/preview/*.apk | head -n 1)"
+"""
+
+[tasks."mobile:install-debug"]
+description = "Build the debuggable APK on the build host and install it on the connected phone, for run-as and the debugger; it runs slower"
+run = """
+set -e
+scripts/gradle-remote --fetch androidApp/build/outputs/apk/debug -- :androidApp:assembleDebug
+exec adb install -r "$(ls mobile/androidApp/build/outputs/apk/debug/*.apk | head -n 1)"
+"""
+
 # Packaging and release ------------------------------------------------------
 
 [tasks.install]

@@ -434,9 +434,21 @@ pub enum HeldStop {
     Dropped,
 }
 
+/// When an adapter's local metadata can be read again, independently of
+/// provider messages on the transport.
+pub enum MetadataWake<'a> {
+    Changed(std::os::fd::BorrowedFd<'a>),
+    RetryAt(std::time::Instant),
+}
+
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    #[cfg(feature = "host")]
+    fn needs_private_temp(&self) -> bool {
+        false
+    }
+
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
     fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {
@@ -478,6 +490,18 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    fn metadata_wake(&self) -> Option<MetadataWake<'_>> {
+        None
+    }
+    fn refresh_metadata(&mut self) -> Option<Step> {
+        None
+    }
+    /// Whether `frame`, one of this adapter's queued writes, is a request it
+    /// made on its own for display data. A provider that exits cleanly
+    /// before reading such a request lost no input of the reader's.
+    fn expendable_write(&self, _frame: &Value) -> bool {
+        false
+    }
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.

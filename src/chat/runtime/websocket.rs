@@ -478,7 +478,7 @@ impl Actor {
             }
             if !flushing && !close_sent && !peer_closed {
                 self.drain_commands(closing.is_some())?;
-                if let Some(bytes) = self.pending.pop_front() {
+                if let Some(super::QueuedWrite { bytes, .. }) = self.pending.pop_front() {
                     self.queued -= bytes.len();
                     let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
                     // WouldBlock means tungstenite has accepted and buffered this

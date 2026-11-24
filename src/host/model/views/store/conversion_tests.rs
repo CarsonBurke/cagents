@@ -952,6 +952,35 @@ fn collection_forgets_one_bounded_batch_at_a_time() {
 }
 
 #[test]
+fn view_revision_reads_scope_metadata_without_decoding_panes() {
+    let (mut registry, _directory, channel) = fresh();
+    let worktree = Scope::Worktree {
+        repository: "/repo".into(),
+        path: "/repo/checkout".into(),
+    };
+    let scopes = [channel, worktree];
+    for scope in &scopes {
+        assert_eq!(registry.view_revision(scope).unwrap(), 0);
+        seed(&mut registry, scope, vec![browser("retained pane")]);
+    }
+    let revisions = scopes
+        .each_ref()
+        .map(|scope| read(&registry.db, scope).unwrap().revision);
+    assert_eq!(
+        registry
+            .db
+            .execute("UPDATE panes SET descriptor = 'not-json'", [])
+            .unwrap(),
+        2
+    );
+    for (scope, stored_revision) in scopes.into_iter().zip(revisions) {
+        assert!(stored_revision > 0);
+        assert!(read(&registry.db, &scope).is_err());
+        assert_eq!(registry.view_revision(&scope).unwrap(), stored_revision);
+    }
+}
+
+#[test]
 fn a_view_written_again_after_its_scope_is_gone_never_repeats_a_revision() {
     let (mut registry, _directory, scope) = fresh();
     seed(&mut registry, &scope, vec![browser("first life")]);

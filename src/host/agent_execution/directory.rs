@@ -15,6 +15,7 @@ use crate::{
     },
     model::{ChannelId, TerminalId},
     project_location::{Placement, place},
+    workspace_model::ModelProject,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -270,7 +271,7 @@ pub(super) fn list(
             let project = if model.project(&path).is_some() {
                 path
             } else if path.is_relative() {
-                named(&model, &path)?
+                named(&model.projects, &path)?
             } else {
                 place_cached(&path)
                     .1
@@ -487,13 +488,9 @@ pub(super) fn list(
 
 /// The open project called `name`, ignoring case. Names are not unique, so a
 /// name two projects share is refused with their paths.
-pub(in crate::host) fn named(
-    model: &crate::workspace_model::WorkspaceModel,
-    name: &Path,
-) -> Result<PathBuf, String> {
+pub(in crate::host) fn named(projects: &[ModelProject], name: &Path) -> Result<PathBuf, String> {
     let wanted = name.to_string_lossy();
-    let matches: Vec<_> = model
-        .projects
+    let matches: Vec<_> = projects
         .iter()
         .filter(|project| project.name.eq_ignore_ascii_case(&wanted))
         .collect();

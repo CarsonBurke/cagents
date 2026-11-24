@@ -262,7 +262,7 @@ pub(crate) fn fake_process_tree(root: &Path, runtime: &Path, instance: Option<&s
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

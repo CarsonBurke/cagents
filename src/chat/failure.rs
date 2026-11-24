@@ -686,6 +686,15 @@ delivery_outcomes! {
     /// A stop whose outcome is still unknown when its caller stops waiting.
     unknown send UNACKNOWLEDGED_STOP: "Claude hasn't confirmed the stop yet.",
         "It may still take effect, so check the conversation before trying again.";
+    /// A delivery whose acknowledgement was lost before it could be saved.
+    unknown send LOST_DELIVERY_OUTCOME: "The outcome of this message could not be confirmed.",
+        "It may have gone through. Check the conversation before sending it again.";
+    /// The outcome of work already admitted could not be recorded.
+    unknown send DELIVERY_HISTORY_UNAVAILABLE: "Message delivery history is unavailable.",
+        "Check the conversation before sending this message again.";
+    /// The daemon could not check or reserve the key before sending the message.
+    refused send DELIVERY_NOT_SENT: "Message delivery history is unavailable, so your message wasn't sent.",
+        "Try sending it again in a moment.";
     /// A new input while an earlier one is still unconfirmed.
     refused send UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
         "Try again in a moment.";
@@ -762,7 +771,7 @@ impl DeliveryOutcome {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 
@@ -798,6 +807,17 @@ mod tests {
             DeliveryOutcome::parse(&format!("Claude said: {}", delivery::UNCONFIRMED_INPUT)),
             None
         );
+    }
+
+    #[test]
+    fn unavailable_delivery_history_distinguishes_refusal_from_an_unknown_outcome() {
+        let refused = DeliveryOutcome::parse(delivery::DELIVERY_NOT_SENT).unwrap();
+        assert!(refused.notice);
+        assert!(!refused.unknown);
+        let unacknowledged =
+            DeliveryOutcome::parse(delivery::DELIVERY_HISTORY_UNAVAILABLE).unwrap();
+        assert!(unacknowledged.notice);
+        assert!(unacknowledged.unknown);
     }
 
     /// A turn an ACP provider refused for a login with no allowance says so,
@@ -861,6 +881,9 @@ mod tests {
             UNACKNOWLEDGED_INPUT,
             UNACKNOWLEDGED_ANSWER,
             UNACKNOWLEDGED_STOP,
+            LOST_DELIVERY_OUTCOME,
+            DELIVERY_HISTORY_UNAVAILABLE,
+            DELIVERY_NOT_SENT,
             UNSETTLED_INPUT,
             RECONNECTING_INPUT,
             CROWDED_INPUT,

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Run the Android app's Gradle build on the build host, the way cargo-gate
+# runs Cargo there, and bring back what callers use.
+#
+#   scripts/gradle-remote [--fetch PATH]... [--] GRADLE-ARGUMENTS...
+#
+# A Gradle build of mobile/ takes several gigabytes and every core for
+# minutes, which made the laptop it ran on unusable. So, like Rust, it runs
+# on CAGENTS_BUILD_REMOTE (default fw16):
+#
+# 1. This checkout's mobile/ and the API fixture its tests read are mirrored
+#    to ~/.cache/cagents-gradle/<checkout>/ there. Build outputs and caches
+#    stay on the host between runs, so a rebuild is incremental.
+# 2. Gradle runs there under a per-checkout lock, one build at a time, with
+#    no daemon left behind (mobile/gradle.properties).
+# 3. Test reports and results, and each --fetch PATH (relative to mobile/),
+#    come back into this checkout's mobile/.
+#
+# Nothing else runs Gradle on this machine: mobile/gradlew refuses unless
+# CAGENTS_GRADLE_LOCAL=1, which this sets only where Gradle should run. On
+# the build host itself, Gradle runs in place. Elsewhere it runs here only
+# when the caller sets CAGENTS_GRADLE_LOCAL=1 deliberately; an unreachable
+# build host is an error, never a reason to build here. Installing on a phone
+# stays here, since that is where the phone is: see the mobile:install tasks.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd)
+fetch=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        --fetch)
+            [ $# -ge 2 ] || { echo "gradle-remote: --fetch needs a path" >&2; exit 2; }
+            fetch+=("$2")
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *) break ;;
+    esac
+done
+[ $# -gt 0 ] || { echo "usage: scripts/gradle-remote [--fetch PATH]... [--] GRADLE-ARGUMENTS..." >&2; exit 2; }
+
+remote=${CAGENTS_BUILD_REMOTE:-fw16}
+short_host=$(hostname -s 2>/dev/null || hostname)
+if [ "$remote" = "$short_host" ] || [ "${CAGENTS_GRADLE_LOCAL-}" = 1 ]; then
+    cd "$root/mobile"
+    CAGENTS_GRADLE_LOCAL=1 ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain "$@"
+fi
+if [ "$remote" = local ]; then
+    echo "gradle-remote: Gradle doesn't run on this machine even with CAGENTS_BUILD_REMOTE=local; set CAGENTS_GRADLE_LOCAL=1 to build here deliberately." >&2
+    exit 64
+fi
+
+# One directory per checkout, named for its path, so worktrees don't share
+# outputs or wait on each other's lock.
+key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
+base=".cache/cagents-gradle/$key"
+quoted() { printf '%q ' "$@"; }
+
+ssh -o BatchMode=yes "$remote" "mkdir -p $base/crates/mobile-api"
+# Sources only: outputs, caches and machine-local settings stay where they
+# are on each side.
+rsync -a --delete \
+    --exclude '/.gradle/' --exclude '/.kotlin/' --exclude 'build/' \
+    --exclude '/local.properties' --exclude '/.idea/' \
+    "$root/mobile/" "$remote:$base/mobile/"
+rsync -a --delete "$root/crates/mobile-api/fixtures/" "$remote:$base/crates/mobile-api/fixtures/"
+
+# The script goes to bash on its standard input, so the host's login shell,
+# whatever it is, parses none of it.
+status=0
+ssh -o BatchMode=yes "$remote" bash -s <<SCRIPT || status=$?
+set -e
+cd $(quoted "$base/mobile")
+export ANDROID_HOME="\${ANDROID_HOME:-\$HOME/Android/Sdk}"
+export CAGENTS_GRADLE_LOCAL=1
+exec flock ../.lock ./gradlew --console=plain $(quoted "$@") </dev/null
+SCRIPT
+
+# Reports come back whether the build passed or not: a failure is read in
+# them.
+rsync -a --prune-empty-dirs \
+    --include '*/' --include '/*/build/reports/**' --include '/*/build/test-results/**' \
+    --exclude '*' \
+    "$remote:$base/mobile/" "$root/mobile/" || true
+if [ "$status" -eq 0 ]; then
+    for path in "${fetch[@]}"; do
+        mkdir -p "$root/mobile/$path"
+        rsync -a --delete "$remote:$base/mobile/$path/" "$root/mobile/$path/"
+    done
+fi
+exit "$status"

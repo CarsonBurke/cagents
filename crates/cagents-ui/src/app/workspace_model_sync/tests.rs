@@ -2648,6 +2648,137 @@ fn delayed_reconnect_baseline_never_resurrects_a_deleted_scope() {
 }
 
 #[test]
+fn compacted_worktree_view_stays_initialized_through_recreation() {
+    use crate::workspace_model::{
+        delta::ViewRevision,
+        views::{Pane, Scope, View},
+    };
+    let (mut app, project, repository) = app_with_project();
+    let path = PathBuf::from("/repo/removed-worktree");
+    let scope = Scope::Worktree {
+        repository: repository.clone(),
+        path: path.clone(),
+    };
+    // The view removal can arrive before the window refreshes the worktree list.
+    app.sidebar_model.projects[0]
+        .worktrees
+        .push(crate::sidebar::SidebarWorktree::from_durable(
+            crate::model::WorktreeId::new(),
+            path.clone(),
+            None,
+        ));
+    app.known_worktree_roots.insert(path);
+    let channel = ChannelId::new();
+    let card = app.workspace.focused().unwrap();
+    let pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+    let mut local_channel = local(channel, project, "Current work", 0);
+    local_channel.shared = true;
+    local_channel.cards = vec![card];
+    local_channel.focused = Some(card);
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.channels.push(local_channel);
+    durable.active_channel = Some(channel);
+
+    let current_view = View {
+        revision: 3,
+        panes: vec![pane.clone()],
+        ..View::empty(channel)
+    };
+    let mut initial = registry(vec![shared(channel, &repository, "Current work", 0)]);
+    initial.sequence = 4;
+    initial.views = vec![
+        current_view.clone(),
+        View {
+            revision: 4,
+            ..View::empty(scope.clone())
+        },
+    ];
+    let identity = initial.identity;
+    let mut mirror = Mirror::for_model(&initial);
+    assert!(app.install_workspace_model_snapshot(initial));
+    app.shared_views
+        .initialize(current_view.scope.clone(), vec![pane]);
+    app.shared_views.initialize(scope.clone(), vec![]);
+    let published = intercept_publishes(&mut app);
+    let assert_pane_unchanged = |app: &Cagents| {
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.shared_views.closed.is_empty());
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert_eq!(app.durable.channels[0].cards, vec![card]);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![card]);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(app.shared_views.scope_settled(&scope));
+        for edit in drain(&published) {
+            assert!(
+                !matches!(
+                    edit,
+                    ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. }
+                ),
+                "unexpected view publication: {edit:?}"
+            );
+        }
+    };
+
+    let edit = ModelEdit::AgentsChanged;
+    let effects = EditEffects {
+        views: vec![ViewRevision {
+            scope: scope.clone(),
+            before: Some(4),
+            after: None,
+        }],
+        ..Default::default()
+    };
+    let mut removal = mirror.apply(&edit, &effects).changes;
+    removal.sequence = 5;
+    drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+        sequence: 5,
+        edit,
+        changes: EdgeChanges {
+            identity: Some(identity),
+            views: removal,
+            effects,
+        },
+    }));
+    assert_eq!(app.workspace_model.views, vec![current_view.clone()]);
+    assert_eq!(app.shared_views.scope_absences.get(&scope), Some(&5));
+    assert_pane_unchanged(&app);
+
+    let edit = ModelEdit::SeedView {
+        scope: scope.clone(),
+        panes: vec![],
+        closed: vec![],
+    };
+    let recreated = View {
+        revision: 6,
+        ..View::empty(scope.clone())
+    };
+    let effects = EditEffects {
+        views: vec![ViewRevision {
+            scope: scope.clone(),
+            before: None,
+            after: Some(recreated.revision),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        mirror.apply(&edit, &effects).unresolved,
+        vec![scope.clone()]
+    );
+    let views = mirror.install_at(scope.clone(), Some(recreated.clone()), 6);
+    drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+        sequence: 6,
+        edit,
+        changes: EdgeChanges {
+            identity: Some(identity),
+            views,
+            effects,
+        },
+    }));
+    assert_eq!(app.workspace_model.views, vec![current_view, recreated]);
+    assert_pane_unchanged(&app);
+}
+
+#[test]
 fn scoped_reads_ahead_of_the_edge_fence_later_but_older_full_snapshots() {
     use crate::workspace_model::views::{Scope, View};
     let (mut app, _, repository) = app_with_project();
@@ -5398,6 +5529,7 @@ fn a_fresh_window_adopts_the_shared_folder_kind_without_git_rediscovery() {
     let directory = tempfile::tempdir().unwrap();
     let repository = directory.path().canonicalize().unwrap();
     std::fs::create_dir(repository.join(".git")).unwrap();
+    std::fs::write(repository.join(".git/HEAD"), "invalid ref\n").unwrap();
     let mut app = super::super::tests::context_inspector_test_app(false);
     app.workspace_model = WorkspaceModel {
         projects: vec![ModelProject {

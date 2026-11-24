@@ -3,6 +3,7 @@ use crate::{
     agent::Provider,
     agent_execution::{Agent, Origin, Spec, Surface, Target},
     automations::{Definition, DirectoryIdentity, Schedule, SchedulePattern, SessionMode},
+    host::model::{Pause, pause_at},
     model::AgentId,
     workspace_model::delta::Mirror,
 };
@@ -68,6 +69,34 @@ fn definition(agent: Spec) -> Definition {
     }
 }
 
+fn open_placed_agent(registry: &Registry, repository: &Path, placement: &Scope) -> AgentId {
+    // New agents start in channels. Model the retained placement an older
+    // agent can still have after its worktree and pane are gone.
+    let agent = Agent {
+        id: AgentId::new(),
+        name: None,
+        origin: Origin::User,
+        spec: spec(repository, repository.into(), Some(placement.clone())),
+        placement: placement.clone(),
+        session: None,
+        console: None,
+        created_ms: 1,
+        closed: false,
+    };
+    registry
+        .db
+        .execute(
+            "INSERT INTO agents(id, origin, record, closed) VALUES (?1, ?2, ?3, 0)",
+            params![
+                agent.id.to_string(),
+                serde_json::to_string(&agent.origin).unwrap(),
+                serde_json::to_string(&agent).unwrap(),
+            ],
+        )
+        .unwrap();
+    agent.id
+}
+
 #[test]
 fn sweep_keeps_every_guard_including_disabled_automation_targets() {
     let (mut registry, root, repository) = fixture(ProjectKind::Folder);
@@ -125,30 +154,7 @@ fn sweep_keeps_every_guard_including_disabled_automation_targets() {
     assert!(!registry.apply_delta(&no_op).unwrap().changed);
     assert!(registry.view_operation_seen(operation_id).unwrap());
 
-    // New agents start in channels. Model the retained placement an older
-    // agent can still have after its worktree and pane are gone.
-    let open_agent = Agent {
-        id: AgentId::new(),
-        name: None,
-        origin: Origin::User,
-        spec: spec(&repository, repository.clone(), Some(agent.clone())),
-        placement: agent.clone(),
-        session: None,
-        console: None,
-        created_ms: 1,
-        closed: false,
-    };
-    registry
-        .db
-        .execute(
-            "INSERT INTO agents(id, origin, record, closed) VALUES (?1, ?2, ?3, 0)",
-            params![
-                open_agent.id.to_string(),
-                serde_json::to_string(&open_agent.origin).unwrap(),
-                serde_json::to_string(&open_agent).unwrap(),
-            ],
-        )
-        .unwrap();
+    let open_agent = open_placed_agent(&registry, &repository, &agent);
     let identity = DirectoryIdentity {
         device: 1,
         inode: 1,
@@ -190,7 +196,7 @@ fn sweep_keeps_every_guard_including_disabled_automation_targets() {
             [operation_id.to_string()],
         )
         .unwrap();
-    registry.close_agent(&Origin::User, open_agent.id).unwrap();
+    registry.close_agent(&Origin::User, open_agent).unwrap();
     registry
         .remove_automation(by_directory.id, by_directory.revision, 2)
         .unwrap();
@@ -204,6 +210,139 @@ fn sweep_keeps_every_guard_including_disabled_automation_targets() {
     assert_eq!(effects.views.len(), 1);
     assert_eq!(effects.views[0].scope, operation);
     assert!(registry.view_snapshot(&operation).unwrap().0.is_none());
+}
+
+#[test]
+fn sweep_rechecks_revision_and_durable_guards_at_deletion() {
+    let (mut registry, _root, repository) = fixture(ProjectKind::Folder);
+    let [
+        revised,
+        transferred,
+        retired,
+        operation,
+        placement,
+        eligible,
+    ] = [
+        "revised",
+        "transferred",
+        "retired",
+        "operation",
+        "placement",
+        "eligible",
+    ]
+    .map(|name| worktree(&repository, name));
+    let candidates = [
+        &revised,
+        &transferred,
+        &retired,
+        &operation,
+        &placement,
+        &eligible,
+    ];
+    for scope in candidates {
+        registry
+            .apply_delta(&seed_edit(scope, vec![], vec![]))
+            .unwrap();
+    }
+    let [
+        old_revision,
+        transfer_revision,
+        retired_revision,
+        operation_revision,
+        placement_revision,
+        eligible_revision,
+    ] = candidates.map(|scope| registry.view_revision(scope).unwrap());
+
+    let source = worktree(&repository, "source");
+    let moved = pane();
+    registry
+        .apply_delta(&seed_edit(&source, vec![moved.clone()], vec![]))
+        .unwrap();
+    let destination_row = store::scope_id(&registry.db, &transferred)
+        .unwrap()
+        .unwrap();
+    let retired_row = store::scope_id(&registry.db, &retired).unwrap().unwrap();
+    let moved_id = moved.id;
+    let tombstone = CardId::new();
+    let new_operation = Uuid::new_v4();
+    let revision_operation = Uuid::new_v4();
+    let removed = CardId::new();
+    let revision_bump = ModelEdit::ChangeView {
+        scope: revised.clone(),
+        expected_revision: old_revision,
+        operation: revision_operation,
+        change: Change::Remove { id: removed },
+    };
+    let no_op = ModelEdit::ChangeView {
+        scope: operation.clone(),
+        expected_revision: operation_revision,
+        operation: new_operation,
+        change: Change::Move {
+            id: CardId::new(),
+            before: None,
+        },
+    };
+    let agent_placement = placement.clone();
+    let mut writer = registry.execution_connection().unwrap();
+    let compactor = registry.execution_connection().unwrap();
+    pause_at(Pause::BeforeCompactionDelete, move || {
+        assert!(writer.apply_delta(&revision_bump).unwrap().changed);
+        // Isolate the revision check by removing the ChangeView side effects.
+        writer
+            .db
+            .execute(
+                "DELETE FROM retired_panes WHERE pane = ?1",
+                [removed.to_string()],
+            )
+            .unwrap();
+        writer
+            .db
+            .execute(
+                "DELETE FROM view_operations WHERE operation = ?1",
+                [revision_operation.to_string()],
+            )
+            .unwrap();
+
+        // Modern view edits refuse transfers into worktrees. Move the pane's
+        // backing row and add the tombstone without changing either revision,
+        // so each guard must protect its own scope at deletion.
+        store::move_pane(&writer.db, moved_id, destination_row).unwrap();
+        writer
+            .db
+            .execute(
+                "INSERT INTO retired_panes (scope, pane, ordinal, retired_at_unix_ms)
+                 VALUES (?1, ?2, 1, 1)",
+                params![retired_row, tombstone.to_string()],
+            )
+            .unwrap();
+        assert!(!writer.apply_delta(&no_op).unwrap().changed);
+        open_placed_agent(&writer, &repository, &agent_placement);
+    });
+
+    let (sequence, effects) = compactor.compact_worktree_views().unwrap().unwrap();
+    assert_eq!(
+        effects.views,
+        [ViewRevision {
+            scope: eligible.clone(),
+            before: Some(eligible_revision),
+            after: None,
+        }]
+    );
+    assert!(effects.closed.is_empty());
+    assert_eq!(registry.view_snapshot(&eligible).unwrap(), (None, sequence));
+    let view = |scope: &Scope| registry.view_snapshot(scope).unwrap().0.unwrap();
+    let revised = view(&revised);
+    assert!(revised.revision > old_revision);
+    assert!(revised.panes.is_empty() && revised.retired.is_empty());
+    assert!(!registry.view_operation_seen(revision_operation).unwrap());
+    assert_eq!(view(&transferred).revision, transfer_revision);
+    assert_eq!(view(&transferred).panes, [moved]);
+    assert!(view(&source).panes.is_empty());
+    assert_eq!(view(&retired).revision, retired_revision);
+    assert_eq!(view(&retired).retired, [tombstone]);
+    assert_eq!(view(&operation).revision, operation_revision);
+    assert!(registry.view_operation_seen(new_operation).unwrap());
+    assert_eq!(view(&placement).revision, placement_revision);
 }
 
 fn git(repository: &Path, args: &[&str]) {

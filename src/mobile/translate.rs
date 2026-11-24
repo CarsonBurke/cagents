@@ -274,7 +274,7 @@ pub fn item(item: &chat::Item) -> api::Item {
         chat::ItemContent::Delivery {
             kind,
             from,
-            sender: _,
+            sender,
             summary,
             body,
         } => {
@@ -286,6 +286,7 @@ pub fn item(item: &chat::Item) -> api::Item {
                     chat::DeliveryKind::Notice => api::DeliveryKind::Notice,
                 },
                 from: from.clone(),
+                sender: sender.clone(),
                 summary: summary.clone(),
                 body: body.into(),
                 clipped,
@@ -501,6 +502,6 @@ fn appended(held: &api::Item, current: &api::Item) -> Option<api::TextAppend> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 #[path = "translate_tests.rs"]
 mod tests;
