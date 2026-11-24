@@ -936,10 +936,12 @@ failing test with its output and each lane's command, and comments when a later
 commit passes. A lane that stops with a status other than Cargo's 101, such as
 the disk guard's refusal or a kill, says nothing about the code: it keeps no
 verdict, opens no issue, and the commit is tested again 30 minutes later.
-The same goes for a lane whose test fixtures refused their temporary root
-because of a `.git` outside the checkout, such as a stray `/var/tmp/.git`.
-That fails every fixture test in every lane, whatever the commit. The
-sentinel's log names the marker to remove.
+The sentinel also defers a verdict when every test failure is a fixture
+refusal for a `.git` above `TMPDIR`, `/tmp` or `/var/tmp` outside the repository.
+The marker must have been present before the test lanes started and still be
+present after the affected lane exits. The log names the marker. After three
+consecutive deferrals for this reason on the same commit, a fourth such failure
+is recorded and the issue names the stray marker as a possible cause.
 
 `scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
 commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a
@@ -1011,7 +1013,8 @@ and GitHub: `python3 -I -B tests/main_build_sentinel.py -v`. It does not compile
 Rust or change real issues. The sentinel sweeps its logs once a day, removing
 files older than 30 days except evidence for pending reports, active bisections,
 and the check, test, and build results referenced by the watcher, including its
-last passing commits. It also removes abandoned verdict writes after 30 days.
+last passing commits. It also removes abandoned verdict writes and retry counts
+after 30 days.
 Published verdicts record release decisions and can still report failed lanes
 after their logs expire. `state.json` holds the checked cursor and issue number.
 

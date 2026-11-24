@@ -83,10 +83,16 @@ TEST_THREADS = {"ui": "2", "browser": "2"}
 # status, such as the disk guard's refusal or a kill, says nothing about the
 # commit, so it leaves no verdict and the lane is tested again.
 CODE_FAILURE = 101
-# The test fixtures refuse a temporary root under a Git checkout. A `.git`
-# that another process leaves above the shared root, such as /var/tmp/.git,
-# fails every fixture test in every lane, which says nothing about the code.
-STRAY_GIT_MARKER = re.compile(r"unsafe test fixture root (/\S*): enclosing Git marker (/\S*) exists")
+# Match the diagnostic from src/test_fixture.rs and the enclosing libtest
+# failure output. Cargo summarizes the failing targets after --no-fail-fast.
+FIXTURE_REFUSAL = re.compile(
+    r'.+: Custom \{ kind: Other, error: "unsafe test fixture root (/.*?): '
+    r'enclosing Git marker (/.+?) exists; set TMPDIR to an existing writable directory outside '
+    r'account HOME, inherited HOME/CODEX_HOME, and Git checkouts, with no symlink components" \}')
+FAILED_TEST_OUTPUT = re.compile(r"---- .+ stdout ----")
+FAILED_TEST_RESULT = re.compile(r"test result: FAILED\. \d+ passed; (\d+) failed;")
+FAILED_TARGETS = re.compile(r"error: (\d+) targets? failed:")
+STRAY_GIT_RETRIES = 3
 # A caller's test variables would change what the lanes test.
 TEST_ENVIRONMENT_IGNORED = re.compile(r"CAGENTS_TEST_|RUST_TEST_|RUSTFLAGS$|RUSTDOCFLAGS$|CARGO_PROFILE_"
                                       r"|CARGO_BUILD_RUSTFLAGS$|CARGO_ENCODED_RUSTFLAGS$|CARGO_INCREMENTAL$")
@@ -100,7 +106,7 @@ LOG_RETENTION_SECONDS = 30 * EVIDENCE_SWEEP_SECONDS
 SHA_NAME = r"([0-9a-f]{40}|[0-9a-f]{64})"
 LOG_NAME = re.compile(SHA_NAME + rf"-(?:(?:{'|'.join(CHECKS)})(?:-warnings)?"
                       rf"|test-(?:{'|'.join(TEST_LANES)})|evidence)\.log")
-TEMP_VERDICT_NAME = re.compile(SHA_NAME + r"\.new")
+TEMP_VERDICT_NAME = re.compile(SHA_NAME + r"\.(?:new|retry)")
 # Bundles releases of what compiled; see scripts/prebuild-release.
 PREBUILD_SERVICE = "cagents-prebuild.service"
 # native-evidence's task for these builds: its path must be short, for sockets.
@@ -156,9 +162,9 @@ def prune_evidence(directory, state):
     protected.update([pending.get("sha"), bisecting.get("after"), *bisecting.get("commits", [])])
     cutoff = now - LOG_RETENTION_SECONDS
     expire_files(directory / "logs", LOG_NAME, cutoff, protected)
-    # A published verdict is a durable release decision. A .new file was
-    # interrupted before publication and no reader uses it.
-    expire_files(directory / "verdicts", TEMP_VERDICT_NAME, cutoff)
+    # A published verdict is a durable release decision. Keep retry counts for
+    # watched commits, and sweep abandoned retries and interrupted writes.
+    expire_files(directory / "verdicts", TEMP_VERDICT_NAME, cutoff, protected)
     state["evidence_swept_at"] = now
     save(directory / "state.json", state)
 
@@ -450,17 +456,74 @@ def test_environment(lane):
     return environment
 
 
-def stray_git_marker(log, checkout):
-    """The `.git` outside the checkout that the fixtures refused to test
-    under, from a lane's log, or None."""
+def enclosing_git_markers(environment, repository):
+    """Mirror the fixture startup warning in src/test_binary.rs, with lstat
+    so a Git file or dangling symlink counts too."""
+    markers = {}
+    for root in (Path(environment.get("TMPDIR", "/tmp")), Path("/tmp"), Path("/var/tmp")):
+        for ancestor in (root, *root.parents):
+            marker = ancestor / ".git"
+            if marker.is_absolute() and not marker.is_relative_to(repository):
+                with contextlib.suppress(OSError):
+                    info = marker.lstat()
+                    markers[str(marker)] = (info.st_dev, info.st_ino)
+    return markers
+
+
+def stray_git_markers(log, markers, repository):
+    """Return the observed markers only if they explain every failed test.
+
+    Libtest omits the output block of a failure with no captured output, so
+    check the summary counts as well. Unfamiliar or incomplete output keeps
+    the ordinary failure verdict.
+    """
+    if not markers:
+        return []
+    found = set()
+    refusals = failed_tests = failed_targets = reruns = targets = 0
+    in_output = needs_reason = after_panic = False
     with contextlib.suppress(OSError), log.open(errors="replace") as lines:
         for line in lines:
-            if "enclosing Git marker" not in line:
+            line = line.rstrip("\n")
+            if "unsafe test fixture root " in line:
+                refusal = FIXTURE_REFUSAL.fullmatch(line)
+                if (not needs_reason or not refusal or not (after_panic or line.startswith("Error: "))
+                        or refusal[2] not in markers):
+                    return []
+                root = Path(refusal[1])
+                if (".." in root.parts or root.is_relative_to(repository)
+                        or not root.is_relative_to(Path(refusal[2]).parent)):
+                    return []
+                found.add(refusal[2])
+                refusals += 1
+                needs_reason = after_panic = False
                 continue
-            found = STRAY_GIT_MARKER.search(line)
-            if found and not Path(found[2]).is_relative_to(checkout):
-                return found[2]
-    return None
+            if after_panic:
+                return []
+            if FAILED_TEST_OUTPUT.fullmatch(line):
+                if needs_reason:
+                    return []
+                in_output = needs_reason = True
+            elif line == "failures:" or line.startswith("test result:"):
+                if needs_reason:
+                    return []
+                in_output = False
+                if result := FAILED_TEST_RESULT.match(line):
+                    failed_tests += int(result[1])
+                    failed_targets += 1
+            elif in_output and line.startswith("thread '") and " panicked at " in line:
+                if not needs_reason:
+                    return []
+                after_panic = True
+            elif line.startswith("error: test failed, to rerun pass "):
+                reruns += 1
+            elif summary := FAILED_TARGETS.fullmatch(line):
+                targets = int(summary[1])
+            elif line.startswith(("error:", "error[", "Caused by:")):
+                return []
+        if not needs_reason and refusals == failed_tests and targets == reruns == failed_targets:
+            return sorted(found)
+    return []
 
 
 def test_commit(repository, directory, sha):
@@ -471,6 +534,8 @@ def test_commit(repository, directory, sha):
     (directory / "logs").mkdir(exist_ok=True)
     lanes = {}
     packages = workspace_packages(checkout)
+    # Take a baseline before any lane can create a marker another lane sees.
+    markers_before = enclosing_git_markers(os.environ, repository)
     for lane in TEST_LANES:
         if lane in TEST_LANE_MANIFESTS and not (checkout / TEST_LANE_MANIFESTS[lane]).exists():
             continue
@@ -483,11 +548,15 @@ def test_commit(repository, directory, sha):
                                     env=test_environment(lane), stdout=log,
                                     stderr=subprocess.STDOUT).returncode
         lanes[lane] = {"status": status, "seconds": round(time.monotonic() - started)}
-        marker = stray_git_marker(path, checkout) if status == CODE_FAILURE else None
-        if marker:
-            lanes[lane]["stray_git_marker"] = marker
-            print(f"main-build-sentinel: {sha} {lane}: the test fixtures refused to run under "
-                  f"{marker}, which something outside the code left; remove it", flush=True)
+        if status == CODE_FAILURE:
+            markers_after = enclosing_git_markers(os.environ, repository)
+            markers = stray_git_markers(path, {
+                marker for marker, identity in markers_after.items() if markers_before.get(marker) == identity
+            }, repository)
+            if markers:
+                lanes[lane]["stray_git_markers"] = markers
+                print(f"main-build-sentinel: {sha} {lane}: test fixtures refused preexisting Git "
+                      f"markers: {', '.join(markers)}", flush=True)
     # A test that leaves files in the checkout must not stop later checks.
     changed = git(checkout, "status", "--porcelain", "--untracked-files=all")
     if changed:
@@ -496,15 +565,27 @@ def test_commit(repository, directory, sha):
         git(checkout, "clean", "--quiet", "-fd")
     verdict = {"sha": sha, "passed": all(entry["status"] == 0 for entry in lanes.values()),
                "lanes": lanes, "finished": time.time()}
-    outside = [lane for lane, entry in lanes.items()
-               if entry["status"] not in (0, CODE_FAILURE) or entry.get("stray_git_marker")]
+    outside = [lane for lane, entry in lanes.items() if entry["status"] not in (0, CODE_FAILURE)]
+    marker_lanes = {lane for lane, entry in lanes.items() if entry.get("stray_git_markers")}
+    failed_lanes = {lane for lane, entry in lanes.items() if entry["status"] == CODE_FAILURE}
+    path = verdict_path(directory, sha)
+    retry = path.with_suffix(".retry")
+    if not outside and marker_lanes and marker_lanes == failed_lanes:
+        attempts = json.loads(retry.read_text()) if retry.exists() else 0
+        if attempts < STRAY_GIT_RETRIES:
+            retry.parent.mkdir(exist_ok=True)
+            save(retry, attempts + 1)
+            outside = [lane for lane in lanes if lane in marker_lanes]
+    elif outside:
+        retry.unlink(missing_ok=True)
     if outside:
         verdict["outside_code"] = outside
         print(f"main-build-sentinel: {sha} {', '.join(outside)} stopped outside the code; "
               "no verdict is kept", flush=True)
         return verdict
-    verdict_path(directory, sha).parent.mkdir(exist_ok=True)
-    save(verdict_path(directory, sha), verdict)
+    path.parent.mkdir(exist_ok=True)
+    save(path, verdict)
+    retry.unlink(missing_ok=True)
     return verdict
 
 
@@ -562,6 +643,9 @@ def report_tests(directory, state, verdict):
             "Each lane runs in the ordinary test profile.\n\n")
     for lane, entry in verdict["lanes"].items():
         body += f"- {lane}: exit {entry['status']} in {entry['seconds']} s\n"
+        if markers := entry.get("stray_git_markers"):
+            paths = ", ".join(f"`{marker}`" for marker in markers)
+            body += f"  A stray .git marker may be the cause for this lane ({paths}).\n"
     for lane, entry in verdict["lanes"].items():
         if not entry["status"]:
             continue
