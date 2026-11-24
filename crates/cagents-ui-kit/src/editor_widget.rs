@@ -5767,7 +5767,9 @@ mod tests {
         );
         let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
         let mut published = Vec::new();
-        for x in [20.0, 29.0] {
+        // Past the gutter, and characters apart, so the second move leaves
+        // the first's hover.
+        for x in [60.0, 100.0] {
             let at = Point::new(x, 12.0);
             let mut shell = Shell::new(&mut published);
             editor.update(
