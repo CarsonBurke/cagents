@@ -2,6 +2,7 @@
 """Exercise the publisher's signature and bridge checks on real bundles in
 --verify-only mode, with real ssh-keygen keys; artifact smoke is stubbed and
 nothing reaches the network."""
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -91,7 +92,7 @@ def option(name):
 def releases():
     found = [json.loads((path / "release.json").read_text()) for path in sorted(state.glob("releases/*"))]
     for release in found:
-        release["assets"] = [{"name": asset.name}
+        release["assets"] = [{"name": asset.name, "size": asset.stat().st_size}
                              for asset in sorted((state / "releases" / release["tag_name"] / "assets").iterdir())]
     return found
 
@@ -307,6 +308,27 @@ class PublisherSignatures(unittest.TestCase):
                                "--dist", str(dist), *extra], cwd=self.checkout, text=True, capture_output=True,
                               env=environment, timeout=HANG_GUARD)
 
+    def promote(self, version: str, digest: str) -> subprocess.CompletedProcess:
+        """Publishes VERSION's draft as rehearsed with metadata of DIGEST."""
+        environment = dict(self.environment, PATH=f"{self.directory / 'tools'}:{os.environ['PATH']}",
+                           FAKE_GITHUB=str(self.directory / "github"), FAKE_CHECKOUT=str(self.checkout))
+        return subprocess.run([str(self.checkout / "scripts/publish-release"), "--version", version,
+                               "--promote", digest], cwd=self.checkout, text=True, capture_output=True,
+                              env=environment, timeout=HANG_GUARD)
+
+    def drafted(self) -> Path:
+        """0.2.5 left as a verified draft after 0.2.3 and 0.2.4, as the
+        release workflow leaves it; its bundle."""
+        self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
+        self.bridge = self.bundle("0.2.4", ["old"])
+        self.published("0.2.4", self.bridge, {"release-metadata.json": "release-metadata.json",
+                                              "release-metadata.json.sig": "release-metadata.json.sig"})
+        release = self.bundle("0.2.5", ["new"])
+        result = self.publish("0.2.5", release, "--draft")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Verified v0.2.5 as a draft", result.stdout)
+        return release
+
     def assertRefused(self, result: subprocess.CompletedProcess, reason: str):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(reason, result.stderr)
@@ -395,6 +417,42 @@ class PublisherSignatures(unittest.TestCase):
         self.assertEqual((served / "release-metadata-2.json").read_bytes(),
                          (release / "release-metadata.json").read_bytes())
         self.assertIn('"draft": false', (self.directory / "github/releases/v0.2.5/release.json").read_text())
+
+    def test_a_draft_is_published_only_as_it_was_rehearsed(self):
+        release = self.drafted()
+        state = self.directory / "github/releases/v0.2.5"
+        self.assertIn('"draft": true', (state / "release.json").read_text())
+        digest = hashlib.sha256((release / "release-metadata.json").read_bytes()).hexdigest()
+        self.assertRefused(self.promote("0.2.5", "0" * 64), "is not what was rehearsed")
+        self.assertRefused(self.promote("0.2.5", "rehearsed"), "SHA-256")
+        self.assertIn('"draft": true', (state / "release.json").read_text())
+        # The draft was smoke-tested before it was left; promotion runs none.
+        smoke = self.checkout / "scripts/smoke-release-artifacts"
+        smoke.write_text("#!/bin/sh\nexit 1\n")
+        uploads = sum(line.startswith("release upload") for line in
+                      (self.directory / "github/requests.log").read_text().splitlines())
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Published v0.2.5 from its verified, rehearsed draft", result.stdout)
+        self.assertIn('"draft": false', (state / "release.json").read_text())
+        # It publishes the draft as it was, uploading nothing.
+        self.assertEqual(sum(line.startswith("release upload") for line in
+                             (self.directory / "github/requests.log").read_text().splitlines()), uploads)
+        self.assertRefused(self.promote("0.2.5", digest), "is published already")
+
+    def test_a_draft_changed_after_it_was_left_is_not_published(self):
+        release = self.drafted()
+        digest = hashlib.sha256((release / "release-metadata.json").read_bytes()).hexdigest()
+        assets = self.directory / "github/releases/v0.2.5/assets"
+        archive = assets / "cagents-0.2.5-x86_64-unknown-linux-gnu.tar.gz"
+        original = archive.read_bytes()
+        archive.write_bytes(b"something else")
+        self.assertRefused(self.promote("0.2.5", digest), "checksum verification failed")
+        archive.write_bytes(original)
+        # What generation 1 builds read must still be what 0.2.4 serves.
+        shutil.copyfile(release / "release-metadata.json", assets / "release-metadata.json")
+        self.assertRefused(self.promote("0.2.5", digest), "GitHub served different bytes for release-metadata.json")
+        self.assertIn('"draft": true', (self.directory / "github/releases/v0.2.5/release.json").read_text())
 
     def test_publication_never_puts_a_release_above_a_newer_one(self):
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})

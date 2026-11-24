@@ -4,6 +4,7 @@ a stand-in build host reached through stand-in ssh and scp, and stand-in
 GitHub, signing and publishing tools. Nothing builds, signs or publishes."""
 
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -69,9 +70,18 @@ case "$1 $2" in
         if [[ " $* " == *" tagName "* ]]; then cat "$FIXTURE/published" 2>/dev/null || echo v0.2.3
         else cat "$FIXTURE/release-draft" 2>/dev/null; fi ;;
     "release download")
-        version=${3#v}
-        while (($#)); do [[ $1 == -D ]] && directory=$2; shift; done
+        version=${3#v} patterns=()
+        while (($#)); do [[ $1 == -D ]] && directory=$2; [[ $1 == -p ]] && patterns+=("$2"); shift; done
         cd "$directory"
+        # A draft serves the files the fixture left for it that match.
+        if [[ -d $FIXTURE/drafts/v$version ]]; then
+            for file in "$FIXTURE/drafts/v$version"/*; do
+                for pattern in "${patterns[@]}"; do
+                    [[ ${file##*/} != $pattern ]] || cp "$file" .
+                done
+            done
+            exit 0
+        fi
         echo "archive of $version" > "cagents-$version-x86_64-unknown-linux-gnu.tar.gz"
         echo "#!/bin/sh" > install.sh
         sha256sum "cagents-$version-x86_64-unknown-linux-gnu.tar.gz" install.sh > SHA256SUMS ;;
@@ -114,6 +124,7 @@ case $command in
             shift
         done
         [[ -z $feed ]] || ls "$feed/download" | sed "s|^|feed $feed offers |" >> "$FIXTURE/rehearse-feed.log"
+        [[ -z $feed ]] || ls "$feed/latest/download" | sed "s|^|feed $feed latest |" >> "$FIXTURE/rehearse-feed.log"
         mkdir -p "$root/home/.local/share/cagents-install/.update"
         outcome=$(cat "$FIXTURE/rehearse-outcome" 2>/dev/null || echo PASS)
         printf 'Total duration: 61.2s\nOutcome: %s\n' "$outcome" > "$root/report.txt"
@@ -578,7 +589,7 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("Rehearsing the staged update", result.stdout)
         run = next(line for line in self.log("rehearse.log") if " run " in line)
         self.assertTrue(run.endswith("--answer yes --ended-provider"), run)
-        self.assertIn("--staged is for rehearse", self.release("publish", "0.2.4", "--staged").stderr)
+        self.assertIn("--staged and --from-draft are for rehearse", self.release("publish", "0.2.4", "--staged").stderr)
 
     def test_a_failed_rehearsal_reports_what_regressed(self):
         self.cut_signed()
@@ -776,25 +787,103 @@ class ReleaseCut(unittest.TestCase):
         self.bundle(self.fix)
         self.assertEqual(self.release("cut", "--actions").returncode, 0)
         self.git("push", "-q", "origin", "main")
-        self.assertIn("not published", self.release("publish", "0.2.4", "--actions", stdin="0.2.3\n").stderr)
+        self.assertIn("not pushed", self.release("publish", "0.2.4", "--actions", stdin="0.2.3\n").stderr)
         self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
         result = self.release("publish", "0.2.4", "--actions", "--yes")
         # Pushed, not published: it says what to do next, and is not done.
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("release-actions admit v0.2.4 public=ssh-ed25519 FIXTURE", self.log("calls.log"))
         self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}", cwd=self.origin), self.fix)
-        self.assertIn("run scripts/release publish 0.2.4 --actions again", result.stdout)
+        self.assertIn("scripts/release rehearse 0.2.4 --from-draft\n  scripts/release publish 0.2.4 --actions",
+                      result.stdout)
         # Nothing is published here, and main keeps its version until Actions publishes.
         self.assertFalse(any(line.startswith(("publish-release", "land-pr")) for line in self.log("calls.log")))
         result = self.release("publish", "0.2.4", "--actions", "--yes")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("is pushed and not published yet", result.stderr)
+        self.assertIn("is pushed and has no draft yet", result.stderr)
         self.assertFalse(any(line.startswith("land-pr") for line in self.log("calls.log")))
         (self.root / "release-draft").write_text("false\n")
         result = self.release("publish", "0.2.4", "--actions", "--yes")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("published already", result.stdout)
         self.assertIn("land-pr 77 -R CarsonBurke/cagents", self.log("calls.log"))
+
+    def drafted(self):
+        """Tags a commit of trust generation 2 for Actions, pushes the tag as
+        publish --actions does, and leaves the release the workflow would
+        have signed as its draft, every file under its published name."""
+        feed = self.repo / "src/update/feed.rs"
+        feed.parent.mkdir(parents=True, exist_ok=True)
+        feed.write_text("const GENERATION: usize = 2;\n")
+        sha = self.commit("feat(update): trust generations")
+        self.git("push", "-q", "origin", "main")
+        dist = self.bundle(sha)
+        result = self.release("cut", "--actions", "--commit", sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.git("push", "-q", "origin", "v0.2.4")
+        draft = self.root / "drafts/v0.2.4"
+        draft.mkdir(parents=True)
+        for path in dist.iterdir():
+            name = "release-metadata-2.json" if path.name == "release-metadata.json" else path.name
+            shutil.copyfile(path, draft / name)
+        (draft / "release-metadata-2.json.sig").write_text("signature\n")
+        # What generation 1 builds read: the release that began generation 2.
+        (draft / "release-metadata.json").write_text('{"version": "0.2.4"}\n')
+        (draft / "release-metadata.json.sig").write_text("bridge signature\n")
+        (self.root / "release-draft").write_text("true\n")
+        return draft
+
+    def test_a_draft_is_rehearsed_as_github_serves_it_and_its_pass_names_its_metadata(self):
+        draft = self.drafted()
+        result = self.release("rehearse", "0.2.4", "--from-draft")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Rehearsing the in-app update from 0.2.3 to 0.2.4 as drafted on GitHub", result.stdout)
+        # The host fetched what the updater reads of the draft; nothing went from here.
+        self.assertIn("release download v0.2.4 -R CarsonBurke/cagents", "\n".join(self.log("gh.log")))
+        self.assertEqual((self.root / "rehearsed-archive").read_bytes(),
+                         (draft / f"cagents-0.2.4-{TARGET}.tar.gz").read_bytes())
+        feed = self.host / ".cache/cagents-release-rehearsal/feed-0.2.4"
+        served = self.log("rehearse-feed.log")
+        self.assertIn(f"feed {feed} offers v0.2.4", served)
+        self.assertEqual([line for line in served if " latest " in line],
+                         [f"feed {feed} latest {name}" for name in ("release-metadata-2.json", "release-metadata-2.json.sig",
+                                                                     "release-metadata.json", "release-metadata.json.sig")])
+        # The pass names the metadata it updated to, as the draft serves it.
+        digest = hashlib.sha256((draft / "release-metadata-2.json").read_bytes()).hexdigest()
+        passed = (self.host / ".cache/cagents-release-rehearsal/passed-0.2.4.txt").read_text().splitlines()
+        self.assertEqual(passed[0], f"Rehearsed metadata: sha256 {digest}")
+        self.assertIn("Outcome: PASS", passed)
+
+    def test_publish_in_actions_publishes_the_draft_only_once_its_rehearsal_passed(self):
+        draft = self.drafted()
+        refused = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("no rehearsal of v0.2.4's draft has passed on fw16, so it is not published; "
+                      "rehearse it: scripts/release rehearse 0.2.4 --from-draft", refused.stderr)
+        self.assertEqual(self.release("rehearse", "0.2.4", "--from-draft").returncode, 0)
+        self.assertIn("not published", self.release("publish", "0.2.4", "--actions", stdin="0.2.3\n").stderr)
+        self.assertFalse(any(line.startswith(("publish-release", "land-pr")) for line in self.log("calls.log")))
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        digest = hashlib.sha256((draft / "release-metadata-2.json").read_bytes()).hexdigest()
+        self.assertIn(f"publish-release --version 0.2.4 --promote {digest}", self.log("calls.log"))
+        self.assertIn("land-pr 77 -R CarsonBurke/cagents", self.log("calls.log"))
+
+    def test_a_failed_rehearsal_withdraws_an_earlier_pass(self):
+        self.drafted()
+        self.assertEqual(self.release("rehearse", "0.2.4", "--from-draft").returncode, 0)
+        (self.root / "rehearse-outcome").write_text("FAIL\n")
+        self.assertNotEqual(self.release("rehearse", "0.2.4", "--from-draft").returncode, 0)
+        self.assertIn("no rehearsal", self.release("publish", "0.2.4", "--actions", "--yes").stderr)
+        self.assertFalse(any(line.startswith("publish-release") for line in self.log("calls.log")))
+
+    def test_rehearsing_a_draft_needs_the_draft_and_the_in_app_update(self):
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--actions").returncode, 0)
+        refused = self.release("rehearse", "0.2.4", "--from-draft")
+        self.assertIn("v0.2.4 has no draft release to rehearse", refused.stderr)
+        self.assertIn("drop --staged", self.release("rehearse", "0.2.4", "--from-draft", "--staged").stderr)
+        self.assertEqual(self.log("rehearse.log"), [])
 
     def test_publish_in_actions_pushes_nothing_the_workflow_would_not_sign(self):
         self.bundle(self.fix)
