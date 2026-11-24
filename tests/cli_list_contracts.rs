@@ -411,6 +411,9 @@ fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) ->
     let listener =
         UnixListener::bind(service.join(cagents::terminal::ipc::SOCKET_FILE_NAME)).unwrap();
     listener.set_nonblocking(true).unwrap();
+    let selected_fields = extra
+        .iter()
+        .any(|arg| *arg == "--fields" || arg.starts_with("--fields="));
     let peer = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(8);
         let proof = HostSessionProof {
@@ -467,7 +470,7 @@ fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) ->
                 // precedes it on the same connection, a populated agent
                 // listing follows with one that names its projects, and a
                 // populated session listing with the model, to mark a chat no
-                // pane shows.
+                // pane shows. A field selection does not need that metadata.
                 let preliminary = match listing {
                     Listing::Work => {
                         matches!(request.request, ClientRequest::ReadWorkspaceMetadata { .. })
@@ -484,6 +487,7 @@ fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) ->
                     }
                     Listing::Sessions => {
                         populated
+                            && !selected_fields
                             && matches!(
                                 request.request,
                                 ClientRequest::Agent {
