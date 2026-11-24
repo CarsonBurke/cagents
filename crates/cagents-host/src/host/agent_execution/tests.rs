@@ -4039,7 +4039,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
             "work"
         )
         .unwrap_err(),
-        "This agent runs in default mode, so it can't start a child in bypassPermissions."
+        "This agent runs in default mode, so it can't start a child in bypassPermissions. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
     );
     assert_eq!(
         spawn(
@@ -4061,7 +4061,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
             "work"
         )
         .unwrap_err(),
-        "This agent runs in default mode, so it can't start a Codex child in never/workspace-write."
+        "This agent runs in default mode, so it can't start a Codex child in never/workspace-write. Without --permission-mode it starts in untrusted/workspace-write, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
     );
 
     // An omitted mode is the parent's own.
@@ -4104,7 +4104,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
     };
     assert_eq!(
         control(answer("allow")).unwrap_err(),
-        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+        "This agent runs in default mode, so it can't approve its child's tool requests. Ask the person to answer it in the child's pane in cagents; the child stays yours."
     );
     assert!(control(answer("allow_session")).is_err());
     assert!(!root.join("decisions").exists(), "nothing was approved");
@@ -4134,7 +4134,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
             "work"
         )
         .unwrap_err(),
-        "This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a child in acceptEdits."
+        "This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a child in acceptEdits. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
     );
     let asking = spawn(&unknown, "unknown-asking", Provider::Claude, None, "work").unwrap();
     assert_eq!(mode(&asking).as_deref(), Some("default"));
@@ -4244,13 +4244,126 @@ done
     };
     assert_eq!(
         answer("submit").unwrap_err(),
-        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+        "This agent runs in default mode, so it can't approve its child's tool requests. Ask the person to answer it in the child's pane in cagents; the child stays yours."
     );
     assert!(!root.join("omp-answer").exists(), "nothing was confirmed");
     answer("cancel").unwrap();
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
     let answered = std::fs::read_to_string(root.join("omp-answer")).unwrap();
     assert!(answered.contains(r#""cancelled":true"#), "{answered}");
+}
+
+/// A person answers the tool request a limited agent was refused in its
+/// child's pane, and the agent keeps its child: answering what the agent may
+/// not grant is not taking the child over.
+#[test]
+fn a_person_approving_a_limited_agent_s_child_leaves_the_child_with_it() {
+    if isolated("a_person_approving_a_limited_agent_s_child_leaves_the_child_with_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let spawn = |authority: &Authority, key: &str, mode: Option<&str>, prompt: &str| {
+        let mut request = request.clone();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.permission_mode = mode.map(str::to_owned);
+        request.prompt = prompt.into();
+        request.idempotency_key = key.into();
+        submit(&host, authority, request).unwrap()
+    };
+    let parent = spawn(&Authority::default(), "parent", Some("default"), "parent");
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let lead = agent_authority(&host, parent.agent.id);
+    let child = spawn(&lead, "child", None, "ASK_PERMISSION");
+    let asked = pending(&host, &lead, child.agent.id);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(child.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let approved = super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatCommand {
+            chat_id: session.id,
+            command: Command::Answer {
+                request_id: asked.id.clone(),
+                action: "allow".into(),
+                answers: Vec::new(),
+            },
+        },
+    );
+    assert!(
+        matches!(approved, Ok(ServerResponse::Accepted)),
+        "{approved:?}"
+    );
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "allow\n"
+    );
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(child.agent.id)
+            .unwrap()
+    );
+
+    // The agent still answers and refuses its child's next request itself.
+    let followup = submit(
+        &host,
+        &lead,
+        Submit {
+            name: None,
+            destination: Destination::Existing(child.agent.id),
+            prompt: "ASK_PERMISSION again".into(),
+            idempotency_key: "again".into(),
+        },
+    )
+    .unwrap();
+    let asked = pending(&host, &lead, child.agent.id);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    let refused = process(
+        &host,
+        lead.clone(),
+        Operation::Control {
+            agent: child.agent.id,
+            command: Control::Answer {
+                request_id: asked.id.clone(),
+                action: "deny".into(),
+                answers: Vec::new(),
+            },
+        },
+    );
+    assert!(matches!(refused, Ok(Reply::Requests(_))), "{refused:?}");
+    assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "allow\ndeny\n"
+    );
 }
 
 fn pending(host: &SharedHost, authority: &Authority, agent: AgentId) -> Vec<chat::Request> {

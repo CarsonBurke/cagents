@@ -2080,6 +2080,37 @@ fn owned_provider(
     Ok((agent, run, handle))
 }
 
+/// Whether answering a request of `kind` can grant the agent something.
+/// Approving a tool request or consenting to what a tool asks does, and so
+/// does any question of a provider that asks its tool approvals as
+/// questions. An owner below nothing-asks may not give such an answer, so a
+/// person gives it in cagents on the owner's behalf, without taking the agent
+/// over.
+pub(super) fn answer_grants(provider: crate::agent::Provider, kind: chat::RequestKind) -> bool {
+    match kind {
+        chat::RequestKind::Approval | chat::RequestKind::Consent => true,
+        chat::RequestKind::Question => provider.approves_through_questions(),
+    }
+}
+
+/// Whether `command` answers one of the agent's pending requests that can
+/// grant it something: a person's answer the agent's owner may need, rather
+/// than a person taking the agent's controls.
+pub(super) fn answers_grant(
+    handle: &chat::runtime::Handle,
+    provider: crate::agent::Provider,
+    command: &Command,
+) -> bool {
+    let Command::Answer { request_id, .. } = command else {
+        return false;
+    };
+    refresh_retained_requests(handle);
+    handle
+        .requests()
+        .iter()
+        .any(|request| request.id == *request_id && answer_grants(provider, request.kind))
+}
+
 /// A retained provider reports its run Waiting through the durable outbox,
 /// which can overtake the proxy's cached metadata, so a caller reading a
 /// Waiting run's requests refreshes that metadata first. A failed refresh
@@ -2232,16 +2263,10 @@ fn control(
                     actions.join(", ")
                 ));
             }
-            // Approving a tool request, or consenting to what a tool asks,
-            // grants what the child asked for, so only an agent that runs with
-            // nothing asking may do it. Any agent may refuse one, as the
-            // provider's adapter reads the action. A provider that asks its
-            // tool approvals as questions has each of its questions treated so.
-            let grants = match request.kind {
-                chat::RequestKind::Approval | chat::RequestKind::Consent => true,
-                chat::RequestKind::Question => agent.spec.provider.approves_through_questions(),
-            };
-            let ceiling = if grants {
+            // Only an agent that runs with nothing asking may grant what its
+            // child asked for. Any agent may refuse it, as the provider's
+            // adapter reads the action.
+            let ceiling = if answer_grants(agent.spec.provider, request.kind) {
                 caller_ceiling(host, authority)?.filter(|ceiling| !ceiling.may_approve())
             } else {
                 None
@@ -2569,10 +2594,12 @@ fn console(
             }
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .claim_agent_interaction(id, None)?;
+            if !answers_grant(&handle, agent.spec.provider, &command) {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .claim_agent_interaction(id, None)?;
+            }
             handle.command(command)?;
             Ok(Reply::Console(None))
         }

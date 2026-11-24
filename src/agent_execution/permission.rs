@@ -188,6 +188,15 @@ impl Mode {
         }
     }
 
+    /// Whether an agent in this mode asks a person before going beyond it,
+    /// rather than never asking or never needing to.
+    fn asks(self) -> bool {
+        match self {
+            Self::Codex(Approval::Never, _) => false,
+            mode => mode.tier() < Tier::Full,
+        }
+    }
+
     fn name(self) -> String {
         match self {
             Self::Claude(mode) => mode.name().into(),
@@ -362,10 +371,11 @@ impl Ceiling {
         }
     }
 
-    /// The refusal of an agent approving its child's tool request.
+    /// The refusal of an agent approving its child's tool request. A person
+    /// answering it in cagents leaves the child with this agent.
     pub fn approval_refusal(&self) -> String {
         format!(
-            "{}, {} it can't approve its child's tool requests; answer it in cagents.",
+            "{}, {} it can't approve its child's tool requests. Ask the person to answer it in the child's pane in cagents; the child stays yours.",
             self.describe(),
             if self.mode.is_some() { "so" } else { "and" },
         )
@@ -382,10 +392,7 @@ impl Ceiling {
     pub fn child(&self, provider: Provider, requested: Option<&str>) -> Result<String, String> {
         let own = self.mode.filter(|_| self.provider == Some(provider));
         let Some(requested) = requested else {
-            if let Some(own) = own {
-                return Ok(own.name());
-            }
-            return self.pin(provider).map(Mode::name);
+            return self.omitted(provider).map(Mode::name);
         };
         let unrankable = || {
             format!(
@@ -418,8 +425,26 @@ impl Ceiling {
             } else {
                 format!("{} ", provider.label())
             };
+            let article = if child.starts_with(['A', 'E', 'I', 'O', 'U']) {
+                "an"
+            } else {
+                "a"
+            };
+            // Name what the agent may do instead, so that it neither gives
+            // up on the child nor starts it weaker without saying why.
+            let instead = match self.omitted(provider) {
+                Ok(omitted) if omitted.asks() => format!(
+                    " Without --permission-mode it starts in {}, and a person approves in cagents what it asks beyond that.",
+                    omitted.name()
+                ),
+                Ok(omitted) => format!(
+                    " Without --permission-mode it starts in {}.",
+                    omitted.name()
+                ),
+                Err(_) => String::new(),
+            };
             return Err(format!(
-                "{}, {} it can't start a {child}child in {}.",
+                "{}, {} it can't start {article} {child}child in {}.{instead} Only a person can start it in that mode.",
                 self.describe(),
                 if self.mode.is_some() { "so" } else { "and" },
                 if provider == Provider::Codex {
@@ -433,6 +458,15 @@ impl Ceiling {
             Provider::Codex => mode.name(),
             _ => requested.into(),
         })
+    }
+
+    /// The mode a child of `provider` gets when its mode is omitted: this
+    /// session's own for the same provider, and otherwise its pin.
+    fn omitted(&self, provider: Provider) -> Result<Mode, String> {
+        match self.mode.filter(|_| self.provider == Some(provider)) {
+            Some(own) => Ok(own),
+            None => self.pin(provider),
+        }
     }
 
     /// The strictest mode of `provider` within this session's tier. An
@@ -871,7 +905,7 @@ mod tests {
         assert_eq!(
             child(&claude("default"), "bypassPermissions"),
             Err(
-                "This agent runs in default mode, so it can't start a child in bypassPermissions."
+                "This agent runs in default mode, so it can't start a child in bypassPermissions. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
                     .into()
             )
         );
@@ -904,7 +938,7 @@ mod tests {
         );
         assert_eq!(
             child(&codex("workspaceWrite"), "never"),
-            Err("This agent runs in on-request/workspace-write mode, so it can't start a child in never/workspace-write.".into())
+            Err("This agent runs in on-request/workspace-write mode, so it can't start a child in never/workspace-write. Without --permission-mode it starts in on-request/workspace-write, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
         );
         assert!(child(&codex("workspaceWrite"), "on-request/danger-full-access").is_err());
         // Never leaving the sandbox does not make a read-only one writable.
@@ -948,7 +982,7 @@ mod tests {
         }
         assert_eq!(
             claude("default").child(Provider::Codex, Some("never")),
-            Err("This agent runs in default mode, so it can't start a Codex child in never/workspace-write.".into())
+            Err("This agent runs in default mode, so it can't start a Codex child in never/workspace-write. Without --permission-mode it starts in untrusted/workspace-write, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
         );
         assert_eq!(
             claude("default")
@@ -999,6 +1033,36 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_names_the_mode_an_omitted_one_gives() {
+        // An Antigravity lead in Auto-accept edits asking for Codex and
+        // Claude children where nothing asks.
+        let lead = Ceiling::confirmed(Provider::Antigravity, Some("acceptEdits"));
+        assert_eq!(
+            lead.child(Provider::Codex, Some("never/danger-full-access")),
+            Err("This agent runs in acceptEdits mode, so it can't start a Codex child in never/danger-full-access. Without --permission-mode it starts in on-request/workspace-write, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
+        );
+        assert_eq!(
+            lead.child(Provider::Claude, Some("bypassPermissions")),
+            Err("This agent runs in acceptEdits mode, so it can't start a Claude Code child in bypassPermissions. Without --permission-mode it starts in acceptEdits, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
+        );
+        // An inherited mode that never asks is named without a person's
+        // approval to offer.
+        let never = Ceiling {
+            provider: Some(Provider::Codex),
+            mode: Some(Mode::Codex(Approval::Never, Sandbox::WorkspaceWrite)),
+        };
+        assert_eq!(
+            never.child(Provider::Codex, Some("never/danger-full-access")),
+            Err("This agent runs in never/workspace-write mode, so it can't start a child in never/danger-full-access. Without --permission-mode it starts in never/workspace-write. Only a person can start it in that mode.".into())
+        );
+        // With no mode to offer, only the person's remedy is named.
+        assert_eq!(
+            Ceiling::confirmed(Provider::Claude, Some("plan")).child(Provider::Omp, Some("yolo")),
+            Err("This agent runs in plan mode, so it can't start an Oh My Pi child in yolo. Only a person can start it in that mode.".into())
+        );
+    }
+
+    #[test]
     fn a_session_of_unknown_mode_counts_as_asking() {
         let unknown = Ceiling::unknown();
         assert_eq!(unknown.tier(), Tier::Ask);
@@ -1013,7 +1077,7 @@ mod tests {
         );
         assert_eq!(
             unknown.child(Provider::Claude, Some("acceptEdits")),
-            Err("This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a Claude Code child in acceptEdits.".into())
+            Err("This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a Claude Code child in acceptEdits. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
         );
         assert!(unknown.child(Provider::Claude, Some("plan")).is_ok());
     }
@@ -1035,7 +1099,7 @@ mod tests {
         }
         assert_eq!(
             Ceiling::confirmed(Provider::Claude, Some("default")).approval_refusal(),
-            "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+            "This agent runs in default mode, so it can't approve its child's tool requests. Ask the person to answer it in the child's pane in cagents; the child stays yours."
         );
     }
 
