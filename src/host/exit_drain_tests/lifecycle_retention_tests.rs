@@ -18,7 +18,7 @@ pub(in crate::host) fn observe_lifecycle_idle_shutdown() {
             .release
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(EVENTUALLY)
             .expect("isolated lifecycle idle scheduling point was not released");
     }
 }
@@ -66,8 +66,11 @@ fn lifecycle_idle_exit_drains_a_late_original_before_releasing_listener_and_leas
     );
     let paths = RuntimePaths::discover().unwrap();
     let (host, completed, running) = run_host();
+    // Lifecycle looks again RETENTION_RETRY (5 s) later whenever shared
+    // admission is busy at its idle check, so wait for the request itself
+    // rather than for a time that a busy host can outlast.
     observed
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(EVENTUALLY)
         .expect("the actual Lifecycle must request idle shutdown");
     {
         let state = host.lock().unwrap();
@@ -132,12 +135,7 @@ fn lifecycle_idle_exit_drains_a_late_original_before_releasing_listener_and_leas
     );
     assert!(completed.try_recv().is_err());
     drop(stdin); // actual cat EOF; no signal, fake receipt, or state-helper exit
-    assert!(
-        completed
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .is_ok()
-    );
+    assert!(completed.recv_timeout(EVENTUALLY).unwrap().is_ok());
     // Keep the RPC open through return: client disconnect cannot supply the
     // wake or conceal a missing sealed-delivery fence.
     running.join().unwrap();
@@ -220,12 +218,7 @@ fn final_detach_on_an_open_connection_wakes_completed_terminal_retirement() {
         rpc.request(ClientRequest::Shutdown).unwrap(),
         ServerResponse::ShutdownAccepted
     ));
-    assert!(
-        completed
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap()
-            .is_ok()
-    );
+    assert!(completed.recv_timeout(EVENTUALLY).unwrap().is_ok());
     running.join().unwrap();
     drop(rpc);
 }

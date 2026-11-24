@@ -7,6 +7,7 @@ use crate::{
     model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
     terminal::TerminalSpawnOptions,
     terminal_ipc::{ClientEnvelope, ClientRequest, ServerResponse, read_frame},
+    test_timing::EVENTUALLY,
 };
 use std::{
     fs::File,
@@ -178,7 +179,9 @@ pub(super) fn private_runtime_case(name: &str, case: Option<&str>) -> Option<Pat
         command.env(CASE, case);
     }
     let mut child = TestChild(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Each of the child's waits fails within EVENTUALLY of the step before
+    // it, reporting which one; this bounds a child that hangs without one.
+    let deadline = Instant::now() + EVENTUALLY * 3;
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break Some(status);
@@ -215,12 +218,8 @@ impl Rpc {
         Self::from_stream(stream)
     }
     fn from_stream(mut stream: UnixStream) -> Self {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        stream.set_read_timeout(Some(EVENTUALLY)).unwrap();
+        stream.set_write_timeout(Some(EVENTUALLY)).unwrap();
         write_frame(
             &mut stream,
             &ClientEnvelope {
@@ -349,15 +348,13 @@ fn assert_lease_held(paths: &RuntimePaths) {
     );
     assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
 }
-fn wait_for(mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !predicate() {
-        assert!(
-            Instant::now() < deadline,
-            "bounded actual HOST transition did not settle"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+/// Waits for a HOST transition that must happen, however busy the machine.
+/// The daemon parks without a polling timer, so a missing wake still fails.
+/// A peer-side timer, such as the client handshake's, is not covered by this:
+/// a test must not let one supply the transition it waits for.
+#[track_caller]
+fn wait_for(predicate: impl FnMut() -> bool) {
+    crate::test_timing::eventually("the actual HOST transition", predicate);
 }
 fn session(root: &Path) -> TerminalSession {
     let recipe = LaunchRecipe {
@@ -420,15 +417,13 @@ fn run_host() -> (
         let _ = ready.send(Err(diagnostic));
         let _ = complete.send(result);
     });
-    let host = observed
-        .recv_timeout(Duration::from_secs(8))
-        .unwrap_or_else(|error| {
-            let diagnostic = startup_diagnostic();
-            if let Some(root) = std::env::var_os(ROOT) {
-                let _ = fs::write(PathBuf::from(root).join("startup-timeout.txt"), &diagnostic);
-            }
-            panic!("actual host::run ready: {error}; {diagnostic}");
-        });
+    let host = observed.recv_timeout(EVENTUALLY).unwrap_or_else(|error| {
+        let diagnostic = startup_diagnostic();
+        if let Some(root) = std::env::var_os(ROOT) {
+            let _ = fs::write(PathBuf::from(root).join("startup-timeout.txt"), &diagnostic);
+        }
+        panic!("actual host::run ready: {error}; {diagnostic}");
+    });
     let host = match host {
         Ok(host) => host,
         Err(error) => {
@@ -555,12 +550,7 @@ fn ordinary_host_exit_keeps_fresh_clients_and_lease_until_late_original_is_reape
         matches!(fresh.request(ClientRequest::List).unwrap(), ServerResponse::Listed { terminals } if terminals.is_empty())
     );
     drop(stdin); // natural EOF, no normal-path signal or invented cleanup ACK
-    assert!(
-        completed
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .is_ok()
-    );
+    assert!(completed.recv_timeout(EVENTUALLY).unwrap().is_ok());
     // Keep BOTH clients open through completion: final current-delivery closure
     // must release their actual reader/writer joins without peer cooperation.
     running.join().unwrap();
@@ -595,12 +585,7 @@ fn healthy_host_exit_joins_its_actual_terminal_without_reopening_reservations() 
         rpc.request(ClientRequest::Shutdown).unwrap(),
         ServerResponse::ShutdownAccepted
     ));
-    assert!(
-        completed
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap()
-            .is_ok()
-    );
+    assert!(completed.recv_timeout(EVENTUALLY).unwrap().is_ok());
     running.join().unwrap();
     root_pin.prove_reaped();
     holder_pin.prove_reaped();
@@ -717,12 +702,31 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     serving.join().unwrap();
     // A connection accepted BEFORE the final snapshot could start its thread
     // AFTER it. Actual Registration and writer closure must not wait for peer EOF.
+    // The peer sends a complete Connect, so a connection that slipped past the
+    // fence answers it rather than closing once its handshake times out.
     let (mut late, server) = UnixStream::pair().unwrap();
-    late.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    late.set_read_timeout(Some(EVENTUALLY)).unwrap();
+    write_frame(
+        &mut late,
+        &ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: 1,
+            proof: None,
+            request: ClientRequest::Connect {
+                expected_host: None,
+                resume: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
     let serve_host = host.clone();
     let late_server = thread::spawn(move || client::serve(server, 2, serve_host));
     let mut byte = [0];
-    assert_eq!(late.read(&mut byte).unwrap(), 0);
+    match late.read(&mut byte) {
+        Ok(read) => assert_eq!(read, 0, "a fenced late connection must not answer"),
+        // Closing with the Connect still unread resets the peer instead.
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::ConnectionReset, "{error}"),
+    }
     wait_for(|| late_server.is_finished());
     late_server.join().unwrap();
     assert!(!host.lock().unwrap().clients.contains_key(&2));
