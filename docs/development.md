@@ -1314,20 +1314,13 @@ there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR`,
 `$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
 for the Unix sockets tests bind under it and emptied before the next command
-there; a HOST test lane leaves about 12 MB. It follows the ancestry, home and
-socket constraints in the HOST recipe below rather than selecting `/tmp`,
-`/var/tmp`, `~/.cache` or the home directory: agent
-sandboxes create `.git` placeholders in the first three, recovery placement
-deliberately refuses any enclosing `.git`, and fixtures refuse roots inside
-the home directory. The runtime directory exists while the host has a login
-session for the user, which the connection itself provides; without one,
-temporary files fall back to the slot, and `test` stops with status 78 if a
-marker is above it. While a
-`.git` sits in any of its ancestors on the host, `test` stops with status 78
-and names it, since fixtures that check Git ancestry fail under one and
-building here instead would hide the leak. Stop and investigate its ownership;
-do not remove a shared marker to make tests pass. Other commands still run there. Cargo's registry and Git caches and the toolchain on the
-host are shared with anything else built there; Cargo locks its caches itself.
+there. A HOST test lane leaves about 12 MB. The runtime directory meets the
+ancestry, home and socket constraints in the HOST recipe below. It exists
+while the host has a login session for the user, which the connection itself
+provides. Without one, temporary files fall back to the slot. If a Git marker
+encloses the selected temporary directory, `test` stops with status 78 and
+names the marker. Other commands still run there. Cargo shares its locked
+registry and Git caches and the toolchain with other builds on the host.
 
 ### Compilation jobs and shared build directories
 
@@ -1739,8 +1732,9 @@ scripts/cargo-gate test --locked --no-default-features --features host --all-tar
 For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
 private **disk-backed** base with a short, physical absolute path. Verify its
 filesystem with `findmnt -T PATH`; `/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can
-be RAM-backed. Neither the base nor any ancestor may contain a `.git` file,
-directory or symlink. The base must also be outside the account home reported
+be RAM-backed. The base and its ancestors must be outside a Git checkout.
+A `.git` file, symlink or directory with `HEAD` counts as a marker. An empty
+sandbox placeholder is skipped. The base must also be outside the account home reported
 by `getent passwd "$(id -u)"`, even when `HOME` points elsewhere: bundled-skill
 tests deliberately refuse installation beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
@@ -2350,9 +2344,8 @@ mode; CLI and cleanup use the same name. The task keeps that selection across
 starts and refuses a different name. This needs a source runner supporting
 `--in-session`; default unnamed tasks retain compatibility with older runners
 and saved seeds.
-Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
-`/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
-fixtures refuse.
+Each task keeps everything in one directory outside Git ancestry. The
+default keeps the task under `~/.local/state/cev/`.
 
 Build before taking a native slot, and never wait for Cargo while holding one: other native sessions queue behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.6 GiB. A clean checkout of a main commit that the [main build sentinel](#watching-main-after-merges) has built takes its executables instead, without compiling, so build `before` from the newest `origin/main` tip it checked. A build that changes how Rust compiles, with `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or a `CARGO_PROFILE_*` setting as a measurement at another optimization level does, compiles both sides with them, since the sentinel's executables were built without them; through `--remote`, a revision or the integrated lane that the host compiles gets them too. `build SIDE CHECKOUT --executables DIR` takes executables already built elsewhere from exactly that checkout, as the remote route below does. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 

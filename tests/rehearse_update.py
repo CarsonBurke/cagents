@@ -2535,6 +2535,28 @@ class PrivateRoot(unittest.TestCase):
         return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
                               capture_output=True, text=True, timeout=HANG_GUARD, **kwargs)
 
+    def test_init_skips_empty_git_ancestors_and_refuses_gitfiles(self):
+        marker = self.root / ".git"
+        marker.mkdir()
+        initial = self.root / "first"
+        initialized = subprocess.run(
+            [str(SCRIPT), "--root", str(initial), "init"],
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        self.assertTrue((initial / ".rehearse-update").is_file())
+
+        marker.rmdir()
+        marker.write_text("gitdir: /elsewhere/worktrees/rehearsal\n")
+        second = self.root / "second"
+        refused = subprocess.run(
+            [str(SCRIPT), "--root", str(second), "init"],
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn(f"root must be outside Git ancestry; found {marker}", refused.stderr)
+        self.assertFalse(second.exists())
+
     def test_counted_daemon_stop_is_private_and_leaves_other_private_processes_alive(self):
         self.assertEqual(self.call('init').returncode,0)
         prefix=self.root/'home/.local/share/cagents-install'

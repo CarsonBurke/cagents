@@ -8425,6 +8425,7 @@ mod tests {
         // Broken metadata deliberately proves the existing key is consulted
         // before attempting Git rediscovery, not only corrected afterwards.
         std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "invalid ref\n").unwrap();
         let ResolvedProject::Open { repository, .. } = (ProjectCommand::Open {
             path: Some(root.clone()),
         })

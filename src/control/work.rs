@@ -406,7 +406,7 @@ fn item_in(item: String, home: Option<&Path>) -> String {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(&item),
     };
-    if expanded.join(".git").exists()
+    if crate::git_marker::present(&expanded.join(".git")).unwrap_or(false)
         && let Ok(canonical) = std::fs::canonicalize(&expanded)
     {
         return canonical.to_string_lossy().into_owned();
@@ -1865,6 +1865,11 @@ mod tests {
         // A branch, or a path only the daemon can place, is sent as given.
         assert_eq!(item_in("fix/login".into(), Some(&home)), "fix/login");
         assert_eq!(item_in("~/absent".into(), Some(&home)), "~/absent");
+        std::fs::create_dir_all(home.join("placeholder/.git")).unwrap();
+        assert_eq!(
+            item_in("~/placeholder".into(), Some(&home)),
+            "~/placeholder"
+        );
         assert_eq!(
             item_in(".worktrees/linked".into(), Some(&home)),
             ".worktrees/linked"

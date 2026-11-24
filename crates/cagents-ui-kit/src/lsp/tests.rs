@@ -2210,6 +2210,23 @@ fn a_manager_that_has_shut_down_starts_no_further_server() {
 }
 
 #[test]
+fn root_discovery_passes_an_empty_git_directory() {
+    let root = canonical_tempdir();
+    let worktree = root.path();
+    let project = worktree.join("project");
+    let nested = project.join("nested");
+    let file = nested.join("readme.txt");
+    std::fs::create_dir_all(nested.join(".git")).unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
+    std::fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let markers = vec![".git".to_owned()];
+    assert_eq!(discover_root(&file, worktree, &markers), project);
+
+    std::fs::write(nested.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert_eq!(discover_root(&file, worktree, &markers), nested);
+}
+
+#[test]
 fn root_discovery_stops_at_the_nearest_marker_and_never_leaves_the_worktree() {
     let root = canonical_tempdir();
     let worktree = root.path();

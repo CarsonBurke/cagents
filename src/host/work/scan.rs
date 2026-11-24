@@ -710,12 +710,10 @@ fn dirty(root: &Path, status: &StatusSnapshot) -> Dirty {
 /// checkout, as during `git worktree remove`; a permission or transient I/O
 /// failure is not evidence of that.
 fn checkout_removed(root: &Path) -> bool {
-    std::fs::symlink_metadata(root.join(".git")).is_err_and(|error| {
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        )
-    })
+    match crate::git_marker::present(&root.join(".git")) {
+        Ok(present) => !present,
+        Err(error) => error.kind() == std::io::ErrorKind::NotADirectory,
+    }
 }
 
 #[cfg(test)]
@@ -1114,7 +1112,11 @@ mod tests {
     fn a_removed_worktree_leaves_the_scan_and_its_siblings_intact() {
         let fixture = fixture();
         let first = run(&fixture, None, &git_watch::Change::default());
-        std::fs::remove_dir_all(&fixture.linked).unwrap();
+        // A sandbox placeholder at the removed marker does not keep the
+        // checkout in the scan while Git's worktree list still names it.
+        let marker = fixture.linked.join(".git");
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
         let second = run(
             &fixture,
             Some(&first),

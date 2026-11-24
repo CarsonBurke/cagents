@@ -374,18 +374,33 @@ class SharedConnection(unittest.TestCase):
 
 
 class EnclosingCheckout(unittest.TestCase):
-    def test_a_git_marker_in_any_ancestor_is_found(self):
-        enclosing_checkout = agent_function("enclosing_checkout")
+    def test_empty_directories_are_skipped_and_repository_markers_are_found(self):
+        enclosing_checkout = agent_scope()["enclosing_checkout"]
         with tempfile.TemporaryDirectory() as root:
             deep = Path(root, "a", "b", "c")
             deep.mkdir(parents=True)
+            marker = Path(root, "a", ".git")
+            (deep.parent / ".git").mkdir()
+            marker.mkdir()
             self.assertIsNone(enclosing_checkout(str(deep)))
-            Path(root, "a", ".git").mkdir()
-            self.assertEqual(enclosing_checkout(str(deep)), str(Path(root, "a", ".git")))
+            (marker / "HEAD").touch()
+            self.assertEqual(enclosing_checkout(str(deep)), str(marker))
+            (marker / "HEAD").unlink()
+            marker.rmdir()
+            marker.write_text("gitdir: x")
+            self.assertEqual(enclosing_checkout(str(deep)), str(marker))
+            marker.unlink()
+            marker.symlink_to("missing")
+            self.assertEqual(enclosing_checkout(str(deep)), str(marker))
+            marker.unlink()
             # The directory itself is not its own ancestor.
-            Path(root, "a", ".git").rmdir()
             Path(deep, ".git").write_text("gitdir: x")
             self.assertIsNone(enclosing_checkout(str(deep)))
+
+    def test_an_unreadable_ancestor_is_still_treated_as_a_marker(self):
+        enclosing_checkout = agent_scope()["enclosing_checkout"]
+        with patch.object(os, "lstat", side_effect=PermissionError):
+            self.assertEqual(enclosing_checkout("/fixture/parent/temp"), "/fixture/parent/.git")
 
 
 class Clear(unittest.TestCase):
@@ -650,7 +665,7 @@ if [ "$1" = marked ]; then
     exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$RUSTUP_HOME" \
         CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_LOCK="$HOME/shares.lock" CAGENTS_BUILD_SLOTS="${STAND_IN_SHARES:-4}" \
         CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
-        sh -c "mkdir -p '$HOME/stray/.git'; $*"
+        sh -c "mkdir -p '$HOME/stray/.git' && touch '$HOME/stray/.git/HEAD' && $*"
 fi
 shift
 cd "$HOME"

@@ -767,7 +767,9 @@ pub fn canonical_checkout(repository: &Path, checkout: &Path) -> Result<Option<P
 pub fn checkout_branch(repository: &Path, checkout: &Path) -> Option<String> {
     let dot_git = checkout.join(".git");
     let administrative = if dot_git.is_dir() {
-        Some(dot_git.clone())
+        crate::git_marker::present(&dot_git)
+            .unwrap_or(true)
+            .then(|| dot_git.clone())
     } else {
         gitdir_line(&dot_git)
     }
@@ -937,6 +939,18 @@ mod tests {
         let folder = std::fs::canonicalize(&plain).unwrap();
         assert_eq!(canonical_checkout(&folder, &folder), Ok(None));
         assert!(canonical_checkout(&folder, &fixture.linked).is_err());
+    }
+
+    #[test]
+    fn an_empty_git_directory_does_not_hide_a_registered_worktree_branch() {
+        let fixture = CheckoutFixture::new();
+        let marker = fixture.linked.join(".git");
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert_eq!(
+            checkout_branch(&fixture.repository, &fixture.linked).as_deref(),
+            Some("feature")
+        );
     }
 
     /// Postcard is positional: a carried older CLI's channel creation has no

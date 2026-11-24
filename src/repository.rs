@@ -4996,8 +4996,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .iter()
                 .filter(|path| {
                     indexed.contains(*path)
-                        && fs::symlink_metadata(worktree.join(path.as_os_str()).join(".git"))
-                            .is_ok()
+                        && crate::git_marker::present(&worktree.join(path.as_os_str()).join(".git"))
+                            .unwrap_or(false)
                 })
                 .cloned(),
         );
@@ -10206,6 +10206,7 @@ mod tests {
         let root = worktree.path();
         // `b` was a tracked file and is now a nested repository.
         fs::create_dir_all(root.join("b/.git")).unwrap();
+        fs::write(root.join("b/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::create_dir_all(root.join("dir/sub")).unwrap();
         fs::write(root.join("dir/new"), b"new").unwrap();
         fs::write(root.join("dir/sub/new"), b"new").unwrap();
