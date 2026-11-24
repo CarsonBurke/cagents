@@ -1000,36 +1000,45 @@ fn compact_project_initials_paint_bright_inside_the_colored_chip() {
     }
 }
 
+/// A highlighted label fades within the slot it is given rather than being
+/// cut short to fit, and is read whole.
 #[test]
-fn highlighted_labels_truncate_to_measured_slot_with_an_ellipsis() {
-    let _renderer = headless_renderer();
-    let font = cosmic::font::default();
-    let emphasis = cosmic::iced::Font {
-        weight: cosmic::iced::font::Weight::Bold,
-        ..font
-    };
+fn highlighted_labels_fade_within_their_slot_and_read_whole() {
     let label = "feature/authentication-long-λ-branch";
-    for width in [55.0, 105.0, 170.0] {
-        let truncated = ellipsize_search_label(label, width, |label| {
-            search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)
-        });
-        assert!(truncated.ends_with('…'), "{truncated}");
-        assert!(
-            search_spans_width(&truncated, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis) <= width
+    let natural = |query: &str| {
+        let texts = drawn_texts(
+            search_text(
+                label,
+                query,
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            )
+            .into(),
+            2000.0,
         );
-        assert!(!search_highlight_ranges(&truncated, "feat").is_empty());
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts[0].0, label);
+        texts[0].1.width
+    };
+    // A match is set in bold, so it is a little wider, never narrower.
+    assert!(natural("feat") >= natural("") - 0.5);
+    for width in [55.0, 105.0, 170.0] {
+        let texts = drawn_texts(
+            search_label(
+                label,
+                "feat",
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            ),
+            width,
+        );
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        let (text, bounds) = &texts[0];
+        assert_eq!(text, label, "the whole label, not a cut one");
+        assert!(bounds.width <= width + 0.5, "{bounds:?} in {width}");
     }
-    assert_eq!(
-        ellipsize_search_label(label, 2000.0, |label| search_spans_width(
-            label,
-            "feat",
-            CHILD_ROW_TEXT_SIZE,
-            font,
-            emphasis
-        )),
-        label
-    );
-    assert!(search_highlight_ranges("fast elegant audit trail", "feat").is_empty());
 }
 
 #[test]
@@ -8298,9 +8307,21 @@ fn attention_search_finds_pane_rows_by_their_checkout() {
     ignore = "its widths assume the development host's fonts, not the release sandbox's"
 )]
 fn a_highlighted_title_keeps_its_width_and_its_place_gives_way() {
-    let (font, emphasis) = search_label_fonts(false);
     let title = "Review agent";
-    let natural = search_spans_width(title, "review", CHILD_ROW_TEXT_SIZE, font, emphasis).ceil();
+    let natural = drawn_texts(
+        search_text(
+            title,
+            "review",
+            CHILD_ROW_TEXT_SIZE,
+            theme::Text::Default,
+            false,
+        )
+        .into(),
+        2000.0,
+    )[0]
+    .1
+    .width
+    .ceil();
     let place = "fix-sidebar-and-a-long-checkout-name";
     let width = natural + 40.0;
     for query in ["", "review"] {
@@ -8315,7 +8336,7 @@ fn a_highlighted_title_keeps_its_width_and_its_place_gives_way() {
         );
         assert!(
             bounds.x + bounds.width <= width + 0.5,
-            "query={query:?}: the place ellipsizes within the row: {bounds:?}"
+            "query={query:?}: the place fades within the row: {bounds:?}"
         );
         assert!(bounds.width < 45.0, "query={query:?}: {bounds:?}");
     }

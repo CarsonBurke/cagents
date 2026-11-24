@@ -972,22 +972,14 @@ impl Runtime {
         let label = self.child_label(child, 80);
         let name = self.child_choice_name(child, &label);
         let line = |text: String, muted: bool| {
-            let text = design::caption(text)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ));
+            let text = crate::ui_controls::FadeText::caption(text);
             if muted {
                 text.class(cosmic::theme::Text::Custom(design::muted_text))
             } else {
                 text
             }
         };
-        let title = design::body(label.into_owned())
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ));
+        let title = crate::ui_controls::fade_text(label.into_owned());
         let mut parts = vec![
             widget::container(status_mark(child))
                 .width(Length::Fixed(f32::from(design::COMPACT_ICON_SIZE)))

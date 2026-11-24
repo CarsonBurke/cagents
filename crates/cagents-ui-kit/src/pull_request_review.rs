@@ -19,7 +19,7 @@ use std::{
 
 use cosmic::{
     Element,
-    iced::{self, Alignment, Length, Padding, advanced::text::EllipsizeHeightLimit},
+    iced::{self, Alignment, Length, Padding},
     widget::{self, button},
 };
 use url::Url;
@@ -2326,11 +2326,8 @@ impl State {
         };
         let pull_request = &target.pull_request;
         let title = crate::interaction::tooltip(
-            design::heading(pull_request.title.as_str())
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(SUMMARY_TITLE_LINES),
-                ))
+            crate::ui_controls::FadeText::heading(pull_request.title.as_str())
+                .lines(SUMMARY_TITLE_LINES)
                 .width(Length::Fill),
             pull_request.title.as_str(),
         );
@@ -2345,11 +2342,8 @@ impl State {
         let mut rows = vec![
             title,
             crate::interaction::tooltip(
-                design::caption(detail.clone())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::Middle(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
+                crate::ui_controls::FadeText::caption(detail.clone())
+                    .edge(crate::ui_controls::FadeEdge::Middle)
                     .width(Length::Fill),
                 detail,
             ),
@@ -2364,11 +2358,7 @@ impl State {
         }
         rows.push(
             widget::row::with_children(vec![
-                design::caption(self.progress_label())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
+                crate::ui_controls::FadeText::caption(self.progress_label())
                     .width(Length::Fill)
                     .into(),
                 self.review_control(modal_open),
@@ -2684,11 +2674,8 @@ impl State {
             self.context.is_some() && file.sync != ViewedSync::Pending && !modal_open,
             self.fenced(Action::ToggleViewed(row.path.clone())),
         ));
-        let name = design::body(&*row.label)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::Start(
-                EllipsizeHeightLimit::Lines(1),
-            ))
+        let name = crate::ui_controls::fade_text(&*row.label)
+            .edge(crate::ui_controls::FadeEdge::Start)
             .width(Length::Fill);
         let name: Element<'a, Action> = if file.viewed {
             name.class(cosmic::theme::Text::Custom(design::muted_text))
@@ -2753,11 +2740,7 @@ impl State {
             widget::container(crate::file_icon::folder(!collapsed))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
-            design::body(&*row.label)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
+            crate::ui_controls::fade_text(&*row.label)
                 .width(Length::Fill)
                 .into(),
         ])
@@ -3223,13 +3206,6 @@ pub fn browser_row<'a>(
         CheckStatus::Failing => Some(("Checks failing", design::destructive_text)),
         CheckStatus::Unknown => None,
     };
-    let one_line = |text: widget::text::Text<'a, cosmic::Theme, cosmic::Renderer>| {
-        text.wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-    };
     let content = widget::row::with_children(vec![
         widget::container(widget::icon::icon(icon).size(ROW_ICON_SIZE).class(
             cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
@@ -3241,23 +3217,18 @@ pub fn browser_row<'a>(
         .center_x(Length::Fixed(ROW_ICON_WIDTH))
         .into(),
         widget::column::with_children(vec![
-            one_line(design::body(pull_request.title.as_str())).into(),
+            crate::ui_controls::fade_text(pull_request.title.as_str())
+                .width(Length::Fill)
+                .into(),
             {
-                let mut facts = vec![
-                    design::caption(detail.join(" · "))
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .into(),
-                ];
+                let mut facts =
+                    vec![crate::ui_controls::FadeText::caption(detail.join(" · ")).into()];
                 if let Some((label, tone)) = checks {
                     facts.push(
-                        one_line(
-                            design::caption(format!(" · {label}"))
-                                .class(cosmic::theme::Text::Custom(tone)),
-                        )
-                        .into(),
+                        crate::ui_controls::FadeText::caption(format!(" · {label}"))
+                            .class(cosmic::theme::Text::Custom(tone))
+                            .width(Length::Fill)
+                            .into(),
                     );
                 }
                 widget::row::with_children(facts).into()
