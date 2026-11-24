@@ -55,7 +55,11 @@ impl Watches {
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, source.clone());
         self.reconcile();
-        self.watcher.is_some() && directories(source).all(|path| self.registered.contains_key(path))
+        self.watcher.is_some()
+            && directories(source).all(|path| {
+                self.registered.contains_key(path)
+                    && crate::git_watch::reliable_filesystem_events(path)
+            })
     }
 
     fn reconcile(&mut self) {

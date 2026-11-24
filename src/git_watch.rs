@@ -1688,6 +1688,12 @@ mod magic {
     pub const HOSTFS: u64 = 0x00c0_ffee;
 }
 
+/// Whether native notifications can cover external writes to this directory.
+#[cfg(feature = "host")]
+pub(crate) fn reliable_filesystem_events(path: &Path) -> bool {
+    !Filesystem::of(path).is_ok_and(Filesystem::omits_events)
+}
+
 impl Filesystem {
     fn of(path: &Path) -> std::io::Result<Self> {
         let path = std::ffi::CString::new(path.as_os_str().as_bytes())

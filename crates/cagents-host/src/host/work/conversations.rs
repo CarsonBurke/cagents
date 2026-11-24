@@ -23,7 +23,7 @@ use crate::{
     agent::Provider,
     github::{GitHubError, GitHubService, polling},
     github_identity::{GitHubRepoKey, PullRequestKey},
-    model::TerminalId,
+    model::{ProjectId, TerminalId},
     pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
     terminal_ipc::ServerMessage,
     work::{
@@ -447,6 +447,7 @@ struct Facts {
 
 #[derive(Clone)]
 struct ProjectFacts {
+    id: ProjectId,
     snapshot: Option<Arc<forge::Snapshot>>,
     local: Option<Arc<super::scan::Local>>,
     forge_error: Option<String>,
@@ -457,6 +458,7 @@ struct ProjectFacts {
 impl ProjectFacts {
     fn of(tracked: &super::Tracked) -> Self {
         Self {
+            id: tracked.id,
             snapshot: tracked.snapshot.clone(),
             local: tracked.local.clone(),
             forge_error: match &tracked.forge {
@@ -542,6 +544,25 @@ impl ProjectFacts {
             .chain(snapshot.others.values())
             .find(|pull_request| pull_request.number == key.number)
     }
+}
+
+pub(super) fn checkout_facts_changed(
+    before: Option<&super::scan::Local>,
+    after: &super::scan::Local,
+) -> bool {
+    before.is_none_or(|before| {
+        before.worktrees.len() != after.worktrees.len()
+            || before
+                .worktrees
+                .iter()
+                .zip(&after.worktrees)
+                .any(|(before, after)| {
+                    before.path != after.path
+                        || before.branch != after.branch
+                        || before.head != after.head
+                        || before.dirty != after.dirty
+                })
+    })
 }
 
 /// A reference turned into a pull request, or what must be asked to do so.
@@ -722,7 +743,7 @@ impl Handle {
             .filter(|(_, record)| recorded_provider(record.session.launch.provider))
             .map(|(conversation, _)| *conversation)
             .collect::<BTreeSet<_>>();
-        let (conversations, read) = {
+        let (conversations, read, was_watching) = {
             let mut state = self.conversations();
             state.watched.retain(|conversation, watched| {
                 watched
@@ -748,10 +769,11 @@ impl Handle {
                 .filter(|(_, watched)| !watched.watchers.is_empty())
                 .map(|(conversation, _)| *conversation)
                 .collect::<Vec<_>>();
-            self.0
+            let was_watching = self
+                .0
                 .conversations
                 .watching
-                .store(!conversations.is_empty(), Ordering::Release);
+                .swap(!conversations.is_empty(), Ordering::AcqRel);
             let now = Instant::now();
             let read = state
                 .watched
@@ -771,13 +793,24 @@ impl Handle {
                         .then_some(*id)
                 })
                 .collect::<Vec<_>>();
-            (conversations, read)
+            (conversations, read, was_watching)
         };
         files.retain(|id| conversations.contains(&id) && !followed.contains(&id));
         let mut facts = conversations
             .iter()
             .map(|id| (*id, self.watched_facts(host, *id)))
             .collect::<BTreeMap<_, _>>();
+        if was_watching || !conversations.is_empty() {
+            // A live inspector keeps only its own project at the watched
+            // forge cadence, even when its cached facts do not need reading.
+            let projects = facts
+                .values()
+                .filter_map(|facts| Some(facts.as_ref()?.project.as_ref()?.id))
+                .collect::<BTreeSet<_>>();
+            for tracked in self.shared().projects.values_mut() {
+                tracked.conversation_watched = projects.contains(&tracked.id);
+            }
+        }
         for conversation in &read {
             let watched = conversations.contains(conversation);
             let (known, search_due) = self
@@ -1901,7 +1934,7 @@ fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> (
         }
         Some(Err(error)) => {
             items.failed(error);
-            true
+            false
         }
         // Gone: what was read stays as it was.
         None => false,

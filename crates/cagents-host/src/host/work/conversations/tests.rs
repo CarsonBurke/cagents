@@ -65,6 +65,7 @@ fn facts(directory: &str) -> Facts {
     Facts {
         directory: PathBuf::from(directory),
         project: Some(ProjectFacts {
+            id: ProjectId::new(),
             snapshot: Some(Arc::new(forge::Snapshot {
                 repository: repo("me"),
                 remotes: vec![repo("me"), repo("upstream")],
