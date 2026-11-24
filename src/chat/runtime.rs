@@ -3462,6 +3462,7 @@ impl Actor {
                 | Command::Compact
                 | Command::Slash { .. }
                 | Command::StartQueued { .. }
+                | Command::SendQueuedNow
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
@@ -4314,6 +4315,7 @@ fn apply_projected_event(
             );
         }
         Event::QueueChanged(messages) => state.queued_messages = messages,
+        Event::SendNow(send_now) => state.send_now = send_now,
         Event::QueueRemoval(removal) => {
             state.queue_removals.push(removal);
             let excess = state
@@ -4337,6 +4339,7 @@ fn apply_projected_event(
             state.interrupt_mode = None;
             state.queued_messages.clear();
             state.queue_removals.clear();
+            state.send_now = None;
             state.items.clear();
             state.subagents.clear();
             indices.clear();
@@ -4721,6 +4724,8 @@ fn apply_projected_event(
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
             state.exited = true;
+            // No turn is left to take what is queued.
+            state.send_now = None;
             for agent in &mut state.subagents {
                 if agent.status == ToolStatus::Waiting {
                     agent.status = ToolStatus::Stopped;

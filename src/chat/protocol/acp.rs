@@ -1417,7 +1417,7 @@ impl Adapter for Acp {
             Command::StopSubagent { .. } => Err(format!("{label} cannot stop a single subagent.")),
             Command::SetFastMode { .. } => Err(format!("{label} has no fast mode.")),
             Command::SetInterruptMode { .. } => Err(format!("{label} stops a turn only one way.")),
-            Command::RemoveQueued { .. } | Command::StartQueued { .. } => {
+            Command::RemoveQueued { .. } | Command::StartQueued { .. } | Command::SendQueuedNow => {
                 Err(format!("{label} keeps no queue of its own."))
             }
             Command::ListBranches | Command::Branch { .. } => {
