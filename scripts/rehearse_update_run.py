@@ -1213,7 +1213,7 @@ class Rehearsal:
                 return True
         return False
 
-    def watch_shown_update(self, version, *, settle=12, limit=180):
+    def watch_shown_update(self, version, *, settle=12, limit=180, name='update-shown'):
         """Watches every reopened window until the update has settled, and
         fails the rehearsal if any of them shows the update as failed.
 
@@ -1225,7 +1225,7 @@ class Rehearsal:
         the worker's job is terminal and SETTLE seconds have passed.
         """
         self.update_version = version
-        output = self.root/'records/after/update-shown.json'
+        output = self.root/f'records/after/{name}.json'
         output.parent.mkdir(parents=True, exist_ok=True)
         rounds, failed, updated, unobserved, headers = [], {}, set(), set(), {}
         deadline = time.monotonic()+limit
@@ -1285,6 +1285,40 @@ class Rehearsal:
         for slot, phrase in sorted(failed.items()):
             self.errors.append(f'the reopened {slot} window shows "{phrase}"; see {output}')
         return failed, sorted(updated)
+
+    def restart_after_update(self, version, slots):
+        """Closes every window, stops NEW's daemon and reopens the windows,
+        as after a reboot, and requires the update to read the same.
+
+        A window that hid OLD's Failed record only while the daemon it saw
+        finish the update was serving shows the failure again here (#3877).
+        A Complete record must stay Complete.
+        """
+        started = time.monotonic()
+        before, _ = update_status(self.root)
+        windows = self.mapped()
+        for slot in slots:
+            if slot in windows:
+                self.call('wm','action','close-window','--id',windows[slot]['id'])
+        deadline = time.monotonic()+30
+        while set(slots) & self.mapped().keys():
+            if time.monotonic() >= deadline:
+                raise RuntimeError('the windows did not close before the restart after the update')
+            time.sleep(.2)
+        self.call('stop-daemon',timeout=45)
+        self.open_windows(slots)
+        self.wait_windows(slots,timeout=60,version=version)
+        _, serving = self.cli('--no-start','daemon','status',check=False)
+        if serving.get('data',{}).get('daemon_version') != version:
+            self.errors.append(f'NEW {version} is not serving after the restart following the update')
+        failed, updated = self.watch_shown_update(version,name='update-shown-after-restart')
+        after, _ = update_status(self.root)
+        phases = [(row or {}).get('phase') for row in (before, after)]
+        if phases[0] == 'Complete' and phases[1] != 'Complete':
+            self.errors.append(f'the update read Complete before the restart and {phases[1]} after it')
+        self.notes.append(f'update status across the restart after the update: {phases[0]} -> {phases[1]}')
+        self.steps.append({'command':['restart-after-update'],'seconds':round(time.monotonic()-started,3),
+                           'exit':int(bool(failed)),'output':json.dumps({'phases':phases,'failed':failed,'updated':updated})})
 
     def capture_chats(self, side, *, baseline='before'):
         """Exercise the seeded chats themselves, preserving UUID-bound evidence."""
@@ -2238,6 +2272,8 @@ class Rehearsal:
             code, _ = self.call('compare','before','after',timeout=30,check=False)
             if code:
                 self.errors.append('comparison found regressions or missing evidence; see comparison step')
+            if args.restart_after_update:
+                self.restart_after_update(args.new_version,reopened)
             if args.reopen_existing_only and not self.errors:
                 self.reopen_existing_only(args.new_version)
             if args.new_terminal_after_restore and not self.errors:
@@ -2360,6 +2396,7 @@ def main():
     run.add_argument('--ceditor',metavar='BIN_DIR')
     run.add_argument('--feed',metavar='DIR',help="update in the app, as a person does, instead of through NEW's staged CLI: OLD's own `daemon upgrade --version NEW` finds NEW in this file feed (scripts/release feed), and OLD's update worker runs the update. The feed must serve the archive in --new-dir")
     run.add_argument('--empty-window',action='store_true',help="also open a window holding nothing, after seeding: reopened, it reports ready at once, so its first read of the update's status races OLD's worker still verifying NEW")
+    run.add_argument('--restart-after-update',action='store_true',help="with --feed, after the update close every window, stop NEW's daemon and reopen the windows, as after a reboot: they must still show no failure, and a Complete update must stay Complete")
     run.add_argument('--answer',default='yes')
     run.add_argument('--yes',action='store_true')
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
@@ -2416,6 +2453,8 @@ def main():
     if args.command=='run' and args.stall_window_after_flush is None and (
             args.stall_suppress_flush or args.stall_under_lock or args.stall_resume_after is not None):
         parser.error('--stall-suppress-flush, --stall-under-lock and --stall-resume-after require --stall-window-after-flush')
+    if args.command == 'run' and args.restart_after_update and (not args.feed or args.expect_refusal or args.fail_new_daemon):
+        parser.error('--restart-after-update requires a successful in-app update (--feed)')
     if args.command == 'run' and args.plain_restart and (args.expect_refusal or args.fail_new_daemon):
         parser.error('--plain-restart requires a successful recovery scenario')
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):

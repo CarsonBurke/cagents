@@ -1360,6 +1360,40 @@ class ShownUpdateOutcome(unittest.TestCase):
             self.assertEqual([row["worker"] for row in evidence["rounds"]], [True, True, False])
 
 
+    def test_a_restart_after_the_update_must_keep_it_complete_and_unshown(self):
+        import rehearse_update_run as run
+        for after, shown, errors in (
+                ("Complete", "Channels", []),
+                ("Failed", "Channels", ["the update read Complete before the restart and Failed after it"]),
+                ("Complete", "Update failed: protocol 203", ['the reopened main window shows "Update failed"'])):
+            with self.subTest(after=after, shown=shown), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                rehearsal = self.rehearsal(root, {"phase": "Complete", "version": "2.0.0"}, {})
+                rehearsal.notes, rehearsal.steps = [], []
+                status = root / "home/.local/share/cagents-install/.update/status.json"
+                windows = {"main": {"id": 1}}
+                rehearsal.mapped = lambda: dict(windows)
+                watched = rehearsal.call
+                def call(*args, **kwargs):
+                    if args[:3] == ("wm", "action", "close-window"):
+                        windows.clear()
+                    elif args == ("stop-daemon",):
+                        status.write_text(json.dumps({"phase": after, "version": "2.0.0"}))
+                    elif args[:1] == ("launch",):
+                        windows["main"] = {"id": 1}
+                    elif args[:2] == ("drive", "--json"):
+                        return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": shown}]})
+                    return watched(*args, **kwargs)
+                rehearsal.call = call
+                rehearsal.open_windows = lambda slots: [call("launch", slot) for slot in slots]
+                rehearsal.wait_windows = lambda *_, **__: windows
+                rehearsal.cli = lambda *_, **__: (0, {"data": {"daemon_version": "2.0.0"}})
+                with patch.object(run.time, "sleep"):
+                    rehearsal.restart_after_update("2.0.0", ["main"])
+                self.assertEqual([error.split(";")[0] for error in rehearsal.errors], errors)
+                self.assertEqual(rehearsal.notes, [f"update status across the restart after the update: Complete -> {after}"])
+                self.assertTrue((root / "records/after/update-shown-after-restart.json").exists())
+
 class CandidateNamespace(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('candidate_namespace_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')

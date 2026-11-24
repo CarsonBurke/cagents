@@ -2811,7 +2811,10 @@ of NEW becomes a note in the report; any other status that is not `Complete`
 still fails the run. The Notes also say whether a window confirmed "Updated to
 cagents NEW". Add `--empty-window` to open a third window holding nothing:
 reopened, it reports ready at once, so its first read of the status races
-OLD's worker still verifying NEW.
+OLD's worker still verifying NEW. Add `--restart-after-update` to then close
+every window, stop NEW's daemon and reopen the windows, as after a reboot. They
+must still show no failure (`records/after/update-shown-after-restart.json`),
+and an update that read `Complete` must still read `Complete`.
 
 `init` refuses a root with a `.git` in its ancestry, as recovery storage does.
 A sandbox that masks `.git` in its writable roots (Codex's does) leaves an empty
