@@ -328,7 +328,9 @@ use crate::{
 /// request to one is written without it.
 ///
 /// Version 203 appends the provider CLI inventory query and reply.
-pub const PROTOCOL_VERSION: u16 = 203;
+///
+/// Version 204 appends a manual provider CLI update request.
+pub const PROTOCOL_VERSION: u16 = 204;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -864,6 +866,9 @@ pub enum ClientRequest {
         nonce: [u8; crate::device_trust::SECRET_BYTES],
     },
     ProviderStatus,
+    ProviderUpdate {
+        provider: Option<crate::agent::Provider>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

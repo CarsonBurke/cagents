@@ -388,7 +388,9 @@ impl Cache {
         entry: Entry,
         fingerprint: Option<String>,
     ) -> io::Result<()> {
-        self.publish(|document, now| document.record_entry(key, entry, fingerprint, now))
+        self.publish(libc::LOCK_EX, |document, now| {
+            document.record_entry(key, entry, fingerprint, now)
+        })
     }
 
     /// Publishes the figures and models from one probe. On a write failure,
@@ -406,7 +408,7 @@ impl Cache {
             let _ = self.store_observed(key, entry, fingerprint);
             return;
         };
-        let result = self.publish(|document, now| {
+        let result = self.publish(libc::LOCK_EX, |document, now| {
             let entry_changed = document.record_entry(key, entry.clone(), fingerprint.clone(), now);
             let catalog_changed = document.record_catalog(provider, catalog.clone(), now);
             entry_changed || catalog_changed
@@ -457,12 +459,25 @@ impl Cache {
     /// Remembers what `provider` listed, unless another window has written
     /// a newer list meanwhile - the same rule [`Cache::store`] keeps.
     pub fn store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
-        self.publish(|document, now| document.record_catalog(provider, catalog, now))
+        self.publish(libc::LOCK_EX, |document, now| {
+            document.record_catalog(provider, catalog, now)
+        })
     }
 
-    fn publish(&self, record: impl FnOnce(&mut Document, u64) -> bool) -> io::Result<()> {
+    #[cfg(feature = "host")]
+    pub(crate) fn try_store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
+        self.publish(libc::LOCK_EX | libc::LOCK_NB, |document, now| {
+            document.record_catalog(provider, catalog, now)
+        })
+    }
+
+    fn publish(
+        &self,
+        operation: i32,
+        record: impl FnOnce(&mut Document, u64) -> bool,
+    ) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
-        let _lock = self.lock(libc::LOCK_EX)?;
+        let _lock = self.lock(operation)?;
         let mut document = read_document(&self.path()).unwrap_or_default();
         // Read after acquiring the lock: waiting to publish can outlast
         // CLOCK_SLACK without a clock rollback having occurred.
@@ -1148,6 +1163,47 @@ mod tests {
             default_model: None,
             reasoning_defaults: BTreeMap::new(),
         }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_catalog_refresh_yields_to_a_busy_cache_and_preserves_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let provider = Provider::Codex;
+        let key = "codex:/fixture";
+        let usage = entry(10, "usage");
+        cache.store_probe(
+            key,
+            usage.clone(),
+            Some("inputs".into()),
+            provider,
+            Some(catalog(20, "before")),
+        );
+
+        let next = catalog(30, "after");
+        let held = cache.lock(libc::LOCK_EX).unwrap();
+        let (tried, result) = std::sync::mpsc::channel();
+        let attempt = std::thread::scope(|scope| {
+            let cache = &cache;
+            let candidate = next.clone();
+            scope.spawn(move || {
+                tried
+                    .send(cache.try_store_catalog(provider, candidate))
+                    .unwrap()
+            });
+            let attempt = result.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held);
+            attempt
+        });
+        assert_eq!(
+            attempt.unwrap().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(cache.catalogs(100)[&provider].models[0].id, "before");
+        cache.try_store_catalog(provider, next).unwrap();
+        assert_eq!(cache.catalogs(100)[&provider].models[0].id, "after");
+        assert_eq!(cache.unchanged(key, "inputs", 100, 100), Some(usage));
     }
 
     #[test]

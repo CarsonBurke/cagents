@@ -413,7 +413,11 @@ struct Inner {
 }
 
 enum NativeOwnership {
-    New(Box<super::Session>, BTreeMap<String, String>),
+    New(
+        Box<super::Session>,
+        BTreeMap<String, String>,
+        Option<Arc<crate::host::provider_update::Permit>>,
+    ),
     Adopted(
         Box<super::native_holder::Holder>,
         crate::daemon::holder_registry::Process,
@@ -479,6 +483,7 @@ impl LocalHandle {
         store: Store,
         source: super::Session,
         recovery_environment: BTreeMap<String, String>,
+        launch_permit: Option<Arc<crate::host::provider_update::Permit>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
@@ -488,7 +493,11 @@ impl LocalHandle {
             initial,
             store,
             id,
-            Some(NativeOwnership::New(Box::new(source), recovery_environment)),
+            Some(NativeOwnership::New(
+                Box::new(source),
+                recovery_environment,
+                launch_permit,
+            )),
             notify,
         )
     }
@@ -597,7 +606,7 @@ impl LocalHandle {
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
         let recovery_environment = match &ownership {
-            Some(NativeOwnership::New(_, environment)) => environment.clone(),
+            Some(NativeOwnership::New(_, environment, _)) => environment.clone(),
             _ => spec.environment.clone(),
         };
         if !matches!(spec.transport, TransportSpec::History)
@@ -657,14 +666,17 @@ impl LocalHandle {
         let startup_budget = StartupBudget::current();
         #[cfg(test)]
         let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(usize::MAX));
-        let native_holder = match ownership {
-            Some(NativeOwnership::New(source, _))
-                if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
-            {
-                Some(super::native_holder::spawn(spec.clone(), *source)?)
+        let (native_holder, launch_permit) = match ownership {
+            Some(NativeOwnership::New(source, _, launch_permit)) => {
+                let holder = if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) {
+                    Some(super::native_holder::spawn(spec.clone(), *source)?)
+                } else {
+                    None
+                };
+                (holder, launch_permit)
             }
-            Some(NativeOwnership::Adopted(holder, _)) => Some(*holder),
-            _ => None,
+            Some(NativeOwnership::Adopted(holder, _)) => (Some(*holder), None),
+            None => (None, None),
         };
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
@@ -821,6 +833,9 @@ impl LocalHandle {
                             }
                             Ok(child)
                         });
+                        // A caller's startup timeout does not release the
+                        // worker's copy while its subprocess can still start.
+                        drop(launch_permit);
                         let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                         actor.child = child?;
                         match spec.transport {

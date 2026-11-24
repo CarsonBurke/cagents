@@ -838,6 +838,7 @@ pub(super) fn restore_saved_history(
         store,
         session.clone(),
         environment,
+        None,
         move |update| changed(&weak, id, update),
     )
     .map_err(retryable_unavailable)?;

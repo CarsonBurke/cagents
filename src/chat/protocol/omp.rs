@@ -1288,31 +1288,7 @@ impl Adapter for Omp {
                             .as_array()
                             .into_iter()
                             .flatten()
-                            .filter_map(|model| {
-                                Some(Model {
-                                    id: model_id(model)?,
-                                    label: model["name"]
-                                        .as_str()
-                                        .unwrap_or_else(|| text(model, "id"))
-                                        .into(),
-                                    reasoning: if model["reasoning"].as_bool() == Some(true) {
-                                        ["off", "auto"]
-                                            .into_iter()
-                                            .map(str::to_owned)
-                                            .chain(
-                                                model["thinking"]["efforts"]
-                                                    .as_array()
-                                                    .into_iter()
-                                                    .flatten()
-                                                    .filter_map(Value::as_str)
-                                                    .map(str::to_owned),
-                                            )
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    },
-                                })
-                            })
+                            .filter_map(Model::from_omp)
                             .collect();
                         step.events.push(Event::Models {
                             models,

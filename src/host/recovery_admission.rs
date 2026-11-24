@@ -177,6 +177,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::RetryPendingTerminalSave { .. }
         | R::PrepareUpgrade { .. }
         | R::PrepareConfirmedUpgrade { .. }
+        | R::ProviderUpdate { .. }
         | R::ChatCapacitySet { .. }
         | R::Work(crate::work::Request::Remove(_))
         // Recovery may still adopt an original that is not resident yet, and

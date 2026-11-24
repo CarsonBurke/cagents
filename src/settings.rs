@@ -1057,6 +1057,10 @@ const fn default_check_for_updates() -> bool {
     true
 }
 
+const fn default_update_providers_automatically() -> bool {
+    true
+}
+
 const fn default_shortcut_defaults_revision() -> u32 {
     SHORTCUT_DEFAULTS_REVISION
 }
@@ -1397,6 +1401,9 @@ pub struct AppSettings {
     /// every few hours. A check the user asks for runs either way.
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
+    /// Whether the daemon checks installed provider CLIs for updates.
+    #[serde(default = "default_update_providers_automatically")]
+    pub update_providers_automatically: bool,
     /// Days without activity after which a Work board card is stale. The
     /// daemon reads it from this file too; see `crate::work::stale_after_days`.
     #[serde(default = "default_work_stale_after_days")]
@@ -1524,6 +1531,7 @@ impl Default for AppSettings {
             inspector_show_work: default_inspector_show_work(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
+            update_providers_automatically: default_update_providers_automatically(),
             work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             preference_defaults_revision: PREFERENCE_DEFAULTS_REVISION,
@@ -2574,6 +2582,32 @@ pub enum SettingsError {
 
 pub fn default_path() -> Result<PathBuf, SettingsError> {
     instance::settings_path().ok_or(SettingsError::DirectoryUnavailable)
+}
+
+/// Read the daemon's update preference without changing the settings file.
+#[cfg(feature = "host")]
+pub(crate) fn provider_update_preference(path: &Path) -> Result<bool, SettingsError> {
+    #[derive(Deserialize)]
+    struct Preference {
+        #[serde(default = "default_update_providers_automatically")]
+        update_providers_automatically: bool,
+    }
+
+    let file = match crate::secure_file::open_existing_private_file_readonly(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(default_update_providers_automatically());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // Settings are small. Use the same inspection limit as daemon notification settings.
+    const LIMIT: u64 = 1024 * 1024;
+    let mut document = String::new();
+    file.take(LIMIT + 1).read_to_string(&mut document)?;
+    if document.len() as u64 > LIMIT {
+        return Err(SettingsError::Invalid("settings exceed one MiB"));
+    }
+    Ok(toml::from_str::<Preference>(&document)?.update_providers_automatically)
 }
 
 fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsError> {

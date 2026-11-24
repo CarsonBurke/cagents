@@ -6,7 +6,7 @@ use crate::chat::{
     self, Command, Snapshot,
     protocol::{Adapter, ProcessSpec, Step},
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 #[derive(Clone)]
 pub struct Handle(Owner);
 /// Why a read of the conversation or its changed files failed.
@@ -125,6 +125,7 @@ impl Handle {
         store: Store,
         source: chat::Session,
         recovery_environment: BTreeMap<String, String>,
+        launch_permit: Option<Arc<crate::host::provider_update::Permit>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         LocalHandle::start_owned(
@@ -134,6 +135,7 @@ impl Handle {
             store,
             source,
             recovery_environment,
+            launch_permit,
             notify,
         )
         .map(|local| Self(Owner::Local(local)))

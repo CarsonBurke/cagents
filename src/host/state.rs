@@ -427,6 +427,7 @@ pub(crate) struct HostState {
     pub(super) agent_probes: Arc<super::activity::Probes>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<super::control_gate::ControlGate>,
+    pub(super) provider_updates: Arc<super::provider_update::Controller>,
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     pub(super) worktree_removals: super::worktree_removal::Reservations,
     upgrade: Option<PreparedUpgrade>,
@@ -583,6 +584,7 @@ impl HostState {
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
             agent_probes: Arc::default(),
             control_gate: Arc::default(),
+            provider_updates: Arc::default(),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
             chat_resolutions: BTreeMap::new(),
@@ -5053,6 +5055,16 @@ fn start_terminal_view_owned_reserved(
             execution_environment.is_none(),
         )?;
     }
+    // A recovered worker already owns its process. Gate only launches whose
+    // executable cagents selects, off HostState and the workspace writer.
+    let _provider_launch = if adoption.is_none() {
+        let launch = execution_recipe.as_ref().unwrap_or(&session.launch);
+        crate::agent::Provider::launched(launch)
+            .map(|(provider, _)| super::provider_update::Controller::of(shared).launch(provider))
+            .transpose()?
+    } else {
+        None
+    };
     let terminal_id = session.id;
     let retained_environment = execution_environment.clone();
     // Adoption already inspected this holder's issued source. Keep that exact

@@ -151,6 +151,11 @@ impl ControlGate {
         Some(Shared(self))
     }
 
+    /// Coordinated maintenance yields to shutdown and upgrade requests.
+    pub(super) fn exclusive_queued(&self) -> bool {
+        self.counts().queued != 0
+    }
+
     /// Exclusive admission only if the gate is free now.
     pub(super) fn try_exclusive(&self) -> Option<Exclusive<'_>> {
         let mut counts = self.counts();

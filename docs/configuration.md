@@ -164,6 +164,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `editor_font_family` | optional string | absent | Follows the terminal family when absent; otherwise a font family of up to 128 bytes |
 | `editor_font_size` | optional float | absent | Follows the terminal size when absent; otherwise `8.0` through `40.0` logical pixels |
 | `confirm_multiline_paste` | boolean | `true` | Confirm multiline terminal paste when bracketed paste is unavailable |
+| `update_providers_automatically` | boolean | `true` | Check for and install provider CLI updates at daemon startup and every four hours. `cagents provider update` works with either value |
 | `browser_search_url` | string | `"https://duckduckgo.com/?q={query}"` | HTTP(S) search URL containing `{query}` |
 | `sidebar_width` | float | `260.0` | `220.0` through `420.0` |
 | `inspector_width` | float | `380.0` | `320.0` through `480.0` |

@@ -967,8 +967,16 @@ and Stop cancels navigation. Search input uses the configured search URL.
 ## Native agent chat
 
 Run `cagents provider status` to see which provider CLIs the daemon finds,
-their versions, and how they were installed. With `--device NAME`, the
-command reports the provider CLIs on that device.
+their versions, how they were installed, and the last update result.
+The daemon checks on startup and every four hours. In your system terminal, run
+`cagents provider update codex` to check one provider immediately, or omit
+the name to check all providers. With `--device NAME`, these commands operate
+on that device.
+
+The daemon uses each supported installer's official update channel. Use your
+system package manager or version manager for installations they own.
+The daemon defers an update while a launch is starting or while an installer
+needs to replace files a running provider still uses.
 
 ### Resume a saved conversation
 

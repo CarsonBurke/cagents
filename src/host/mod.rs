@@ -26,6 +26,7 @@ mod notifications;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
 mod provider_status;
+pub(crate) mod provider_update;
 mod recovery_admission;
 mod service;
 #[cfg(all(test, target_os = "linux"))]
@@ -730,6 +731,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             .proof()
             .clone(),
     );
+    let _provider_updates = match provider_update::start(Arc::downgrade(&host)) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!(%error, "automatic provider updates are unavailable");
+            None
+        }
+    };
     // After restore, so the first pass covers every conversation it carried.
     if let Err(error) = chat::keep_legacy_codex_listeners_fresh(&host) {
         tracing::warn!(%error, "Codex listeners in the temporary directory will not be kept fresh");

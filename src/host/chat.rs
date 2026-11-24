@@ -448,6 +448,15 @@ fn retryable_unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
 }
 
+/// A retained helper can still be starting after its request times out.
+/// Keep installation changes off that path until startup or cleanup settles.
+pub(super) fn provider_startup_pending(state: &HostState, provider: Provider) -> bool {
+    state
+        .native_actor_startups
+        .values()
+        .any(|startup| startup.source.launch.provider == provider)
+}
+
 fn launch_account_error(failure: crate::account::registry::LaunchAccountError) -> ProtocolError {
     let retryable = matches!(&failure,
         crate::account::registry::LaunchAccountError::Unreadable(error)
@@ -2450,6 +2459,10 @@ fn start_publishing(
     // history. Codex also supports a live socket attachment, whose account is
     // deliberately not reauthorized; its transport is checked below instead.
     let saved_history_only = session.launch.needs_read_only_history();
+    let launch_permit = (!saved_history_only)
+        .then(|| super::provider_update::Controller::of(host).launch(session.launch.provider))
+        .transpose()?
+        .map(Arc::new);
     if session.launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&session.launch)?;
     }
@@ -3000,6 +3013,7 @@ fn start_publishing(
                 store,
                 session.clone(),
                 recovery_environment,
+                launch_permit.clone(),
                 notify,
             )
         }

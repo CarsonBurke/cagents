@@ -894,6 +894,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         202,
         "intermediate #3840 protocol; no release qualified as a live-update source",
     ),
+    (
+        203,
+        "intermediate provider status protocol; no release qualified as a live-update source",
+    ),
 ];
 
 #[cfg(test)]

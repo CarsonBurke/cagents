@@ -3159,6 +3159,37 @@ pub struct Model {
 }
 
 impl Model {
+    #[cfg(feature = "host")]
+    pub(crate) fn from_omp(value: &serde_json::Value) -> Option<Self> {
+        let id = value["id"].as_str()?;
+        let provider = value["provider"].as_str()?;
+        // RPC nests the efforts under thinking. The CLI's JSON listing emits
+        // the effort array directly.
+        let thinking = &value["thinking"];
+        let reasoning = if value["reasoning"].as_bool() == Some(true) {
+            let efforts = thinking
+                .as_array()
+                .or_else(|| thinking["efforts"].as_array());
+            ["off", "auto"]
+                .map(str::to_owned)
+                .into_iter()
+                .chain(
+                    efforts
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|effort| effort.as_str().map(str::to_owned)),
+                )
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(Self {
+            id: format!("{provider}/{id}"),
+            label: value["name"].as_str().unwrap_or(id).to_owned(),
+            reasoning,
+        })
+    }
+
     /// One entry of the `models` Claude Code's `initialize` control response
     /// lists, which both a conversation and an account probe receive.
     pub fn from_claude(value: &serde_json::Value) -> Option<Self> {

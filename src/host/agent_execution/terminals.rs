@@ -102,6 +102,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
         | R::DeviceTrust { .. }
+        | R::ProviderUpdate { .. }
         | R::SignDeviceChallenge { .. }
         | R::Agent { .. }
         | R::Automation { .. }

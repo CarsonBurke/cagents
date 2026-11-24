@@ -529,6 +529,79 @@ async fn probe_cli(
     }
 }
 
+/// Refresh the shared model catalog from the verified installation. Keep an
+/// existing catalog if this provider cannot list models or save the new list.
+#[cfg(feature = "host")]
+pub(crate) async fn refresh_catalog(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+    cache: &Cache,
+) -> Result<(), String> {
+    let catalog = tokio::time::timeout(TIMEOUT, async {
+        let lock = loop {
+            if let Some(lock) = cache
+                .try_probe_lock(&account.lock_name())
+                .map_err(|error| error.to_string())?
+            {
+                break lock;
+            }
+            // A pre-update probe may still own the account. Let it finish
+            // publishing before the new version replaces its model list.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let catalog = match account.provider {
+            Provider::Omp => omp_catalog(account, program, search_path).await?,
+            _ => {
+                probe_cli(account, program, search_path, Some(cache))
+                    .await?
+                    .catalog
+            }
+        };
+        Ok::<_, String>((catalog, lock))
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "{} did not list models within {} seconds",
+            account.provider.label(),
+            TIMEOUT.as_secs()
+        )
+    })??;
+    let (catalog, _lock) = catalog;
+    let catalog = catalog
+        .ok_or_else(|| format!("{} did not list available models", account.provider.label()))?;
+    cache
+        .try_store_catalog(account.provider, catalog)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "host")]
+async fn omp_catalog(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Option<Catalog>, String> {
+    let mut command = command_with_path(account, program, search_path);
+    command.args(["models", "--json", "--no-extensions"]);
+    let (status, json) = run_provider_command_with(
+        command,
+        TIMEOUT,
+        OUTPUT_LIMIT as usize,
+        None::<fn() -> bool>,
+    )
+    .await?;
+    if !status.success() {
+        return Err(format!("Listing Omp's models exited with {status}"));
+    }
+    let answer: Value = serde_json::from_slice(&json)
+        .map_err(|_| "Omp did not return a usable model catalog".to_owned())?;
+    Ok(observed_catalog(
+        models(answer["models"].as_array(), Model::from_omp),
+        now_ms(),
+    ))
+}
+
 /// The `PATH` the reader's shell sets up, once asked: `Some(None)` when it
 /// could not say.
 static SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCell::const_new();
@@ -842,10 +915,30 @@ fn version_number(word: &str) -> Option<&str> {
 /// Its process group is killed and reaped before an updater can roll back.
 #[cfg(feature = "host")]
 pub async fn run_provider_command(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
-    const CAPTURE_LIMIT: usize = 32 * 1024;
+    run_provider_command_with(command, timeout, 32 * 1024, None::<fn() -> bool>).await
+}
+
+/// An installer may be cancelled while the daemon is stopping. Wait for the
+/// child to be reaped before returning so its caller can safely roll back.
+#[cfg(feature = "host")]
+pub(crate) async fn run_provider_command_cancellable(
+    command: Command,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    run_provider_command_with(command, timeout, 32 * 1024, Some(cancelled)).await
+}
+
+#[cfg(feature = "host")]
+async fn run_provider_command_with(
+    mut command: Command,
+    timeout: Duration,
+    capture_limit: usize,
+    cancelled: Option<impl Fn() -> bool>,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     scrub(&mut command, SHELL_SCRUBBED_ENVIRONMENT);
     command
         .stdin(Stdio::null())
@@ -864,7 +957,7 @@ pub async fn run_provider_command(
     }
 
     let mut group = Group::spawn(command).await?;
-    let read = tokio::time::timeout(timeout, async {
+    let read = async {
         let mut stdout = group
             .child
             .stdout
@@ -880,28 +973,31 @@ pub async fn run_provider_command(
             if count == 0 {
                 break;
             }
-            let capture = count.min(CAPTURE_LIMIT - captured.len());
+            let capture = count.min(capture_limit - captured.len());
             captured.extend_from_slice(&buffer[..capture]);
         }
         while !group.leader_exited() {
             tokio::time::sleep(EXIT_POLL).await;
         }
         Ok::<_, String>(captured)
-    })
-    .await;
+    };
+    let captured = tokio::select! {
+        result = tokio::time::timeout(timeout, read) => result.map_err(|_| {
+            format!("The CLI did not finish within {} seconds", timeout.as_secs())
+        }).and_then(|result| result),
+        () = async {
+            while !cancelled.as_ref().is_some_and(|cancelled| cancelled()) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }, if cancelled.is_some() => Err("The daemon interrupted the provider update".into()),
+    };
     group.kill();
     let status = group
         .child
         .wait()
         .await
         .map_err(|error| error.to_string())?;
-    let captured = read.map_err(|_| {
-        format!(
-            "The CLI did not finish within {} seconds",
-            timeout.as_secs()
-        )
-    })??;
-    Ok((status, captured))
+    Ok((status, captured?))
 }
 
 /// A spawned CLI and the process group it leads, which goes with it: when

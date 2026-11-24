@@ -321,7 +321,7 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// Inspect the provider CLIs this daemon uses.
+    /// Inspect and update the provider CLIs this daemon uses.
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
@@ -2431,6 +2431,20 @@ impl ControlClient {
         }
     }
 
+    /// Run an immediate check on the selected daemon and wait for its result.
+    pub fn update_providers(
+        &mut self,
+        provider: Option<crate::agent::Provider>,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ProviderUpdate { provider },
+            Instant::now() + Duration::from_secs(45 * 60),
+        )? {
+            ServerResponse::ProviderStatus(providers) => Ok(providers),
+            response => Err(unexpected_response("provider update", &response)),
+        }
+    }
+
     /// Answered during startup recovery, when other requests are refused.
     pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
         self.startup_state_with_deadline(Instant::now() + io_timeout())
@@ -3832,6 +3846,9 @@ where
                 | AccountCommand::Remove { .. }
                 | AccountCommand::Reset { .. },
         } => Some("Account changes require your own terminal".into()),
+        TopCommand::Provider {
+            command: ProviderCommand::Update { .. },
+        } => Some("Provider updates require your own terminal".into()),
         // An agent must never link a device or grant itself access to one.
         TopCommand::Device { command } if command.changes_access() => {
             Some("Device links and grants require your own terminal".into())

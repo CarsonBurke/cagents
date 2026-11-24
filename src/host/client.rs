@@ -1228,6 +1228,20 @@ fn process_wire_request(
         ensure_startup_recovery_request(host, &request)
     })?;
     let gate = control_gate(host);
+    if let ClientRequest::ProviderUpdate { provider } = request {
+        {
+            let _shared = gate.shared();
+            ensure_control_open(host)?;
+            ensure_startup_recovery_request(host, &request)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        let providers = super::provider_update::update(host, provider)?;
+        return Ok((
+            ServerResponse::ProviderStatus(providers).into(),
+            Vec::new(),
+            false,
+        ));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -1591,8 +1605,11 @@ fn process_admitted_request(
         )),
         ClientRequest::ProviderStatus => {
             drop(_shared);
-            let providers = super::provider_status::snapshot()?;
+            let providers = super::provider_update::status(host)?;
             Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
+        }
+        ClientRequest::ProviderUpdate { .. } => {
+            unreachable!("provider updates run outside general request admission")
         }
         ClientRequest::Work(request) => {
             // Admission was checked above. A board may wait on scans and

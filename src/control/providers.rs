@@ -5,6 +5,12 @@ use crate::account::provider_install::{ProviderStatus, ProviderUpdateResult};
 pub enum ProviderCommand {
     /// Show installed versions, install methods and the last update result.
     Status,
+    /// Check official channels and update eligible CLI installs now.
+    Update {
+        /// Update only claude, codex, agy, muse, or omp. Omit to check all.
+        #[arg(value_parser = agents::parse_provider, value_name = "NAME")]
+        provider: Option<crate::agent::Provider>,
+    },
 }
 
 pub(super) fn execute(command: ProviderCommand) -> Result<CommandOutput, AppError> {
@@ -16,6 +22,25 @@ pub(super) fn execute(command: ProviderCommand) -> Result<CommandOutput, AppErro
         ProviderCommand::Status => {
             let providers = client.provider_status().map_err(protocol_error)?;
             output("provider.status", &providers)
+        }
+        ProviderCommand::Update { provider } => {
+            let providers = client.update_providers(provider).map_err(protocol_error)?;
+            let outcome = if providers
+                .iter()
+                .any(|status| status.last_result == Some(ProviderUpdateResult::Failed))
+            {
+                "failed"
+            } else if providers
+                .iter()
+                .any(|status| status.last_result == Some(ProviderUpdateResult::Deferred))
+            {
+                "pending"
+            } else {
+                "succeeded"
+            };
+            let mut report = output("provider.update", &providers)?;
+            report.data["outcome"] = json!(outcome);
+            Ok(report)
         }
     }
 }
@@ -54,7 +79,7 @@ fn output(command: &'static str, providers: &[ProviderStatus]) -> Result<Command
             "Install method",
             "Last check",
             "Result",
-            "Error",
+            "Details",
         ],
         rows,
         "No providers found.",
