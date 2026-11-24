@@ -326,6 +326,29 @@ remove_owned_link() {
     fi
 }
 
+is_managed_editor_launcher() {
+    [ -f "$1" ] && [ ! -L "$1" ] \
+        && [ "$(sed -n '2{p;q;}' "$1")" = '# cagents managed ceditor launcher v1' ]
+}
+
+remove_editor_launchers() {
+    editor_link=$HOME/.local/bin/ceditor
+    editor_launcher=$PREFIX/.ceditor-launcher
+    if is_managed_editor_launcher "$editor_launcher" && [ -L "$editor_link" ] \
+        && [ "$(readlink "$editor_link")" = "$editor_launcher" ]; then
+        legacy_bin=$HOME/.local/lib/ceditor/current/bin
+        if [ -x "$legacy_bin/ceditor" ] \
+            && [ "$(cat "$legacy_bin/.ceditor-companions" 2>/dev/null)" = 'ceditor companions v1' ]; then
+            ln -sTf ../lib/ceditor/current/bin/ceditor "$editor_link"
+        else
+            rm -f "$editor_link"
+        fi
+    fi
+    if is_managed_editor_launcher "$editor_launcher"; then rm -f "$editor_launcher"; fi
+    remove_owned_link "$DATA_HOME/applications/io.github.cagents.ceditor.desktop"
+    remove_owned_link "$DATA_HOME/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg"
+}
+
 # Interpret one `cagents --json daemon status` reply. A daemon process that is
 # present but not serving is starting or draining and can still own terminals,
 # so it is neither running nor stopped.
@@ -435,6 +458,7 @@ uninstall_installation() {
     remove_owned_link "$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png"
     remove_owned_link "$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml"
     remove_owned_link "$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop"
+    remove_editor_launchers
 
     rm -f "$PREFIX/current"
     rm -rf "$PREFIX/versions"
@@ -702,6 +726,20 @@ ICON_TARGET=$PREFIX/current/$ICON_MEMBER
 RASTER_ICON_TARGET=$PREFIX/current/$RASTER_ICON_MEMBER
 METAINFO_TARGET=$PREFIX/current/$METAINFO_MEMBER
 AUTOSTART_TARGET=$PREFIX/current/$AUTOSTART_MEMBER
+EDITOR_BIN_LINK=$HOME/.local/bin/ceditor
+EDITOR_LAUNCHER=$PREFIX/.ceditor-launcher
+EDITOR_DESKTOP_MEMBER=share/applications/io.github.cagents.ceditor.desktop
+EDITOR_ICON_MEMBER=share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg
+EDITOR_DESKTOP_LINK=$DATA_HOME/${EDITOR_DESKTOP_MEMBER#share/}
+EDITOR_ICON_LINK=$DATA_HOME/${EDITOR_ICON_MEMBER#share/}
+LEGACY_EDITOR_LINK=../lib/ceditor/current/bin/ceditor
+EDITOR_LAUNCHER_TEMP=
+EDITOR_BIN_LINK_TEMP=
+EDITOR_LAUNCHER_CREATED=0
+EDITOR_BIN_LINK_CREATED=0
+EDITOR_BIN_LINK_MIGRATED=0
+EDITOR_DESKTOP_LINK_CREATED=0
+EDITOR_ICON_LINK_CREATED=0
 BIN_LINK_CREATED=0
 DESKTOP_LINK_CREATED=0
 ICON_LINK_CREATED=0
@@ -748,6 +786,50 @@ settle_adopted_link() {
             "$PROGRAM" "$settle_link" "$settle_backup" >&2
     fi
 }
+remove_created_link() {
+    if [ "$1" -eq 1 ] && [ -L "$2" ] \
+        && [ "$(readlink "$2" 2>/dev/null || :)" = "$3" ]; then
+        rm -f "$2" || :
+    fi
+}
+
+replace_editor_bin_link() {
+    editor_link_temp=$(link_backup_path "$EDITOR_BIN_LINK")
+    [ ! -e "$editor_link_temp" ] && [ ! -L "$editor_link_temp" ] || return 1
+    EDITOR_BIN_LINK_TEMP=$editor_link_temp
+    ln -sT "$2" "$EDITOR_BIN_LINK_TEMP" \
+        && [ -L "$EDITOR_BIN_LINK" ] && [ "$(readlink "$EDITOR_BIN_LINK")" = "$1" ] \
+        && mv -Tf "$EDITOR_BIN_LINK_TEMP" "$EDITOR_BIN_LINK"
+}
+
+remove_editor_link_temp() {
+    if [ -n "$EDITOR_BIN_LINK_TEMP" ]; then
+        rm -f "$EDITOR_BIN_LINK_TEMP" || :
+        EDITOR_BIN_LINK_TEMP=
+    fi
+}
+
+settle_editor_launchers() {
+    if [ -n "$EDITOR_LAUNCHER_TEMP" ]; then rm -f "$EDITOR_LAUNCHER_TEMP" || :; fi
+    remove_editor_link_temp
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$ROLLBACK_OK" -eq 1 ]; then
+        remove_created_link "$EDITOR_BIN_LINK_CREATED" "$EDITOR_BIN_LINK" "$EDITOR_LAUNCHER"
+        remove_created_link "$EDITOR_DESKTOP_LINK_CREATED" "$EDITOR_DESKTOP_LINK" "$PREFIX/current/$EDITOR_DESKTOP_MEMBER"
+        remove_created_link "$EDITOR_ICON_LINK_CREATED" "$EDITOR_ICON_LINK" "$PREFIX/current/$EDITOR_ICON_MEMBER"
+        if [ "$EDITOR_BIN_LINK_MIGRATED" -eq 1 ] && [ -L "$EDITOR_BIN_LINK" ] \
+            && [ "$(readlink "$EDITOR_BIN_LINK" 2>/dev/null || :)" = "$EDITOR_LAUNCHER" ]; then
+            replace_editor_bin_link "$EDITOR_LAUNCHER" "$LEGACY_EDITOR_LINK" \
+                || printf '%s: could not restore the source editor link at %s\n' "$PROGRAM" "$EDITOR_BIN_LINK" >&2
+            remove_editor_link_temp
+        fi
+        if [ "$EDITOR_LAUNCHER_CREATED" -eq 1 ] \
+            && { [ ! -L "$EDITOR_BIN_LINK" ] || [ "$(readlink "$EDITOR_BIN_LINK" 2>/dev/null || :)" != "$EDITOR_LAUNCHER" ]; } \
+            && is_managed_editor_launcher "$EDITOR_LAUNCHER"; then
+            rm -f "$EDITOR_LAUNCHER" || :
+        fi
+    fi
+}
+
 # These commands belong to the verified candidate, including after current
 # rolls back to a release that cannot report recovery inventory itself.
 verify_update_census() {
@@ -1015,6 +1097,7 @@ cleanup() {
     settle_adopted_link "$RASTER_ICON_LINK_ADOPTED" "$RASTER_ICON_LINK" "$RASTER_ICON_TARGET"
     settle_adopted_link "$METAINFO_LINK_ADOPTED" "$METAINFO_LINK" "$METAINFO_TARGET"
     settle_adopted_link "$AUTOSTART_LINK_ADOPTED" "$AUTOSTART_LINK" "$AUTOSTART_TARGET"
+    settle_editor_launchers
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
         && [ -n "$NEW_VERSION_DIR" ] && [ "$ROLLBACK_OK" -eq 1 ] \
@@ -1114,11 +1197,13 @@ validate_version_members() {
             path == top "/bin/cagents-ui" ||
             path == top "/bin/cagentsd" ||
             path == top "/bin/cagents-dictate" ||
+            path == top "/bin/ceditor" ||
             path == top "/bin/.cagents-ui-lease-v1" ||
             path == top "/bin/cagents-uninstall" ||
             path == top "/share/" ||
             path == top "/share/applications/" ||
             path == top "/share/applications/dev.cagents.Cagents.desktop" ||
+            path == top "/share/applications/io.github.cagents.ceditor.desktop" ||
             path == top "/share/autostart/" ||
             path == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" ||
             path == top "/share/icons/" ||
@@ -1126,6 +1211,7 @@ validate_version_members() {
             path == top "/share/icons/hicolor/scalable/" ||
             path == top "/share/icons/hicolor/scalable/apps/" ||
             path == top "/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg" ||
+            path == top "/share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg" ||
             path == top "/share/icons/hicolor/128x128/" ||
             path == top "/share/icons/hicolor/128x128/apps/" ||
             path == top "/share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png" ||
@@ -1154,9 +1240,14 @@ validate_version_members() {
     # carry both together.
     $0 == top "/bin/cagents-dictate" { dictate = 1 }
     $0 == top "/share/doc/cagents/THIRD-PARTY-NOTICES" { notices = 1 }
+    # Older releases and the browserless archive omit the editor altogether.
+    $0 == top "/bin/ceditor" { editor = 1 }
+    $0 == top "/share/applications/io.github.cagents.ceditor.desktop" { editor_desktop = 1 }
+    $0 == top "/share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg" { editor_icon = 1 }
     END {
         for (i = 1; i <= 11; i++) if (!required[i]) exit 1
         if (dictate != notices) exit 1
+        if (editor != editor_desktop || editor != editor_icon) exit 1
     }
     '
 }
@@ -1310,6 +1401,13 @@ refresh_launcher_caches() {
     fi
 }
 
+refresh_desktop_link() {
+    if [ -L "$1" ] && [ "$(readlink "$1" 2>/dev/null || :)" = "$2" ]; then
+        # Refresh directory watchers after switching the version target.
+        ln -snf "$2" "$1"
+    fi
+}
+
 # Run only after a verified publication, while still holding the launch fence.
 # `current` also serves a staged release. Keep the actual replaced tree and
 # the owner's matched set even if its daemon exited during this installation.
@@ -1353,7 +1451,7 @@ prune_installed_versions() (
             if awk -v uid="$owner_uid" '
                 $1 == "Uid:" { owned = ($3 == uid) }
                 $1 == "State:" { live = ($2 !~ /^[ZXx]$/) }
-                $1 == "Name:" { candidate = ($2 ~ /^cagents(d|-ui|-dictate|-uninsta)?$/) }
+                $1 == "Name:" { candidate = ($2 == "ceditor" || $2 ~ /^cagents(d|-ui|-dictate|-uninsta)?$/) }
                 END { exit !(owned && live && candidate) }
             ' "${process_exe%/exe}/status" 2>/dev/null; then
                 exit 0
@@ -1414,10 +1512,8 @@ if [ -n "$SELECT_VERSION" ]; then
         --version-root "$PREFIX/versions/$SELECT_VERSION" \
         --expect-current "$SELECTED_FROM" >/dev/null \
         || fail "version $SELECT_VERSION was not selected"
-    if [ -L "$DESKTOP_LINK" ] && [ "$(readlink "$DESKTOP_LINK" 2>/dev/null || :)" = "$DESKTOP_TARGET" ]; then
-        # Refresh directory watchers after switching the version target.
-        ln -snf "$DESKTOP_TARGET" "$DESKTOP_LINK" || :
-    fi
+    refresh_desktop_link "$DESKTOP_LINK" "$DESKTOP_TARGET" || :
+    refresh_desktop_link "$EDITOR_DESKTOP_LINK" "$PREFIX/current/$EDITOR_DESKTOP_MEMBER" || :
     refresh_launcher_caches
     printf 'Serving installed cagents %s; running windows and daemon were preserved. Windows offer an update only while it differs from the version they run.\n' "$SELECT_VERSION"
     exit 0
@@ -1585,25 +1681,45 @@ desktop_string_escape() {
         -e 's/\n/\\n/g'
 }
 
+desktop_exec_command() {
+    # GLib checks the executable before expanding %% in Exec. Keep paths
+    # containing percent signs out of that lookup and only in arguments.
+    case $1 in
+        *%*) printf '%s' '/bin/sh -c "exec \\"\\$@\\"" cagents-desktop ' ;;
+    esac
+    printf '"%s"\n' "$(desktop_exec_escape "$1")"
+}
+
+rewrite_editor_desktop() {
+    editor_desktop_file=$1
+    editor_exec=$(desktop_exec_command "$EDITOR_LAUNCHER")
+    editor_try_exec=$(desktop_string_escape "$EDITOR_LAUNCHER")
+    {
+        while IFS= read -r line || [ -n "$line" ]; do
+            case $line in
+                Exec=*) printf 'Exec=%s %%F\nTryExec=%s\n' "$editor_exec" "$editor_try_exec" ;;
+                TryExec=*) ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done
+    } < "$editor_desktop_file" > "$editor_desktop_file.rewritten" \
+        || fail 'could not prepare the ceditor desktop entry'
+    mv "$editor_desktop_file.rewritten" "$editor_desktop_file" \
+        || fail 'could not replace the ceditor desktop entry'
+}
+
 INSTALL_STAGE=$PREFIX/.staging.$$
 (umask 077 && mkdir "$INSTALL_STAGE") || fail 'could not create installation staging directory'
 tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" -C "$INSTALL_STAGE" \
     || fail 'archive extraction failed'
-AUTOSTART_EXEC=$(desktop_exec_escape "$BIN_TARGET")
-DESKTOP_EXEC=$(desktop_exec_escape "$BIN_TARGET")
-# GLib checks the executable exists before expanding %% in Exec. Keep paths
-# containing percent signs out of that lookup and only in positional arguments.
-DESKTOP_EXEC_PREFIX=
-case $BIN_TARGET in
-    *%*) DESKTOP_EXEC_PREFIX='/bin/sh -c "exec \\"\\$@\\"" cagents-desktop ' ;;
-esac
+DESKTOP_EXEC=$(desktop_exec_command "$BIN_TARGET")
 DESKTOP_TRY_EXEC=$(desktop_string_escape "$BIN_TARGET")
 DESKTOP_ICON=$(desktop_string_escape "$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg")
 DESKTOP_FILE=$INSTALL_STAGE/$TOP_LEVEL/share/applications/dev.cagents.Cagents.desktop
 {
     while IFS= read -r line || [ -n "$line" ]; do
         case $line in
-            Exec=*) printf 'Exec=%s"%s" ui\n' "$DESKTOP_EXEC_PREFIX" "$DESKTOP_EXEC" ;;
+            Exec=*) printf 'Exec=%s ui\n' "$DESKTOP_EXEC" ;;
             TryExec=*) printf 'TryExec=%s\n' "$DESKTOP_TRY_EXEC" ;;
             Icon=*) printf 'Icon=%s\n' "$DESKTOP_ICON" ;;
             *) printf '%s\n' "$line" ;;
@@ -1619,13 +1735,16 @@ mv "$DESKTOP_FILE.rewritten" "$DESKTOP_FILE" \
         'Type=Application' \
         'Name=cagents daemon' \
         'Comment=Keep cagents sessions available in the system tray'
-    printf 'Exec=%s"%s" daemon start\n' "$DESKTOP_EXEC_PREFIX" "$AUTOSTART_EXEC"
+    printf 'Exec=%s daemon start\n' "$DESKTOP_EXEC"
     printf '%s\n' \
         'Terminal=false' \
         'NoDisplay=true' \
         'X-GNOME-Autostart-enabled=true'
 } > "$INSTALL_STAGE/$TOP_LEVEL/share/autostart/dev.cagents.Cagents.Daemon.desktop" \
     || fail 'could not prepare the daemon autostart entry'
+if [ -f "$INSTALL_STAGE/$TOP_LEVEL/$EDITOR_DESKTOP_MEMBER" ]; then
+    rewrite_editor_desktop "$INSTALL_STAGE/$TOP_LEVEL/$EDITOR_DESKTOP_MEMBER"
+fi
 chmod 0755 "$INSTALL_STAGE/$TOP_LEVEL" "$INSTALL_STAGE/$TOP_LEVEL/bin"
 chmod 0755 \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents" \
@@ -1634,6 +1753,9 @@ chmod 0755 \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-uninstall"
 if [ -e "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-dictate" ]; then
     chmod 0755 "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-dictate"
+fi
+if [ -e "$INSTALL_STAGE/$TOP_LEVEL/bin/ceditor" ]; then
+    chmod 0755 "$INSTALL_STAGE/$TOP_LEVEL/bin/ceditor"
 fi
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type d -exec chmod 0755 {} +
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type f -exec chmod 0644 {} +
@@ -1791,6 +1913,68 @@ ensure_link() {
     ln -sT "$link_target" "$link_path" || fail "cannot create link $link_path"
 }
 
+prepare_editor_launchers() {
+    if [ -e "$EDITOR_LAUNCHER" ] || [ -L "$EDITOR_LAUNCHER" ]; then
+        is_managed_editor_launcher "$EDITOR_LAUNCHER" && [ -x "$EDITOR_LAUNCHER" ] \
+            || fail "refusing to replace existing file $EDITOR_LAUNCHER"
+    fi
+    prepare_link_parent "$EDITOR_BIN_LINK"
+    prepare_link_parent "$EDITOR_DESKTOP_LINK"
+    prepare_link_parent "$EDITOR_ICON_LINK"
+}
+
+publish_editor_launchers() {
+    if ! is_managed_editor_launcher "$EDITOR_LAUNCHER"; then
+        EDITOR_LAUNCHER_TEMP=$(mktemp "$PREFIX/.ceditor-launcher.XXXXXX")
+        # Keep this indirection across current switches, including a rollback
+        # to a release from before the editor was bundled.
+        cat > "$EDITOR_LAUNCHER_TEMP" <<'EOF'
+#!/bin/sh
+# cagents managed ceditor launcher v1
+launcher=$(readlink -f -- "$0") || exit 1
+editor=${launcher%/*}/current/bin/ceditor
+if [ -x "$editor" ]; then exec "$editor" "$@"; fi
+legacy_bin=$HOME/.local/lib/ceditor/current/bin
+if [ -x "$legacy_bin/ceditor" ] \
+    && [ "$(cat "$legacy_bin/.ceditor-companions" 2>/dev/null)" = 'ceditor companions v1' ]; then
+    exec "$legacy_bin/ceditor" "$@"
+fi
+printf '%s\n' 'ceditor is unavailable in the selected cagents release' >&2
+exit 1
+EOF
+        chmod 0755 "$EDITOR_LAUNCHER_TEMP"
+        ln -T "$EDITOR_LAUNCHER_TEMP" "$EDITOR_LAUNCHER" \
+            || fail "cannot publish $EDITOR_LAUNCHER"
+        EDITOR_LAUNCHER_CREATED=1
+    fi
+
+    if [ -L "$EDITOR_BIN_LINK" ] && [ "$(readlink "$EDITOR_BIN_LINK")" = "$LEGACY_EDITOR_LINK" ]; then
+        EDITOR_BIN_LINK_MIGRATED=1
+        replace_editor_bin_link "$LEGACY_EDITOR_LINK" "$EDITOR_LAUNCHER" \
+            || fail "cannot migrate $EDITOR_BIN_LINK"
+        remove_editor_link_temp
+    elif [ ! -e "$EDITOR_BIN_LINK" ] && [ ! -L "$EDITOR_BIN_LINK" ]; then
+        EDITOR_BIN_LINK_CREATED=1
+        ln -sT "$EDITOR_LAUNCHER" "$EDITOR_BIN_LINK" || fail "cannot create $EDITOR_BIN_LINK"
+    fi
+
+    # Existing source installs own copies of these files. Keep them so their
+    # menu entry and icon still work if the selected bundle has no editor.
+    editor_desktop_target=$PREFIX/current/$EDITOR_DESKTOP_MEMBER
+    if [ ! -e "$EDITOR_DESKTOP_LINK" ] && [ ! -L "$EDITOR_DESKTOP_LINK" ]; then
+        EDITOR_DESKTOP_LINK_CREATED=1
+        ln -sT "$editor_desktop_target" "$EDITOR_DESKTOP_LINK" || fail "cannot create $EDITOR_DESKTOP_LINK"
+    else
+        refresh_desktop_link "$EDITOR_DESKTOP_LINK" "$editor_desktop_target" \
+            || fail "cannot refresh $EDITOR_DESKTOP_LINK"
+    fi
+    if [ ! -e "$EDITOR_ICON_LINK" ] && [ ! -L "$EDITOR_ICON_LINK" ]; then
+        EDITOR_ICON_LINK_CREATED=1
+        ln -sT "$PREFIX/current/$EDITOR_ICON_MEMBER" "$EDITOR_ICON_LINK" || fail "cannot create $EDITOR_ICON_LINK"
+    fi
+}
+
+[ ! -x "$NEW_VERSION_DIR/bin/ceditor" ] || prepare_editor_launchers
 
 # A reviewed worker supplies its pre-shutdown census. A standalone installer
 # captures the authenticated source before it can prepare or stop that source.
@@ -1930,6 +2114,7 @@ ensure_link "$ICON_MEMBER" "$ICON_LINK" icon
 ensure_link "$RASTER_ICON_MEMBER" "$RASTER_ICON_LINK" raster_icon
 ensure_link "$METAINFO_MEMBER" "$METAINFO_LINK" metainfo
 ensure_link "$AUTOSTART_MEMBER" "$AUTOSTART_LINK" autostart
+[ ! -x "$NEW_VERSION_DIR/bin/ceditor" ] || publish_editor_launchers
 # Startup exit status alone says nothing about retained terminals. Commit only
 # after the candidate proves serving readiness and the captured census matches.
 # The sole file-only exception is a proven absent source on an ordinary install.

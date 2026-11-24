@@ -27,6 +27,11 @@ VERSION = "9.9.9"
 JOB = "00000000-0000-4000-8000-000000000001"
 TOP = f"cagents-{VERSION}"
 ARCHIVE_NAME = f"{TOP}-x86_64-unknown-linux-gnu.tar.gz"
+EDITOR_MEMBERS = (
+    "bin/ceditor",
+    "share/applications/io.github.cagents.ceditor.desktop",
+    "share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg",
+)
 # Preparation deliberately runs syncfs. Parallel gate compilation can leave
 # substantial shared-filesystem writeback ahead of this private fixture tree.
 INSTALL_TIMEOUT_SECONDS = 60
@@ -46,7 +51,7 @@ if forbidden and pathlib.Path(sys.argv[0]).resolve() == pathlib.Path(forbidden):
 # serving socket. Census/receipt envelopes still use the production schema.
 fixture_proof = {'host_session_id': 'fixture-daemon', 'boot_id': 'fixture-boot',
                  'host_incarnation': 'fixture-incarnation'}
-commands = ('coordinate-install', 'verify-install-guard', 'record-deferred-install')
+commands = ('coordinate-install', 'verify-install-guard', 'record-deferred-install', 'select-install')
 if len(args) == 2 and args[0] in commands and args[1] == '--help':
     print('Options:\n  --stage-only  Preserve the running application')
 elif args[0] == 'coordinate-install':
@@ -76,6 +81,15 @@ elif args[:2] == ['record-deferred-install', '--stage-only']:
     assert version_root.parent == pathlib.Path(args[3]) / 'versions'
     assert (version_root / 'bin/cagents').is_file()
     (version_root / '.deferred-owner.json').write_text('{"version":1,"owner_version":null}\n')
+elif args[0] == 'select-install':
+    assert args[1::2] == ['--prefix', '--version-root', '--expect-current']
+    assert os.environ['CAGENTS_UI_UPDATE_GUARD_FD'] == 'fixture-only'
+    prefix, selected = pathlib.Path(args[2]), pathlib.Path(args[4])
+    assert (prefix / 'current').readlink() == pathlib.Path(args[6])
+    assert (selected / 'bin/cagents').is_file()
+    switch = prefix / '.select-fixture'
+    switch.symlink_to(selected.relative_to(prefix))
+    switch.replace(prefix / 'current')
 elif args[:2] == ['daemon', 'capture-update-census']:
     assert args[2] == '--output' and args[4] == '--candidate-cli' and len(args) == 6
     assert pathlib.Path(args[5]).is_file()
@@ -323,11 +337,11 @@ class InstallerCoordinator(unittest.TestCase):
     def events(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
 
-    def installed_cli(self, *, guarded):
-        previous = self.prefix / "versions/old/bin"
+    def installed_cli(self, *, guarded, version="old"):
+        previous = self.prefix / "versions" / version / "bin"
         previous.mkdir(parents=True)
         self.write(self.prefix / ".cagents-install-root", "cagents install root\n")
-        (self.prefix / "current").symlink_to("versions/old")
+        (self.prefix / "current").symlink_to(f"versions/{version}")
         if guarded:
             self.python(previous / "cagents", COORDINATOR)
             self.python(previous / "cagentsd", "SOURCE = 'installed'\n" + INSPECTOR)
@@ -402,9 +416,10 @@ class InstallerCoordinator(unittest.TestCase):
 
     def test_install_defers_pruning_when_a_live_cagents_executable_cannot_be_read(self):
         self.installed_cli(guarded=True)
+        self.add_editor_to_archive()
         obsolete = self.prefix / 'versions/9.9.0'
         shutil.copytree(self.payload, obsolete)
-        hidden = obsolete / 'bin/cagentsd'
+        hidden = obsolete / 'bin/ceditor'
         shutil.copy2(sys.executable, hidden)
         program = '''
 import ctypes, time
@@ -529,12 +544,130 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
             with self.subTest(missing=member):
                 self.assert_missing_member_rejected(member)
 
+    def add_editor_to_archive(self):
+        editor, *assets = EDITOR_MEMBERS
+        self.executable(self.payload / editor, '#!/bin/sh\nprintf "%s\\n" bundled "$@"\n')
+        for asset in assets:
+            target = self.payload / asset
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / "packaging" / target.name, target)
+        self.package()
+
+    def install_source_editor(self):
+        private = self.home / ".local/lib/ceditor"
+        product = private / "releases/build.fixture/bin/ceditor"
+        self.executable(product, '#!/bin/sh\nprintf "%s\\n" source "$@"\n')
+        self.write(product.with_name(".ceditor-companions"), "ceditor companions v1\n")
+        (private / "current").symlink_to("releases/build.fixture")
+        launcher = self.managed_link("bin/ceditor")
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.symlink_to("../lib/ceditor/current/bin/ceditor")
+        return product
+
+    def assert_editor_launches(self, edition, launcher=None):
+        launcher = launcher or self.managed_link("bin/ceditor")
+        result = subprocess.run([str(launcher), "file with spaces.rs"],
+                                env=self.environment, capture_output=True, text=True,
+                                timeout=INSTALL_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [edition, "file with spaces.rs"])
+
+    def test_archive_ships_the_editor_only_with_its_desktop_entry_and_icon(self):
+        self.add_editor_to_archive()
+        for member in EDITOR_MEMBERS:
+            with self.subTest(missing=member):
+                self.assert_missing_member_rejected(member)
+
+    def test_new_install_links_the_bundled_editor_and_its_desktop_files(self):
+        self.add_editor_to_archive()
+        (self.payload / "bin/ceditor").chmod(0o700)
+        self.package()
+        self.assert_installed(self.install(), "candidate")
+        self.assert_editor_launches("bundled")
+        self.assertEqual(stat.S_IMODE((self.prefix / "current/bin/ceditor").stat().st_mode), 0o755)
+        for asset in EDITOR_MEMBERS[1:]:
+            self.assertEqual(self.managed_link(asset).readlink(), self.prefix / "current" / asset)
+        self.assertIn(f'TryExec={self.prefix / ".ceditor-launcher"}\n',
+                      self.managed_link(EDITOR_MEMBERS[1]).read_text())
+        result = self.uninstall("packaged helper")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.prefix.exists())
+        for member in EDITOR_MEMBERS:
+            self.assertFalse(self.managed_link(member).is_symlink())
+
+    def test_staging_and_selecting_older_release_routes_editor_through_current(self):
+        self.environment["XDG_DATA_HOME"] = str(self.home / ".local/share")
+        source = self.install_source_editor()
+        self.installed_cli(guarded=True, version="9.9.8")
+        self.add_editor_to_archive()
+        for member in EDITOR_MEMBERS[1:]:
+            self.place_copy(member, (self.payload / member).read_bytes())
+        before = self.install("--stage-only")
+        self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
+        self.assert_editor_launches("bundled")
+        selected = self.install("--stage-only", "--select", "9.9.8")
+        self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
+        self.assert_editor_launches("source")
+        for member in EDITOR_MEMBERS[1:]:
+            asset = self.managed_link(member)
+            self.assertFalse(asset.is_symlink())
+            self.assertEqual(asset.read_bytes(), (self.payload / member).read_bytes())
+        selected = self.install("--stage-only", "--select", VERSION)
+        self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
+        self.assert_editor_launches("bundled")
+        self.assertTrue(source.is_file())
+
+    def test_source_launcher_and_data_survive_failed_update_and_uninstall(self):
+        source = self.install_source_editor()
+        self.installed_cli(guarded=True)
+        self.add_editor_to_archive()
+        desktop = self.managed_link(EDITOR_MEMBERS[1])
+        self.write(desktop, "source desktop configuration\n")
+        config = self.home / "config/ceditor/settings.toml"
+        state = self.home / ".local/state/ceditor/workspace.json"
+        for item in (config, state):
+            self.write(item, "editor data\n")
+        before = self.managed_link("bin/ceditor").readlink()
+        self.environment.update(FIXTURE_DAEMON_START_FAILS="1", FIXTURE_CHECKPOINT_BEFORE="a" * 64)
+        failed = self.install("--restart-daemon")
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertIn("replacement daemon startup failed", failed.stderr)
+        self.assertEqual(self.managed_link("bin/ceditor").readlink(), before)
+        self.assert_editor_launches("source")
+        self.assertFalse((self.prefix / ".ceditor-launcher").exists())
+        self.assertEqual(list(self.managed_link("bin/ceditor").parent.glob(".ceditor.cagents-install.*")), [])
+
+        del self.environment["FIXTURE_DAEMON_START_FAILS"], self.environment["FIXTURE_CHECKPOINT_BEFORE"]
+        staged = self.install("--stage-only")
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assert_editor_launches("bundled")
+        result = self.uninstall("install.sh", "--purge")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.managed_link("bin/ceditor").readlink(), before)
+        self.assert_editor_launches("source")
+        self.assertTrue(source.is_file())
+        self.assertEqual(desktop.read_text(), "source desktop configuration\n")
+        for item in (config, state):
+            self.assertEqual(item.read_text(), "editor data\n")
+
+    def test_bundled_editor_preserves_an_unrelated_public_launcher(self):
+        self.add_editor_to_archive()
+        custom = self.home / "custom-editor"
+        self.executable(custom, '#!/bin/sh\nprintf "%s\\n" custom "$@"\n')
+        public = self.managed_link("bin/ceditor")
+        public.parent.mkdir(parents=True)
+        public.symlink_to(custom)
+        self.assert_installed(self.install(), "candidate")
+        self.assertEqual(public.readlink(), custom)
+        self.assert_editor_launches("custom")
+        self.assert_editor_launches("bundled", self.prefix / ".ceditor-launcher")
+
     def managed_link(self, member):
-        if member == "bin/cagents":
-            return self.home / ".local/bin/cagents"
+        if member.startswith("bin/"):
+            return self.home / ".local" / member
         if member.startswith("share/autostart/"):
             return self.home / "config/autostart" / Path(member).name
-        return self.home / "data" / member.removeprefix("share/")
+        return Path(self.environment["XDG_DATA_HOME"]) / member.removeprefix("share/")
 
     def place_copy(self, member, content):
         """A regular file where the installer keeps a link, as desktop tools leave it."""
