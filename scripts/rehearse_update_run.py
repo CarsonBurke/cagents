@@ -260,23 +260,55 @@ def active_working_contract(before, agents, serving, events, agent_id):
     return {'agent_id':agent_id,'run':old['run'],'serving':serving,'parent':started,'observed_at':time.time()}
 
 
-def update_completed(root, version):
-    """What reopened windows would show about an update that exited 0.
-
-    A failed or refused job reads "Update failed" or "Update not installed"
-    there even when NEW is serving (#3877), so a clean exit alone is no pass.
-    """
+def update_status(root):
+    """The update job's status.json, or the reason it cannot be read."""
     path = Path(root)/'home/.local/share/cagents-install/.update/status.json'
     try:
-        status = json.loads(path.read_text())
+        return json.loads(path.read_text()), None
     except (OSError, ValueError) as error:
-        return [f'the update left no readable status: {error}']
+        return None, f'the update left no readable status: {error}'
+
+
+def update_completed(root, version):
+    """Why status.json does not record a Complete update to VERSION.
+
+    A failed or refused job reads "Update failed" or "Update not installed"
+    in the windows even when NEW is serving (#3877), so a clean exit alone is
+    no pass. Only the worker's own record is read here; what the reopened
+    windows show is `shown_update_outcome`'s concern.
+    """
+    status, error = update_status(root)
+    if error:
+        return [error]
     errors = []
     if status.get('phase') != 'Complete' or status.get('version') != version:
         errors.append(f'the update status is {status.get("phase")} for {status.get("version")}, not Complete for {version}: {status.get("message")}')
     if status.get('refusal'):
         errors.append(f'the update status carries a refusal: {status["refusal"]}')
     return errors
+
+
+# What a reopened window says, in its error notice or update header, when it
+# takes the last update for a failure; and its confirmation of a success.
+SHOWN_UPDATE_FAILURES = ('Update failed', 'Update not installed')
+
+
+def shown_update_outcome(observations, version):
+    """Reads one round of window observations as the person would.
+
+    Returns ({slot: failure phrase} for every window showing a failure,
+    the slots showing "Updated to cagents VERSION").
+    """
+    failed, updated = {}, []
+    for slot, observation in observations.items():
+        words = ' '.join(row.get('text','') for row in observation.get('runs',[]))
+        shown = [phrase for phrase in SHOWN_UPDATE_FAILURES if visible_phrase(words, phrase)]
+        if shown:
+            failed[slot] = shown[0]
+        # visible_phrase reads letters only, so the version is matched apart.
+        if visible_phrase(words, 'Updated to cagents') and version in words:
+            updated.append(slot)
+    return failed, updated
 
 
 def candidate_namespace_contract(evidence, old_version, new_version):
@@ -766,6 +798,8 @@ class Rehearsal:
         self.shell = shell
         self.steps = []
         self.errors = []
+        self.notes = []
+        self.shown_updated = []
 
     def call(self, *args, timeout=90, check=True):
         start = time.monotonic()
@@ -1049,6 +1083,76 @@ class Rehearsal:
                 self.call('shot', f'{shots}-{slot}', timeout=45)
         Path(output).write_text(json.dumps(observed, indent=2, sort_keys=True)+'\n')
         return observed
+
+    def update_worker_running(self):
+        """Whether this private user's `cagents update-worker` still runs."""
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                argv = (entry/'cmdline').read_bytes().split(b'\0')
+                executable = os.readlink(entry/'exe')
+            except OSError:
+                continue
+            if b'update-worker' in argv[1:2] and executable.startswith(str(self.root)+'/'):
+                return True
+        return False
+
+    def watch_shown_update(self, version, *, settle=12, limit=180):
+        """Watches every reopened window until the update has settled, and
+        fails the rehearsal if any of them shows the update as failed.
+
+        A window reads the update's status once as it starts and again only
+        while the job is still running, so a status it misread while OLD's
+        worker was still verifying stays on screen (#3877). An error notice
+        stays until dismissed; the success confirmation lasts six seconds,
+        so it is recorded when seen but not required. Watching goes on until
+        the worker's job is terminal and SETTLE seconds have passed.
+        """
+        output = self.root/'records/after/update-shown.json'
+        output.parent.mkdir(parents=True, exist_ok=True)
+        rounds, failed, updated = [], {}, set()
+        deadline = time.monotonic()+limit
+        settled_at = None
+        while time.monotonic() < deadline:
+            status, _ = update_status(self.root)
+            phase = (status or {}).get('phase')
+            working = self.update_worker_running()
+            observations = {}
+            for slot, window in sorted(self.mapped().items()):
+                if slot == 'ceditor':
+                    continue
+                self.call('wm', 'action', 'focus-window', '--id', window['id'])
+                _, text = self.call('drive', '--json', 'observe', timeout=30)
+                observation = json.loads(text)
+                if observation['window']['id'] == window['id']:
+                    observations[slot] = observation
+            shown_failed, shown_updated = shown_update_outcome(observations, version)
+            rounds.append({'at': time.time(), 'phase': phase, 'worker': working, 'failed': shown_failed, 'updated': shown_updated,
+                           'words': {slot: ' '.join(row.get('text','') for row in observation.get('runs',[]))
+                                     for slot, observation in observations.items()}})
+            for slot, phrase in shown_failed.items():
+                failed.setdefault(slot, phrase)
+            updated.update(shown_updated)
+            if failed:
+                for slot in failed:
+                    self.call('shot', f'after-update-shown-failed-{slot}', timeout=45, check=False)
+                break
+            # OLD's worker may record Failed before it verifies the reopened
+            # windows' service, so a terminal phase alone is not settled.
+            terminal = phase in ('Complete', 'Failed', 'Cancelled') and not working
+            if terminal and settled_at is None:
+                settled_at = time.monotonic()
+            if settled_at is not None and time.monotonic()-settled_at >= settle:
+                break
+            time.sleep(.5)
+        else:
+            self.errors.append(f'the update job never settled within {limit:.0f} s of the windows reopening')
+        output.write_text(json.dumps({'version': version, 'failed': failed, 'updated': sorted(updated),
+                                      'rounds': rounds}, indent=2, sort_keys=True)+'\n')
+        for slot, phrase in sorted(failed.items()):
+            self.errors.append(f'the reopened {slot} window shows "{phrase}"; see {output}')
+        return failed, sorted(updated)
 
     def capture_chats(self, side, *, baseline='before'):
         """Exercise the seeded chats themselves, preserving UUID-bound evidence."""
@@ -1859,6 +1963,12 @@ class Rehearsal:
             if args.ceditor:
                 self.call('ceditor','start',args.ceditor,timeout=60)
                 self.wait_windows(['main','second','ceditor'])
+            if args.empty_window:
+                # Opened after seeding so it holds nothing to reconnect: when
+                # the update reopens it, it reports ready at once and reads
+                # the update's status while OLD's worker is still verifying.
+                self.call('launch','empty')
+                self.wait_windows(['main','second','empty'])
             self.capture_chats('before')
             self.capture_console('before')
             code, _ = self.call('record','before',timeout=150,check=False)
@@ -1933,14 +2043,37 @@ class Rehearsal:
             elif args.expect_refusal:
                 if not code or code==124:
                     self.errors.append('expected refusal did not return a normal nonzero result')
-            elif code:
+            elif code and not args.feed:
                 self.errors.append(f'update exited {code}')
-            else:
-                self.errors.extend(update_completed(self.root,args.new_version))
+            if args.feed and not args.fail_new_daemon and not args.expect_refusal:
+                # On the in-app path OLD's CLI follows OLD's worker, whose
+                # record may call an update Failed that NEW's windows accept
+                # (#3877). NEW serving and NEW's windows decide; the exit is noted.
+                if code:
+                    self.notes.append(f'OLD\'s `daemon upgrade` exited {code}')
+                serving_code, serving = self.cli('--no-start','daemon','status',check=False)
+                if (serving_code or serving.get('data',{}).get('running') is not True
+                        or serving.get('data',{}).get('daemon_version') != args.new_version):
+                    self.errors.append(f'NEW {args.new_version} is not serving after the in-app update')
+                code = 0 if code != 124 else code
+            reopened = ['main','second']+(['empty'] if args.empty_window else [])
             try:
-                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon or args.expect_refusal else args.new_version if code==0 else None)
+                self.wait_windows(reopened,timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon or args.expect_refusal else args.new_version if code==0 else None)
             except RuntimeError as exc:
                 self.errors.append(str(exc))
+            if not code and not args.fail_new_daemon and not args.expect_refusal:
+                # What the person sees decides the outcome. On the in-app path
+                # OLD's worker writes status.json, and a worker older than NEW
+                # may record Failed for an update NEW's windows rightly accept.
+                _, self.shown_updated = self.watch_shown_update(args.new_version)
+                incomplete = update_completed(self.root,args.new_version)
+                if incomplete and args.feed:
+                    self.notes += [f'OLD\'s worker recorded: {reason}' for reason in incomplete]
+                    self.notes.append('the reopened windows showed no update failure')
+                else:
+                    self.errors.extend(incomplete)
+                self.notes.append('a window confirmed "Updated to cagents '+args.new_version+'": '
+                                  +(', '.join(self.shown_updated) or 'none seen'))
             # The shared recovery verifier qualifies paused presentations before
             # inspecting them. Capture again afterwards to retain the final UI.
             self.call('record','after',timeout=150)
@@ -1996,7 +2129,7 @@ class Rehearsal:
             report = [f'Rehearsal: {self.root}',f'OLD: {args.old_version}',f'NEW: {args.new_version}',
                       f'Ceditor: {args.ceditor or "disabled"}',f'Total duration: {time.monotonic()-start:.3f}s',
                       f'Outcome: {"FAIL" if self.errors else "PASS"}', '', 'Regressions / evidence gaps:',
-                      *self.errors, '', 'Steps (seconds, exit):']
+                      *self.errors, '', 'Notes:', *self.notes, '', 'Steps (seconds, exit):']
             for step in self.steps:
                 report += [f'{step["seconds"]:.3f}s exit={step["exit"]}: {" ".join(step["command"])}']
                 if step['command'][0] in ('compare','install') or (step['exit'] and step['command'][0] not in ('seed','update')):
@@ -2090,6 +2223,7 @@ def main():
             run.add_argument('--'+prefix+'-'+field,required=True)
     run.add_argument('--ceditor',metavar='BIN_DIR')
     run.add_argument('--feed',metavar='DIR',help="update in the app, as a person does, instead of through NEW's staged CLI: OLD's own `daemon upgrade --version NEW` finds NEW in this file feed (scripts/release feed), and OLD's update worker runs the update. The feed must serve the archive in --new-dir")
+    run.add_argument('--empty-window',action='store_true',help="also open a window holding nothing, after seeding: reopened, it reports ready at once, so its first read of the update's status races OLD's worker still verifying NEW")
     run.add_argument('--answer',default='yes')
     run.add_argument('--yes',action='store_true')
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')

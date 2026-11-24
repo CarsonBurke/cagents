@@ -2777,9 +2777,18 @@ build reads the feed as `CAGENTS_UPDATE_FEED`. An unmodified published build
 ignores that variable and asks github.com, and the private user's curl answers
 those release URLs from the feed, so the published previous release can be the
 OLD side when NEW's bundle carries a signature from a key in
-`src/update/release-keys.pub`; a published build ignores rehearsal keys. Whichever path it takes, an update that exits 0 passes only when its
-status ends `Complete` for NEW with no refusal, because anything else shows a
-failure banner when the windows reopen.
+`src/update/release-keys.pub`; a published build ignores rehearsal keys. On the
+staged path, an update that exits 0 passes only when its status ends `Complete`
+for NEW with no refusal. On the in-app path OLD's worker writes that status and
+OLD's CLI exits on it, and a worker older than NEW may record Failed for an
+update NEW's windows rightly accept (#3877). There NEW must be serving, every
+window must reopen on NEW, and no window may show "Update failed" or "Update not
+installed" while the harness watches them, from their reopening until the worker
+has exited and 12 seconds more (`records/after/update-shown.json`). The report's
+Notes keep OLD's verdict and whether a window confirmed "Updated to cagents
+NEW". Add `--empty-window` to open a third window holding nothing: reopened, it
+reports ready at once, so its first read of the status races OLD's worker still
+verifying NEW.
 
 `init` refuses a root with a `.git` in its ancestry, as recovery storage does.
 A sandbox that masks `.git` in its writable roots (Codex's does) leaves an empty

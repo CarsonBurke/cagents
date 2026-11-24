@@ -1213,6 +1213,53 @@ class UpdateCompleted(unittest.TestCase):
                     self.assertEqual(len(run.update_completed(directory, "2.0.0")), failures)
 
 
+class ShownUpdateOutcome(unittest.TestCase):
+    def observation(self, *texts):
+        return {"runs": [{"text": text} for text in texts]}
+
+    def test_a_window_showing_a_failure_or_refusal_fails_and_a_confirmation_is_read(self):
+        import rehearse_update_run as run
+        failed, updated = run.shown_update_outcome({
+            "main": self.observation("Update failed: the running cagents service uses protocol 203."),
+            "second": self.observation("Updated", "to cagents", "2.0.0"),
+            "empty": self.observation("Update not installed: 1 agent is working"),
+            "quiet": self.observation("Channels", "New chat"),
+        }, "2.0.0")
+        self.assertEqual(failed, {"main": "Update failed", "empty": "Update not installed"})
+        self.assertEqual(updated, ["second"])
+
+    def test_a_confirmation_for_another_version_is_not_this_update(self):
+        import rehearse_update_run as run
+        self.assertEqual(run.shown_update_outcome({"main": self.observation("Updated to cagents 1.9.0")}, "2.0.0"),
+                         ({}, []))
+
+    def test_watching_waits_for_the_worker_to_exit_before_settling(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "home/.local/share/cagents-install/.update"
+            state.mkdir(parents=True)
+            (state / "status.json").write_text(json.dumps({"phase": "Failed", "version": "2.0.0"}))
+            rehearsal = run.Rehearsal.__new__(run.Rehearsal)
+            rehearsal.root, rehearsal.errors = root, []
+            # OLD's worker records Failed early, then verifies the reopened windows.
+            working = iter([True, True, False])
+            rehearsal.update_worker_running = lambda: next(working, False)
+            rehearsal.mapped = lambda: {"main": {"id": 1}, "ceditor": {"id": 9}}
+            shown = iter(["Channels", "Channels", "Update failed: protocol 203"])
+            def call(*args, **_):
+                if args[:2] == ("drive", "--json"):
+                    return 0, json.dumps({"window": {"id": 1}, "runs": [{"text": next(shown, "Channels")}]})
+                return 0, ""
+            rehearsal.call = call
+            with patch.object(run.time, "sleep"):
+                failed, updated = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual((failed, updated), ({"main": "Update failed"}, []))
+            self.assertIn('main window shows "Update failed"', rehearsal.errors[0])
+            evidence = json.loads((root / "records/after/update-shown.json").read_text())
+            self.assertEqual([row["worker"] for row in evidence["rounds"]], [True, True, False])
+
+
 class CandidateNamespace(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('candidate_namespace_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
