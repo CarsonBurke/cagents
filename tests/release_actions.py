@@ -18,7 +18,7 @@ GH = r"""#!/bin/bash
 echo "$*" >> "$FIXTURE/gh.log"
 case "$1 $2" in
     "release list") cat "$FIXTURE/published" 2>/dev/null ;;
-    "secret list") ls "$FIXTURE/secrets" 2>/dev/null ;;
+    "secret list") [[ ! -e $FIXTURE/list-fails ]] || exit 1; ls "$FIXTURE/secrets" 2>/dev/null ;;
     "secret set") mkdir -p "$FIXTURE/secrets"; cat > "$FIXTURE/secrets/$3" ;;
     "secret delete") rm -f "$FIXTURE/secrets/$3" ;;
     "variable set")
@@ -55,7 +55,7 @@ class ReleaseActions(unittest.TestCase):
         self.git("init", "-q", "-b", "main")
         self.git("init", "-q", "--bare", str(self.origin), cwd=self.root)
         self.git("remote", "add", "origin", str(self.origin))
-        self.release_commit("0.2.3", "security")
+        self.release_commit("0.2.3", "security", generation=1)
         self.git("tag", "-a", "v0.2.3", "-m", "v0.2.3")
         self.published("v0.2.3")
         self.git("push", "-q", "origin", "main")
@@ -74,8 +74,10 @@ class ReleaseActions(unittest.TestCase):
         return subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", *args],
                               cwd=cwd or self.repo, check=True, text=True, capture_output=True).stdout.strip()
 
-    def release_commit(self, version, *trusted):
+    def release_commit(self, version, *trusted, generation=2):
         (self.repo / "Cargo.toml").write_text(f'[package]\nname = "cagents"\nversion = "{version}"\n')
+        (self.repo / "src/update/feed.rs").write_text(
+            f"const GENERATION: usize = {generation};\n" if generation > 1 else "// before generations\n")
         (self.repo / "src/update/release-keys.pub").write_text(
             "# Release keys.\n" + "".join(f"{self.keys[name]}\n" for name in trusted))
         self.git("add", "-A")
@@ -103,8 +105,8 @@ class ReleaseActions(unittest.TestCase):
         path = self.root / "output"
         return dict(line.split("=", 1) for line in path.read_text().splitlines()) if path.exists() else {}
 
-    def tag(self, version, *trusted):
-        sha = self.release_commit(version, *trusted)
+    def tag(self, version, *trusted, generation=2):
+        sha = self.release_commit(version, *trusted, generation=generation)
         self.git("tag", "-a", f"v{version}", "-m", f"v{version}")
         self.git("push", "-q", "origin", "main")
         return sha
@@ -144,6 +146,15 @@ class ReleaseActions(unittest.TestCase):
         result = self.run_actions("admit", "v0.2.6")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["sign"], "false")
+
+    def test_a_release_that_begins_a_trust_generation_is_signed_locally(self):
+        self.tag("0.2.4", "security", "actions")
+        self.published("v0.2.3", "v0.2.4")
+        self.tag("0.2.5", "security", "actions", generation=3)
+        result = self.run_actions("admit", "v0.2.5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["sign"], "false")
+        self.assertIn("begins a new trust generation", result.stdout)
 
     def test_a_version_is_signed_once_and_only_after_every_published_one(self):
         self.tag("0.2.4", "security", "actions")
@@ -223,9 +234,23 @@ class ReleaseActions(unittest.TestCase):
                          sorted([" ".join(self.keys["security"].split()[:2]), " ".join(public)]))
         self.assertIn(f"{' '.join(public)} cagents-release-actions", result.stdout)
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+        (self.root / "secrets/RELEASE_KEYGEN_TOKEN").write_text("token")
         result = self.run_actions("keygen", actions=None, env={"GH_TOKEN": "token"})
         self.assertIn("has a signing key already", result.stderr)
         self.assertEqual((self.root / "secrets/RELEASE_SIGNING_KEY").read_text(), private)
+        # Refused or failed, the token does not outlive the run.
+        self.assertFalse((self.root / "secrets/RELEASE_KEYGEN_TOKEN").exists())
+
+    def test_keygen_stops_when_it_cannot_tell_whether_a_key_exists(self):
+        (self.root / "secrets").mkdir()
+        (self.root / "secrets/RELEASE_KEYGEN_TOKEN").write_text("token")
+        (self.root / "list-fails").touch()
+        result = self.run_actions("keygen", actions=None, env={"GH_TOKEN": "token"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot list the release environment secrets", result.stderr)
+        self.assertFalse((self.root / "secrets/RELEASE_SIGNING_KEY").exists())
+        self.assertFalse((self.root / "secrets/RELEASE_KEYGEN_TOKEN").exists())
+        self.assertIn("secret delete RELEASE_KEYGEN_TOKEN --env release-keygen", (self.root / "gh.log").read_text())
 
 
 if __name__ == "__main__":

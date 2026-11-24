@@ -14,9 +14,11 @@ on:
 permissions:
   contents: read
 
-# One release at a time, and a started one always finishes.
+# A tag runs once at a time. Releases are not serialized with one another: a
+# shared group would cancel a waiting run when a third arrives. Publication
+# refuses a release when a newer one is out.
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -35,6 +37,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Keep the tag annotated, as it is on origin
+        # actions/checkout makes a tag lightweight (actions/checkout#290);
+        # publication compares the tag object with origin's.
+        if: github.ref_type == 'tag'
+        run: git fetch --no-tags --force origin "+$GITHUB_REF:$GITHUB_REF"
       - name: Decide whether Actions signs it
         id: admit
         env:
@@ -58,6 +65,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Keep the tag annotated, as it is on origin
+        # actions/checkout makes a tag lightweight (actions/checkout#290);
+        # publication compares the tag object with origin's.
+        if: github.ref_type == 'tag'
+        run: git fetch --no-tags --force origin "+$GITHUB_REF:$GITHUB_REF"
       - name: Prepare the runner for rootless release builds
         run: .github/release-runner-setup
       - name: Build, package and smoke-test the tagged source
@@ -73,7 +85,7 @@ jobs:
           name: bundle
           path: /mnt/cagents/dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   sign:
     name: Sign the metadata
@@ -107,7 +119,7 @@ jobs:
           name: signature
           path: ${{ runner.temp }}/dist/release-metadata.json.sig
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   publish:
     name: Publish the release
@@ -122,6 +134,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Keep the tag annotated, as it is on origin
+        # actions/checkout makes a tag lightweight (actions/checkout#290);
+        # publication compares the tag object with origin's.
+        if: github.ref_type == 'tag'
+        run: git fetch --no-tags --force origin "+$GITHUB_REF:$GITHUB_REF"
       - name: Prepare the runner for the offline smoke install
         run: .github/release-runner-setup
       - name: Take this run's bundle

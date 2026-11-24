@@ -426,9 +426,20 @@ cut() {
     if jq -e --arg v "$VERSION" 'index($v)' <<< "$released" >/dev/null; then
         # publish pushes the tag just before it publishes; a failure between
         # the two leaves the tag on origin with nothing published.
-        [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) == false ]] \
+        [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) != false ]] \
+            || fail "$TAG is already released; main needs its version bump first"
+        # Pushed but never published. With a signed cut here, publishing
+        # failed after the push. Without one, as when GitHub Actions did not
+        # sign it, it is cut here, and keeps the tag origin has, which
+        # cannot move.
+        [[ ! -f $BUNDLES/$VERSION/release-metadata.json.sig ]] \
             || fail "$TAG is on origin but not published; finish it with scripts/release publish $VERSION"
-        fail "$TAG is already released; main needs its version bump first"
+        local pushed
+        pushed=$(repository_git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | sort -k2 | tail -n1 | awk '{print $1}')
+        [[ $pushed == "$sha" && $ACTIONS == false ]] \
+            || fail "$TAG is on origin at ${pushed:-an unknown commit} but not published; finish it with scripts/release publish $VERSION$([[ $ACTIONS == true ]] && printf ' --actions'), or cut that commit here: scripts/release cut --commit $pushed --key KEY"
+        repository_git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG" || fail "cannot fetch $TAG from origin"
+        printf '%s is on origin but not published; cutting it here, from the same tag.\n' "$TAG"
     fi
     if [[ $ACTIONS == true ]]; then
         # Actions builds the tag itself; only the commit and version are
@@ -751,7 +762,7 @@ HOST
 # then builds, signs and publishes it. Succeeds once the release is published;
 # until then it says so, and running it again resumes.
 publish_in_actions() {
-    local sha answer state
+    local sha answer state admitted
     sha=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
         || fail "tag $TAG does not exist here; make it with scripts/release cut --actions"
     state=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) || state=
@@ -759,19 +770,31 @@ publish_in_actions() {
         printf '%s is published already.\n' "$TAG"
         return
     fi
-    repository_git fetch --quiet origin main
-    repository_git merge-base --is-ancestor "$sha" origin/main || fail "$TAG is not a commit on main"
     if [[ -n $(repository_git ls-remote --tags origin "refs/tags/$TAG") ]]; then
-        printf '%s is pushed and not published yet; the release workflow is building it, or failed:\n' "$TAG"
-        printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY"
+        printf '%s is pushed and not published yet; the release workflow is building it, or failed:\n' "$TAG" >&2
+        printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY" >&2
         return 1
     fi
+    # A pushed tag cannot be moved or deleted, so ask first what the
+    # workflow's admission will: a refused tag would leave its version used.
+    admitted=$(mktemp "${TMPDIR:-/tmp}/cagents-admit.XXXXXX")
+    if ! GITHUB_OUTPUT=$admitted CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
+        RELEASE_SIGNING_PUBLIC_KEY=$(gh variable get RELEASE_SIGNING_PUBLIC_KEY -R "$GITHUB_REPOSITORY" 2>/dev/null) \
+        RELEASE_TRUSTED_KEYS=$(gh variable get RELEASE_TRUSTED_KEYS -R "$GITHUB_REPOSITORY" 2>/dev/null) \
+        "$ROOT_DIR/scripts/release-actions" admit "$TAG"; then
+        rm -f -- "$admitted"
+        fail "GitHub Actions would refuse $TAG; nothing is pushed"
+    fi
+    if ! grep -qx 'sign=true' "$admitted"; then
+        rm -f -- "$admitted"
+        fail "GitHub Actions would not sign $TAG, so nothing is pushed; cut and sign it here: scripts/release cut --commit $sha --key KEY"
+    fi
+    rm -f -- "$admitted"
     if [[ $YES == false ]]; then
         printf 'Pushing %s has GitHub Actions build, sign and publish it as the update every installed cagents offers.\n' "$TAG"
         read -r -p "Type $VERSION to publish: " answer
         [[ $answer == "$VERSION" ]] || fail 'not published'
     fi
-    # Idempotent: origin refuses a different tag of the same name.
     repository_git push --quiet origin "refs/tags/$TAG" || fail "cannot push $TAG to origin"
     printf 'Pushed %s. The release workflow builds, signs and publishes it in a few hours:\n' "$TAG"
     printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY"
@@ -798,7 +821,8 @@ case $COMMAND in
     publish)
         if [[ $ACTIONS == true ]]; then
             # The next version starts once the release is published.
-            publish_in_actions && start_next_version
+            publish_in_actions || exit 1
+            start_next_version
             exit 0
         fi
         bundle=$(signed_bundle)

@@ -2,9 +2,10 @@ name: Release signing key
 
 # Makes the Actions release signing key once, inside this run, and stores it
 # as the release environment's secret: no person or agent ever holds the
-# private half. GITHUB_TOKEN cannot write secrets, so the run uses a token
-# given for this purpose as the repository secret RELEASE_KEYGEN_TOKEN, and
-# deletes that secret when it is done. It refuses to replace an existing key.
+# private half. GITHUB_TOKEN cannot write secrets, so the run uses a short-lived
+# token given for this purpose as the release-keygen environment's secret
+# RELEASE_KEYGEN_TOKEN, and deletes that secret however it ends. It refuses to
+# replace an existing key.
 # See docs/releasing.md#signing-in-github-actions.
 on:
   workflow_dispatch:
@@ -13,13 +14,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: release
+  group: release-signing-key
   cancel-in-progress: false
 
 jobs:
   generate:
     name: Generate and store the key
     if: github.ref == 'refs/heads/main'
+    # Holds RELEASE_KEYGEN_TOKEN, deployable only from main.
+    environment: release-keygen
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

@@ -7,8 +7,10 @@
 #                 the tag's version, that version is newer than every
 #                 published release and not published itself, the release
 #                 before it trusts the Actions key (else it is signed locally
-#                 with a key that release trusts), and the keys its source
-#                 trusts are exactly RELEASE_TRUSTED_KEYS. Writes version=
+#                 with a key that release trusts), it is of that release's
+#                 trust generation (else it begins one, signed locally), and
+#                 the keys its source trusts are exactly
+#                 RELEASE_TRUSTED_KEYS. Writes version=
 #                 and sign=true|false to $GITHUB_OUTPUT when set.
 #   keygen        Make the Actions signing key in memory, store it as the
 #                 release environment's secret RELEASE_SIGNING_KEY, and its
@@ -16,8 +18,8 @@
 #                 repository variables RELEASE_SIGNING_PUBLIC_KEY and
 #                 RELEASE_TRUSTED_KEYS (the security key main lists, and this
 #                 one), with GH_TOKEN, which must be allowed to write them.
-#                 Refuses when the secret exists. Deletes the repository
-#                 secret RELEASE_KEYGEN_TOKEN afterwards.
+#                 Refuses when the secret exists. However it ends, deletes
+#                 the release-keygen environment secret RELEASE_KEYGEN_TOKEN.
 #   sign DIR VERSION COMMIT
 #                 Check the bundle DIR against its metadata, then sign the
 #                 metadata with the key in RELEASE_SIGNING_KEY and check the
@@ -31,11 +33,28 @@ VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 MANIFESTS=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
 export LC_ALL=C
 SCRATCH=
+DELETE_KEYGEN_TOKEN=false
+
+finish() {
+    [[ -z $SCRATCH ]] || rm -rf -- "$SCRATCH"
+    if "$DELETE_KEYGEN_TOKEN"; then
+        gh secret delete RELEASE_KEYGEN_TOKEN --env release-keygen -R "$REPOSITORY" >/dev/null 2>&1 \
+            || notice 'Delete the release-keygen environment secret RELEASE_KEYGEN_TOKEN, and revoke the token.'
+    fi
+}
+trap finish EXIT
 
 # Memory-backed scratch for a private key, removed however the script ends.
 make_scratch() {
     SCRATCH=$(mktemp -d "${CAGENTS_SIGNING_SCRATCH:-/dev/shm}/cagents-$1.XXXXXX")
-    trap 'rm -rf -- "$SCRATCH"' EXIT
+}
+
+# A tagged source's trust generation (src/update/feed.rs); 1 predates them.
+generation_at() {
+    local generation
+    generation=$(repository_git show "$1:src/update/feed.rs" 2>/dev/null \
+        | sed -n 's/^const GENERATION: usize = \([1-9][0-9]*\);$/\1/p')
+    printf '%s\n' "${generation:-1}"
 }
 
 fail() {
@@ -111,6 +130,11 @@ admit() {
         output sign=false
         return
     fi
+    if [[ $(generation_at "$sha") != "$(generation_at "$previous")" ]]; then
+        notice "$tag begins a new trust generation, so it is signed locally with a key every build of $previous's generation trusts."
+        output sign=false
+        return
+    fi
     at_commit=$(keys_at "$sha")
     if ! grep -qxF -- "$actions" <<< "$at_commit"; then
         notice "$tag no longer trusts the Actions key, so it is signed locally."
@@ -149,9 +173,14 @@ sign() {
 }
 
 keygen() {
-    local repository=$REPOSITORY public trusted
+    local repository=$REPOSITORY public trusted secrets
     [[ -n ${GH_TOKEN:-} ]] || fail 'keygen needs GH_TOKEN (the RELEASE_KEYGEN_TOKEN secret)'
-    if gh secret list --env release -R "$repository" --json name --jq '.[].name' | grep -qx RELEASE_SIGNING_KEY; then
+    # The token is for this run alone, whatever its outcome.
+    DELETE_KEYGEN_TOKEN=true
+    # Read the list whole: a failed read must stop keygen, never pass for "none".
+    secrets=$(gh secret list --env release -R "$repository" --json name --jq '.[].name') \
+        || fail 'cannot list the release environment secrets'
+    if grep -qx RELEASE_SIGNING_KEY <<< "$secrets"; then
         fail 'the release environment has a signing key already; delete it first to make another'
     fi
     make_scratch keygen
@@ -165,8 +194,6 @@ keygen() {
         || fail 'cannot store the public key'
     gh variable set RELEASE_TRUSTED_KEYS -R "$repository" --body "$trusted" >/dev/null \
         || fail 'cannot store the trusted keys'
-    gh secret delete RELEASE_KEYGEN_TOKEN -R "$repository" >/dev/null 2>&1 \
-        || notice 'Delete the repository secret RELEASE_KEYGEN_TOKEN; it is no longer needed.'
     notice "Stored the Actions release signing key. Add this line to src/update/release-keys.pub:"
     notice ""
     notice "    $public cagents-release-actions"

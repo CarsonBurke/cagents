@@ -75,6 +75,7 @@ case "$1 $2" in
         echo "archive of $version" > "cagents-$version-x86_64-unknown-linux-gnu.tar.gz"
         echo "#!/bin/sh" > install.sh
         sha256sum "cagents-$version-x86_64-unknown-linux-gnu.tar.gz" install.sh > SHA256SUMS ;;
+    "variable get") [[ $3 != RELEASE_SIGNING_PUBLIC_KEY ]] || echo "ssh-ed25519 FIXTURE" ;;
 esac
 exit 0
 """
@@ -128,6 +129,14 @@ case $command in
 esac
 """
 
+# The workflow's admission, as asked before pushing a tag: refuses when the
+# fixture says so, and otherwise says whether Actions would sign.
+ADMIT = r"""#!/bin/bash
+echo "release-actions $* public=$RELEASE_SIGNING_PUBLIC_KEY" >> "$FIXTURE/calls.log"
+[[ ! -e $FIXTURE/admit-refuses ]] || { echo "release-actions: refused by the fixture" >&2; exit 1; }
+echo "sign=$(cat "$FIXTURE/admit-sign" 2>/dev/null || echo true)" >> "$GITHUB_OUTPUT"
+"""
+
 # Exits with each line of land-statuses in turn, then 0.
 LAND = r"""#!/bin/bash
 echo "land-pr $*" >> "$FIXTURE/calls.log"
@@ -173,6 +182,7 @@ class ReleaseCut(unittest.TestCase):
         self.tool(self.repo / "scripts/publish-release", PUBLISH)
         self.tool(self.repo / "scripts/land-pr", LAND)
         self.tool(self.repo / "scripts/rehearse-update", REHEARSE)
+        self.tool(self.repo / "scripts/release-actions", ADMIT)
         (self.repo / ".gitignore").write_text(".worktrees/\n")
         lock = ["version = 4\n"]
         for name, manifest in (("cagents", "Cargo.toml"), ("cagents-ui", "crates/cagents-ui/Cargo.toml"),
@@ -668,9 +678,10 @@ class ReleaseCut(unittest.TestCase):
         self.assertFalse(any(line.startswith("pr create") for line in self.log("gh.log")))
 
     def test_a_tag_on_origin_that_was_never_published_says_to_publish(self):
+        # Publishing pushed the signed cut's tag, then failed.
         self.bundle(self.fix)
-        self.git("tag", "-a", "v0.2.4", "-m", "v0.2.4", self.fix)
-        self.git("push", "-q", "origin", "v0.2.4")
+        self.assertEqual(self.release("cut", "--commit", self.fix, "--key", str(self.root / "key")).returncode, 0)
+        self.git("push", "-q", "origin", "main", "v0.2.4")
         result = self.release("cut", "--commit", self.fix)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("finish it with scripts/release publish 0.2.4", result.stderr)
@@ -767,13 +778,16 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("not published", self.release("publish", "0.2.4", "--actions", stdin="0.2.3\n").stderr)
         self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
         result = self.release("publish", "0.2.4", "--actions", "--yes")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        # Pushed, not published: it says what to do next, and is not done.
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("release-actions admit v0.2.4 public=ssh-ed25519 FIXTURE", self.log("calls.log"))
         self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}", cwd=self.origin), self.fix)
         self.assertIn("run scripts/release publish 0.2.4 --actions again", result.stdout)
         # Nothing is published here, and main keeps its version until Actions publishes.
         self.assertFalse(any(line.startswith(("publish-release", "land-pr")) for line in self.log("calls.log")))
         result = self.release("publish", "0.2.4", "--actions", "--yes")
-        self.assertIn("is pushed and not published yet", result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("is pushed and not published yet", result.stderr)
         self.assertFalse(any(line.startswith("land-pr") for line in self.log("calls.log")))
         (self.root / "release-draft").write_text("false\n")
         result = self.release("publish", "0.2.4", "--actions", "--yes")
@@ -781,15 +795,45 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("published already", result.stdout)
         self.assertIn("land-pr 77 -R CarsonBurke/cagents", self.log("calls.log"))
 
-    def test_publish_in_actions_refuses_a_tag_off_main(self):
-        self.git("checkout", "-q", "-b", "side")
-        side = self.commit("feat(side): never merged")
-        self.git("checkout", "-q", "main")
-        self.git("tag", "-a", "v0.2.4", "-m", "v0.2.4", side)
+    def test_publish_in_actions_pushes_nothing_the_workflow_would_not_sign(self):
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--actions").returncode, 0)
+        (self.root / "admit-sign").write_text("false\n")
         result = self.release("publish", "0.2.4", "--actions", "--yes")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("not a commit on main", result.stderr)
+        self.assertIn(f"would not sign v0.2.4, so nothing is pushed; cut and sign it here: "
+                      f"scripts/release cut --commit {self.fix} --key KEY", result.stderr)
+        (self.root / "admit-refuses").touch()
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertIn("refused by the fixture", result.stderr)
+        self.assertIn("would refuse v0.2.4; nothing is pushed", result.stderr)
         self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
+
+    def test_a_tag_pushed_but_never_published_is_cut_here_from_the_same_tag(self):
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--actions").returncode, 0)
+        self.git("push", "-q", "origin", "main", "v0.2.4")
+        pushed = self.git("rev-parse", "v0.2.4", cwd=self.origin)
+        # Another tag object of the same name here gives way to origin's.
+        self.git("tag", "-d", "v0.2.4")
+        self.git("tag", "-a", "v0.2.4", "-m", "another", self.fix)
+        result = self.release("cut", "--commit", self.fix, "--key", str(self.root / "key"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cutting it here, from the same tag", result.stdout)
+        self.assertEqual(self.git("rev-parse", "v0.2.4"), pushed)
+        self.assertTrue((self.root / "bundles/0.2.4").is_dir())
+
+    def test_a_tag_pushed_at_another_commit_is_not_cut_again(self):
+        self.bundle(self.feature)
+        self.bundle(self.fix)
+        self.git("push", "-q", "origin", "main")
+        self.git("tag", "-a", "v0.2.4", "-m", "v0.2.4", self.feature)
+        self.git("push", "-q", "origin", "v0.2.4")
+        self.git("tag", "-d", "v0.2.4")
+        result = self.release("cut", "--commit", self.fix, "--key", str(self.root / "key"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"on origin at {self.feature} but not published", result.stderr)
+        self.assertIn(f"scripts/release cut --commit {self.feature} --key KEY", result.stderr)
 
 
 if __name__ == "__main__":
