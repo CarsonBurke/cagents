@@ -16,6 +16,43 @@ use std::{
     },
 };
 
+/// `openat` relative to `directory`, with creation races settled as Linux
+/// settles them.
+///
+/// When several openers create one name beneath a directory descriptor at
+/// once, Darwin answers every one but the winner `ENOENT`; a path-based `open`
+/// does not. A creating open that reads `ENOENT` therefore tries again: the
+/// retry opens the winner's file, or reports `EEXIST` under `O_EXCL`. A
+/// removed directory keeps answering `ENOENT`, which is returned once the
+/// bounded retries are spent.
+pub(crate) fn openat(
+    directory: RawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> io::Result<OwnedFd> {
+    const CREATION_ATTEMPTS: usize = if cfg!(target_os = "macos") { 8 } else { 1 };
+    let mut attempt = 1;
+    loop {
+        // SAFETY: `name` is NUL-terminated and outlives the call; the mode
+        // argument is the promoted variadic `O_CREAT` reads, ignored otherwise.
+        let descriptor =
+            unsafe { libc::openat(directory, name.as_ptr(), flags, libc::c_uint::from(mode)) };
+        if descriptor >= 0 {
+            // SAFETY: `openat` just returned this descriptor; nothing else owns it.
+            return Ok(unsafe { OwnedFd::from_raw_fd(descriptor) });
+        }
+        let error = io::Error::last_os_error();
+        if flags & libc::O_CREAT == 0
+            || error.raw_os_error() != Some(libc::ENOENT)
+            || attempt == CREATION_ATTEMPTS
+        {
+            return Err(error);
+        }
+        attempt += 1;
+    }
+}
+
 /// Marks `descriptor` close-on-exec, which Linux sets at creation instead.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_close_on_exec(descriptor: BorrowedFd<'_>) -> io::Result<()> {
@@ -103,7 +140,7 @@ pub(crate) fn connect(path: &std::path::Path) -> io::Result<UnixStream> {
 /// copies the setting from the listener to each connection as it queues, so
 /// it is in place before a fast peer can write, close, and leave the accepted
 /// stream refusing it.
-pub(crate) fn bind(path: &std::path::Path) -> io::Result<UnixListener> {
+pub(crate) fn bind(path: impl AsRef<std::path::Path>) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     keep_options_after_shutdown(std::os::fd::AsFd::as_fd(&listener))?;
     Ok(listener)
@@ -222,4 +259,65 @@ fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
         .unwrap_or(path.len());
     path.truncate(length);
     Ok(std::ffi::OsString::from_vec(path).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::CString,
+        fs::File,
+        io,
+        os::fd::AsRawFd,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    /// Racing creators of one name each settle as Linux settles them: every
+    /// plain creator opens the file, and exactly one exclusive creator wins.
+    #[test]
+    fn racing_creators_beneath_a_directory_settle_as_on_linux() {
+        const CREATORS: usize = 4;
+        let root = tempfile::tempdir().unwrap();
+        let directory = Arc::new(File::open(root.path()).unwrap());
+        for round in 0..20 {
+            for exclusive in [false, true] {
+                let name = Arc::new(CString::new(format!("{round}-{exclusive}")).unwrap());
+                let start = Arc::new(Barrier::new(CREATORS));
+                let flags = libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | if exclusive { libc::O_EXCL } else { 0 };
+                let results: Vec<_> = (0..CREATORS)
+                    .map(|_| {
+                        let (directory, name, start) = (
+                            Arc::clone(&directory),
+                            Arc::clone(&name),
+                            Arc::clone(&start),
+                        );
+                        thread::spawn(move || {
+                            start.wait();
+                            super::openat(directory.as_raw_fd(), &name, flags, 0o600)
+                                .map_err(|error| error.kind())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|creator| creator.join().unwrap())
+                    .collect();
+                let opened = results.iter().filter(|result| result.is_ok()).count();
+                if exclusive {
+                    assert_eq!(opened, 1, "{results:?}");
+                    assert!(
+                        results.iter().all(|result| matches!(
+                            result,
+                            Ok(_) | Err(io::ErrorKind::AlreadyExists)
+                        )),
+                        "{results:?}"
+                    );
+                } else {
+                    assert_eq!(opened, CREATORS, "{results:?}");
+                }
+            }
+        }
+    }
 }

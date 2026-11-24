@@ -280,21 +280,13 @@ impl RecoveryLease {
             .into());
         }
         let lock_path = directory_path.join("cagentsd.recovery.lock");
-        // SAFETY: directory is a live directory descriptor and the fixed name
-        // is NUL-terminated. Opening relative to it cannot follow a swapped path.
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                c"cagentsd.recovery.lock".as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | LOCK_OPEN_FLAGS,
-                0o600 as libc::mode_t,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: openat returned a new descriptor, transferred exactly once.
-        let lock = unsafe { File::from_raw_fd(fd) };
+        // Opening relative to the directory cannot follow a swapped path.
+        let lock = File::from(crate::descriptor::openat(
+            directory.as_raw_fd(),
+            c"cagentsd.recovery.lock",
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | LOCK_OPEN_FLAGS,
+            0o600,
+        )?);
         let metadata = lock.metadata()?;
         validate_lock_file(&lock_path, &metadata, current_uid())?;
         if metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
@@ -1351,9 +1343,9 @@ pub(crate) fn isolated_handoff_coordinator() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     #[cfg(feature = "host")]
     use std::os::unix::fs::symlink;
-    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
     use tempfile::tempdir;
 
@@ -1459,7 +1451,7 @@ mod tests {
         };
         let directory = tempdir().unwrap();
         let path = directory.path().join("activity.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         // Unlike the global signal channel, this local test channel never
         // publishes a descriptor to a handler or mutates process signal state.
         let channel = Arc::new(Wakeup::channel().unwrap());
@@ -1499,7 +1491,7 @@ mod tests {
         );
         let _client = UnixStream::connect(&path).unwrap();
         wait_for_activity_with(&listener, &channel).unwrap();
-        let _accepted = listener.accept().unwrap();
+        let _accepted = crate::descriptor::accept(&listener).unwrap();
     }
 
     #[cfg(all(feature = "host", target_os = "linux"))]
@@ -1575,7 +1567,7 @@ mod tests {
     fn lifecycle_activity_wait_observes_absolute_deadline_without_other_activity() {
         use std::{sync::mpsc, time::Duration};
         let directory = tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("deadline.sock")).unwrap();
+        let listener = crate::descriptor::bind(directory.path().join("deadline.sock")).unwrap();
         let channel = Arc::new(Wakeup::channel().unwrap());
         let owned_channel = channel.clone();
         let (sent, received) = mpsc::channel();
@@ -1617,7 +1609,7 @@ mod tests {
     fn lifecycle_activity_wait_wakes_on_original_holder_exit_with_quiet_listener_and_wake() {
         use std::{sync::mpsc, time::Duration};
         let directory = tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("holder.sock")).unwrap();
+        let listener = crate::descriptor::bind(directory.path().join("holder.sock")).unwrap();
         let inspect_listener = listener.try_clone().unwrap();
         let channel = Arc::new(Wakeup::channel().unwrap());
         let owned_channel = channel.clone();
@@ -1682,7 +1674,7 @@ mod tests {
     fn lifecycle_activity_wait_preserves_local_wake_with_pending_holder_and_deadline() {
         use std::{sync::mpsc, time::Duration};
         let directory = tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("wake-holder.sock")).unwrap();
+        let listener = crate::descriptor::bind(directory.path().join("wake-holder.sock")).unwrap();
         let channel = Arc::new(Wakeup::channel().unwrap());
         let owned_channel = channel.clone();
         let mut child = ActivityWaitChild::start();
@@ -2046,7 +2038,7 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = paths(root.path().join("runtime"));
         let lease = HostLease::acquire(&paths, &proof()).unwrap();
-        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let listener = crate::descriptor::bind(&paths.socket).unwrap();
         drop(listener);
         fs::remove_file(&paths.socket).unwrap();
 
@@ -2094,7 +2086,7 @@ mod tests {
     }
 
     fn leave_stale_socket(path: &Path) {
-        let listener = UnixListener::bind(path).unwrap();
+        let listener = crate::descriptor::bind(path).unwrap();
         shut_down_test_listener(listener);
     }
 

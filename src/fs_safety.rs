@@ -992,24 +992,10 @@ pub fn create_temporary_in(directory: &Root, mode: u32) -> Result<(File, OsStrin
     for _ in 0..TEMPORARY_NAME_ATTEMPTS {
         let name = temporary_name().map_err(|error| ResolveError::io(&directory.path, &error))?;
         let raw = c_component(&name, &directory.path)?;
-        // SAFETY: `raw` outlives the call; `openat` returns a fresh owned
-        // descriptor or -1, and the variadic mode argument is required by
-        // `O_CREAT`.
-        let descriptor = unsafe {
-            libc::openat(
-                directory.descriptor(),
-                raw.as_ptr(),
-                flags,
-                libc::c_uint::from(mode),
-            )
+        let error = match crate::descriptor::openat(directory.descriptor(), &raw, flags, mode) {
+            Ok(descriptor) => return Ok((File::from(descriptor), name)),
+            Err(error) => error,
         };
-        if descriptor >= 0 {
-            // SAFETY: `descriptor` was just returned by a successful `openat`
-            // and is not owned anywhere else.
-            let file = unsafe { File::from_raw_fd(descriptor) };
-            return Ok((file, name));
-        }
-        let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(ResolveError::io(&directory.path, &error));
         }
@@ -1039,22 +1025,9 @@ pub fn open_or_create_within(
     let flags =
         libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
     let mode = kernel_mode(mode).map_err(|error| ResolveError::io(&reported, &error))?;
-    // SAFETY: `raw` outlives the call; `openat` returns a fresh owned
-    // descriptor or -1, and `O_CREAT` requires the variadic mode argument.
-    let descriptor = unsafe {
-        libc::openat(
-            directory.descriptor(),
-            raw.as_ptr(),
-            flags,
-            libc::c_uint::from(mode),
-        )
-    };
-    if descriptor < 0 {
-        return Err(classify(&reported, &io::Error::last_os_error()));
-    }
-    // SAFETY: `descriptor` was just returned by a successful `openat` and is
-    // not owned anywhere else.
-    Ok(unsafe { File::from_raw_fd(descriptor) })
+    crate::descriptor::openat(directory.descriptor(), &raw, flags, mode)
+        .map(File::from)
+        .map_err(|error| classify(&reported, &error))
 }
 
 /// Renames `from` to `to`, both relative to `directory`, with no path
@@ -1861,16 +1834,7 @@ fn openat2(root: RawFd, relative: &Path, flags: i32) -> io::Result<OwnedFd> {
 
 /// One `openat` call for a single component.
 fn open_at(directory: RawFd, name: &OsStr, flags: i32) -> io::Result<OwnedFd> {
-    let raw = c_name(name)?;
-    // SAFETY: `raw` outlives the call and `openat` returns a fresh owned
-    // descriptor or -1.
-    let descriptor = unsafe { libc::openat(directory, raw.as_ptr(), flags) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `descriptor` was just returned by a successful `openat` and is
-    // not owned anywhere else.
-    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    crate::descriptor::openat(directory, &c_name(name)?, flags, 0)
 }
 
 /// `ELOOP` and `EXDEV` are how the kernel reports the two refusals this module
