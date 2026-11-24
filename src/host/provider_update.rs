@@ -1,10 +1,12 @@
 //! Serializes provider installation changes with the beginnings of launches.
 
 mod install;
+mod preferences;
 
 use std::{
     ffi::OsStr,
-    sync::{Arc, Mutex, Weak},
+    future::Future,
+    sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -22,6 +24,7 @@ use crate::{
 };
 
 use super::{
+    control_gate::{ControlGate, Shared},
     provider_status::inspect,
     service,
     state::{HostLock, SharedHost},
@@ -29,6 +32,7 @@ use super::{
 
 const INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 const DEFERRED_RETRY: Duration = Duration::from_secs(10 * 60);
+const LAUNCH_PATIENCE: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub(super) struct Controller {
@@ -38,6 +42,7 @@ pub(super) struct Controller {
 #[derive(Default)]
 struct ProviderUpdate {
     admission: Mutex<Admission>,
+    swap_finished: Condvar,
     status: Mutex<Option<ProviderStatus>>,
 }
 
@@ -46,6 +51,7 @@ struct Admission {
     launches: usize,
     checking: bool,
     applying: bool,
+    apply_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -64,32 +70,60 @@ pub(crate) struct Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut state = self
-            .update
-            .admission
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut state = self.update.admission();
         match self.operation {
             Operation::Launch => state.launches -= 1,
             Operation::Check => state.checking = false,
-            Operation::Apply => state.applying = false,
+            Operation::Apply => {
+                state.applying = false;
+                drop(state);
+                self.update.swap_finished.notify_all();
+            }
         }
     }
 }
 
 impl ProviderUpdate {
+    fn admission(&self) -> MutexGuard<'_, Admission> {
+        self.admission.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn try_enter(self: &Arc<Self>, operation: Operation) -> Option<Permit> {
-        let mut state = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.admission();
         match operation {
-            Operation::Launch if !state.applying => state.launches += 1,
             Operation::Check if !state.checking => state.checking = true,
-            Operation::Apply if !state.applying && state.launches == 0 => state.applying = true,
+            Operation::Apply if !state.applying && state.launches == 0 => {
+                state.applying = true;
+                state.apply_generation = state.apply_generation.wrapping_add(1);
+            }
             _ => return None,
         }
-        Some(Permit {
+        Some(self.permit(operation))
+    }
+
+    fn permit(self: &Arc<Self>, operation: Operation) -> Permit {
+        Permit {
             update: Arc::clone(self),
             operation,
-        })
+        }
+    }
+
+    fn launch(self: &Arc<Self>, patience: Duration) -> Option<Permit> {
+        let mut state = self
+            .swap_finished
+            .wait_timeout_while(self.admission(), patience, |state| state.applying)
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
+        if state.applying {
+            return None;
+        }
+        state.launches += 1;
+        Some(self.permit(Operation::Launch))
+    }
+
+    fn idle_generation(&self) -> Option<u64> {
+        let state = self.admission();
+        (!state.applying).then_some(state.apply_generation)
     }
 
     fn status(&self) -> Option<ProviderStatus> {
@@ -100,11 +134,7 @@ impl ProviderUpdate {
     }
 
     fn launching(&self) -> bool {
-        self.admission
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .launches
-            != 0
+        self.admission().launches != 0
     }
 
     fn publish(&self, status: &ProviderStatus) {
@@ -128,7 +158,7 @@ impl Controller {
 
     pub(super) fn launch(&self, provider: Provider) -> Result<Permit, ProtocolError> {
         self.update(provider)
-            .try_enter(Operation::Launch)
+            .launch(LAUNCH_PATIENCE)
             .ok_or_else(|| {
                 ProtocolError::new(
                     ProtocolErrorCode::TerminalUnavailable,
@@ -178,12 +208,30 @@ async fn observe(
     provider: Provider,
     search_path: Option<&OsStr>,
 ) -> ProviderStatus {
-    if let Some(_observing) = slot.try_enter(Operation::Launch) {
-        with_history(inspect(provider, search_path).await, slot.status())
-    } else {
-        // A mutation always publishes its verified baseline first.
-        slot.status().expect("provider update baseline")
+    observe_installation(slot, async {
+        let mut status = inspect(ProviderStatus::detect(provider, search_path), search_path).await;
+        if let Some(error) = install::recovery_issue(&status, search_path) {
+            status.error = Some(error);
+        }
+        status
+    })
+    .await
+}
+
+async fn observe_installation(
+    slot: &ProviderUpdate,
+    inspect: impl Future<Output = ProviderStatus>,
+) -> ProviderStatus {
+    if let Some(generation) = slot.idle_generation() {
+        let detected = inspect.await;
+        let history = slot.status();
+        if slot.idle_generation() == Some(generation) {
+            return with_history(detected, history);
+        }
     }
+    // A mutation publishes its baseline first. Discard observations that
+    // could have seen an intermediate installation, even if the swap ended.
+    slot.status().expect("provider update baseline")
 }
 
 pub(super) fn update(
@@ -243,15 +291,44 @@ async fn check(
         );
         return status;
     };
+    // An interrupted swap can hide the executable entirely. Recover it before
+    // probing the version or deciding whether the installation is updatable.
+    let previous = slot.status();
+    let mut baseline = ProviderStatus::detect(provider, search_path);
+    if let Some(issue) = install::recovery_issue(&baseline, search_path) {
+        baseline = with_history(baseline, previous.clone());
+        baseline.error = Some(issue.clone());
+        slot.publish(&baseline);
+        let control = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
+        let failure = match admit_apply(&control, host, slot, provider) {
+            Ok((_control, _applying)) => {
+                install::recover(&baseline, search_path).err().map(|error| {
+                    let result = if error.deferred {
+                        ProviderUpdateResult::Deferred
+                    } else {
+                        ProviderUpdateResult::Failed
+                    };
+                    (result, error.reason)
+                })
+            }
+            Err(reason) => Some((ProviderUpdateResult::Deferred, format!("{issue}. {reason}"))),
+        };
+        if let Some((result, error)) = failure {
+            finish(&mut baseline, result, Some(error));
+            slot.publish(&baseline);
+            return baseline;
+        }
+        baseline = ProviderStatus::detect(provider, search_path);
+    }
     let detected = tokio::select! {
-        detected = inspect(provider, search_path) => detected,
+        detected = inspect(baseline, search_path) => detected,
         () = wait_for_shutdown(host) => {
             let mut status = slot.status().unwrap_or_else(|| ProviderStatus::detect(provider, search_path));
             finish(&mut status, ProviderUpdateResult::Deferred, Some("The daemon is shutting down".into()));
             return status;
         }
     };
-    let mut status = with_history(detected, slot.status());
+    let mut status = with_history(detected, previous);
     // A status request can report the previous result even while a mutation
     // is changing the installation beneath it.
     slot.publish(&status);
@@ -300,7 +377,7 @@ async fn perform_update(
         return (Deferred, Some("The daemon is shutting down".into()));
     }
     if automatic && !automatic_updates_enabled() {
-        return (Skipped, Some("Automatic updates are turned off".into()));
+        return (Deferred, Some("Automatic updates are turned off".into()));
     }
     if slot.launching()
         || super::chat::provider_startup_pending(
@@ -314,7 +391,7 @@ async fn perform_update(
         preparation = install::prepare(status, search_path, automatic) => preparation,
         () = wait_for_shutdown(host) => return (Deferred, Some("The daemon is shutting down".into())),
     };
-    let mut prepared = match preparation {
+    let prepared = match preparation {
         Ok(install::Preparation::Current(version)) => {
             status.version = Some(version);
             return (Current, None);
@@ -326,34 +403,23 @@ async fn perform_update(
     };
     // A settings change during staging takes effect before publication.
     if automatic && !automatic_updates_enabled() {
-        return (Skipped, Some("Automatic updates are turned off".into()));
+        return (Deferred, Some("Automatic updates are turned off".into()));
     }
     match prepared.opt_out(automatic) {
         Ok(Some(reason)) => return (Skipped, Some(reason)),
         Ok(None) => {}
         Err(error) => return (Failed, Some(error)),
     }
-    let applied = {
+    let (applied, prepared) = {
         let control = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
-        let Some(_control) = control.try_shared() else {
-            return (Deferred, Some("The daemon is busy".into()));
+        let (_control, _applying) = match admit_apply(&control, host, slot, status.provider) {
+            Ok(admission) => admission,
+            Err(reason) => return (Deferred, Some(reason.into())),
         };
-        let Some(_applying) = slot.try_enter(Operation::Apply) else {
-            return (Deferred, Some("A provider launch is starting".into()));
-        };
-        {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if state.shutting_down || state.startup_recovery().is_some() {
-                return (
-                    Deferred,
-                    Some("The daemon is shutting down or recovering sessions".into()),
-                );
-            }
-            if super::chat::provider_startup_pending(&state, status.provider) {
-                return (Deferred, Some("A provider launch is starting".into()));
-            }
-        }
-        prepared.apply(search_path).await
+        // Drop the transaction before the launch fence if this task unwinds.
+        let mut prepared = prepared;
+        let applied = prepared.apply(search_path).await;
+        (applied, prepared)
     };
     let version = match applied {
         Ok(install::Applied::Updated(version)) => version,
@@ -375,6 +441,26 @@ async fn perform_update(
         .err()
         .map(|error| format!("Update succeeded, but the model catalog refresh failed: {error}"));
     (Updated, error)
+}
+
+fn admit_apply<'a>(
+    control: &'a ControlGate,
+    host: &SharedHost,
+    slot: &Arc<ProviderUpdate>,
+    provider: Provider,
+) -> Result<(Shared<'a>, Permit), &'static str> {
+    let control = control.try_shared().ok_or("The daemon is busy")?;
+    let applying = slot
+        .try_enter(Operation::Apply)
+        .ok_or("A provider launch is starting")?;
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.shutting_down || state.startup_recovery().is_some() {
+        return Err("The daemon is shutting down or recovering sessions");
+    }
+    if super::chat::provider_startup_pending(&state, provider) {
+        return Err("A provider launch is starting");
+    }
+    Ok((control, applying))
 }
 
 async fn refresh_capabilities(
@@ -425,13 +511,13 @@ impl Drop for Scheduler {
 /// Start after the daemon has restored its sessions. Recovering originals defer
 /// mutation, and the later passes still run if that recovery hold is cleared.
 pub(super) fn start(host: Weak<HostLock>) -> std::io::Result<Option<Scheduler>> {
-    if cfg!(test) {
+    if cfg!(test) || !automatic_updates_allowed() {
         return Ok(None);
     }
+    let Some(settings_path) = crate::instance::settings_path() else {
+        return Ok(None);
+    };
     let runtime = runtime()?;
-    let mut pending = Vec::new();
-    let mut wait = Duration::ZERO;
-    let mut next_full_check = Instant::now();
     let (stop, stopped) = crossbeam_channel::bounded(1);
     let worker = thread::Builder::new()
         .name("cagents-provider-update".into())
@@ -443,10 +529,11 @@ pub(super) fn start(host: Weak<HostLock>) -> std::io::Result<Option<Scheduler>> 
                 libc::nice(10);
                 libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13);
             }
-            while matches!(
-                stopped.recv_timeout(wait),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout)
-            ) {
+            let mut preferences = preferences::SettingsWatch::new(settings_path);
+            let mut pending = Vec::new();
+            let mut next_check = Instant::now();
+            let mut next_full_check = next_check;
+            while let Some(enabled) = preferences.wait_for_check(&stopped, next_check) {
                 let Some(host) = host.upgrade() else {
                     break;
                 };
@@ -454,10 +541,10 @@ pub(super) fn start(host: Weak<HostLock>) -> std::io::Result<Option<Scheduler>> 
                     break;
                 }
                 let now = Instant::now();
-                if !automatic_updates_enabled() {
+                if !enabled {
                     pending.clear();
-                    next_full_check = now + INTERVAL;
-                    wait = INTERVAL;
+                    next_full_check = now;
+                    next_check = now + INTERVAL;
                     continue;
                 }
                 if now >= next_full_check {
@@ -478,14 +565,15 @@ pub(super) fn start(host: Weak<HostLock>) -> std::io::Result<Option<Scheduler>> 
                         .collect(),
                     Err(error) => {
                         tracing::warn!(%error, "the provider update check will be retried");
-                        wait = DEFERRED_RETRY;
+                        next_check = Instant::now() + DEFERRED_RETRY;
                         continue;
                     }
                 };
-                wait = next_full_check.saturating_duration_since(Instant::now());
-                if !pending.is_empty() {
-                    wait = wait.min(DEFERRED_RETRY);
-                }
+                next_check = if pending.is_empty() {
+                    next_full_check
+                } else {
+                    next_full_check.min(Instant::now() + DEFERRED_RETRY)
+                };
             }
         })?;
     Ok(Some(Scheduler {
@@ -494,25 +582,21 @@ pub(super) fn start(host: Weak<HostLock>) -> std::io::Result<Option<Scheduler>> 
     }))
 }
 
-fn automatic_updates_enabled() -> bool {
+fn automatic_updates_allowed() -> bool {
     // These runners explicitly provide synthetic installs and must stay offline.
     if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some()
         || std::env::var_os("CAGENTS_REHEARSAL_ROOT").is_some()
     {
         return false;
     }
-    if crate::instance::IS_DEVELOPMENT
-        && std::env::var_os("CAGENTS_DEVELOPMENT_PROVIDER_UPDATES").as_deref()
-            != Some(OsStr::new("1"))
-    {
-        return false;
-    }
-    let preference = crate::settings::default_path()
-        .and_then(|path| crate::settings::provider_update_preference(&path));
-    preference.unwrap_or_else(|error| {
-        tracing::warn!(%error, "automatic provider updates could not read settings");
-        false
-    })
+    !crate::instance::IS_DEVELOPMENT
+        || std::env::var_os("CAGENTS_DEVELOPMENT_PROVIDER_UPDATES").as_deref()
+            == Some(OsStr::new("1"))
+}
+
+fn automatic_updates_enabled() -> bool {
+    automatic_updates_allowed()
+        && crate::instance::settings_path().is_some_and(|path| preferences::enabled(&path))
 }
 
 #[cfg(test)]
@@ -773,6 +857,65 @@ esac
         assert_eq!(current.last_result, Some(ProviderUpdateResult::Current));
     }
 
+    #[tokio::test]
+    async fn a_status_probe_allows_apply_and_discards_an_overlapping_observation() {
+        let updates = Controller::default();
+        let slot = updates.update(Provider::Omp);
+        let mut baseline = ProviderStatus::detect(Provider::Omp, Some(OsStr::new("/")));
+        baseline.version = Some("1.0.0".into());
+        slot.publish(&baseline);
+        let (started, probe_started) = tokio::sync::oneshot::channel();
+        let (swapped, probe_resume) = tokio::sync::oneshot::channel();
+        let observing = observe_installation(slot, async {
+            started.send(()).unwrap();
+            probe_resume.await.unwrap();
+            let mut intermediate = baseline.clone();
+            intermediate.version = None;
+            intermediate
+        });
+        let applying = async {
+            probe_started.await.unwrap();
+            assert!(!slot.launching());
+            let permit = slot.try_enter(Operation::Apply).unwrap();
+            drop(permit);
+            swapped.send(()).unwrap();
+        };
+        let (status, ()) = tokio::join!(observing, applying);
+        assert_eq!(status, baseline);
+    }
+
+    #[tokio::test]
+    async fn status_reports_an_unrepairable_stage_without_an_update_check() {
+        use std::{fs, os::unix::fs::DirBuilderExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let scope = directory.path().join("lib/node_modules/@openai");
+        fs::create_dir_all(&scope).unwrap();
+        let stage = scope.join(".cagents-provider-update-legacy");
+        fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
+        fs::write(stage.join(".cagents-stage"), []).unwrap();
+        fs::write(stage.join(".cagents-update-incomplete"), []).unwrap();
+        fs::create_dir(stage.join("codex")).unwrap();
+        // Codex's npm launcher points to the scope that contains its stage,
+        // even after the underlying installation has been moved away.
+        std::os::unix::fs::symlink(
+            scope.join("codex/bin/codex.js"),
+            directory.path().join("codex"),
+        )
+        .unwrap();
+
+        let updates = Controller::default();
+        let status = observe(
+            updates.update(Provider::Codex),
+            Provider::Codex,
+            Some(directory.path().as_os_str()),
+        )
+        .await;
+        let error = status.error.unwrap();
+        assert!(error.contains(&*stage.to_string_lossy()), "{error}");
+        assert!(error.contains("no rollback journal"), "{error}");
+    }
+
     #[test]
     fn updates_stage_during_launches_and_apply_after_they_finish() {
         let updates = Controller::default();
@@ -787,11 +930,39 @@ esac
         drop(second);
 
         let applied = codex.try_enter(Operation::Apply).unwrap();
-        assert!(updates.launch(Provider::Codex).err().unwrap().retryable);
+        assert!(codex.launch(Duration::ZERO).is_none());
         assert!(updates.launch(Provider::Claude).is_ok());
         drop(applied);
         drop(check);
         assert!(updates.launch(Provider::Codex).is_ok());
         assert!(codex.try_enter(Operation::Check).is_some());
+    }
+
+    #[test]
+    fn a_launch_waits_for_the_swap_then_acquires_its_permit() {
+        let updates = Controller::default();
+        let slot = updates.update(Provider::Omp);
+        let applying = slot.try_enter(Operation::Apply).unwrap();
+        let (started, starting) = crossbeam_channel::bounded(1);
+        let (publish, launched) = crossbeam_channel::bounded(1);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                started.send(()).unwrap();
+                publish.send(updates.launch(Provider::Omp)).unwrap();
+            });
+            starting.recv().unwrap();
+            assert!(matches!(
+                launched.recv_timeout(Duration::from_millis(50)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ));
+            drop(applying);
+            let permit = launched
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert!(slot.try_enter(Operation::Apply).is_none());
+            drop(permit);
+            assert!(slot.try_enter(Operation::Apply).is_some());
+        });
     }
 }

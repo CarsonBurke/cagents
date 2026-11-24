@@ -20,7 +20,7 @@ pub(super) async fn prepare(
     if let Some(reason) = policy.opt_out(&|name| std::env::var_os(name), automatic) {
         return Ok(Preparation::Skipped(reason));
     }
-    let preparation = prepare_for_home(status, context, home, &policy).await?;
+    let preparation = prepare_for_home(status, context, home, &policy, automatic).await?;
     if matches!(&preparation, Preparation::Ready(_))
         && load_live_policy(home)?.channel() != policy.channel()
     {
@@ -198,11 +198,9 @@ async fn prepare_for_home(
     context: &CommandContext<'_>,
     home: &Path,
     policy: &Policy,
+    automatic: bool,
 ) -> Result<Preparation, String> {
     let launcher_dir = home.join(".local/bin").canonicalize().map_err(fs_error)?;
-    if status.executable.as_deref().and_then(Path::parent) != Some(launcher_dir.as_path()) {
-        reap_stages(&launcher_dir);
-    }
     let launcher = launcher_dir.join("claude");
     fs::read_link(&launcher).map_err(fs_error)?;
     let launcher_stamp = EntryStamp::read(&launcher).map_err(fs_error)?;
@@ -214,6 +212,7 @@ async fn prepare_for_home(
     let installed = status
         .version
         .as_deref()
+        .and_then(|version| Version::parse(version).ok())
         .ok_or("Claude's installed version is unknown")?;
     let channel = policy.channel();
     let curl = crate::account::probe::find_executable("curl", context.search_path)
@@ -238,14 +237,16 @@ async fn prepare_for_home(
         .and_then(|output| Version::parse(output.trim()).ok())
         .ok_or("Claude's release channel did not report a version")?;
     let expected = next.to_string();
-    if installed == expected {
+    if installed == next {
         installation.check(context.search_path)?;
         return Ok(Preparation::Current(expected));
     }
     if let Some(reason) = policy.exclusion(&next) {
         return Ok(Preparation::Skipped(reason));
     }
-    if channel == "latest" && Version::parse(installed).is_ok_and(|version| next < version) {
+    // The minimum version is a floor: meeting it never requires replacing a
+    // newer installation with an older release.
+    if (automatic || channel == "latest") && next.cmp_precedence(&installed).is_lt() {
         return Ok(Preparation::Skipped(format!(
             "Claude's updater selected older release {expected}"
         )));
@@ -256,9 +257,24 @@ async fn prepare_for_home(
     let stage = stage_in(versions)?;
     let staged_home = stage.path();
     let data = staged_home.join(".local/share");
-    let mut command = context.command(&installation.resolved);
+    let mut command = isolated_installer(
+        &installation.resolved,
+        &[
+            "http_proxy",
+            "HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+            "NODE_EXTRA_CA_CERTS",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ],
+        std::env::vars_os(),
+    );
     command
-        .env_clear()
         .env(
             "PATH",
             context
@@ -274,23 +290,6 @@ async fn prepare_for_home(
         .env("DISABLE_TELEMETRY", "1")
         .current_dir(staged_home)
         .args(["install", &expected]);
-    for name in [
-        "http_proxy",
-        "HTTP_PROXY",
-        "https_proxy",
-        "HTTPS_PROXY",
-        "all_proxy",
-        "ALL_PROXY",
-        "no_proxy",
-        "NO_PROXY",
-        "NODE_EXTRA_CA_CERTS",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
     stage.protect(&mut command);
     run_update(command).await?;
 
@@ -378,6 +377,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_checks_keep_newer_claude_on_both_channels() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let bin = home.join(".local/bin");
+        let versions = home.join(".local/share/claude/versions");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&versions).unwrap();
+        let installed = versions.join("2.0.0");
+        let launcher = bin.join("claude");
+        write_executable(&installed, "#!/bin/sh\nexit 1\n");
+        symlink(&installed, &launcher).unwrap();
+        write_executable(&bin.join("curl"), "#!/bin/sh\necho 1.0.0\n");
+
+        let mut status = fixture_status(Provider::Claude, &launcher, ProviderInstallMethod::Native);
+        status.version = Some("2.0.0".into());
+        let path = fixture_path(&bin);
+        let context = CommandContext {
+            search_path: Some(&path),
+        };
+        for (channel, minimum, reason) in [
+            ("stable", None, "selected older release 1.0.0"),
+            ("stable", Some("1.0.0"), "selected older release 1.0.0"),
+            ("latest", None, "selected older release 1.0.0"),
+            ("stable", Some("1.1.0"), "exclude release 1.0.0"),
+        ] {
+            let policy = Policy {
+                global: Value::Null,
+                user: serde_json::json!({
+                    "autoUpdatesChannel": channel,
+                    "minimumVersion": minimum,
+                }),
+                managed: vec![],
+            };
+            assert!(matches!(
+                prepare_for_home(&status, &context, &home, &policy, true).await.unwrap(),
+                Preparation::Skipped(message) if message.contains(reason)
+            ));
+        }
+        assert_eq!(launcher.canonicalize().unwrap(), installed);
+        assert!(!versions.join("1.0.0").exists());
+    }
+
+    #[tokio::test]
     async fn prepares_in_a_private_home_then_switches_the_native_launcher() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path();
@@ -417,12 +459,13 @@ esac
         };
         let policy = Policy {
             global: Value::Null,
-            user: Value::Null,
+            user: serde_json::json!({"autoUpdatesChannel": "stable", "minimumVersion": "2.0.0"}),
             managed: vec![],
         };
-        let Preparation::Ready(mut update) = prepare_for_home(&status, &context, home, &policy)
-            .await
-            .unwrap()
+        let Preparation::Ready(mut update) =
+            prepare_for_home(&status, &context, home, &policy, true)
+                .await
+                .unwrap()
         else {
             panic!("expected staged Claude update");
         };

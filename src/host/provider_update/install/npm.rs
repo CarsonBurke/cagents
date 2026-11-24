@@ -22,7 +22,7 @@ use crate::{
 };
 
 const PACKAGE: &str = "@openai/codex";
-const SCOPE_DIRECTORY: &str = "lib/node_modules/@openai";
+pub(super) const SCOPE_DIRECTORY: &str = "lib/node_modules/@openai";
 const WRAPPER: &str = "bin/codex.js";
 const NESTED_SCOPE: &str = "node_modules/@openai";
 
@@ -75,7 +75,6 @@ pub(super) async fn prepare(
     {
         return Err("Codex's npm package directory is not owned by this user".into());
     }
-    super::reap_stages(&scope);
     if automatic {
         // npm records the installed version but no version constraint for a
         // global install, so an install pinned with @VERSION looks the same.

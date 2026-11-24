@@ -1,14 +1,13 @@
 use std::ffi::OsStr;
 
-use crate::{
-    account::provider_install::{ProviderStatus, read_version},
-    agent::Provider,
-};
+use crate::account::provider_install::{ProviderStatus, read_version};
 
-pub(super) async fn inspect(provider: Provider, search_path: Option<&OsStr>) -> ProviderStatus {
-    let mut status = ProviderStatus::detect(provider, search_path);
+pub(super) async fn inspect(
+    mut status: ProviderStatus,
+    search_path: Option<&OsStr>,
+) -> ProviderStatus {
     if let Some(executable) = &status.executable {
-        match read_version(provider, executable, search_path).await {
+        match read_version(status.provider, executable, search_path).await {
             Ok(version) => status.version = Some(version),
             Err(error) => status.error = Some(error),
         }
