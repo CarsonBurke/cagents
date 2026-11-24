@@ -200,6 +200,11 @@ impl Registry {
         Self::at(&self.path)
     }
 
+    /// Open projects in registry order. A single query is a coherent read.
+    pub(super) fn projects(&self) -> Result<Vec<ModelProject>, String> {
+        project_rows(&self.db)
+    }
+
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
         // Independent execution and workspace writers can commit between SQL
@@ -771,7 +776,7 @@ fn close_project(
 }
 
 fn project_rows(db: &Connection) -> Result<Vec<ModelProject>, String> {
-    db.prepare("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
+    db.prepare_cached("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
         .map_err(|error| error.to_string())?
         .query_map([], |row| {
             Ok(ModelProject {

@@ -44,6 +44,7 @@ use crate::{
     repository::CancellationToken,
     terminal_ipc::ServerMessage,
     work::{Board, Column, Forge, Item, Request, Response, Scope},
+    workspace_model::ModelProject,
 };
 
 /// The shortest gap between two event-driven scans of one project; edits in
@@ -925,18 +926,15 @@ fn now_unix_ms() -> u64 {
     crate::chat::now_ms().unwrap_or_default()
 }
 
-/// The open Git projects: repository and name.
-fn open_projects(host: &SharedHost) -> Result<Vec<(PathBuf, String)>, String> {
-    let model = agent_execution::registry(host)?
+fn open_projects(host: &SharedHost) -> Result<Vec<ModelProject>, String> {
+    agent_execution::registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .model()?;
-    Ok(model
-        .projects
-        .into_iter()
-        .filter(|project| project.kind == ProjectKind::Git)
-        .map(|project| (project.repository, project.name))
-        .collect())
+        .projects()
+}
+
+fn git_project(project: ModelProject) -> Option<(PathBuf, String)> {
+    (project.kind == ProjectKind::Git).then_some((project.repository, project.name))
 }
 
 /// Live sessions with their directories canonicalized, so a session started
@@ -999,35 +997,30 @@ impl Handle {
         self.0.scanner.notify();
     }
 
-    /// The repositories `scope` covers, read from the shared workspace model.
+    /// The repositories `scope` covers, read from the open project rows.
     fn resolve(&self, host: &SharedHost, scope: &Scope) -> Result<Vec<(PathBuf, String)>, String> {
-        let model = agent_execution::registry(host)?
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .model()?;
-        let git = |project: &crate::workspace_model::ModelProject| {
-            (project.kind == ProjectKind::Git)
-                .then(|| (project.repository.clone(), project.name.clone()))
-        };
+        let projects = open_projects(host)?;
         let path = match scope {
-            Scope::All => return Ok(model.projects.iter().filter_map(git).collect()),
+            Scope::All => return Ok(projects.into_iter().filter_map(git_project).collect()),
             Scope::Project(path) => path,
         };
-        let repository = if model.project(path).is_some() {
+        let repository = if projects.iter().any(|project| &project.repository == path) {
             path.clone()
         } else if path.is_relative() {
-            agent_execution::named(&model, path)?
+            agent_execution::named(&projects, path)?
         } else {
-            crate::project_location::place(path, &model)
+            crate::project_location::place_among(path, &projects)
                 .project
                 .ok_or_else(|| format!("No open project contains {}", path.display()))?
         };
-        let project = model
-            .project(&repository)
+        let project = projects
+            .into_iter()
+            .find(|project| project.repository == repository)
             .ok_or_else(|| format!("No open project contains {}", path.display()))?;
-        git(project)
-            .map(|project| vec![project])
-            .ok_or_else(|| format!("{} is not a Git project", project.name))
+        if project.kind != ProjectKind::Git {
+            return Err(format!("{} is not a Git project", project.name));
+        }
+        Ok(vec![(project.repository, project.name)])
     }
 
     fn board(&self, host: &SharedHost, scope: &Scope, fresh: bool) -> Result<Board, String> {
@@ -1780,8 +1773,8 @@ impl Scanner {
 
     /// Tracks the open Git projects, forgetting closed ones.
     fn refresh(&mut self, handle: &Handle, host: &SharedHost) {
-        let projects = match open_projects(host) {
-            Ok(projects) => projects,
+        let projects: Vec<_> = match open_projects(host) {
+            Ok(projects) => projects.into_iter().filter_map(git_project).collect(),
             Err(error) => {
                 tracing::debug!(%error, "the Work board could not read the open projects");
                 return;
@@ -2125,6 +2118,78 @@ mod tests {
         );
         assert_eq!(named("other").unwrap(), Path::new("/elsewhere/other"));
         assert!(named("worktrees/fix").is_err());
+    }
+
+    #[test]
+    fn work_project_reads_skip_unrelated_view_history() {
+        use crate::workspace_model::ModelEdit;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let mut registry = super::super::model::Registry::at(&path).unwrap();
+        let repo = directory.path().join("repo");
+        let folder = directory.path().join("folder");
+        for (repository, name, kind) in [
+            (&repo, "Repo", ProjectKind::Git),
+            (&folder, "Folder", ProjectKind::Folder),
+        ] {
+            registry
+                .apply(&ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: name.into(),
+                    kind,
+                })
+                .unwrap();
+        }
+
+        // A project read has no reason to decode an unrelated pane tombstone.
+        let db = rusqlite::Connection::open(path).unwrap();
+        let scope: i64 = db
+            .query_row(
+                "INSERT INTO view_scopes(repository, worktree, revision) VALUES (?1, ?1, 0)
+                 RETURNING id",
+                [folder.to_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "INSERT INTO retired_panes(scope, pane, ordinal, retired_at_unix_ms)
+             VALUES (?1, 'unreadable', 1, 0)",
+            [scope],
+        )
+        .unwrap();
+        assert!(registry.model().is_err());
+
+        let host = super::super::service::test_host();
+        host.lock().unwrap().execution_registry = Some(Arc::new(Mutex::new(registry)));
+        let handle = Handle::idle(Arc::downgrade(&host));
+        for scope in [
+            Scope::All,
+            Scope::Project(repo.clone()),
+            Scope::Project("rEpO".into()),
+        ] {
+            assert_eq!(
+                handle.resolve(&host, &scope).unwrap(),
+                vec![(repo.clone(), "Repo".into())]
+            );
+        }
+        assert_eq!(
+            handle.resolve(&host, &Scope::Project(folder)).unwrap_err(),
+            "Folder is not a Git project"
+        );
+        let mut scanner = Scanner {
+            monitor: None,
+            configured: BTreeMap::new(),
+            stamped: HashMap::new(),
+            sessions: Vec::new(),
+            sampled: None,
+            refreshed: None,
+        };
+        scanner.refresh(&handle, &host);
+        assert_eq!(
+            handle.shared().projects.keys().collect::<Vec<_>>(),
+            vec![&repo]
+        );
     }
 
     fn polling_handle() -> Handle {
