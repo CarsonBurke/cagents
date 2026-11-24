@@ -10,15 +10,14 @@ const WAIT: Duration = Duration::from_secs(5);
 /// The daemon trouble behind #2444: a composed draft is closed while its
 /// Insert is still unanswered. The Insert lands, but the Close does not -
 /// refused outright, or given up on as the daemon stopped answering. The
-/// draft stays closed, its removal is sent again, and a new chat's first
-/// message is saved and started. Before, the view reopened the closed card,
-/// storage refused it, and every first message failed on that refusal.
+/// draft stays closed, the person is told other windows may still show it,
+/// and a new chat's first message is saved and started. Before, the view
+/// reopened the closed card, storage refused it, and every first message
+/// failed on that refusal.
 ///
-/// The registry may also hold an older copy of the draft that this window
-/// published, when a later change to its options was lost to the same
-/// trouble: still this window's draft, removed again without a notice. A copy
-/// this window never published was changed by another client, which keeps
-/// it: this window says so and sends nothing.
+/// Whatever copy the registry holds - the one closed, an older one this
+/// window published, or one another window changed - the identity this
+/// window closed stays closed here.
 #[test]
 fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -93,7 +92,8 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
         app.publish_view_changes();
         assert!(
             !app.card_state(card).unwrap().existence.is_open(),
-            "{refusal}: the draft closes at once"
+            "{refusal}: the draft closes at once: {:?}",
+            app.status.as_ref().map(|notice| notice.message.to_string()),
         );
         let close = app
             .shared_views
@@ -156,24 +156,15 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
                 *operation != close
                     && matches!(change, Change::RemoveSource { before, .. } if before.id == card)
             });
-        if held_copy == Held::ChangedElsewhere {
-            assert!(!resent, "{refusal}: another window's pane is not removed");
-            assert_eq!(
-                told,
-                vec![super::super::PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()],
-                "{refusal}"
-            );
-        } else {
-            assert!(
-                told.is_empty(),
-                "{refusal}: nothing to tell when the removal is sent again: {told:?}"
-            );
-            assert!(
-                resent,
-                "{refusal}: the removal is sent again: {:?}",
-                app.shared_views.pending
-            );
-        }
+        assert!(
+            !resent,
+            "{refusal}: nothing is sent behind the person's back"
+        );
+        assert_eq!(
+            told,
+            vec![super::super::PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()],
+            "{refusal}"
+        );
         app.persist();
         app.session
             .as_ref()

@@ -211,6 +211,14 @@ impl Cagents {
             if !views::same_removal_source(before, &local) {
                 return Err(());
             }
+            let repository = match scope {
+                Scope::Channel(channel) => self
+                    .workspace_model
+                    .channel(*channel)
+                    .map(|channel| channel.repository.clone())
+                    .ok_or(())?,
+                Scope::Worktree { repository, .. } => repository.clone(),
+            };
             let terminal = match self.cards.get(&card) {
                 Some(CardRuntime::Terminal(handle)) => handle
                     .execution_instance()
@@ -218,9 +226,34 @@ impl Cagents {
                     .map(|(instance, owner)| TerminalRemovalBasis::Worker { owner, instance }),
                 _ => None,
             };
-            let change = self
-                .removal_source_change(scope, before, terminal)
-                .ok_or(())?;
+            let change = Change::RemoveSource {
+                registry: self.workspace_model.identity,
+                repository: repository.clone(),
+                before: before.clone(),
+                terminal,
+                capture: matches!(before.kind, CardKind::Terminal(_)).then(|| {
+                    CapturedTerminalSource {
+                        registry: self.workspace_model.identity,
+                        repository,
+                        scope: scope.clone(),
+                        view_revision: self
+                            .workspace_model
+                            .views
+                            .iter()
+                            .find(|v| &v.scope == scope)
+                            .unwrap()
+                            .revision,
+                        model_sequence: self.shared_views.snapshot_sequence.max(
+                            self.shared_views
+                                .view_sequences
+                                .get(scope)
+                                .copied()
+                                .unwrap_or(0),
+                        ),
+                        before: Box::new(before.clone()),
+                    }
+                }),
+            };
             if !self.removal_source_expected(scope, &change) {
                 return Err(());
             }
@@ -239,53 +272,6 @@ impl Cagents {
                 false
             }
         }
-    }
-
-    /// The removal of `before`, as `scope` lists it now, consenting to close
-    /// exactly that source. `None` when the scope's project or view is
-    /// unknown here.
-    pub(super) fn removal_source_change(
-        &self,
-        scope: &Scope,
-        before: &Pane,
-        terminal: Option<TerminalRemovalBasis>,
-    ) -> Option<Change> {
-        let repository = match scope {
-            Scope::Channel(channel) => self
-                .workspace_model
-                .channel(*channel)
-                .map(|channel| channel.repository.clone())?,
-            Scope::Worktree { repository, .. } => repository.clone(),
-        };
-        let capture = match before.kind {
-            CardKind::Terminal(_) => Some(CapturedTerminalSource {
-                registry: self.workspace_model.identity,
-                repository: repository.clone(),
-                scope: scope.clone(),
-                view_revision: self
-                    .workspace_model
-                    .views
-                    .iter()
-                    .find(|view| &view.scope == scope)?
-                    .revision,
-                model_sequence: self.shared_views.snapshot_sequence.max(
-                    self.shared_views
-                        .view_sequences
-                        .get(scope)
-                        .copied()
-                        .unwrap_or(0),
-                ),
-                before: Box::new(before.clone()),
-            }),
-            _ => None,
-        };
-        Some(Change::RemoveSource {
-            registry: self.workspace_model.identity,
-            repository,
-            before: before.clone(),
-            terminal,
-            capture,
-        })
     }
 
     /// Whether the captured source is still what the registry holds for the
@@ -308,50 +294,12 @@ impl Cagents {
         self.status = Some(TransientNotice::warning(PANE_KEPT));
     }
 
-    /// Keeps each copy of `card` this window had published, or the registry
-    /// had accepted, as it closes: the copies a later removal of the pane may
-    /// find in the registry without another client having changed it.
-    fn record_closed_sources(&mut self, card: CardId) {
-        let accepted = self
-            .workspace_model
-            .views
-            .iter()
-            .flat_map(|view| view.panes.iter());
-        let published = self
-            .shared_views
-            .pending
-            .iter()
-            .flat_map(|(_, _, change)| match change {
-                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => vec![pane],
-                Change::Update { before, pane }
-                | Change::UpdateTerminalSource { before, pane, .. } => {
-                    vec![before, pane]
-                }
-                _ => Vec::new(),
-            });
-        let copies: Vec<Pane> = accepted
-            .chain(published)
-            .filter(|pane| pane.id == card)
-            .cloned()
-            .collect();
-        if copies.is_empty() {
-            return;
-        }
-        let sources = self.shared_views.closed_sources.entry(card).or_default();
-        for copy in copies {
-            if !sources.contains(&copy) {
-                sources.push(copy);
-            }
-        }
-    }
-
     pub(in crate::app) fn prepare_shared_removal(&mut self, card: CardId) -> bool {
         // A fenced pane's saved source is unconfirmed, so its close captures
         // none: publication removes the closed pane from its view by identity.
         if self.shared_views.quarantined.contains(&card) {
             return true;
         }
-        self.record_closed_sources(card);
         if !self.shared_views.removals.contains_key(&card) && !self.capture_shared_removal(card) {
             return false;
         }

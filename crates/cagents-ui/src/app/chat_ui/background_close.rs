@@ -39,7 +39,7 @@ pub(in crate::app) struct Closing {
 
 /// Whether `current` is `closed` with nothing changed but what its provider has
 /// confirmed since: the conversation's identity and how its provider is kept.
-pub(in crate::app) fn only_confirms(closed: &chat::Session, current: &chat::Session) -> bool {
+pub(super) fn only_confirms(closed: &chat::Session, current: &chat::Session) -> bool {
     if closed
         .launch
         .session_id

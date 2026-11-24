@@ -76,7 +76,7 @@ mod artifacts;
 mod attachment_draft;
 mod attachment_tile;
 mod auth_recovery;
-pub(in crate::app) mod background_close;
+mod background_close;
 pub(in crate::app) use background_close::shares_conversation;
 #[cfg(test)]
 pub(in crate::app) mod blocked_recovery_tests;

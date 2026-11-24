@@ -275,11 +275,10 @@ pub(in crate::app) const PANE_KEPT: &str =
 pub(super) const PANE_KEPT_ELSEWHERE: &str =
     "This pane couldn't be removed everywhere, so it may come back. Close it again if it does.";
 
-/// A Close the registry refused because another window changed the pane
-/// first, as by starting a conversation in it. The pane stays closed here and
-/// open in that window.
+/// A Close the registry refused or never received. The pane stays closed
+/// here, under its identity, but other windows may still show it.
 pub(super) const PANE_CLOSED_HERE_KEPT_ELSEWHERE: &str =
-    "This pane changed in another window before it could close, so it stays open there.";
+    "This pane closed here, but other windows may still show it. Close it there if they do.";
 
 /// Any other pane edit the registry would not save: a rename, a resize, a
 /// move or an added pane. This window then shows the panes as saved.
@@ -343,22 +342,6 @@ fn view_scope_hold<'a>(
     })
 }
 
-/// How many times one connection sends the removal of a pane closed here
-/// that the registry keeps refusing. A reconnect is a new chance.
-const OUTSTANDING_CLOSE_SENDS: u8 = 4;
-
-/// Where a pane this window closed stands with a registry that still lists it.
-#[derive(Clone, Debug, Default)]
-pub(super) struct OutstandingClose {
-    /// The registry, scope and view revision its removal was last sent at.
-    sent_at: Option<(uuid::Uuid, Scope, u64)>,
-    /// Removals sent for it on this connection.
-    sends: u8,
-    /// Another client changed the pane since: it stays open there, and
-    /// nothing is sent for it on this connection.
-    kept_elsewhere: bool,
-}
-
 #[derive(Default)]
 pub(super) struct State {
     pub(super) removals: HashMap<CardId, Option<removal::RemovalSource>>,
@@ -380,16 +363,6 @@ pub(super) struct State {
     pub(super) metadata_revisions: HashMap<super::workspace_model_sync::MetadataKey, u64>,
     /// Exact closed pane identities, retained across reconnects to this registry.
     pub(super) closed: HashSet<CardId>,
-    /// Panes this window closed, and keeps closed, that a shared view still
-    /// lists: their removal never reached the registry, or it was refused.
-    /// Its removal is sent again at most once per view revision, and only a
-    /// few times per connection, so a refusal never becomes a loop.
-    pub(super) outstanding_closes: HashMap<CardId, OutstandingClose>,
-    /// Each copy of a pane this window had published or seen accepted when
-    /// it closed the pane. A registry still holding one of them holds this
-    /// window's pane, however far behind the card it is; any other copy was
-    /// changed by another client.
-    pub(super) closed_sources: HashMap<CardId, Vec<Pane>>,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -622,8 +595,6 @@ impl State {
             view_sequences,
             metadata_revisions,
             closed,
-            outstanding_closes,
-            closed_sources,
             local_projection_count: _,
             topology_build_count: _,
             view_projection_count: _,
@@ -679,8 +650,6 @@ impl State {
             view_sequences: view_sequences.clone(),
             metadata_revisions: metadata_revisions.clone(),
             closed: closed.clone(),
-            outstanding_closes: outstanding_closes.clone(),
-            closed_sources: closed_sources.clone(),
             registry_unavailable: *registry_unavailable,
             unintroduced_projects: *unintroduced_projects,
             baseline: baseline.clone(),
@@ -972,28 +941,20 @@ impl Cagents {
         card: CardId,
         error: &str,
     ) {
-        let kept = self.workspace_model.views.iter().find_map(|view| {
-            view.panes
-                .iter()
-                .find(|pane| pane.id == card)
-                .map(|pane| (view.scope.clone(), pane.clone()))
-        });
+        let kept = self
+            .workspace_model
+            .views
+            .iter()
+            .any(|view| view.panes.iter().any(|pane| pane.id == card));
         self.index_cards();
-        if let Some((owner, pane)) = kept.as_ref().filter(|_| self.closed_here(card)) {
-            // The pane stays closed here whatever the registry kept. While it
-            // is still what this window closed, its removal is sent again and
-            // there is nothing to tell; another client that changed it since
-            // keeps it open there, which is what the person is told.
-            if self.outstanding_removal(owner, pane).is_some() {
-                tracing::debug!(?scope, %operation, %error, %card, "the registry kept a pane closed here; its removal is sent again");
-            } else {
-                tracing::warn!(?scope, %operation, %error, %card, "the registry kept a pane closed here that another client changed");
-                self.notices
-                    .record(TransientNotice::warning(PANE_CLOSED_HERE_KEPT_ELSEWHERE));
-            }
+        if kept && self.closed_here(card) {
+            // The pane stays closed here whatever the registry kept: storage
+            // holds its tombstone, and the view does not bring it back.
+            tracing::warn!(?scope, %operation, %error, %card, "the registry kept a pane closed here");
+            self.notices
+                .record(TransientNotice::warning(PANE_CLOSED_HERE_KEPT_ELSEWHERE));
             return;
         }
-        let kept = kept.is_some();
         if kept && self.closes_in_background(card) {
             // Its removal was judged against the conversation still running,
             // which is stopping; the pane, out of sight, goes once it has.
@@ -2733,7 +2694,6 @@ impl Cagents {
                 change,
             });
         }
-        self.publish_outstanding_closes();
         for scope in scopes {
             if self.shared_views.blocked.contains(&scope)
                 || self.shared_views.seed_failures.contains_key(&scope)
@@ -3623,8 +3583,8 @@ impl Cagents {
         // snapshot that supplied a descriptor. Exact closed identity wins over
         // both that older descriptor and a pending local insertion overlay.
         // So does this window's own close: a card it closed stays closed
-        // under its identity, whatever a view still lists, and its removal is
-        // sent again until the registry retires it (#2093, #2444).
+        // under its identity, whatever a view still lists. Storage holds its
+        // tombstone and would refuse it reopened (#2093, #2444).
         self.index_cards();
         for view in &mut views {
             let closed: Vec<_> = view
@@ -3640,9 +3600,6 @@ impl Cagents {
             }
             view.panes.retain(|pane| !closed.contains(&pane.id));
             for id in closed {
-                if !self.shared_views.closed.contains(&id) {
-                    self.shared_views.outstanding_closes.entry(id).or_default();
-                }
                 if !view.retired.contains(&id) {
                     view.retired.push(id);
                 }
@@ -4743,137 +4700,6 @@ impl Cagents {
             .is_some_and(|card| card.id == id && matches!(card.existence, Existence::Closed { .. }))
             && !self.shared_views.quarantined.contains(&id)
             && !self.chat_close_returns_through_stop(id)
-    }
-
-    /// The removal that retires `pane`, which `scope` lists, for a card this
-    /// window closed: only while the pane is still what this window closed.
-    /// A pane another client has changed since, as by starting a
-    /// conversation in it, is that client's to close; it stays there.
-    fn outstanding_removal(&self, scope: &Scope, pane: &Pane) -> Option<Change> {
-        let card = self.card_state(pane.id)?;
-        let closed = Pane {
-            id: card.id,
-            title: card.title.clone(),
-            user_title: None,
-            pending_terminal_start: false,
-            width_fraction: card.width_fraction,
-            kind: views::shared_kind(&card.kind),
-            scope: pane.scope.clone(),
-        };
-        // A conversation's pane also changes as its provider confirms what
-        // it already is, as when its session is named after the close.
-        let confirms = matches!((&closed.kind, &pane.kind), (CardKind::Chat(closed), CardKind::Chat(current))
-                if super::chat_ui::background_close::only_confirms(closed, current));
-        // The registry may also be behind the card, holding a copy this
-        // window published before an edit lost to the same trouble.
-        let published = self
-            .shared_views
-            .closed_sources
-            .get(&pane.id)
-            .is_some_and(|sources| {
-                sources
-                    .iter()
-                    .any(|source| views::same_removal_source(source, pane))
-            });
-        if !confirms && !published && !views::same_removal_source(&closed, pane) {
-            return None;
-        }
-        self.removal_source_change(scope, pane, None)
-    }
-
-    /// Sends again the removal of each pane this window closed that a view
-    /// still lists. One is sent at most once for each revision of its view,
-    /// and at most [`OUTSTANDING_CLOSE_SENDS`] times per connection, so a
-    /// refusal waits for the view to change or a reconnect, never looping.
-    fn publish_outstanding_closes(&mut self) {
-        // What a close saw is owed nothing once the registry retired the pane.
-        if !self.shared_views.closed_sources.is_empty() {
-            let owed_nothing: Vec<CardId> = self
-                .shared_views
-                .closed_sources
-                .keys()
-                .copied()
-                .filter(|id| {
-                    self.card_state(*id).is_none()
-                        || self
-                            .workspace_model
-                            .views
-                            .iter()
-                            .any(|view| view.retired.contains(id))
-                })
-                .collect();
-            for id in owed_nothing {
-                self.shared_views.closed_sources.remove(&id);
-            }
-        }
-        if self.shared_views.outstanding_closes.is_empty() {
-            return;
-        }
-        self.index_cards();
-        let identity = self.workspace_model.identity;
-        let mut held = HashSet::new();
-        let mut sends = Vec::new();
-        for view in &self.workspace_model.views {
-            for pane in &view.panes {
-                let Some(close) = self.shared_views.outstanding_closes.get(&pane.id) else {
-                    continue;
-                };
-                if !self.closed_here(pane.id) {
-                    continue;
-                }
-                held.insert(pane.id);
-                let at = (identity, view.scope.clone(), view.revision);
-                if close.kept_elsewhere
-                    || close.sends >= OUTSTANDING_CLOSE_SENDS
-                    || close.sent_at.as_ref() == Some(&at)
-                    || !self.shared_views.initialized.contains(&view.scope)
-                    || self.shared_views.seeding.contains(&view.scope)
-                    || self.shared_views.blocked.contains(&view.scope)
-                    || self.shared_views.seed_failures.contains_key(&view.scope)
-                    || self.shared_views.pending.iter().any(|(_, _, change)| {
-                        matches!(change, Change::Remove { .. } | Change::RemoveSource { .. })
-                            && change.pane_id() == pane.id
-                    })
-                {
-                    continue;
-                }
-                sends.push((at, pane.clone()));
-            }
-        }
-        // A pane no view lists any more has been retired: nothing is owed.
-        self.shared_views
-            .outstanding_closes
-            .retain(|id, _| held.contains(id));
-        for ((identity, scope, revision), pane) in sends {
-            let change = self.outstanding_removal(&scope, &pane);
-            let close = self
-                .shared_views
-                .outstanding_closes
-                .entry(pane.id)
-                .or_default();
-            let Some(change) = change else {
-                close.kept_elsewhere = true;
-                tracing::info!(card = %pane.id, ?scope, "a pane closed here changed in another client; it stays open there");
-                continue;
-            };
-            close.sent_at = Some((identity, scope.clone(), revision));
-            close.sends += 1;
-            if close.sends == OUTSTANDING_CLOSE_SENDS {
-                tracing::warn!(card = %pane.id, ?scope, "the removal of a pane closed here is sent a last time on this connection");
-            } else {
-                tracing::debug!(card = %pane.id, ?scope, "sending again the removal of a pane closed here");
-            }
-            let operation = uuid::Uuid::new_v4();
-            self.shared_views
-                .pending
-                .push((operation, scope.clone(), change.clone()));
-            self.publish_model_edit(ModelEdit::ChangeView {
-                scope,
-                expected_revision: revision,
-                operation,
-                change,
-            });
-        }
     }
 
     /// Whether a pane missing from its shared view should close here. Only a
