@@ -6,18 +6,31 @@
 
 <p align="center">A native Linux workspace for coding agents.</p>
 
+<p align="center">
+  <a href="https://carsonburke.github.io/cagents/">Website</a> ·
+  <a href="https://github.com/CarsonBurke/cagents/releases/latest">Download</a> ·
+  <a href="docs/user-guide.md">User guide</a>
+</p>
+
 > [!NOTE]
 > This product is in beta. Expect bugs.
 
-Run Claude Code, Codex, and OMP across repositories and Git worktrees. Keep
-conversations, terminals, files, diffs, and pull requests together, with a
-separate workspace for each worktree.
+<img src="website/src/screens/workspace-dark.webp" width="1600" alt="The cagents window: a sidebar of worktrees with each agent's status, a Muse conversation beside a Claude Code conversation running on a work account.">
+
+Sign in to as many Claude Code and Codex accounts as you have and run them side
+by side, each with its own allowance. Keep Claude Code, Codex, Antigravity,
+Muse and Oh My Pi in one native app, across repositories and Git worktrees,
+with each agent's conversation, terminals, files, diffs and pull requests
+together.
 
 A per-user daemon owns your terminals and conversations. Close the window or
 restart the UI while your agents keep working.
 
 ## Work with your agents
 
+- **Several accounts per provider.** Add each Claude Code and Codex login, see
+  how much of every allowance is left, and choose an account per conversation
+  or let Automatic move to another plan when one runs out.
 - **Terminal or native chat.** Switch a supported agent session between a real
   terminal and a native chat view of the same conversation.
 - **Parallel worktrees.** Create a worktree from a branch name or Linear issue.
@@ -39,6 +52,13 @@ restart the UI while your agents keep working.
 - **From your phone.** The [Android app](mobile/README.md) follows your agents
   over SSH: see what needs you, read conversations as they stream, answer
   approvals and questions, and send, steer or stop a turn.
+
+| | |
+| --- | --- |
+| ![Three Claude Code accounts and a Codex account, each with its session and weekly allowance](website/src/screens/accounts-dark.webp) | ![Codex and Antigravity chats side by side, with Muse and Claude Code tabs beside them](website/src/screens/agents-dark.webp) |
+| Every account and its allowance | Different providers' agents side by side |
+| ![Source control for a worktree next to a unified diff](website/src/screens/review-dark.webp) | ![The sidebar showing which worktrees' agents are working or have unread output](website/src/screens/worktrees-dark.webp) |
+| Review the diff and commit in place | A worktree per task, with each agent's status |
 
 ## Install
 

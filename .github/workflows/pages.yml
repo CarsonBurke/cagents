@@ -6,17 +6,23 @@ on:
       - main
     paths:
       - ".github/workflows/pages.yml"
+      - "docs/installation.md"
+      - "website/**"
+  pull_request:
+    paths:
+      - ".github/workflows/pages.yml"
+      - "docs/installation.md"
       - "website/**"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# Pull requests only build and test the site; a newer push to the same pull
+# request replaces its run. Deployments from main queue rather than cancel.
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -32,22 +38,20 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: website/package-lock.json
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
 
       - name: Install dependencies
         run: npm ci
         working-directory: website
 
-      - name: Build website
+      - name: Test and build website
         run: npm run build
         working-directory: website
 
       - name: Upload website artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: website/dist
@@ -55,6 +59,10 @@ jobs:
   deploy:
     name: Deploy website
     needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:
