@@ -268,7 +268,7 @@ fn a_closed_card_back_in_memory_blocks_neither_an_update_nor_a_new_chat() {
     let completion = first_start_save_completion(save);
     assert!(
         matches!(&completion, Action::DraftStartCheckpointed(_, _, Ok(()))),
-        "another pane's refusal must not fail this draft's save: {completion:?}"
+        "the closed pane back in memory must not fail this draft's save: {completion:?}"
     );
     let _ = channel;
 

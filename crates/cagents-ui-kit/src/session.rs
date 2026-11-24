@@ -1755,8 +1755,11 @@ impl Quarantine {
                 // card the person closed, brought back in memory. Closed is
                 // what they left it, so nothing of theirs went unsaved, and a
                 // checkpoint - a first message, an update - does not wait on it.
+                // A pane shown again under its closed identity is not saved,
+                // which the warning records.
                 StoreError::Card { card, .. } if error.resurrects_closed_card() => {
-                    tracing::info!(%card, "storage keeps a closed pane closed that the window offered open");
+                    previous.remove(card);
+                    tracing::warn!(%card, "storage keeps a closed pane closed that the window offered open; changes to it are not saved");
                     None
                 }
                 StoreError::Card { card, .. } => Some((
