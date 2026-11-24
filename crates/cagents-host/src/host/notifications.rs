@@ -37,6 +37,7 @@ const MAX_ACTIONS: usize = 32;
 const MAX_ACTIVATION_TOKEN: usize = 4096;
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+const JOURNAL_READ_RETRY: Duration = Duration::from_secs(30);
 
 /// The application action a notification's default action invokes, with the
 /// stable conversation-group identity as its target. The broker resolves it to
@@ -201,6 +202,24 @@ impl Pending {
             preferences: self.preferences,
             ..Pending::default()
         }
+    }
+
+    /// Reconcile the latest inbox state against a verified journal projection,
+    /// or return it for retry if the projection is unavailable.
+    fn reconcile_inboxes(&mut self, notices: Option<&[Notice]>) -> Option<InboxAttention> {
+        let inboxes = self.inboxes.take()?;
+        let Some(notices) = notices else {
+            return Some(inboxes);
+        };
+        for notice in notices {
+            if let Target::SessionInbox(lineage) = notice.event.target
+                && !inboxes.pending.contains(&lineage)
+            {
+                self.retired.insert(Target::SessionInbox(lineage));
+            }
+        }
+        self.events.extend(inboxes.events);
+        None
     }
 }
 
@@ -941,7 +960,7 @@ fn restore(
     policy: &Preferences,
     snapshot: &mut Snapshot,
     withdrawals: &mut Withdrawals,
-) -> bool {
+) -> Option<Instant> {
     if !policy.message_previews {
         match journal.clear_content() {
             Ok(notices) => {
@@ -956,7 +975,7 @@ fn restore(
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
-    loaded
+    (!loaded).then(|| Instant::now() + JOURNAL_READ_RETRY)
 }
 
 fn refresh_notices(
@@ -977,6 +996,26 @@ fn refresh_notices(
         Err(error) => {
             snapshot.diagnostic = Some(error);
             false
+        }
+    }
+}
+
+fn refresh_due_notices(
+    journal: &mut Journal,
+    policy: &Preferences,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    next_read: &mut Option<Instant>,
+    now: Instant,
+) {
+    if !next_read.is_some_and(|time| time <= now) {
+        return;
+    }
+    let loaded = refresh_notices(journal, snapshot, withdrawals);
+    *next_read = (!loaded).then_some(now + JOURNAL_READ_RETRY);
+    if !policy.message_previews {
+        for notice in &mut snapshot.notices {
+            notice.event.content = None;
         }
     }
 }
@@ -1186,31 +1225,37 @@ async fn run(
         diagnostic: settings_error.clone(),
         ..Default::default()
     };
-    let mut notices_dirty = match store.journal() {
-        Ok(journal) => !restore(journal, &policy, &mut snapshot, &mut withdrawals),
+    // A failed list leaves the last trusted projection visible. Retry that
+    // read even if no more events arrive.
+    let mut next_read = match store.journal() {
+        Ok(journal) => restore(journal, &policy, &mut snapshot, &mut withdrawals),
         Err(error) => {
             snapshot.diagnostic = Some(error.clone());
-            true
+            None
         }
     };
     publish(&shared, &host, &snapshot);
-    while wait_for_work(
-        &mut receiver,
-        if proxy.is_none() {
-            if !withdrawals.is_empty() {
-                Some(next_attempt)
-            } else {
-                delivery_schedule
-                    .deadline()
-                    .map(|due| due.max(next_attempt))
-            }
-        } else {
+    while wait_for_work(&mut receiver, {
+        // A stale journal projection cannot establish that queued
+        // desktop deliveries still refer to retained notices.
+        let delivery_due = if next_read.is_none() {
             delivery_schedule.deadline()
-        }
-        .into_iter()
-        .chain(store.retry_at())
-        .min(),
-    )
+        } else {
+            None
+        };
+        let portal_due = if proxy.is_some() {
+            delivery_due
+        } else if !withdrawals.is_empty() {
+            Some(next_attempt)
+        } else {
+            delivery_due.map(|due| due.max(next_attempt))
+        };
+        portal_due
+            .into_iter()
+            .chain(store.retry_at())
+            .chain(next_read)
+            .min()
+    })
     .await
     {
         let Some(core) = shared.upgrade() else {
@@ -1244,7 +1289,7 @@ async fn run(
             if snapshot.diagnostic.as_ref() == Some(&recovered) {
                 snapshot.diagnostic.clone_from(&settings_error);
             }
-            notices_dirty = !restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            next_read = restore(journal, &policy, &mut snapshot, &mut withdrawals);
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -1277,28 +1322,19 @@ async fn run(
                 continue;
             }
         };
-        if notices_dirty && pending.inboxes.is_some() {
-            notices_dirty = !refresh_notices(journal, &mut snapshot, &mut withdrawals);
-            if !policy.message_previews {
-                for notice in &mut snapshot.notices {
-                    notice.event.content = None;
-                }
-            }
-        }
-        if let Some(inboxes) = pending.inboxes.take() {
-            // This broker alone writes the journal, so its current projection
-            // also tells it which pending inboxes have gone away.
-            if !notices_dirty {
-                for notice in &snapshot.notices {
-                    if let Target::SessionInbox(lineage) = notice.event.target
-                        && !inboxes.pending.contains(&lineage)
-                    {
-                        pending.retired.insert(Target::SessionInbox(lineage));
-                    }
-                }
-            }
-            pending.events.extend(inboxes.events);
-        }
+        refresh_due_notices(
+            journal,
+            &policy,
+            &mut snapshot,
+            &mut withdrawals,
+            &mut next_read,
+            Instant::now(),
+        );
+        // A newer courier publication supersedes a deferred batch on the
+        // next wake. The broker alone writes the journal.
+        deferred.inboxes =
+            pending.reconcile_inboxes(next_read.is_none().then_some(snapshot.notices.as_slice()));
+        let mut notices_dirty = false;
         if let Some(current) = current_presence {
             for (client, update) in &current {
                 if stopped(&shared) {
@@ -1447,31 +1483,32 @@ async fn run(
             }
         }
         if notices_dirty {
-            notices_dirty = !refresh_notices(journal, &mut snapshot, &mut withdrawals);
-            if !policy.message_previews {
-                for notice in &mut snapshot.notices {
-                    notice.event.content = None;
-                }
-            }
-        }
-        for notice in delivery.values_mut() {
-            if let Some(current) = snapshot
-                .notices
-                .iter()
-                .find(|current| current.id == notice.id)
-            {
-                *notice = current.clone();
-            }
+            next_read.get_or_insert_with(Instant::now);
+            refresh_due_notices(
+                journal,
+                &policy,
+                &mut snapshot,
+                &mut withdrawals,
+                &mut next_read,
+                Instant::now(),
+            );
         }
         // Journal eviction also bounds retries across multiple disconnected
         // batches. Never announce an event whose durable identity was evicted.
-        if !delivery.is_empty() {
+        if next_read.is_none() && !delivery.is_empty() {
             let retained = snapshot
                 .notices
                 .iter()
-                .map(|notice| notice.id)
-                .collect::<BTreeSet<_>>();
-            delivery.retain(|_, notice| retained.contains(&notice.id));
+                .map(|notice| (notice.id, notice))
+                .collect::<BTreeMap<_, _>>();
+            delivery.retain(|_, notice| {
+                if let Some(current) = retained.get(&notice.id) {
+                    notice.clone_from(current);
+                    true
+                } else {
+                    false
+                }
+            });
         }
         // A delayed completion stops being a desktop alert once the user has
         // returned to that pane or disabled its category.
@@ -1485,9 +1522,10 @@ async fn run(
             });
             policy.allows(notice.event.evidence.kind, focused)
         });
-        let backlog_due = (delivery
-            .keys()
-            .any(|target| delivery_schedule.ready(target, Instant::now()))
+        let backlog_due = ((next_read.is_none()
+            && delivery
+                .keys()
+                .any(|target| delivery_schedule.ready(target, Instant::now())))
             || !withdrawals.is_empty())
             && Instant::now() >= next_attempt;
         // A test is a person asking right now, so it retries a portal that
@@ -1523,7 +1561,7 @@ async fn run(
             // bounded batches, rather than delaying it behind thousands of alerts.
             // A portal that just failed the test is dropped below, not
             // handed the backlog as well.
-            let batch: Vec<_> = if failed {
+            let batch: Vec<_> = if failed || next_read.is_some() {
                 Vec::new()
             } else {
                 delivery_batch(&delivery, &delivery_schedule, &withdrawals, Instant::now())
@@ -1578,9 +1616,10 @@ async fn run(
                 proxy = None;
                 next_attempt = Instant::now() + retry_delay;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
-            } else if (delivery
-                .keys()
-                .any(|target| delivery_schedule.ready(target, Instant::now()))
+            } else if ((next_read.is_none()
+                && delivery
+                    .keys()
+                    .any(|target| delivery_schedule.ready(target, Instant::now())))
                 || !withdrawals.is_empty())
                 && let Some(shared) = shared.upgrade()
             {
@@ -1646,6 +1685,91 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         )
+    }
+
+    fn inbox_event(session: TerminalId) -> Event {
+        Event {
+            content: None,
+            target: Target::SessionInbox(crate::agent_execution::Lineage(session)),
+            source_session: Some(session),
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: crate::model::MessageId::new().to_string(),
+                kind: crate::notifications::Kind::MessageReceived,
+            },
+        }
+    }
+
+    #[test]
+    fn unreadable_journal_defers_inbox_reconciliation_until_its_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let inbox = inbox_event(TerminalId::new());
+        journal.record(inbox.clone(), false).unwrap();
+        let writer = rusqlite::Connection::open(path).unwrap();
+        writer
+            .execute("UPDATE notices SET event = 'unreadable'", [])
+            .unwrap();
+
+        let policy = Preferences::default();
+        let mut snapshot = Snapshot::default();
+        let mut withdrawals = Withdrawals::default();
+        let start = Instant::now();
+        let mut next_read = Some(start);
+        refresh_due_notices(
+            &mut journal,
+            &policy,
+            &mut snapshot,
+            &mut withdrawals,
+            &mut next_read,
+            start,
+        );
+        let deadline = start + JOURNAL_READ_RETRY;
+        assert_eq!(next_read, Some(deadline));
+        let mut pending = Pending {
+            inboxes: Some(InboxAttention::default()),
+            ..Pending::default()
+        };
+        let deferred = Pending {
+            inboxes: pending.reconcile_inboxes(None),
+            ..Pending::default()
+        };
+        assert!(deferred.inboxes.is_some());
+        assert!(pending.retired.is_empty());
+
+        writer
+            .execute(
+                "UPDATE notices SET event = ?1",
+                [serde_json::to_string(&inbox).unwrap()],
+            )
+            .unwrap();
+        refresh_due_notices(
+            &mut journal,
+            &policy,
+            &mut snapshot,
+            &mut withdrawals,
+            &mut next_read,
+            start,
+        );
+        assert_eq!(next_read, Some(deadline));
+        assert!(snapshot.notices.is_empty());
+
+        // Recovery and reconciliation need no further courier publications.
+        refresh_due_notices(
+            &mut journal,
+            &policy,
+            &mut snapshot,
+            &mut withdrawals,
+            &mut next_read,
+            deadline,
+        );
+        assert_eq!(next_read, None);
+        let mut pending = deferred.followed_by(Pending::default());
+        assert!(pending.reconcile_inboxes(Some(&snapshot.notices)).is_none());
+        assert_eq!(pending.retired, BTreeSet::from([inbox.target()]));
     }
 
     #[test]
@@ -2038,18 +2162,7 @@ mod tests {
         let handle = Handle(shared.clone());
         let session = TerminalId::new();
         let lineage = crate::agent_execution::Lineage(session);
-        let inbox = Event {
-            content: None,
-            target: Target::SessionInbox(lineage),
-            source_session: Some(session),
-            provider: None,
-            directory: None,
-            destination: None,
-            evidence: crate::notifications::Evidence {
-                key: crate::model::MessageId::new().to_string(),
-                kind: crate::notifications::Kind::MessageReceived,
-            },
-        };
+        let inbox = inbox_event(session);
         let lifecycle = Event::session(
             session,
             crate::agent::Provider::Claude,
