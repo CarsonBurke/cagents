@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -23,7 +25,10 @@ SSH = r"""#!/bin/bash
 host=$1; shift
 [[ $1 == bash ]] || { echo "unexpected ssh: $*" >&2; exit 99; }
 echo "$host $*" >> "$FIXTURE/ssh.log"
-HOME=$FIXTURE/host exec bash -c "$*"
+# The remote side outlives the client, which an interrupt ends at once.
+HOME=$FIXTURE/host bash -c "$*" <&0 &
+trap 'exit 255' INT TERM
+wait "$!"
 """
 
 SCP = r"""#!/bin/bash
@@ -114,6 +119,11 @@ case $command in
         cat "$FIXTURE/rehearse-status" 2>/dev/null > "$root/home/.local/share/cagents-install/.update/status.json" \
             || echo '{"phase": "Complete"}' > "$root/home/.local/share/cagents-install/.update/status.json"
         [[ ! -e $FIXTURE/rehearse-plants ]] || mkdir -p "$(cat "$FIXTURE/rehearse-plants")"
+        if [[ -e $FIXTURE/rehearse-hangs ]]; then
+            trap 'echo stopped >> "$FIXTURE/rehearse-stopped"; exit 143' TERM
+            echo running > "$FIXTURE/rehearse-running"
+            sleep 60 & wait
+        fi
         [[ $outcome == PASS ]] ;;
 esac
 """
@@ -509,6 +519,34 @@ class ReleaseCut(unittest.TestCase):
         result = self.release("rehearse", "0.2.4")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT", result.stderr)
+
+    def test_an_interrupt_stops_the_hosts_run_and_frees_its_lock(self):
+        self.cut_signed()
+        (self.root / "rehearse-hangs").touch()
+        release = subprocess.Popen([str(self.repo / "scripts/release"), "rehearse", "0.2.4"], cwd=self.repo,
+                                   env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(release.kill)
+        deadline = time.monotonic() + HANG_GUARD
+        while not (self.root / "rehearse-running").exists():
+            self.assertIsNone(release.poll(), release.stderr.read() if release.poll() is not None else "")
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.1)
+        # Ctrl-C reaches the terminal's foreground group: here, and the ssh client.
+        os.killpg(release.pid, signal.SIGINT)
+        _, stderr = release.communicate(timeout=HANG_GUARD)
+        self.assertEqual(release.returncode, 130, stderr)
+        self.assertIn("Stopping the rehearsal", stderr)
+        deadline = time.monotonic() + 30
+        while not (self.root / "rehearse-stopped").exists():
+            self.assertLess(time.monotonic(), deadline, "the host's harness was never stopped")
+            time.sleep(0.1)
+        cache = self.host / ".cache/cagents-release-rehearsal"
+        while any(path.name.startswith("incoming-") for path in cache.iterdir()):
+            self.assertLess(time.monotonic(), deadline, "the host kept the interrupted run's files")
+            time.sleep(0.1)
+        (self.root / "rehearse-hangs").unlink()
+        self.assertEqual(self.release("rehearse", "0.2.4").returncode, 0)
 
     def test_a_root_the_hosts_shell_would_reparse_is_refused(self):
         self.cut_signed()
