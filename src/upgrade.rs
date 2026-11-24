@@ -1749,6 +1749,46 @@ pub(crate) mod handoff {
         Store::existing()?.map_or(Ok(STARTUP_BASE), |store| store.startup_timeout())
     }
 
+    /// The daemon can consume the checkpoint before answering hello. Keep its
+    /// file open so the client can still estimate the budget if hello stalls.
+    pub(crate) struct StartupInventory(Option<std::fs::File>);
+
+    impl StartupInventory {
+        pub(crate) fn capture() -> Result<Self, String> {
+            let directory = Store::directory()?;
+            // A serving daemon usually has no checkpoint. In that case there
+            // is no need to open or prepare the upgrade storage directory.
+            match std::fs::symlink_metadata(directory.join(FILE)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+                Err(error) => Err(error.to_string()),
+                Ok(_) => Store::open(&directory)?.startup_inventory(),
+            }
+        }
+
+        pub(crate) fn timeout(self) -> Result<std::time::Duration, String> {
+            let Some(file) = self.0 else {
+                return Ok(STARTUP_BASE);
+            };
+            let bytes = Store::read_evidence(file)?;
+            let inventory: Inventory =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if !VERSIONS.contains(&inventory.version) {
+                return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
+            }
+            if inventory.terminals + inventory.carried > MAX_TERMINALS
+                || inventory.chats > MAX_CHATS
+            {
+                return Err("Upgrade checkpoint exceeds session limits".into());
+            }
+            // Adopting a carried terminal is a local handshake with its holder.
+            Ok(STARTUP_BASE
+                + std::time::Duration::from_secs(
+                    30 * (inventory.terminals + inventory.chats) as u64
+                        + 5 * inventory.carried as u64,
+                ))
+        }
+    }
+
     #[derive(Deserialize)]
     struct Inventory {
         version: u16,
@@ -1791,18 +1831,20 @@ pub(crate) mod handoff {
     }
 
     impl Store {
-        pub fn discover() -> Result<Self, String> {
+        fn directory() -> Result<PathBuf, String> {
             let dirs =
                 crate::instance::project_dirs().ok_or("Cannot discover durable upgrade storage")?;
-            Self::open(&dirs.data_local_dir().join("daemon-upgrade"))
+            Ok(dirs.data_local_dir().join("daemon-upgrade"))
+        }
+
+        pub fn discover() -> Result<Self, String> {
+            Self::open(&Self::directory()?)
         }
 
         /// Opens the durable storage only if some daemon already created it,
         /// so read-only callers never create it.
         pub fn existing() -> Result<Option<Self>, String> {
-            let dirs =
-                crate::instance::project_dirs().ok_or("Cannot discover durable upgrade storage")?;
-            let directory = dirs.data_local_dir().join("daemon-upgrade");
+            let directory = Self::directory()?;
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error.to_string()),
@@ -1849,7 +1891,13 @@ pub(crate) mod handoff {
         }
 
         fn read_named(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
-            let mut file = match fs_safety::open_beneath(&self.root, Path::new(name)) {
+            self.open_evidence(name)?
+                .map(Self::read_evidence)
+                .transpose()
+        }
+
+        fn open_evidence(&self, name: &str) -> Result<Option<std::fs::File>, String> {
+            let file = match fs_safety::open_beneath(&self.root, Path::new(name)) {
                 Ok(file) => file,
                 Err(error) if error.is_not_found() => return Ok(None),
                 Err(error) => return Err(error.to_string()),
@@ -1865,12 +1913,16 @@ pub(crate) mod handoff {
                     self.path.with_file_name(name).display()
                 ));
             }
+            Ok(Some(file))
+        }
+
+        fn read_evidence(mut file: std::fs::File) -> Result<Vec<u8>, String> {
             let bytes =
                 fs_safety::read_bounded(&mut file, MAX_BYTES).map_err(|error| error.to_string())?;
             if bytes.len() as u64 > MAX_BYTES {
                 return Err("Upgrade evidence exceeds durable byte limit".into());
             }
-            Ok(Some(bytes))
+            Ok(bytes)
         }
 
         /// Inspect only the common envelope, retaining the exact private-byte
@@ -1904,26 +1956,12 @@ pub(crate) mod handoff {
             }))
         }
 
+        fn startup_inventory(&self) -> Result<StartupInventory, String> {
+            self.open_evidence(FILE).map(StartupInventory)
+        }
+
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
-            let Some(bytes) = self.read_bytes()? else {
-                return Ok(STARTUP_BASE);
-            };
-            let inventory: Inventory =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            if !VERSIONS.contains(&inventory.version) {
-                return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
-            }
-            if inventory.terminals + inventory.carried > MAX_TERMINALS
-                || inventory.chats > MAX_CHATS
-            {
-                return Err("Upgrade checkpoint exceeds session limits".into());
-            }
-            // Adopting a carried terminal is a local handshake with its holder.
-            Ok(STARTUP_BASE
-                + std::time::Duration::from_secs(
-                    30 * (inventory.terminals + inventory.chats) as u64
-                        + 5 * inventory.carried as u64,
-                ))
+            self.startup_inventory()?.timeout()
         }
 
         #[cfg(any(feature = "host", test))]

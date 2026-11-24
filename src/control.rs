@@ -1177,6 +1177,21 @@ impl ControlClient {
         Self::from_stream_inner(stream, deadline, Instant::now() + io_timeout())
     }
 
+    /// Consult the restoration deadline only if the ordinary hello budget runs out.
+    pub(crate) fn from_stream_with_startup_deadline(
+        stream: UnixStream,
+        startup_deadline: impl FnOnce() -> Instant,
+    ) -> Result<Self, ControlError> {
+        let now = Instant::now();
+        Self::from_stream_at(
+            stream,
+            now + Self::handshake_timeout(),
+            now + io_timeout(),
+            PROTOCOL_VERSION,
+            Some(startup_deadline),
+        )
+    }
+
     pub(crate) fn from_stream_with_deadline(
         stream: UnixStream,
         deadline: Instant,
@@ -1195,7 +1210,13 @@ impl ControlClient {
         if !crate::update::source::is_qualified_source(protocol) {
             return Err(ControlError::UnsupportedVersion { actual: protocol });
         }
-        Self::from_stream_at(stream, deadline, deadline, protocol)
+        Self::from_stream_at(
+            stream,
+            deadline,
+            deadline,
+            protocol,
+            None::<fn() -> Instant>,
+        )
     }
 
     fn from_stream_inner(
@@ -1203,7 +1224,13 @@ impl ControlClient {
         deadline: Instant,
         write_deadline: Instant,
     ) -> Result<Self, ControlError> {
-        Self::from_stream_at(stream, deadline, write_deadline, PROTOCOL_VERSION)
+        Self::from_stream_at(
+            stream,
+            deadline,
+            write_deadline,
+            PROTOCOL_VERSION,
+            None::<fn() -> Instant>,
+        )
     }
 
     fn from_stream_at(
@@ -1211,6 +1238,7 @@ impl ControlClient {
         deadline: Instant,
         write_deadline: Instant,
         protocol: u16,
+        extend: Option<impl FnOnce() -> Instant>,
     ) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(Self::handshake_timeout()))
@@ -1223,7 +1251,7 @@ impl ControlClient {
             next_request_id: 1,
             protocol,
         };
-        let proof = client.handshake(deadline, write_deadline)?;
+        let proof = client.handshake(deadline, write_deadline, extend)?;
         client
             .stream
             .set_read_timeout(Some(io_timeout()))
@@ -3160,6 +3188,33 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
+/// Extend a timed-out hello read inside the frame reader, which still holds
+/// any prefix or payload bytes already received on this connection.
+struct HandshakeReplyReader<'a, F> {
+    reader: DeadlineReader<'a>,
+    extend: Option<F>,
+}
+
+impl<F: FnOnce() -> Instant> Read for HandshakeReplyReader<'_, F> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let result = self.reader.read(buffer);
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+        }) && let Some(extend) = self.extend.take()
+        {
+            let deadline = extend();
+            if deadline > self.reader.deadline {
+                self.reader.deadline = deadline;
+                return self.reader.read(buffer);
+            }
+        }
+        result
+    }
+}
+
 /// Bound every partial write of a request against the same overall deadline.
 struct DeadlineWriter<'a> {
     stream: &'a mut UnixStream,
@@ -3195,6 +3250,7 @@ impl HandshakeClient {
         &mut self,
         deadline: Instant,
         write_deadline: Instant,
+        extend: Option<impl FnOnce() -> Instant>,
     ) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
@@ -3217,16 +3273,22 @@ impl HandshakeClient {
             },
             &request,
         )?;
-        let timeout = deadline.saturating_duration_since(Instant::now());
-        let envelope: ServerEnvelope = read_frame_from(
-            self.protocol,
-            &mut DeadlineReader {
+        let started = Instant::now();
+        let mut reader = HandshakeReplyReader {
+            reader: DeadlineReader {
                 stream: &mut self.stream,
                 deadline,
             },
-        )
-        .map_err(|error| reply_error(error, Some(timeout)))?
-        .ok_or(ControlError::ConnectionClosed)?;
+            extend,
+        };
+        let envelope: ServerEnvelope = read_frame_from(self.protocol, &mut reader)
+            .map_err(|error| {
+                reply_error(
+                    error,
+                    Some(reader.reader.deadline.saturating_duration_since(started)),
+                )
+            })?
+            .ok_or(ControlError::ConnectionClosed)?;
         validate_handshake(&envelope, self.protocol, request_id)
             .cloned()
             .map_err(|error| match error {
@@ -8190,6 +8252,25 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn warm_startup_handshake_skips_deadline_estimation() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        write_frame(
+            &mut server,
+            &connected_envelope(1, pinned.clone(), pinned.clone()),
+        )
+        .unwrap();
+
+        let client = ControlClient::from_stream_with_startup_deadline(client, || {
+            panic!("a warm hello must not read the upgrade checkpoint")
+        })
+        .unwrap();
+        assert_eq!(client.proof(), &pinned);
+        let request: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+        assert!(matches!(request.request, ClientRequest::Connect { .. }));
     }
 
     /// `channel spawn` opens the project before creating the channel in it,
