@@ -74,7 +74,7 @@ pub(super) fn perform(
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
     terminal: bool,
-) -> Result<Handoff, UpdateError> {
+) -> Result<Completion, UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
@@ -249,8 +249,7 @@ pub(super) fn perform(
         }
         // Wait through bounded restoration until the exact successor is
         // Ready, then prove this job's recovery inventory against it.
-        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)?;
-        survivors.verify_successor(&root.join("bin/cagentsd"))
+        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)
     })();
     announce_primary_failure(&result);
     let mut restored_previous = false;
@@ -308,17 +307,9 @@ pub(super) fn perform(
     let reopened = guard
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    let handoff_kind = verify_reopened_service(&recovery, state, job)?;
-    if let Err(error) = reopened {
-        return report_recovery_failure(
-            state,
-            job,
-            invalid(format!(
-                "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: {error}. Run `cagents ui` to reopen the saved workspace."
-            )),
-        );
-    }
-    result.map(|()| handoff_kind)
+    let handoff_kind =
+        verify_reopened_service(&recovery, state, job, result.is_ok().then_some(&*survivors))?;
+    finish_reopening_windows(state, job, result, handoff_kind, reopened)
 }
 
 /// Store maintenance receives the reservation intentionally; status probes

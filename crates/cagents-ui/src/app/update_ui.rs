@@ -1115,6 +1115,18 @@ impl Cagents {
                             {
                                 self.status = Some(failure.notice);
                             }
+                        } else if job.phase == UpdatePhase::Complete
+                            && self.update_ui.job.as_ref().is_some_and(|shown| {
+                                shown.id == job.id && !shown.phase.is_terminal()
+                            })
+                        {
+                            self.notices.record(
+                                TransientNotice::success(format!(
+                                    "Updated to cagents {}",
+                                    job.version
+                                ))
+                                .with_details(job.message.clone()),
+                            );
                         }
                         // A review set aside returns by itself once nothing
                         // blocks the update, and never outlives its job.
@@ -1339,6 +1351,38 @@ pub(in crate::app) mod tests {
             assert_eq!(app.status.is_some(), shown, "{:?}", app.status);
             assert!(app.update_ui.error.is_some());
         }
+    }
+
+    #[test]
+    fn a_completed_update_shows_success_and_keeps_the_pane_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let pane = TransientNotice::warning("Gemini could not reconnect.");
+        app.status = Some(pane.clone());
+        let mut job = UpdateJob {
+            id: "updated".into(),
+            version: "0.2.3".into(),
+            phase: UpdatePhase::Installing,
+            message: "Installing".into(),
+            log_path: "/nonexistent/update.log".into(),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+        };
+        app.update_ui.job = Some(job.clone());
+        job.phase = UpdatePhase::Complete;
+        job.message =
+            "Update installed; saved windows reopened\n\nGemini could not reconnect.".into();
+        for _ in 0..2 {
+            drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job.clone())))));
+        }
+        assert_eq!(app.status, Some(pane));
+        let [entry] = app.notices.entries.make_contiguous() else {
+            panic!("expected one completion notice");
+        };
+        assert_eq!(entry.notice.message, "Updated to cagents 0.2.3");
+        assert_eq!(entry.notice.details.as_deref(), Some(job.message.as_str()));
+        assert_eq!(entry.repeats, 1);
+        assert!(app.update_ui.error.is_none());
     }
 
     /// A refusal names what held the update back, once, and the header keeps

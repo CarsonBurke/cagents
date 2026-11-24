@@ -423,6 +423,11 @@ impl Census {
         let executable = target.join("bin/cagents");
         let before = match fs::symlink_metadata(&executable) {
             Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && target.exists() => {
+                return self.unverified(
+                    "The selected installation's recovery verifier is unavailable".into(),
+                );
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let busy = BusyPatience::shared_for(VERIFIER_BUSY_PATIENCE);
                 let receipt = self.verify(busy)?;
@@ -664,7 +669,17 @@ impl InventorySource for source::Client {
 }
 
 fn observe(busy: BusyPatience) -> Result<Observation, UpdateError> {
-    observe_with(busy, |_, _, _, _| Ok(())).map(|(inventory, ())| inventory)
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let mut client = source::Client::connect(&socket)
+        .map_err(|error| invalid(error.to_string()))?
+        .with_busy_patience(busy);
+    read_inventory_with(&mut client, |_, _, _, _| Ok(())).map(|(inventory, ())| inventory)
+}
+
+fn inventory_client(socket: &Path, busy: BusyPatience) -> Result<source::Client, UpdateError> {
+    Ok(source::Client::connect_inventory(socket)
+        .map_err(|error| invalid(error.to_string()))?
+        .with_busy_patience(busy))
 }
 
 fn observe_with<E>(
@@ -680,9 +695,7 @@ fn observe_with<E>(
         return Err(invalid("Update recovery requires the local daemon"));
     }
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let mut client = source::Client::connect(&socket)
-        .map_err(|error| invalid(error.to_string()))?
-        .with_busy_patience(busy);
+    let mut client = inventory_client(&socket, busy)?;
     read_inventory_with(&mut client, read_evidence)
 }
 
@@ -1279,9 +1292,7 @@ fn retire_service(
             }
         }
         let socket = crate::terminal_ipc::daemon_socket_path()?;
-        let mut client = source::Client::connect(&socket)
-            .map_err(|e| invalid(e.to_string()))?
-            .with_busy_patience(busy);
+        let mut client = inventory_client(&socket, busy)?;
         let generation = client.inventory_generation()?;
         let ((proof, terminals, chats, readiness), retirement) = read_inventory_with(
             &mut client,
@@ -1682,7 +1693,7 @@ fn verify_file_within(
     }
     let census = Census::load(census)?;
     let mut receipt = if require_absent || (allow_absent && census.source.is_none()) {
-        match census.verify_absence(busy) {
+        match census.verify_absence() {
             Ok(receipt) => receipt,
             Err(error) => census.unobserved(&error)?,
         }
@@ -1761,25 +1772,33 @@ pub(crate) fn verify_file_retiring(
 }
 
 impl Census {
-    pub(super) fn verify_absence(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
-        let fresh = Self::capture(self.transaction.clone(), busy)?;
-        if !proves_absent(self, &fresh) {
+    pub(super) fn verify_absence(&self) -> Result<Receipt, UpdateError> {
+        let paths = crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
+        // An active listener or lease defeats absence without running a
+        // source handshake against a daemon the installer may have started.
+        if !self.had_no_source()
+            || crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
+            || !std::os::unix::net::UnixStream::connect(&paths.socket).is_err_and(|e| {
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                )
+            })
+            || checkpoint_status()?.is_some()
+        {
             return Err(invalid(
                 "A daemon or pending recovery exists; a fresh installation without a source daemon was not proven",
             ));
         }
         self.receipt(Outcome::NoSource)
     }
-}
 
-fn proves_absent(census: &Census, fresh: &Census) -> bool {
-    census.transaction == fresh.transaction
-        && [census, fresh].iter().all(|observed| {
-            observed.source.is_none()
-                && observed.terminals.is_empty()
-                && observed.chats.is_empty()
-                && observed.checkpoint_before.is_none()
-        })
+    fn had_no_source(&self) -> bool {
+        self.source.is_none()
+            && self.terminals.is_empty()
+            && self.chats.is_empty()
+            && self.checkpoint_before.is_none()
+    }
 }
 
 #[derive(Default)]
@@ -1802,10 +1821,9 @@ pub(super) fn outcome_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.recovery.json"))
 }
 
-/// The daemon `job`'s recovery receipt, matched to its saved census, found
-/// serving every recorded session with none paused.
+/// The daemon `job`'s recovery receipt found usable against its saved census.
 #[cfg(any(feature = "ui", test))]
-pub(super) fn verified_complete(
+pub(super) fn verified_serving(
     state: &Path,
     job: &str,
 ) -> Result<Option<HostSessionProof>, UpdateError> {
@@ -1814,12 +1832,7 @@ pub(super) fn verified_complete(
         serde_json::from_slice(&read_private(&outcome_path(state, job), JOB_STATE_LIMIT)?)?;
     receipt.matches(&census)?;
     Ok(match receipt.outcome {
-        Outcome::Usable {
-            serving,
-            paused_terminals,
-            paused_chats,
-            ..
-        } if paused_terminals.is_empty() && paused_chats.is_empty() => Some(serving),
+        Outcome::Usable { serving, .. } => Some(serving),
         _ => None,
     })
 }
@@ -2181,23 +2194,19 @@ mod tests {
         let mut empty = census(&terminal());
         empty.source = None;
         empty.terminals.clear();
-        assert!(proves_absent(&empty, &empty));
-        for mutation in 0..5 {
+        assert!(empty.had_no_source());
+        for mutation in 0..4 {
             let mut changed = empty.clone();
             match mutation {
                 0 => changed.source = Some(proof()),
                 1 => changed.terminals.push(terminal().session),
                 2 => changed.chats.push(chat()),
                 3 => changed.checkpoint_before = Some("pending-checkpoint".into()),
-                _ => changed.transaction = uuid::Uuid::new_v4().to_string(),
+                _ => unreachable!(),
             }
             assert!(
-                !proves_absent(&empty, &changed),
-                "fresh mutation {mutation}"
-            );
-            assert!(
-                !proves_absent(&changed, &empty),
-                "original mutation {mutation}"
+                !changed.had_no_source(),
+                "original census mutation {mutation}"
             );
         }
     }
@@ -2627,7 +2636,7 @@ mod tests {
     /// every session usable. Paths and user names are anonymized; the digest is
     /// recomputed, so loading it also proves the old census still digests alike.
     #[test]
-    fn an_older_workers_usable_receipt_proves_the_update_complete() {
+    fn e8bbb84f2_update_completes_with_pane_reconnect_notes() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/update-e8bbb84f2-reached-target");
         let job = "467204f6-b633-4600-b92d-afd4a95547f8";
@@ -2641,7 +2650,7 @@ mod tests {
         let receipt = fs::read_to_string(fixture.join("recovery.json")).unwrap();
         write(census_path(state, job), &census);
         write(outcome_path(state, job), receipt.as_bytes());
-        let serving = verified_complete(state, job).unwrap().unwrap();
+        let serving = verified_serving(state, job).unwrap().unwrap();
         assert_eq!(
             serving.host_incarnation,
             crate::model::HostIncarnation::new("af2d02a9-f1dc-4bd8-9bae-9c549c9b640f")
@@ -2654,9 +2663,63 @@ mod tests {
         assert_ne!(paused, receipt);
         write(outcome_path(state, job), paused.as_bytes());
         assert_eq!(
-            verified_complete(state, job).unwrap(),
-            None,
-            "a paused session still needs the user's attention"
+            verified_serving(state, job).unwrap(),
+            Some(serving.clone()),
+            "a paused session can coexist with a usable target"
+        );
+
+        // The old worker spoke 191. The 0.2.3 verifier's receipt proves
+        // readiness at 198 without asking the successor for source admission.
+        #[cfg(feature = "host")]
+        {
+            let paths = crate::daemon::RuntimePaths {
+                directory: state.to_owned(),
+                lock: state.join("cagentsd.lock"),
+                socket: state.join("cagentsd.sock"),
+            };
+            let mut live = serving;
+            live.boot_id = crate::daemon::read_boot_id().unwrap();
+            let _lease = crate::daemon::HostLease::acquire(&paths, &live).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let executable = std::env::current_exe().unwrap();
+            source::Peer::confirm_serving(&paths.socket, &executable, &live).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut frames = Vec::new();
+            stream.read_to_end(&mut frames).unwrap();
+            assert!(frames.is_empty(), "the worker sent a protocol request");
+        }
+
+        let notes = "Build pane made no progress reconnecting for 90 seconds.\nGemini could not reconnect.\nSaved chat identity could not be confirmed.";
+        let mut update = UpdateJob {
+            id: job.into(),
+            version: "0.2.3".into(),
+            phase: UpdatePhase::Installing,
+            message: "Installing".into(),
+            log_path: state.join("update.log"),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+        };
+        let completion = finish_reopening_windows(
+            state,
+            &mut update,
+            Ok(()),
+            Handoff::Served,
+            Ok(Some(notes.into())),
+        );
+        finish_worker(
+            state,
+            &mut update,
+            completion,
+            &mut floor::Survivors::default(),
+        )
+        .unwrap();
+        let recorded: UpdateJob =
+            serde_json::from_slice(&fs::read(state.join("status.json")).unwrap()).unwrap();
+        assert_eq!(recorded.phase, UpdatePhase::Complete);
+        assert_eq!(
+            recorded.message,
+            format!("Update installed; saved windows reopened\n\n{notes}")
         );
 
         let unverified = Census::load(&census_path(state, job))
@@ -2667,7 +2730,7 @@ mod tests {
             outcome_path(state, job),
             &serde_json::to_vec(&unverified).unwrap(),
         );
-        assert_eq!(verified_complete(state, job).unwrap(), None);
+        assert_eq!(verified_serving(state, job).unwrap(), None);
 
         write(outcome_path(state, job), receipt.as_bytes());
         let mut changed: serde_json::Value = serde_json::from_slice(&census).unwrap();
@@ -2677,7 +2740,7 @@ mod tests {
             &serde_json::to_vec(&changed).unwrap(),
         );
         assert!(
-            verified_complete(state, job).is_err(),
+            verified_serving(state, job).is_err(),
             "a receipt for another census proves nothing"
         );
     }

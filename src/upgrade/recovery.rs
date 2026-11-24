@@ -1597,13 +1597,13 @@ impl Receipt {
         )
     }
 
-    pub(crate) fn verify(
+    /// Bind the target's verified serving proof to this exact Prepared job.
+    /// The target's census verifier checks the live inventory on its own wire.
+    pub(crate) fn verify_successor(
         &self,
         serving: &HostSessionProof,
-        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
-        live_chats: &[Session],
     ) -> Result<RecoveryOutcome, String> {
-        verify_record(
+        let record = read_verified_record_identity(
             &self.authority.checkpoint_path,
             &self.authority.checkpoint_hash,
             &self.authority.source,
@@ -1612,42 +1612,12 @@ impl Receipt {
             Some(&self.authority),
             Some(&self.authority.target_hash),
             serving,
-            live_terminals,
-            live_chats,
-        )
+        )?;
+        Ok(RecoveryOutcome {
+            paused_terminals: record.paused_terminals,
+            paused_chats: record.paused_chats,
+        })
     }
-}
-
-/// The same verifier serves a live sealed receipt and a read-only retry probe.
-/// A record's shape, a held lease, or a binary rollback alone proves nothing.
-fn verify_record(
-    checkpoint_path: &Path,
-    checkpoint_hash: &str,
-    source: &HostSessionProof,
-    census: &Census,
-    target: &Path,
-    request: Option<&Authority>,
-    target_hash: Option<&str>,
-    serving: &HostSessionProof,
-    live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
-    live_chats: &[Session],
-) -> Result<RecoveryOutcome, String> {
-    let record = read_verified_record(
-        checkpoint_path,
-        checkpoint_hash,
-        source,
-        census,
-        target,
-        request,
-        target_hash,
-        serving,
-        live_terminals,
-        live_chats,
-    )?;
-    Ok(RecoveryOutcome {
-        paused_terminals: record.paused_terminals,
-        paused_chats: record.paused_chats,
-    })
 }
 
 fn read_settled_checkpoint(
@@ -1674,7 +1644,9 @@ fn read_settled_checkpoint(
     Ok(bytes)
 }
 
-fn read_verified_record(
+/// Both the target's inventory verifier and the sealed receipt authenticate
+/// the same durable outcome. Only the sealed receipt has the original authority.
+fn read_verified_record_identity(
     checkpoint_path: &Path,
     checkpoint_hash: &str,
     source: &HostSessionProof,
@@ -1683,8 +1655,6 @@ fn read_verified_record(
     request: Option<&Authority>,
     target_hash: Option<&str>,
     serving: &HostSessionProof,
-    live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
-    live_chats: &[Session],
 ) -> Result<RecoveryRecord, String> {
     let path = checkpoint_path.with_file_name(recovery_name(checkpoint_hash));
     let bytes = read_checkpoint(&path)?.ok_or("The recovery daemon has no durable outcome")?;
@@ -1724,6 +1694,31 @@ fn read_verified_record(
     };
     evidence.validate(&checkpoint)?;
     record.validate_census()?;
+    Ok(record)
+}
+
+fn read_verified_record(
+    checkpoint_path: &Path,
+    checkpoint_hash: &str,
+    source: &HostSessionProof,
+    census: &Census,
+    target: &Path,
+    request: Option<&Authority>,
+    target_hash: Option<&str>,
+    serving: &HostSessionProof,
+    live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+    live_chats: &[Session],
+) -> Result<RecoveryRecord, String> {
+    let record = read_verified_record_identity(
+        checkpoint_path,
+        checkpoint_hash,
+        source,
+        census,
+        target,
+        request,
+        target_hash,
+        serving,
+    )?;
     let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
     let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
     if terminals.len() != live_terminals.len()

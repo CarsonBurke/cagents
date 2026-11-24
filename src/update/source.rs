@@ -191,6 +191,23 @@ pub(crate) struct Peer {
 }
 
 impl Peer {
+    /// Authenticate an already verified serving proof without protocol discovery.
+    pub(super) fn confirm_serving(
+        socket: &Path,
+        executable: &Path,
+        proof: &HostSessionProof,
+    ) -> Result<(), UpdateError> {
+        let stream = crate::control::connect_control_socket(socket, Duration::from_secs(5))?;
+        let peer = Self::observe(&stream, socket)?;
+        peer.verify(proof)?;
+        if peer.executable()? != executable {
+            return Err(invalid(
+                "The terminal service does not belong to the confirmed installation",
+            ));
+        }
+        peer.verify(proof)
+    }
+
     pub(super) fn observe(stream: &UnixStream, socket: &Path) -> Result<Self, UpdateError> {
         let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
         let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -307,6 +324,45 @@ impl Client {
                 unsupported_source(protocol),
             )));
         }
+        Self::connect_authenticated(socket, deadline, |stream| {
+            ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)
+        })
+    }
+
+    /// Read from the daemon at this executable's own protocol, without source admission.
+    pub(super) fn connect_matched(socket: &Path) -> Result<Self, ControlError> {
+        Self::connect_matched_until(socket, Instant::now() + Duration::from_secs(5))
+    }
+
+    fn connect_matched_until(socket: &Path, deadline: Instant) -> Result<Self, ControlError> {
+        Self::connect_authenticated(socket, deadline, |stream| {
+            ControlClient::from_stream_with_deadline(stream, deadline)
+        })
+    }
+
+    /// Verification can also read a compatible older daemon during staging or
+    /// rollback. The matched daemon never goes through source admission.
+    pub(super) fn connect_inventory(socket: &Path) -> Result<Self, ControlError> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (protocol, peer) = discovery::discover_protocol_and_peer(socket, deadline)?;
+        let client = if protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+            Self::connect_matched_until(socket, deadline)?
+        } else if protocol < crate::terminal_ipc::PROTOCOL_VERSION && is_qualified_source(protocol)
+        {
+            Self::connect_selected(socket, deadline, protocol)?
+        } else {
+            return Err(ControlError::UnsupportedVersion { actual: protocol });
+        };
+        peer.verify(client.proof())
+            .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
+        Ok(client)
+    }
+
+    fn connect_authenticated(
+        socket: &Path,
+        deadline: Instant,
+        handshake: impl FnOnce(UnixStream) -> Result<ControlClient, ControlError>,
+    ) -> Result<Self, ControlError> {
         let stream = crate::control::connect_control_socket(
             socket,
             deadline.saturating_duration_since(Instant::now()),
@@ -314,8 +370,7 @@ impl Client {
         .map_err(ControlError::Connect)?;
         let peer = Peer::observe(&stream, socket)
             .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
-        // The lifecycle and inspector subset is wire-proven for each source.
-        let client = ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
+        let client = handshake(stream)?;
         peer.verify(client.proof())
             .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
         Ok(Self {

@@ -89,7 +89,10 @@ pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
 /// Older launchers understand only the final ready/error response. Progress
 /// requires a separate explicit capability to keep their stdout protocol valid.
 pub const UI_LAUNCH_RECOVERY_PROGRESS_ENV: &str = "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS";
+/// A newer launcher can receive pane notes with the successful acknowledgement.
+pub(crate) const UI_LAUNCH_PANE_NOTES_ENV: &str = "CAGENTS_UI_LAUNCH_PANE_NOTES";
 pub const UI_LAUNCH_READY: &str = "ready";
+pub(crate) const UI_LAUNCH_PANE_NOTES_PREFIX: &str = "ready-with-pane-notes: ";
 pub const UI_LAUNCH_ERROR_PREFIX: &str = "error: ";
 /// A usable recovery window remains open while the updater reports failure.
 pub const UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX: &str = "recovery-incomplete: ";
@@ -569,6 +572,15 @@ pub fn ui_window_opened() -> bool {
 }
 
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
+    report_ui_startup_result(result.as_ref().map(|_| None).map_err(String::as_str))
+}
+
+/// The window opened and can be used while individual panes still need attention.
+pub fn report_ui_startup_with_pane_notes(notes: &str) -> io::Result<()> {
+    report_ui_startup_result(Ok(Some(notes)))
+}
+
+fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
         crate::diagnostics::record(crate::diagnostics::Event::Ready);
@@ -576,7 +588,12 @@ pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
     if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
     {
         let message = match result {
-            Ok(()) => UI_LAUNCH_READY.to_owned(),
+            Ok(Some(notes))
+                if env::var_os(UI_LAUNCH_PANE_NOTES_ENV).as_deref() == Some("1".as_ref()) =>
+            {
+                format!("{UI_LAUNCH_PANE_NOTES_PREFIX}{notes}").replace('\n', " ")
+            }
+            Ok(_) => UI_LAUNCH_READY.to_owned(),
             Err(error) => format!("{UI_LAUNCH_ERROR_PREFIX}{error}").replace('\n', " "),
         };
         let mut stdout = io::stdout().lock();
@@ -1969,33 +1986,52 @@ impl UiUpdateGuard {
     /// Finish a staged update without reopening windows that never closed.
     /// On a partial close, Drop cancels the remaining prepared windows and waits
     /// for committed windows to exit before reopening only those slots.
-    pub(crate) fn relaunch_closed_windows(mut self, executable: &Path) -> io::Result<()> {
+    pub(crate) fn relaunch_closed_windows(
+        mut self,
+        executable: &Path,
+    ) -> io::Result<Option<String>> {
         if self.prepared.is_empty() {
             let closed = self.closed.clone();
-            self.relaunch_windows(&closed, executable)
+            self.relaunch_windows_with_notes(&closed, executable)
         } else {
             self.set_fallback_executable(executable.to_owned());
             drop(self);
-            Ok(())
+            Ok(None)
         }
     }
 
-    pub fn relaunch_windows(mut self, slots: &[String], executable: &Path) -> io::Result<()> {
+    pub fn relaunch_windows(self, slots: &[String], executable: &Path) -> io::Result<()> {
+        self.relaunch_windows_with_notes(slots, executable)
+            .map(|_| ())
+    }
+
+    fn relaunch_windows_with_notes(
+        mut self,
+        slots: &[String],
+        executable: &Path,
+    ) -> io::Result<Option<String>> {
         self.prepared.clear();
         self.release_launch_fence()?;
         self.closed.clear();
         let mut errors = Vec::new();
+        let mut notes = Vec::new();
         for slot in slots {
-            if let Err(error) =
-                launch_window_at(executable, false, Some(slot), None, self.restore_policy)
-            {
-                errors.push((slot.as_str(), error.to_string()));
+            match launch_window_at(executable, false, Some(slot), None, self.restore_policy) {
+                Ok(Some(note)) => notes.push((slot.as_str(), note)),
+                Ok(None) => {}
+                Err(error) => errors.push((slot.as_str(), error.to_string())),
             }
         }
+        let notes = (!notes.is_empty()).then(|| relaunch_failure(slots.len(), &notes));
         if errors.is_empty() {
-            Ok(())
+            Ok(notes)
         } else {
-            Err(io::Error::other(relaunch_failure(slots.len(), &errors)))
+            let mut error = relaunch_failure(slots.len(), &errors);
+            if let Some(notes) = notes {
+                error.push('\n');
+                error.push_str(&notes);
+            }
+            Err(io::Error::other(error))
         }
     }
 
@@ -2151,6 +2187,7 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
         source,
         WindowRestorePolicy::Ordinary,
     )
+    .map(|_| ())
 }
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
@@ -2203,7 +2240,7 @@ fn launch_window_at(
     slot: Option<&str>,
     source: Option<&str>,
     restore_policy: WindowRestorePolicy,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     if let Some(slot) = slot {
         validate_window_slot(slot)?;
     }
@@ -2632,7 +2669,7 @@ pub fn launch_notification_destination(
     if let Some(token) = token.filter(|token| valid_activation_token(token)) {
         command.env("XDG_ACTIVATION_TOKEN", token);
     }
-    crate::control::spawn_ui_process(&mut command)
+    crate::control::spawn_ui_process(&mut command).map(|_| ())
 }
 
 pub fn launch_notification_window(slot: &str, token: Option<&str>) -> io::Result<()> {
@@ -2644,7 +2681,7 @@ pub fn launch_notification_window(slot: &str, token: Option<&str>) -> io::Result
     if let Some(token) = token.filter(|token| valid_activation_token(token)) {
         command.env("XDG_ACTIVATION_TOKEN", token);
     }
-    crate::control::spawn_ui_process(&mut command)
+    crate::control::spawn_ui_process(&mut command).map(|_| ())
 }
 
 fn activate_window_in(runtime_directory: &Path, slot: &str) -> io::Result<bool> {

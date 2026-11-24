@@ -2968,7 +2968,7 @@ fn upgrade_gate_requires_all_hundred_saved_panes_and_preserves_their_composers()
     let title = app.card_display_title(app.card_state(card).unwrap());
     assert!(
         reason.starts_with(&format!(
-            "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+            "1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
         )),
         "{reason}"
     );
@@ -2999,7 +2999,7 @@ fn upgrade_gate_requires_every_live_terminal_without_provider_activity_heuristic
         let title = app.card_display_title(app.card_state(card).unwrap());
         assert!(
             reason.starts_with(&format!(
-                "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+                "1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
             )),
             "{program}: {reason}"
         );
