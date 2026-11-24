@@ -1230,10 +1230,7 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                         .collect::<Vec<_>>();
                     actual.sort();
                     expected.sort();
-                    assert_eq!(
-                        actual, expected,
-                        "AX choices keep complete names and exact child identities"
-                    );
+                    assert_eq!(actual, expected, "AX choices keep complete names");
                 }
             }
         }
@@ -1371,9 +1368,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
                 .collect();
             let actual: Vec<_> = current
                 .iter()
-                .filter(|label| {
-                    label.ends_with(" · chosen-worker") || label.ends_with(" · other-worker")
-                })
+                .filter(|label| expected.contains(label))
                 .cloned()
                 .collect();
             assert_eq!(actual, expected);
@@ -2583,4 +2578,23 @@ fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_r
     assert!(runtime.failure_ui.expanded.contains(&key));
     assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw.as_str()));
     assert!(runtime.failure_preview(&key).is_some());
+}
+
+/// A subagent chooser row is named by the child's label, status and task;
+/// the provider's ID for the child is an address, never part of its name.
+#[test]
+fn a_chooser_row_is_not_named_by_its_childs_id() {
+    const ID: &str = "a404930e4df62e728";
+    let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.generation += 1;
+    let mut agent = child(ID, ToolStatus::Running, false);
+    agent.description = "Build and install the app".into();
+    snapshot.subagents = vec![agent];
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    let child = &runtime.snapshot.subagents[0];
+    let name = runtime.child_choice_name(child, &runtime.child_label(child, 80));
+    assert!(!name.contains(&ID[..8]), "{name}");
+    assert!(name.contains("Build and install the app"), "{name}");
 }

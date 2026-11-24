@@ -284,7 +284,7 @@ impl Coordinated {
     /// conversation lists, by its listed ID or its provider's address for it.
     pub(super) fn line(&self, listed: &dyn Fn(&str) -> Option<String>) -> (String, String) {
         let reading = &self.reading;
-        let names = |agents: &[String]| agents_phrase(reading, agents, listed);
+        let names = |agents: &[String]| agents_phrase(agents, listed);
         let name = |agent: &String| names(std::slice::from_ref(agent));
         let (verb, label): (&str, String) = match &reading.kind {
             Kind::Message(message) => (
@@ -313,11 +313,11 @@ impl Coordinated {
                 Act::Requests { agent } => ("Read what", format!("{} is asking", name(agent))),
                 Act::Answer {
                     agent,
-                    request,
+                    request: _,
                     action,
                 } => (
                     "Answered",
-                    format!("{}'s request {request} with {action}", name(agent)),
+                    format!("{}'s request with {action}", name(agent)),
                 ),
                 Act::Interrupt { agent } => ("Interrupted", name(agent)),
                 Act::Close { agents } => ("Closed", names(agents)),
@@ -367,15 +367,6 @@ fn message_verb(kind: OutboundKind) -> &'static str {
     }
 }
 
-/// An ID's first eight characters, which is how the CLI prints one. A name,
-/// such as `reviewer-2`, is kept whole.
-fn short_id(id: &str) -> &str {
-    if !is_identifier(id) {
-        return id;
-    }
-    id.char_indices().nth(8).map_or(id, |(end, _)| &id[..end])
-}
-
 /// Whom started agents are, as one phrase. One agent goes by its name, else
 /// its task's first line, else its type, as its tab will name it.
 fn started(spawn: &Spawn) -> String {
@@ -389,20 +380,16 @@ fn started(spawn: &Spawn) -> String {
 }
 
 /// A phrase for `agents`, as a step names them: by the names their tabs show
-/// where this conversation lists them. A `cagents` agent it does not list goes
-/// by the short ID the CLI prints; a provider's own agent, whose IDs the app
-/// shows nowhere, is only counted.
-fn agents_phrase(
-    reading: &Coordination,
-    agents: &[String],
-    listed: &dyn Fn(&str) -> Option<String>,
-) -> String {
+/// where this conversation lists them, or a name the agent was addressed by.
+/// An agent known only by an ID, which is an address rather than a name, is
+/// only counted.
+fn agents_phrase(agents: &[String], listed: &dyn Fn(&str) -> Option<String>) -> String {
     let mut names = Vec::new();
     let mut unknown = 0;
     for agent in agents {
         match listed(agent) {
             Some(name) => names.push(name),
-            None if reading.cli || !is_identifier(agent) => names.push(short_id(agent).to_owned()),
+            None if !is_identifier(agent) => names.push(agent.clone()),
             None => unknown += 1,
         }
     }
@@ -427,26 +414,19 @@ struct Recipient {
 }
 
 impl Recipient {
+    /// The recipient by name. A session's ID is the CLI's address for it,
+    /// not a name the reader knows, so a session without a title is only
+    /// another session.
     fn plain(&self) -> String {
         match (&self.session, self.name.is_empty()) {
-            (Some(session), true) => format!("session {}", short_id(session)),
-            (Some(session), false) => format!("{} ({})", self.name, short_id(session)),
-            (None, _) => self.name.clone(),
+            (Some(_), true) => "another session".into(),
+            _ => self.name.clone(),
         }
     }
 
-    /// As a row draws it: the name cut to fit beside the session ID that
-    /// tells it apart, and that ID, which the row keeps whole after it.
-    fn shown(&self) -> (String, String) {
-        let cut = |name: &str, room: usize| Runtime::short_description(name, room);
-        match (&self.session, self.name.is_empty()) {
-            (Some(session), false) => {
-                let id = short_id(session);
-                let room = LABEL_CHARS.saturating_sub(id.chars().count() + 3).max(8);
-                (cut(&self.name, room), format!(" ({id})"))
-            }
-            _ => (cut(&self.plain(), LABEL_CHARS), String::new()),
-        }
+    /// As a row draws it: the name, cut to fit.
+    fn shown(&self) -> String {
+        Runtime::short_description(&self.plain(), LABEL_CHARS)
     }
 }
 
@@ -480,10 +460,10 @@ fn recipient(
         session: None,
         live: false,
     };
-    let phrase = |agents: &[String]| named(agents_phrase(reading, agents, listed));
+    let phrase = |agents: &[String]| named(agents_phrase(agents, listed));
     match message.kind {
         OutboundKind::Report => named("the conversation that started it".into()),
-        OutboundKind::Reply => named(format!("message {}", short_id(&message.to))),
+        OutboundKind::Reply => named("a message".into()),
         _ if message.to == "parent" => named("the session that started it".into()),
         // A `cagents` recipient is a session ID, or a prefix of one.
         _ if reading.cli && is_identifier(&message.to) => Recipient {
@@ -650,7 +630,7 @@ impl MessageRun {
                         names: std::iter::once(agent.clone())
                             .chain(listed(agent))
                             .collect(),
-                        shown: agents_phrase(reading, std::slice::from_ref(agent), listed),
+                        shown: agents_phrase(std::slice::from_ref(agent), listed),
                     })
                     .collect(),
                 _ => vec![Agent::sent(message, reading, listed)],
@@ -937,8 +917,9 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
     }
     if reading.cli {
         match (&spawn.placement, &spawn.channel) {
-            (Some(crate::agent_execution::Placement::Channel(channel)), _)
-            | (None, Some(channel)) => parts.push(format!("Channel {channel}")),
+            // A channel is known here only by its ID, which is no name to
+            // show; the row's own place in the sidebar says which it is.
+            (Some(crate::agent_execution::Placement::Channel(_)), _) | (None, Some(_)) => {}
             (Some(crate::agent_execution::Placement::Worktree { path, .. }), _) => {
                 parts.push(format!("Worktree view {}", path.display()))
             }
@@ -1656,7 +1637,7 @@ impl Runtime {
             [agent] if drawn.session.is_none() && drawn.name == joined(agent) => {
                 self.row_agent_name(agent)
             }
-            _ => drawn.shown(),
+            _ => (drawn.shown(), String::new()),
         };
         let open = match (listed.as_slice(), &recipient_whole.session) {
             ([agent], _) => Some(Action::SelectSubagent(self.target, Some(agent.id.clone()))),
@@ -2965,16 +2946,9 @@ mod identity_tests {
 
     #[test]
     fn agents_a_step_cannot_name_are_counted() {
-        let reading = |cli| Coordination {
-            kind: Kind::Act(Act::Agents),
-            outcome: Default::default(),
-            subagents: Vec::new(),
-            cli,
-        };
         let listed = |id: &str| (id == "thread-a").then(|| "reviewer".to_owned());
         let agents = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
-        let native = reading(false);
-        let phrase = |ids: &[&str]| agents_phrase(&native, &agents(ids), &listed);
+        let phrase = |ids: &[&str]| agents_phrase(&agents(ids), &listed);
         assert_eq!(phrase(&["thread-a"]), "reviewer");
         assert_eq!(
             phrase(&["thread-a", "019a4c2e-7f10-7c3e-9b1d-2f5e8a6c4d01"]),
@@ -2985,11 +2959,9 @@ mod identity_tests {
             "reviewer and 2 other agents"
         );
         assert_eq!(phrase(&["019a4c2e-7f10", "019a4c2e-7f11"]), "2 agents");
-        // A `cagents` agent goes by the short ID the CLI prints for it.
-        assert_eq!(
-            agents_phrase(&reading(true), &agents(&["95fcd1b9e0aa"]), &listed),
-            "95fcd1b9"
-        );
+        // A `cagents` agent the conversation does not list is known only by
+        // its ID, an address rather than a name, so it is counted too.
+        assert_eq!(phrase(&["95fcd1b9e0aa"]), "an agent");
     }
 
     #[test]
@@ -3197,18 +3169,22 @@ mod identity_tests {
             session: Some("95fcd1b9e3a4".into()),
             live: true,
         };
-        let (shown, id) = titled.shown();
-        assert_eq!(id, " (95fcd1b9)");
-        assert!(
-            shown.chars().count() + id.chars().count() <= LABEL_CHARS + 1,
-            "{shown}{id}"
-        );
+        // The session's ID is its address, not a name: the row shows the
+        // title alone, and a session with none as another session.
+        let shown = titled.shown();
+        assert!(!shown.contains("95fcd1b9"), "{shown}");
+        assert!(shown.chars().count() <= LABEL_CHARS + 1, "{shown}");
+        let untitled = Recipient {
+            name: String::new(),
+            ..titled
+        };
+        assert_eq!(untitled.shown(), "another session");
         // A phrase the row draws whole.
         let report = Recipient {
             name: "the conversation that started it".into(),
             session: None,
             live: false,
         };
-        assert_eq!(report.shown(), (report.name.clone(), String::new()));
+        assert_eq!(report.shown(), report.name);
     }
 }

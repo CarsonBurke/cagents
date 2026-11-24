@@ -68,7 +68,7 @@ pub(super) fn surface<'a, Message: 'a>(
     Element::new(Host {
         id: card_control_id(card, "browser.host"),
         description: format!(
-            "Browser card {card}. Location: {}. {}. {}. {}. {}Embedded webpage accessibility is unavailable. Use Open in system browser to access the webpage in your browser.",
+            "Browser. Location: {}. {}. {}. {}. {}Embedded webpage accessibility is unavailable. Use Open in system browser to access the webpage in your browser.",
             location.as_str(),
             match capability {
                 BrowserCapability::Integrated => "Integrated browser",
@@ -341,11 +341,9 @@ impl Cagents {
             return;
         }
         self.status = Some(if opened {
-            TransientNotice::success(format!("Browser card {card}: opened in the system browser"))
+            TransientNotice::success("Opened in the system browser")
         } else {
-            TransientNotice::error(format!(
-                "Browser card {card}: could not open in the system browser"
-            ))
+            TransientNotice::error("Could not open in the system browser")
         });
     }
 }

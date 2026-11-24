@@ -423,10 +423,8 @@ impl Cagents {
                         })
                         .map(|project| project.id);
                     let Some(project) = project else {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Journal operation {} remains inspectable in the journal: {:?}: {}",
-                            report.operation_id, report.state, report.detail
-                        )));
+                        self.status =
+                            Some(TransientNotice::warning(unowned_operation_notice(&report)));
                         continue;
                     };
                     self.worktree_operations.insert(
@@ -547,9 +545,57 @@ pub(super) fn created_worktree_notice(
     }
 }
 
+/// What became of a worktree creation whose project is no longer in the
+/// sidebar, said by its branch and repository rather than its journal ID.
+fn unowned_operation_notice(report: &WorktreeOperationReport) -> String {
+    let subject = report.request.as_ref().map_or_else(
+        || "A worktree for a project no longer in the sidebar".to_owned(),
+        |request| {
+            format!(
+                "Worktree {} in {}",
+                request.branch.as_str(),
+                request.repository.display()
+            )
+        },
+    );
+    let what = match report.state {
+        WorktreeOperationState::Created => "was created",
+        WorktreeOperationState::NotCreated => "was not created",
+        _ => "did not finish being created",
+    };
+    if report.detail.trim().is_empty() {
+        format!("{subject} {what}")
+    } else {
+        format!("{subject} {what}: {}", report.detail.trim())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leftover creation whose project has gone is reported in words, not
+    /// by its journal ID and Debug-printed state.
+    #[test]
+    fn an_unowned_operation_is_reported_without_its_journal_id() {
+        let report = WorktreeOperationReport {
+            operation_id: OperationId::new(),
+            generation: 1,
+            request: None,
+            state: WorktreeOperationState::OutcomeUnknown,
+            outcome: None,
+            detail: "git exited before confirming".into(),
+            created_at_unix_ms: 1,
+        };
+        let notice = unowned_operation_notice(&report);
+        assert_eq!(
+            notice,
+            "A worktree for a project no longer in the sidebar did not finish being created: \
+             git exited before confirming"
+        );
+        assert!(!notice.contains(&report.operation_id.to_string()));
+        assert!(!notice.contains("OutcomeUnknown"));
+    }
 
     #[test]
     fn retained_cancel_is_once_and_stale_stages_do_not_advance() {

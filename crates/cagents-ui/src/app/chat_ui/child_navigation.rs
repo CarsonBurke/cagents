@@ -545,17 +545,17 @@ impl Runtime {
         child_ordinal(&self.snapshot.subagents, &self.child_ordinals, child)
     }
 
-    /// A chooser row's accessible name. It ends with the exact child ID,
-    /// which tells apart rows whose names and tasks read the same.
+    /// A chooser row's accessible name. `label` carries the number that
+    /// tells apart children whose names read the same, as their tabs do;
+    /// the child's ID is the provider's address for it, not a name.
     pub(super) fn child_choice_name(&self, child: &chat::Subagent, label: &str) -> String {
         let status = self.native_child_status(child);
         match Self::native_child_task(child).filter(|_| !Self::named_by_task(child)) {
             Some(task) => format!(
-                "{label} · {status} · Task: {} · {}",
+                "{label} · {status} · Task: {}",
                 Self::short_description(task, 120),
-                child.id
             ),
-            None => format!("{label} · {status} · {}", child.id),
+            None => format!("{label} · {status}"),
         }
     }
 
