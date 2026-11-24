@@ -547,7 +547,7 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
         })
         .chain((1..10).map(|number| view(&spent, number)))
         .chain([view(&rest_spent, 1), view(&open, 1)]);
-        work.run_lookups(&gh, lookups, Some(scope));
+        work.run_lookups(&gh, lookups);
     });
 
     let commands = forge.0.lock().unwrap();

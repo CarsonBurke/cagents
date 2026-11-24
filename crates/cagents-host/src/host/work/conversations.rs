@@ -1145,20 +1145,16 @@ impl Handle {
         if lookups.is_empty() {
             return;
         }
-        let gh = GitHubService::system("gh");
-        let lookups = lookups.into_iter().map(|(_, lookup)| lookup);
-        if let Ok(scope) = crate::github_status::credential_fingerprint() {
-            polling::with_scope(&scope, || self.run_lookups(&gh, lookups, Some(&scope)));
-        } else {
-            self.run_lookups(&gh, lookups, None);
-        }
+        self.run_lookups(
+            &GitHubService::system("gh"),
+            lookups.into_iter().map(|(_, lookup)| lookup),
+        );
     }
 
     fn run_lookups<E: crate::repository::ProcessExecutor>(
         &self,
         gh: &GitHubService<E>,
         lookups: impl IntoIterator<Item = Lookup>,
-        scope: Option<&str>,
     ) {
         let cancellation = &self.0.cancellation;
         let mut checked_hosts = BTreeSet::new();
@@ -1167,13 +1163,13 @@ impl Handle {
         for lookup in lookups {
             let repository = lookup.repository();
             let authority = repository.authority();
-            if checked_hosts.insert(authority.clone()) {
-                if let Some(scope) = scope {
-                    polling::bind_scope(&authority, scope);
-                }
-                if let Some(limit) = polling::rate_limit_for(&authority, "graphql") {
-                    limited.insert(authority.clone(), limit);
-                }
+            // A transport worker binds the credential context. Use its
+            // published budget here without reading the credentials for a
+            // request that cannot run.
+            if checked_hosts.insert(authority.clone())
+                && let Some(limit) = polling::rate_limit_for(&authority, "graphql")
+            {
+                limited.insert(authority.clone(), limit);
             }
             if limited.contains_key(&authority) {
                 continue;
