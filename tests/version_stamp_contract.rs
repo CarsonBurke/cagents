@@ -2,6 +2,9 @@
 //! place of `main`, as the terminal and native holders' do: a holder records
 //! the version of the executable it was started from.
 
+// Nothing here depends on a feature, so only the cli lane runs this target.
+#![cfg(not(any(feature = "host", feature = "ui")))]
+
 use std::sync::OnceLock;
 
 cagents::stamp_version!();

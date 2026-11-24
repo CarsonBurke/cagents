@@ -1,3 +1,6 @@
+// The shipped `cagents` command has no features, so only the cli lane runs
+// this target: the host and ui lanes would test a build nobody ships.
+#![cfg(not(any(feature = "host", feature = "ui")))]
 use cagents::process::{
     CancellationToken, CommandSpec, ProcessExecutor, ProcessOutput, SystemProcessExecutor,
 };

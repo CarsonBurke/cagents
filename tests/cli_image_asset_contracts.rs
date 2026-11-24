@@ -1,4 +1,6 @@
-#![cfg(target_os = "linux")]
+// The shipped `cagents` command has no features, so only the cli lane runs
+// this target: the host and ui lanes would test a build nobody ships.
+#![cfg(all(target_os = "linux", not(any(feature = "host", feature = "ui"))))]
 //! Public CLI refusals must precede backend preparation and private store access.
 use cagents::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
 use serde_json::Value;

@@ -10,6 +10,9 @@
 //! `CAGENTS_RECORD_MOBILE_API=1` appends examples that have no recording.
 //! Recordings are never rewritten.
 
+// Nothing here depends on a feature, so only the cli lane runs this target.
+#![cfg(not(any(feature = "host", feature = "ui")))]
+
 use std::{collections::BTreeMap, path::PathBuf};
 
 use cagents_mobile_api::*;
