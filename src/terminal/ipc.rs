@@ -326,7 +326,9 @@ use crate::{
 /// them. An older client is sent launches without it, and its requests are
 /// read without it; one read from an older update source has none, and a
 /// request to one is written without it.
-pub const PROTOCOL_VERSION: u16 = 202;
+///
+/// Version 203 appends the provider CLI inventory query and reply.
+pub const PROTOCOL_VERSION: u16 = 203;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -861,6 +863,7 @@ pub enum ClientRequest {
         device: String,
         nonce: [u8; crate::device_trust::SECRET_BYTES],
     },
+    ProviderStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1351,6 +1354,7 @@ pub enum ServerResponse {
         claim: crate::device_trust::Claim,
         proof: [u8; crate::device_trust::SECRET_BYTES],
     },
+    ProviderStatus(Vec<crate::account::provider_install::ProviderStatus>),
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

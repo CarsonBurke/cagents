@@ -793,6 +793,120 @@ fn command_with_path(account: &Account, program: &Path, search_path: Option<&OsS
     command
 }
 
+/// Runs the entry point that a new launch uses, or a staged binary awaiting
+/// installation. Merely asking for the version should never trigger an update.
+#[cfg(feature = "host")]
+pub async fn provider_version(
+    provider: Provider,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<String, String> {
+    let mut command = command_with_path(&Account::system(provider), program, search_path);
+    command.arg("--version");
+    match provider {
+        Provider::Claude => {
+            command.env("DISABLE_AUTOUPDATER", "1");
+        }
+        Provider::Muse => {
+            command
+                .env_remove("MUSE_LAUNCHER_INSTALL")
+                .env("MUSE_NO_AUTO_UPDATE", "1")
+                .env("MUSE_LOGIN", "0");
+        }
+        Provider::Omp | Provider::Codex | Provider::Antigravity => {}
+    }
+    let (status, output) = run_provider_command(command, Duration::from_secs(5)).await?;
+    if !status.success() {
+        return Err(format!("--version exited with {status}"));
+    }
+    std::str::from_utf8(&output)
+        .ok()
+        .and_then(|output| {
+            output.split_ascii_whitespace().find_map(|word| {
+                let word = if provider == Provider::Omp {
+                    word.strip_prefix("omp/").unwrap_or(word)
+                } else {
+                    word
+                };
+                version_number(word)
+            })
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| "--version did not print a version number".to_owned())
+}
+
+#[cfg(feature = "host")]
+fn version_number(word: &str) -> Option<&str> {
+    let version = word.strip_prefix('v').unwrap_or(word);
+    (version.len() <= 128 && semver::Version::parse(version).is_ok()).then_some(version)
+}
+
+/// Runs one maintenance command at low priority with a bounded output buffer.
+/// Its process group is killed and reaped before an updater can roll back.
+#[cfg(feature = "host")]
+pub async fn run_provider_command(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    const CAPTURE_LIMIT: usize = 32 * 1024;
+    scrub(&mut command, SHELL_SCRUBBED_ENVIRONMENT);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .process_group(0);
+    // SAFETY: these calls use only scalar values in the new child, before exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::nice(10);
+            #[cfg(target_os = "linux")]
+            libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13); // current process, idle class
+            Ok(())
+        });
+    }
+
+    let mut group = Group::spawn(command).await?;
+    let read = tokio::time::timeout(timeout, async {
+        let mut stdout = group
+            .child
+            .stdout
+            .take()
+            .ok_or("The CLI's output could not be read")?;
+        let mut captured = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let count = stdout
+                .read(&mut buffer)
+                .await
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            let capture = count.min(CAPTURE_LIMIT - captured.len());
+            captured.extend_from_slice(&buffer[..capture]);
+        }
+        while !group.leader_exited() {
+            tokio::time::sleep(EXIT_POLL).await;
+        }
+        Ok::<_, String>(captured)
+    })
+    .await;
+    group.kill();
+    let status = group
+        .child
+        .wait()
+        .await
+        .map_err(|error| error.to_string())?;
+    let captured = read.map_err(|_| {
+        format!(
+            "The CLI did not finish within {} seconds",
+            timeout.as_secs()
+        )
+    })??;
+    Ok((status, captured))
+}
+
 /// A spawned CLI and the process group it leads, which goes with it: when
 /// the probe finishes, and when it is abandoned by its timeout, so nothing
 /// the CLI started outlives the probe.
