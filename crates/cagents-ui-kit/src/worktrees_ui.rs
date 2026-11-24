@@ -1504,8 +1504,8 @@ mod tests {
 
     /// The accessible names a project's header publishes, in tree order.
     fn heading_names(project: &SidebarProject) -> Vec<String> {
-        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
         use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
 
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let state = State::default();
