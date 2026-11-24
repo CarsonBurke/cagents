@@ -74,7 +74,6 @@ import kotlinx.coroutines.launch
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PairingScreen(
-    main: MainViewModel,
     link: String?,
     onBack: () -> Unit,
     onPaired: () -> Unit,
@@ -83,7 +82,6 @@ fun PairingScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val hint by vm.hint.collectAsStateWithLifecycle()
-    val current by main.settings.collectAsStateWithLifecycle()
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
 
@@ -97,7 +95,7 @@ fun PairingScreen(
     val paste: () -> Unit = {
         scope.launch {
             val text = clipboard.getClipEntry()?.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text
-            vm.offered(text?.toString().orEmpty())
+            vm.pasted(text?.toString().orEmpty())
         }
     }
 
@@ -120,7 +118,7 @@ fun PairingScreen(
         ) {
             when (val s = state) {
                 PairingState.Scanning -> Scanning(hint, onScanned = vm::scanned, onPaste = paste, onManual = onManual)
-                is PairingState.Confirm -> Confirm(s.code, current.label.takeIf { current.isComplete && current.host !in s.code.hosts }, vm::confirm, vm::scanAgain)
+                is PairingState.Confirm -> Confirm(s.code, s.replaces, s.conflicts, onPair = vm::confirm, onCancel = vm::scanAgain)
                 is PairingState.Connecting -> Progress("Connecting to ${s.code.name}…") {
                     OutlinedButton(onClick = vm::scanAgain) { Text("Cancel") }
                 }
@@ -148,6 +146,8 @@ private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> 
     val activity = LocalActivity.current
     fun granted() = context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     var camera by remember { mutableStateOf(granted()) }
+    val hasCamera = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) }
+    var cameraFailed by remember { mutableStateOf(false) }
     // Asked once on arriving: the person just chose to scan, which is when the camera is needed.
     var asked by rememberSaveable { mutableStateOf(false) }
     var refused by rememberSaveable { mutableStateOf(false) }
@@ -158,7 +158,7 @@ private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> 
     // Coming back from system settings, where camera access may have been turned on.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { camera = granted() }
     LaunchedEffect(Unit) {
-        if (!camera && !asked) {
+        if (hasCamera && !camera && !asked) {
             asked = true
             request.launch(Manifest.permission.CAMERA)
         }
@@ -177,8 +177,23 @@ private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> 
             .clip(RoundedCornerShape(24.dp)),
         contentAlignment = Alignment.Center,
     ) {
-        if (camera) {
-            QrScanner(onText = onScanned, modifier = Modifier.fillMaxSize())
+        if (!hasCamera || cameraFailed) {
+            Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxSize()) {
+                Column(
+                    Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
+                ) {
+                    Icon(Icons.Outlined.NoPhotography, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "The camera isn't available. Paste the pairing code instead, or set the computer up by hand.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        } else if (camera) {
+            QrScanner(onText = onScanned, onUnavailable = { cameraFailed = true }, modifier = Modifier.fillMaxSize())
             Surface(
                 color = androidx.compose.ui.graphics.Color.Transparent,
                 border = BorderStroke(3.dp, MaterialTheme.colorScheme.primary),
@@ -229,7 +244,7 @@ private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> 
 }
 
 @Composable
-private fun Confirm(code: PairingCode, replaces: String?, onPair: () -> Unit, onCancel: () -> Unit) {
+private fun Confirm(code: PairingCode, replaces: String?, conflicts: List<String>, onPair: () -> Unit, onCancel: () -> Unit) {
     Icon(Icons.Outlined.PhonelinkLock, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
     Text("Pair with ${code.name}?", style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
     Text(
@@ -243,6 +258,15 @@ private fun Confirm(code: PairingCode, replaces: String?, onPair: () -> Unit, on
             "It replaces $replaces as the computer this phone connects to.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+    }
+    if (conflicts.isNotEmpty()) {
+        Text(
+            "This phone trusts a different computer at ${conflicts.joinToString(", ")}. " +
+                "Pair only if you reinstalled that computer or its SSH server.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.error,
             textAlign = TextAlign.Center,
         )
     }

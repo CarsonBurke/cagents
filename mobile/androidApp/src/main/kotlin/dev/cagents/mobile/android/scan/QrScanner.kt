@@ -30,12 +30,14 @@ import java.util.concurrent.Executors
 /**
  * The camera's view, reading QR codes from it. Each text read is handed to
  * [onText] on the main thread, as often as the code stays in view.
+ * [onUnavailable] is called if the camera can't be opened.
  */
 @Composable
-fun QrScanner(onText: (String) -> Unit, modifier: Modifier = Modifier) {
+fun QrScanner(onText: (String) -> Unit, onUnavailable: () -> Unit, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
     val currentOnText by rememberUpdatedState(onText)
+    val currentOnUnavailable by rememberUpdatedState(onUnavailable)
     val controller = remember {
         LifecycleCameraController(context).apply {
             setEnabledUseCases(CameraController.IMAGE_ANALYSIS)
@@ -52,7 +54,14 @@ fun QrScanner(onText: (String) -> Unit, modifier: Modifier = Modifier) {
         val analysis = Executors.newSingleThreadExecutor()
         val main = ContextCompat.getMainExecutor(context)
         controller.setImageAnalysisAnalyzer(analysis, QrAnalyzer { text -> main.execute { currentOnText(text) } })
-        controller.bindToLifecycle(owner)
+        try {
+            controller.bindToLifecycle(owner)
+            controller.initializationFuture.addListener({
+                runCatching { controller.initializationFuture.get() }.onFailure { currentOnUnavailable() }
+            }, main)
+        } catch (e: RuntimeException) {
+            currentOnUnavailable()
+        }
         onDispose {
             controller.unbind()
             controller.clearImageAnalysisAnalyzer()

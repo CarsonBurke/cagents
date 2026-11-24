@@ -69,7 +69,8 @@ class PairingCode(
             val hostKey = one("hostkey")?.takeIf(FINGERPRINT::matches) ?: return Parsed.Invalid(
                 "This pairing code doesn't say how to recognize the computer. Update cagents there and show a new code.",
             )
-            val user = one("user")?.takeIf(::isPlainWord) ?: return invalid()
+            // A directory user may be `person@domain`.
+            val user = one("user")?.takeIf { isPlainWord(it.replace("@", "")) } ?: return invalid()
             val port = one("port")?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return invalid()
             val hosts = params["host"].orEmpty().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
             if (hosts.isEmpty() || !hosts.all(::isPlainWord)) return invalid()

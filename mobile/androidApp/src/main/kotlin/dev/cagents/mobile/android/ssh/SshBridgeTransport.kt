@@ -52,6 +52,7 @@ class SshBridgeTransport(
         if (!target.isComplete) throw ConnectFailure.Refused("Enter your computer's address in Settings.")
         return openSsh(
             SshTarget(
+                name = target.label,
                 hosts = target.hosts,
                 port = target.port,
                 user = target.user,
@@ -96,6 +97,8 @@ private class StoredHostKeys(private val store: HostKeyStore, private val target
 }
 
 internal class SshTarget(
+    /** What to call the computer in messages. */
+    val name: String,
     /** Tried in order, each given a head start; see [firstToSucceed]. */
     val hosts: List<String>,
     val port: Int,
@@ -115,7 +118,9 @@ private const val KEEPALIVE_SECONDS = 20
  * Connects to the first of the target's hosts to answer with an acceptable
  * host key, authenticates there, and runs its command.
  */
-internal suspend fun openSsh(target: SshTarget): LineChannel {
+internal suspend fun openSsh(target: SshTarget): LineChannel = withContext(Dispatchers.IO) {
+    // Everything here may touch the network, disconnecting included, which
+    // Android refuses on the main thread.
     val client = try {
         firstToSucceed(target.hosts, ADDRESS_HEAD_START, discard = { it.disconnectQuietly() }) { host ->
             connect(target, host)
@@ -127,7 +132,7 @@ internal suspend fun openSsh(target: SshTarget): LineChannel {
     // cancellation that discards the result, the connection is closed.
     var made: SshLineChannel? = null
     try {
-        return blocking(client) {
+        blocking(client) {
             val host = client.remoteHostname
             try {
                 client.authPublickey(target.user, SigningKeyProvider(target.key))
@@ -161,6 +166,8 @@ private suspend fun connect(target: SshTarget, host: String): SSHClient {
     try {
         blocking(client) { client.connect(host, target.port) }
     } catch (e: CancellationException) {
+        // Cancelled even as it connected: nobody else will close it.
+        client.disconnectQuietly()
         throw e
     } catch (e: TransportException) {
         client.disconnectQuietly()
@@ -201,7 +208,7 @@ private fun mostTelling(failures: List<Throwable>, target: SshTarget): Throwable
         ?: failures.firstOrNull { it is ConnectFailure && it !is ConnectFailure.Network }
         ?: failures.singleOrNull()
         ?: ConnectFailure.Network(
-            "Couldn't reach the computer at ${target.hosts.joinToString(", ")}. " +
+            "Couldn't reach ${target.name} at any of its ${target.hosts.size} addresses. " +
                 "Is it awake, and is this phone on its network or on Tailscale?",
             failures.first(),
         )
@@ -209,7 +216,7 @@ private fun mostTelling(failures: List<Throwable>, target: SshTarget): Throwable
 private fun describe(e: Throwable, host: String, port: Int): String {
     val address = "$host:$port"
     return when (generateSequence(e) { it.cause }.last()) {
-        is UnknownHostException -> "Couldn't find $host. Check the address in Settings."
+        is UnknownHostException -> "Couldn't find $host. Check the address."
         is ConnectException, is NoRouteToHostException ->
             "Couldn't reach $address. Is the computer awake and on the same network?"
         is SocketTimeoutException -> "$address didn't answer in time."

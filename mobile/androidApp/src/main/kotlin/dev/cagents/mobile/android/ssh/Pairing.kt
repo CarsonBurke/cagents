@@ -32,6 +32,7 @@ class Pairing(
         val channel = try {
             openSsh(
                 SshTarget(
+                    name = code.name,
                     hosts = code.hosts,
                     port = code.port,
                     user = code.user,

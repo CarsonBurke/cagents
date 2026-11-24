@@ -82,9 +82,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         controller.retryNow()
     }
 
-    /** Forgets the trusted host key at every address, so the next connection asks again. */
-    fun forgetHostKey() {
-        graph.hostKeys.forget(settings.value.hostKeyIds)
+    /**
+     * Forgets the trusted host key at [host], or at every address when null,
+     * so the next connection there asks again.
+     */
+    fun forgetHostKey(host: String? = null) {
+        val settings = settings.value
+        graph.hostKeys.forget(host?.let { listOf(settings.hostKeyId(it)) } ?: settings.hostKeyIds)
         controller.retryNow()
     }
 

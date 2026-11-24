@@ -22,8 +22,13 @@ sealed interface PairingState {
     /** Looking for a code with the camera. */
     data object Scanning : PairingState
 
-    /** A code from a link or the clipboard, waiting for the person to confirm. */
-    data class Confirm(val code: PairingCode) : PairingState
+    /**
+     * A code waiting for the person to confirm: one from a link or the
+     * clipboard, or one that would replace the computer this phone uses
+     * ([replaces]) or trusts a different key at some of its addresses
+     * ([conflicts]).
+     */
+    data class Confirm(val code: PairingCode, val replaces: String?, val conflicts: List<String>) : PairingState
 
     data class Connecting(val code: PairingCode) : PairingState
 
@@ -63,7 +68,10 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         if (_state.value != PairingState.Scanning || text == lastScanned) return
         lastScanned = text
         when (val parsed = PairingCode.parse(text, now())) {
-            is PairingCode.Parsed.Code -> start(parsed.code)
+            is PairingCode.Parsed.Code -> {
+                val confirm = confirmation(parsed.code)
+                if (confirm.replaces != null || confirm.conflicts.isNotEmpty()) _state.value = confirm else start(parsed.code)
+            }
             is PairingCode.Parsed.Invalid -> showHint(parsed.message)
             PairingCode.Parsed.NotACode -> showHint("That isn't a cagents pairing code.")
         }
@@ -77,10 +85,20 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
     fun offered(text: String) {
         if (_state.value is PairingState.Connecting || _state.value is PairingState.Waiting) return
         _state.value = when (val parsed = PairingCode.parse(text, now())) {
-            is PairingCode.Parsed.Code -> PairingState.Confirm(parsed.code)
+            is PairingCode.Parsed.Code -> confirmation(parsed.code)
             is PairingCode.Parsed.Invalid -> PairingState.Failed(parsed.message)
             PairingCode.Parsed.NotACode -> PairingState.Failed("That isn't a cagents pairing code. On the computer, click the phone icon in the status bar, then Pair a phone.")
         }
+    }
+
+    private fun confirmation(code: PairingCode): PairingState.Confirm {
+        val current = graph.settings.settings.value
+        val ids = current.copy(port = code.port)
+        val conflicts = code.hosts.filter { host ->
+            graph.hostKeys.pinned(ids.hostKeyId(host)).let { it != null && it != code.hostKey }
+        }
+        val replaces = current.label.takeIf { current.isComplete && current.hosts.none { it in code.hosts } }
+        return PairingState.Confirm(code, replaces, conflicts)
     }
 
     /** A link another app opened this one with; offered once, however often the screen is recreated. */
@@ -88,6 +106,16 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         if (link == linked) return
         linked = link
         offered(link)
+    }
+
+    /** A code from the clipboard: the person chose it, but it is confirmed like a link. Anything else is only a hint. */
+    fun pasted(text: String) {
+        if (_state.value != PairingState.Scanning) return
+        when (val parsed = PairingCode.parse(text, now())) {
+            is PairingCode.Parsed.Code -> _state.value = confirmation(parsed.code)
+            is PairingCode.Parsed.Invalid -> showHint(parsed.message)
+            PairingCode.Parsed.NotACode -> showHint("The clipboard has no cagents pairing code.")
+        }
     }
 
     fun confirm() {
@@ -114,7 +142,8 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
             _state.value = when (outcome) {
                 is PairOutcome.Paired -> {
                     // Connect with the phone's own key to the computer just saved.
-                    launch(Dispatchers.Default) { graph.controller.restart() }
+                    // In the app's scope: leaving this screen, which comes next, mustn't cancel it.
+                    graph.scope.launch { graph.controller.restart() }
                     PairingState.Paired(code)
                 }
                 PairOutcome.Declined -> PairingState.Declined(code)

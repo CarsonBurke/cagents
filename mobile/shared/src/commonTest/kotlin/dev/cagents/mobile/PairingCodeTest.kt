@@ -71,6 +71,12 @@ class PairingCodeTest {
     }
 
     @Test
+    fun aDirectoryUserKeepsItsDomain() {
+        assertEquals("person@corp.example", valid(code().replace("user=person", "user=person%40corp.example")).user)
+        assertIs<Parsed.Invalid>(parsed(code().replace("user=person", "user=%40")))
+    }
+
+    @Test
     fun withoutANameShowsTheFirstHost() {
         assertEquals("workstation.tail1234.ts.net", valid(code(name = "")).name)
     }

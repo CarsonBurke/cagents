@@ -79,8 +79,10 @@ fun SettingsScreen(
     var advanced by rememberSaveable { mutableStateOf(saved.command != ConnectionSettings.DEFAULT_COMMAND) }
     val firstRun = !saved.isComplete
     val manualSetup by vm.manualSetup.collectAsStateWithLifecycle()
-    // A first run leads with pairing; the fields are for setting a computer up by hand.
-    val manual = !firstRun || manualSetup
+    // A first run leads with pairing, and a paired computer needs no fields;
+    // they are for setting a computer up by hand.
+    val paired = !firstRun && saved.name.isNotEmpty()
+    val manual = (!firstRun && !paired) || manualSetup
     val hosts = ConnectionSettings.parseHosts(host)
     val draft = ConnectionSettings(
         hosts = hosts,
@@ -134,6 +136,21 @@ fun SettingsScreen(
                 if (!manual) {
                     TextButton(onClick = { vm.showManualSetup() }) { Text("Set up by hand instead") }
                 }
+            }
+            if (paired && !manual) {
+                SectionTitle("Computer")
+                Text("Paired with ${saved.name}", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "${saved.user}@${saved.hosts.joinToString(", ")}, port ${saved.port}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Outlined.QrCodeScanner, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Pair again or with another computer")
+                }
+                TextButton(onClick = { vm.showManualSetup() }) { Text("Edit the connection by hand") }
             }
             if (manual) {
                 SectionTitle("Computer")
@@ -212,7 +229,7 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Fingerprint(pinned!!)
-                OutlinedButton(onClick = vm::forgetHostKey) { Text("Forget this computer's key") }
+                OutlinedButton(onClick = { vm.forgetHostKey() }) { Text("Forget this computer's key") }
             }
 
             Spacer(Modifier.height(8.dp))

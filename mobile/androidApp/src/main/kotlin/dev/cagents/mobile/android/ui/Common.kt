@@ -120,7 +120,7 @@ private fun Banner(
  * a trusted one presents a different key.
  */
 @Composable
-fun HostKeyDialogs(vm: MainViewModel) {
+fun HostKeyDialogs(vm: MainViewModel, onPairAgain: () -> Unit) {
     val remote by vm.remote.collectAsStateWithLifecycle()
     val settings by vm.settings.collectAsStateWithLifecycle()
     val failure = (remote.connection as? ConnectionState.NeedsAction)?.failure
@@ -155,6 +155,9 @@ fun HostKeyDialogs(vm: MainViewModel) {
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Its host key differs from the one you trusted. If you didn't reinstall the computer or its SSH server, someone may be impersonating it.")
+                        if (settings.name.isNotEmpty()) {
+                            Text("If you did, pair again from the computer to trust its new key.")
+                        }
                         Text("Now", style = MaterialTheme.typography.labelMedium)
                         Fingerprint(failure.fingerprint)
                         Text("Trusted", style = MaterialTheme.typography.labelMedium)
@@ -165,8 +168,16 @@ fun HostKeyDialogs(vm: MainViewModel) {
                     TextButton(onClick = { vm.dismissHostKey(failure.fingerprint) }) { Text("Keep the old key") }
                 },
                 dismissButton = {
-                    TextButton(onClick = vm::forgetHostKey) {
-                        Text("Forget old key", color = MaterialTheme.colorScheme.error)
+                    // A paired computer's key came from its pairing code, so a new one comes from a new code.
+                    if (settings.name.isNotEmpty()) {
+                        TextButton(onClick = {
+                            vm.dismissHostKey(failure.fingerprint)
+                            onPairAgain()
+                        }) { Text("Pair again") }
+                    } else {
+                        TextButton(onClick = { vm.forgetHostKey(failure.host.ifEmpty { null }) }) {
+                            Text("Forget old key", color = MaterialTheme.colorScheme.error)
+                        }
                     }
                 },
             )

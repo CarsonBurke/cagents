@@ -4,13 +4,21 @@ import dev.cagents.mobile.client.AllFailed
 import dev.cagents.mobile.client.firstToSucceed
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
@@ -47,6 +55,8 @@ class FirstToSucceedTest {
         }
         assertEquals("lan", winner)
         assertEquals(1100, currentTime)
+        // The loser isn't waited for, but it is cancelled.
+        runCurrent()
         assertEquals(listOf("tailscale"), cancelled)
     }
 
@@ -75,6 +85,47 @@ class FirstToSucceedTest {
         }
         assertEquals("slow", winner)
         assertEquals(listOf("fast"), discarded)
+    }
+
+    @Test
+    fun aLoserThatCannotBeInterruptedDoesNotHoldUpTheWinner() = runTest {
+        val discarded = mutableListOf<String>()
+        val winner = firstToSucceed(listOf("stuck", "lan"), stagger, discard = { discarded += it }) { host ->
+            // Like a DNS lookup: cancelling doesn't reach it.
+            withContext(NonCancellable) { delay(if (host == "stuck") 10.seconds else 100.milliseconds) }
+            host
+        }
+        assertEquals("lan", winner)
+        assertEquals(1100, currentTime)
+        advanceUntilIdle()
+        assertEquals(listOf("stuck"), discarded)
+    }
+
+    @Test
+    fun cancellingTheCallerDisposesOfASuccessAlreadyIn() = runTest {
+        val discarded = mutableListOf<String>()
+        lateinit var race: Job
+        race = launch {
+            firstToSucceed<String, String>(listOf("a"), stagger, discard = { discarded += it }) { host ->
+                delay(100.milliseconds)
+                // The caller is cancelled just as the connection is made.
+                race.cancel()
+                host
+            }
+        }
+        advanceUntilIdle()
+        assertTrue(race.isCancelled)
+        assertEquals(listOf("a"), discarded)
+    }
+
+    @Test
+    fun anAttemptsOwnTimeoutCountsAsAFailure() = runTest {
+        val winner = firstToSucceed(listOf("a", "b"), stagger) { host ->
+            if (host == "a") withTimeout(10.milliseconds) { awaitCancellation() }
+            host
+        }
+        assertEquals("b", winner)
+        assertEquals(10, currentTime)
     }
 
     @Test

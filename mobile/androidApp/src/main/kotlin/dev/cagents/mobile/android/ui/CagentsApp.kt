@@ -49,7 +49,7 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
         backStack.add(PairingRoute(link))
     }
 
-    HostKeyDialogs(vm)
+    HostKeyDialogs(vm, onPairAgain = { backStack.add(PairingRoute()) })
 
     NavDisplay(
         backStack = backStack,
@@ -96,7 +96,6 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
             }
             entry<PairingRoute> { route ->
                 PairingScreen(
-                    main = vm,
                     link = route.link,
                     onBack = { backStack.removeAt(backStack.lastIndex) },
                     onPaired = {

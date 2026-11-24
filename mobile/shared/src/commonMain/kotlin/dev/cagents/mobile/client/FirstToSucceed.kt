@@ -1,10 +1,13 @@
 package dev.cagents.mobile.client
 
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.time.Duration
 
@@ -26,66 +29,66 @@ suspend fun <C, T> firstToSucceed(
     stagger: Duration,
     discard: (T) -> Unit = {},
     attempt: suspend (C) -> T,
-): T = coroutineScope {
+): T {
     require(candidates.isNotEmpty()) { "Nothing to try" }
     val events = Channel<Event<T>>(Channel.UNLIMITED)
+    // Attempts aren't joined: one stuck where cancelling can't reach, such as
+    // a DNS lookup, mustn't hold up the winner. What they return late is discarded.
+    val attempts = CoroutineScope(currentCoroutineContext().minusKey(Job) + Job())
     val failures = arrayOfNulls<Throwable>(candidates.size)
     var started = 0
     var failed = 0
 
     fun startNext() {
         val index = started++
-        launch {
+        attempts.launch {
             val result = try {
                 Result.success(attempt(candidates[index]))
             } catch (e: CancellationException) {
-                throw e
+                // A cancellation of the attempt's own, such as a timeout inside it, is a failure.
+                if (!isActive) throw e
+                Result.failure(e)
             } catch (e: Throwable) {
                 Result.failure(e)
             }
+            // Once the race is over the channel is closed, and a late success is disposed of here.
             if (events.trySend(Event.Done(index, result)).isFailure) result.onSuccess(discard)
         }
         if (started < candidates.size) {
             val next = started
-            launch {
+            attempts.launch {
                 delay(stagger)
                 events.trySend(Event.Waited(next))
             }
         }
     }
 
-    val scope = this
-    suspend fun winner(): T {
+    try {
         startNext()
         while (true) {
             when (val event = events.receive()) {
                 // Only the timer of the attempt that is next still counts.
                 is Event.Waited -> if (event.next == started) startNext()
                 is Event.Done -> event.result.fold(
-                    onSuccess = { winner ->
-                        events.close()
-                        // Results that arrived before closing still need disposing of.
-                        while (true) {
-                            val late = events.tryReceive().getOrNull() ?: break
-                            if (late is Event.Done) late.result.onSuccess(discard)
-                        }
-                        scope.coroutineContext.cancelChildren()
-                        return winner
-                    },
+                    onSuccess = { return it },
                     onFailure = { error ->
                         failures[event.index] = error
                         failed++
-                        if (failed == candidates.size) {
-                            scope.coroutineContext.cancelChildren()
-                            throw AllFailed(failures.map { it!! })
-                        }
+                        if (failed == candidates.size) throw AllFailed(failures.map { it!! })
                         if (started < candidates.size) startNext()
                     },
                 )
             }
         }
+    } finally {
+        // Whether one won, all failed or the caller was cancelled.
+        attempts.cancel()
+        events.close()
+        while (true) {
+            val late = events.tryReceive().getOrNull() ?: break
+            if (late is Event.Done) late.result.onSuccess(discard)
+        }
     }
-    winner()
 }
 
 private sealed interface Event<out T> {
