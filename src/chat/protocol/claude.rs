@@ -8191,7 +8191,10 @@ fn sidecar_meta(path: &Path) -> Option<Value> {
     {
         return None;
     }
-    serde_json::from_reader(file).ok()
+    // At once: serde_json reads an unbuffered file one byte per read(2).
+    let mut metadata = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, 16 * 1024), &mut metadata).ok()?;
+    serde_json::from_slice(&metadata).ok()
 }
 
 // Port of the official SDK's _build_conversation_chain, with a bounded offset
