@@ -1141,7 +1141,7 @@ the detached `.worktrees/.prebuild` checkout. Its offline regression is
 Rust compiles on the build host named by `CAGENTS_BUILD_REMOTE` (default
 `fw16`, reached with `ssh`), never here: `scripts/cargo-gate` sends every Cargo
 command that compiles there through `scripts/cargo-offload`, without taking a
-slot here. Commands that compile nothing, such as `metadata`, `tree` or
+build slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as `scripts/build-ceditor-product`, builds there too,
@@ -1179,6 +1179,26 @@ another) from a clean environment, as sshd would, and only what the caller
 uses comes back. `scripts/native-evidence` builds this way. A gate without
 `scripts/cargo-offload` beside it refuses to build unless
 `CAGENTS_BUILD_REMOTE=local` is set.
+
+Cargo offload and remote native evidence share local sync slots across all
+worktrees for the same Linux user. Source preparation, uploads and artifact
+downloads take a slot and run at CPU nice +10 and best-effort I/O priority 7.
+If all slots are in use, the client prints `waiting for a local sync slot`
+and blocks in the kernel. Remote compilation continues without a local slot.
+
+| Client setting | Default | Effect |
+| --- | --- | --- |
+| `CAGENTS_BUILD_LOCAL_SYNC_SLOTS` | `2` | Concurrent local file phases. Set the same value for every client on the laptop. |
+| `CAGENTS_BUILD_LOCAL_SYNC_LOCK` | `/var/tmp/cagents-offload-local-UID.lock` | Lock file prefix. Clients must use the same prefix to share slots. |
+| `CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS` | `180` | Wall-clock limit for each transfer attempt. A failed connection gets one retry where the transfer can be repeated safely. |
+| `CAGENTS_BUILD_REMOTE_COMMAND_TIMEOUT_SECONDS` | `7200` | Wall-clock limit for a long-lived remote command or lease connection. |
+
+SSH probes the server every 15 seconds and gives up after four unanswered
+probes. The transfer deadline also covers a stuck local SSH proxy, including
+`tailscale nc`. The client stops and reaps the transport tree when its
+invoking process exits. Once a remote command begins, a lost connection
+fails the command so its effects cannot be replayed. Waiting for the build
+host to accept a lease keeps its separate admission budget and retry interval.
 
 The host has build slots under
 `~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
@@ -1245,9 +1265,10 @@ While the host is unreachable, does not answer within
 leased slot's own build output), the command waits and tries again every
 `CAGENTS_BUILD_REMOTE_RETRY_SECONDS` (default 15), saying why once and then
 once a minute. It never builds here instead. `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS`
-bounds that wait, and the wait for a slot there, as it does a wait here; on
-expiry the command exits 124 naming the cause. The build there has no
-timeout. Set `CAGENTS_BUILD_REMOTE=local` to build here.
+bounds that wait, the wait for a slot there and the initial local sync slot
+wait. On expiry the command exits 124 naming the cause. The transport
+deadlines still apply after admission. Set `CAGENTS_BUILD_REMOTE=local` to
+build here.
 
 Each slot's build output is bounded by its lease. Cargo removes nothing, and
 every feature lane, profile and kind of target of the `cagents` crate keeps
@@ -2613,9 +2634,9 @@ tool timeout drops the SSH connection, and that ends the work on the host too.
 TERM, HUP or INT sent to the wrapper alone also ends and reaps its SSH
 connections, Git's and rsync's included, and then the wrapper dies by that
 signal; the host ends the build or comparison they started. A signal its
-caller ignores stays ignored, so `nohup` keeps a run through a closed
-terminal. A session detached by an explicit `start` keeps running until
-`stop`.
+caller ignores stays ignored. If the invoking shell exits, the wrapper ends
+the connections it owns. A session detached by an explicit `start` keeps
+running until `stop`.
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,

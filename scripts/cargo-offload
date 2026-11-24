@@ -42,6 +42,7 @@ import queue
 import re
 import resource
 from pathlib import Path
+import select
 import shlex
 import shutil
 import signal
@@ -51,6 +52,12 @@ import sys
 import tempfile
 import threading
 import time
+
+CLIENT_PARENT = os.getppid()
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True
+import offload_client
 
 # The gate builds here: CAGENTS_BUILD_REMOTE is `local` or names this host.
 FALL_BACK = 75
@@ -103,6 +110,7 @@ PATHS = {"--manifest-path", "--lockfile-path", "--target-dir", "--artifact-dir",
 SCRIPT_SETTINGS = {"CAGENTS_ZIG", "CAGENTS_DEVELOPMENT_HOSTED_BY"}
 SCRIPT_PREFIXES = ("CAGENTS_EVIDENCE_",)
 RUN_MARKER = "cargo-offload-run "
+RUN_READY = b"cargo-offload-ready\n"
 # What `--hold` gives the command it runs: the build host, the slot it holds
 # there and the checkout it holds it for, and a lock it keeps while it does.
 HELD = "CAGENTS_BUILD_OFFLOAD_HELD"
@@ -126,6 +134,10 @@ DIRECTORIES_MARKER = "cargo-offload-directories "
 
 class Refusal(Exception):
     """The command compiles, but the build host cannot run it faithfully."""
+
+
+class LeaseLost(Exception):
+    """The build host no longer reserves the checkout for this client."""
 
 
 class Plan:
@@ -1586,7 +1598,10 @@ elif command == "prune":
     # Removes the slot checkout's files that are not in the list on standard
     # input, keeping Cargo's target directory.
     source = os.path.join(base, "src")
-    keep = set(filter(None, sys.stdin.buffer.read().split(b"\0")))
+    listing = sys.stdin.buffer.read()
+    if len(listing) != int(sys.argv[3]):
+        sys.exit(255)  # The connection dropped; a partial list must not remove files.
+    keep = set(filter(None, listing.split(b"\0")))
     # A cancelled build's lease is released only after this ends, as after a
     # command, so the next build's copy cannot lose files to this walk.
     running = open(os.path.join(base, "running"), "a")
@@ -1642,11 +1657,16 @@ elif command == "exists":
     # Whether a result the caller may copy back is there.
     sys.exit(0 if os.path.exists(base) else 1)
 
-elif command == "run":
+elif command in ("run", "run-client"):
+    if command == "run-client":
+        say("cargo-offload-ready")
     # The environment and limits come first on standard input, never on the command
     # line, which every user of the host can read.
     directory, arguments = sys.argv[3], sys.argv[4:]
-    request = json.loads(sys.stdin.buffer.readline())
+    incoming = sys.stdin.buffer.readline()
+    if not incoming.endswith(b"\n"):
+        sys.exit(255)
+    request = json.loads(incoming)
     environment = request["environment"]
     # The command may open as many files as the host allows. An ssh
     # session's soft limit is the conventional 1024, which fails
@@ -1934,17 +1954,22 @@ class Offload:
                                     INCREMENTAL_GIB, least=0)
         self.answer = positive(environment, "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS", 30)
         self.retry = positive(environment, "CAGENTS_BUILD_REMOTE_RETRY_SECONDS", 15)
+        self.transfer_timeout = positive(environment, "CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS", 180)
+        self.command_timeout = positive(environment, "CAGENTS_BUILD_REMOTE_COMMAND_TIMEOUT_SECONDS", 7200)
         # The build host's memory shares the build takes, as scripts/cargo-gate
         # counts them.
         self.shares = positive(environment, "CAGENTS_BUILD_SHARES", 1)
         self.ssh = [
             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+            "-o", "TCPKeepAlive=yes",
+            "-o", "ControlPersist=no", "-o", "ForkAfterAuthentication=no",
         ]
         if loopback:
             # The same commands and copies, run here as ssh would run them there.
             self.ssh = [sys.executable, os.path.abspath(__file__), "--loopback-shell"]
         self.control = None
+        self.owns_control = False
         self.children = []
         self.command = None
         self.lease = None
@@ -1952,18 +1977,66 @@ class Offload:
         # A Git marker above the slot's checkout, as its lease reported.
         self.marker = None
 
+    def connection(self, master=False):
+        if self.loopback:
+            return self.ssh
+        mode = "yes" if master and self.control is not None else "no"
+        path = f"{self.control}/m" if self.control is not None else "none"
+        options = [*self.ssh, "-o", f"ControlMaster={mode}", "-o", f"ControlPath={path}"]
+        if not master and self.control is not None:
+            # OpenSSH falls back to a new login if the master disappeared.
+            # These channels belong to that lease and cannot outlive it.
+            options += ["-o", "ProxyCommand=false"]
+        return options
+
     def remote(self, *arguments):
         if self.control is not None:
             try:
                 os.utime(self.control)  # In use: see sweep_connections.
             except OSError:
                 pass
-        return self.ssh + [self.host] + remote_command(arguments)
+        return self.connection(master=arguments[0] == "lease") + [self.host] + remote_command(arguments)
 
-    def spawn(self, command, **options):
-        child = subprocess.Popen(command, start_new_session=True, **options)
+    def spawn(self, command, *, timeout, remote_long=False, **options):
+        # Own the whole transport tree, including ProxyCommand, even if ssh
+        # exits first or this client is killed before it can cancel the child.
+        supervisor = Path(__file__).resolve().with_name("cargo-gate-command.py")
+        wrapper = [sys.executable, "-I", str(supervisor), "--wrapper", program,
+                   "--parent", str(os.getpid()), "--timeout", str(timeout)]
+        if not (self.loopback and remote_long):
+            wrapper.append("--drain-on-exit")
+        if remote_long and not self.loopback:
+            lower = Path(__file__).resolve().with_name("offload_client.py")
+            command = [sys.executable, "-I", str(lower), "low", *command]
+        child = subprocess.Popen([*wrapper, "/dev/null", *command], start_new_session=True, **options)
         self.children.append(child)
+        if self.cancelled:
+            child.terminate()
         return child
+
+    def transfer(self, command, *, rsync=False, data=None, **options):
+        """Run a replayable transport operation, retrying one connection failure."""
+        failures = {EXPIRED, 255}
+        if rsync:
+            failures.update((10, 12, 30, 35))  # Socket, protocol stream, I/O or connect timeout.
+        for attempt in range(2):
+            self.check_lease()
+            child = self.spawn(command, timeout=self.transfer_timeout,
+                               stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                               **options)
+            output, errors = child.communicate(data)
+            if self.cancelled or child.returncode not in failures or attempt:
+                return subprocess.CompletedProcess(command, child.returncode, output, errors)
+            say(f"transfer with {self.host} failed (status {child.returncode}); retrying once")
+
+    def check_lease(self):
+        if self.lease is not None and self.lease.poll() is not None and not self.cancelled:
+            raise LeaseLost
+
+    def mark_cancelled(self, number):
+        if not self.cancelled:
+            self.cancelled = number
+            os.write(self.cancel_writer, b"\0")
 
     def cancel(self, number, _frame):
         """Ends what this build started. The remote command ends through its
@@ -1971,8 +2044,7 @@ class Offload:
         and ends after it. A second signal stops waiting for a connection
         that may be dead; the host still ends the command when it notices."""
         again = bool(self.cancelled)
-        if not self.cancelled:
-            self.cancelled = number
+        self.mark_cancelled(number)
         for child in self.children:
             if child.poll() is not None or (child is self.lease and self.command is not None):
                 continue
@@ -2018,14 +2090,41 @@ class Offload:
         return top, workspace, cwd, metadata, f"~/.cache/cagents-offload/{repository}"
 
     def run(self):
-        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            signal.signal(number, self.cancel)
+        self.cancel_reader, self.cancel_writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        previous = {number: signal.signal(number, self.cancel)
+                    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        try:
+            return self.run_build()
+        except offload_client.LocalSyncCancelled:
+            return 128 + self.cancelled
+        except offload_client.LocalSyncTimeout:
+            say("build admission timed out while waiting for a local sync slot")
+            return EXPIRED
+        except offload_client.LocalSyncError as error:
+            say(str(error))
+            return 2
+        except LeaseLost:
+            say(f"lost the build slot lease on {self.host}")
+            return EXPIRED if self.lease.returncode == EXPIRED else 255
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+            os.close(self.cancel_reader)
+            os.close(self.cancel_writer)
+
+    def local(self, function, *arguments, admitting=False):
+        deadline = admission_deadline(self.environment) if admitting else None
+        return offload_client.run_local(function, *arguments, environment=self.environment,
+                                        cancel_fd=self.cancel_reader,
+                                        deadline=None if deadline is None else deadline / 1e9)
+
+    def run_build(self):
         try:
             top, workspace, cwd, metadata, base = self.locate()
         except Refusal as refusal:
             return self.refuse(str(refusal))
         if self.plan.fixes and not self.plan.flag("--allow-no-vcs"):
-            dirty, staged = uncommitted(top, workspace, self.environment)
+            dirty, staged = self.local(uncommitted, top, workspace, self.environment, admitting=True)
             allowed_dirty = self.plan.flag("--allow-dirty")
             if dirty and not allowed_dirty:
                 return self.refuse("the working directory has uncommitted changes, which "
@@ -2063,11 +2162,16 @@ class Offload:
         try:
             self.lease.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            self.lease.kill()
+            self.stop(self.lease)
+
+    def stop(self, child):
+        # The supervisor drains its entire tree on TERM before it exits.
+        child.terminate()
+        return child.wait()
 
     def held(self, base, top):
         """The slot an enclosing `--hold` holds for this checkout on this
-        build host, as (slot, marker, lock), or None. A holder keeps its lock
+        build host, with its marker, lock and SSH control directory. A holder keeps its lock
         while its lease lasts, so a lock anyone can take is a hold that has
         ended, and the build leases a slot of its own."""
         try:
@@ -2090,7 +2194,7 @@ class Offload:
             fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
             return None
         except BlockingIOError:
-            return slot, held.get("marker"), held["lock"]
+            return slot, held.get("marker"), held["lock"], held.get("control")
         finally:
             os.close(descriptor)
 
@@ -2108,10 +2212,10 @@ class Offload:
             held = self.held(base, top)
             if held is None:
                 return None
-            slot, marker, _ = held
+            slot, marker, _, control = held
             if marker and self.tests_there():
                 return self.refuse_marker(marker)
-            self.share_connection()
+            self.control = control
             try:
                 return self.build(slot, top, workspace, cwd, metadata)
             except Refusal as refusal:
@@ -2119,7 +2223,7 @@ class Offload:
                     return 128 + self.cancelled
                 return self.refuse(str(refusal))
             finally:
-                self.close_connection()
+                self.control = None
 
     def tests_there(self):
         """Whether the command runs tests on the build host."""
@@ -2155,19 +2259,13 @@ class Offload:
         else:
             return  # No directory has a short enough path: each step connects on its own.
         self.control = control
-        self.ssh += ["-o", "ControlMaster=auto", "-o", f"ControlPath={control}/m",
-                     "-o", "ControlPersist=60"]
+        self.owns_control = True
 
     def close_connection(self):
-        if self.control is None:
-            return
-        try:
-            subprocess.run([*self.ssh, "-O", "exit", self.host], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        shutil.rmtree(self.control, ignore_errors=True)
+        if self.owns_control:
+            shutil.rmtree(self.control, ignore_errors=True)
         self.control = None
+        self.owns_control = False
 
     def refuse(self, reason):
         say(reason)
@@ -2179,10 +2277,13 @@ class Offload:
         minute, within the gate's admission budget."""
         deadline = admission_deadline(self.environment)
         since = said = reason = None
+        cancellation = select.poll()
+        cancellation.register(self.cancel_reader, select.POLLIN)
         while True:
             outcome, detail = self.try_lease(base, top, deadline)
             if outcome == "slot":
                 return None, detail
+            self.lease.stdin.close()
             if outcome in ("status", "cancelled"):
                 return detail, None
             if outcome == "expired":
@@ -2201,11 +2302,8 @@ class Offload:
                 say(f"build admission timed out: {detail}; {OPT_OUT}")
                 return EXPIRED, None
             pause = self.retry if left is None else min(self.retry, left)
-            end = time.monotonic() + pause
-            while time.monotonic() < end:
-                if self.cancelled:
-                    return 128 + self.cancelled, None
-                time.sleep(0.1)
+            if cancellation.poll(int(pause * 1000) + 1):
+                return 128 + self.cancelled, None
 
     def build_identity(self, directory):
         """The Cargo command this is, run from `directory` of the checkout, for
@@ -2233,6 +2331,7 @@ class Offload:
                         profile_config(user_cargo_config(self.environment)),
                         self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top)),
                         self.incremental),
+            timeout=self.command_timeout, remote_long=True,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
         lines = Lines(lease.stdout)
@@ -2253,7 +2352,7 @@ class Offload:
             if line and line.startswith("marker "):
                 self.marker = json.loads(line.removeprefix("marker "))
                 if self.tests_there():
-                    lease.kill()
+                    self.stop(lease)
                     return "status", self.refuse_marker(self.marker)
                 line = next_line(self.answer)
             told = set()
@@ -2271,33 +2370,113 @@ class Offload:
                         say(f"waiting for a build slot on {self.host}")
                 line = next_line(None)
         except AdmissionExpired:
-            lease.kill()
+            self.stop(lease)
             return "expired", None
         except TimeoutError:
-            lease.kill()
-            lease.wait()
+            self.stop(lease)
             return "waiting", f"{self.host} did not answer within {self.answer}s"
         if self.cancelled:
+            self.stop(lease)
             return "cancelled", 128 + self.cancelled
         words = (line or "").split()
         if words[:1] == ["slot"]:
             return "slot", json.loads(line.removeprefix("slot "))["path"]
         if words[:1] == ["refuse"]:
-            lease.kill()
-            lease.wait()
+            self.stop(lease)
             return "waiting", f"{self.host} has {words[1]} GiB free, below its {words[2]} GiB floor"
         try:
             status = lease.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            lease.kill()
-            status = lease.wait()
+            status = self.stop(lease)
         if self.cancelled:
             return "cancelled", 128 + self.cancelled
         if status == 255:
             # ssh's own failure: no connection.
             return "waiting", f"{self.host} is unreachable"
+        if status == EXPIRED:
+            say(f"connection to {self.host} timed out while waiting for its build slot")
+            return "status", EXPIRED
         say(f"{self.host} could not lease a build slot (status {status}); {OPT_OUT}")
         return "status", UNAVAILABLE
+
+    def start_command(self, slot, directory, arguments, request):
+        """Retry establishing the run channel before sending a Cargo request.
+
+        A command may mutate files or run tests. Once it has the whole request,
+        its status can be lost, but it must not be replayed.
+        """
+        admission = admission_deadline(self.environment)
+        for attempt in range(2):
+            self.check_lease()
+            if admission is not None and remaining(admission) <= 0:
+                say("build admission timed out before starting Cargo")
+                return None, EXPIRED
+            child = self.spawn(self.remote("run-client", slot, directory, "cargo", *arguments),
+                               timeout=self.command_timeout, remote_long=True,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            deadline = time.monotonic() + self.transfer_timeout
+            if admission is not None:
+                deadline = min(deadline, admission / 1e9)
+            if self.send_request(child, request, deadline, admission):
+                self.command = child
+                return child, 0
+            try:
+                status = child.wait(timeout=max(0, min(2, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                self.stop(child)
+                status = EXPIRED
+            child.stdin.close()
+            child.stdout.close()
+            if self.cancelled:
+                return None, 128 + self.cancelled
+            if admission is not None and remaining(admission) <= 0:
+                say("build admission timed out before starting Cargo")
+                return None, EXPIRED
+            status = status or 255  # A clean exit without an acknowledgement is a lost channel.
+            if attempt or status not in (EXPIRED, 255):
+                say(f"could not start Cargo on {self.host} (status {status})")
+                return None, status
+            say(f"connection to {self.host} failed before starting Cargo; retrying once")
+
+    def send_request(self, child, request, deadline, admission):
+        """Wait for a remote acknowledgement and send the request within one deadline."""
+        incoming = child.stdout.fileno()
+        outgoing = child.stdin.fileno()
+        os.set_blocking(outgoing, False)
+        poller = select.poll()
+        poller.register(self.cancel_reader, select.POLLIN)
+
+        def ready():
+            left = deadline - time.monotonic()
+            if left <= 0 or self.cancelled:
+                return False
+            return bool(poller.poll(int(left * 1000) + 1)) and not self.cancelled
+
+        poller.register(incoming, select.POLLIN)
+        response = bytearray()
+        while len(response) < len(RUN_READY) and ready():
+            block = os.read(incoming, len(RUN_READY) - len(response))
+            if not block:
+                return False
+            response.extend(block)
+            if not RUN_READY.startswith(response):
+                return False
+        if response != RUN_READY:
+            return False
+        poller.unregister(incoming)
+        poller.register(outgoing, select.POLLOUT)
+        # The time spent connecting comes out of the wait for build shares.
+        if admission is not None:
+            request = request | {"admission_seconds": max(0, int(remaining(admission)))}
+        payload = memoryview((json.dumps(request) + "\n").encode())
+        while payload and ready():
+            try:
+                payload = payload[os.write(outgoing, payload):]
+            except BlockingIOError:
+                continue
+            except BrokenPipeError:
+                break
+        return not payload
 
     def build(self, slot, top, workspace, cwd, metadata):
         plan = self.plan
@@ -2344,53 +2523,24 @@ class Offload:
         if "--manifest-path" in directories:
             metadata_options += ["--manifest-path", directories["--manifest-path"][0]]
 
-        listing = subprocess.run(
-            ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            capture_output=True, check=True,
-        ).stdout
-        files = [name for name in dict.fromkeys(listing.split(b"\0")) if name and (
-            os.path.islink(os.path.join(os.fsencode(top), name))
-            or os.path.isfile(os.path.join(os.fsencode(top), name)))]
-        listing = b"\0".join(files) + b"\0"
-        environment = forwarded_environment(self.environment)
-        environment.update(self.inputs(slot, top, local_target, remote_target,
-                                       {os.fsdecode(name) for name in files}))
-        shell = " ".join(shlex.quote(word) for word in self.ssh)
-        # What each file was as sent, so that one edited here meanwhile keeps
-        # that edit over what the command writes there.
-        sent = {name: file_state(os.path.join(os.fsencode(top), name)) for name in files}
-        # Files are compared by content and a changed one is written with
-        # the time it arrives, not the time it has here. Cargo judges path
-        # crates, such as the vendored patches, by modification time: a
-        # worktree whose copy of a file is older than another worktree's
-        # build in the slot would otherwise build against that build.
-        sync = self.spawn(
-            ["rsync", "-rlpgoD", "--checksum", "-z", "--from0", "--files-from=-", "-e", shell,
-             "./", f"{self.host}:{source}/"],
-            cwd=top, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-        )
-        sync.communicate(listing)
-        if self.cancelled:
-            return 128 + self.cancelled
-        # 24: a file was removed while being copied; the next build copies
-        # the checkout as it is then.
-        if sync.returncode not in (0, 24):
-            say(f"could not copy the sources to {self.host} (rsync exited {sync.returncode})")
-            return sync.returncode
-        prune = self.spawn(self.remote("prune", slot), stdin=subprocess.PIPE)
-        prune.communicate(listing)
-        if self.cancelled:
-            return 128 + self.cancelled
-
+        shell = shlex.join(self.connection())
         root = next((package for package in metadata.get("packages", [])
                      if os.path.dirname(os.path.realpath(package["manifest_path"])) == workspace),
                     None)
+        sent, inputs, stamp, status = self.local(
+            self.sync_sources, slot, top, local_target, remote_target, shell,
+            root["version"] if root else "", admitting=True)
+        if self.cancelled:
+            return 128 + self.cancelled
+        if status:
+            return status
+
+        environment = forwarded_environment(self.environment) | inputs
         if self.jobs:
             environment["CARGO_BUILD_JOBS"] = str(self.jobs)
         environment.setdefault("CARGO_TERM_PROGRESS_WHEN", "never")
         if sys.stderr.isatty():
             environment.setdefault("CARGO_TERM_COLOR", "always")
-        stamp = build_metadata(top, root["version"] if root else "", self.environment)
         if stamp:
             environment["CAGENTS_BUILD_METADATA"] = stamp
         environment[SUPPLIED] = "1"
@@ -2402,33 +2552,21 @@ class Offload:
                 (remote_build, local_build), (remote_target, local_target), (source, top),
                 *directories.values()]}.items(), key=lambda pair: -len(pair[0]))
         mappings = mapped()
-        command = self.command = self.spawn(
-            self.remote("run", slot, os.path.relpath(cwd, top), "cargo", *arguments),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE if plan.captures else None,
-        )
-        try:
-            request = {"environment": environment,
-                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1",
-                       "metadata": [[plan.toolchain] if plan.toolchain else [], metadata_options],
-                       "target_dir": remote_target if "--target-dir" in directories else None,
-                       "report_directories": plan.captures,
-                       # Build output in the checkout, which does not come back as written.
-                       "outputs": sorted({remote_target, *(remote for remote, _ in directories.values())})}
-            request["tools"] = self.tools
-            request["shares"] = self.shares
-            # The rest of the gate's admission budget covers the wait for
-            # the build's shares there.
-            left = remaining(admission_deadline(self.environment))
-            if left is not None:
-                request["admission_seconds"] = max(0, int(left))
-            command.stdin.write((json.dumps(request) + "\n").encode())
-            command.stdin.flush()
-        except (BrokenPipeError, ValueError):
-            pass  # The connection failed or was cancelled; its status says which.
+        request = {"environment": environment,
+                   "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1",
+                   "metadata": [[plan.toolchain] if plan.toolchain else [], metadata_options],
+                   "target_dir": remote_target if "--target-dir" in directories else None,
+                   "report_directories": plan.captures,
+                   # Build output in the checkout, which does not come back as written.
+                   "outputs": sorted({remote_target, *(remote for remote, _ in directories.values())}),
+                   "tools": self.tools, "shares": self.shares}
+        command, status = self.start_command(slot, os.path.relpath(cwd, top), arguments, request)
+        if command is None:
+            return status
         messages = []
         launch = None
         if plan.captures:
+            keep_artifacts = plan.executables or plan.flag("--open")
             for line in command.stdout:
                 if line.startswith(DIRECTORIES_MARKER.encode()):
                     there = json.loads(line[len(DIRECTORIES_MARKER):])
@@ -2449,23 +2587,82 @@ class Offload:
                     except ValueError:
                         message = None
                     if message is not None:
-                        messages.append(message)
+                        if keep_artifacts and message.get("reason") == "compiler-artifact":
+                            messages.append(message)
                         if plan.caller_wants_json or not plan.executables and not plan.flag("--open"):
                             line = (json.dumps(rewrite(message, mappings)) + "\n").encode()
                         else:
                             continue
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
+        else:
+            while block := command.stdout.read1(65536):
+                sys.stdout.buffer.write(block)
+                sys.stdout.buffer.flush()
         status = command.wait()
+        command.stdin.close()
+        command.stdout.close()
         if self.cancelled:
             return 128 + self.cancelled
-        if status == 255:
-            say(f"lost the connection to {self.host}")
+        if status in (255, EXPIRED):
+            if status == 255:
+                say(f"lost the connection to {self.host}")
             return status
 
-        # What the command left for this host, whether or not it succeeded:
-        # what it wrote in the checkout, such as fixes it applied before
-        # failing or a test's recording, and a failed build's timings.
+        back = self.local(self.take_results, slot, source, top, sent, shell, status,
+                          remote_target, local_target, remote_build, directories, messages, mappings)
+        if self.cancelled:
+            return 128 + self.cancelled
+        if back:
+            return back
+        if plan.flag("--open"):
+            return self.open_documentation(messages, mappings)
+        if plan.subcommand == "run":
+            return self.launch(launch, mappings)
+        return 0
+
+    def sync_sources(self, slot, top, local_target, remote_target, shell, version):
+        """Prepare the source listing and upload the checkout and inputs."""
+        listing = subprocess.run(
+            ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, check=True,
+        ).stdout
+        here = os.fsencode(top)
+        files = [name for name in dict.fromkeys(listing.split(b"\0")) if name and (
+            os.path.islink(os.path.join(here, name)) or os.path.isfile(os.path.join(here, name)))]
+        listing = b"\0".join(files) + b"\0"
+        inputs = self.inputs(slot, top, local_target, remote_target, shell,
+                             {os.fsdecode(name) for name in files})
+        # What each file was as sent, so that one edited here meanwhile keeps
+        # that edit over what the command writes there.
+        sent = {name: file_state(os.path.join(here, name)) for name in files}
+        # Files are compared by content and a changed one is written with
+        # the time it arrives, so Cargo notices changes to path crates even
+        # when this worktree's copy is older than the one previously built.
+        source = f"{slot}/src"
+        sync = self.transfer(
+            ["rsync", "-rlpgoD", "--checksum", "-z", "--from0", "--files-from=-", "-e", shell,
+             "./", f"{self.host}:{source}/"],
+            cwd=top, data=listing, stdout=subprocess.DEVNULL, rsync=True,
+        )
+        # 24: a file was removed while being copied; the next build copies
+        # the checkout as it is then.
+        status = 0 if sync.returncode in (0, 24) else sync.returncode
+        if status and not self.cancelled:
+            say(f"could not copy the sources to {self.host} (rsync exited {status})")
+        if not status and not self.cancelled:
+            status = self.transfer(self.remote("prune", slot, len(listing)), data=listing).returncode
+            if status and not self.cancelled:
+                say(f"could not remove stale sources on {self.host} (status {status})")
+        stamp = None if status or self.cancelled else build_metadata(top, version, self.environment)
+        return sent, inputs, stamp, status
+
+    def take_results(self, slot, source, top, sent, shell, status, remote_target, local_target,
+                     remote_build, directories, messages, mappings):
+        """Take the checkout writes and build results back under a local slot."""
+        plan = self.plan
+        # What the command wrote in the checkout and its timings come back
+        # even when the build failed.
         back = self.take_written(slot, source, top, sent, shell)
         if plan.timings:
             back = back or self.fetch(f"{remote_target}/cargo-timings/",
@@ -2495,14 +2692,9 @@ class Offload:
                 back = back or self.fetch(remote + "/", local + "/", shell)
         if back:
             say(f"could not copy the results back from {self.host} (rsync exited {back})")
-            return back
-        if plan.flag("--open"):
-            return self.open_documentation(messages, mappings)
-        if plan.subcommand == "run":
-            return self.launch(launch, mappings)
-        return 0
+        return back
 
-    def inputs(self, slot, top, local_target, remote_target, synced):
+    def inputs(self, slot, top, local_target, remote_target, shell, synced):
         """The settings naming files on this host, as the build host has
         them: a checkout file it was sent, or a copy of a file in the
         checkout or its target, such as the retained-actor helper. A copy of
@@ -2527,10 +2719,9 @@ class Offload:
                               f"sent; {OPT_OUT}")
             relative = os.path.relpath(local, base)
             destination = os.path.join(slot, "inputs", kind)
-            shell = " ".join(shlex.quote(word) for word in self.ssh)
-            status = self.spawn(
+            status = self.transfer(
                 ["rsync", "-a", "--modify-window=-1", "-z", "-R", f"--link-dest={link}", "-e", shell,
-                 f"{base}/./{relative}", f"{self.host}:{destination}/"]).wait()
+                 f"{base}/./{relative}", f"{self.host}:{destination}/"], rsync=True).returncode
             if self.cancelled:
                 raise Refusal("cancelled")
             if status:
@@ -2551,16 +2742,12 @@ class Offload:
             command += ["--from0", "--files-from=-"]
         if missing_ok:
             # Only when the directory is there: a failed build may leave none.
-            probe = self.spawn(self.remote("exists", remote)).wait()
+            probe = self.transfer(self.remote("exists", remote)).returncode
             if probe:
-                return 0
+                return 0 if probe == 1 else probe
         os.makedirs(local, exist_ok=True)
-        back = self.spawn(command + [f"{self.host}:{remote}", local],
-                          stdin=subprocess.PIPE if files is not None else subprocess.DEVNULL)
-        if files is not None:
-            back.communicate(b"".join(os.fsencode(name) + b"\0" for name in files))
-        else:
-            back.wait()
+        listing = b"".join(os.fsencode(name) + b"\0" for name in files) if files is not None else None
+        back = self.transfer(command + [f"{self.host}:{remote}", local], data=listing, rsync=True)
         return 0 if self.cancelled else back.returncode
 
     def take_written(self, slot, source, top, sent, shell):
@@ -2569,8 +2756,7 @@ class Offload:
         updated lockfile. A file here that changed after it was sent, or a new
         one that appears here meanwhile, is newer and is kept; a new file this
         checkout ignores is left there."""
-        found = subprocess.run(self.remote("written", slot), stdin=subprocess.DEVNULL,
-                               capture_output=True)
+        found = self.transfer(self.remote("written", slot), stdout=subprocess.PIPE)
         if found.returncode:
             return found.returncode
         written = [(base64.b64decode(name), new) for name, new in json.loads(found.stdout)]
@@ -2659,15 +2845,15 @@ class Offload:
         # end of the build. Closing the lease frees the slot; what this
         # started ends and is reaped first, rather than becoming the
         # program's children, which it would never wait for.
-        self.lease.stdin.close()
-        self.close_connection()
+        if self.lease is not None:
+            self.end_lease()
         deadline = time.monotonic() + 10
         for child in self.children:
             try:
                 child.wait(timeout=max(0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
+                self.stop(child)
+        self.close_connection()
         try:
             os.execve(executable, [executable, *self.plan.program], environment)
         except OSError as error:
@@ -2713,7 +2899,7 @@ class Hold(Offload):
     def cancel(self, number, frame):
         if self.command is not None and self.command.poll() is None:
             # The command ends its builds, which end before the lease does.
-            self.cancelled = self.cancelled or number
+            self.mark_cancelled(number)
             try:
                 self.command.send_signal(number)
             except ProcessLookupError:
@@ -2721,9 +2907,7 @@ class Hold(Offload):
             return
         super().cancel(number, frame)
 
-    def run(self):
-        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            signal.signal(number, self.cancel)
+    def run_build(self):
         try:
             top, _, _, _, base = self.locate()
         except Refusal as refusal:
@@ -2758,7 +2942,7 @@ class Hold(Offload):
                 environment = dict(self.environment)
                 environment[HELD] = json.dumps({"host": self.host, "base": base, "top": top,
                                                 "slot": slot, "marker": self.marker,
-                                                "lock": lock})
+                                                "lock": lock, "control": self.control})
                 return self.execute(environment)
             finally:
                 self.end_lease()
@@ -2790,7 +2974,8 @@ def positive(environment, name, default, least=1):
     value = environment.get(name, "")
     if not value:
         return default
-    if not value.isdigit() or value.startswith("0") and value != "0" or int(value) < least:
+    if (not value.isascii() or not value.isdecimal()
+            or value.startswith("0") and value != "0" or int(value) < least):
         say(f"{name} must be a {'positive' if least else 'nonnegative'} integer")
         sys.exit(2)
     return int(value)
@@ -2814,8 +2999,9 @@ class Lines:
         threading.Thread(target=self.read, args=(stream,), daemon=True).start()
 
     def read(self, stream):
-        for line in stream:
-            self.queue.put(line.strip())
+        with stream:
+            for line in stream:
+                self.queue.put(line.strip())
         self.queue.put(None)
 
     def next(self, timeout):
@@ -2841,6 +3027,17 @@ def remaining(deadline):
 
 def say(message):
     print(f"{program}: {message}", file=sys.stderr, flush=True)
+
+
+def supervise_client(arguments, host, loopback):
+    """An offload run launched directly has no enclosing cargo-gate."""
+    script = Path(__file__).resolve()
+    supervisor = script.with_name("cargo-gate-command.py")
+    os.environ["CAGENTS_BUILD_OFFLOAD_HOST"] = host + (LOOPBACK_MARK if loopback else "")
+    os.environ["CAGENTS_BUILD_OFFLOAD_SUPERVISED"] = "1"
+    os.execv(sys.executable, [sys.executable, "-I", str(supervisor), "--wrapper", "cargo-offload",
+                              "--parent", str(CLIENT_PARENT), "/dev/null", sys.executable, "-I",
+                              str(script), *arguments])
 
 
 def main(arguments):
@@ -2871,6 +3068,7 @@ def main(arguments):
     # FALL_BACK having built nothing. Nothing this starts inherits it.
     decided = os.environ.pop("CAGENTS_BUILD_OFFLOAD_HOST", "")
     decided, loopback = decided.removesuffix(LOOPBACK_MARK), decided.endswith(LOOPBACK_MARK)
+    supervised = os.environ.pop("CAGENTS_BUILD_OFFLOAD_SUPERVISED", "") == "1"
     environment = dict(os.environ)
     if arguments[:1] == ["--stamp"]:
         # The version stamp for a build here of the workspace the Cargo
@@ -2906,6 +3104,8 @@ def main(arguments):
         if len(arguments) < 2:
             say("missing command for --hold")
             return 2
+        if not supervised and __name__ == "__main__":
+            supervise_client(arguments, host, loopback)
         return Hold(host, arguments[1:], environment, loopback).run()
     try:
         plan = parse(arguments)
@@ -2915,6 +3115,8 @@ def main(arguments):
     if plan is None:
         cargo = real_cargo(environment)
         os.execvp(cargo, [cargo, *arguments])
+    if not supervised and __name__ == "__main__":
+        supervise_client(arguments, host, loopback)
     try:
         return Offload(host, plan, environment, loopback).run()
     except Refusal as refusal:

@@ -12,6 +12,7 @@ import ast
 import base64
 import contextlib
 import fcntl
+import io
 import json
 import os
 import pwd
@@ -27,6 +28,7 @@ import tempfile
 import textwrap
 import time
 import tomllib
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -318,18 +320,9 @@ class SharedConnection(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="cof-", dir=SOCKET_ROOT)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.log = self.root / "ssh.log"
-        tools = self.root / "tools"
-        tools.mkdir()
-        (tools / "ssh").write_text(f'#!/bin/sh\necho "$@" >> {self.log}\n')
-        (tools / "ssh").chmod(0o755)
         self.runtime = self.root / "runtime"
         self.runtime.mkdir(mode=0o700)
-        self.environment = {"XDG_RUNTIME_DIR": str(self.runtime),
-                            "PATH": f"{tools}:{os.environ['PATH']}"}
-        old_path = os.environ["PATH"]
-        os.environ["PATH"] = self.environment["PATH"]
-        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        self.environment = {"XDG_RUNTIME_DIR": str(self.runtime)}
 
     def build(self, environment=None):
         return offload.Offload("host", offload.parse(["check"]), environment or self.environment)
@@ -341,7 +334,12 @@ class SharedConnection(unittest.TestCase):
         path = command.split("ControlPath=")[1].split()[0]
         self.assertTrue(path.startswith(f"{self.runtime}/cof-ssh-{os.getpid()}-"))
         self.assertLessEqual(len(path) + 17, 107)
-        self.assertIn("ControlMaster=auto", command)
+        self.assertIn("ControlMaster=no", command)
+        self.assertIn("ProxyCommand=false", command)
+        master = " ".join(build.remote("lease", "x"))
+        self.assertIn(f"ControlMaster=yes -o ControlPath={path}", master)
+        self.assertIn("ControlPersist=no", master)
+        self.assertNotIn("ProxyCommand=false", master)
         other = self.build()
         other.share_connection()
         self.assertNotEqual(other.control, build.control)
@@ -349,7 +347,6 @@ class SharedConnection(unittest.TestCase):
         directory = build.control
         build.close_connection()
         self.assertFalse(os.path.exists(directory))
-        self.assertIn(f"ControlPath={path} -o ControlPersist=60 -O exit host", self.log.read_text())
 
     def test_a_runtime_directory_too_long_for_a_socket_is_passed_over(self):
         deep = self.runtime / ("d" * 90)
@@ -369,8 +366,113 @@ class SharedConnection(unittest.TestCase):
         build = self.build()
         build.share_connection()
         self.assertIsNone(build.control)
-        self.assertNotIn("ControlPath", " ".join(build.remote("exists", "x")))
+        self.assertIn("ControlPath=none", " ".join(build.remote("exists", "x")))
         self.assertEqual(list(self.runtime.iterdir()), [])
+
+
+class Transport(unittest.TestCase):
+    def test_bad_local_admission_configuration_has_a_diagnostic(self):
+        build = offload.Offload("host", offload.parse(["check"]), {"CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "0"})
+        with patch.object(build, "run_build", side_effect=lambda: build.local(lambda: 0)), \
+                patch.object(offload, "say") as say:
+            self.assertEqual(build.run(), 2)
+        say.assert_called_once_with("CAGENTS_BUILD_LOCAL_SYNC_SLOTS must be a positive integer")
+
+    def test_source_and_result_work_hold_local_admission_but_cargo_does_not(self):
+        with FixtureDirectory() as scope:
+            prefix = Path(scope.name, "sync.lock")
+            build = offload.Offload("host", offload.parse(["check"]), {
+                "CAGENTS_BUILD_LOCAL_SYNC_LOCK": str(prefix), "CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "1",
+            })
+            phases = []
+
+            def held(expected):
+                with open(f"{prefix}.0") as lock:
+                    if expected:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def source(*_):
+                held(True)
+                phases.append("source")
+                return {}, {}, None, 0
+
+            def compile_on_host(*_):
+                held(False)
+                phases.append("cargo")
+                return SimpleNamespace(stdin=io.BytesIO(), stdout=io.BytesIO(), wait=lambda: 0), 0
+
+            def results(*_):
+                held(True)
+                phases.append("results")
+                return 0
+
+            with patch.object(build, "run_build", side_effect=lambda:
+                              build.build("/host/slot", scope.name, scope.name, scope.name,
+                                          {"target_directory": f"{scope.name}/target"})), \
+                    patch.object(build, "sync_sources", side_effect=source), \
+                    patch.object(build, "start_command", side_effect=compile_on_host), \
+                    patch.object(build, "take_results", side_effect=results):
+                self.assertEqual(build.run(), 0)
+            self.assertEqual(phases, ["source", "cargo", "results"])
+
+    def test_a_hung_transfer_reaps_its_proxy_and_retries_once(self):
+        with FixtureDirectory() as scope:
+            marker = Path(scope.name, "proxy")
+            command = [sys.executable, "-c", textwrap.dedent(f"""
+                from pathlib import Path
+                import signal, subprocess, sys
+
+                marker = Path({str(marker)!r})
+                if marker.exists():
+                    print('retry')
+                    sys.exit(0)
+                proxy = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'],
+                                         start_new_session=True)
+                marker.write_text(str(proxy.pid))
+                signal.pause()
+            """)]
+            build = offload.Offload("host", offload.parse(["check"]),
+                                    {"CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS": "1"})
+            with patch.object(offload, "say") as say:
+                result = build.transfer(command, stdout=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"retry\n")
+            self.assertFalse(Path(f"/proc/{marker.read_text()}").exists())
+            say.assert_called_once_with("transfer with host failed (status 124); retrying once")
+
+    def test_a_run_channel_retries_before_sending_a_cargo_request(self):
+        with FixtureDirectory() as scope:
+            marker = Path(scope.name, "attempted")
+            transport = [sys.executable, "-c", textwrap.dedent(f"""
+                from pathlib import Path
+                import json, sys
+
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    marker.touch()
+                    sys.exit(255)
+                print({offload.RUN_READY.decode().rstrip()!r}, flush=True)
+                print(json.loads(sys.stdin.readline())['environment']['PROBE'], flush=True)
+            """)]
+            build = offload.Offload("host", offload.parse(["check"]), {}, loopback=True)
+            build.cancel_reader, writer = os.pipe()
+            try:
+                with patch.object(build, "remote", return_value=transport), \
+                        patch.object(offload, "say") as say:
+                    child, status = build.start_command("slot", ".", ["check"],
+                                                        {"environment": {"PROBE": "ok"}})
+                self.assertEqual(status, 0)
+                self.assertEqual(child.stdout.readline(), b"ok\n")
+                self.assertEqual(child.wait(timeout=HANG_GUARD), 0)
+                child.stdout.close()
+                child.stdin.close()
+                say.assert_called_once_with("connection to host failed before starting Cargo; retrying once")
+            finally:
+                os.close(build.cancel_reader)
+                os.close(writer)
 
 
 class EnclosingCheckout(unittest.TestCase):
@@ -701,7 +803,8 @@ class StandInHost(unittest.TestCase):
         python_tools.mkdir()
         (python_tools / "python3").symlink_to(Path(sys.executable).resolve())
         for name in ("build-host", "cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
-                     "cargo-incremental-retry.py", "cargo-offload", "git_ancestry.py", "memory-capped"):
+                     "cargo-incremental-retry.py", "cargo-offload", "offload_client.py", "native_slots.py",
+                     "git_ancestry.py", "memory-capped"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
         (tools / "ssh").write_text(STAND_IN_SSH)
         (tools / "ssh").chmod(0o755)
@@ -742,6 +845,7 @@ class StandInHost(unittest.TestCase):
                 str(self.cargo_bin),
                 os.environ["PATH"]]),
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
+            "CAGENTS_BUILD_LOCAL_SYNC_LOCK": str(self.root / "sync.lock"),
             # Builds here run in place, never in a scope of this host's.
             "CAGENTS_BUILD_SCOPE": "0",
             "CAGENTS_BUILD_REMOTE": "stand-in",
@@ -2260,7 +2364,7 @@ class RemoteRun(unittest.TestCase):
             stale.write_text("")
             with open(Path(base, "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-                prune = self.agent(scope, "prune", base, stdin=subprocess.PIPE)
+                prune = self.agent(scope, "prune", base, "0", stdin=subprocess.PIPE)
                 prune.stdin.close()
                 with self.assertRaises(subprocess.TimeoutExpired):
                     prune.wait(timeout=1)
@@ -3095,11 +3199,22 @@ class Prune(unittest.TestCase):
                 Path(source, name).parent.mkdir(parents=True, exist_ok=True)
                 Path(source, name).write_text("")
             Path(source, "link").symlink_to("keep.rs")
-            scope.run([sys.executable, "-c", offload.REMOTE_AGENT, "prune", base],
-                           input=b"keep.rs\0a/keep.rs\0", check=True, timeout=HANG_GUARD)
+            listing = b"keep.rs\0a/keep.rs\0"
+            scope.run([sys.executable, "-c", offload.REMOTE_AGENT, "prune", base, str(len(listing))],
+                      input=listing, check=True, timeout=HANG_GUARD)
             left = sorted(str(path.relative_to(source)) for path in source.rglob("*"))
             self.assertEqual(left, ["a", "a/keep.rs", "keep.rs", "target", "target/debug",
                                     "target/debug/x"])
+
+    def test_a_truncated_source_listing_leaves_the_checkout_intact(self):
+        with FixtureDirectory() as scope:
+            source = Path(scope.name, "src")
+            source.mkdir()
+            (source / "keep.rs").touch()
+            result = scope.run([sys.executable, "-c", offload.REMOTE_AGENT, "prune", scope.name, "8"],
+                               input=b"keep", timeout=HANG_GUARD)
+            self.assertEqual(result.returncode, 255)
+            self.assertTrue((source / "keep.rs").is_file())
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ else
     export CAGENTS_EVIDENCE_REMOTE_SUPERVISOR=$$
     # It reads cancellation from a file too, which this never writes.
     exec /usr/bin/python3 -I "$tool_root/scripts/cargo-gate-command.py" --wrapper native-evidence-remote \
+        --parent "$PPID" --drain-on-exit \
         /dev/null "$self" "$@"
 fi
 
@@ -128,11 +129,39 @@ tool_source=${CAGENTS_EVIDENCE_REMOTE_TOOL:-$tool_root}
 # Its own connection, never a channel of a user's multiplexing master: the
 # host ends what a connection started when that connection's sshd goes, and a
 # master's outlives this command.
-ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30
-    -o ControlMaster=no -o ControlPath=none)
-# Git's own SSH connection, the first contact in a build, gets the same
-# options, so an unreachable host fails in seconds rather than prompting.
-git_ssh="${ssh_command[*]}"
+ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o TCPKeepAlive=yes
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+    -o ControlMaster=no -o ControlPath=none -o ForkAfterAuthentication=no)
+# Git and rsync use the same connection policy as the script's SSH calls.
+ssh_command_line="${ssh_command[*]}"
+supervisor=(/usr/bin/python3 -I "$tool_root/scripts/cargo-gate-command.py" --wrapper native-evidence-remote)
+client=(/usr/bin/python3 -I "$tool_root/scripts/offload_client.py")
+transfer_seconds=${CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS-180}
+command_seconds=${CAGENTS_BUILD_REMOTE_COMMAND_TIMEOUT_SECONDS-7200}
+
+transfer() {
+    "${client[@]}" local "${supervisor[@]}" --drain-on-exit --timeout "$transfer_seconds" /dev/null "$@"
+}
+
+remote_command() {
+    local seconds=$1
+    shift
+    "${supervisor[@]}" --drain-on-exit --timeout "$seconds" /dev/null "${client[@]}" low "$@"
+}
+
+# Replay only transfers of the same data to the same destination, or reads
+# whose caller can discard any partial output from the failed connection.
+retry_transfer() {
+    local statuses=$1 description=$2 status=0
+    shift 2
+    "$@" || status=$?
+    [ "$status" -ne 0 ] || return 0
+    case " $statuses " in
+        *" $status "*) printf 'native-evidence-remote: %s failed (status %s), retrying once\n' "$description" "$status" >&2 ;;
+        *) return "$status" ;;
+    esac
+    "$@"
+}
 
 # Runs a Bash script on HOST in a fresh SSH login, which inherits nothing from
 # this shell. The login shell there may be fish, so the script travels on
@@ -140,13 +169,18 @@ git_ssh="${ssh_command[*]}"
 # parse. One function holds it all: Bash reads it whole before running any
 # of it, and its commands read nothing more from that input.
 on_host() {
+    local -a runner=(remote_command "$transfer_seconds")
+    case $1 in
+        --long) runner=(remote_command "$command_seconds"); shift ;;
+        --transfer) runner=(transfer); shift ;;
+    esac
     local script=$1
     shift
     local quoted='' argument
     for argument in "$@"; do
         quoted+=" $(printf '%q' "$argument")"
     done
-    "${ssh_command[@]}" "$host" bash -s <<SCRIPT
+    "${runner[@]}" "${ssh_command[@]}" "$host" bash -s <<SCRIPT
 set -euo pipefail
 remote_main() {
 $script
@@ -270,7 +304,7 @@ mkdir -p -- "$task/shots"
 
 # A commit holding exactly what a checkout's working tree holds, tracked or
 # not, without touching its index, branch or files. A clean checkout is its HEAD.
-snapshot() {
+write_snapshot() {
     local checkout=$1 head index tree date
     head=$(git -C "$checkout" rev-parse --verify HEAD^{commit}) ||
         die "$checkout has no commit to start from"
@@ -279,8 +313,8 @@ snapshot() {
         return
     fi
     index=$(mktemp)
-    # This runs in a command substitution, so the trap is its own; it names
-    # the file itself, as the function's variable is gone by then.
+    # The snapshot runs in a shell of its own. The trap names the file
+    # itself, as the function's variable is gone by then.
     trap "rm -f -- $(printf '%q' "$index")" EXIT
     # A copy of its index, so unchanged files need no rehashing.
     cp -- "$(git -C "$checkout" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || :
@@ -296,6 +330,11 @@ snapshot() {
     GIT_AUTHOR_NAME=native-evidence GIT_AUTHOR_EMAIL=native-evidence@localhost GIT_AUTHOR_DATE=$date \
         GIT_COMMITTER_NAME=native-evidence GIT_COMMITTER_EMAIL=native-evidence@localhost GIT_COMMITTER_DATE=$date \
         git -C "$checkout" commit-tree "$tree" -p "$head" -m "native-evidence: uncommitted state of $checkout"
+}
+
+snapshot() {
+    "${client[@]}" local /bin/bash -ec "$(declare -f die write_snapshot)"$'\nwrite_snapshot "$@"' \
+        native-evidence-snapshot "$@"
 }
 
 # Resolves SOURCE to the checkout that sends it and the commit it is.
@@ -318,7 +357,10 @@ resolve_source() {
 # exactly that commit: untracked files left by an earlier copy are removed.
 sync_checkout() {
     local role=$1 checkout=$2 commit=$3
-    git -C "$checkout" -c core.sshCommand="$git_ssh" push --quiet --force --no-verify "ssh://$host$repository" \
+    # Git reports a failed SSH exchange as 128 before it receives the ref
+    # update result. A second push of the same commit to this task's ref is safe.
+    retry_transfer '124 128 255' 'source upload' transfer \
+        git -C "$checkout" -c core.sshCommand="$ssh_command_line" push --quiet --force --no-verify "ssh://$host$repository" \
         "$commit:refs/native-evidence/$name/$role" ||
         die "could not copy $commit to $host:$repository"
     on_host "$remote_prelude"'
@@ -410,7 +452,7 @@ build_in_checkout() {
 # what differs.
 send_executables() {
     local side=$1 directory=$2 answer remote_task executables=() bases=() base
-    answer=$(on_host "$remote_prelude"'
+    answer=$(retry_transfer '124 255' 'executable upload preparation' read_on_host "$remote_prelude"'
         # Made a task first, which only native-evidence does.
         "$tool/scripts/native-evidence" --task "$task" status >/dev/null
         printf "%s\n" "$task"
@@ -430,31 +472,48 @@ send_executables() {
     mkdir -p -- "$task/upload"
     printf '%s\n' "$evidence_arguments" >"$task/upload/arguments"
     executables+=("$task/upload/arguments")
-    rsync --perms --compress --mkpath -e "${ssh_command[*]}" "${bases[@]}" \
+    retry_transfer '10 12 30 35 124 255' 'executable upload' transfer \
+        rsync --perms --compress --mkpath -e "$ssh_command_line" "${bases[@]}" \
         -- "${executables[@]}" "$host:$remote_task/upload-$side/" ||
         die "could not send the executables to $host"
     printf '%s\n' "$remote_task/upload-$side"
 }
 
-# Brings back the task's shots directory, manifest included.
-fetch_shots() {
-    on_host "$remote_prelude"'
+receive_shots() {
+    local archive=$1
+    on_host --transfer "$remote_prelude"'
         [ -d "$task/shots" ] || exit 0
         tar -C "$task/shots" -cf - .
-    ' >"$task/.shots.tar" || {
-        rm -f -- "$task/.shots.tar"
+    ' >"$archive"
+}
+
+# Brings back the task's shots directory, manifest included.
+fetch_shots() (
+    archive=$(mktemp -- "$task/.shots.XXXXXXXX")
+    trap 'rm -f -- "$archive"' EXIT
+    retry_transfer '124 255' 'screenshot download' receive_shots "$archive" ||
         die "could not bring back the shots from $host"
-    }
     # Nothing comes back from a host with no shots yet.
-    if [ -s "$task/.shots.tar" ]; then
-        tar -C "$task/shots" -xf "$task/.shots.tar"
+    if [ -s "$archive" ]; then
+        "${client[@]}" local tar -C "$task/shots" -xf "$archive"
     fi
-    rm -f -- "$task/.shots.tar"
+)
+
+# Wait for a complete answer before printing a retriable read's output.
+read_on_host() {
+    local answer
+    answer=$(on_host "$@") || return "$?"
+    printf '%s\n' "$answer"
 }
 
 # Forwards a native-evidence command.
 forward() {
-    on_host "$remote_prelude"'
+    local -a runner=(on_host --long)
+    case $1 in
+        status) runner=(retry_transfer '124 255' 'status request' read_on_host) ;;
+        shot) runner=(on_host) ;;
+    esac
+    "${runner[@]}" "$remote_prelude"'
         [ -x "$tool/scripts/native-evidence" ] ||
             { echo "native-evidence-remote: nothing is built for this task on this host yet; run build first" >&2; exit 1; }
         evidence "$@"
@@ -464,7 +523,7 @@ forward() {
 # forward, with the caller's compiler settings, which a fresh login on HOST
 # would otherwise lack when it compiles a revision or the integrated lane.
 forward_compiling() {
-    on_host "$remote_prelude
+    on_host --long "$remote_prelude
 $(compiler_settings)"'
         [ -x "$tool/scripts/native-evidence" ] ||
             { echo "native-evidence-remote: nothing is built for this task on this host yet; run build first" >&2; exit 1; }
@@ -497,7 +556,7 @@ cmd_build() {
     # Take the task's name on the host, or be refused, before anything is
     # sent there; and not while a session runs from what would be rewritten.
     local running=0 prebuilt=false answer
-    answer=$(on_host "claim=true
+    answer=$(retry_transfer '124 255' 'task ownership check' read_on_host "claim=true
 $remote_prelude"'
         # Executables the sentinel here built of a main commit, which
         # native-evidence here takes instead of building.
@@ -606,7 +665,7 @@ cmd_pair() {
     local side status=0
     for side in before after; do
         printf 'running %s on %s\n' "$side" "$host"
-        on_host "$remote_prelude"'
+        on_host --long "$remote_prelude"'
             side=$1 body=$2
             shift 2
             # A lost connection sends TERM; the session still stops.
@@ -652,7 +711,7 @@ case $command in
         ;;
     fetch) fetch_shots; printf '%s\n' "$task/shots" ;;
     where)
-        on_host "$remote_prelude"'
+        retry_transfer '124 255' 'task location request' read_on_host "$remote_prelude"'
             printf "host:     %s\n" "$(hostname)"
             printf "task:     %s\n" "$task"
             for role in tool before after; do
