@@ -95,10 +95,13 @@ const COMPOSER_INSET_Y: f32 =
 /// How far a scrolled draft runs on into the editor's vertical inset (#2824):
 /// up to the composer's border, never over it.
 const COMPOSER_TEXT_REACH: f32 = COMPOSER_INSET_Y - design::BORDER_WIDTH;
-/// The side of an image's square tile in the composer's tray.
-const ATTACHMENT_TILE: f32 = 56.0;
-/// The height of a file's chip in the tray, centred against the tiles.
+/// The height of an attachment's chip, an image's or a file's.
 const ATTACHMENT_CHIP: f32 = 40.0;
+/// The side of an image chip's thumbnail, inset in the chip.
+const ATTACHMENT_THUMBNAIL: f32 = ATTACHMENT_CHIP - 2.0 * ATTACHMENT_THUMBNAIL_INSET;
+const ATTACHMENT_THUMBNAIL_INSET: f32 = 4.0;
+/// The most characters of a name a chip shows before it fades out.
+const ATTACHMENT_NAME_LIMIT: usize = 32;
 /// The × in a tile's corner.
 const ATTACHMENT_CLOSE: f32 = 18.0;
 
@@ -120,6 +123,83 @@ pub(super) fn is_image_attachment(attachment: &Attachment) -> bool {
                     .iter()
                     .any(|known| extension.eq_ignore_ascii_case(known))
             })
+}
+
+/// The name an attachment goes by: an image by the `[Image N]` reference the
+/// message holds for it, a file by its own name.
+pub(super) fn attachment_title(attachment: &Attachment) -> String {
+    if attachment.reference.is_none() && clipboard_image::is_pasted(&attachment.path) {
+        "Pasted image".to_owned()
+    } else {
+        attachment.label()
+    }
+}
+
+/// Where an image came from, under its reference: the file it was attached
+/// from, or "Pasted image". Nothing where that is already its title.
+fn attachment_source(attachment: &Attachment) -> Option<&str> {
+    attachment
+        .reference
+        .as_ref()
+        .map(|reference| reference.name.as_str())
+        .filter(|name| !name.is_empty())
+}
+
+/// An image attachment as one chip: its thumbnail, or an image glyph until
+/// one is loaded, beside the reference it goes by and where it came from,
+/// each in its own place rather than written over the picture. `trailing`
+/// is the room kept at its end, as for the composer's ×.
+fn image_chip<'a>(
+    thumbnail: Option<&iced::widget::image::Handle>,
+    title: String,
+    source: Option<&'a str>,
+    trailing: f32,
+) -> Element<'a, Message> {
+    let size = Length::Fixed(ATTACHMENT_THUMBNAIL);
+    let radius = (design::RADIUS_S - ATTACHMENT_THUMBNAIL_INSET / 2.0).max(2.0);
+    let picture: Element<'a, Message> = match thumbnail {
+        Some(handle) => iced::widget::image(handle.clone())
+            .width(size)
+            .height(size)
+            .content_fit(iced::ContentFit::Cover)
+            .border_radius([radius; 4])
+            .into(),
+        None => widget::container(crate::ui_controls::passive_icon(
+            Icon::Image,
+            design::COMPACT_ICON_SIZE,
+        ))
+        .center(size)
+        .into(),
+    };
+    let mut names: Vec<Element<'a, Message>> = vec![
+        crate::ui_controls::FadeText::caption(title)
+            .limit(ATTACHMENT_NAME_LIMIT)
+            .into(),
+    ];
+    if let Some(source) = source {
+        names.push(
+            crate::ui_controls::FadeText::caption(source)
+                .limit(ATTACHMENT_NAME_LIMIT)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into(),
+        );
+    }
+    widget::container(
+        widget::row::with_children(vec![picture, widget::column::with_children(names).into()])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center),
+    )
+    .padding(
+        iced::Padding::from([0.0, ATTACHMENT_THUMBNAIL_INSET]).right(trailing.max(step::GAP_S)),
+    )
+    .height(Length::Fixed(ATTACHMENT_CHIP))
+    .align_y(iced::alignment::Vertical::Center)
+    .class(design::surface(
+        Some(design::sunken),
+        [design::RADIUS_S; 4],
+        true,
+    ))
+    .into()
 }
 
 /// The tray's small remove button, which sits inside its tile's corner. A
@@ -781,16 +861,12 @@ fn queue_row<'a>(
             unconfirmed_detail(retry),
         ),
     };
+    // Named as the composer named them: an image by its `[Image N]`
+    // reference, not the stored copy's file name.
     let names = || {
         attachments
             .iter()
-            .map(|attachment| {
-                attachment
-                    .path
-                    .file_name()
-                    .unwrap_or(attachment.path.as_os_str())
-                    .to_string_lossy()
-            })
+            .map(attachment_title)
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -4994,7 +5070,7 @@ impl Runtime {
     }
 
     /// The draft's attachments as one compact strip above the message: a
-    /// square thumbnail per image and a chip per file, wrapping onto more
+    /// chip per image, with its thumbnail, and per file, wrapping onto more
     /// rows in a narrow pane rather than hiding any off its edge.
     fn attachment_tray(&self, target: Target, transitioning: bool) -> Option<Element<'_, Message>> {
         if self.attachments.is_empty() {
@@ -5051,12 +5127,7 @@ impl Runtime {
         attachment: &'a Attachment,
         transitioning: bool,
     ) -> Element<'a, Message> {
-        let label =
-            if attachment.reference.is_none() && clipboard_image::is_pasted(&attachment.path) {
-                "Pasted image".to_owned()
-            } else {
-                attachment.label()
-            };
+        let label = attachment_title(attachment);
         // While the draft is fixed, so are its attachments, for the keyboard
         // as for the ×, and the message's history.
         let fixed = self.composer_read_only(transitioning);
@@ -5071,34 +5142,27 @@ impl Runtime {
         let removal =
             |removal| (!fixed).then(|| action(Action::RemoveAttachment(target, index, removal)));
         let remove = removal(Removal::Key);
-        let close = attachment_close(removal(Removal::Pointer));
+        let close = widget::container(attachment_close(removal(Removal::Pointer)))
+            .center_y(Length::Fixed(ATTACHMENT_CHIP - 6.0));
         let id = attachment_tile_id(target.card, index);
-        // The file's own name, which the tile's short label leaves out, as
-        // the attachment rows showed it.
-        let named = |tile: Element<'a, Message>| -> Element<'a, Message> {
-            widget::tooltip(
-                tile,
-                design::caption(attachment.reference.as_ref().map_or_else(
-                    || attachment.path.display().to_string(),
-                    |reference| reference.name.clone(),
-                )),
-                widget::tooltip::Position::Top,
-            )
-            .into()
+        // Room at the trailing end for the × it reveals, where it has one.
+        let trailing = if fixed {
+            step::GAP_S
+        } else {
+            ATTACHMENT_CLOSE + 6.0
         };
         if !is_image_attachment(attachment) {
             let face = widget::container(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(Icon::TextFile, design::ROW_ICON_SIZE),
                     crate::ui_controls::FadeText::caption(label.clone())
-                        .limit(32)
+                        .limit(ATTACHMENT_NAME_LIMIT)
                         .into(),
                 ])
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center),
             )
-            // Room at the trailing end for the × it reveals.
-            .padding(iced::Padding::from([0.0, step::GAP_S]).right(ATTACHMENT_CLOSE + 6.0))
+            .padding(iced::Padding::from([0.0, step::GAP_S]).right(trailing))
             .height(Length::Fixed(ATTACHMENT_CHIP))
             .align_y(iced::alignment::Vertical::Center)
             .class(design::surface(
@@ -5106,78 +5170,47 @@ impl Runtime {
                 [design::RADIUS_S; 4],
                 true,
             ));
-            return named(
-                attachment_tile::tile(
-                    id,
-                    face,
-                    widget::Space::new(),
-                    widget::container(close).center_y(Length::Fixed(ATTACHMENT_CHIP - 6.0)),
-                    label,
-                    remove,
-                )
-                .on_history(undo.clone(), redo.clone())
-                .into(),
+            // The chip names the file; where it is, the path, waits for the
+            // pointer, above the chip rather than over the draft below it.
+            return crate::interaction::tooltip_above(
+                attachment_tile::tile(id, face, close, label, remove).on_history(undo, redo),
+                attachment.path.display().to_string(),
             );
         }
-        let size = Length::Fixed(ATTACHMENT_TILE);
-        let face: Element<'_, Message> = match self.thumbnails.handle(&attachment.path) {
-            Some(handle) => iced::widget::image(handle.clone())
-                .width(size)
-                .height(size)
-                .content_fit(iced::ContentFit::Cover)
-                .border_radius([design::RADIUS_S; 4])
-                .into(),
-            None => widget::container(crate::ui_controls::passive_icon(
-                Icon::Image,
-                design::ROW_ICON_SIZE,
-            ))
-            .center(size)
-            .class(design::surface(
-                Some(design::sunken),
-                [design::RADIUS_S; 4],
-                true,
-            ))
-            .into(),
+        let source = attachment_source(attachment).filter(|source| *source != label);
+        let name = match source {
+            Some(source) => format!("{label}, {source}"),
+            None => label.clone(),
         };
-        let caption = widget::container(
-            design::caption(label.clone()).class(cosmic::theme::Text::Color(iced::Color::WHITE)),
-        )
-        .center_x(Length::Fill)
-        .padding([1, 2])
-        .class(cosmic::theme::Container::custom(|_theme| {
-            widget::container::Style {
-                background: Some(iced::Background::Color(iced::Color {
-                    a: 0.62,
-                    ..iced::Color::BLACK
-                })),
-                border: iced::Border {
-                    radius: [0.0, 0.0, design::RADIUS_S, design::RADIUS_S].into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }));
         let marked = attachment
             .reference
             .as_ref()
             .is_some_and(|reference| self.caret_reference == Some(reference.id));
-        named(
-            attachment_tile::tile(
-                id,
-                face,
-                widget::container(caption)
-                    .width(size)
-                    .height(size)
-                    .align_y(iced::alignment::Vertical::Bottom),
-                close,
+        // Everything a reader needs is on the chip itself, so it has no
+        // tooltip of its own to cover it or its neighbours, unless the file
+        // it came from is named too long to show whole.
+        let full = source
+            .filter(|source| source.chars().count() > ATTACHMENT_NAME_LIMIT)
+            .map(str::to_owned);
+        let tile = attachment_tile::tile(
+            id,
+            image_chip(
+                self.thumbnails.handle(&attachment.path),
                 label,
-                remove,
-            )
-            .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
-            .on_history(undo, redo)
-            .marked(marked)
-            .into(),
+                source,
+                trailing,
+            ),
+            close,
+            name,
+            remove,
         )
+        .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
+        .on_history(undo, redo)
+        .marked(marked);
+        match full {
+            Some(full) => crate::interaction::tooltip_above(tile, full),
+            None => tile.into(),
+        }
     }
 
     /// The `+` at the composer's leading edge, and the menu it opens while it
@@ -7271,15 +7304,35 @@ impl Runtime {
         if !local.text().trim().is_empty() {
             rows.push(user_bubble(body, false, false));
         }
-        for attachment in &local.attachments {
+        // Its attachments read as they did in the composer: an image by its
+        // chip, a file by its name.
+        if !local.attachments.is_empty() {
             rows.push(
-                design::caption(
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy(),
+                widget::row::with_children(
+                    local
+                        .attachments
+                        .iter()
+                        .map(|attachment| {
+                            let title = attachment_title(attachment);
+                            if is_image_attachment(attachment) {
+                                let source =
+                                    attachment_source(attachment).filter(|source| *source != title);
+                                image_chip(
+                                    self.thumbnails.handle(&attachment.path),
+                                    title,
+                                    source,
+                                    step::GAP_S,
+                                )
+                            } else {
+                                design::caption(title).into()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
                 )
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .wrap()
+                .vertical_spacing(step::GAP_S)
                 .into(),
             );
         }
