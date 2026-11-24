@@ -559,6 +559,7 @@ mod fixture {
         listening: Option<bool>,
         host_key: Option<String>,
         /// `null` for installed but not connected; absent for not installed.
+        #[serde(deserialize_with = "present")]
         tailscale: Option<Option<FixtureTailscale>>,
         lan: Vec<String>,
         /// Network addresses the firewall blocks SSH on, while it allows SSH
@@ -567,6 +568,16 @@ mod fixture {
         /// The phones' addresses; absent to find the phones really connected,
         /// as a fixture that a real phone pairs with does.
         connections: Option<Vec<String>>,
+    }
+
+    /// A field that is present, even as `null`, which `Option` alone would
+    /// read as absent.
+    fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        T::deserialize(deserializer).map(Some)
     }
 
     #[derive(Deserialize)]
@@ -632,6 +643,25 @@ mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fixture_tells_tailscale_off_from_not_installed() {
+        let tailscale = |json: &str| {
+            serde_json::from_str::<fixture::Fixture>(json)
+                .unwrap()
+                .network()
+                .tailscale
+        };
+        assert_eq!(tailscale(r#"{"tailscale":null}"#), Tailscale::NotConnected);
+        assert_eq!(tailscale("{}"), Tailscale::NotInstalled);
+        assert_eq!(
+            tailscale(r#"{"tailscale":{"name":"box.ts.net","addresses":["100.1.2.3"]}}"#),
+            Tailscale::Connected {
+                name: Some("box.ts.net".into()),
+                addresses: vec!["100.1.2.3".into()],
+            }
+        );
+    }
 
     #[test]
     fn tailscale_counts_only_when_running() {

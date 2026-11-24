@@ -562,7 +562,7 @@ impl Cagents {
                          messages, as you. You can remove it here at any time.",
                     )
                     .into(),
-                    design::caption(format!("Phone key {}", request.key.fingerprint())).into(),
+                    fingerprint_text(format!("Phone key {}", request.key.fingerprint())),
                     widget::container(actions).align_right(Length::Fill).into(),
                 ])
                 .spacing(space::S)
@@ -769,6 +769,15 @@ fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Element<'a,
     widget::column::with_children(rows).spacing(space::S).into()
 }
 
+/// A whole fingerprint, broken between characters where it doesn't fit:
+/// it is one word, so it would otherwise run past the popover's edge.
+fn fingerprint_text(text: String) -> Element<'static, Message> {
+    design::caption(text)
+        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+        .width(Length::Fill)
+        .into()
+}
+
 /// The start of a fingerprint, enough to tell two keys apart.
 fn short_fingerprint(fingerprint: &str) -> String {
     let mut short: String = fingerprint.chars().take(7 + 12).collect();
@@ -873,7 +882,7 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
         rows.push(fact(
             "Host key",
             widget::row::with_children(vec![
-                design::caption(host_key.clone()).width(Length::Fill).into(),
+                fingerprint_text(host_key.clone()),
                 crate::ui_controls::icon_button(Icon::Copy, "Copy host key fingerprint")
                     .compact()
                     .on_press(Message::Phone(Action::Copy(host_key.clone())))
