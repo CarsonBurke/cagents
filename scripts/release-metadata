@@ -7,6 +7,11 @@ cagents-release`). The metadata names every other file of the release with
 its size and SHA-256, so the signature covers them all, the installer
 included. See docs/releasing.md#signing.
 
+A bundle holds them under those names. Published, a release carries them
+under its trust generation's name (`release-metadata-2.json` from 0.2.4 on),
+and under each older generation's name the metadata of the release that began
+the next generation (see docs/releasing.md#trust-generations).
+
   write --dir DIR --version V --source-commit SHA --protocol N [--notes FILE]
         write DIR/release-metadata.json for the files in DIR
   check --dir DIR [--version V] [--source-commit SHA]
@@ -15,9 +20,12 @@ included. See docs/releasing.md#signing.
   notes --repository PATH --to REF [--from TAG]
         print release notes from the Conventional Commit subjects in FROM..TO:
         features and fixes, with their pull request numbers
-  feed --dir DIR --feed FEED
+  feed --dir DIR --feed FEED [--generation G] [--bridge BRIDGE]
         lay out DIR as a file feed: FEED/download/vV/* and, when V is the
-        newest there, FEED/latest/download/* (copies; DIR is unchanged)
+        newest there, FEED/latest/download/* (copies; DIR is unchanged). The
+        metadata appears under the names of generation G (default 2) and every
+        older one; BRIDGE holds, under their published names, older releases'
+        metadata to carry instead under some of those names
 """
 
 import argparse
@@ -36,6 +44,13 @@ REPOSITORY = "CarsonBurke/cagents"
 TARGET = "x86_64-unknown-linux-gnu"
 METADATA = "release-metadata.json"
 SIGNATURE = "release-metadata.json.sig"
+# Every trust generation's published metadata name; see metadata_name.
+PUBLISHED_METADATA = re.compile(r"^release-metadata(-[1-9][0-9]*)?\.json(\.sig)?$")
+
+
+def metadata_name(generation: int) -> str:
+    """The published metadata name of a trust generation."""
+    return METADATA if generation == 1 else f"release-metadata-{generation}.json"
 VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 NAME = re.compile(r"^[-A-Za-z0-9_.]+$")
@@ -63,7 +78,7 @@ def payloads(directory: Path) -> list[Path]:
     """Every file of the release other than its metadata and signature."""
     found = []
     for path in sorted(directory.iterdir()):
-        if path.name in (METADATA, SIGNATURE):
+        if PUBLISHED_METADATA.match(path.name):
             continue
         if path.is_symlink() or not path.is_file() or not NAME.match(path.name):
             raise Refused(f"release file is not a plainly named regular file: {path.name}")
@@ -181,12 +196,28 @@ def notes(repository: Path, start: str | None, end: str) -> str:
     return "\n".join(lines).strip() + "\n" if lines else ""
 
 
-def feed(directory: Path, destination: Path) -> None:
+def feed(directory: Path, destination: Path, generation: int, bridge: Path | None) -> None:
     metadata = json.loads((directory / METADATA).read_bytes())
     check(directory, None, None)
     if not (directory / SIGNATURE).is_file():
         raise Refused(f"{SIGNATURE} is missing; sign the metadata first")
     version = metadata["version"]
+    if generation < 1:
+        raise Refused("a trust generation is a positive number")
+    # Each generation's names: this release's own metadata, or for an older
+    # generation the bridge's, as a published release carries it.
+    published_names = {}
+    for older in range(1, generation + 1):
+        name = metadata_name(older)
+        source = directory / METADATA, directory / SIGNATURE
+        if older < generation and bridge is not None and (bridge / name).is_file():
+            if not (bridge / f"{name}.sig").is_file():
+                raise Refused(f"the bridge has no {name}.sig")
+            bridged = json.loads((bridge / name).read_bytes())["version"]
+            if version_key(bridged) >= version_key(version):
+                raise Refused(f"the bridge release {bridged} is not older than {version}")
+            source = bridge / name, bridge / f"{name}.sig"
+        published_names[name], published_names[f"{name}.sig"] = source
     downloads = destination / "download"
     release = downloads / f"v{version}"
     if release.exists():
@@ -194,8 +225,10 @@ def feed(directory: Path, destination: Path) -> None:
     downloads.mkdir(parents=True, exist_ok=True)
     # Each directory appears whole, so a reader never sees half a release.
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=downloads))
-    for path in [*payloads(directory), directory / METADATA, directory / SIGNATURE]:
+    for path in payloads(directory):
         shutil.copyfile(path, staging / path.name)
+    for name, path in published_names.items():
+        shutil.copyfile(path, staging / name)
     staging.chmod(0o755)
     staging.rename(release)
     published = sorted(
@@ -207,7 +240,7 @@ def feed(directory: Path, destination: Path) -> None:
         latest = destination / "latest"
         latest.mkdir(exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=latest))
-        for name in (METADATA, SIGNATURE):
+        for name in published_names:
             shutil.copyfile(release / name, staging / name)
         staging.chmod(0o755)
         previous = latest / "download"
@@ -241,6 +274,8 @@ def main() -> int:
     feed_parser = commands.add_parser("feed")
     feed_parser.add_argument("--dir", type=Path, required=True)
     feed_parser.add_argument("--feed", type=Path, required=True)
+    feed_parser.add_argument("--generation", type=int, default=2)
+    feed_parser.add_argument("--bridge", type=Path)
     arguments = parser.parse_args()
     try:
         if arguments.command == "write":
@@ -256,7 +291,7 @@ def main() -> int:
         elif arguments.command == "notes":
             sys.stdout.write(notes(arguments.repository, arguments.start, arguments.to))
         else:
-            feed(arguments.dir, arguments.feed)
+            feed(arguments.dir, arguments.feed, arguments.generation, arguments.bridge)
     except Refused as error:
         print(f"release-metadata: {error}", file=sys.stderr)
         return 1

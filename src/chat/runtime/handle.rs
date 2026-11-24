@@ -387,17 +387,18 @@ impl Handle {
             Owner::Remote(remote) => remote.submit(None, command),
         }
     }
-    /// Sends `command` once under `key`: asked again with the same key, it
-    /// reports what became of the first send instead of sending it twice. A
-    /// command that gives no work, such as a stop or a read, changes nothing
-    /// when it is repeated, so it goes as it is.
-    pub fn deliver(&self, command: Command, key: chat::DeliveryKey) -> Result<(), String> {
-        if !command.gives_work() {
-            return self.command(command);
-        }
+    /// Delivers work through the daemon's ledger, which outlives this owner.
+    pub(crate) fn deliver(
+        &self,
+        deliveries: &super::Deliveries,
+        chat: crate::model::TerminalId,
+        command: Command,
+        key: chat::DeliveryKey,
+        given_work: impl FnOnce(),
+    ) -> Result<(), String> {
         match &self.0 {
-            Owner::Local(local) => local.deliver(command, key),
-            Owner::Remote(remote) => remote.deliver(command, key),
+            Owner::Local(local) => local.deliver(deliveries, chat, command, key, given_work),
+            Owner::Remote(remote) => remote.deliver(deliveries, chat, command, key, given_work),
         }
         .map_err(String::from)
     }

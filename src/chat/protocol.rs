@@ -444,6 +444,11 @@ pub enum MetadataWake<'a> {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    #[cfg(feature = "host")]
+    fn needs_private_temp(&self) -> bool {
+        false
+    }
+
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
     fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {

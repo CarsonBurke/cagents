@@ -2050,6 +2050,17 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
     }
 }
 
+/// `parts` as one copied text, its empty parts left out.
+fn joined(parts: &[&str]) -> Option<String> {
+    let text = parts
+        .iter()
+        .copied()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
 /// What a copy control hands the reader.
 ///
 /// Every step variant answers, because a control that silently does nothing is
@@ -2058,15 +2069,6 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
 /// transcript for them. `Text` is the whole step as a reader would quote it;
 /// `Input` and `Output` are the individual blocks their own headers offer.
 fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
-    fn joined(parts: &[&str]) -> Option<String> {
-        let text = parts
-            .iter()
-            .copied()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        (!text.is_empty()).then_some(text)
-    }
     match (part, content) {
         (CopyPart::Text, ItemContent::Text { text, .. }) => joined(&[text]),
         (
@@ -2101,16 +2103,9 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
                 path, description, ..
             },
         ) => joined(&[description, path]),
-        (
-            CopyPart::Text,
-            ItemContent::Delivery {
-                kind,
-                from,
-                sender,
-                summary,
-                body,
-            },
-        ) => joined(&[&chat::delivery_heading(*kind, from, sender, summary), body]),
+        // A delivery's heading names its sender as this conversation lists
+        // it, which only the runtime knows: see `Runtime::item_copy_text`.
+        (CopyPart::Text, ItemContent::Delivery { .. }) => None,
         // A command has no separate input block, so its header offers the
         // command line under the same name the tool detail uses for one.
         (CopyPart::Input, ItemContent::Command { command, .. }) => joined(&[command]),
@@ -2130,6 +2125,30 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
         }
         (CopyPart::Change(_), _)
         | (CopyPart::Input | CopyPart::Sent | CopyPart::Output | CopyPart::Received, _) => None,
+    }
+}
+
+impl Runtime {
+    /// What a copy control hands the reader for `content`, as [`copy_text`]
+    /// says it, except that a delivery's heading is the one its row shows,
+    /// naming its sender by name rather than by the provider's ID.
+    pub(super) fn item_copy_text(&self, part: CopyPart, content: &ItemContent) -> Option<String> {
+        match (&part, content) {
+            (
+                CopyPart::Text,
+                ItemContent::Delivery {
+                    kind,
+                    from,
+                    sender,
+                    summary,
+                    body,
+                },
+            ) => joined(&[
+                &self.delivery_heading(*kind, from, sender, summary, body),
+                body,
+            ]),
+            _ => copy_text(part, content),
+        }
     }
 }
 
@@ -16666,10 +16685,10 @@ impl Cagents {
                     match card {
                         // A message read from a file copies as the
                         // command that sent it.
-                        Some(card) if matches!(part, CopyPart::Text) => {
-                            card.copy_text().or_else(|| copy_text(part, &item.content))
-                        }
-                        _ => copy_text(part, &item.content),
+                        Some(card) if matches!(part, CopyPart::Text) => card
+                            .copy_text()
+                            .or_else(|| runtime.item_copy_text(part, &item.content)),
+                        _ => runtime.item_copy_text(part, &item.content),
                     }
                 });
                 if let Some(text) = text {

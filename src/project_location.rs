@@ -102,8 +102,13 @@ fn has_git_metadata(directory: &Path) -> Result<bool, String> {
         return Ok(true);
     }
     for ancestor in directory.ancestors() {
-        if ancestor.file_name().is_some_and(|name| name == ".git")
-            || exists(&ancestor.join(".git"))?
+        let marker = if ancestor.file_name().is_some_and(|name| name == ".git") {
+            ancestor.to_owned()
+        } else {
+            ancestor.join(".git")
+        };
+        if crate::git_marker::present(&marker)
+            .map_err(|error| format!("could not inspect {}: {error}", marker.display()))?
             || (exists(&ancestor.join("HEAD"))?
                 && (exists(&ancestor.join("objects"))? || exists(&ancestor.join("refs"))?))
         {
@@ -205,6 +210,9 @@ pub(crate) struct GitDirectories {
 /// nothing readable; such a marker is skipped, not trusted.
 pub(crate) fn git_directories(checkout: &Path) -> Option<GitDirectories> {
     let marker = checkout.join(".git");
+    if !crate::git_marker::present(&marker).ok()? {
+        return None;
+    }
     let private = if fs::metadata(&marker).ok()?.is_dir() {
         fs::canonicalize(&marker).ok()?
     } else {
@@ -432,6 +440,8 @@ mod tests {
     fn plain_folders_have_canonical_folder_identity() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("folder")).unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        assert_eq!(git_directories(root.path()), None);
         let selected = root.path().join("folder/..");
         assert_eq!(
             discover(&selected).unwrap(),
@@ -446,8 +456,9 @@ mod tests {
     fn broken_git_metadata_is_not_reinterpreted_as_a_folder() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         assert!(discover(root.path()).is_err());
-        fs::remove_dir(root.path().join(".git")).unwrap();
+        fs::remove_dir_all(root.path().join(".git")).unwrap();
         fs::write(
             root.path().join(".git"),
             "gitdir: /missing/cagents-test-git\n",
@@ -535,6 +546,7 @@ mod tests {
         let common = root.join("repository/.git");
         let private = common.join("worktrees/linked");
         fs::create_dir_all(&private).unwrap();
+        fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
         // A linked worktree: a `gitdir: ` file naming its private directory
         // relative to the checkout, whose `commondir` is relative to it.
@@ -566,6 +578,7 @@ mod tests {
         // A `.git` directory may name its common directory too, absolutely.
         let shared = root.join("shared");
         fs::create_dir_all(shared.join(".git")).unwrap();
+        fs::write(shared.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(
             shared.join(".git/commondir"),
             format!("{}\n", common.display()),

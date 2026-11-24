@@ -111,7 +111,7 @@ fn descriptor(id: TerminalId) -> TerminalDescriptor {
     )
 }
 
-struct Peer(Option<JoinHandle<(UnixListener, usize, usize)>>);
+struct Peer(Option<JoinHandle<UnixListener>>);
 impl Peer {
     fn new(business: Business, id: TerminalId, authority: Authority, refuse_auth: bool) -> Self {
         let socket = daemon_socket_path().unwrap();
@@ -124,49 +124,39 @@ impl Peer {
         listener.set_nonblocking(true).unwrap();
         Self(Some(thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
-            let mut readiness = 0;
-            let mut raw = 0;
-            let (mut peer, mut request) = loop {
-                let mut peer = loop {
-                    match listener.accept() {
-                        Ok((peer, _)) => break peer,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(
-                                Instant::now() < deadline,
-                                "private terminal entry did not connect"
-                            );
-                            thread::sleep(Duration::from_millis(2));
-                        }
-                        Err(error) => panic!("private listener: {error}"),
+            let mut peer = loop {
+                match listener.accept() {
+                    Ok((peer, _)) => break peer,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "private terminal entry did not connect"
+                        );
+                        thread::sleep(Duration::from_millis(2));
                     }
-                };
-                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                peer.set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                let Some(hello) = read_frame::<ClientEnvelope>(&mut peer).unwrap() else {
-                    raw += 1;
-                    assert!(raw <= 1, "only the User no-start existence probe");
-                    continue;
-                };
-                assert!(matches!(hello.request, ClientRequest::Connect { .. }));
-                assert!(hello.proof.is_none());
-                response(
-                    &mut peer,
-                    &hello,
-                    ServerResponse::Connected {
-                        proof: proof(),
-                        resumed: vec![],
-                    },
-                );
-                if let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
-                    assert_eq!(request.proof.as_ref(), Some(&proof()));
-                    break (peer, request);
+                    Err(error) => panic!("private listener: {error}"),
                 }
-                // A connection that only handshakes is a separate readiness
-                // probe. Diagnose it only after the actual terminal operation.
-                readiness += 1;
-                assert!(readiness <= 1, "no repeated readiness or fallback");
             };
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let hello = read_frame::<ClientEnvelope>(&mut peer)
+                .unwrap()
+                .expect("the first connection handshakes");
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            assert!(hello.proof.is_none());
+            response(
+                &mut peer,
+                &hello,
+                ServerResponse::Connected {
+                    proof: proof(),
+                    resumed: vec![],
+                },
+            );
+            let mut request = read_frame::<ClientEnvelope>(&mut peer)
+                .unwrap()
+                .expect("the same connection carries the terminal request");
+            assert_eq!(request.proof.as_ref(), Some(&proof()));
             let scoped = authority.token().is_some() && !matches!(business, Business::List);
             if scoped {
                 assert!(
@@ -178,7 +168,7 @@ impl Peer {
                         read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
                         "authentication refusal forbids Spawn/Attach and User fallback"
                     );
-                    return (listener, readiness, raw);
+                    return listener;
                 }
                 response(&mut peer, &request, ServerResponse::Accepted);
                 request = next(&mut peer);
@@ -263,16 +253,15 @@ impl Peer {
                 read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
                 "no extra business request, User fallback, or automatic retry"
             );
-            (listener, readiness, raw)
+            listener
         })))
     }
-    fn finished(mut self) -> (usize, usize) {
-        let (listener, readiness, raw) = self.0.take().unwrap().join().unwrap();
+    fn finished(mut self) {
+        let listener = self.0.take().unwrap().join().unwrap();
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
             "no fallback connection"
         );
-        (readiness, raw)
     }
 }
 impl Drop for Peer {
@@ -337,8 +326,8 @@ fn local(role: &str) {
                     ExitCode::SUCCESS
                 }
             );
-            let (readiness, raw) = peer.finished();
-            routing.push((business, refuse_auth, staged.get(), readiness, raw));
+            peer.finished();
+            routing.push((business, refuse_auth, staged.get()));
         }
     }
     // Readiness hands its connection to the request, so each route shows in
@@ -352,21 +341,12 @@ fn local(role: &str) {
     }
     // Reach every real command and both scoped refusal boundaries first;
     // only then diagnose the predecessor's startup/staged-owner behavior.
-    for (business, refused_auth, staged, readiness, raw) in routing {
+    for (business, refused_auth, staged) in routing {
         let scoped_mutation = scoped && !matches!(business, Business::List);
         assert_eq!(
             staged,
             usize::from(!scoped_mutation),
             "{business:?} auth_refused={refused_auth}: scoped mutation bypasses staged owner"
-        );
-        assert_eq!(
-            readiness, 0,
-            "{business:?}: readiness hands its connection to the request rather than handshaking twice"
-        );
-        assert_eq!(
-            raw,
-            usize::from(!scoped_mutation && no_start),
-            "User no-start/global-read existence probe remains unchanged"
         );
     }
 }

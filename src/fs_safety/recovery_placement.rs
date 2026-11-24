@@ -142,11 +142,10 @@ fn validate_recovery_ancestry(
                 "Recovery payloads would be inside a captured known checkout root; this step was refused and existing recovery was retained.",
             ));
         }
-        // Presence alone refuses placement. Do not read an attacker/FIFO
-        // locator, follow a symlink, or adopt unknown foreign Git metadata.
-        match metadata_beneath(&cursor, Path::new(".git")) {
-            Err(error) if error.is_not_found() => {}
-            Ok(_) => {
+        // Inspect metadata without opening a locator or following a link.
+        match crate::git_marker::present_beneath(&cursor, Path::new(".git")) {
+            Ok(false) => {}
+            Ok(true) => {
                 return Err(unsupported(
                     "Recovery placement has an enclosing Git checkout locator; this step was refused and existing recovery was retained.",
                 ));
@@ -367,6 +366,16 @@ mod tests {
             RecoveryPlacement::acquire(outside, source.clone(), Arc::from([source])).unwrap();
         placement.validate().unwrap();
     }
+    #[test]
+    fn local_recovery_skips_empty_git_directory_until_head_appears() {
+        let (directory, source, outside) = roots();
+        let marker = directory.path().join(".git");
+        std::fs::create_dir(&marker).unwrap();
+        let placement = RecoveryPlacement::acquire(outside, source, Arc::from([])).unwrap();
+        std::fs::write(marker.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(placement.validate().is_err());
+    }
+
     #[test]
     fn local_recovery_refuses_later_enclosing_git_locator_without_opening_fifo() {
         let (directory, source, outside) = roots();

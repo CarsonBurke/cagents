@@ -931,7 +931,7 @@ impl Registry {
     }
 
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
-        Ok(read(&self.db, scope)?.revision)
+        store::revision(&self.db, scope)
     }
     pub(crate) fn view_operation_seen(&self, operation: Uuid) -> Result<bool, String> {
         operation_seen(&self.db, operation)
@@ -1562,9 +1562,18 @@ mod tests {
     #[test]
     fn view_listings_read_each_view_whole_and_occupied_skips_emptied_views() {
         let (mut r, _, a, b) = setup();
-        let kept = pane();
+        let kept = vec![pane(), pane()];
+        let retired = [
+            CardId::from_uuid(Uuid::from_u128(2)),
+            CardId::from_uuid(Uuid::from_u128(1)),
+        ];
+        r.apply(&ModelEdit::SeedView {
+            scope: Scope::Channel(a),
+            panes: kept.clone(),
+            closed: retired.to_vec(),
+        })
+        .unwrap();
         let emptied = pane();
-        seed(&mut r, a, vec![kept.clone()]);
         seed(&mut r, b, vec![emptied.clone()]);
         let remove = edit(&mut r, b, Change::Remove { id: emptied.id });
         r.apply(&remove).unwrap();
@@ -1573,10 +1582,15 @@ mod tests {
         for view in &every {
             assert_eq!(view, &read(&r.db, &view.scope).unwrap());
         }
+        let active = read(&r.db, &Scope::Channel(a)).unwrap();
+        assert_eq!(active.panes, kept);
+        assert_eq!(active.retired, retired);
         assert_eq!(
-            occupied(&r.db).unwrap(),
-            vec![read(&r.db, &Scope::Channel(a)).unwrap()]
+            read(&r.db, &Scope::Channel(b)).unwrap().retired,
+            [emptied.id]
         );
+        assert_eq!(occupied(&r.db).unwrap(), vec![active.clone()]);
+        assert_eq!(occupied_for_start(&r.db).unwrap(), vec![active]);
     }
     #[test]
     fn hosted_resource_ownership_reads_only_occupied_views() {

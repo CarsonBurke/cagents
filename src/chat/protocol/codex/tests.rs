@@ -1088,6 +1088,69 @@ fn codex_live_rename_wins_over_an_in_flight_resume_or_metadata_read() {
 }
 
 #[test]
+fn codex_explicit_name_removal_falls_back_and_fences_stale_metadata() {
+    let mut adapter = adapter();
+    adapter.attached = false;
+    adapter.pending.insert(
+        json!("attach").to_string(),
+        Pending::Attach { renamed: None },
+    );
+    let clear =
+        |id| json!({"method":"thread/name/updated","params":{"threadId":id,"threadName":null}});
+    let metadata = |id| json!({"id":id,"result":{"thread":{"id":"thread-exact","name":"Stale title","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}});
+    let clear_event = Event::ProviderTitleCleared {
+        id: "thread-exact".into(),
+    };
+    assert!(adapter.receive(clear("other")).unwrap().events.is_empty());
+    assert!(
+        adapter
+            .receive(clear("thread-exact"))
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let attached = adapter.receive(metadata(json!("attach"))).unwrap();
+    assert!(attached.events.contains(&clear_event));
+    assert!(
+        !attached
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+    );
+
+    let explicit_name = "My provider title";
+    let renamed = adapter.receive(json!({"method":"thread/name/updated","params":{"threadId":"thread-exact","threadName":explicit_name}})).unwrap();
+    let mut state = chat::Snapshot::default();
+    crate::chat::runtime::project_events_for_test(&mut state, renamed.events);
+    let opening = chat::OpeningTitle::Prompt("Fix the channel naming race".into());
+    state.opening_title = Some(opening.clone());
+    assert_eq!(state.title.as_deref(), Some(explicit_name));
+
+    let refresh = adapter.command(Command::Refresh).unwrap();
+    let omitted = adapter
+        .receive(json!({"method":"thread/name/updated","params":{"threadId":"thread-exact"}}))
+        .unwrap();
+    crate::chat::runtime::project_events_for_test(&mut state, omitted.events);
+    assert_eq!(state.title.as_deref(), Some(explicit_name));
+    let cleared = adapter.receive(clear("thread-exact")).unwrap();
+    assert_eq!(cleared.events, [clear_event]);
+    crate::chat::runtime::project_events_for_test(&mut state, cleared.events);
+    assert!(state.title.is_none());
+    assert!(state.provider_title_cleared);
+    assert_eq!(state.opening_title, Some(opening));
+
+    let read = adapter
+        .receive(metadata(refresh.writes[0]["id"].clone()))
+        .unwrap();
+    crate::chat::runtime::project_events_for_test(&mut state, read.events);
+    assert!(
+        state.title.is_none(),
+        "an in-flight read must not restore the cleared title"
+    );
+    assert!(state.provider_title_cleared);
+}
+
+#[test]
 fn codex_paginated_resume_reads_the_first_meaningful_prompt_from_exact_rollout() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("codex-config");
@@ -1131,12 +1194,10 @@ fn codex_paginated_resume_reads_the_first_meaningful_prompt_from_exact_rollout()
     let mut mismatched = records;
     mismatched[0]["payload"]["id"] = json!(uuid::Uuid::new_v4().to_string());
     write_rollout(&mismatched);
-    assert!(
-        !resume()
-            .events
-            .iter()
-            .any(|event| matches!(event, Event::OpeningTitle(_)))
-    );
+    assert!(!resume().events.iter().any(|event| matches!(
+        event,
+        Event::OpeningTitle(_) | Event::OpeningHistoryComplete
+    )));
 }
 
 #[test]
@@ -5521,6 +5582,25 @@ fn a_tool_result_keeps_structured_content_its_text_does_not_carry() {
     let same = json!({"content":[{"type":"text","text":"{\"issues\":[\"ENG-1\"]}"}],
         "structuredContent":{"issues":["ENG-1"]}});
     assert_eq!(images::readable(&same), "{\"issues\":[\"ENG-1\"]}");
+}
+
+#[test]
+fn a_turn_diff_passes_an_empty_git_directory_in_the_working_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path();
+    let cwd = repository.join("src");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    std::fs::create_dir(repository.join(".git")).unwrap();
+    std::fs::write(repository.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let mut adapter = adapter();
+    adapter.cwd = cwd;
+    adapter
+        .receive(json!({
+            "method": "turn/diff/updated",
+            "params": {"threadId": "thread-exact", "turnId": "turn", "diff": ""}
+        }))
+        .unwrap();
+    assert_eq!(adapter.repo_root, Some(Some(repository.to_path_buf())));
 }
 
 /// A turn's diff is its own change row only for the files none of its

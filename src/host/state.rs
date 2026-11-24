@@ -10,7 +10,7 @@ pub(super) use presentation::snapshot as client_snapshot;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
@@ -407,6 +407,8 @@ pub(crate) struct HostState {
     pub(super) native_chat_capacity: usize,
     /// How long each provider account's prompt caches last, as observed.
     pub(super) prompt_cache: Arc<super::agent_execution::prompt_cache::Calibration>,
+    /// Keyed sends survive replacement of a chat's process or attachment.
+    pub(super) chat_deliveries: Option<Arc<crate::chat::runtime::Deliveries>>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
@@ -569,6 +571,7 @@ impl HostState {
             shutdown_capabilities: VecDeque::new(),
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
             prompt_cache: Arc::new(super::agent_execution::prompt_cache::Calibration::in_memory()),
+            chat_deliveries: None,
             chats: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
@@ -746,22 +749,29 @@ impl HostState {
         activation
     }
 
-    /// The sessions this publication adds to its window's live claim.
-    pub(super) fn notification_sessions_unclaimed(
+    /// Partition a window publication into new and existing live claims.
+    pub(super) fn partition_notification_sessions(
         &self,
         presence: &crate::notifications::Presence,
-    ) -> Vec<TerminalId> {
+    ) -> (Vec<TerminalId>, Vec<TerminalId>) {
+        if presence.sessions.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let claimed: HashSet<_> = self
+            .notification_watchers
+            .values()
+            .filter(|current| {
+                current.application == presence.application && current.window == presence.window
+            })
+            .flat_map(|current| current.sessions.iter().copied())
+            .collect();
+        let mut seen = HashSet::with_capacity(presence.sessions.len());
         presence
             .sessions
             .iter()
-            .filter(|session| {
-                !self.notification_watchers.values().any(|current| {
-                    current.destination() == presence.destination()
-                        && current.sessions.contains(session)
-                })
-            })
             .copied()
-            .collect()
+            .filter(|session| seen.insert(*session))
+            .partition(|session| !claimed.contains(session))
     }
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
@@ -967,6 +977,8 @@ impl HostState {
     }
 
     /// Checks the resident chat metadata that authorizes an inferred title.
+    /// Returns whether the provider explicitly removed its own title, allowing
+    /// the canonical fallback to replace that source.
     ///
     /// The workspace writer calls this while it holds SQL writer admission,
     /// after it acquired that admission off the host lock. Keep it free of
@@ -977,10 +989,11 @@ impl HostState {
         expected: crate::chat::Session,
         title: &str,
         source: crate::model::ChannelTitleSource,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<bool, ProtocolError> {
         let naming = self.title_conversation(&expected)?;
+        let cleared = naming.provider_cleared && source == crate::model::ChannelTitleSource::Prompt;
         match naming.title() {
-            Some((current, kind)) if current == title && kind == source => Ok(()),
+            Some((current, kind)) if current == title && kind == source => Ok(cleared),
             // Older retained helpers and window transcript readers may know an
             // opening the resident hasn't read. A real opening supersedes the
             // provisional title of a conversation without a meaningful prompt yet.
@@ -991,9 +1004,11 @@ impl HostState {
                         .as_ref()
                         .is_some_and(crate::chat::OpeningTitle::provisional) =>
             {
-                Ok(())
+                Ok(false)
             }
-            None if source == crate::model::ChannelTitleSource::Prompt => Ok(()),
+            None if source == crate::model::ChannelTitleSource::Prompt => {
+                Ok(cleared && title.is_empty())
+            }
             _ => Err(Self::stale_title()),
         }
     }

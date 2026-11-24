@@ -6,6 +6,7 @@ use crate::{
     terminal_ipc::{ProtocolError, ProtocolErrorCode},
     workspace_model::{ModelEdit, views::Scope},
 };
+use ChannelTitleSource::{Manual, Prompt, Provider};
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
@@ -104,7 +105,7 @@ pub(super) fn refresh(host: &SharedHost, target: Target) -> Result<(), ProtocolE
     let Some(channel) = registry.channel(id).map_err(unavailable)? else {
         return Ok(());
     };
-    if channel.title_source == ChannelTitleSource::Manual && !channel.title.is_empty() {
+    if channel.title_source == Manual && !channel.title.is_empty() {
         return Ok(());
     }
     let (view, _) = registry
@@ -136,12 +137,16 @@ pub(super) fn refresh(host: &SharedHost, target: Target) -> Result<(), ProtocolE
         }
         state.title_conversation(expected)?
     };
-    let Some((title, source)) = naming.title() else {
-        return Ok(());
+    let replacing_provider = channel.title_source == Provider && naming.provider_cleared;
+    let (title, source) = match naming.title() {
+        Some(title) => title,
+        None if replacing_provider => (String::new(), Prompt),
+        None => return Ok(()),
     };
-    if !channel.title_source.accepts_refresh(&channel.title, source)
-        || (channel.title == title && channel.title_source == source)
-        || (source == ChannelTitleSource::Prompt
+    if (channel.title == title && channel.title_source == source)
+        || (!replacing_provider && !channel.title_source.accepts_refresh(&channel.title, source))
+        || (!replacing_provider
+            && source == Prompt
             && naming
                 .opening
                 .as_ref()

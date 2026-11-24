@@ -29,6 +29,7 @@ mod child_text_copy;
 pub(crate) mod courier_tests;
 mod delivery;
 use crate::chat::DeliveryKey;
+pub(crate) use delivery::Deliveries;
 mod execution;
 mod handle;
 pub use handle::Handle;
@@ -272,6 +273,7 @@ pub(crate) enum Update {
 pub(crate) struct ConversationNaming {
     pub session: Option<String>,
     pub provider: Option<String>,
+    pub provider_cleared: bool,
     pub opening: Option<super::OpeningTitle>,
 }
 
@@ -407,8 +409,6 @@ struct Inner {
     /// file lock before accepting. See [`Handle::startup_lock_wait`].
     startup_lock_wait: Arc<AtomicU64>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
-    /// What became of the messages sent under a key.
-    deliveries: delivery::Deliveries,
     #[cfg(test)]
     idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
@@ -726,7 +726,6 @@ impl LocalHandle {
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
-            deliveries: delivery::Deliveries::default(),
             #[cfg(test)]
             idle_frame_buffer_capacity: idle_frame_buffer_capacity.clone(),
         });
@@ -805,7 +804,12 @@ impl LocalHandle {
                         let child = if actor.native_holder.is_some() {
                             Ok(None)
                         } else {
-                            spawn_provider(&spec, &actor.stop, scope_wake)
+                            spawn_provider(
+                                &spec,
+                                &actor.stop,
+                                scope_wake,
+                                actor.adapter.needs_private_temp(),
+                            )
                         };
                         let child = child.and_then(|child| {
                             if let Some(child) = &child {
@@ -1115,17 +1119,28 @@ impl LocalHandle {
         })
     }
 
-    /// Sends `command` once under `key`, as [`delivery`] describes.
-    pub(crate) fn deliver(&self, command: Command, key: DeliveryKey) -> Result<(), Rejection> {
-        self.0
-            .deliveries
-            .deliver(key, COMMAND_ACKNOWLEDGEMENT, unacknowledged_command, || {
+    fn deliver(
+        &self,
+        deliveries: &Deliveries,
+        chat: crate::model::TerminalId,
+        command: Command,
+        key: DeliveryKey,
+        given_work: impl FnOnce(),
+    ) -> Result<(), Rejection> {
+        deliveries.deliver(
+            chat,
+            key,
+            COMMAND_ACKNOWLEDGEMENT,
+            unacknowledged_command,
+            || {
+                given_work();
                 self.enqueue_actor_command(ActorCommand::Provider {
                     run: None,
                     command,
                     decline_only: false,
                 })
-            })
+            },
+        )
     }
 
     fn submit_actor_command(&self, command: ActorCommand) -> Result<(), Rejection> {
@@ -1806,6 +1821,7 @@ impl LocalHandle {
         Ok(ConversationNaming {
             session: state.session_id.clone(),
             provider: state.title.clone(),
+            provider_cleared: state.provider_title_cleared,
             opening: state.opening_title.clone(),
         })
     }
@@ -2119,6 +2135,7 @@ fn spawn_provider(
     spec: &ProcessSpec,
     stop: &AtomicBool,
     wake: Option<UnixStream>,
+    private_temp: bool,
 ) -> Result<Option<ChildGuard>, String> {
     if matches!(
         spec.transport,
@@ -2193,13 +2210,29 @@ fn spawn_provider(
     if stop.load(Ordering::Acquire) {
         return Err("Provider startup was cancelled before process creation".into());
     }
+    let mut temp = if private_temp {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
+        let inherited = spec.environment.get("TMPDIR").map(std::ffi::OsStr::new);
+        let cwd = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let temporary = PrivateDir::create(inherited, Some(&cwd))
+            .map_err(|error| format!("Cannot create private Codex temporary directory: {error}"))?;
+        process.envs(TEMP_ENV_KEYS.map(|key| (key, temporary.path())));
+        Some(temporary)
+    } else {
+        None
+    };
     // A retained actor sweeps its unregistered exited children; this
     // registration keeps the provider's status for its ChildGuard.
     let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+    if let Some(temporary) = &mut temp {
+        temporary.launched();
+    }
     let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
     child.directory = Some(directory);
+    child._temp = temp;
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
@@ -2268,6 +2301,7 @@ struct ChildGuard {
     stop_detached: bool,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
+    _temp: Option<crate::daemon::codex_temp::PrivateDir>,
 }
 impl ChildGuard {
     /// Wait on the original child capability without reaping it or releasing
@@ -2357,6 +2391,7 @@ impl ChildGuard {
             directory: None,
             scope: None,
             _registration: registration,
+            _temp: None,
         })
     }
 
@@ -2970,12 +3005,14 @@ impl Actor {
             // framing; a stalled write has its own `write_started` deadline below.
             let mut frames_ready = false;
             let mut parsed = 0usize;
+            let mut consumed = 0;
             loop {
-                let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
+                let unread = &self.output[consumed..];
+                let Some(newline) = next_newline(unread, &mut self.scanned) else {
                     break;
                 };
                 if newline == 0 {
-                    self.output.drain(..1);
+                    consumed += 1;
                     self.scanned = 0;
                     continue;
                 }
@@ -2983,7 +3020,8 @@ impl Actor {
                     frames_ready = true;
                     break;
                 }
-                let frame = match serde_json::from_slice(&self.output[..newline]) {
+                let line = &unread[..newline];
+                let frame = match serde_json::from_slice(line) {
                     Ok(frame) => {
                         garbage_lines = 0;
                         Some(frame)
@@ -2994,9 +3032,8 @@ impl Actor {
                                 "Unsupported provider stdout (expected JSON-lines): {error}"
                             ));
                         };
-                        let preview =
-                            super::protocol::diagnostic_preview(&self.output[..newline], 200);
-                        if hides_frame(&self.output[..newline]) {
+                        let preview = super::protocol::diagnostic_preview(line, 200);
+                        if hides_frame(line) {
                             return Err(format!(
                                 "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
                             ));
@@ -3019,8 +3056,14 @@ impl Actor {
                         None
                     }
                 };
-                self.output.drain(..=newline);
+                consumed += newline + 1;
                 self.scanned = 0;
+                // Let a prompt-ready step release the allocation immediately
+                // when it consumes the last frame. Clearing moves no bytes.
+                if consumed == self.output.len() {
+                    self.output.clear();
+                    consumed = 0;
+                }
                 partial_started = None;
                 parsed += 1;
                 let Some(frame) = frame else {
@@ -3030,6 +3073,11 @@ impl Actor {
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
                 startup_progress = Instant::now();
+            }
+            // Move any unread suffix once per poll. `scanned` is already
+            // relative to this suffix, including when it holds a partial line.
+            if consumed != 0 {
+                self.output.drain(..consumed);
             }
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
@@ -3796,14 +3844,19 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
-        let frame_context = {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            super::notification::FrameContext::capture(&state)
-        };
-        let mut frame_contents = if suppress_current_notification {
-            Default::default()
-        } else {
+        let mut frame_contents = if !suppress_current_notification
+            && step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        {
+            let frame_context = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                super::notification::FrameContext::capture(&state)
+            };
             frame_context.project(&step.events)
+        } else {
+            Default::default()
         };
         // Preserve decoded outcomes even when the transcript cache fails.
         // Stop further Store writes, then report the original error after
@@ -4077,6 +4130,9 @@ impl Actor {
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         let name_changed = match &event {
             Event::OpeningTitle(title) => state.opening_title.as_ref() != Some(title),
+            Event::ProviderTitleCleared { id } => {
+                state.session_id.as_ref() == Some(id) && !state.provider_title_cleared
+            }
             Event::Session { id, title } => {
                 state.session_id.as_ref() != Some(id)
                     || title
@@ -4446,6 +4502,7 @@ fn apply_projected_event(
             };
             state.session_id = None;
             state.title = None;
+            state.provider_title_cleared = false;
             state.opening_title = None;
             state.has_earlier = false;
             state.has_later = false;
@@ -4467,13 +4524,22 @@ fn apply_projected_event(
                     state.opening_title = None;
                 }
                 state.title = title;
+                state.provider_title_cleared = false;
             } else if title.is_some() {
                 // Identity-only frames carry no new naming information.
                 state.title = title;
+                state.provider_title_cleared = false;
             }
             state.session_id = Some(id);
         }
+        Event::ProviderTitleCleared { id } => {
+            if state.session_id.as_ref() == Some(&id) {
+                state.title = None;
+                state.provider_title_cleared = true;
+            }
+        }
         Event::OpeningTitle(title) => state.opening_title = Some(title),
+        Event::OpeningHistoryComplete => {}
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.

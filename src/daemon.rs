@@ -4,6 +4,8 @@ pub(crate) mod adopted_orphans;
 pub(crate) mod child_events;
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub(crate) mod child_reaper;
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) mod codex_temp;
 pub mod holder_registry;
 pub(crate) mod hosting;
 pub(crate) mod lease_handoff;

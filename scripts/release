@@ -56,7 +56,7 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
                    fixes and speedups since the previous tag here.
-  rehearse VERSION [--staged] [--build-host HOST]
+  rehearse VERSION [--staged | --from-draft] [--build-host HOST]
                    Rehearse installed cagents updating from the newest
                    published release to the signed cut VERSION, on HOST,
                    with that commit's scripts/rehearse-update: a private user
@@ -66,10 +66,25 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    survive and no reopened window may show the update as
                    failed. --staged instead runs the cut's own staged
                    `cagents daemon upgrade`, which needs no signature, and
-                   requires the update to end Complete.
+                   requires the update to end Complete. --from-draft
+                   rehearses the in-app update to the draft the release
+                   workflow left, served as GitHub would serve it published;
+                   a pass is what lets publish --actions publish that draft.
   feed VERSION --feed DIR
                    Add the signed bundle to a file feed, for rehearsing the
                    update before publishing (docs/releasing.md#rehearsing).
+  cut --actions [--wait] [--commit SHA]
+                   Choose the commit as cut does, check its version is not
+                   released, and tag it here, for GitHub Actions to build
+                   and sign once publish --actions pushes the tag.
+  publish VERSION --actions [--yes] [--build-host HOST]
+                   Push the tag cut --actions made, which starts the release
+                   workflow (docs/releasing.md#signing-in-github-actions); it
+                   leaves the signed release as a draft. Run again once
+                   rehearse VERSION --from-draft has passed on HOST for that
+                   draft, it publishes the draft, then opens and lands the
+                   next version's pull request. --yes does each without
+                   asking you to type the version.
   publish VERSION  Verify the signed bundle, then push its tag and publish it
                    on GitHub, after you confirm by typing the version. Then
                    open and land the pull request that starts the next patch
@@ -99,6 +114,9 @@ COMMIT=
 KEY=
 WAIT=false
 STAGED=false
+FROM_DRAFT=false
+ACTIONS=false
+YES=false
 while (($#)); do
     case $1 in
         --notes|--build-host|--feed|--commit|--key)
@@ -111,13 +129,20 @@ while (($#)); do
             ;;
         --wait) WAIT=true; shift ;;
         --staged) STAGED=true; shift ;;
+        --from-draft) FROM_DRAFT=true; shift ;;
+        --actions) ACTIONS=true; shift ;;
+        --yes) YES=true; shift ;;
         *) fail "unknown argument: $1 (see --help)" ;;
     esac
 done
 [[ $COMMAND == cut || ( -z $COMMIT && -z $KEY && $WAIT == false ) ]] \
     || fail '--commit, --key and --wait are for cut'
+[[ $ACTIONS == false || $COMMAND == cut || $COMMAND == publish ]] || fail '--actions is for cut and publish'
+[[ $YES == false || $COMMAND == publish ]] || fail '--yes is for publish'
+[[ $ACTIONS == false || -z $KEY ]] || fail '--actions signs in GitHub Actions; drop --key'
 [[ -z $COMMIT || $WAIT == false ]] || fail "--wait releases main's tip; --commit releases another bundle"
-[[ $COMMAND == rehearse || $STAGED == false ]] || fail '--staged is for rehearse'
+[[ $COMMAND == rehearse || ( $STAGED == false && $FROM_DRAFT == false ) ]] || fail '--staged and --from-draft are for rehearse'
+[[ $STAGED == false || $FROM_DRAFT == false ]] || fail "--from-draft rehearses the in-app update, which publication requires; drop --staged"
 
 repository_git() (
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
@@ -357,7 +382,8 @@ cut_cleanup() {
     unpin_bundle
 }
 
-cut() {
+# Named apart from the cut command, which it would otherwise shadow.
+cut_release() {
     local status released selected sha behind tip answer version bundle protocol previous key building
     trap cut_cleanup EXIT
     repository_git fetch --quiet origin main
@@ -409,9 +435,38 @@ cut() {
     if jq -e --arg v "$VERSION" 'index($v)' <<< "$released" >/dev/null; then
         # publish pushes the tag just before it publishes; a failure between
         # the two leaves the tag on origin with nothing published.
-        [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) == false ]] \
+        [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) != false ]] \
+            || fail "$TAG is already released; main needs its version bump first"
+        # Pushed but never published. With a signed cut here, publishing
+        # failed after the push. Without one, as when GitHub Actions did not
+        # sign it, it is cut here, and keeps the tag origin has, which
+        # cannot move.
+        [[ ! -f $BUNDLES/$VERSION/release-metadata.json.sig ]] \
             || fail "$TAG is on origin but not published; finish it with scripts/release publish $VERSION"
-        fail "$TAG is already released; main needs its version bump first"
+        local pushed
+        pushed=$(repository_git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | sort -k2 | tail -n1 | awk '{print $1}')
+        [[ $pushed == "$sha" && $ACTIONS == false ]] \
+            || fail "$TAG is on origin at ${pushed:-an unknown commit} but not published; finish it with scripts/release publish $VERSION$([[ $ACTIONS == true ]] && printf ' --actions'), or cut that commit here: scripts/release cut --commit $pushed --key KEY"
+        repository_git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG" || fail "cannot fetch $TAG from origin"
+        printf '%s is on origin but not published; cutting it here, from the same tag.\n' "$TAG"
+    fi
+    if [[ $ACTIONS == true ]]; then
+        # Actions builds the tag itself; only the commit and version are
+        # decided here, from the bundle whose tests passed.
+        unpin_bundle
+        if [[ $(repository_git rev-parse --quiet --verify "refs/tags/$TAG^{commit}") != "$sha" ]]; then
+            repository_git tag -d "$TAG" >/dev/null 2>&1 || :
+        fi
+        repository_git tag -a "$TAG" -m "$TAG" "$sha" 2>/dev/null \
+            || [[ $(repository_git rev-parse "refs/tags/$TAG^{commit}") == "$sha" ]] || fail "cannot tag $sha as $TAG"
+        printf '\nTagged %s at %s for GitHub Actions to build, sign and publish. Its notes will be:\n\n' "$TAG" "$sha"
+        previous=$(repository_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) \
+            || previous=
+        "$ROOT_DIR/scripts/release-metadata" notes --repository "$ROOT_DIR" ${previous:+--from "$previous"} \
+            --to "$sha" | sed 's/^/  /'
+        printf '\nPush it, which has the release workflow leave a signed draft; rehearse that draft; then publish it:\n  scripts/release publish %s --actions\n  scripts/release rehearse %s --from-draft\n  scripts/release publish %s --actions\n' \
+            "$VERSION" "$VERSION" "$VERSION"
+        return
     fi
     bundle=$BUNDLES/$VERSION
     # Not on origin, so an earlier cut of this version was never published:
@@ -537,20 +592,39 @@ start_next_version() {
 # The version is updated from what is published now to the bytes cut, copied
 # to the build host. By default the published build updates itself as a
 # person does, from a file feed of the signed cut; --staged runs the cut's
-# own staged upgrade instead.
+# own staged upgrade instead. --from-draft has the build host download the
+# draft the release workflow left and serve it as it would be published.
 rehearse() {
-    local bundle=$BUNDLES/$VERSION sha previous root started mode=in-app files incoming status
-    [[ -f $bundle/release-metadata.json ]] || fail "cut $VERSION first: scripts/release cut"
-    if [[ $STAGED == true ]]; then
-        mode=staged
-        files=("$bundle/cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz" "$bundle/SHA256SUMS" "$bundle/install.sh")
+    local bundle=$BUNDLES/$VERSION sha previous root started mode=in-app files=() incoming status
+    local source=bundle metadata=release-metadata.json generation state reason
+    if [[ $FROM_DRAFT == true ]]; then
+        source=draft
+        sha=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
+            || fail "tag $TAG does not exist here; fetch it: git fetch origin tag $TAG"
+        state=$(release_state) || exit 1
+        case $state in
+            published) fail "$TAG is published already; there is no draft to rehearse" ;;
+            none) fail "$TAG has no draft release to rehearse; publish $VERSION --actions pushes its tag, and the release workflow leaves the draft" ;;
+        esac
+        reason=$(draft_not_ready)
+        [[ -z $reason ]] || fail "$reason"
+        # A release carries its own metadata under its trust generation's name.
+        generation=$(repository_git show "$sha:src/update/feed.rs" 2>/dev/null \
+            | sed -n 's/^const GENERATION: usize = \([1-9][0-9]*\);$/\1/p')
+        ((${generation:-1} == 1)) || metadata=release-metadata-$generation.json
     else
-        # The published build trusts only the release keys.
-        [[ -f $bundle/release-metadata.json.sig ]] \
-            || fail "sign $bundle/release-metadata.json first (see --help), or rehearse the staged upgrade, which needs no signature: scripts/release rehearse $VERSION --staged"
-        files=("$bundle"/*)
+        [[ -f $bundle/release-metadata.json ]] || fail "cut $VERSION first: scripts/release cut"
+        if [[ $STAGED == true ]]; then
+            mode=staged
+            files=("$bundle/cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz" "$bundle/SHA256SUMS" "$bundle/install.sh")
+        else
+            # The published build trusts only the release keys.
+            [[ -f $bundle/release-metadata.json.sig ]] \
+                || fail "sign $bundle/release-metadata.json first (see --help), or rehearse the staged upgrade, which needs no signature: scripts/release rehearse $VERSION --staged"
+            files=("$bundle"/*)
+        fi
+        sha=$(jq -er .source_commit "$bundle/release-metadata.json") || fail "$bundle names no source commit"
     fi
-    sha=$(jq -er .source_commit "$bundle/release-metadata.json") || fail "$bundle names no source commit"
     previous=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName --jq .tagName) \
         || fail 'cannot read the newest published release'
     previous=${previous#v}
@@ -561,8 +635,8 @@ rehearse() {
     root=${REHEARSAL_ROOT:--}
     [[ $root =~ ^[A-Za-z0-9_./-]+$ && $REHEARSAL_PARENTS =~ ^[A-Za-z0-9_./:-]+$ ]] \
         || fail 'CAGENTS_RELEASE_REHEARSAL_ROOT and _PARENTS may hold only letters, digits and _ . / - (and : between parents)'
-    printf 'Rehearsing the %s update from %s to %s on %s; it takes about 12 minutes.\n' \
-        "$mode" "$previous" "$VERSION" "$BUILD_HOST"
+    printf 'Rehearsing the %s update from %s to %s%s on %s; it takes about 12 minutes.\n' \
+        "$mode" "$previous" "$VERSION" "$([[ $source == bundle ]] || printf ' as drafted on GitHub')" "$BUILD_HOST"
     started=$SECONDS
     # Copied apart from any rehearsal running there; the run moves it into
     # place once it holds the lock.
@@ -575,12 +649,13 @@ HOST
     trap 'trap - INT TERM; printf "Stopping the rehearsal on %s.\n" "$BUILD_HOST" >&2
           on_host "$incoming" <<<"kill -TERM -- -\$(cat ~/.cache/cagents-release-rehearsal/\$2.pid) 2>/dev/null; rm -rf -- ~/.cache/cagents-release-rehearsal/\$2" || :
           exit 130' INT TERM
-    if ! scp -q -- "${files[@]}" "$BUILD_HOST:.cache/cagents-release-rehearsal/$incoming/"; then
+    if ((${#files[@]})) && ! scp -q -- "${files[@]}" "$BUILD_HOST:.cache/cagents-release-rehearsal/$incoming/"; then
         on_host "$incoming" <<<'rm -rf -- ~/.cache/cagents-release-rehearsal/"$2"' || :
         fail "cannot copy the cut to $BUILD_HOST"
     fi
     status=0
-    on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" "$REHEARSAL_PARENTS" "$incoming" <<'HOST' || status=$?
+    on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" "$REHEARSAL_PARENTS" "$incoming" \
+        "$source" "$metadata" <<'HOST' || status=$?
 # Parsed whole before it runs, so nothing it starts reads the rest of it.
 main() {
 set -euo pipefail
@@ -595,6 +670,7 @@ main_run() {
 local repository=$PWD sha=$2 version=$3 previous=$4 github=$5 root=$6 mode=$7 cache=~/.cache/cagents-release-rehearsal
 local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release status=0 update
 local feed=$cache/feed-$3 path=() parents parent kept= marker before
+local source=${10} metadata=${11} digest
 # The nearest .git above a path, or nothing.
 git_above() {
     local ancestor=$1
@@ -609,11 +685,33 @@ if [[ $root == - ]]; then
     done
     [[ -n $root ]] || { echo "release: each of ${parents[*]} has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT" >&2; exit 1; }
 fi
+if [[ $source == draft ]]; then
+    # What the updater fetches of the draft, as GitHub serves it: the
+    # archive, its installer and checksums, and every generation's metadata.
+    gh release download "v$version" -R "$github" -D "$cache/$9" --clobber \
+        -p "cagents-$version-x86_64-unknown-linux-gnu.tar.gz" -p SHA256SUMS -p install.sh \
+        -p 'release-metadata*.json' -p 'release-metadata*.json.sig'
+fi
 exec 9>>"$cache/lock"
 flock -n 9 || { echo "release: another rehearsal is running on $HOSTNAME" >&2; exit 1; }
+# Whatever passed before, only this rehearsal's outcome stands.
+rm -f -- "$cache/passed-$version.txt"
 rm -rf -- "$new"
 mv -- "$cache/$9" "$new"
 (cd "$new" && sha256sum --check --strict --ignore-missing --quiet SHA256SUMS)
+# The metadata the in-app update reads, whose digest a pass records; the
+# staged upgrade reads none.
+digest=
+if [[ $mode == in-app ]]; then
+    /usr/bin/python3 -I -c '
+import json, sys
+metadata = json.load(open(sys.argv[1]))
+sys.exit(metadata.get("version") != sys.argv[2] or metadata.get("source_commit") != sys.argv[3])' \
+        "$new/$metadata" "$version" "$sha" \
+        || { echo "release: $metadata is not $version's from $sha" >&2; exit 1; }
+    digest=$(sha256sum < "$new/$metadata")
+    digest=${digest%% *}
+fi
 if [[ ! -f $old/SHA256SUMS ]]; then
     rm -rf -- "$old.partial"
     mkdir -p -- "$old.partial"
@@ -633,9 +731,17 @@ git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$reposit
 git -C "$repository" worktree add -q --detach "$harness" "$sha"
 local rehearse=$harness/scripts/rehearse-update
 if [[ $mode == in-app ]]; then
-    # The feed offers only the cut, whose signature the published build checks.
     rm -rf -- "$feed"
-    "$harness/scripts/release-metadata" feed --dir "$new" --feed "$feed" >/dev/null
+    if [[ $source == draft ]]; then
+        # The feed serves the draft as published, every file under its
+        # published name.
+        mkdir -p -- "$feed/download" "$feed/latest/download"
+        cp -a -- "$new" "$feed/download/v$version"
+        cp -- "$new"/release-metadata*.json "$new"/release-metadata*.json.sig "$feed/latest/download/"
+    else
+        # The feed offers only the cut, whose signature the published build checks.
+        "$harness/scripts/release-metadata" feed --dir "$new" --feed "$feed" >/dev/null
+    fi
     # A third window holding nothing reads the update's status as soon as it
     # reopens, while the published build's worker is still verifying the cut.
     # Then a reboot: the windows must still read the update as good.
@@ -676,8 +782,10 @@ echo "Update status: $update"
 # Either way a reopened window reports anything but Complete as a failed
 # or refused update, which is what the rehearsal must catch (#3877).
 if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == Complete ]]; then
-    # Its report is the evidence that it passed.
-    cp -- "$report" "$cache/passed-$version.txt"
+    # Its report is the evidence that it passed, for the metadata it updated
+    # to: publishing a draft requires a pass for that draft's.
+    { [[ -z $digest ]] || printf 'Rehearsed metadata: sha256 %s\nRehearsed from: %s\n' "$digest" "$previous"; cat -- "$report"; } \
+        > "$cache/passed-$version.txt"
     "$rehearse" --root "$root" cleanup >/dev/null \
         || echo "release: the rehearsal passed, but $root could not be removed" >&2
     git -C "$repository" worktree remove --force "$harness" || :
@@ -712,6 +820,127 @@ HOST
     ((status == 0)) || fail "the rehearsal of $VERSION did not pass"
 }
 
+# Pushes the tag cut --actions made, which starts the release workflow: it
+# admits the tag only when the release before it trusts the Actions key, and
+# then builds and signs it and leaves it as a draft. Run again once that
+# draft's update has been rehearsed, it publishes the draft. Succeeds once
+# the release is published; until then it says what is next.
+publish_in_actions() {
+    local sha answer state admitted variables
+    sha=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
+        || fail "tag $TAG does not exist here; make it with scripts/release cut --actions"
+    state=$(release_state) || exit 1
+    if [[ $state == published ]]; then
+        printf '%s is published already.\n' "$TAG"
+        return
+    fi
+    if [[ $state == draft ]]; then
+        publish_draft
+        return
+    fi
+    if [[ -n $(repository_git ls-remote --tags origin "refs/tags/$TAG") ]]; then
+        printf '%s is pushed and has no draft yet; the release workflow is building it, or failed:\n' "$TAG" >&2
+        printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY" >&2
+        return 1
+    fi
+    # A pushed tag cannot be moved or deleted, so ask first what the
+    # workflow's admission will: a refused tag would leave its version used.
+    # Unset variables read as empty; a failure to read them stops here.
+    variables=$(gh variable list -R "$GITHUB_REPOSITORY" --json name,value) \
+        || fail "cannot read the repository variables of $GITHUB_REPOSITORY"
+    admitted=$(mktemp "${TMPDIR:-/tmp}/cagents-admit.XXXXXX")
+    if ! GITHUB_OUTPUT=$admitted CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
+        RELEASE_SIGNING_PUBLIC_KEY=$(jq -r '.[] | select(.name == "RELEASE_SIGNING_PUBLIC_KEY") | .value' <<< "$variables") \
+        RELEASE_TRUSTED_KEYS=$(jq -r '.[] | select(.name == "RELEASE_TRUSTED_KEYS") | .value' <<< "$variables") \
+        "$ROOT_DIR/scripts/release-actions" admit "$TAG"; then
+        rm -f -- "$admitted"
+        fail "GitHub Actions would refuse $TAG; nothing is pushed"
+    fi
+    if ! grep -qx 'sign=true' "$admitted"; then
+        rm -f -- "$admitted"
+        fail "GitHub Actions would not sign $TAG, so nothing is pushed; cut and sign it here: scripts/release cut --commit $sha --key KEY"
+    fi
+    rm -f -- "$admitted"
+    if [[ $YES == false ]]; then
+        printf 'Pushing %s releases %s: GitHub Actions builds and signs it, and the tag cannot be moved.\n' "$TAG" "$VERSION"
+        read -r -p "Type $VERSION to push it: " answer
+        [[ $answer == "$VERSION" ]] || fail 'not pushed'
+    fi
+    repository_git push --quiet origin "refs/tags/$TAG" || fail "cannot push $TAG to origin"
+    printf 'Pushed %s. The release workflow builds and signs it in a few hours, and leaves it as a draft:\n' "$TAG"
+    printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY"
+    printf 'Then rehearse its update, and publish it:\n  scripts/release rehearse %s --from-draft\n  scripts/release publish %s --actions\n' \
+        "$VERSION" "$VERSION"
+    return 1
+}
+
+# Publishes the draft the release workflow left, once a rehearsal of its
+# update has passed on the build host. The pass records the digest of the
+# metadata it updated to, and publication verifies the draft again and
+# refuses it unless its metadata has that digest.
+publish_draft() {
+    local record digest from latest answer reason
+    reason=$(draft_not_ready)
+    [[ -z $reason ]] || fail "$reason"
+    record=$(on_host "$VERSION" <<'HOST'
+head -n2 ~/.cache/cagents-release-rehearsal/passed-"$2".txt 2>/dev/null || :
+HOST
+    ) || fail "cannot read the rehearsal of $VERSION on $BUILD_HOST"
+    digest=$(sed -n '1s/^Rehearsed metadata: sha256 \([0-9a-f]\{64\}\)$/\1/p' <<< "$record")
+    from=$(sed -n '2s/^Rehearsed from: \(.*\)$/\1/p' <<< "$record")
+    [[ -n $digest && -n $from ]] \
+        || fail "no rehearsal of $TAG's draft has passed on $BUILD_HOST, so it is not published; rehearse it: scripts/release rehearse $VERSION --from-draft"
+    # The update rehearsed is from what every installed cagents runs now.
+    latest=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName --jq .tagName) \
+        || fail 'cannot read the newest published release'
+    [[ ${latest#v} == "$from" ]] \
+        || fail "$TAG's draft was rehearsed updating from $from, but the newest published release is now ${latest#v}; rehearse it again: scripts/release rehearse $VERSION --from-draft"
+    if [[ $YES == false ]]; then
+        printf 'Publishing %s makes its rehearsed draft the update every installed cagents offers.\n' "$TAG"
+        read -r -p "Type $VERSION to publish: " answer
+        [[ $answer == "$VERSION" ]] || fail 'not published'
+    fi
+    "$ROOT_DIR/scripts/publish-release" --version "$VERSION" --promote "$digest" \
+        || fail "$TAG is not published; once the cause is fixed, run scripts/release publish $VERSION --actions again"
+}
+
+# TAG's release on GitHub: published, draft or none. A failure to read it
+# other than its absence stops.
+release_state() {
+    local state error
+    error=$(mktemp "${TMPDIR:-/tmp}/cagents-release-view.XXXXXX")
+    if state=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>"$error"); then
+        case $state in false) echo published ;; true) echo draft ;; *) echo none ;; esac
+    elif grep -qi 'not found' "$error"; then
+        echo none
+    else
+        printf '%s: cannot read the release %s on GitHub: %s\n' "$PROGRAM" "$TAG" "$(head -n1 "$error")" >&2
+        rm -f -- "$error"
+        return 1
+    fi
+    rm -f -- "$error"
+}
+
+# Why TAG's draft is not ready yet, if it is not: the release workflow run of
+# the tag must have finished and succeeded, or its draft may be incomplete
+# or unverified.
+draft_not_ready() {
+    local runs status conclusion url
+    runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml --branch "$TAG" --event push --limit 1 \
+        --json status,conclusion,url) || { printf 'cannot read the release workflow run of %s' "$TAG"; return; }
+    status=$(jq -r '.[0].status // ""' <<< "$runs")
+    conclusion=$(jq -r '.[0].conclusion // ""' <<< "$runs")
+    url=$(jq -r '.[0].url // ""' <<< "$runs")
+    if [[ -z $status ]]; then
+        printf 'no release workflow run of %s is found, so its draft was not left by the workflow' "$TAG"
+    elif [[ $status != completed ]]; then
+        printf 'the release workflow run of %s is still %s: its draft is not finished yet (%s)' "$TAG" "$status" "$url"
+    elif [[ $conclusion != success ]]; then
+        printf 'the release workflow run of %s ended %s, so its draft may be incomplete or unverified; rerun its failed jobs (%s)' \
+            "$TAG" "$conclusion" "$url"
+    fi
+}
+
 signed_bundle() {
     local bundle=$BUNDLES/$VERSION
     [[ -f $bundle/release-metadata.json.sig ]] \
@@ -722,13 +951,19 @@ signed_bundle() {
 case $COMMAND in
     bump) bump ;;
     build) build ;;
-    cut) cut ;;
+    cut) cut_release ;;
     rehearse) rehearse ;;
     feed)
         [[ -n $FEED ]] || fail 'feed needs --feed DIR'
         "$ROOT_DIR/scripts/release-metadata" feed --dir "$(signed_bundle)" --feed "$FEED"
         ;;
     publish)
+        if [[ $ACTIONS == true ]]; then
+            # The next version starts once the release is published.
+            publish_in_actions || exit 1
+            start_next_version
+            exit 0
+        fi
         bundle=$(signed_bundle)
         # Run again after a failure, it resumes past what is done.
         if [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) == false ]]; then

@@ -213,9 +213,25 @@ pub(crate) struct Store {
     pending_text: Option<(String, Role, bool, String)>,
     naming_session: Option<String>,
     opening_title: Option<crate::chat::OpeningTitle>,
+    opening_history_complete: bool,
+    history_opening: Option<crate::chat::OpeningTitle>,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
 }
+
+fn prefer_opening(
+    earlier: Option<crate::chat::OpeningTitle>,
+    later: Option<crate::chat::OpeningTitle>,
+) -> Option<crate::chat::OpeningTitle> {
+    if earlier.as_ref().is_some_and(|title| title.provisional())
+        && later.as_ref().is_some_and(|title| !title.provisional())
+    {
+        later
+    } else {
+        earlier.or(later)
+    }
+}
+
 impl Store {
     pub(super) fn directory(&self) -> &std::path::Path {
         &self.directory
@@ -471,6 +487,8 @@ impl Store {
                 pending_text: None,
                 naming_session: None,
                 opening_title: None,
+                opening_history_complete: false,
+                history_opening: None,
             })
         })();
         if result.is_err() {
@@ -981,16 +999,22 @@ impl Store {
         self.apply_inner(event).map_err(Into::into)
     }
 
+    fn clear_opening(&mut self) {
+        self.opening_title = None;
+        self.opening_history_complete = false;
+        self.history_opening = None;
+    }
+
     fn observe_opening(&mut self, event: &Event, out: &mut Vec<Event>) {
         use crate::chat::OpeningTitle;
         match event {
             Event::Reset { .. } => {
                 self.naming_session = None;
-                self.opening_title = None;
+                self.clear_opening();
             }
             Event::Session { id, .. } if self.naming_session.as_ref() != Some(id) => {
                 if self.naming_session.replace(id.clone()).is_some() {
-                    self.opening_title = None;
+                    self.clear_opening();
                 }
             }
             Event::OpeningTitle(title) => self.opening_title = Some(title.clone()),
@@ -1003,28 +1027,38 @@ impl Store {
         {
             return;
         }
-        let items = match event {
-            Event::Item(item) => std::slice::from_ref(item),
-            Event::History {
-                items,
-                has_earlier: false,
-            }
-            | Event::LatestHistory {
-                items,
-                has_earlier: false,
-            } => items.as_slice(),
-            _ => return,
-        };
         let previous = self.opening_title.clone();
-        for item in items {
-            OpeningTitle::observe(&mut self.opening_title, item);
-            if self
-                .opening_title
-                .as_ref()
-                .is_some_and(|title| !title.provisional())
-            {
-                break;
+        match event {
+            Event::OpeningHistoryComplete => self.opening_history_complete = true,
+            Event::Item(item) if self.opening_history_complete => {
+                OpeningTitle::observe(&mut self.opening_title, item);
             }
+            Event::History { items, has_earlier } | Event::LatestHistory { items, has_earlier } => {
+                let mut page_opening = None;
+                for item in items {
+                    OpeningTitle::observe(&mut page_opening, item);
+                    if page_opening
+                        .as_ref()
+                        .is_some_and(|title| !title.provisional())
+                    {
+                        break;
+                    }
+                }
+                // Earlier pages prepend, while refreshed latest pages can only
+                // add candidates after those we've already seen.
+                let cached = self.history_opening.take();
+                self.history_opening = if matches!(event, Event::History { .. }) {
+                    prefer_opening(page_opening, cached)
+                } else {
+                    prefer_opening(cached, page_opening)
+                };
+                self.opening_history_complete |= !has_earlier;
+            }
+            _ => return,
+        }
+        if self.opening_history_complete {
+            self.opening_title =
+                prefer_opening(self.opening_title.take(), self.history_opening.take());
         }
         if self.opening_title != previous
             && let Some(title) = &self.opening_title
@@ -1114,6 +1148,7 @@ impl Store {
                     out.push(nonfatal(warning));
                 }
             }
+            Event::OpeningHistoryComplete => {}
             Event::History {
                 mut items,
                 has_earlier,
@@ -1181,6 +1216,8 @@ impl Store {
                     self.pending_text = Some((id, role, thinking, delta));
                 }
                 self.dirty = true;
+                // `append` checks the WAL when buffered text reaches SQLite.
+                return Ok(out);
             }
             Event::ItemsRemoved { ids } => {
                 self.files_removed(&ids)?;
@@ -1309,7 +1346,9 @@ impl Store {
             )?;
             self.copy_remove(&[id.to_owned()])?;
             if !self.exists(id)? {
-                // The identity itself could not be cached; the delta has nowhere to go.
+                // The item could not be cached. Removing its copy source can
+                // still leave a checkpoint due.
+                self.trim_wal();
                 return Ok(warning);
             }
         }
@@ -2169,6 +2208,111 @@ fn insert_body(
 mod tests {
     use super::*;
 
+    fn opening_item(id: &str, text: &str) -> Item {
+        Item {
+            role: Role::User,
+            ..history_item(id, text)
+        }
+    }
+
+    #[test]
+    fn partial_history_does_not_turn_a_live_prompt_into_the_opening() {
+        use crate::chat::OpeningTitle;
+
+        let mut store = Store::new().unwrap();
+        assert_eq!(
+            store
+                .apply(Event::LatestHistory {
+                    items: vec![opening_item("recent", "Check the sidebar layout")],
+                    has_earlier: true,
+                })
+                .unwrap(),
+            [Event::HistoryRecovered]
+        );
+        assert!(
+            store
+                .apply(Event::Item(opening_item("live", "Now run the tests")))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .apply(Event::History {
+                    items: vec![history_item("old", "Earlier assistant message")],
+                    has_earlier: false,
+                })
+                .unwrap(),
+            [
+                Event::OpeningTitle(OpeningTitle::Prompt("Check the sidebar layout".into())),
+                Event::HistoryRecovered
+            ]
+        );
+        assert!(
+            store
+                .apply(Event::Item(opening_item("next", "Commit the changes")))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn live_opening_requires_coverage_for_the_current_session() {
+        use crate::chat::OpeningTitle;
+
+        let session = |id: &str| Event::Session {
+            id: id.into(),
+            title: None,
+        };
+        let mut store = Store::new().unwrap();
+        assert!(
+            store
+                .apply(Event::OpeningHistoryComplete)
+                .unwrap()
+                .is_empty()
+        );
+        store.apply(session("new")).unwrap();
+        assert_eq!(
+            store
+                .apply(Event::Item(opening_item("first", "Design the sidebar")))
+                .unwrap(),
+            [Event::OpeningTitle(OpeningTitle::Prompt(
+                "Design the sidebar".into()
+            ))]
+        );
+        store.apply(session("resumed")).unwrap();
+        assert!(
+            store
+                .apply(Event::Item(opening_item("unknown", "Now run the tests")))
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .apply(Event::LatestHistory {
+                items: vec![],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .apply(Event::Item(opening_item("known", "Review the design")))
+                .unwrap(),
+            [Event::OpeningTitle(OpeningTitle::Prompt(
+                "Review the design".into()
+            ))]
+        );
+        store
+            .apply(Event::Reset {
+                reason: "New conversation".into(),
+            })
+            .unwrap();
+        assert!(
+            store
+                .apply(Event::Item(opening_item("after-reset", "Run the checks")))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn startup_cache_write_failure_retries_the_same_event_after_repair() {
         let mut store = Store::new().unwrap();
@@ -2289,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn large_commit_wal_held_by_a_reader_is_trimmed_by_the_next_write() {
+    fn large_commit_wal_held_by_a_reader_is_trimmed_when_buffered_text_flushes() {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::at(root.path().to_owned()).unwrap();
         let large = "large 🦀\n".repeat(1024 * 1024);
@@ -2305,16 +2449,25 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        let pinned = "p".repeat(2 * 1024 * 1024);
+        let mut pinned = "p".repeat(2 * 1024 * 1024);
         store
             .apply(Event::Item(history_item("pinned", &pinned)))
             .unwrap();
-        assert!(wal_bytes(&store) > WAL_LIMIT);
+        let held = wal_bytes(&store);
+        assert!(held > WAL_LIMIT);
         drop(reader);
         store
-            .apply(Event::Item(history_item("next", "next")))
+            .apply(Event::TextDelta {
+                id: "pinned".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " more".into(),
+            })
             .unwrap();
+        assert_eq!(wal_bytes(&store), held);
+        assert_eq!(store.flush_text().unwrap(), None);
         assert!(wal_bytes(&store) <= WAL_LIMIT);
+        pinned.push_str(" more");
         assert_copy(&store, "large", &large);
         assert_copy(&store, "pinned", &pinned);
     }

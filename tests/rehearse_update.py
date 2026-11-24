@@ -2535,6 +2535,28 @@ class PrivateRoot(unittest.TestCase):
         return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
                               capture_output=True, text=True, timeout=HANG_GUARD, **kwargs)
 
+    def test_init_skips_empty_git_ancestors_and_refuses_gitfiles(self):
+        marker = self.root / ".git"
+        marker.mkdir()
+        initial = self.root / "first"
+        initialized = subprocess.run(
+            [str(SCRIPT), "--root", str(initial), "init"],
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        self.assertTrue((initial / ".rehearse-update").is_file())
+
+        marker.rmdir()
+        marker.write_text("gitdir: /elsewhere/worktrees/rehearsal\n")
+        second = self.root / "second"
+        refused = subprocess.run(
+            [str(SCRIPT), "--root", str(second), "init"],
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn(f"root must be outside Git ancestry; found {marker}", refused.stderr)
+        self.assertFalse(second.exists())
+
     def test_counted_daemon_stop_is_private_and_leaves_other_private_processes_alive(self):
         self.assertEqual(self.call('init').returncode,0)
         prefix=self.root/'home/.local/share/cagents-install'
@@ -2632,6 +2654,17 @@ else:sys.exit(2)
         self.assertIn("latest release 3.0.0 has no SHA256SUMS", refused.stderr)
         (feed / "download/v3.0.0/SHA256SUMS").write_text(f"{'1' * 64}  install.sh\n")
         self.assertEqual(self.call("feed", str(feed)).returncode, 0)
+
+    def test_feed_offers_the_generation_2_release_over_the_bridge_release(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        feed, _ = self.feed("0.2.4")
+        # After 0.2.4 the old name keeps 0.2.4's metadata for 0.2.3; the
+        # release the feed offers is the one release-metadata-2.json names.
+        (feed / "latest/download/release-metadata-2.json").write_text('{"version":"0.2.5"}')
+        (feed / "download/v0.2.5").mkdir()
+        refused = self.call("feed", str(feed))
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("latest release 0.2.5 has no SHA256SUMS", refused.stderr)
 
     def test_feed_answers_a_published_builds_github_requests_from_the_feed(self):
         self.assertEqual(self.call("init").returncode, 0)

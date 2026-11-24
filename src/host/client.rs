@@ -1775,12 +1775,12 @@ fn process_admitted_request(
                 ));
             }
             if presence.application == crate::notifications::Application::Cagents {
-                let (registry, unclaimed) = {
+                let (registry, (mut claims, held)) = {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
                     state.ensure_retention_available(&presence.sessions)?;
                     (
                         state.execution_registry.clone(),
-                        state.notification_sessions_unclaimed(&presence),
+                        state.partition_notification_sessions(&presence),
                     )
                 };
                 // The shared control reader spans selection and publication;
@@ -1793,17 +1793,7 @@ fn process_admitted_request(
                     // Windows republish on any workspace change. Only a new
                     // claim, or a pin that a close removed, needs a write, and
                     // rotating any other would refuse its close in progress.
-                    let mut claims = unclaimed;
-                    for terminal in &presence.sessions {
-                        if !claims.contains(terminal)
-                            && registry
-                                .retention_pin_generation(*terminal)
-                                .map_err(internal)?
-                                .is_none()
-                        {
-                            claims.push(*terminal);
-                        }
-                    }
+                    claims.extend(registry.missing_retention_pins(&held).map_err(internal)?);
                     if !claims.is_empty() {
                         registry.pin_window_terminals(&claims).map_err(internal)?;
                     }

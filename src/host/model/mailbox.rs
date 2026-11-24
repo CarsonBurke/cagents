@@ -14,6 +14,7 @@ use rusqlite::{
     Connection, Row, TransactionBehavior, params,
     types::{ToSql, ToSqlOutput},
 };
+use std::collections::BTreeMap;
 
 // Preserve SQLite's primary error class before its diagnostic becomes text.
 // Busy snapshots and shared-cache locks have extended codes in these classes.
@@ -29,7 +30,7 @@ fn store_error(error: rusqlite::Error) -> AcceptanceError {
 pub(crate) use crate::agent_execution::MESSAGE_RUN_KEY;
 const _: () = assert!(
     const_str_eq(MESSAGE_RUN_KEY, "cagents-message:"),
-    "RETURNED and IN_LINE spell out the message run key"
+    "the returned-message lookup and its index spell out the message run key"
 );
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
@@ -68,18 +69,17 @@ pub(super) fn return_run_message_in(
 
 /// Whether message `m` already became an agent run once, which ended unsent
 /// and gave it back: it then arrives as a message, out of the order runs keep.
+/// The prefix condition lets SQLite seek by the computed key in the partial index.
 const RETURNED: &str = "EXISTS(SELECT 1 FROM agent_runs given
-    WHERE given.idempotency_key = 'cagents-message:' || m.id)";
+    WHERE given.idempotency_key GLOB 'cagents-message:*'
+      AND given.idempotency_key = 'cagents-message:' || m.id)";
 
-/// Pending messages that take their place in a recipient agent's order of
-/// runs, as `deliverable_messages` offers them: a reply held for its
-/// question's asker waits out of line, and so does a returned message.
+/// Pending messages a recipient may now receive, including returned messages.
+/// Callers ordering new runs also exclude `RETURNED`.
 /// Expects the message alias `m` and the parameter `:now`.
-const IN_LINE: &str = "m.state = 'pending'
+const ELIGIBLE_PENDING: &str = "m.state = 'pending'
     AND NOT EXISTS(SELECT 1 FROM messages asked WHERE asked.id = m.reply_to
-        AND asked.wait_until_ms > :now)
-    AND NOT EXISTS(SELECT 1 FROM agent_runs given
-        WHERE given.idempotency_key = 'cagents-message:' || m.id)";
+        AND asked.wait_until_ms > :now)";
 
 /// Whether a message to `agent`'s conversation waits to be delivered. A
 /// follow-up given to that agent then goes behind it, so messages and
@@ -95,7 +95,7 @@ pub(super) fn messages_wait_for_agent(
                  ON m.recipient_lineage = coalesce(
                      (SELECT lineage FROM session_lineages WHERE session_id = a.session_id),
                      a.session_id)
-             WHERE a.id = :agent AND {IN_LINE})"
+             WHERE a.id = :agent AND {ELIGIBLE_PENDING} AND NOT {RETURNED})"
         ),
         rusqlite::named_params! {":agent": agent.to_string(), ":now": now as i64},
         |row| row.get(0),
@@ -111,7 +111,7 @@ fn earlier_message_waits(db: &Connection, id: MessageId, now: u64) -> Result<boo
             "SELECT EXISTS(SELECT 1 FROM messages later JOIN messages m
                  ON m.recipient_lineage = later.recipient_lineage
                  AND (m.created_ms, m.rowid) < (later.created_ms, later.rowid)
-             WHERE later.id = :id AND {IN_LINE})"
+             WHERE later.id = :id AND {ELIGIBLE_PENDING} AND NOT {RETURNED})"
         ),
         rusqlite::named_params! {":id": id.to_string(), ":now": now as i64},
         |row| row.get(0),
@@ -212,6 +212,50 @@ impl ToSql for Recipient {
 
 const COLUMNS: &str = "id, sender_lineage, sender_session, sender_title, recipient_lineage,
      delivered_session, reply_to, body, wait_until_ms, state, created_ms";
+
+// Group only the pending index. An index ordered by recipient across all states
+// can satisfy GROUP BY but reads settled mail too.
+const ELIGIBLE_ATTENTION: &str =
+    "SELECT p.recipient_lineage AS lineage, MAX(p.rowid) AS message_rowid
+    FROM messages p INDEXED BY messages_pending LEFT JOIN messages asked ON asked.id = p.reply_to
+    WHERE p.state = 'pending' AND p.recipient_lineage IS NOT NULL
+      AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
+    GROUP BY p.recipient_lineage";
+
+fn attention_heads(
+    db: &Connection,
+    now: u64,
+) -> Result<(BTreeMap<Lineage, MessageId>, bool), String> {
+    let mut query = db
+        .prepare_cached(&format!(
+            "SELECT eligible.lineage,
+                 CASE WHEN eligible.message_rowid <= COALESCE(previous.rowid, 0)
+                      THEN h.message END
+             FROM ({ELIGIBLE_ATTENTION}) eligible
+             LEFT JOIN mailbox_attention_heads h ON h.lineage = eligible.lineage
+             LEFT JOIN messages previous ON previous.id = h.message"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = query
+        .query_map([now as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut heads = BTreeMap::new();
+    let mut needs_advance = false;
+    for row in rows {
+        let (lineage, message) = row.map_err(|e| e.to_string())?;
+        if let Some(message) = message {
+            heads.insert(
+                Lineage(lineage.parse().map_err(|e: uuid::Error| e.to_string())?),
+                message.parse().map_err(|e: uuid::Error| e.to_string())?,
+            );
+        } else {
+            needs_advance = true;
+        }
+    }
+    Ok((heads, needs_advance))
+}
 
 fn message(row: &Row<'_>) -> rusqlite::Result<Message> {
     fn id<T: std::str::FromStr>(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<T>> {
@@ -406,7 +450,13 @@ impl Registry {
     pub(crate) fn pending_message_lineages(
         &self,
     ) -> Result<std::collections::BTreeSet<Lineage>, String> {
-        let mut query = self.db.prepare_cached("SELECT DISTINCT recipient_lineage FROM messages WHERE state='pending' AND recipient_lineage IS NOT NULL").map_err(|e| e.to_string())?;
+        let mut query = self
+            .db
+            .prepare_cached(
+                "SELECT DISTINCT recipient_lineage FROM messages INDEXED BY messages_pending
+                 WHERE state = 'pending' AND recipient_lineage IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
         query
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?
@@ -426,41 +476,32 @@ impl Registry {
     pub(crate) fn reconcile_message_attention(
         &mut self,
         now: u64,
-    ) -> Result<std::collections::BTreeMap<Lineage, MessageId>, String> {
-        self.db
-            .execute(
-                "INSERT INTO mailbox_attention_heads(lineage,message)
-            SELECT recipient_lineage,id FROM messages WHERE rowid IN (
-                SELECT MAX(p.rowid) FROM messages p LEFT JOIN messages asked ON asked.id=p.reply_to
-                WHERE p.recipient_lineage IS NOT NULL AND p.state='pending'
-                  AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
-                GROUP BY p.recipient_lineage
-            )
-            ON CONFLICT(lineage) DO UPDATE SET message=excluded.message
-            WHERE (SELECT rowid FROM messages WHERE id=excluded.message) >
-                COALESCE((SELECT rowid FROM messages WHERE id=mailbox_attention_heads.message),0)",
-                [now as i64],
-            )
+    ) -> Result<BTreeMap<Lineage, MessageId>, String> {
+        let (heads, needs_advance) = attention_heads(&self.db, now)?;
+        if !needs_advance {
+            return Ok(heads);
+        }
+
+        // Recompute eligibility after reserving the writer. A competing inbox
+        // read may have settled a released reply since the read above.
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        let mut query = self.db.prepare_cached("SELECT h.lineage,h.message FROM mailbox_attention_heads h
-            WHERE EXISTS(SELECT 1 FROM messages pending LEFT JOIN messages asked ON asked.id=pending.reply_to
-                WHERE pending.recipient_lineage=h.lineage AND pending.state='pending'
-                  AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1))").map_err(|e| e.to_string())?;
-        query
-            .query_map([now as i64], |row| {
-                let lineage: String = row.get(0)?;
-                let message: String = row.get(1)?;
-                Ok((lineage, message))
-            })
-            .map_err(|e| e.to_string())?
-            .map(|row| {
-                let (lineage, message) = row.map_err(|e| e.to_string())?;
-                Ok((
-                    Lineage(lineage.parse().map_err(|e: uuid::Error| e.to_string())?),
-                    message.parse().map_err(|e: uuid::Error| e.to_string())?,
-                ))
-            })
-            .collect()
+        tx.prepare_cached(&format!(
+            "INSERT INTO mailbox_attention_heads(lineage,message)
+             SELECT recipient_lineage,id FROM messages WHERE rowid IN (
+                 SELECT message_rowid FROM ({ELIGIBLE_ATTENTION})
+             )
+             ON CONFLICT(lineage) DO UPDATE SET message=excluded.message
+             WHERE (SELECT rowid FROM messages WHERE id=excluded.message) >
+                 COALESCE((SELECT rowid FROM messages WHERE id=mailbox_attention_heads.message),0)"
+        ))
+        .and_then(|mut query| query.execute([now as i64]))
+        .map_err(|e| e.to_string())?;
+        let (heads, _) = attention_heads(&tx, now)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(heads)
     }
 
     /// The message `recipient` received whose ID begins with `handle`.
@@ -513,7 +554,7 @@ impl Registry {
                              PARTITION BY m.recipient_lineage, {RETURNED}
                              ORDER BY m.created_ms, m.rowid
                          ) AS position
-                         FROM messages m
+                         FROM messages m INDEXED BY messages_pending
                          LEFT JOIN messages asked ON asked.id = m.reply_to
                          WHERE m.state = 'pending' AND m.recipient_lineage IS NOT NULL
                            AND (asked.wait_until_ms IS NULL OR asked.wait_until_ms <= ?1)
@@ -555,7 +596,7 @@ impl Registry {
                              ON m.recipient_lineage = coalesce(
                                  (SELECT lineage FROM session_lineages WHERE session_id = a.session_id),
                                  a.session_id)
-                         WHERE a.id = :agent AND {IN_LINE}
+                         WHERE a.id = :agent AND {ELIGIBLE_PENDING} AND NOT {RETURNED}
                          ORDER BY m.created_ms, m.rowid LIMIT 1)"
                 ),
                 rusqlite::named_params! {":agent": agent.to_string(), ":now": now as i64},
@@ -797,6 +838,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn returned_message_receipt_survives_schema_round_trip_and_uses_its_index() {
+        let (mut registry, _directory) = registry();
+        let path = registry.path.clone();
+        let recipient = Lineage(TerminalId::new());
+        let returned = message(Party::user(), party(recipient), 1);
+        let ordinary = message(Party::user(), party(recipient), 2);
+        registry.post_message(&returned).unwrap();
+        registry.post_message(&ordinary).unwrap();
+        let agent = crate::model::AgentId::new();
+        registry
+            .db
+            .execute(
+                "INSERT INTO agents(id,origin,record,session_id,closed) VALUES(?1,'new','{}',?2,0)",
+                params![agent.to_string(), recipient.0.to_string()],
+            )
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "INSERT INTO agent_runs(id,agent,origin,idempotency_key,request,state,revision,record)
+                 VALUES(?1,?2,'old',?3,'{}','cancelled',1,'{}')",
+                params![
+                    crate::model::RunId::new().to_string(),
+                    agent.to_string(),
+                    format!("{MESSAGE_RUN_KEY}{}", returned.id),
+                ],
+            )
+            .unwrap();
+        drop(registry);
+        assert_eq!(
+            super::super::schema::downgrade(&path, 30).unwrap(),
+            Some(31)
+        );
+
+        let registry = Registry::at(&path).unwrap();
+        let plan: Vec<String> = registry
+            .db
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT {RETURNED} FROM messages m WHERE m.id = ?1"
+            ))
+            .unwrap()
+            .query_map([returned.id.to_string()], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("agent_runs_by_message (idempotency_key=?)")),
+            "{plan:?}"
+        );
+        let (deliverable, next_release) = registry.deliverable_messages(3).unwrap();
+        let ids: Vec<_> = deliverable.iter().map(|message| message.id).collect();
+        assert_eq!(ids, [returned.id, ordinary.id]);
+        assert_eq!(next_release, None);
+        assert_eq!(
+            registry
+                .next_message_in_line(agent, 3)
+                .unwrap()
+                .map(|message| message.id),
+            Some(ordinary.id)
+        );
+    }
+
     fn assert_inbox_fits_wire(messages: &[Message]) {
         use crate::{
             model::HostSessionProof,
@@ -1022,6 +1127,41 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn only_an_attention_advance_needs_the_writer() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let retired = Lineage(TerminalId::new());
+        let first = message(Party::user(), party(recipient), 1);
+        let old = message(Party::user(), party(retired), 2);
+        let mut ask = message(party(recipient), Party::user(), 3);
+        ask.wait_until_ms = Some(100);
+        let mut reply = message(Party::user(), party(recipient), 4);
+        reply.reply_to = Some(ask.id);
+        for entry in [&first, &old, &ask, &reply] {
+            registry.post_message(entry).unwrap();
+        }
+        registry
+            .acknowledge_messages(Some(retired), None, &Receipt { ids: vec![old.id] }, 5)
+            .unwrap();
+
+        registry.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mut rival = Connection::open(&registry.path).unwrap();
+        let writer = rival
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(99).unwrap(),
+            BTreeMap::from([(recipient, first.id)])
+        );
+        assert!(registry.reconcile_message_attention(100).is_err());
+        writer.commit().unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(100).unwrap(),
+            BTreeMap::from([(recipient, reply.id)])
+        );
     }
 
     #[test]

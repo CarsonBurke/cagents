@@ -21,10 +21,10 @@ spec.loader.exec_module(fixture)
 class RetiredOwnershipFixtureTests(unittest.TestCase):
     def test_recognized_schemas_and_exact_restore_guards(self):
         result = fixture.self_test()
-        self.assertEqual(result["schemas"], [22, *range(23, 31)])
+        self.assertEqual(result["schemas"], [22, *range(23, 32)])
         # Two per recognized schema, plus the fixed rejection checks.
-        self.assertEqual(result["selection_checks_passed"], 2 * 9 + 12)
-        self.assertEqual(result["restore_checks_passed"], 9 * 9)
+        self.assertEqual(result["selection_checks_passed"], 2 * 10 + 12)
+        self.assertEqual(result["restore_checks_passed"], 9 * 10)
 
     def test_hosted_authority_refuses_both_mutations_before_opening_paths(self):
         environment = dict(os.environ, CAGENTS_AGENT_AUTHORITY="fixture-contract")
@@ -44,7 +44,7 @@ class RetiredOwnershipFixtureTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["restore_checks_passed"], 9 * 9)
+        self.assertEqual(json.loads(result.stdout)["restore_checks_passed"], 9 * 10)
 
     def test_backup_is_private_exclusive_and_refuses_symlink_targets(self):
         with tempfile.TemporaryDirectory(prefix="retired-ownership-contract-", dir="/var/tmp") as directory:

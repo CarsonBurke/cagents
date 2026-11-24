@@ -13082,10 +13082,10 @@ fn an_unreadable_transcript_still_resumes_and_a_missing_one_refuses() {
     ));
     let step = adapter.initialize_for_start().unwrap();
     let notice = step.events.iter().find_map(|event| match event {
-        Event::History { items, .. } => items.iter().find_map(|item| match &item.content {
-            ItemContent::Delivery { summary, body, .. } => Some((summary.clone(), body.clone())),
-            _ => None,
-        }),
+        Event::Item(Item {
+            content: ItemContent::Delivery { summary, body, .. },
+            ..
+        }) => Some((summary, body)),
         _ => None,
     });
     let (summary, body) = notice.expect("the transcript says what is missing");

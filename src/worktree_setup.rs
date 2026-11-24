@@ -554,12 +554,10 @@ fn matches(
         // A primary checkout may physically contain managed worktrees.
         // Never recurse into another Git checkout, including the destination
         // itself, when a broad glob such as **/.env is configured.
-        if metadata.is_dir() {
-            match fs_safety::metadata_beneath(root, &child.join(".git")) {
-                Ok(_) => continue,
-                Err(err) if err.is_not_found() => {}
-                Err(err) => return Err(error(err)),
-            }
+        if metadata.is_dir()
+            && crate::git_marker::present_beneath(root, &child.join(".git")).map_err(error)?
+        {
+            continue;
         }
         if parts[0] == "**" {
             if metadata.is_dir() {
@@ -1582,9 +1580,19 @@ mod tests {
         fixture.git(&["worktree", "add", "--detach", other.to_str().unwrap()]);
         fs::write(fixture.primary.join(".env"), "primary secret").unwrap();
         fs::write(other.join(".env"), "other agent secret").unwrap();
+        let config = fixture.primary.join("config");
+        fs::create_dir_all(config.join(".git")).unwrap();
+        fs::write(config.join(".env"), "nested config").unwrap();
         let plan = fixture.config("copy = ['**/.env']");
         let result = fixture.prepare(&plan).unwrap();
-        assert_eq!(result.copied, [PathBuf::from(".env")]);
+        assert_eq!(
+            result.copied,
+            [PathBuf::from(".env"), PathBuf::from("config/.env")]
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join("config/.env")).unwrap(),
+            b"nested config"
+        );
         assert_eq!(
             fs::read(fixture.destination.join(".env")).unwrap(),
             b"primary secret"

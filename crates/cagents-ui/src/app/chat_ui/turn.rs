@@ -902,18 +902,14 @@ pub(super) fn step_label(content: &ItemContent) -> Cow<'_, str> {
         ItemContent::Tool { name, .. } => return Cow::Owned(Title::unread(name).label),
         ItemContent::Image { description, .. } => description.as_str(),
         // As `chat::delivery_heading` has it, less a named sender's summary.
-        ItemContent::Delivery {
-            from,
-            sender,
-            summary,
-            ..
-        } => {
+        ItemContent::Delivery { from, summary, .. } => {
             if !from.is_empty() {
                 from.as_str()
             } else if !summary.is_empty() {
                 summary.as_str()
             } else {
-                sender.get(..8).unwrap_or(sender)
+                // Its address is the provider's, not a name the reader knows.
+                "Another agent"
             }
         }
     })

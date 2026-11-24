@@ -314,12 +314,11 @@ impl Runtime {
         match &key.source {
             FileChangeSource::Conversation => "Main chat".into(),
             FileChangeSource::Subagent { id } => self
-                .snapshot
-                .subagents
-                .iter()
-                .find(|agent| &agent.id == id)
+                .subagent(id)
                 .map(|agent| format!("Subagent: {}", self.child_label(agent, 80)))
-                .unwrap_or_else(|| format!("Subagent: {}", id.chars().take(8).collect::<String>())),
+                // An agent this conversation no longer lists has only the
+                // provider's ID, which is not a name to show.
+                .unwrap_or_else(|| "Subagent".into()),
         }
     }
 

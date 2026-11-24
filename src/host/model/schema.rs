@@ -151,7 +151,7 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     drop(reader);
     checkpoint("admitted")?;
     super::migrate_through(&tx, inspected.version, SCHEMA_VERSION)?;
-    require_layout(&tx)?;
+    require_layout(&inspect(&tx)?.objects)?;
     // Also forces the rollback-mode EXCLUSIVE write before commit for an
     // already-current store. No future writer can enter the conversion gap.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -238,6 +238,12 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            31 => {
+                tx.execute_batch(
+                    "DROP INDEX agent_runs_unfinished_by_agent; DROP INDEX agent_runs_by_message;",
+                )
+                .map_err(|error| error.to_string())?;
+            }
             30 => {
                 // An older daemon has no checkout to read; every channel it
                 // shows works in its project's main checkout.
@@ -402,6 +408,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_EIGHT: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_NINE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -422,6 +429,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         28 => &TWENTY_EIGHT,
         29 => &TWENTY_NINE,
         30 => &THIRTY,
+        31 => &THIRTY_ONE,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -439,8 +447,8 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         .as_ref()
         .map_err(Clone::clone)
 }
-fn require_layout(db: &Connection) -> Result<(), String> {
-    if inspect(db)?.objects != published_layouts(SCHEMA_VERSION)?.0 {
+fn require_layout(objects: &Layout) -> Result<(), String> {
+    if objects != &published_layouts(SCHEMA_VERSION)?.0 {
         return Err(format!(
             "workspace registry layout does not match published schema {SCHEMA_VERSION}"
         ));
@@ -509,7 +517,7 @@ pub(super) fn require_current(db: &Connection) -> Result<(), String> {
             actual.version
         ));
     }
-    require_layout(db)
+    require_layout(&actual.objects)
 }
 
 // Tokenize, rather than deleting substrings: a column named
@@ -1364,7 +1372,8 @@ mod tests {
             // channel history25 and source bindings26, schema 27 drops
             // channel work, schema 28 adds private pane chat ownership,
             // schema 29 retains explicitly deleted channel identities, and
-            // schema 30 records each channel's checkout.
+            // schema 30 records each channel's checkout, and schema 31 adds
+            // indexes for mailbox run receipts and unfinished runs.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1382,6 +1391,8 @@ mod tests {
                 "pane_chat_starts",
                 "pane_chat_allocations",
                 "deleted_channels",
+                "agent_runs_by_message",
+                "agent_runs_unfinished_by_agent",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1772,7 +1783,7 @@ mod tests {
         let _clear = Clear;
         for step in [
             1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26, 27, 28, 29, 30,
+            26, 27, 28, 29, 30, 31,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");

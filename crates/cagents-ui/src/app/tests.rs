@@ -13807,6 +13807,7 @@ fn folder_projects_select_a_directory_scope_and_keep_their_mode_on_refresh() {
     assert_eq!(app.workspace_view(), context_sections::WorkspaceView::Files);
 
     std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/HEAD"), "invalid ref\n").unwrap();
     let refreshed = load_project(
         &root,
         Some(project),
