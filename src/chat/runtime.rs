@@ -3266,7 +3266,10 @@ impl Actor {
                     // The provider closed its input, ordinarily by exiting.
                     // Drain its output to EOF so its exit status, and any
                     // final frames, explain the failure instead of EPIPE.
+                    // Nobody waits on the adapter's own requests for display
+                    // data, so they no longer hold the actor busy either.
                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                        self.drop_expendable_writes();
                         stdin_closed = Some(format!("Provider stdin: {e}"));
                     }
                     Err(e) => return Err(format!("Provider stdin: {e}")),
@@ -3303,6 +3306,27 @@ impl Actor {
                 }
             }
             self.refresh_metadata(fds[4].revents != 0)?;
+        }
+    }
+    /// Forgets the queued writes the provider can no longer read and nobody
+    /// waits on: see [`Adapter::expendable_write`].
+    fn drop_expendable_writes(&mut self) {
+        // The front write may be partly sent, and only its rest is queued.
+        let mut sent = self.offset;
+        if self.pending.front().is_some_and(|write| write.expendable) {
+            self.offset = 0;
+        }
+        let mut unsent = 0;
+        self.pending.retain(|write| {
+            let already = std::mem::take(&mut sent);
+            if write.expendable {
+                unsent += write.bytes.len() - already;
+            }
+            !write.expendable
+        });
+        self.queued -= unsent;
+        if self.pending.is_empty() {
+            self.write_started = None;
         }
     }
     /// The provider read input or wrote output, so it may be about to start

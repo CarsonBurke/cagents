@@ -4728,7 +4728,7 @@ fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() 
 // context figure. A provider that exits cleanly before reading it lost none
 // of the reader's input, while one that leaves a prompt unread did (#3888).
 #[test]
-fn claude_clean_exit_reports_only_lost_input_of_the_readers() {
+fn claude_clean_exit_reports_only_lost_reader_input() {
     // Closing its stdin before answering fails that request's write with
     // EPIPE every time, rather than only when the exit wins a race.
     let (_directory, handle) = claude_initialization_pipe(
