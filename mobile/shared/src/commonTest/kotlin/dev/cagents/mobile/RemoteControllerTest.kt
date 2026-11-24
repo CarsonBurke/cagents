@@ -1,6 +1,7 @@
 package dev.cagents.mobile
 
 import dev.cagents.mobile.client.ConnectFailure
+import dev.cagents.mobile.client.ConnectionLost
 import dev.cagents.mobile.client.ConnectionState
 import dev.cagents.mobile.client.ControllerConfig
 import dev.cagents.mobile.client.RemoteController
@@ -12,6 +13,7 @@ import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.ItemBody
 import dev.cagents.mobile.protocol.SendMode
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
@@ -45,7 +47,7 @@ class RemoteControllerTest {
     private val bridge = FakeBridge()
 
     private fun TestScope.controller(config: ControllerConfig = ControllerConfig(pingInterval = 10.hours)) =
-        RemoteController(backgroundScope, bridge, config, Random(1))
+        RemoteController(backgroundScope, bridge, config, Random(1), testScheduler.timeSource)
 
     private suspend fun RemoteController.await(predicate: (RemoteState) -> Boolean): RemoteState =
         state.first(predicate)
@@ -217,9 +219,102 @@ class RemoteControllerTest {
         val ended = controller.await { it.conversations[S]?.ended != null }
         assertEquals("This session runs in a terminal.", ended.conversations.getValue(S).ended)
 
+        // Nothing to unwatch: opening it again goes straight to a new watch.
         controller.close(S)
         assertNull(controller.state.value.conversations[S])
-        connection.expect("conversation.unwatch")
+        controller.open(S)
+        assertEquals("conversation.watch", connection.nextRequest().op)
+    }
+
+    @Test
+    fun aWatchAnsweredUnavailableEndsTheConversation() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.error(connection.expect("conversation.watch"), "unavailable", "The conversation couldn't be loaded.")
+        val ended = controller.await { it.conversations[S]?.ended != null }
+        assertEquals("The conversation couldn't be loaded.", ended.conversations.getValue(S).ended)
+
+        controller.rewatch(S)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = "[]", items = "[]"))
+        controller.await { it.conversations[S]?.let { c -> c.loaded && c.ended == null } == true }
+    }
+
+    @Test
+    fun closingAndReopeningQuicklyWatchesAfresh() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+
+        controller.close(S)
+        controller.open(S)
+        // The reopened conversation needs a reset, and no unwatch may land after its watch.
+        val again = connection.nextRequest()
+        assertEquals("conversation.watch", again.op)
+        connection.ok(again)
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+
+        controller.close(S)
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+    }
+
+    @Test
+    fun anUnreadableUpdateWatchesAgainThenGivesUp() = runTest {
+        val unreadable = """{"type":"event","event":"conversation","data":{"session":"$S","reset":false,"state":"from a newer cagents","items":[],"appends":[]}}"""
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+
+        connection.send(unreadable)
+        connection.ok(connection.expect("conversation.watch"))
+        // Updates still in flight from before the reset are set aside, not applied.
+        connection.send(conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":5,"text":" there"}]"""))
+        connection.send(unreadable)
+        val ended = controller.await { it.conversations[S]?.ended != null }.conversations.getValue(S)
+        assertEquals("Hello", (ended.items.single().body as ItemBody.Text).text)
+        assertTrue(ended.ended!!.contains("Update the app"))
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+        // The connection itself carries on.
+        assertEquals(ConnectionState.Connected, controller.state.value.connection)
+    }
+
+    @Test
+    fun aConnectionThatDropsAtOnceKeepsBackingOff() = runTest {
+        val controller = controller()
+        controller.start()
+        bridge.acceptWelcomed().hangUp()
+        controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 1 }
+        bridge.acceptWelcomed().hangUp()
+        controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 2 }
+
+        // One that held for a while starts over.
+        val held = bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+        delay(11.seconds)
+        held.hangUp()
+        controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 1 }
+    }
+
+    @Test
+    fun aRequestInFlightFailsWhenTheConnectionDrops() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        val send = async { runCatching { controller.send(S, "hello", SendMode.Queue) } }
+        connection.expect("conversation.send")
+        connection.hangUp()
+        assertIs<ConnectionLost>(send.await().exceptionOrNull())
     }
 
     @Test

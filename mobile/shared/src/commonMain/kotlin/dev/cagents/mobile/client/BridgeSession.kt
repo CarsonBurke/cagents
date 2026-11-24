@@ -9,7 +9,15 @@ import dev.cagents.mobile.protocol.Welcome
 import dev.cagents.mobile.protocol.decodeServerLine
 import dev.cagents.mobile.protocol.encodeHello
 import dev.cagents.mobile.protocol.encodeRequest
+import dev.cagents.mobile.protocol.WireJson
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerializationException
@@ -65,12 +73,18 @@ class BridgeSession(
             id
         }
         try {
-            channel.writeLine(encodeRequest(id, call))
-        } catch (e: Exception) {
-            lock.withLock { pending.remove(id) }
-            throw ConnectionLost(e.message ?: "The connection was lost.")
+            try {
+                channel.writeLine(encodeRequest(id, call))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                throw ConnectionLost(e.message ?: "The connection was lost.")
+            }
+            answer.await()
+        } finally {
+            // A caller that stopped waiting, such as a timed-out ping, leaves nothing behind.
+            if (!answer.isCompleted) withContext(NonCancellable) { lock.withLock { pending.remove(id) } }
         }
-        answer.await()
     }
 
     /**
@@ -80,11 +94,10 @@ class BridgeSession(
     suspend fun run(onEvent: suspend (Event) -> Unit): String {
         val reason = try {
             readLoop(onEvent)
+        } catch (e: CancellationException) {
+            end("The connection was closed.")
+            throw e
         } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) {
-                end("The connection was closed.")
-                throw e
-            }
             e.message ?: "The connection was lost."
         }
         end(reason)
@@ -96,7 +109,16 @@ class BridgeSession(
         while (true) {
             val line = channel.readLine() ?: return closing ?: "The computer closed the connection."
             if (line.isBlank()) continue
-            when (val decoded = decode(line)) {
+            val decoded = try {
+                decode(line)
+            } catch (e: ConnectFailure.Refused) {
+                // One unreadable line, such as an item a newer cagents shapes
+                // differently, mustn't end the connection; the controller
+                // decides what to do about the conversation it concerned.
+                onEvent(Event.Unreadable(sessionOf(line), e.message.orEmpty()))
+                continue
+            }
+            when (decoded) {
                 is ServerLine.Ok -> resolve(decoded.id, null)
                 is ServerLine.Error -> {
                     val id = decoded.id
@@ -120,12 +142,17 @@ class BridgeSession(
         throw ConnectFailure.Refused("cagents sent something this app can't read: ${e.message}")
     }
 
+    private fun sessionOf(line: String): String? = runCatching {
+        val data = WireJson.parseToJsonElement(line).jsonObject["data"] as? JsonObject
+        (data?.get("session") as? JsonPrimitive)?.contentOrNull
+    }.getOrNull()
+
     private suspend fun resolve(id: Long, error: RemoteError?) {
         val answer = lock.withLock { pending.remove(id) } ?: return
         if (error == null) answer.complete(Unit) else answer.completeExceptionally(RequestFailed(error))
     }
 
-    private suspend fun end(reason: String) {
+    private suspend fun end(reason: String) = withContext(NonCancellable) {
         val waiting = lock.withLock {
             ended = reason
             pending.values.toList().also { pending.clear() }
