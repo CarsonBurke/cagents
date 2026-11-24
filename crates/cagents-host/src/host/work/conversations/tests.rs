@@ -484,45 +484,94 @@ fn failed_lookups_back_off() {
     assert!(state.forge_error.is_none());
 }
 
-/// A rate limit pauses lookups until it resets, without growing the backoff
-/// an outage would, its own or a pull request's, so they resume as soon as
-/// GitHub admits them.
 #[test]
-fn rate_limited_lookups_wait_for_the_reset_not_a_backoff() {
-    let limited = |seconds| GitHubError::RateLimited {
-        limit: crate::github::polling::RateLimit::primary(
-            "graphql",
-            crate::github::polling::now() + seconds,
-        ),
+fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
+    use crate::repository::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
     };
-    let outage = GitHubError::NoActiveAccount("github.com".into());
-    let mut state = State::default();
-    // Outages before it are over once GitHub answers with its limit.
-    state.failed(&outage);
-    state.failed(&outage);
-    state.failed(&limited(3600));
-    assert!(!state.lookups_due());
-    assert_eq!(state.failures, 0);
-    assert!(state.forge_error.is_some());
-    let mut pull_request = Observed::default();
-    pull_request.lookup_failed(&limited(3600));
-    assert_eq!(pull_request.failures, 0);
-    // Once it resets: due, though a doubling backoff would wait on.
-    state.paused_until = Some(crate::github::polling::now());
-    assert!(state.lookups_due());
-    // An outage after it backs off as before.
-    state.failed(&outage);
-    pull_request.lookup_failed(&outage);
-    assert!(state.paused_until.is_none());
-    assert!(!state.lookups_due());
-    assert_eq!(state.failures, 1);
-    assert_eq!(pull_request.failures, 1);
-    // A reset about now means the clocks disagree: that backs off too.
-    state.failed(&limited(1));
-    pull_request.lookup_failed(&limited(1));
-    assert!(state.paused_until.is_none());
-    assert_eq!(state.failures, 2);
-    assert_eq!(pull_request.failures, 2);
+
+    #[derive(Default)]
+    struct Forge(Mutex<Vec<String>>);
+    impl ProcessExecutor for Forge {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            self.0.lock().unwrap().push(
+                command
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            Ok(ProcessOutput {
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: b"Could not resolve to a PullRequest".to_vec(),
+            })
+        }
+    }
+
+    let scope = "conversation-lookups-quota-test";
+    let spent = GitHubRepoKey::new("spent-graphql.invalid", None, "owner", "repo").unwrap();
+    let rest_spent = GitHubRepoKey::new("spent-rest.invalid", None, "owner", "repo").unwrap();
+    let open = GitHubRepoKey::new("open-graphql.invalid", None, "owner", "repo").unwrap();
+    let forge = Arc::new(Forge::default());
+    let gh = GitHubService::new("gh", forge.clone());
+    let work = Handle::idle(Weak::new());
+    let view = |repository: &GitHubRepoKey, number| {
+        Lookup::PullRequest(PullRequestKeyOrd {
+            repository: repository.into(),
+            number,
+        })
+    };
+
+    polling::with_scope(scope, || {
+        let reset = polling::now() + 600;
+        for (repository, resource) in [(&spent, "graphql"), (&rest_spent, "core")] {
+            polling::failed(
+                &repository.authority(),
+                &GitHubError::RateLimited {
+                    limit: polling::RateLimit::primary(resource, reset),
+                },
+            );
+        }
+        let lookups = std::iter::once(Lookup::Branch {
+            base: (&spent).into(),
+            head: (&spent).into(),
+            branch: "next".into(),
+        })
+        .chain((1..10).map(|number| view(&spent, number)))
+        .chain([view(&rest_spent, 1), view(&open, 1)]);
+        work.run_lookups(&gh, lookups, Some(scope));
+    });
+
+    let commands = forge.0.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert!(commands[0].contains("spent-rest.invalid"));
+    assert!(commands[1].contains("open-graphql.invalid"));
+    let state = work.conversations();
+    assert_eq!(
+        state.observed.len(),
+        2,
+        "a skipped lookup changes no observation"
+    );
+    assert!(state.branches.is_empty());
+    assert!(
+        state.lookups_due(),
+        "rate limits do not start an outage backoff"
+    );
+    assert!(
+        state
+            .forge_error
+            .as_deref()
+            .unwrap()
+            .contains("Retrying at")
+    );
 }
 
 /// A transcript file under `/var/tmp`, removed when dropped.

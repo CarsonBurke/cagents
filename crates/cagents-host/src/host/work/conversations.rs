@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     agent::Provider,
-    github::{GitHubError, GitHubService},
+    github::{GitHubError, GitHubService, polling},
     github_identity::{GitHubRepoKey, PullRequestKey},
     model::TerminalId,
     pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
@@ -114,51 +114,25 @@ struct State {
     /// cannot be reached, lookups back off rather than retry every pass.
     failures: u32,
     failed: Option<Instant>,
-    /// The Unix second GitHub's rate limit admits lookups again. They resume
-    /// then rather than after a doubling backoff.
-    paused_until: Option<u64>,
 }
 
 impl State {
     fn lookups_due(&self) -> bool {
-        match self.paused_until {
-            Some(until) => super::pause_over(until),
-            None => self
-                .failed
-                .is_none_or(|failed| failed.elapsed() >= backoff(self.failures)),
-        }
+        self.failed
+            .is_none_or(|failed| failed.elapsed() >= backoff(self.failures))
     }
 
     fn succeeded(&mut self) {
         self.forge_error = None;
         self.failures = 0;
         self.failed = None;
-        self.paused_until = None;
     }
 
     fn failed(&mut self, error: &GitHubError) {
         self.forge_error = Some(error.to_string());
+        self.failures = self.failures.saturating_add(1);
         self.failed = Some(Instant::now());
-        match pause(error) {
-            // GitHub answered, so earlier outages are over.
-            Some(until) => {
-                self.paused_until = Some(until);
-                self.failures = 0;
-            }
-            None => {
-                self.failures = self.failures.saturating_add(1);
-                self.paused_until = None;
-            }
-        }
     }
-}
-
-/// Until when a rate limit that refused a lookup pauses the rest, as the
-/// board's polls pause.
-fn pause(error: &GitHubError) -> Option<u64> {
-    error
-        .rate_limit()
-        .and_then(|limit| super::rate_limit_pause(limit.retry_at))
 }
 
 /// As the board backs off: 30 s doubling, at most 30 min.
@@ -180,15 +154,6 @@ struct Observed {
 }
 
 impl Observed {
-    /// Counts a failed lookup of this pull request toward its backoff. A
-    /// rate limit is no fault of the pull request: lookups resume together
-    /// when it resets.
-    fn lookup_failed(&mut self, error: &GitHubError) {
-        if pause(error).is_none() {
-            self.failures = self.failures.saturating_add(1);
-        }
-    }
-
     fn due(&self, worked_on: bool) -> bool {
         let Some(checked) = self.checked else {
             return true;
@@ -1177,78 +1142,111 @@ impl Handle {
             lookups.sort_by_key(|(relation, _)| *relation);
             lookups
         };
+        if lookups.is_empty() {
+            return;
+        }
         let gh = GitHubService::system("gh");
+        let lookups = lookups.into_iter().map(|(_, lookup)| lookup);
+        if let Ok(scope) = crate::github_status::credential_fingerprint() {
+            polling::with_scope(&scope, || self.run_lookups(&gh, lookups, Some(&scope)));
+        } else {
+            self.run_lookups(&gh, lookups, None);
+        }
+    }
+
+    fn run_lookups<E: crate::repository::ProcessExecutor>(
+        &self,
+        gh: &GitHubService<E>,
+        lookups: impl IntoIterator<Item = Lookup>,
+        scope: Option<&str>,
+    ) {
         let cancellation = &self.0.cancellation;
-        for (_, lookup) in lookups.into_iter().take(LOOKUPS_PER_PASS) {
-            match lookup {
-                Lookup::Branch {
-                    base: base_key,
-                    head,
-                    branch,
-                } => {
-                    let base = GitHubRepoKey::from(&base_key);
-                    let head = GitHubRepoKey::from(&head);
-                    let result = gh.resolve_branch(&base, &head, &branch, None, cancellation);
-                    let mut state = self.conversations();
-                    match result {
-                        Ok(found) => {
-                            if let Some(found) = &found
-                                && let Ok(key) = PullRequestKey::new(base.clone(), found.number)
-                            {
-                                state.observed.insert((&key).into(), observed_now(found));
-                            }
-                            state.branches.insert(
-                                (base_key, branch),
-                                BranchLookup {
-                                    number: found.map(|found| found.number),
-                                    checked: Instant::now(),
-                                },
-                            );
-                            state.succeeded();
-                        }
-                        // GitHub answered, about this branch only: it has no
-                        // single pull request here. That is not GitHub being
-                        // unreachable.
-                        Err(error) if answered(&error) => {
-                            state.branches.insert(
-                                (base_key, branch),
-                                BranchLookup {
-                                    number: None,
-                                    checked: Instant::now(),
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            state.failed(&error);
-                            return;
-                        }
-                    }
+        let mut checked_hosts = BTreeSet::new();
+        let mut limited = BTreeMap::new();
+        let mut reads = 0;
+        for lookup in lookups {
+            let repository = lookup.repository();
+            let authority = repository.authority();
+            if checked_hosts.insert(authority.clone()) {
+                if let Some(scope) = scope {
+                    polling::bind_scope(&authority, scope);
                 }
-                Lookup::PullRequest(key) => {
-                    let pull_request_key = PullRequestKey::from(&key);
-                    let result =
-                        gh.view_with_timeout(&pull_request_key, cancellation, LOOKUP_TIMEOUT);
-                    let mut state = self.conversations();
-                    let entry = state.observed.entry(key).or_default();
-                    entry.checked = Some(Instant::now());
-                    match result {
-                        Ok(found) => {
-                            *entry = observed_now(&found);
-                            state.succeeded();
+                if let Some(limit) = polling::rate_limit_for(&authority, "graphql") {
+                    limited.insert(authority.clone(), limit);
+                }
+            }
+            if limited.contains_key(&authority) {
+                continue;
+            }
+
+            let result = match &lookup {
+                Lookup::Branch { head, branch, .. } => {
+                    gh.resolve_branch(&repository, &head.into(), branch, None, cancellation)
+                }
+                Lookup::PullRequest(key) => gh
+                    .view_with_timeout(&key.into(), cancellation, LOOKUP_TIMEOUT)
+                    .map(Some),
+            };
+            reads += 1;
+            // An applicable shared pause leaves both the observations and
+            // their ordinary failure backoff alone. Other hosts can continue.
+            if let Err(error) = &result
+                && let Some(limit) = error.rate_limit()
+            {
+                limited.insert(authority, limit);
+            } else {
+                let mut state = self.conversations();
+                let found = match result {
+                    Ok(found) => {
+                        state.succeeded();
+                        found
+                    }
+                    Err(error) if answered(&error) => None,
+                    Err(error) => {
+                        if let Lookup::PullRequest(key) = lookup {
+                            let entry = state.observed.entry(key).or_default();
+                            entry.checked = Some(Instant::now());
+                            entry.failures = entry.failures.saturating_add(1);
                         }
-                        Err(error) if answered(&error) => {
+                        state.failed(&error);
+                        return;
+                    }
+                };
+                match lookup {
+                    Lookup::Branch { base, branch, .. } => {
+                        if let Some(found) = &found
+                            && let Ok(key) = PullRequestKey::new(repository, found.number)
+                        {
+                            state.observed.insert((&key).into(), observed_now(found));
+                        }
+                        state.branches.insert(
+                            (base, branch),
+                            BranchLookup {
+                                number: found.map(|found| found.number),
+                                checked: Instant::now(),
+                            },
+                        );
+                    }
+                    Lookup::PullRequest(key) => {
+                        let entry = state.observed.entry(key).or_default();
+                        if let Some(found) = found {
+                            *entry = observed_now(&found);
+                        } else {
+                            entry.checked = Some(Instant::now());
                             entry.missing = true;
                             entry.failures = 0;
-                        }
-                        Err(error) => {
-                            entry.lookup_failed(&error);
-                            state.failed(&error);
-                            return;
                         }
                     }
                 }
             }
+            if reads == LOOKUPS_PER_PASS {
+                break;
+            }
         }
+        self.conversations().forge_error = limited
+            .values()
+            .min_by_key(|limit| limit.retry_at)
+            .map(ToString::to_string);
     }
 }
 
@@ -1262,6 +1260,15 @@ enum Lookup {
         head: RepoKeyOrd,
         branch: String,
     },
+}
+
+impl Lookup {
+    fn repository(&self) -> GitHubRepoKey {
+        match self {
+            Self::PullRequest(key) => (&key.repository).into(),
+            Self::Branch { base, .. } => base.into(),
+        }
+    }
 }
 
 /// What a pull request's row shows beyond its state: the lines it changes
