@@ -34,6 +34,11 @@ Development builds substitute `cagents-development` for the final `cagents`
 directory component. Program files installed by `install.sh` live separately
 under `${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/`.
 
+The daemon removes superseded, completed upgrade evidence and unused preparation
+captures after 30 days. It keeps the current upgrade's verification files and
+retains checkpoints or captures still needed to recover conversations or review
+an interrupted update.
+
 ## Settings file
 
 Preferences live in `${XDG_CONFIG_HOME:-$HOME/.config}/cagents/settings.toml`

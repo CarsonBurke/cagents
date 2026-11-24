@@ -5,6 +5,32 @@ use crate::terminal_ipc::TerminalDescriptor;
 
 const FILE: &str = "daemon-upgrade.ready-outcome.json";
 
+#[cfg(any(feature = "host", test))]
+pub(in crate::upgrade::recovery) fn retained_captures(
+    checkpoint: &Path,
+) -> Result<impl Iterator<Item = (String, HostSessionProof)>, String> {
+    let publication = read_checkpoint(&checkpoint.with_file_name(FILE))?
+        .map(|bytes| {
+            let publication: Publication =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if publication.version != 1
+                || publication.partitions.iter().any(|partition| {
+                    !valid_hash(&partition.checkpoint_hash) || !partition.source.is_complete()
+                })
+            {
+                return Err("Unsupported Ready evidence; captures were preserved".into());
+            }
+            Ok::<_, String>(publication)
+        })
+        .transpose()?;
+    Ok(publication.into_iter().flat_map(|publication| {
+        publication
+            .partitions
+            .into_iter()
+            .map(|partition| (partition.checkpoint_hash, partition.source))
+    }))
+}
+
 #[derive(Serialize, Deserialize)]
 struct Publication {
     version: u16,
