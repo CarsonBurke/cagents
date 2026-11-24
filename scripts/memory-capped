@@ -3,10 +3,12 @@
 early instead of filling the host's memory and swap. Without a working scope
 the command runs anyway, uncapped, with a note."""
 import ctypes
+import fcntl
 import os
 import shlex
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -40,6 +42,8 @@ PR_SET_PDEATHSIG = 1
 UNIT_PREFIX = "cagents-capped-"
 # Seconds a process the command left gets to end by itself.
 LEFTOVER_GRACE = 1
+LEFTOVER_LOG = "leftover-processes.log"
+LEFTOVER_LOG_BYTES = 1024 * 1024
 # A fixture or a nested session replaces these, which hides the user manager
 # from systemd's tools. The command gets them back inside its scope.
 MANAGER_VARIABLES = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
@@ -233,6 +237,63 @@ def leftovers(unit):
     return found
 
 
+def require_owned_log(info):
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        raise OSError("not an owned regular log file")
+
+
+def open_log(directory, name):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW
+    return os.fdopen(os.open(name, flags, 0o600, dir_fd=directory), "ab")
+
+
+def record_leftovers(unit, name, lines):
+    """Keep the active log and one rotated file, with at most 1 MiB each."""
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    root = os.path.join(state, "cagents")
+    try:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        record = (f"{stamp} {unit} in {os.getcwd()}: {name}\n"
+                  + "".join(f"  {line}\n" for line in lines)).encode(errors="backslashreplace")
+        if len(record) > LEFTOVER_LOG_BYTES:
+            omitted = b"  [additional process details omitted]\n"
+            end = record.rfind(b"\n", 0, LEFTOVER_LOG_BYTES - len(omitted))
+            record = record[:end + 1] + omitted
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            # Lock a separate inode so another new writer never acquires the
+            # lock on a log that is about to become the rotated copy.
+            with open_log(directory, LEFTOVER_LOG + ".lock") as lock:
+                require_owned_log(os.fstat(lock.fileno()))
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with open_log(directory, LEFTOVER_LOG) as log:
+                    info = os.fstat(log.fileno())
+                    require_owned_log(info)
+                    if info.st_size > LEFTOVER_LOG_BYTES:
+                        # A log from an older tool can already exceed the
+                        # limit. Start a bounded generation on this write.
+                        log.truncate(0)
+                    elif info.st_size + len(record) > LEFTOVER_LOG_BYTES:
+                        # The last generation remains readable if the new
+                        # current file cannot be created after the rename.
+                        previous = LEFTOVER_LOG + ".1"
+                        try:
+                            require_owned_log(os.stat(previous, dir_fd=directory, follow_symlinks=False))
+                        except FileNotFoundError:
+                            pass
+                        os.replace(LEFTOVER_LOG, previous, src_dir_fd=directory, dst_dir_fd=directory)
+                        with open_log(directory, LEFTOVER_LOG) as current:
+                            require_owned_log(os.fstat(current.fileno()))
+                            current.write(record)
+                        return
+                    log.write(record)
+        finally:
+            os.close(directory)
+    except OSError:
+        pass
+
+
 def stop_leftovers(unit, name):
     """Stops what the command left in its scope, saying what that was. A
     process already on its way out gets a moment to finish."""
@@ -247,15 +308,7 @@ def stop_leftovers(unit, name):
           f"after it exited; stopping {them}. Whatever started {them} should stop {them}:", file=sys.stderr)
     for line in lines:
         print(f"{PROGRAM}:   {line}", file=sys.stderr)
-    try:
-        state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-        os.makedirs(os.path.join(state, "cagents"), exist_ok=True)
-        with open(os.path.join(state, "cagents", "leftover-processes.log"), "a") as log:
-            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            log.write(f"{stamp} {unit} in {os.getcwd()}: {name}\n")
-            log.writelines(f"  {line}\n" for line in lines)
-    except OSError:
-        pass
+    record_leftovers(unit, name, lines)
     stop(unit)
     forget(unit)
 

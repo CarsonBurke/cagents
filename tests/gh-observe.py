@@ -289,6 +289,45 @@ class ReportTests(unittest.TestCase):
             self.assertIn("does not mean zero network traffic", report["coverage_note"])
 
 
+class DailyLogRetentionTests(unittest.TestCase):
+    def test_first_daily_append_preserves_thirty_days_and_unowned_entries(self):
+        class Clock(observe.datetime.datetime):
+            @classmethod
+            def now(cls, tz):
+                return cls(2026, 11, 23, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory) / "cagents/gh-observe"
+            logs.mkdir(parents=True)
+            expired = logs / "2026-10-24.jsonl"
+            expired.write_text("expired log")
+            kept = logs / "2026-10-25.jsonl"
+            kept.write_text("oldest retained log")
+            other = logs / "saved-report.jsonl"
+            other.write_text("saved report")
+            invalid = logs / "2026-09-31.jsonl"
+            invalid.touch()
+            alias = logs / "2026-09-30.jsonl"
+            alias.symlink_to(other)
+            hardlink = logs / "2026-09-29.jsonl"
+            hardlink.hardlink_to(other)
+            folder = logs / "2026-09-28.jsonl"
+            folder.mkdir()
+
+            with patch.dict(os.environ, {"XDG_STATE_HOME": directory}), \
+                    patch.object(observe.datetime, "datetime", Clock):
+                self.assertTrue(observe.append({"event": "fixture"}))
+
+            self.assertFalse(expired.exists())
+            self.assertEqual(kept.read_text(), "oldest retained log")
+            self.assertEqual(other.read_text(), "saved report")
+            self.assertTrue(invalid.is_file())
+            self.assertTrue(alias.is_symlink())
+            self.assertTrue(hardlink.samefile(other))
+            self.assertTrue(folder.is_dir())
+            self.assertEqual(json.loads((logs / "2026-11-23.jsonl").read_text()), {"event": "fixture"})
+
+
 class ShimTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

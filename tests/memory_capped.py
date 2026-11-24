@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import fcntl
+import importlib.machinery
+import importlib.util
 import os
 import re
 from pathlib import Path
@@ -11,6 +14,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts/memory-capped"
@@ -35,6 +39,74 @@ def real_scopes_work():
                             "--property=MemoryMax=67108864", "/bin/sh", "-c", report],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True)
     return found.returncode == 0 and found.stdout.strip() == "67108864"
+
+
+class LeftoverLogTests(unittest.TestCase):
+    def setUp(self):
+        loader = importlib.machinery.SourceFileLoader("memory_capped", str(TOOL))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.cap = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.cap)
+        directory = tempfile.TemporaryDirectory(prefix="memory-capped-logs-")
+        self.addCleanup(directory.cleanup)
+        self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": directory.name}))
+        self.enterContext(patch.object(self.cap, "LEFTOVER_LOG_BYTES", 256))
+        self.enterContext(patch.object(self.cap.os, "getcwd", return_value="/work"))
+        self.root = Path(directory.name) / "cagents"
+        self.current = self.root / "leftover-processes.log"
+        self.previous = self.root / "leftover-processes.log.1"
+
+    def record(self, name):
+        self.cap.record_leftovers("fixture.scope", name, [f"{name} child " + "x" * 120])
+
+    def test_repeated_rotation_keeps_one_previous_generation(self):
+        self.record("first")
+        self.record("second")
+        self.record("third")
+        self.assertIn("third child", self.current.read_text())
+        self.assertIn("second child", self.previous.read_text())
+        self.assertNotIn("first child", self.previous.read_text())
+        for generation in (self.current, self.previous):
+            self.assertLessEqual(generation.stat().st_size, self.cap.LEFTOVER_LOG_BYTES)
+            self.assertEqual(generation.stat().st_mode & 0o777, 0o600)
+
+    def test_oversized_legacy_log_and_event_are_bounded(self):
+        self.root.mkdir()
+        self.current.write_text("oversized legacy log" * 256)
+        self.cap.record_leftovers("fixture.scope", "large", ["huge child " + "x" * 256])
+        current = self.current.read_text()
+        self.assertIn("fixture.scope in /work: large", current)
+        self.assertIn("additional process details omitted", current)
+        self.assertNotIn("oversized legacy log", current)
+        self.assertLessEqual(len(current.encode()), self.cap.LEFTOVER_LOG_BYTES)
+        self.assertFalse(self.previous.exists())
+
+    def test_symlink_logs_are_preserved(self):
+        self.record("first")
+        saved = self.root.parent / "saved"
+        saved.write_text("saved report")
+        self.previous.symlink_to(saved)
+        self.record("second")
+        self.assertIn("first child", self.current.read_text())
+        self.assertTrue(self.previous.is_symlink())
+        self.current.unlink()
+        self.current.symlink_to(saved)
+        self.record("third")
+        self.assertTrue(self.current.is_symlink())
+        self.assertEqual(saved.read_text(), "saved report")
+
+    def test_busy_log_lock_does_not_delay_leftover_cleanup(self):
+        self.record("first")
+        with (self.root / "leftover-processes.log.lock").open("a") as lock, \
+                patch.object(self.cap, "LEFTOVER_GRACE", 0), \
+                patch.object(self.cap, "leftovers", return_value=[(42, 1, ["fixture"])]), \
+                patch.object(self.cap, "stop") as stop, patch.object(self.cap, "forget") as forget, \
+                patch.object(self.cap.sys, "stderr"):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.cap.stop_leftovers("fixture.scope", "second")
+        self.assertNotIn("second", self.current.read_text())
+        stop.assert_called_once_with("fixture.scope")
+        forget.assert_called_once_with("fixture.scope")
 
 
 class UnderAMovedHome(unittest.TestCase):
