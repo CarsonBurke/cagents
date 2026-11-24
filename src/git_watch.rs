@@ -128,14 +128,12 @@ enum Tracked {
     Directory,
 }
 
-/// Which index file a census was read from. Git writes the index to a new
-/// file and renames it over the old one, so each of its writes gives the index
-/// another inode, as well as new times. A writer that rewrote the file in place
-/// would still change its size or times, unless it kept the same size within
-/// one timestamp tick. Only a filesystem that `reports_rewrites` keeps a
-/// census by this identity.
+/// Which version of a file Git read. Git replaces the index and configuration
+/// by renaming new files over them, so a write gives them a new inode and
+/// times. Only a filesystem that `reports_rewrites` can keep a cached read
+/// by this identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexIdentity {
+struct FileIdentity {
     device: u64,
     inode: u64,
     size: u64,
@@ -143,10 +141,13 @@ struct IndexIdentity {
     changed: (i64, i64),
 }
 
-impl IndexIdentity {
-    /// `None` when there is no index to identify, or it cannot be read.
-    fn of(git_dir: &Path) -> Option<Self> {
-        let metadata = std::fs::symlink_metadata(git_dir.join("index")).ok()?;
+impl FileIdentity {
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        Self::from_metadata(&metadata)
+    }
+
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
         metadata.is_file().then(|| Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -154,6 +155,90 @@ impl IndexIdentity {
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusFile {
+    Present(FileIdentity),
+    Missing { device: u64, inode: u64 },
+}
+
+impl StatusFile {
+    fn of(directory: &Path, name: &str) -> Option<Self> {
+        let path = directory.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let identity = FileIdentity::from_metadata(&metadata)?;
+                Filesystem::of(&path)
+                    .is_ok_and(Filesystem::reports_rewrites)
+                    .then_some(Self::Present(identity))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !Filesystem::of(directory).is_ok_and(Filesystem::reports_rewrites) {
+                    return None;
+                }
+                let directory = std::fs::metadata(directory).ok()?;
+                directory.is_dir().then_some(Self::Missing {
+                    device: directory.dev(),
+                    inode: directory.ino(),
+                })
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StatusMetadata {
+    directories: GitDirectories,
+    index: StatusFile,
+    config: StatusFile,
+    worktree_config: StatusFile,
+}
+
+impl StatusMetadata {
+    fn of(worktree: &Path) -> Option<Self> {
+        let directories = git_directories(worktree)?;
+        Some(Self {
+            index: StatusFile::of(&directories.private, "index")?,
+            config: StatusFile::of(&directories.common, "config")?,
+            worktree_config: StatusFile::of(&directories.private, "config.worktree")?,
+            directories,
+        })
+    }
+}
+
+/// Evidence supplied by a successful status read. Metadata identities are
+/// taken before invoking Git so that a write during the read still invalidates it.
+#[derive(Debug, Clone)]
+pub struct StatusRead {
+    metadata: Option<Arc<StatusMetadata>>,
+    pub completed_at: Instant,
+}
+
+impl StatusRead {
+    pub fn read<T, E>(
+        worktree: &Path,
+        read: impl FnOnce() -> Result<T, E>,
+    ) -> Result<(T, Self), E> {
+        let metadata = StatusMetadata::of(worktree).map(Arc::new);
+        let status = read()?;
+        Ok((
+            status,
+            Self {
+                metadata,
+                completed_at: Instant::now(),
+            },
+        ))
+    }
+
+    /// Whether the index or repository configuration may have changed since
+    /// the last status read. The worktree listing checks HEAD separately.
+    pub fn metadata_changed(&self, worktree: &Path) -> bool {
+        self.metadata
+            .as_deref()
+            .is_none_or(|metadata| StatusMetadata::of(worktree).as_ref() != Some(metadata))
     }
 }
 
@@ -197,7 +282,7 @@ pub struct Worktree {
     census: Arc<Census>,
     /// The index `census` was read from, taken before reading it: a write
     /// that lands during the read changes it, so the next plan reads again.
-    index: Option<IndexIdentity>,
+    index: Option<FileIdentity>,
     polling: Option<String>,
 }
 
@@ -269,12 +354,20 @@ pub struct Project {
     pub id: ProjectId,
     pub common_dir: PathBuf,
     pub worktrees: Vec<Worktree>,
+    /// An owner that discarded its status asks for a new baseline even when
+    /// removal and re-addition of its watch plan coalesce.
+    baseline_generation: u64,
     /// Why the shared metadata itself may change without an event. A reason
     /// confined to one worktree's files is that worktree's own.
     polling: Option<String>,
 }
 
 impl Project {
+    /// Identifies the owner's status baseline independently of its watch paths.
+    pub fn set_baseline_generation(&mut self, generation: u64) {
+        self.baseline_generation = generation;
+    }
+
     /// The watch plan for `records`, re-reading only what may have moved: a
     /// worktree `changed` names, or one `previous` does not hold at the same
     /// root. A re-read runs Git only for an index that was rewritten since
@@ -409,7 +502,7 @@ impl Project {
                 .map_err(|error| error.to_string())?
                 .reports_rewrites()
             {
-                IndexIdentity::of(&git_dir)
+                FileIdentity::of(&git_dir.join("index"))
             } else {
                 None
             };
@@ -461,6 +554,7 @@ impl Project {
             id,
             common_dir,
             worktrees,
+            baseline_generation: previous.map_or(0, |project| project.baseline_generation),
             polling,
         })
     }
@@ -491,6 +585,38 @@ impl Project {
         paths
     }
 
+    /// Checkouts with at least one installed content watch. A partially
+    /// covered checkout can still lose events for the directories we saw.
+    /// Limiting the search to newly acquired watches identifies which
+    /// checkouts need a catch-up read after an ordinary plan change.
+    fn watched_files(
+        &self,
+        registered: &BTreeMap<PathBuf, RegisteredPath>,
+        only_acquired: bool,
+    ) -> BTreeSet<WorktreeId> {
+        self.worktrees
+            .iter()
+            .filter(|worktree| {
+                worktree.interest.watches_files()
+                    && (registered
+                        .range(worktree.root.clone()..)
+                        .take_while(|(path, _)| path.starts_with(&worktree.root))
+                        .any(|(path, watch)| {
+                            (!only_acquired || watch.acquired)
+                                && worktree.tracks(path) == Some(Tracked::Directory)
+                        })
+                        || worktree.tracks(&worktree.root) == Some(Tracked::Directory)
+                            && worktree.root.ancestors().skip(1).any(|ancestor| {
+                                registered.get(ancestor).is_some_and(|watch| {
+                                    (!only_acquired || watch.acquired)
+                                        && watch.mode == RecursiveMode::Recursive
+                                })
+                            }))
+            })
+            .map(|worktree| worktree.id)
+            .collect()
+    }
+
     fn change(&self, event: &Event) -> Option<Change> {
         if matches!(event.kind, EventKind::Access(_)) {
             return None;
@@ -512,7 +638,14 @@ impl Project {
                     || relative.starts_with("reftable")
             }) {
                 change.references = true;
-                change.configuration |= common == Some(Path::new("config"));
+                if common == Some(Path::new("config")) {
+                    change.configuration = true;
+                    // Shared settings such as core.fileMode can change status
+                    // in every checkout without touching its HEAD or index.
+                    change
+                        .worktrees
+                        .extend(self.worktrees.iter().map(|tree| tree.id));
+                }
                 change.membership |= common == Some(Path::new("refs"));
                 continue;
             }
@@ -630,6 +763,9 @@ pub struct Change {
     /// through it — its remote and that remote's URLs — may have moved even
     /// where no ref did.
     pub configuration: bool,
+    /// Metadata events may have been lost. Compare the index and configuration
+    /// with the last status read as well as the freshly listed branches and heads.
+    pub rescan: bool,
     pub topology: bool,
     pub membership: bool,
     pub error: Option<String>,
@@ -649,10 +785,23 @@ pub struct Change {
 }
 
 impl Change {
+    fn recovering(worktrees: BTreeSet<WorktreeId>) -> Self {
+        Self {
+            worktrees,
+            references: true,
+            configuration: true,
+            rescan: true,
+            topology: true,
+            membership: true,
+            ..Self::default()
+        }
+    }
+
     pub fn merge(&mut self, other: Self) {
         self.worktrees.extend(other.worktrees);
         self.references |= other.references;
         self.configuration |= other.configuration;
+        self.rescan |= other.rescan;
         self.topology |= other.topology;
         self.membership |= other.membership;
         if let Some(coverage) = other.coverage {
@@ -673,6 +822,7 @@ impl Change {
 struct Pending {
     projects: BTreeMap<ProjectId, Arc<Project>>,
     roots: BTreeMap<PathBuf, BTreeSet<ProjectId>>,
+    watched_files: BTreeMap<ProjectId, BTreeSet<WorktreeId>>,
     changes: BTreeMap<ProjectId, Change>,
     faulted: bool,
     // Only desired recursive roots are retained, never an unbounded list of
@@ -735,23 +885,19 @@ impl Pending {
             let Some(project) = self.projects.get(&id) else {
                 continue;
             };
-            let change = match &event {
-                Ok(event) if !event.need_rescan() => project.change(event),
-                Ok(_) => Some(Change {
-                    worktrees: project.worktrees.iter().map(|row| row.id).collect(),
-                    topology: true,
-                    membership: true,
-                    ..Change::default()
-                }),
-                Err(error) => Some(Change {
-                    worktrees: project.worktrees.iter().map(|row| row.id).collect(),
-                    topology: true,
-                    membership: true,
-                    error: Some(error.to_string()),
-                    coverage: Some(false),
-                    recoverable: true,
-                    ..Change::default()
-                }),
+            let change = if let Ok(event) = &event
+                && !event.need_rescan()
+            {
+                project.change(event)
+            } else {
+                let mut change =
+                    Change::recovering(self.watched_files.get(&id).cloned().unwrap_or_default());
+                if let Err(error) = &event {
+                    change.error = Some(error.to_string());
+                    change.coverage = Some(false);
+                    change.recoverable = true;
+                }
+                Some(change)
             };
             if let Some(change) = change {
                 self.changes.entry(id).or_default().merge(change);
@@ -816,6 +962,12 @@ impl Pending {
 struct Rearm {
     all: bool,
     recursive: BTreeSet<PathBuf>,
+}
+
+struct RegisteredPath {
+    mode: RecursiveMode,
+    identity: (u64, u64),
+    acquired: bool,
 }
 
 /// What the watcher should hold for a set of projects, and which of them it
@@ -1111,11 +1263,12 @@ impl Monitor {
                     }))
                 };
                 let mut watcher = create_watcher();
-                let mut registered: BTreeMap<PathBuf, (RecursiveMode, u64, u64)> = BTreeMap::new();
+                let mut registered = BTreeMap::new();
                 let mut unadmitted = BTreeMap::new();
                 // What the last registration left unwatched, per project: a
                 // worktree that leaves this set gained watches only now.
                 let mut was_unwatched: BTreeMap<ProjectId, BTreeSet<WorktreeId>> = BTreeMap::new();
+                let mut was_metadata_blind = BTreeSet::new();
                 while requests.recv().is_ok() {
                     let projects = {
                         let configuration = desired_configuration
@@ -1136,6 +1289,9 @@ impl Monitor {
                     let old = {
                         let mut pending = state.lock().unwrap_or_else(|p| p.into_inner());
                         pending.changes.retain(|id, _| projects.contains_key(id));
+                        pending
+                            .watched_files
+                            .retain(|id, _| projects.contains_key(id));
                         pending.roots.clear();
                         for (&id, project) in &projects {
                             pending
@@ -1186,7 +1342,7 @@ impl Monitor {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .rearm(&desired, &owners);
-                    let rearmed = match &mut watcher {
+                    match &mut watcher {
                         Ok(watcher) => reconcile(
                             watcher,
                             &mut registered,
@@ -1199,9 +1355,27 @@ impl Monitor {
                         ),
                         Err(error) => {
                             failures.extend(projects.keys().map(|id| (*id, error.to_string())));
-                            BTreeSet::new()
                         }
-                    };
+                    }
+                    let rearmed_metadata = rearm
+                        .recursive
+                        .iter()
+                        .filter_map(|path| owners.get(path))
+                        .flatten()
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    let mut watched_files = projects
+                        .iter()
+                        .map(|(&id, project)| {
+                            (
+                                id,
+                                (
+                                    project.watched_files(&registered, false),
+                                    project.watched_files(&registered, true),
+                                ),
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
                     let mut pending = state.lock().unwrap_or_else(|p| p.into_inner());
                     pending.retain_failures(&mut failures);
                     for (&id, project) in &projects {
@@ -1216,28 +1390,60 @@ impl Monitor {
                                 .map(|worktree| worktree.id)
                                 .collect()
                         };
+                        let before = old
+                            .get(&id)
+                            .map(Arc::as_ref)
+                            .filter(|old| old.baseline_generation == project.baseline_generation);
+                        let (watched, mut acquired) = watched_files.remove(&id).unwrap_or_default();
+                        if rearm.all
+                            && let Some(previous) = pending.watched_files.get(&id)
+                        {
+                            // A checkout can lose coverage during the rebuild.
+                            // Catch up changes made before it becomes polled.
+                            acquired.extend(previous);
+                        }
+                        let restoring_metadata =
+                            metadata_covered && was_metadata_blind.contains(&id);
+                        let recovering = before.is_none()
+                            || restoring_metadata
+                            || rearm.all
+                            || rearmed_metadata.contains(&id);
                         let worktrees = reads_after_registration(
                             project,
-                            old.get(&id).map(Arc::as_ref),
+                            before,
                             was_unwatched.get(&id),
                             &now_unwatched,
-                            rearmed.contains(&id).then_some(rearm.all),
+                            &acquired,
                         );
+                        let mut change = if recovering {
+                            // The listing and bookkeeping could have moved
+                            // before these watches were installed.
+                            Change::recovering(worktrees)
+                        } else {
+                            Change {
+                                worktrees,
+                                ..Change::default()
+                            }
+                        };
                         // Acknowledge coverage even when the paths did not change:
                         // this settles fallback after a successful retry.
-                        pending.changes.entry(id).or_default().merge(Change {
-                            worktrees,
-                            coverage: Some(coverage),
-                            recoverable: !coverage && !planned.contains(&id),
-                            error: failures
-                                .remove(&id)
-                                .or_else(|| content_failures.remove(&id)),
-                            unwatched: metadata_covered.then(|| now_unwatched.clone()),
-                            ..Change::default()
-                        });
+                        change.coverage = Some(coverage);
+                        change.recoverable = !coverage && !planned.contains(&id);
+                        change.error = failures
+                            .remove(&id)
+                            .or_else(|| content_failures.remove(&id));
+                        change.unwatched = metadata_covered.then(|| now_unwatched.clone());
+                        pending.changes.entry(id).or_default().merge(change);
+                        pending.watched_files.insert(id, watched);
                         was_unwatched.insert(id, now_unwatched);
+                        if metadata_covered {
+                            was_metadata_blind.remove(&id);
+                        } else {
+                            was_metadata_blind.insert(id);
+                        }
                     }
                     was_unwatched.retain(|id, _| projects.contains_key(id));
+                    was_metadata_blind.retain(|id| projects.contains_key(id));
                     if !pending.changes.is_empty() {
                         wake();
                     }
@@ -1277,27 +1483,27 @@ impl Monitor {
 /// [`EVICTION_RETRY`] has passed, a full rearm, or success.
 fn reconcile(
     watcher: &mut impl Watcher,
-    registered: &mut BTreeMap<PathBuf, (RecursiveMode, u64, u64)>,
+    registered: &mut BTreeMap<PathBuf, RegisteredPath>,
     unadmitted: &mut BTreeMap<PathBuf, Instant>,
     desired: &BTreeMap<PathBuf, RecursiveMode>,
     metadata: &BTreeSet<PathBuf>,
     owners: &BTreeMap<PathBuf, BTreeSet<ProjectId>>,
     rearm: &Rearm,
     failures: &mut BTreeMap<ProjectId, String>,
-) -> BTreeSet<ProjectId> {
-    let mut rearmed = BTreeSet::new();
+) {
     if rearm.all {
         unadmitted.clear();
     } else {
         unadmitted.retain(|path, at| metadata.contains(path) && at.elapsed() < EVICTION_RETRY);
     }
-    registered.retain(|path, (mode, device, inode)| {
+    registered.retain(|path, watch| {
         if !rearm.all
             && !rearm.recursive.contains(path)
-            && desired.get(path) == Some(&*mode)
+            && desired.get(path) == Some(&watch.mode)
             && std::fs::symlink_metadata(path)
-                .is_ok_and(|metadata| metadata.dev() == *device && metadata.ino() == *inode)
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == watch.identity)
         {
+            watch.acquired = false;
             true
         } else {
             let _ = watcher.unwatch(path);
@@ -1351,15 +1557,19 @@ fn reconcile(
                     "watched directory changed during registration",
                 ));
             }
-            registered.insert(path.clone(), (mode, identity.dev(), identity.ino()));
+            registered.insert(
+                path.clone(),
+                RegisteredPath {
+                    mode,
+                    identity: (identity.dev(), identity.ino()),
+                    acquired: true,
+                },
+            );
             Ok(())
         });
         match result {
             Ok(()) => {
                 unadmitted.remove(path);
-                if let Some(ids) = owners.get(path) {
-                    rearmed.extend(ids);
-                }
             }
             Err(error) => {
                 // Recursive watch can fail after installing a partial subtree.
@@ -1372,26 +1582,26 @@ fn reconcile(
             }
         }
     }
-    rearmed
 }
 
 /// The worktrees `project`'s owner must read once a registration has put
 /// its watches in place, given the plan `before` it and which worktrees the
 /// previous and this registration left without file watches:
 ///
+/// - Every checkout when the owner has no registered baseline. Even a
+///   checkout with only metadata watches may have changed since a status
+///   read that ran before registration.
 /// - One whose plan asks for it ([`Worktree::needs_read_after`]).
 /// - One whose files are watched only now, because the budget reached it:
 ///   an edit made while it was unwatched would otherwise never show.
-/// - When the project's watches were re-registered (`rearmed`), every
-///   worktree whose files are watched, or every one at all when all
-///   watches were rebuilt (`Some(true)`): events may have been lost while
-///   they were down.
+/// - One whose file watches were acquired in this pass: events may have
+///   been lost while they were down.
 fn reads_after_registration(
     project: &Project,
     before: Option<&Project>,
     was_unwatched: Option<&BTreeSet<WorktreeId>>,
     now_unwatched: &BTreeSet<WorktreeId>,
-    rearmed: Option<bool>,
+    acquired: &BTreeSet<WorktreeId>,
 ) -> BTreeSet<WorktreeId> {
     let before = before
         .into_iter()
@@ -1402,11 +1612,12 @@ fn reads_after_registration(
         .worktrees
         .iter()
         .filter(|worktree| {
-            let watched =
-                worktree.interest.watches_files() && !now_unwatched.contains(&worktree.id);
-            worktree.needs_read_after(before.get(&worktree.id).copied())
-                || (watched && was_unwatched.is_some_and(|was| was.contains(&worktree.id)))
-                || rearmed.is_some_and(|all| all || worktree.interest.watches_files())
+            let old = before.get(&worktree.id).copied();
+            acquired.contains(&worktree.id)
+                || worktree.needs_read_after(old)
+                || (worktree.interest.watches_files()
+                    && !now_unwatched.contains(&worktree.id)
+                    && was_unwatched.is_some_and(|was| was.contains(&worktree.id)))
         })
         .map(|worktree| worktree.id)
         .collect()
@@ -1545,6 +1756,7 @@ mod tests {
         Project {
             id: ProjectId::new(),
             common_dir: common.clone(),
+            baseline_generation: 0,
             polling: None,
             worktrees: vec![
                 Worktree {
@@ -1567,6 +1779,45 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn status_read_dates_the_result_and_rejects_an_index_modified_during_the_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let git_dir = directory.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let index = git_dir.join("index");
+        let replacement = git_dir.join("index.lock");
+        let known_filesystem = Filesystem::of(&git_dir).unwrap().reports_rewrites();
+        std::fs::write(&index, "before").unwrap();
+        std::fs::write(&replacement, "after").unwrap();
+
+        let (at, read) = StatusRead::read(directory.path(), || {
+            std::fs::rename(&replacement, &index)?;
+            Ok::<_, std::io::Error>(Instant::now())
+        })
+        .unwrap();
+        assert!(read.completed_at >= at);
+        assert!(read.metadata_changed(directory.path()));
+
+        let (_, read) = StatusRead::read(directory.path(), || Ok::<_, ()>(())).unwrap();
+        assert_eq!(read.metadata_changed(directory.path()), !known_filesystem);
+        std::fs::remove_file(&index).unwrap();
+        assert!(read.metadata_changed(directory.path()));
+
+        let (_, missing_index) = StatusRead::read(directory.path(), || Ok::<_, ()>(())).unwrap();
+        assert_eq!(
+            missing_index.metadata_changed(directory.path()),
+            !known_filesystem
+        );
+        std::fs::write(&index, "recreated").unwrap();
+        assert!(missing_index.metadata_changed(directory.path()));
+
+        let (_, read) = StatusRead::read(directory.path(), || Ok::<_, ()>(())).unwrap();
+        std::fs::rename(&git_dir, directory.path().join("moved-git-dir")).unwrap();
+        std::fs::write(&git_dir, "gitdir: moved-git-dir\n").unwrap();
+        assert!(read.metadata_changed(directory.path()));
     }
 
     #[test]
@@ -1983,22 +2234,22 @@ mod tests {
             Some(&worked_first),
             Some(&first_unwatched),
             &linked_unwatched,
-            None,
+            &BTreeSet::new(),
         );
         assert_eq!(reads, BTreeSet::from([linked]));
-        // Registering the same plan again reads nothing; re-registering the
-        // project's watches reads every worktree whose files are watched.
-        let again = |rearmed| {
+        // Registering the same plan again only reads the checkouts whose
+        // content watches had to be set up again.
+        let again = |acquired: &BTreeSet<WorktreeId>| {
             reads_after_registration(
                 &worked_linked,
                 Some(&worked_linked),
                 Some(&linked_unwatched),
                 &linked_unwatched,
-                rearmed,
+                acquired,
             )
         };
-        assert!(again(None).is_empty());
-        assert_eq!(again(Some(false)), BTreeSet::from([first, linked]));
+        assert!(again(&BTreeSet::new()).is_empty());
+        assert_eq!(again(&BTreeSet::from([first])), BTreeSet::from([first]));
     }
 
     #[test]
@@ -2099,7 +2350,12 @@ mod tests {
             }
         }
 
-        let project = project(Path::new("/repo"));
+        let directory = tempfile::tempdir().unwrap();
+        let project = project(directory.path());
+        for worktree in &project.worktrees {
+            std::fs::create_dir_all(worktree.root.join("src")).unwrap();
+            std::fs::create_dir_all(&worktree.git_dir).unwrap();
+        }
         let (wake, woken) = mpsc::channel();
         let monitor = Monitor::with_watcher(
             move || {
@@ -2119,7 +2375,7 @@ mod tests {
             "a new plan's worktrees are read again once watched"
         );
         let mut rewritten = project.clone();
-        rewritten.worktrees[0].index = Some(IndexIdentity {
+        rewritten.worktrees[0].index = Some(FileIdentity {
             device: 1,
             inode: 2,
             size: 3,
@@ -2170,6 +2426,7 @@ mod tests {
             .unwrap();
         assert!(change.references);
         assert!(change.configuration);
+        assert_eq!(change.worktrees, BTreeSet::from([first.id, linked.id]));
         assert!(
             project
                 .change(&modified(project.common_dir.join("worktrees/new/gitdir")))
@@ -2295,8 +2552,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_bursts_ignore_locks_but_keep_real_rename_destinations_and_rescans() {
-        use notify::event::{AccessKind, Flag, RenameMode};
+    fn metadata_bursts_ignore_locks_but_keep_real_rename_destinations() {
+        use notify::event::{AccessKind, RenameMode};
 
         let project = project(Path::new("/repo"));
         let linked = &project.worktrees[1];
@@ -2343,12 +2600,6 @@ mod tests {
         assert!(change.references);
         assert!(!change.membership);
         assert!(change.worktrees.is_empty());
-        pending.changes.clear();
-        let rescan = Event::new(EventKind::Access(AccessKind::Any)).set_flag(Flag::Rescan);
-        assert!(pending.event(Ok(rescan)));
-        assert!(pending.changes[&project.id].topology);
-        assert!(pending.changes[&project.id].membership);
-        assert_eq!(pending.changes[&project.id].worktrees.len(), 2);
     }
 
     #[test]
@@ -2728,10 +2979,106 @@ mod tests {
         }
     }
 
+    #[test]
+    fn registration_overflow_and_rearm_only_invalidate_affected_watches() {
+        use notify::event::Flag;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        project.worktrees[1].interest = Interest::Metadata;
+        project.worktrees[1].census = Arc::default();
+        project.worktrees.push(Worktree {
+            id: WorktreeId::new(),
+            root: directory.path().join("third"),
+            git_dir: project.common_dir.join("worktrees/third"),
+            ..project.worktrees[0].clone()
+        });
+        for worktree in &project.worktrees {
+            std::fs::create_dir_all(worktree.root.join("src")).unwrap();
+            std::fs::create_dir_all(&worktree.git_dir).unwrap();
+        }
+        let primary = project.worktrees[0].id;
+        let expected = BTreeSet::from([primary, project.worktrees[2].id]);
+        let (wake, woken) = mpsc::sync_channel(1);
+        let (handler, incoming) = mpsc::channel();
+        let watcher = Monitor::with_watcher(
+            move || {
+                let _ = wake.try_send(());
+            },
+            move |emit| {
+                assert!(handler.send(emit).is_ok());
+                Ok(LimitedWatcher {
+                    capacity: 32,
+                    ..Default::default()
+                })
+            },
+        )
+        .unwrap();
+        let monitor = (watcher, woken);
+        let mut emit = incoming.recv_timeout(Duration::from_secs(5)).unwrap();
+        let id = project.id;
+        let project = Arc::new(project);
+        let recovering = |change: &Change| {
+            assert!(change.rescan && change.topology && change.membership);
+            assert!(change.references && change.configuration);
+        };
+
+        monitor.0.configure(vec![project.clone()]);
+        wait_for(&monitor, id, "first registration", |change| {
+            assert_eq!(change.coverage, Some(true));
+            recovering(change);
+            assert_eq!(
+                change.worktrees,
+                project
+                    .worktrees
+                    .iter()
+                    .map(|worktree| worktree.id)
+                    .collect()
+            );
+            true
+        });
+
+        let source = project.worktrees[0].root.join("src");
+        let old_source = std::fs::File::open(&source).unwrap();
+        std::fs::remove_dir(&source).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        monitor.0.configure(vec![project.clone()]);
+        wait_for(&monitor, id, "replaced directory watch", |change| {
+            assert!(!change.rescan && !change.topology && !change.references);
+            assert_eq!(change.worktrees, BTreeSet::from([primary]));
+            true
+        });
+        drop(old_source);
+
+        emit(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        wait_for(&monitor, id, "overflow", |change| {
+            assert_eq!(change.coverage, None);
+            recovering(change);
+            assert_eq!(change.worktrees, expected);
+            true
+        });
+
+        emit(Err(notify::Error::generic("fixture backend fault")));
+        wait_for(&monitor, id, "backend fault", |change| {
+            assert_eq!(change.coverage, Some(false));
+            assert!(change.recoverable);
+            recovering(change);
+            assert_eq!(change.worktrees, expected);
+            true
+        });
+        monitor.0.configure(vec![project]);
+        wait_for(&monitor, id, "full rearm", |change| {
+            assert_eq!(change.coverage, Some(true));
+            recovering(change);
+            assert_eq!(change.worktrees, expected);
+            true
+        });
+    }
+
     fn registered_transition(
         pending: &mut Pending,
         watcher: &mut LimitedWatcher,
-        registered: &mut BTreeMap<PathBuf, (RecursiveMode, u64, u64)>,
+        registered: &mut BTreeMap<PathBuf, RegisteredPath>,
         desired: &BTreeMap<PathBuf, RecursiveMode>,
         metadata: &BTreeSet<PathBuf>,
         owners: &BTreeMap<PathBuf, BTreeSet<ProjectId>>,
