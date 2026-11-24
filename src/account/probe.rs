@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
+    time::Instant,
 };
 
 use super::{
@@ -38,6 +39,7 @@ use super::{
 use crate::{agent::Provider, chat::Model};
 
 mod acp;
+mod antigravity_usage;
 pub mod conversations;
 mod inputs;
 pub mod login_path;
@@ -155,7 +157,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     if force {
         run_forced(account, cache, second_home, TIMEOUT).await
     } else {
-        run_reading(account, cache, Reuse::Reading, second_home).await
+        run_reading(account, cache, Reuse::Reading, second_home, None).await
     }
 }
 
@@ -165,7 +167,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
 /// reading, because the login it names is current either way.
 pub async fn login(account: Account, cache: Option<Cache>) -> Outcome {
     let second_home = second_home(&account, &|name| std::env::var(name).ok());
-    run_reading(account, cache, Reuse::Login, second_home).await
+    run_reading(account, cache, Reuse::Login, second_home, None).await
 }
 
 /// Which cached answer a probe may return instead of running the CLI.
@@ -186,6 +188,7 @@ async fn run_forced(
     second_home: Option<PathBuf>,
     timeout: Duration,
 ) -> Outcome {
+    let deadline = Instant::now() + timeout;
     let reading = async {
         loop {
             let outcome = run_reading(
@@ -193,6 +196,7 @@ async fn run_forced(
                 cache.clone(),
                 Reuse::Never,
                 second_home.clone(),
+                Some(deadline),
             )
             .await;
             if !matches!(outcome, Outcome::Busy) {
@@ -202,7 +206,7 @@ async fn run_forced(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     };
-    tokio::time::timeout(timeout, reading)
+    tokio::time::timeout_at(deadline, reading)
         .await
         .unwrap_or_else(|_| {
             Outcome::Failed(format!(
@@ -220,6 +224,7 @@ async fn run_reading(
     cache: Option<Cache>,
     reuse: Reuse,
     second_home: Option<PathBuf>,
+    force_deadline: Option<Instant>,
 ) -> Outcome {
     let now = now_ms();
     let search_path = search_path().await;
@@ -242,9 +247,17 @@ async fn run_reading(
         }) => (program, key, lock, fingerprint),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
-    let probed = tokio::time::timeout(
-        TIMEOUT,
-        probe_cli(&account, &program, search_path.as_deref(), cache.as_ref()),
+    let probe_deadline = Instant::now() + TIMEOUT;
+    let result_deadline = force_deadline.map_or(probe_deadline, |limit| limit.min(probe_deadline));
+    let probed = tokio::time::timeout_at(
+        probe_deadline,
+        probe_cli(
+            &account,
+            &program,
+            search_path.as_deref(),
+            cache.as_ref(),
+            result_deadline,
+        ),
     )
     .await;
     let mut outcome = match probed {
@@ -412,7 +425,7 @@ fn prepare(
     if reuse != Reuse::Never
         && let (Some(key), Some(fingerprint)) = (&key, &fingerprint)
         && let Some(entry) = cache.unchanged(key, fingerprint, now, inputs::UNCHANGED_FOR)
-        && inputs::vouches_for(account.provider, entry.snapshot.status)
+        && inputs::vouches_for(entry.snapshot.status)
     {
         // Nothing the answer depends on has changed, which is as good as
         // asking again now, without starting the CLI.
@@ -524,12 +537,15 @@ async fn probe_cli(
     program: &Path,
     search_path: Option<&OsStr>,
     cache: Option<&Cache>,
+    deadline: Instant,
 ) -> Result<Probed, String> {
     match account.provider {
         Provider::Claude => probe_claude_with_path(account, program, search_path, cache).await,
         Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
-        Provider::Antigravity => acp::probe_antigravity(account, program, search_path).await,
+        Provider::Antigravity => {
+            acp::probe_antigravity(account, program, search_path, deadline).await
+        }
         Provider::Muse => muse::probe_muse(account, program, search_path).await,
     }
 }
@@ -3439,23 +3455,49 @@ PATH=/fixture/bin eval "$3"
             prepare(&agy, Some(&cache), Reuse::Never, now, path),
             Prepared::Probe { .. }
         ));
-        // Once such a check has answered, its answer stands rather than the
-        // missing home: a later scheduled read asks the agent again.
-        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "probed", observed_at);
+        // A cached sign-in stands when the home is absent. Once the usage
+        // schedule is due, even an old input fingerprint cannot skip the probe.
+        let mut snapshot = UsageSnapshot::state(
+            UsageStatus::Ok,
+            "Antigravity does not report usage limits",
+            observed_at,
+        );
         snapshot.source = UsageSource::Probe;
+        let key = agy.cache_key().unwrap();
         cache
-            .store(
-                &agy.cache_key().unwrap(),
+            .store_observed(
+                &key,
                 Entry {
                     identity: None,
-                    snapshot,
+                    snapshot: snapshot.clone(),
                     inventory_observed_at: Some(observed_at),
+                },
+                Some("old probe inputs".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            prepare(&agy, Some(&cache), Reuse::Reading, now, path),
+            Prepared::Probe {
+                fingerprint: None,
+                ..
+            }
+        ));
+        // A recent check is shared with other windows on the ordinary schedule.
+        snapshot.observed_at = now - 1;
+        cache
+            .store(
+                &key,
+                Entry {
+                    identity: None,
+                    inventory_observed_at: Some(snapshot.observed_at),
+                    snapshot,
                 },
             )
             .unwrap();
         assert!(matches!(
             prepare(&agy, Some(&cache), Reuse::Reading, now, path),
-            Prepared::Probe { .. }
+            Prepared::Done(Outcome::Answered { snapshot, .. })
+                if snapshot.source == UsageSource::Cache
         ));
     }
 

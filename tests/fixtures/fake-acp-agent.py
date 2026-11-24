@@ -3,13 +3,13 @@
 
 It answers over stdio like `agy acp` or `muse acp`, without network access,
 credentials or a model, and never touches the real agents' data. Its replies
-copy the shapes of Antigravity 1.5.12's and Muse 1.4.23's `initialize` and
+copy the shapes of Antigravity 1.5.15's and Muse 1.4.23's `initialize` and
 `session/new` answers: by default Antigravity's, Muse's when it is run as
-`muse` or `muse-upstream` or with FAKE_ACP_SHAPE=muse. Any command-line
-arguments, such as `acp --disable-telemetry`, are accepted and ignored,
-but for Antigravity's `--app-data-dir DIR`, which keeps that process's
-conversations apart from the ones it lists otherwise, as `agy` keeps them
-in ~/.gemini/DIR rather than ~/.gemini/antigravity-cli.
+`muse` or `muse-upstream` or with FAKE_ACP_SHAPE=muse. ACP arguments such as
+`acp --disable-telemetry` are accepted and ignored, but for Antigravity's
+`--app-data-dir DIR`, which keeps that process's conversations apart from
+the ones it lists otherwise, as `agy` keeps them in ~/.gemini/DIR rather
+than ~/.gemini/antigravity-cli.
 
 Each conversation is saved under the explicitly supplied FAKE_ACP_STATE
 inside a marked fixture home as the session updates it sent, so
@@ -66,7 +66,7 @@ Environment switches:
                             writes them
   FAKE_ACP_LOGIN_SECONDS=N  how long `login` waits before signing in
   FAKE_ACP_VERSION=V        the version `initialize` reports (default
-                            `fixture`, a current one)
+                            `1.5.18` for Antigravity, `fixture` for Muse)
   FAKE_ACP_CANCEL_SECONDS=N how long a stopped turn takes to end after
                             `session/cancel`, as an agent that winds down
                             its work first (default 0)
@@ -101,6 +101,8 @@ Files under FAKE_ACP_STATE switch states that last across processes:
   unavailable-mode omits the named mode from the advertised choices
   reject-mode     rejects a request to set the mode
   ignore-mode     returns its current config without changing mode
+  quota-unavailable  Antigravity's `/usage` reports no summary for the account
+  quota-hangs        Antigravity's `/usage` stalls until the probe times out
 
 Run with `--app-data-dir DIR`, as cagents' Antigravity probe runs `agy acp`,
 it saves each new session's files under ~/.gemini/DIR the way agy does
@@ -108,7 +110,8 @@ it saves each new session's files under ~/.gemini/DIR the way agy does
 `implicit/ID.pb`), so a probe can be checked for leaving them behind.
 
 In the Muse shape, `usage [--json]`, `login` and `logout` answer like Muse's
-account commands.
+account commands. In the Antigravity shape, `--print /usage --output-format json`
+reports two model pools with five-hour and weekly quota windows.
 """
 import fcntl
 import json
@@ -239,11 +242,12 @@ def logged_out():
 
 def version():
     """The version `initialize` reports: Antigravity's `version` state file,
-    else FAKE_ACP_VERSION, else `fixture`, which stands for a current one."""
+    else FAKE_ACP_VERSION, else a current version for the fixture's shape."""
+    current = "1.5.18" if SHAPE == "agy" else "fixture"
     if SHAPE == "agy" and marked("version"):
         with open(os.path.join(MARKS, "version")) as recorded:
-            return recorded.read().strip() or "fixture"
-    return os.environ.get("FAKE_ACP_VERSION") or "fixture"
+            return recorded.read().strip() or current
+    return os.environ.get("FAKE_ACP_VERSION") or current
 
 
 def keyring_locked():
@@ -1054,9 +1058,53 @@ def work_result(call, name, arguments, output, failed):
     return update
 
 
+def antigravity_usage():
+    if logged_out():
+        print("Sign in to Antigravity to see usage.", file=sys.stderr)
+        return 1
+    if marked("quota-unavailable"):
+        send({"status": "ERROR", "error": "/usage failed: no quota summary is available for this account"})
+        return 1
+    if marked("quota-hangs"):
+        time.sleep(30)
+
+    now = time.time()
+
+    def bucket(pool, window, name, remaining, reset_in):
+        return {"id": f"{pool}-{window}", "name": name, "window": window,
+                "remaining_fraction": remaining,
+                "reset_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + reset_in))}
+
+    groups = [
+        {"name": "Gemini models", "buckets": [
+            bucket("gemini", "5h", "5-hour", 0.65, 2 * 3600),
+            bucket("gemini", "weekly", "Weekly", 0.81, 4 * 86400),
+        ]},
+        {"name": "Claude and GPT-OSS models", "buckets": [
+            bucket("other", "5h", "5-hour", 0.14, 3 * 3600),
+            bucket("other", "weekly", "Weekly", 0.42, 5 * 86400),
+        ]},
+    ]
+    send({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": groups}}})
+    return 0
+
+
 def command_line(arguments):
-    """Muse's account commands, for a fixture installed as `muse-upstream`:
-    `usage --json`, `login` and `logout`. Anything else serves ACP."""
+    """Answer the agent's account commands; anything else serves ACP."""
+    if SHAPE == "agy":
+        if arguments[:2] in (["--print", "/usage"], ["-p", "/usage"]):
+            if arguments[2:4] != ["--output-format", "json"]:
+                print("Pass --output-format json to read the quota fixture.", file=sys.stderr)
+                return 1
+            if "--disable-slash-commands=false" not in arguments:
+                print("Enable slash commands explicitly for the quota probe.", file=sys.stderr)
+                return 1
+            settings = arguments[arguments.index("--settings") + 1] if "--settings" in arguments else "{}"
+            if json.loads(settings).get("disableSlashCommands") is not False:
+                print("Override disabled slash commands in the quota probe settings.", file=sys.stderr)
+                return 1
+            return antigravity_usage()
+        return None
     if SHAPE != "muse" or not arguments or arguments[0] not in ("usage", "login", "logout"):
         return None
     marker = os.path.join(STATE, "signed-out")
