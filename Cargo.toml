@@ -178,6 +178,8 @@ directories = "6.0"
 # Verifies the signature on a release's metadata before an update trusts it.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", optional = true }
+# The one-time key a phone pairs with; already in the graph through uuid.
+getrandom = "0.4"
 glob = "0.3.4"
 # Seals the messages the daemon delivers between sessions, so a conversation
 # can tell them apart from text that merely looks like one. Daemon only.

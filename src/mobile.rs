@@ -18,6 +18,7 @@
 //! exits; reconnecting starts the bridge that matches the daemon then running.
 
 mod conversation;
+pub mod pairing;
 mod translate;
 
 use std::{
@@ -150,7 +151,8 @@ fn negotiate(hello: &api::Hello) -> Option<u32> {
     (newest >= hello.api_min.max(api::MIN_API_VERSION)).then_some(newest)
 }
 
-fn host_name() -> Option<String> {
+/// This computer's host name.
+pub fn host_name() -> Option<String> {
     let mut buffer = [0u8; 256];
     // SAFETY: the buffer is valid for its whole length; gethostname writes at
     // most that many bytes.
