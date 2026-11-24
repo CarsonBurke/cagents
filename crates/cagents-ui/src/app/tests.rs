@@ -3205,20 +3205,31 @@ fn review_file_panel_control_remains_accessible_across_pane_widths() {
     use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
-    let mut pane = app.pull_request_pane(&crate::model::PullRequestView {
+    let view = crate::model::PullRequestView {
         repository: PathBuf::from("/repo"),
         selected_number: None,
         file_panel_width: None,
         file_panel_collapsed: None,
-    });
+    };
+    let mut pane = app.pull_request_pane(&view);
     let renderer = headless_renderer();
-    for (width, collapsed, label) in [
-        (260.0, None, "Show review files"),
-        (260.0, Some(false), "Hide review files"),
-        (500.0, None, "Show review files"),
-        (900.0, None, "Hide review files"),
+    // Until a pull request is open the panel holds the list to choose from,
+    // so only an open review folds it away on a narrow card unasked.
+    for (width, collapsed, open, label) in [
+        (260.0, None, false, "Hide pull requests"),
+        (260.0, Some(true), false, "Show pull requests"),
+        (500.0, None, false, "Hide pull requests"),
+        (260.0, None, true, "Show review files"),
+        (260.0, Some(false), true, "Hide review files"),
+        (500.0, None, true, "Show review files"),
+        (900.0, None, true, "Hide review files"),
     ] {
         pane.file_panel_collapsed = collapsed;
+        pane.review = if open {
+            crate::pull_request_review::discussion_ui::test_support::ready()
+        } else {
+            app.pull_request_pane(&view).review
+        };
         drop(app.workspace.resize_viewport(width));
         let mut element = app.pull_request_card_view(card, &pane);
         let mut tree = Tree::new(element.as_widget());

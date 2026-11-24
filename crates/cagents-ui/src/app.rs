@@ -5730,9 +5730,13 @@ impl PullRequestPane {
     }
 }
 
-/// Whether a pull request card `width` wide hides its side panel.
+/// Whether a pull request card `width` wide hides its side panel: the
+/// person's choice, or else whether a narrow card needs the room for an open
+/// review. Until one is open the panel holds the list to choose from and the
+/// rest of the card is empty, so it is never folded away unasked.
 fn review_files_collapsed(pane: &PullRequestPane, width: f32) -> bool {
-    pane.file_panel_collapsed.unwrap_or(width < 640.0)
+    pane.file_panel_collapsed
+        .unwrap_or(width < 640.0 && pane.review.is_open())
 }
 
 /// Static chrome strings for a card kind.
@@ -8300,10 +8304,11 @@ impl Cagents {
         let file_panel_toggle = || {
             crate::ui_controls::icon_button(
                 Icon::Sidebar,
-                if collapsed {
-                    "Show review files"
-                } else {
-                    "Hide review files"
+                match (collapsed, review.is_open()) {
+                    (true, true) => "Show review files",
+                    (false, true) => "Hide review files",
+                    (true, false) => "Show pull requests",
+                    (false, false) => "Hide pull requests",
                 },
             )
             .selected(!collapsed)
