@@ -1331,7 +1331,7 @@ fn changing_edge_timing() {
     // `CAGENTS_WORKLOAD_PERF_CTL=FIFO` names the control FIFO of a
     // `perf record --control fifo:FIFO -D -1`, which then samples only them:
     // building the workspace otherwise dominates a profile.
-    let count = multiplier("CAGENTS_WORKLOAD_EDGES").unwrap_or(12);
+    let count = multiplier("CAGENTS_WORKLOAD_EDGES").unwrap_or(12).max(1);
     let perf = std::env::var_os("CAGENTS_WORKLOAD_PERF_CTL").map(|fifo| {
         std::fs::OpenOptions::new()
             .write(true)

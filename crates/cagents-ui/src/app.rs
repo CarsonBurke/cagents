@@ -9602,12 +9602,22 @@ impl Cagents {
         self.prune_presence();
     }
 
-    /// Whether a closed card other than `card` shows `terminal`.
-    fn closed_terminal_elsewhere(&mut self, card: CardId, terminal: TerminalId) -> bool {
-        self.index_cards();
-        self.closed_cards_by_terminal
-            .get(&terminal)
-            .is_some_and(|cards| cards.iter().any(|closed| *closed != card))
+    /// Whether a closed card other than `card` shows `terminal`. The index
+    /// answers while it is current; a pass that changed the workspace since
+    /// asks the cards themselves, rather than rebuilding every index once
+    /// per pane it restores.
+    fn closed_terminal_elsewhere(&self, card: CardId, terminal: TerminalId) -> bool {
+        if self.card_indices_source.as_ptr() == Arc::as_ptr(&self.durable) {
+            return self
+                .closed_cards_by_terminal
+                .get(&terminal)
+                .is_some_and(|cards| cards.iter().any(|closed| *closed != card));
+        }
+        self.durable.cards.iter().any(|source| {
+            source.id != card
+                && !source.existence.is_open()
+                && matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal)
+        })
     }
 
     /// Rebuilds everything the workspace derives for the sidebar, the panes'
