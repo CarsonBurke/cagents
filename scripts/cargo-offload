@@ -54,6 +54,8 @@ import time
 
 # The gate builds here: CAGENTS_BUILD_REMOTE is `local` or names this host.
 FALL_BACK = 75
+# A read-only Cargo query can run here without admission, even on the build host.
+LOCAL_QUERY = 76
 # A command the build host cannot run faithfully, which building here would hide.
 REFUSED = 78
 # The build host could not lease a slot for a reason waiting does not fix.
@@ -69,13 +71,18 @@ REMOTE = {
     "test": "test", "t": "test", "bench": "bench", "doc": "doc", "d": "doc",
     "rustc": "rustc", "rustdoc": "rustdoc", "run": "run", "r": "run", "fix": "fix",
 }
+# Built-in queries that do not touch Cargo's build directories. Aliases and
+# external commands need the usual local admission, as does `clean`.
+QUERIES = {
+    "metadata", "tree", "locate-project", "pkgid", "help", "-V", "--version", "-vV",
+    "--list", "-h", "--help",
+}
 # Subcommands that read or change only this checkout, the lock file or
 # Cargo's caches, and compile nothing: they run here as they are.
-HERE = {
-    "metadata", "tree", "fmt", "locate-project", "pkgid", "fetch", "generate-lockfile",
-    "update", "vendor", "clean", "search", "version", "help", "verify-project",
+HERE = QUERIES | {
+    "fmt", "fetch", "generate-lockfile", "update", "vendor", "clean", "search", "version", "verify-project",
     "read-manifest", "config", "info", "add", "remove", "new", "init", "owner", "yank",
-    "login", "logout", "report", "-V", "--version", "-vV", "--list", "-h", "--help",
+    "login", "logout", "report",
 }
 # Options that take a value in the next argument when not given with `=`.
 VALUED = {
@@ -240,10 +247,19 @@ class Plan:
         return words + self.trailing
 
 
+def cargo_words(arguments):
+    return arguments[1:] if arguments[:1] and arguments[0].startswith("+") else arguments
+
+
+def local_query(arguments):
+    words = cargo_words(arguments)
+    return bool(words and words[0] in QUERIES and (len(words) == 1 or not words[0].startswith("-")))
+
+
 def parse(arguments):
     """The Plan for a command that compiles, or None for one that runs here.
     Raises Refusal for one that compiles and cannot run on the build host."""
-    words = arguments[1:] if arguments[:1] and arguments[0].startswith("+") else arguments
+    words = cargo_words(arguments)
     if not words or words[0] in HERE:
         return None
     if words[0].startswith("-"):
@@ -2888,9 +2904,10 @@ def main(arguments):
     if arguments[:1] == ["--host"]:
         # Where builds go: 0, printing the build host, marked when that is
         # this host reached by loopback, or FALL_BACK when this host builds
-        # in place. Any other status is a failure.
+        # in place. Cargo arguments may follow; LOCAL_QUERY runs one here
+        # without taking a slot. Any other status is a failure.
         if here:
-            return FALL_BACK
+            return LOCAL_QUERY if local_query(arguments[1:]) else FALL_BACK
         print(host + (LOOPBACK_MARK if loopback else ""))
         return 0
     if here:
