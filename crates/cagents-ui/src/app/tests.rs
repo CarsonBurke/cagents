@@ -12161,6 +12161,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
             .unwrap_or_default(),
         card_chrome: HashMap::new(),
         card_indices: HashMap::new(),
+        closed_cards_by_terminal: HashMap::new(),
         card_indices_source: std::sync::Weak::new(),
         terminal_ordinals_source: std::sync::Weak::new(),
         navigation_cache: sidebar::NavigationCache::default(),

@@ -1276,19 +1276,23 @@ fn changing_edge_timing() {
     // `CAGENTS_WORKLOAD_HISTORY=N` multiplies the workspace's history - closed
     // cards, worktrees and their empty views - leaving what is open alone, so
     // runs at two sizes show which work grows with history.
-    let history = std::env::var("CAGENTS_WORKLOAD_HISTORY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
+    // `CAGENTS_WORKLOAD_CLOSED=N` multiplies closed cards alone, overriding it.
+    let multiplier = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    let history = multiplier("CAGENTS_WORKLOAD_HISTORY").unwrap_or(1);
+    let closed = multiplier("CAGENTS_WORKLOAD_CLOSED").unwrap_or(history);
     let scale = Scale {
         worktrees: Scale::LARGE.worktrees * history,
-        closed_cards: Scale::LARGE.closed_cards * history,
+        closed_cards: Scale::LARGE.closed_cards * closed,
         historical_views: Scale::LARGE.historical_views * history,
         ..Scale::LARGE
     };
     let (mut app, channels, directory) = large_workspace(&scale);
     eprintln!(
-        "history x{history}: {} cards, {} views",
+        "history x{history}, closed cards x{closed}: {} cards, {} views",
         app.durable.cards.len(),
         app.workspace_model.views.len()
     );
@@ -1323,10 +1327,29 @@ fn changing_edge_timing() {
             })
             .collect::<Vec<_>>()
     };
+    // `CAGENTS_WORKLOAD_EDGES=N` measures N edges rather than 12, and
+    // `CAGENTS_WORKLOAD_PERF_CTL=FIFO` names the control FIFO of a
+    // `perf record --control fifo:FIFO -D -1`, which then samples only them:
+    // building the workspace otherwise dominates a profile.
+    let count = multiplier("CAGENTS_WORKLOAD_EDGES").unwrap_or(12);
+    let perf = std::env::var_os("CAGENTS_WORKLOAD_PERF_CTL").map(|fifo| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(fifo)
+            .expect("perf control FIFO")
+    });
+    let perf_control = |command: &str| {
+        if let Some(mut fifo) = perf.as_ref() {
+            std::io::Write::write_all(&mut fifo, format!("{command}\n").as_bytes())
+                .expect("perf control");
+        }
+    };
     let mut apart = Vec::new();
     let counter = RetiredInstructions::open();
     let mut instructions = Vec::new();
-    for edge in edges(&app, 12) {
+    let measured = edges(&app, count);
+    perf_control("enable");
+    for edge in measured {
         let before = counter.as_ref().map(RetiredInstructions::read);
         let started = Instant::now();
         drop(app.update(Message::WorkspaceModelObserved(edge)));
@@ -1335,6 +1358,7 @@ fn changing_edge_timing() {
             instructions.push(counter.read() - before);
         }
     }
+    perf_control("disable");
     summary("update per changing edge", &mut apart);
     if instructions.is_empty() {
         eprintln!("instructions per changing edge: no hardware counter here");

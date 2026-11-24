@@ -5964,6 +5964,10 @@ pub struct Cagents {
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
+    /// The closed cards showing each terminal session, from the same
+    /// workspace as `card_indices`, so a lookup by session needs no walk of
+    /// the workspace's whole card history.
+    closed_cards_by_terminal: HashMap<TerminalId, Vec<CardId>>,
     /// The workspace `card_indices` was built from. Holding it weakly pins
     /// its allocation, so a changed workspace always has a different address.
     card_indices_source: std::sync::Weak<WorkspaceState>,
@@ -9583,14 +9587,27 @@ impl Cagents {
         terminal_output_tests::record_card_index();
         self.card_indices_source = Arc::downgrade(&self.durable);
         self.card_indices.clear();
-        self.card_indices.extend(
-            self.durable
-                .cards
-                .iter()
-                .enumerate()
-                .map(|(index, card)| (card.id, index)),
-        );
+        self.closed_cards_by_terminal.clear();
+        for (index, card) in self.durable.cards.iter().enumerate() {
+            self.card_indices.insert(card.id, index);
+            if !card.existence.is_open()
+                && let CardKind::Terminal(session) = &card.kind
+            {
+                self.closed_cards_by_terminal
+                    .entry(session.id)
+                    .or_default()
+                    .push(card.id);
+            }
+        }
         self.prune_presence();
+    }
+
+    /// Whether a closed card other than `card` shows `terminal`.
+    fn closed_terminal_elsewhere(&mut self, card: CardId, terminal: TerminalId) -> bool {
+        self.index_cards();
+        self.closed_cards_by_terminal
+            .get(&terminal)
+            .is_some_and(|cards| cards.iter().any(|closed| *closed != card))
     }
 
     /// Rebuilds everything the workspace derives for the sidebar, the panes'
@@ -16686,6 +16703,7 @@ impl Application for Cagents {
             terminal_paste: None,
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            closed_cards_by_terminal: HashMap::new(),
             card_indices_source: std::sync::Weak::new(),
             terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),

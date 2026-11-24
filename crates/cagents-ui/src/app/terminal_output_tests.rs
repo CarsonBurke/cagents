@@ -648,6 +648,31 @@ fn card_indices_rebuild_only_for_a_changed_workspace() {
     assert!(!app.card_indices.contains_key(&first.id));
 }
 
+/// A closed card showing a terminal is found by its session without a walk
+/// of every card, including one closed since the index was built, and a
+/// card is never its own closed source.
+#[test]
+fn a_closed_terminal_is_found_by_its_session_after_the_workspace_changes() {
+    let (mut app, card, _peer) = fixture();
+    let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+        panic!("the fixture card is a terminal");
+    };
+    let terminal = session.id;
+    let other = CardId::new();
+    assert!(
+        !app.closed_terminal_elsewhere(other, terminal),
+        "an open card is no closed source"
+    );
+    let index = app.card_index(card).unwrap();
+    Arc::make_mut(&mut app.durable).cards[index].existence =
+        project_ui::removed_existence("closed");
+    assert!(app.closed_terminal_elsewhere(other, terminal));
+    assert!(
+        !app.closed_terminal_elsewhere(card, terminal),
+        "a card is not its own closed source"
+    );
+}
+
 #[test]
 fn clipboard_reply_is_delivered_even_when_no_metadata_changed() {
     use cosmic::iced::futures::StreamExt;

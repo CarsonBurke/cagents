@@ -146,12 +146,12 @@ fn projection_resource(kind: &CardKind) -> Option<ProjectionResource> {
     }
 }
 
-/// Each open card's worktree during one projection, with how many cards
-/// each path holds, so a view no card resolves to is known without a scan.
+/// Each open card's worktree during one projection, and the cards each path
+/// holds, so a view's cards are known without a scan.
 #[derive(Default)]
 struct CardWorktrees {
     paths: HashMap<CardId, PathBuf>,
-    counts: HashMap<PathBuf, usize>,
+    cards: HashMap<PathBuf, HashSet<CardId>>,
 }
 
 impl CardWorktrees {
@@ -161,20 +161,17 @@ impl CardWorktrees {
     }
 
     fn holds(&self, path: &Path) -> bool {
-        self.counts.contains_key(path)
+        self.cards.contains_key(path)
     }
 
     /// The cards resolving to `path`, in no particular order.
-    fn cards_in<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = CardId> + 'a {
-        self.paths
-            .iter()
-            .filter(move |(_, card_path)| card_path.as_path() == path)
-            .map(|(&card, _)| card)
+    fn cards_in(&self, path: &Path) -> impl Iterator<Item = CardId> + '_ {
+        self.cards.get(path).into_iter().flatten().copied()
     }
 
     fn insert(&mut self, card: CardId, path: PathBuf) {
         self.remove(card);
-        *self.counts.entry(path.clone()).or_default() += 1;
+        self.cards.entry(path.clone()).or_default().insert(card);
         self.paths.insert(card, path);
     }
 
@@ -182,10 +179,10 @@ impl CardWorktrees {
         let Some(path) = self.paths.remove(&card) else {
             return;
         };
-        if let Some(count) = self.counts.get_mut(&path) {
-            *count -= 1;
-            if *count == 0 {
-                self.counts.remove(&path);
+        if let Some(cards) = self.cards.get_mut(&path) {
+            cards.remove(&card);
+            if cards.is_empty() {
+                self.cards.remove(&path);
             }
         }
     }
@@ -3953,11 +3950,7 @@ impl Cagents {
             // projection-local deduplication.
             self.shared_views.restoration_requests.remove(&pane.id);
         }
-        if self.session.is_none() || !self.durable.cards.iter().any(|source| {
-            source.id != pane.id
-                && !source.existence.is_open()
-                && matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal.id)
-        }) {
+        if self.session.is_none() || !self.closed_terminal_elsewhere(pane.id, terminal.id) {
             return;
         }
         // Resolving the recipe's actual archived owner belongs to the ordered
