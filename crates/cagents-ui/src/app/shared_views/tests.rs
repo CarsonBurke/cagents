@@ -3751,7 +3751,8 @@ fn presentation_noop_projection_does_not_copy_a_writer_held_workspace() {
     let owned = view.panes.iter().map(|pane| pane.id).collect();
     let writer = app.durable.clone();
     app.shared_views.applying = true;
-    drop(app.project_shared_view_with_cards(&view, &owned, current));
+    let listed = app.registry_listed_panes();
+    drop(app.project_shared_view_with_cards(&view, &owned, &listed, current));
     app.shared_views.applying = false;
     assert!(Arc::ptr_eq(&writer, &app.durable));
     assert_eq!(app.shared_views.order_rewrites, 0);
@@ -9885,4 +9886,62 @@ fn a_pane_reopening_in_a_channel_keeps_its_place_until_it_starts() {
         app.shared_views.pending
     );
     assert_eq!(order(&app), [first.id, held, last.id]);
+}
+
+/// A worktree strip visits only the cards resolving to its path, yet lists
+/// exactly what a walk of every card would: open, not in a channel, in the
+/// workspace's card order whatever order the cards resolved in.
+#[test]
+#[cfg(not(feature = "integrated-browser"))]
+fn a_worktree_strip_lists_its_cards_in_workspace_order_without_walking_history() {
+    let (mut app, channel, _, pane) = presentation_fixture();
+    let path = PathBuf::from("/repo/feature");
+    let base = app.card_state(pane.id).unwrap().clone();
+    let cards = (0..8)
+        .map(|index| {
+            let mut card = base.clone();
+            card.id = CardId::new();
+            if index == 2 {
+                card.existence = super::super::project_ui::removed_existence("history");
+            }
+            card
+        })
+        .collect::<Vec<_>>();
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards.extend(cards.iter().cloned());
+    durable
+        .channels
+        .iter_mut()
+        .find(|candidate| candidate.id == channel)
+        .unwrap()
+        .cards
+        .push(cards[5].id);
+    // As a pass does, so the strip reads members through the card index.
+    app.index_cards();
+    let mut local_worktrees = CardWorktrees::default();
+    for card in cards.iter().rev() {
+        local_worktrees.insert(card.id, path.clone());
+    }
+    local_worktrees.insert(cards[7].id, PathBuf::from("/repo/other"));
+
+    let walked = app
+        .durable
+        .cards
+        .iter()
+        .filter(|card| {
+            shows_in_worktree(card)
+                && !app
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.cards.contains(&card.id))
+                && local_worktrees.get(card.id) == Some(&path)
+        })
+        .map(|card| card.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        walked,
+        [0, 1, 3, 4, 6].map(|index| cards[index].id).to_vec()
+    );
+    assert_eq!(app.worktree_strip_cards(&local_worktrees, &path), walked);
 }

@@ -155,12 +155,21 @@ struct CardWorktrees {
 }
 
 impl CardWorktrees {
+    #[cfg(test)]
     fn get(&self, card: CardId) -> Option<&PathBuf> {
         self.paths.get(&card)
     }
 
     fn holds(&self, path: &Path) -> bool {
         self.counts.contains_key(path)
+    }
+
+    /// The cards resolving to `path`, in no particular order.
+    fn cards_in<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = CardId> + 'a {
+        self.paths
+            .iter()
+            .filter(move |(_, card_path)| card_path.as_path() == path)
+            .map(|(&card, _)| card)
     }
 
     fn insert(&mut self, card: CardId, path: PathBuf) {
@@ -3672,6 +3681,9 @@ impl Cagents {
             }
         }
         phase.mark(stage("selected_prepare", "shared_worktrees"));
+        // Whether the registry lists a pane, read once for every pane this
+        // pass projects rather than by a walk of every view for each.
+        let listed = self.registry_listed_panes();
         let mut projected_scopes = Vec::new();
         for view in views {
             if selected.is_some_and(|selected| !selected.contains(&view.scope)) {
@@ -3690,26 +3702,28 @@ impl Cagents {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
                 // Most views are historical: no card resolves to them at all.
                 Scope::Worktree { path, .. } if !local_worktrees.holds(path) => Vec::new(),
-                Scope::Worktree { path, .. } => {
-                    let channel_cards = self
-                        .durable
-                        .channels
-                        .iter()
-                        .flat_map(|channel| channel.cards.iter().copied())
-                        .collect::<HashSet<_>>();
-                    self.durable
-                        .cards
-                        .iter()
-                        .filter(|card| {
-                            shows_in_worktree(card)
-                                && !channel_cards.contains(&card.id)
-                                && local_worktrees.get(card.id) == Some(path)
-                        })
-                        .map(|card| card.id)
-                        .collect()
-                }
+                Scope::Worktree { path, .. } => self.worktree_strip_cards(&local_worktrees, path),
             };
-            tasks.push(self.project_shared_view_with_cards(&view, &owned, current));
+            #[cfg(test)]
+            self.shared_views
+                .view_projection_count
+                .set(self.shared_views.view_projection_count.get() + 1);
+            // A historical worktree view, with no pane listed and no card
+            // resolving to it, projects nothing unless it is the active strip.
+            let historical = match &view.scope {
+                Scope::Worktree { path, .. } => {
+                    current.is_empty()
+                        && view.panes.is_empty()
+                        && !(self.durable.active_channel.is_none()
+                            && self.active_workspace.as_ref() == Some(path))
+                }
+                Scope::Channel(_) => false,
+            };
+            if historical {
+                projected_scopes.push(view.scope);
+                continue;
+            }
+            tasks.push(self.project_shared_view_with_cards(&view, &owned, &listed, current));
             if !view.panes.is_empty() {
                 for pane in &view.panes {
                     if let Some(path) = self
@@ -3925,9 +3939,8 @@ impl Cagents {
         let CardKind::Terminal(terminal) = &pane.kind else {
             return;
         };
-        let already_projected = self.durable.cards.iter().any(|card| {
-            card.id == pane.id
-                && card.existence.is_open()
+        let already_projected = self.card_state(pane.id).is_some_and(|card| {
+            card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal.id)
         });
         if already_projected {
@@ -3965,7 +3978,8 @@ impl Cagents {
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
         let viewport = self.workspace.capture_viewport_anchor();
         let current = self.local_view_cards(&view.scope);
-        let projection = self.project_shared_view_with_cards(view, owned, current);
+        let listed = self.registry_listed_panes();
+        let projection = self.project_shared_view_with_cards(view, owned, &listed, current);
         Task::batch([projection, self.finish_shared_viewport_projection(viewport)])
     }
 
@@ -3993,16 +4007,38 @@ impl Cagents {
                 .is_some_and(|card| matches!(&card.kind, CardKind::Chat(_)))
     }
 
+    /// The cards a worktree view's strip holds here: open, not a utility page,
+    /// in no channel and resolving to `path`, in the workspace's card order.
+    /// Only the few cards resolving to `path` are visited, never every card
+    /// the workspace has ever opened.
+    fn worktree_strip_cards(&self, local_worktrees: &CardWorktrees, path: &Path) -> Vec<CardId> {
+        let channel_cards = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut members = local_worktrees
+            .cards_in(path)
+            .filter(|card| !channel_cards.contains(card))
+            .filter_map(|card| {
+                let index = self.card_index(card)?;
+                shows_in_worktree(&self.durable.cards[index]).then_some((index, card))
+            })
+            .collect::<Vec<_>>();
+        members.sort_unstable_by_key(|&(index, _)| index);
+        members.into_iter().map(|(_, card)| card).collect()
+    }
+
+    /// `listed` holds every pane the registry's raw views list, which
+    /// projecting a view leaves as it is.
     fn project_shared_view_with_cards(
         &mut self,
         view: &View,
         owned: &HashSet<CardId>,
+        listed: &HashSet<CardId>,
         mut current: Vec<CardId>,
     ) -> Task<Message> {
-        #[cfg(test)]
-        self.shared_views
-            .view_projection_count
-            .set(self.shared_views.view_projection_count.get() + 1);
         let index = match &view.scope {
             Scope::Channel(id) => {
                 let Some(index) = self
@@ -4181,11 +4217,7 @@ impl Cagents {
                 }
             }
             let pane: &Pane = &projected;
-            let accepted_default = self
-                .workspace_model
-                .views
-                .iter()
-                .any(|view| view.panes.iter().any(|shared| shared.id == pane.id));
+            let accepted_default = listed.contains(&pane.id);
             if accepted_default {
                 let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
