@@ -2821,8 +2821,13 @@ OLD's worker still verifying NEW. Add `--restart-after-update` to then close
 every window, stop NEW's daemon and reopen the windows, as after a reboot. It
 runs once the update has passed, and requires new window processes and a new
 daemon. The windows must still show no failure
-(`records/after/update-shown-after-restart.json`), and an update that read
-`Complete` must still read `Complete`. It can't be combined with `--ceditor`.
+(`records/after/update-shown-after-restart.json`); there an error notice
+counts only when it is about the update, since stopping the daemon ends its
+terminals and the windows rightly say so. The update's status
+must then read `Complete` for NEW with no refusal: by then NEW has had its
+chance to settle a Failed record from OLD's worker. The private runtime
+directory is not cleared, as a reboot would clear it. It can't be combined
+with `--ceditor`.
 
 `init` refuses a root with a `.git` in its ancestry, as recovery storage does.
 A sandbox that masks `.git` in its writable roots (Codex's does) leaves an empty
