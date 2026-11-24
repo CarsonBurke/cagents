@@ -94,7 +94,9 @@ impl Badges {
     /// then a failed update, then the unread count. The tooltip and the
     /// accessible name still give the whole summary.
     pub fn attention(summary: AttentionSummary) -> Self {
-        let news = match summary.state() {
+        // The state the expanded indicator names, so mixed waits are the
+        // plain waiting glyph here too.
+        let news = match super::attention_count(summary).map(|(state, _)| state) {
             Some(AttentionState::Unread | AttentionState::Working) | None => {
                 // One unread update is the dot, as it is in the expanded
                 // sidebar; only a count of more than one is worth a number.

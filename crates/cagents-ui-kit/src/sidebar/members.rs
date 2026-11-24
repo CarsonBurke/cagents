@@ -392,11 +392,12 @@ fn mark<Message: 'static>(
 /// sits on it on `ground`, so the badge is set off from the mark by
 /// whatever is behind the row: its resting, hovered or selected fill alike.
 fn lead_handle(provider: Provider, ground: Ground, badge_width: Option<f32>) -> Handle {
-    type Cuts = [[[Handle; BADGE_WIDTHS.len()]; 2]; Provider::ALL.len()];
+    // Members cap their count at "9+", so only the first two widths occur.
+    type Cuts = [[[Handle; 2]; 2]; Provider::ALL.len()];
     static CUT: LazyLock<Cuts> = LazyLock::new(|| {
         Provider::ALL.map(|provider| {
             [Ground::Row, Ground::Rail].map(|ground| {
-                BADGE_WIDTHS.map(|width| {
+                [BADGE_WIDTHS[0], BADGE_WIDTHS[1]].map(|width| {
                     cut_handle(
                         provider,
                         LEAD,
