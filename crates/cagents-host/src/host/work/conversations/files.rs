@@ -82,31 +82,33 @@ impl Watches {
             let wake = self.wake.clone();
             self.watcher = RecommendedWatcher::new(
                 move |event: notify::Result<Event>| {
-                    if event.is_err() {
-                        faulted.store(true, Ordering::Release);
-                    }
                     let sources = sources.lock().unwrap_or_else(|p| p.into_inner());
-                    for (id, source) in sources.iter() {
-                        let changed = match &event {
-                            Ok(event) => {
-                                // A backend can drop a descriptor on directory
-                                // removal, even if the path already exists again.
-                                if matches!(
+                    let rebuild = match &event {
+                        Ok(event) => {
+                            event.need_rescan()
+                                || (matches!(
                                     event.kind,
                                     EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-                                ) && event
-                                    .paths
-                                    .iter()
-                                    .any(|path| directory_ancestor(source, path))
-                                {
-                                    faulted.store(true, Ordering::Release);
-                                }
-                                event.need_rescan()
-                                    || event.paths.iter().any(|path| relevant(source, path))
-                            }
-                            Err(_) => true,
-                        };
-                        if changed {
+                                ) && sources.values().any(|source| {
+                                    event
+                                        .paths
+                                        .iter()
+                                        .any(|path| directory_ancestor(source, path))
+                                }))
+                        }
+                        Err(_) => true,
+                    };
+                    if rebuild {
+                        // Rebuilding the shared watcher can miss concurrent
+                        // writes to any of its transcripts.
+                        faulted.store(true, Ordering::Release);
+                    }
+                    for (id, source) in sources.iter() {
+                        if rebuild
+                            || event.as_ref().is_ok_and(|event| {
+                                event.paths.iter().any(|path| relevant(source, path))
+                            })
+                        {
                             wake(*id);
                         }
                     }
@@ -207,7 +209,7 @@ mod tests {
         wake();
         assert!(watches.cover(id, &source));
         // Drain any further topology notifications from this change.
-        while recv.try_recv().is_ok() {}
+        for _ in recv.try_iter() {}
         fs::write(subagents.join("agent-1.jsonl"), "new subagent output").unwrap();
         wake();
     }

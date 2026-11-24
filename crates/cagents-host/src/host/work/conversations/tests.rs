@@ -177,16 +177,17 @@ fn a_branch_pushed_outside_the_project_s_remotes_is_not_its_pull_request() {
 fn a_branch_known_to_have_no_pull_request_is_not_asked_about_again_soon() {
     let facts = facts("/w/app");
     let mut branches = BTreeMap::new();
+    let checked = Instant::now();
     branches.insert(
         ((&repo("me")).into(), "lonely".to_owned()),
         BranchLookup {
             number: None,
-            checked: Instant::now(),
+            checked,
         },
     );
     assert!(matches!(
         resolve(&branch(None, "lonely"), &facts, &branches),
-        Resolved::Nothing
+        Resolved::Deferred(due) if due == checked + BRANCH_MISSING_FOR
     ));
     branches.insert(
         ((&repo("me")).into(), "found".to_owned()),
