@@ -539,7 +539,7 @@ impl HostLease {
         if let Some(mut lock) = inherited {
             lease_handoff::validate_inherited(&lock, paths)?;
             lock.seek(SeekFrom::Start(0))?;
-            let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+            let stored: StoredLockMetadata = read_lock_metadata(&mut lock)?;
             if !recorded_daemon_exited(stored.pid)? {
                 return Err(PlatformError::AlreadyRunning {
                     path: paths.socket.clone(),
@@ -689,7 +689,7 @@ pub(crate) fn daemon_process_alive_at(paths: &RuntimePaths) -> Result<bool, Plat
         Err(error) => return Err(error.into()),
     };
     validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
-    let stored: StoredLockMetadata = serde_json::from_reader(&lock)?;
+    let stored: StoredLockMetadata = read_lock_metadata(&lock)?;
     let pid = i32::try_from(stored.pid)
         .ok()
         .filter(|pid| *pid > 1)
@@ -773,7 +773,7 @@ pub(crate) fn running_executable_at(
         return Ok(None);
     };
     lock.seek(SeekFrom::Start(0))?;
-    let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+    let stored: StoredLockMetadata = read_lock_metadata(&mut lock)?;
     let executable = fs::read_link(format!("/proc/{}/exe", stored.pid))?;
     let _validated = open_validated_pidfd(&lock, stored.pid, Path::new("/proc"))?;
     Ok(Some(executable))
@@ -804,6 +804,19 @@ pub fn replacement_owner(socket: &Path, proof: &HostSessionProof) -> Result<u32,
         return Err(io::Error::other("daemon socket does not belong to its lease owner").into());
     }
     Ok(pid)
+}
+
+/// A lock's JSON metadata, read from the current offset to its end.
+/// `serde_json::from_reader` takes an unbuffered file one byte per `read(2)`;
+/// the daemon's lock is read on every discovery and on every request a
+/// retained actor authorizes, about 190 reads each. This reads it at once.
+/// Like `from_reader`, it reads to the end and refuses trailing data.
+fn read_lock_metadata<T: serde::de::DeserializeOwned>(
+    mut lock: impl io::Read,
+) -> Result<T, PlatformError> {
+    let mut metadata = Vec::with_capacity(512);
+    io::Read::read_to_end(&mut lock, &mut metadata)?;
+    Ok(serde_json::from_slice(&metadata)?)
 }
 
 /// Validate the exclusive owner before its public listener exists. Holders use
@@ -886,7 +899,7 @@ fn lease_owner_process(
     if error.kind() != io::ErrorKind::WouldBlock {
         return Err(error.into());
     }
-    let metadata: RecoveryMetadata = serde_json::from_reader(&lock)?;
+    let metadata: RecoveryMetadata = read_lock_metadata(&lock)?;
     if !proof.is_complete() || metadata.proof != *proof || read_boot_id()? != proof.boot_id {
         return Err(io::Error::other("daemon lease does not match its discovery proof").into());
     }
@@ -1009,7 +1022,7 @@ fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformErro
     let _discovered = daemon_pidfd_from_lock(&mut lock, paths)?
         .ok_or_else(|| io::Error::other("the daemon has already stopped"))?;
     lock.seek(SeekFrom::Start(0))?;
-    let metadata: Metadata = serde_json::from_reader(&mut lock)?;
+    let metadata: Metadata = read_lock_metadata(&mut lock)?;
     let process = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
     if lease_owner(&paths.lock, &metadata.proof)? != metadata.pid {
         return Err(io::Error::other("daemon ownership changed while opening confirmation").into());
@@ -1144,7 +1157,7 @@ fn daemon_pidfd_from_lock(
         return Err(lock_error.into());
     }
     lock.seek(SeekFrom::Start(0))?;
-    let stored: StoredLockMetadata = serde_json::from_reader(&mut *lock)?;
+    let stored: StoredLockMetadata = read_lock_metadata(&mut *lock)?;
     open_daemon_pidfd_or_recover(lock, paths, stored.pid)
 }
 
@@ -1444,6 +1457,47 @@ mod tests {
 
     use super::*;
     use crate::model::{HostIncarnation, HostSessionId};
+
+    /// Counts the `read` calls a parser makes, as `read(2)` on a file would.
+    struct CountedReads<'a> {
+        bytes: &'a [u8],
+        reads: usize,
+    }
+
+    impl io::Read for CountedReads<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            let length = buffer.len().min(self.bytes.len());
+            buffer[..length].copy_from_slice(&self.bytes[..length]);
+            self.bytes = &self.bytes[length..];
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn lock_metadata_is_read_in_a_few_calls_not_one_per_byte() {
+        let lock = br#"{"pid":3238386,"proof":{"host_session_id":"00000000-0000-4000-8000-000000000001","boot_id":"00000000-0000-4000-8000-000000000002","host_incarnation":"00000000-0000-4000-8000-000000000003"}}"#;
+        let mut unbuffered = CountedReads {
+            bytes: lock,
+            reads: 0,
+        };
+        let parsed: StoredLockMetadata = serde_json::from_reader(&mut unbuffered).unwrap();
+        assert_eq!(parsed.pid, 3_238_386);
+        assert!(unbuffered.reads > lock.len(), "{}", unbuffered.reads);
+        let mut counted = CountedReads {
+            bytes: lock,
+            reads: 0,
+        };
+        let parsed: StoredLockMetadata = read_lock_metadata(&mut counted).unwrap();
+        assert_eq!(parsed.pid, 3_238_386);
+        assert!(counted.reads <= 3, "{}", counted.reads);
+        // Trailing data is refused, as from_reader refuses it.
+        let trailing = CountedReads {
+            bytes: br#"{"pid":7} x"#,
+            reads: 0,
+        };
+        assert!(read_lock_metadata::<StoredLockMetadata>(trailing).is_err());
+    }
 
     #[cfg(feature = "host")]
     #[test]
