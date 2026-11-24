@@ -1393,6 +1393,49 @@ fn antigravity_refreshes_the_exact_conversations_listed_title() {
 }
 
 #[test]
+fn post_turn_title_listing_stops_after_four_pages() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let sent = prompt(&mut acp, "Check the build");
+    let mut step = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert_eq!(only_write(&step)["params"], json!({"cwd": "/work/project"}));
+    for page in 1..=4 {
+        let request = only_write(&step);
+        assert_eq!(request["method"], "session/list");
+        step = acp
+            .receive(reply(
+                request,
+                json!({"sessions": [{"sessionId": format!("other-{page}")}],
+                    "nextCursor": format!("page-{}", page + 1)}),
+            ))
+            .unwrap();
+        assert!(step.events.is_empty());
+    }
+    assert!(step.writes.is_empty());
+
+    let sent = prompt(&mut acp, "/rename Build diagnostics");
+    let ended = acp
+        .receive(reply(&sent, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let request = only_write(&ended);
+    assert_eq!(request["params"], json!({"cwd": "/work/project"}));
+    assert_eq!(
+        acp.receive(reply(
+            request,
+            json!({"sessions": [{"sessionId": session, "title": "Build diagnostics"}]}),
+        ))
+        .unwrap()
+        .events,
+        [Event::Session {
+            id: session,
+            title: Some("Build diagnostics".into()),
+        }]
+    );
+}
+
+#[test]
 fn muse_reads_the_saved_title_and_prefers_later_title_notifications() {
     let session = muse_new()["sessionId"].as_str().unwrap().to_owned();
     let mut acp = adapter(&[], Some(&session));
@@ -1400,9 +1443,22 @@ fn muse_reads_the_saved_title_and_prefers_later_title_notifications() {
     let load = acp
         .receive(reply(only_write(&init), muse_initialize()))
         .unwrap();
-    let opened = acp.receive(reply(only_write(&load), muse_new())).unwrap();
-    let list = only_write(&opened);
+    let mut listing = acp.receive(reply(only_write(&load), muse_new())).unwrap();
+    // The saved conversation can be older than the post-turn search reaches.
+    for page in 1..=4 {
+        let request = only_write(&listing);
+        assert_eq!(request["method"], "session/list");
+        listing = acp
+            .receive(reply(
+                request,
+                json!({"sessions": [{"sessionId": format!("other-{page}")}],
+                    "nextCursor": format!("page-{}", page + 1)}),
+            ))
+            .unwrap();
+    }
+    let list = only_write(&listing);
     assert_eq!(list["method"], "session/list");
+    assert_eq!(list["params"]["cursor"], "page-5");
     let listed = |request: &Value, title: &str| {
         reply(
             request,

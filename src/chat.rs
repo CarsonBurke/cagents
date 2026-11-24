@@ -1715,6 +1715,10 @@ pub struct Snapshot {
     #[serde(default)]
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
+    /// Whether the current conversation's provider explicitly cleared its name.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    pub(crate) provider_title_cleared: bool,
     /// The first meaningful user prompt, kept independently of loaded pages.
     #[cfg(feature = "host")]
     #[serde(skip)]
@@ -3708,6 +3712,14 @@ pub enum Event {
     /// A prompt-derived title from the exact conversation's opening.
     #[cfg(feature = "host")]
     OpeningTitle(OpeningTitle),
+    /// The provider has established that no older messages can supply a name.
+    #[cfg(feature = "host")]
+    OpeningHistoryComplete,
+    /// An explicit removal of the provider name for this exact conversation.
+    #[cfg(feature = "host")]
+    ProviderTitleCleared {
+        id: String,
+    },
 }
 
 #[cfg(feature = "host")]

@@ -272,6 +272,7 @@ pub(crate) enum Update {
 pub(crate) struct ConversationNaming {
     pub session: Option<String>,
     pub provider: Option<String>,
+    pub provider_cleared: bool,
     pub opening: Option<super::OpeningTitle>,
 }
 
@@ -1819,6 +1820,7 @@ impl LocalHandle {
         Ok(ConversationNaming {
             session: state.session_id.clone(),
             provider: state.title.clone(),
+            provider_cleared: state.provider_title_cleared,
             opening: state.opening_title.clone(),
         })
     }
@@ -4106,6 +4108,9 @@ impl Actor {
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         let name_changed = match &event {
             Event::OpeningTitle(title) => state.opening_title.as_ref() != Some(title),
+            Event::ProviderTitleCleared { id } => {
+                state.session_id.as_ref() == Some(id) && !state.provider_title_cleared
+            }
             Event::Session { id, title } => {
                 state.session_id.as_ref() != Some(id)
                     || title
@@ -4472,6 +4477,7 @@ fn apply_projected_event(
             };
             state.session_id = None;
             state.title = None;
+            state.provider_title_cleared = false;
             state.opening_title = None;
             state.has_earlier = false;
             state.has_later = false;
@@ -4493,13 +4499,22 @@ fn apply_projected_event(
                     state.opening_title = None;
                 }
                 state.title = title;
+                state.provider_title_cleared = false;
             } else if title.is_some() {
                 // Identity-only frames carry no new naming information.
                 state.title = title;
+                state.provider_title_cleared = false;
             }
             state.session_id = Some(id);
         }
+        Event::ProviderTitleCleared { id } => {
+            if state.session_id.as_ref() == Some(&id) {
+                state.title = None;
+                state.provider_title_cleared = true;
+            }
+        }
         Event::OpeningTitle(title) => state.opening_title = Some(title),
+        Event::OpeningHistoryComplete => {}
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.

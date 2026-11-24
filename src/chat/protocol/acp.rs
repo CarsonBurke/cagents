@@ -36,7 +36,10 @@ mod tools;
 /// session list does.
 const PLACEHOLDER_TITLES: &[&str] = &["New session"];
 const MAX_TITLE_BYTES: usize = 4096;
-const MAX_TITLE_LIST_PAGES: u8 = 64;
+/// Allow a deeper lookup when loading a saved conversation that may be old.
+const MAX_SAVED_TITLE_LIST_PAGES: u8 = 64;
+/// Keep repeated lookups for a conversation that just handled a prompt cheap.
+const MAX_TURN_TITLE_LIST_PAGES: u8 = 4;
 /// The ACP version this client speaks.
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_COMMANDS: usize = 256;
@@ -342,10 +345,10 @@ impl Acp {
             .retain(|_, request| !matches!(request, Pending::ListTitle { .. }));
     }
 
-    fn refresh_title(&mut self, step: &mut Step) {
+    fn refresh_title(&mut self, pages: u8, step: &mut Step) {
         if self.list_titles {
             self.discard_title_request();
-            self.list_title_page(None, MAX_TITLE_LIST_PAGES, step);
+            self.list_title_page(None, pages, step);
         }
     }
 
@@ -690,7 +693,7 @@ impl Acp {
             key: Some(turn.key),
             outcome: kind,
         });
-        self.refresh_title(step);
+        self.refresh_title(MAX_TURN_TITLE_LIST_PAGES, step);
     }
 
     fn respond(&mut self, id: u64, outcome: Result<&Value, &Value>, step: &mut Step) {
@@ -856,6 +859,9 @@ impl Acp {
             id: self.session_id().to_owned(),
             title: None,
         });
+        if self.resume.is_none() {
+            step.events.push(Event::OpeningHistoryComplete);
+        }
         self.config.learn(result);
         self.config.retain_models(self.profile.offers_model);
         self.configuration_changed(step);
@@ -866,7 +872,7 @@ impl Acp {
         // Session load replays messages, but an agent may only publish a
         // saved conversation's title in session/list.
         if self.resume.is_some() {
-            self.refresh_title(step);
+            self.refresh_title(MAX_SAVED_TITLE_LIST_PAGES, step);
         }
     }
 

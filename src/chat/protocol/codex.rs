@@ -571,8 +571,8 @@ enum Pending {
     },
     Initialize,
     Attach {
-        /// A verified connection may send a rename before resume answers.
-        renamed: Option<String>,
+        /// A verified connection may set or clear the name before resume answers.
+        renamed: Option<Option<String>>,
     },
     ReadThread {
         name_revision: u64,
@@ -2721,7 +2721,8 @@ impl Codex {
                                 .into(),
                         );
                     }
-                    if self.thread.is_none() {
+                    let fresh = self.thread.is_none();
+                    if fresh {
                         self.cursor = None;
                         self.history_initialized = false;
                     }
@@ -2744,13 +2745,25 @@ impl Codex {
                     ));
                     step.events
                         .push(Event::Waiting(waiting_on_user(&thread["status"])));
-                    if renamed.is_some() {
-                        self.name_revision = self.name_revision.wrapping_add(1);
-                    }
+                    let cleared = matches!(renamed, Some(None));
+                    let title = match renamed {
+                        Some(title) => {
+                            self.name_revision = self.name_revision.wrapping_add(1);
+                            title
+                        }
+                        None => thread_name(&thread["name"]),
+                    };
                     step.events.push(Event::Session {
                         id: id.into(),
-                        title: renamed.or_else(|| thread_name(&thread["name"])),
+                        title,
                     });
+                    if fresh {
+                        step.events.push(Event::OpeningHistoryComplete);
+                    }
+                    if cleared {
+                        step.events
+                            .push(Event::ProviderTitleCleared { id: id.into() });
+                    }
                     step.events.push(Event::Status {
                         busy: self.busy,
                         detail: "Connected to Codex".into(),
@@ -3499,21 +3512,27 @@ impl Codex {
                     && self.thread.as_deref() == Some(id)
                 {
                     let title = thread_name(&params["threadName"]);
+                    let cleared = params.get("threadName").is_some_and(Value::is_null);
+                    let changed = title.is_some() || cleared;
                     if self.attached || self.is_child {
-                        if title.is_some() {
+                        if changed {
                             self.name_revision = self.name_revision.wrapping_add(1);
                         }
-                        step.events.push(Event::Session {
-                            id: id.into(),
-                            title,
+                        step.events.push(if cleared {
+                            Event::ProviderTitleCleared { id: id.into() }
+                        } else {
+                            Event::Session {
+                                id: id.into(),
+                                title,
+                            }
                         });
-                    } else if title.is_some()
+                    } else if changed
                         && let Some(Pending::Attach { renamed }) = self
                             .pending
                             .values_mut()
                             .find(|pending| matches!(pending, Pending::Attach { .. }))
                     {
-                        *renamed = title;
+                        *renamed = Some(title);
                     }
                 }
             }

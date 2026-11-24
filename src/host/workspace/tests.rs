@@ -223,7 +223,11 @@ fn hidden_primary_chat_names_its_channel_and_follows_provider_renames() {
     impl Adapter for Conversation {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
-                events: vec![user("image", "[Image 236]"), Event::Ready(true)],
+                events: vec![
+                    Event::OpeningHistoryComplete,
+                    user("image", "[Image 236]"),
+                    Event::Ready(true),
+                ],
                 ..Default::default()
             })
         }
@@ -242,6 +246,9 @@ fn hidden_primary_chat_names_its_channel_and_follows_provider_renames() {
                 2 => vec![user("another-text", "Review unrelated code")],
                 3 => vec![name(Some("Channel naming review"))],
                 4 => vec![name(Some("Sidebar naming follow-up"))],
+                5 | 7 => vec![Event::ProviderTitleCleared {
+                    id: "exact-conversation".into(),
+                }],
                 _ => vec![name(Some("Provider's last title"))],
             };
             Ok(Step {
@@ -318,6 +325,10 @@ fn hidden_primary_chat_names_its_channel_and_follows_provider_renames() {
     wait_for("Channel naming review", Provider);
     handle.command(Command::Compact).unwrap();
     wait_for("Sidebar naming follow-up", Provider);
+    handle.command(Command::Compact).unwrap();
+    wait_for("Fix the sidebar channel names", Prompt);
+    handle.command(Command::Compact).unwrap();
+    wait_for("Provider's last title", Provider);
     commit(ModelEdit::RetitleChannel {
         id,
         title: "Release checklist".into(),
@@ -329,6 +340,8 @@ fn hidden_primary_chat_names_its_channel_and_follows_provider_renames() {
         id,
         title: String::new(),
     });
+    wait_for("Fix the sidebar channel names", Prompt);
+    handle.command(Command::Compact).unwrap();
     wait_for("Provider's last title", Provider);
     handle.close().unwrap();
 }
