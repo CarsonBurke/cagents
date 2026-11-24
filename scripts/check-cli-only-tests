@@ -1,14 +1,14 @@
 #!/usr/bin/python3
 """Check that tests run only in the cli lane cannot depend on a feature.
 
-The cli, host, ui and browser lanes each build the root library's tests with
-different features. A test module whose code never branches on a feature
-would run the same tests four times, so it is declared with
+The cli, host and ui lanes each build the root library's tests with different
+features (the browser lane does not build them). A test module whose code
+never branches on a feature would run the same tests three times, so it is
+declared with
 
     #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 
-and runs only in the cli lane (`--no-default-features`). The browser lane
-enables `ui` through `cagents-ui`, so it skips these modules too.
+and runs only in the cli lane (`--no-default-features`).
 
 That is sound only while nothing the module owns branches on a feature. This
 check walks the library's module tree from src/lib.rs and refuses a gated test
@@ -16,16 +16,24 @@ module unless:
 
 - every file of the module that declares it, including that module's
   submodules, its tests and every file pulled in by `#[path]` or `include!`,
-  is free of `feature = "..."` in any form (`cfg`, `cfg!`, `cfg_attr`); and
+  is free of `feature = "..."` in any form (`cfg`, `cfg!`, `cfg_attr`);
 - no module on the path from the crate root is itself declared under a
-  feature, so the cli lane compiles it at all.
+  feature, by an outer attribute or the file's own `#![cfg(...)]`, so the cli
+  lane compiles it at all; and
+- the module uses exactly this gate: any other cfg that keeps tests out of a
+  lane by excluding its feature is refused, since this check does not vouch
+  for it.
 
 What it cannot see: a feature branch in a module outside that subtree, which
-the tested code calls (for example `instance` calling into `diagnostics`). A
-test that depends on such a branch must stay `#[cfg(test)]`. It reads source
-text only, so CI runs it without compiling Rust.
+the tested code calls (for example `instance` calling into `diagnostics`), or
+a dependency feature that only another lane's graph enables (the ui graph
+turns on serde_json's `preserve_order`, so object key order differs there). A
+test that depends on either must stay `#[cfg(test)]`. It reads source text
+only, so CI runs it without compiling Rust.
 
-`--eligible` lists the `#[cfg(test)]` modules that would pass if gated.
+`--eligible` lists the `#[cfg(test)]` modules that would pass if gated. It
+leaves out the two that other lanes' tests take fixtures from, which must run
+everywhere: update::impact::tests and workspace_model::tests.
 """
 
 import argparse
@@ -34,15 +42,19 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Test modules whose fixtures other lanes' tests use; they run everywhere.
+SHARED_FIXTURES = {"crate::update::impact::tests", "crate::workspace_model::tests"}
 GATE = 'all(test, not(any(feature = "host", feature = "ui")))'
 FEATURE = re.compile(r'\bfeature\s*=\s*"')
+# A leading inner attribute, `#![...]`, after any whitespace.
+INNER = re.compile(r"\s*#!\s*\[")
 # A module declaration, or the start of an `include!`.
 ITEM = re.compile(r"\bmod\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)\s*([;{])|\binclude!\s*\(")
 STRING = re.compile(r'"((?:\\.|[^"\\])*)"')
 
 
 # The starts of the lexical forms whose contents are not structure.
-LEXICAL = re.compile(r"""//|/\*|(?<![A-Za-z0-9_])b?r#*"|"|'""")
+LEXICAL = re.compile(r"""//|/\*|(?<![A-Za-z0-9_])[bc]?r#*"|"|'""")
 LINE_COMMENT = re.compile(r"[^\n]*")
 BLOCK_COMMENT = re.compile(r"/\*|\*/")
 QUOTED = re.compile(r'"(?:\\.|[^"\\])*"', re.DOTALL)
@@ -89,6 +101,19 @@ def blank(text: str) -> str:
         i = resume
     pieces.append(text[i:])
     return "".join(pieces)
+
+
+def compact(attribute: str) -> str:
+    return re.sub(r"\s+", "", attribute)
+
+
+def is_test_gate(attribute: str) -> bool:
+    """A cfg that keeps tests out of a lane by excluding its feature, such as
+    `cfg(all(test, not(feature = "host")))`; of these only the cli-only gate
+    is allowed. Tests gated *to* a feature's lane are not affected."""
+    flat = compact(attribute)
+    return (flat.startswith("cfg(all(") and re.search(r"\btest\b", flat) is not None
+            and re.search(r"not\((?:any\()?feature=", flat) is not None)
 
 
 def matching(structure: str, open_at: int, opening: str, closing: str) -> int:
@@ -167,7 +192,21 @@ class Tree:
             self.problems.append(f"{module.path}: cannot read {file}: {error}")
             return
         module.files.append(file)
-        self.scan(module, file, text, blank(text), 0, len(text), directory)
+        structure = blank(text)
+        try:
+            self.parse(module, file, text, structure, directory)
+        except ValueError:
+            self.problems.append(f"{module.path}: unbalanced brackets in {file}")
+
+    def parse(self, module, file, text, structure, directory) -> None:
+        # A file's leading inner attributes, such as `#![cfg(...)]`, gate
+        # its module as an outer attribute on the declaration would.
+        position = 0
+        while (inner := INNER.match(structure, position)):
+            close = matching(structure, inner.end() - 1, "[", "]")
+            module.declaration.append(text[inner.end():close])
+            position = close + 1
+        self.scan(module, file, text, structure, 0, len(text), directory)
 
     def scan(self, module, file, text, structure, start, end, directory) -> None:
         position = start
@@ -186,7 +225,7 @@ class Tree:
             attributes = attributes_before(text, structure, declaration.start())
             child = Module(f"{module.path}::{name}", attributes, parent=module)
             module.children.append(child)
-            if any(a.strip() in ("cfg(test)", f"cfg({GATE})") for a in attributes):
+            if any(compact(a) == "cfg(test)" or is_test_gate(a) for a in attributes):
                 child.site = (file, text.rfind("#", 0, declaration.start()))
             explicit = next((STRING.search(a).group(1) for a in attributes
                              if re.match(r"\s*path\s*=", a) and STRING.search(a)), None)
@@ -198,7 +237,9 @@ class Tree:
             else:
                 if explicit:
                     target = (file.parent / explicit) if directory == self.child_directory(file) else (directory / explicit)
-                    sub = (target.parent / target.stem) if target.name != "mod.rs" else target.parent
+                    # A file loaded through #[path] declares its submodules
+                    # beside itself, as a mod.rs does.
+                    sub = target.parent
                 elif (directory / f"{name}.rs").exists():
                     target, sub = directory / f"{name}.rs", directory / name
                 else:
@@ -254,11 +295,14 @@ def check(root: Path) -> tuple[list[str], list[str]]:
     for module in tree.modules():
         if not module.site:
             continue
-        gated = any(a.strip() == f"cfg({GATE})" for a in module.declaration)
+        gates = [a for a in module.declaration if is_test_gate(a)]
+        gated = bool(gates)
         found = reasons(tree, module, cache)
+        found += [f"its gate #[{a.strip()}] is not the cli-only gate #[cfg({GATE})]"
+                  for a in gates if a.strip() != f"cfg({GATE})"]
         if gated and found:
             failures.append(f"{module.path} runs only in the cli lane, but:\n  " + "\n  ".join(found))
-        elif not gated and not found:
+        elif not gated and not found and module.path not in SHARED_FIXTURES:
             file, offset = module.site
             line = file.read_text(encoding="utf-8").count("\n", 0, offset) + 1
             eligible.append(f"{file.relative_to(tree.root)}:{line}: {module.path}")

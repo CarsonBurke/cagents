@@ -85,13 +85,63 @@ class Tree(unittest.TestCase):
                             "src/hosted.rs": "mod plain;\n", "src/hosted/plain.rs": GATED},
                            "crate::hosted::plain::tests", "crate::hosted is declared under a feature")
 
-    def test_branches_outside_the_owner_and_in_comments_or_strings_elsewhere_do_not_count(self):
+    def test_branches_outside_the_owner_and_mod_in_comments_or_strings_do_not_count(self):
         failures, _ = self.check({
             "src/lib.rs": "mod plain;\nmod gated;\n",
             "src/gated.rs": '#[cfg(feature = "host")]\nfn f() {}\n',
             "src/plain.rs": '// mod fake;\nconst S: &str = "mod fake;";\n' + GATED,
         })
         self.assertEqual(failures, [])
+
+    def test_a_mention_in_a_comment_of_the_owner_still_refuses(self):
+        self.assertRefused({"src/lib.rs": "mod plain;\n",
+                            "src/plain.rs": '// see #[cfg(feature = "ui")] elsewhere\n' + GATED},
+                           "crate::plain::tests", "src/plain.rs branches on a feature")
+
+    def test_lexical_forms_do_not_hide_or_invent_declarations(self):
+        # Each prefix ends with a string or comment holding a quote or a
+        # brace; a real `mod child;` follows, whose feature branch must count.
+        for prefix in ('const A: &str = "\\"{";\n', "const B: &str = r#\"a\"{\"#;\n",
+                       'const C: &[u8] = b"}";\n', "const D: &CStr = cr#\"a\"b\"#;\n",
+                       "const E: char = '\"';\nfn f<'a>(x: &'a str) {}\n",
+                       "/* outer /* inner */ still \" */\n"):
+            with self.subTest(prefix=prefix):
+                self.assertRefused({"src/lib.rs": "mod plain;\n",
+                                    "src/plain.rs": prefix + "mod child;\n" + GATED,
+                                    "src/plain/child.rs": '#[cfg(feature = "ui")]\nfn f() {}\n'},
+                                   "crate::plain::tests", "src/plain/child.rs branches on a feature")
+
+    def test_a_module_gated_by_its_own_inner_attribute_refuses_the_gate(self):
+        self.assertRefused({"src/lib.rs": "mod hosted;\n",
+                            "src/hosted.rs": '//! Host only.\n#![cfg(feature = "host")]\nmod plain;\n',
+                            "src/hosted/plain.rs": GATED},
+                           "crate::hosted::plain::tests", "crate::hosted is declared under a feature")
+
+    def test_another_lane_excluding_gate_is_refused_but_a_lane_only_gate_is_not(self):
+        for gate in ('cfg(all(test, not(feature = "host")))',
+                     'cfg(all(test,not(any(feature="host",feature="ui"))))'):
+            with self.subTest(gate=gate):
+                failures, _ = self.check({"src/lib.rs": "mod plain;\n",
+                                          "src/plain.rs": f"#[{gate}]\nmod tests {{}}\n"})
+                self.assertEqual(len(failures), 1, failures)
+                self.assertIn("is not the cli-only gate", failures[0])
+        failures, eligible = self.check({"src/lib.rs": "mod plain;\n",
+                                         "src/plain.rs": '#[cfg(all(test, feature = "host"))]\nmod tests {}\n'})
+        self.assertEqual((failures, eligible), ([], []))
+
+    def test_a_path_file_declares_its_submodules_beside_itself(self):
+        self.assertRefused({"src/lib.rs": "mod plain;\n",
+                            # Relative to the declaring file's directory.
+                            "src/plain.rs": '#[path = "elsewhere/impl.rs"]\nmod inner;\n' + GATED,
+                            "src/elsewhere/impl.rs": "mod leaf;\n",
+                            "src/elsewhere/leaf.rs": '#[cfg(feature = "ui")]\nfn f() {}\n',
+                            "src/elsewhere/impl/leaf.rs": "fn clean() {}\n"},
+                           "crate::plain::tests", "src/elsewhere/leaf.rs branches on a feature")
+
+    def test_an_unbalanced_file_is_a_problem_not_a_traceback(self):
+        failures, _ = self.check({"src/lib.rs": "mod plain;\n", "src/plain.rs": "mod inner {\n"})
+        self.assertEqual(len(failures), 1, failures)
+        self.assertTrue(failures[0].startswith("crate::plain: unbalanced brackets in "), failures)
 
     def test_an_unreadable_module_is_a_problem_not_a_pass(self):
         failures, _ = self.check({"src/lib.rs": "mod missing;\n"})
