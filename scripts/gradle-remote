@@ -69,6 +69,18 @@ rsync -a --delete \
     "$root/mobile/" "$remote:$base/mobile/"
 rsync -a --delete "$root/crates/mobile-api/fixtures/" "$remote:$base/crates/mobile-api/fixtures/"
 
+# Sign with this machine's debug key, as a build here would. The phone is
+# connected here, and Android won't replace an installed app with one signed
+# by another key, so an APK signed with the build host's own debug key could
+# only be installed by uninstalling, which loses the phone's key and trusted
+# computers. The debug key is a development key, not a secret.
+signing=()
+debug_keystore=${ANDROID_DEBUG_KEYSTORE:-$HOME/.android/debug.keystore}
+if [ -f "$debug_keystore" ]; then
+    rsync -a "$debug_keystore" "$remote:$base/debug.keystore"
+    signing=(-Pcagents.debugKeystore=../debug.keystore)
+fi
+
 # The script goes to bash on its standard input, so the host's login shell,
 # whatever it is, parses none of it.
 status=0
@@ -77,7 +89,7 @@ set -e
 cd $(quoted "$base/mobile")
 export ANDROID_HOME="\${ANDROID_HOME:-\$HOME/Android/Sdk}"
 export CAGENTS_GRADLE_LOCAL=1
-exec flock ../.lock ./gradlew --console=plain $(quoted "$@") </dev/null
+exec flock ../.lock ./gradlew --console=plain $(quoted ${signing[@]+"${signing[@]}"} "$@") </dev/null
 SCRIPT
 
 # Reports come back whether the build passed or not: a failure is read in
