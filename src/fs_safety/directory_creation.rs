@@ -72,12 +72,24 @@ fn sticky_parent_effective_access(directory: &Root) -> io::Result<()> {
     }
     Err(error)
 }
-#[cfg(not(target_os = "linux"))]
-fn sticky_parent_effective_access(_directory: &Root) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Retained sticky-parent effective permission observation is unavailable on this platform",
-    ))
+/// Darwin has no `AT_EMPTY_PATH`, but `.` relative to the retained descriptor
+/// names that same directory and can never be substituted, and its
+/// `faccessat` honors `AT_EACCESS`, ACLs and supplementary groups alike.
+#[cfg(target_os = "macos")]
+fn sticky_parent_effective_access(directory: &Root) -> io::Result<()> {
+    // SAFETY: the Root retains its descriptor and the literal is static.
+    let status = unsafe {
+        libc::faccessat(
+            directory.descriptor(),
+            c".".as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    Err(io::Error::last_os_error())
 }
 impl StickyParent {
     pub fn acquire(directory: Arc<Root>) -> io::Result<Arc<Self>> {

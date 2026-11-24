@@ -17,12 +17,19 @@
 //!    file outside the tree. Resolution here refuses a symlink in any
 //!    component and refuses to leave the root at all.
 //!
-//! Resolution prefers `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`,
-//! which enforces both properties in the kernel in one syscall. Kernels older
-//! than 5.6 answer `ENOSYS`, and seccomp filters that do not know the syscall
-//! answer `EINVAL`; those fall back to an `openat` walk that opens one
-//! component at a time with `O_NOFOLLOW` and verifies each intermediate really
-//! is a directory. Which of the two is in use is decided once, not per call.
+//! On Linux, resolution prefers `openat2` with `RESOLVE_BENEATH |
+//! RESOLVE_NO_SYMLINKS`, which enforces both properties in the kernel in one
+//! syscall. Kernels older than 5.6 answer `ENOSYS`, and seccomp filters that do
+//! not know the syscall answer `EINVAL`; those fall back to an `openat` walk
+//! that opens one component at a time with `O_NOFOLLOW` and verifies each
+//! intermediate really is a directory. Which of the two is in use is decided
+//! once, not per call.
+//!
+//! On macOS, `openat` with `O_NOFOLLOW_ANY` refuses a symlink in any component
+//! in the kernel, and [`components`] has already refused every `..`, `.` and
+//! absolute component, so the one call cannot leave the root either. Directory
+//! handles there are `O_SEARCH`, Darwin's nearest equivalent of `O_PATH`: they
+//! grant lookup beneath the directory and nothing else.
 
 use std::{
     ffi::{CStr, CString, OsStr, OsString},
@@ -35,7 +42,6 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     ptr,
-    sync::LazyLock,
 };
 
 /// Bytes of randomness in a generated temporary name.
@@ -66,6 +72,7 @@ const ATTRIBUTE_SIZE_ATTEMPTS: usize = 4;
 /// Declared here rather than reusing `libc::open_how`, which is
 /// `#[non_exhaustive]` and therefore cannot be built from a literal; a zeroed
 /// value would need an `unsafe` block for no benefit.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Default)]
 struct OpenHow {
@@ -74,10 +81,32 @@ struct OpenHow {
     resolve: u64,
 }
 
+/// Flags for a directory handle that grants lookup beneath it and nothing
+/// else: `O_PATH` on Linux, which needs no permission on the directory at all,
+/// and `O_SEARCH` on macOS, which needs search (execute) permission.
+#[cfg(target_os = "linux")]
+const DIRECTORY_HANDLE: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
+#[cfg(target_os = "macos")]
+const DIRECTORY_HANDLE: libc::c_int = libc::O_SEARCH;
+
+/// Flags for an intermediate component of the component-at-a-time walk. The
+/// walk checks each one is a directory, so Linux needs no `O_DIRECTORY`; on
+/// macOS `O_SEARCH` implies it, and a non-directory answers `ENOTDIR`.
+#[cfg(target_os = "linux")]
+const INTERMEDIATE_HANDLE: libc::c_int = libc::O_PATH;
+#[cfg(target_os = "macos")]
+const INTERMEDIATE_HANDLE: libc::c_int = libc::O_SEARCH;
+
+/// The errno an extended-attribute call answers for an absent attribute.
+#[cfg(target_os = "linux")]
+const NO_ATTRIBUTE: libc::c_int = libc::ENODATA;
+#[cfg(target_os = "macos")]
+const NO_ATTRIBUTE: libc::c_int = libc::ENOATTR;
+
 /// A directory a path may be resolved beneath.
 ///
-/// The descriptor is `O_PATH`, which needs no read permission on the directory
-/// and cannot be used for anything but further fd-relative resolution — the
+/// The descriptor is a [`DIRECTORY_HANDLE`], which cannot be used for anything
+/// but further fd-relative resolution and the directory's own metadata — the
 /// least authority that still lets this module work.
 #[derive(Debug)]
 pub struct Root {
@@ -101,7 +130,7 @@ impl Root {
             ));
         }
         let name = c_path(root)?;
-        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let flags = DIRECTORY_HANDLE | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // SAFETY: `name` is a NUL-terminated string that outlives the call, and
         // `open` returns either a fresh owned descriptor or -1.
         let descriptor = unsafe { libc::open(name.as_ptr(), flags) };
@@ -159,6 +188,9 @@ impl Root {
     /// Address this retained directory from a synchronous child without
     /// inheriting a descriptor. The caller must keep this root alive until
     /// that child exits; `/proc/self` would name the child's different FD table.
+    /// Darwin has no per-process descriptor namespace another process can
+    /// address, so there is no equivalent there.
+    #[cfg(target_os = "linux")]
     pub(crate) fn process_path(&self) -> PathBuf {
         PathBuf::from(format!(
             "/proc/{}/fd/{}",
@@ -176,9 +208,8 @@ impl Root {
 /// This intentional literal parent lookup is separate from confined public
 /// component resolution: `open_at` MUST continue rejecting user-supplied `..`.
 /// The returned descriptor alone does not grant placement/effect consent.
-#[cfg(target_os = "linux")]
 pub(crate) fn retained_parent_directory(root: &Root) -> io::Result<Root> {
-    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = DIRECTORY_HANDLE | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: the directory is retained, the ONLY lookup is this static NUL-
     // terminated parent literal, and openat returns a fresh owned descriptor.
     let descriptor = unsafe { libc::openat(root.descriptor(), c"..".as_ptr(), flags) };
@@ -189,13 +220,6 @@ pub(crate) fn retained_parent_directory(root: &Root) -> io::Result<Root> {
         directory: unsafe { OwnedFd::from_raw_fd(descriptor) },
         path: root.path().join(".."),
     })
-}
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn retained_parent_directory(_root: &Root) -> io::Result<Root> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Retained parent observation is unavailable on this platform.",
-    ))
 }
 
 /// Why a path could not be resolved beneath a root.
@@ -357,10 +381,85 @@ pub fn open_beneath_writable(root: &Root, relative: &Path) -> Result<Option<File
 pub fn metadata_beneath(root: &Root, relative: &Path) -> Result<Metadata, ResolveError> {
     let reported = root.path.join(relative);
     let (directory, name) = open_parent_beneath(root, relative)?;
+    entry_metadata(&directory, &name, &reported)
+}
+
+#[cfg(target_os = "linux")]
+fn entry_metadata(
+    directory: &Root,
+    name: &OsStr,
+    reported: &Path,
+) -> Result<Metadata, ResolveError> {
     let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let entry = open_at(directory.descriptor(), &name, flags)
-        .map_err(|error| classify(&reported, &error))?;
-    metadata_of_descriptor(&entry).map_err(|error| ResolveError::io(&reported, &error))
+    let entry =
+        open_at(directory.descriptor(), name, flags).map_err(|error| classify(reported, &error))?;
+    metadata_of_descriptor(&entry).map_err(|error| ResolveError::io(reported, &error))
+}
+
+/// Darwin has no `O_PATH`: opening the entry would need read permission on it,
+/// and opening a dataless file makes the file provider download it. `fstatat`
+/// through the retained parent names the entry without either, but only `std`
+/// can build a [`Metadata`], and it does so from a path.
+///
+/// So the entry's identity is taken through the retained parent, its metadata
+/// through the parent's current path, and the answer is accepted only when both
+/// describe the same inode. A rename or substitution anywhere along that path in
+/// between yields a different inode — or none — and is reported rather than
+/// answered with another object's metadata.
+#[cfg(target_os = "macos")]
+fn entry_metadata(
+    directory: &Root,
+    name: &OsStr,
+    reported: &Path,
+) -> Result<Metadata, ResolveError> {
+    use std::os::unix::fs::MetadataExt;
+    let raw = c_component(name, reported)?;
+    // SAFETY: `stat` is plain data for which all-zero bytes are a valid value,
+    // and `fstatat` overwrites it on success.
+    let mut identity: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the retained descriptor and `raw` outlive the call, and the
+    // output pointer addresses an owned `stat`.
+    let status = unsafe {
+        libc::fstatat(
+            directory.descriptor(),
+            raw.as_ptr(),
+            &mut identity,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status < 0 {
+        return Err(classify(reported, &io::Error::last_os_error()));
+    }
+    let parent = descriptor_path(directory.descriptor())
+        .map_err(|error| ResolveError::io(reported, &error))?;
+    let metadata = std::fs::symlink_metadata(parent.join(name))
+        .map_err(|error| ResolveError::io(reported, &error))?;
+    if metadata.dev() != identity.st_dev as u64 || metadata.ino() != identity.st_ino {
+        return Err(ResolveError::message(
+            reported,
+            "the entry changed while its metadata was read",
+        ));
+    }
+    Ok(metadata)
+}
+
+/// The path the kernel currently records for an open descriptor. It is a name,
+/// not an identity: a caller must verify what it reaches through it.
+#[cfg(target_os = "macos")]
+fn descriptor_path(descriptor: RawFd) -> io::Result<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` writes at most `MAXPATHLEN` (`PATH_MAX`) bytes,
+    // including the terminating NUL, into the buffer, which is that long.
+    let status = unsafe { libc::fcntl(descriptor, libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    buffer.truncate(length);
+    Ok(PathBuf::from(OsString::from_vec(buffer)))
 }
 
 /// Reads the target of the symbolic link `relative` beneath `root`.
@@ -446,12 +545,29 @@ pub use directory_creation::{
 };
 
 /// Changes permissions through the exact retained directory descriptor.
+///
+/// Linux refuses `fchmod` on an `O_PATH` descriptor, so the kernel-owned
+/// `/proc/self/fd` link names it instead; Darwin's `O_SEARCH` descriptor
+/// accepts `fchmod` directly.
+#[cfg(target_os = "linux")]
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         format!("/proc/self/fd/{}", directory.descriptor()),
         std::fs::Permissions::from_mode(mode),
     )
+}
+
+/// Changes permissions through the exact retained directory descriptor.
+#[cfg(target_os = "macos")]
+pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
+    let mode = libc::mode_t::try_from(mode)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mode out of range"))?;
+    // SAFETY: the Root owns a live descriptor for the duration of the call.
+    if unsafe { libc::fchmod(directory.descriptor(), mode) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Removes only an empty direct child through its retained parent.
@@ -531,31 +647,118 @@ pub fn directory_entries_beneath(
     } else {
         resolve_directory(root, relative)?
     };
-    // /proc resolves the already-open directory, never the repository pathname.
-    // read_dir owns its new descriptor for the entire enumeration.
-    let entries = std::fs::read_dir(format!("/proc/self/fd/{}", directory.descriptor()))
-        .map_err(|error| ResolveError::io(directory.path(), &error))?;
+    entry_names(&directory, limit)
+}
+
+/// Lists the direct children of a retained directory through that descriptor,
+/// never through a pathname, refusing to hold more than `limit` names.
+///
+/// The directory is reopened for reading through its descriptor (see
+/// [`reopen_directory_for_reading`]), and `fdopendir` then owns that new
+/// descriptor for the whole enumeration.
+pub(crate) fn entry_names(directory: &Root, limit: usize) -> Result<Vec<OsString>, ResolveError> {
+    let reported = directory.path();
+    let descriptor = reopen_directory_for_reading(directory)
+        .map_err(|error| ResolveError::io(reported, &error))?;
+    let descriptor = std::os::fd::IntoRawFd::into_raw_fd(descriptor);
+    // SAFETY: `descriptor` is fresh and owned by nothing else; on success the
+    // stream takes ownership of it, and on failure it is still ours to close.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `descriptor` is still owned here.
+        drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
+        return Err(ResolveError::io(reported, &error));
+    }
+    let stream = DirectoryStream(stream);
     let mut names = Vec::new();
-    for entry in entries {
+    loop {
+        clear_errno();
+        // SAFETY: the stream is open and owned by `stream` until it drops.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(0) {
+                return Ok(names);
+            }
+            return Err(ResolveError::io(reported, &error));
+        }
+        // SAFETY: a non-null `readdir` result points at an entry whose name is
+        // NUL-terminated and valid until the next call on this stream.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
         if names.len() == limit {
             return Err(ResolveError::message(
-                directory.path(),
+                reported,
                 "directory entry limit exceeded",
             ));
         }
-        names.push(
-            entry
-                .map_err(|error| ResolveError::io(directory.path(), &error))?
-                .file_name(),
-        );
+        names.push(OsString::from_vec(name.to_vec()));
     }
-    Ok(names)
+}
+
+/// Opens the retained directory itself for reading, without a pathname.
+///
+/// Linux reopens the kernel-owned `/proc/self/fd` link, which needs only read
+/// permission on the directory, as the `O_PATH` handle needed none. Darwin
+/// reopens `.` relative to the `O_SEARCH` handle, the one name that can never
+/// be substituted; the handle already required search permission.
+fn reopen_directory_for_reading(directory: &Root) -> io::Result<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    let descriptor = {
+        let link = CString::new(format!("/proc/self/fd/{}", directory.descriptor()))
+            .expect("a decimal descriptor contains no NUL");
+        // SAFETY: the link string outlives the call, and `open` returns a
+        // fresh owned descriptor or -1.
+        unsafe { libc::open(link.as_ptr(), flags) }
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: the literal is NUL-terminated and static, and `openat` returns a
+    // fresh owned descriptor or -1.
+    let descriptor = unsafe { libc::openat(directory.descriptor(), c".".as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `descriptor` was just returned by a successful open and is not
+    // owned anywhere else.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+}
+
+/// An open directory stream, closed when dropped.
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: the stream came from a successful `fdopendir` and is closed
+        // exactly once, here; `closedir` also closes its descriptor.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+/// Resets `errno`, so a null `readdir` can tell the end of the stream (errno
+/// still zero) from a failure.
+fn clear_errno() {
+    // SAFETY: the errno location is this thread's own, valid for its lifetime.
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            *libc::__error() = 0;
+        }
+    }
 }
 
 /// Creates an unnamed regular file on this retained directory's filesystem.
 ///
 /// No directory entry can be substituted or require cleanup. Unsupported
 /// filesystems are an explicit refusal; there is no named temporary fallback.
+#[cfg(target_os = "linux")]
 pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveError> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: the Root owns its descriptor, the literal is NUL-terminated,
@@ -597,6 +800,7 @@ pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveE
 /// name. AT_SYMLINK_FOLLOW follows only that kernel-owned descriptor link.
 /// The caller keeps the File alive across linkat. Failure leaves the output
 /// unnamed and never unlinks or overwrites anything in the destination.
+#[cfg(target_os = "linux")]
 pub fn link_anonymous_new(directory: &Root, file: &File, to: &OsStr) -> Result<(), ResolveError> {
     use std::os::unix::fs::MetadataExt;
     let destination = c_component(to, directory.path())?;
@@ -629,6 +833,26 @@ pub fn link_anonymous_new(directory: &Root, file: &File, to: &OsStr) -> Result<(
         ));
     }
     Ok(())
+}
+
+/// Darwin has no unnamed file (`O_TMPFILE`), and this contract allows no named
+/// temporary in its place, so the refusal is the one unsupported filesystems
+/// give on Linux.
+#[cfg(target_os = "macos")]
+pub fn create_anonymous_in(directory: &Root, _mode: u32) -> Result<File, ResolveError> {
+    Err(ResolveError::message(
+        directory.path(),
+        "Cannot create an anonymous copy file; this platform has no O_TMPFILE",
+    ))
+}
+
+/// See the Darwin [`create_anonymous_in`]: no unnamed file can exist to publish.
+#[cfg(target_os = "macos")]
+pub fn link_anonymous_new(directory: &Root, _file: &File, to: &OsStr) -> Result<(), ResolveError> {
+    Err(ResolveError::message(
+        &directory.path.join(to),
+        "Only an unnamed regular copy file may be published",
+    ))
 }
 
 /// Creates a file inside `directory` with `mode`, for the atomic
@@ -729,6 +953,9 @@ pub fn rename_new_between(
     let source = c_component(from, &source_directory.path)?;
     let destination = c_component(to, &destination_directory.path)?;
     // SAFETY: both names and the owned directory descriptor outlive this call.
+    // `RENAME_NOREPLACE` and Darwin's `RENAME_EXCL` both refuse, atomically
+    // and with `EEXIST`, any existing destination entry, including a link.
+    #[cfg(target_os = "linux")]
     let status = unsafe {
         libc::renameat2(
             source_directory.descriptor(),
@@ -736,6 +963,16 @@ pub fn rename_new_between(
             destination_directory.descriptor(),
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let status = unsafe {
+        libc::renameatx_np(
+            source_directory.descriptor(),
+            source.as_ptr(),
+            destination_directory.descriptor(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
         )
     };
     if status < 0 {
@@ -1004,7 +1241,8 @@ pub fn preserve_group(group: libc::gid_t, destination: &File) -> io::Result<()> 
     Ok(())
 }
 
-/// Preserves the source's POSIX access ACL on a new file.
+/// Preserves the source's access ACL on a new file: the POSIX access ACL on
+/// Linux, the extended (NFSv4-style) ACL on macOS.
 /// Unlike optional content attributes, losing an ACL can grant unintended
 /// access, so every failure prevents publication. An absent source ACL removes
 /// any access ACL inherited by the destination from its parent.
@@ -1017,6 +1255,11 @@ pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
 /// metadata observed before and after a concurrent permission change.
 pub struct AccessAcl(Option<Vec<u8>>);
 
+#[cfg(target_os = "macos")]
+#[path = "fs_safety/darwin_acl.rs"]
+mod darwin_acl;
+
+#[cfg(target_os = "linux")]
 impl AccessAcl {
     pub fn capture(source: &File) -> io::Result<Self> {
         let name = c"system.posix_acl_access";
@@ -1034,10 +1277,10 @@ impl AccessAcl {
             return write_attribute(destination, name, value);
         }
         // SAFETY: the descriptor is live and the attribute name is static.
-        let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
+        let status = unsafe { xattr::remove(destination.as_raw_fd(), name.as_ptr()) };
         if status < 0 {
             let error = io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+            if !matches!(error.raw_os_error(), Some(NO_ATTRIBUTE | libc::EOPNOTSUPP)) {
                 return Err(error);
             }
         }
@@ -1048,9 +1291,84 @@ impl AccessAcl {
 /// Whether an attribute describes the file's content rather than the kernel's
 /// or the filesystem's relationship with the inode. See
 /// [`copy_extended_attributes`] for why the line falls here.
+#[cfg(target_os = "linux")]
 fn is_content_attribute(name: &CStr) -> bool {
     let bytes = name.to_bytes();
     bytes.starts_with(b"user.") || bytes.starts_with(b"system.")
+}
+
+/// Darwin has no namespaces: every attribute is the file's own (Finder info,
+/// resource forks, `com.apple.quarantine`, a user's tags) except those the
+/// kernel keeps for itself. `com.apple.system.*` holds protected kernel state,
+/// `com.apple.provenance` is stamped by the kernel and refused to anyone else,
+/// and `com.apple.rootless` marks System Integrity Protection. An access ACL is
+/// not an attribute there; [`AccessAcl`] carries it.
+#[cfg(target_os = "macos")]
+fn is_content_attribute(name: &CStr) -> bool {
+    let bytes = name.to_bytes();
+    !(bytes.starts_with(b"com.apple.system.")
+        || bytes == b"com.apple.provenance"
+        || bytes == b"com.apple.rootless")
+}
+
+/// The descriptor forms of the extended-attribute calls, with Linux's
+/// signatures. Darwin's take a resource-fork `position` and an `options` word
+/// as well; zero for both is the plain behavior, and a descriptor never
+/// follows a link either way.
+#[cfg(target_os = "linux")]
+mod xattr {
+    pub(super) use libc::{
+        fgetxattr as get, flistxattr as list, fremovexattr as remove, fsetxattr as set_with_flags,
+    };
+
+    /// Creates or replaces one attribute.
+    pub(super) unsafe fn set(
+        fd: libc::c_int,
+        name: *const libc::c_char,
+        value: *const libc::c_void,
+        size: libc::size_t,
+    ) -> libc::c_int {
+        // SAFETY: forwarded under the caller's obligations.
+        unsafe { set_with_flags(fd, name, value, size, 0) }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod xattr {
+    pub(super) unsafe fn list(
+        fd: libc::c_int,
+        names: *mut libc::c_char,
+        size: libc::size_t,
+    ) -> libc::ssize_t {
+        // SAFETY: forwarded under the caller's obligations.
+        unsafe { libc::flistxattr(fd, names, size, 0) }
+    }
+
+    pub(super) unsafe fn get(
+        fd: libc::c_int,
+        name: *const libc::c_char,
+        value: *mut libc::c_void,
+        size: libc::size_t,
+    ) -> libc::ssize_t {
+        // SAFETY: forwarded under the caller's obligations.
+        unsafe { libc::fgetxattr(fd, name, value, size, 0, 0) }
+    }
+
+    /// Creates or replaces one attribute.
+    pub(super) unsafe fn set(
+        fd: libc::c_int,
+        name: *const libc::c_char,
+        value: *const libc::c_void,
+        size: libc::size_t,
+    ) -> libc::c_int {
+        // SAFETY: forwarded under the caller's obligations.
+        unsafe { libc::fsetxattr(fd, name, value, size, 0, 0) }
+    }
+
+    pub(super) unsafe fn remove(fd: libc::c_int, name: *const libc::c_char) -> libc::c_int {
+        // SAFETY: forwarded under the caller's obligations.
+        unsafe { libc::fremovexattr(fd, name, 0) }
+    }
 }
 
 /// Every extended-attribute name an open file carries.
@@ -1064,7 +1382,7 @@ fn attribute_names_with_limit(file: &File, limit: usize) -> io::Result<Vec<CStri
         // SAFETY: a null buffer with a zero length asks `flistxattr` only for
         // the size the list would need, which is the documented way to query
         // it.
-        let size = unsafe { libc::flistxattr(file.as_raw_fd(), ptr::null_mut(), 0) };
+        let size = unsafe { xattr::list(file.as_raw_fd(), ptr::null_mut(), 0) };
         if size < 0 {
             let error = io::Error::last_os_error();
             // A filesystem that has no such thing as an extended attribute
@@ -1085,7 +1403,7 @@ fn attribute_names_with_limit(file: &File, limit: usize) -> io::Result<Vec<CStri
         buffer.resize(size as usize, 0);
         // SAFETY: the write is bounded by the buffer's own length.
         let read = unsafe {
-            libc::flistxattr(
+            xattr::list(
                 file.as_raw_fd(),
                 buffer.as_mut_ptr().cast::<libc::c_char>(),
                 buffer.len(),
@@ -1127,10 +1445,10 @@ fn read_attribute_with_limit(
     for _ in 0..ATTRIBUTE_SIZE_ATTEMPTS {
         // SAFETY: `name` outlives the call, and a null buffer with a zero
         // length asks only for the size the value would need.
-        let size = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), ptr::null_mut(), 0) };
+        let size = unsafe { xattr::get(file.as_raw_fd(), name.as_ptr(), ptr::null_mut(), 0) };
         if size < 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ENODATA) {
+            if error.raw_os_error() == Some(NO_ATTRIBUTE) {
                 return Ok(None);
             }
             return Err(error);
@@ -1145,7 +1463,7 @@ fn read_attribute_with_limit(
         // buffer's own length. An empty value passes a dangling but aligned
         // pointer with a zero length, which `fgetxattr` never dereferences.
         let read = unsafe {
-            libc::fgetxattr(
+            xattr::get(
                 file.as_raw_fd(),
                 name.as_ptr(),
                 value.as_mut_ptr().cast::<libc::c_void>(),
@@ -1160,7 +1478,7 @@ fn read_attribute_with_limit(
             return Ok(Some(value));
         }
         let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENODATA) {
+        if error.raw_os_error() == Some(NO_ATTRIBUTE) {
             return Ok(None);
         }
         if error.raw_os_error() != Some(libc::ERANGE) {
@@ -1177,12 +1495,11 @@ fn write_attribute(file: &File, name: &CStr, value: &[u8]) -> io::Result<()> {
     // value's own. A zero flag means "create or replace", which is what a
     // freshly created replacement needs.
     let status = unsafe {
-        libc::fsetxattr(
+        xattr::set(
             file.as_raw_fd(),
             name.as_ptr(),
             value.as_ptr().cast::<libc::c_void>(),
             value.len(),
-            0,
         )
     };
     if status < 0 {
@@ -1210,16 +1527,26 @@ pub fn read_bounded(file: &mut File, limit: u64) -> io::Result<Vec<u8>> {
 /// Which mechanism resolves a path beneath a root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resolver {
-    /// One `openat2` call with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`.
+    /// One kernel call that refuses both escapes: `openat2` with
+    /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux, `openat` with
+    /// `O_NOFOLLOW_ANY` on macOS.
     Kernel,
     /// A component-at-a-time `openat` walk with `O_NOFOLLOW`.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     Walk,
 }
 
 /// The resolver this kernel supports, decided once.
+#[cfg(target_os = "linux")]
 fn resolver() -> Resolver {
-    static SUPPORTED: LazyLock<Resolver> = LazyLock::new(probe_resolver);
+    static SUPPORTED: std::sync::LazyLock<Resolver> = std::sync::LazyLock::new(probe_resolver);
     *SUPPORTED
+}
+
+/// Every macOS this builds for (11 and later) has `O_NOFOLLOW_ANY`.
+#[cfg(target_os = "macos")]
+fn resolver() -> Resolver {
+    Resolver::Kernel
 }
 
 /// Probes `openat2` by resolving `.` beneath the current directory.
@@ -1227,6 +1554,7 @@ fn resolver() -> Resolver {
 /// Only a kernel or sandbox that does not know the syscall selects the walk;
 /// an ordinary failure such as an unreadable working directory says nothing
 /// about the syscall's availability and must not disable it forever.
+#[cfg(target_os = "linux")]
 fn probe_resolver() -> Resolver {
     let flags = libc::O_PATH | libc::O_CLOEXEC;
     match openat2(libc::AT_FDCWD, Path::new("."), flags) {
@@ -1251,9 +1579,8 @@ fn resolve(
         // `RESOLVE_NO_SYMLINKS` already rejects a trailing symlink, and adding
         // `O_NOFOLLOW` would re-enable the `O_PATH | O_NOFOLLOW` exception that
         // hands back the link itself.
-        Resolver::Kernel => {
-            openat2(root.descriptor(), relative, flags).map_err(|error| classify(&reported, &error))
-        }
+        Resolver::Kernel => kernel_resolve(root.descriptor(), relative, flags)
+            .map_err(|error| classify(&reported, &error)),
         Resolver::Walk => walk(root, &parts, flags, &reported),
     }
 }
@@ -1261,7 +1588,7 @@ fn resolve(
 /// Resolves `relative` beneath `root` as a directory.
 fn resolve_directory(root: &Root, relative: &Path) -> Result<Root, ResolveError> {
     let reported = root.path.join(relative);
-    let flags = libc::O_PATH | libc::O_CLOEXEC;
+    let flags = INTERMEDIATE_HANDLE | libc::O_CLOEXEC;
     let descriptor = resolve(root, relative, flags, resolver())?;
     // The walk opens the final component `O_NOFOLLOW`, which for `O_PATH`
     // yields the symlink itself rather than an error, so the kind is checked
@@ -1295,7 +1622,7 @@ fn walk(
         .directory
         .try_clone()
         .map_err(|error| ResolveError::io(reported, &error))?;
-    let intermediate = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let intermediate = INTERMEDIATE_HANDLE | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     for part in leading {
         let child = open_at(directory.as_raw_fd(), part, intermediate)
             .map_err(|error| classify(reported, &error))?;
@@ -1314,7 +1641,33 @@ fn walk(
         .map_err(|error| classify(reported, &error))
 }
 
+/// One kernel call that resolves `relative` beneath `root`, refusing both a
+/// symlink in any component and a component that leaves it.
+#[cfg(target_os = "linux")]
+fn kernel_resolve(root: RawFd, relative: &Path, flags: i32) -> io::Result<OwnedFd> {
+    openat2(root, relative, flags)
+}
+
+/// `O_NOFOLLOW_ANY` refuses a symlink in any component, the final one
+/// included, with `ELOOP`. It does not itself confine the walk to `root`; that
+/// holds because every caller first passes `relative` through [`components`],
+/// which refuses absolute paths and every `..`.
+#[cfg(target_os = "macos")]
+fn kernel_resolve(root: RawFd, relative: &Path, flags: i32) -> io::Result<OwnedFd> {
+    let name = c_path(relative)?;
+    // SAFETY: `name` outlives the call, and `openat` returns a fresh owned
+    // descriptor or -1.
+    let descriptor = unsafe { libc::openat(root, name.as_ptr(), flags | libc::O_NOFOLLOW_ANY) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `descriptor` was just returned by a successful `openat` and is
+    // not owned anywhere else.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+}
+
 /// One `openat2` call restricted to `root`.
+#[cfg(target_os = "linux")]
 fn openat2(root: RawFd, relative: &Path, flags: i32) -> io::Result<OwnedFd> {
     let name = c_path(relative)?;
     let how = OpenHow {
@@ -1434,6 +1787,21 @@ fn temporary_name() -> io::Result<OsString> {
 }
 
 /// Fills `buffer` from the kernel's random pool.
+#[cfg(target_os = "macos")]
+pub fn fill_random(buffer: &mut [u8]) -> io::Result<()> {
+    // `getentropy` fills at most 256 bytes per call and never short-reads.
+    for chunk in buffer.chunks_mut(256) {
+        // SAFETY: the pointer and length describe exactly `chunk`, which
+        // outlives the call.
+        if unsafe { libc::getentropy(chunk.as_mut_ptr().cast::<libc::c_void>(), chunk.len()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Fills `buffer` from the kernel's random pool.
+#[cfg(target_os = "linux")]
 pub fn fill_random(buffer: &mut [u8]) -> io::Result<()> {
     let mut filled = 0;
     while filled < buffer.len() {
