@@ -151,7 +151,7 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     drop(reader);
     checkpoint("admitted")?;
     super::migrate_through(&tx, inspected.version, SCHEMA_VERSION)?;
-    require_layout(&tx)?;
+    require_layout(&inspect(&tx)?.objects)?;
     // Also forces the rollback-mode EXCLUSIVE write before commit for an
     // already-current store. No future writer can enter the conversion gap.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -447,8 +447,8 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         .as_ref()
         .map_err(Clone::clone)
 }
-fn require_layout(db: &Connection) -> Result<(), String> {
-    if inspect(db)?.objects != published_layouts(SCHEMA_VERSION)?.0 {
+fn require_layout(objects: &Layout) -> Result<(), String> {
+    if objects != &published_layouts(SCHEMA_VERSION)?.0 {
         return Err(format!(
             "workspace registry layout does not match published schema {SCHEMA_VERSION}"
         ));
@@ -517,7 +517,7 @@ pub(super) fn require_current(db: &Connection) -> Result<(), String> {
             actual.version
         ));
     }
-    require_layout(db)
+    require_layout(&actual.objects)
 }
 
 // Tokenize, rather than deleting substrings: a column named
