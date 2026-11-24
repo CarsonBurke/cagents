@@ -1311,6 +1311,7 @@ fn legacy_daemon_drains_outcomes_and_retires_with_pending_attention_clears() {
     notify(clear);
     server.actor.close().unwrap();
     server.closed_snapshot = Some(Arc::new(server.actor.snapshot(None).unwrap()));
+    std::fs::create_dir_all(registry::directory(Kind::Native).unwrap()).unwrap();
     assert!(call(server, "retire", Value::Bool(true)).is_err());
     assert!(!server.session_stopping);
     call(server, "retire", Value::Null).unwrap();
