@@ -343,6 +343,12 @@ impl Cagents {
     /// so only another terminal, whose close needs the same daemon request,
     /// waits for it; a chat or any other pane closes beside it.
     pub(super) fn another_close_under_way(&self, card: CardId) -> bool {
+        self.close_blocking(card).is_some()
+    }
+
+    /// The pane whose close `card`'s has to wait for; see
+    /// [`Self::another_close_under_way`].
+    fn close_blocking(&self, card: CardId) -> Option<CardId> {
         let terminal = matches!(
             self.card_state(card).map(|state| &state.kind),
             Some(CardKind::Terminal(_))
@@ -352,10 +358,72 @@ impl Cagents {
             .workspace
             .pending_close()
             .map(|pending| pending.unmounting);
-        self.closes_under_way().any(|running| {
-            running != card
-                && (terminal || reserved == Some(running) || !self.hidden_closes.contains(&running))
+        self.closes_under_way().find(|running| {
+            *running != card
+                && (terminal || reserved == Some(*running) || !self.hidden_closes.contains(running))
         })
+    }
+
+    /// Whether `blocker` holds the strip's removal with nothing left working
+    /// towards it: no dialog, daemon request, editor question or group, only a
+    /// reservation whose commit never came. Its pane is still on screen and
+    /// can be closed again, so giving the reservation up loses nothing.
+    fn removal_stranded(&self, blocker: CardId) -> bool {
+        self.workspace
+            .pending_close()
+            .is_some_and(|pending| pending.unmounting == blocker)
+            && !self.removal_owner_running(blocker)
+            && !self.hidden_closes.contains(&blocker)
+            && !self.chrome_ui.closing_group.contains(&blocker)
+            && !self
+                .dirty_repository_close
+                .as_ref()
+                .is_some_and(|close| close.card == blocker || close.remaining.contains(&blocker))
+    }
+
+    /// Queues `card`'s close behind `blocker`'s and tells the reader what it
+    /// waits for, so a Close that can't start yet is never silent.
+    fn queue_card_close_behind(&mut self, card: CardId, blocker: CardId, unasked: bool) {
+        self.queue_card_close(card, unasked);
+        let name = self
+            .card_state(blocker)
+            .map(|state| self.card_display_title(state).to_owned())
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| "another pane".to_owned(), |name| format!("“{name}”"));
+        let message = if self
+            .dirty_repository_close
+            .as_ref()
+            .is_some_and(|close| close.card == blocker || close.remaining.contains(&blocker))
+        {
+            format!(
+                "This pane closes once you decide what to do with the unsaved changes in {name}."
+            )
+        } else if self.chrome_ui.closing_group.contains(&blocker) {
+            "This pane closes once the panes already closing have gone.".to_owned()
+        } else if self
+            .terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.card == blocker && !intent.pending)
+        {
+            format!("This pane closes once you answer the question about {name}.")
+        } else if self
+            .terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.card == blocker)
+            || self.completed_release == Some(blocker)
+        {
+            format!(
+                "This pane closes once {name} has finished closing. Cagents is waiting for its terminal to stop."
+            )
+        } else if self.removal_stranded(blocker) {
+            format!(
+                "This pane is waiting for {name} to finish closing. Close this pane again to stop waiting."
+            )
+        } else {
+            format!("This pane closes once {name} has finished closing.")
+        };
+        self.status =
+            Some(TransientNotice::warning(message).with_key(NoticeKey::CloseWaiting(card)));
     }
 
     /// Whether the next queued pane has to wait: for a close under way, or for
@@ -404,6 +472,8 @@ impl Cagents {
             else {
                 break;
             };
+            // It is starting, or gone: either way it waits no longer.
+            self.resolve_notice(NoticeKey::CloseWaiting(card));
             let open = |app: &Self| {
                 app.card_state(card)
                     .is_some_and(|state| state.existence.is_open())
@@ -595,6 +665,12 @@ impl Cagents {
         }
         if self.chat_close_dialog_visible() {
             self.queue_card_close(card, unasked);
+            self.status = Some(
+                TransientNotice::warning(
+                    "This pane closes once you answer the question about the chat that is closing.",
+                )
+                .with_key(NoticeKey::CloseWaiting(card)),
+            );
             return Task::none();
         }
         if let Some(closed) = self.close_fenced_card(card) {
@@ -612,9 +688,24 @@ impl Cagents {
         }
         // Wait for the close under way, rather than have it refuse this pane at
         // the end of its own close.
-        if self.another_close_under_way(card) {
-            self.queue_card_close(card, unasked);
-            return Task::none();
+        if let Some(blocker) = self.close_blocking(card) {
+            // Asked again while it waits on a reservation nothing will
+            // commit, the reader is told they may stop waiting: the stranded
+            // pane stays open and this close goes ahead.
+            let asked_again = self
+                .queued_card_closes
+                .iter()
+                .any(|queued| queued.card == card);
+            if asked_again && self.removal_stranded(blocker) {
+                tracing::warn!(%blocker, "gave up a pane removal that was never committed");
+                self.abandon_removal(blocker);
+            }
+            if let Some(blocker) = self.close_blocking(card) {
+                self.queue_card_close_behind(card, blocker, unasked);
+                return Task::none();
+            }
+            self.queued_card_closes.retain(|queued| queued.card != card);
+            self.resolve_notice(NoticeKey::CloseWaiting(card));
         }
         // This pane's own close is already running or asking, or the daemon has
         // answered and only its removal is left.
@@ -3653,5 +3744,151 @@ pub(in crate::app) mod tests {
         );
         assert!(next.pending);
         assert!(!next.active);
+    }
+
+    fn settings_beside(app: &mut Cagents) -> CardId {
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        app.utility_card(&CardKind::Settings).unwrap()
+    }
+
+    fn waiting_notice(app: &Cagents, card: CardId) -> Option<String> {
+        let key = Some(NoticeKey::CloseWaiting(card));
+        app.status
+            .iter()
+            .chain(app.notices.recent().map(|entry| &entry.notice))
+            .find(|notice| notice.key == key)
+            .map(|notice| notice.message.clone())
+    }
+
+    /// A Close that has to wait for another pane's says what it waits for,
+    /// and the notice goes once the close starts.
+    #[test]
+    fn a_close_queued_behind_another_says_what_it_waits_for() {
+        let (mut app, first) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        app.completed_release = Some(first);
+        drop(app.update(Message::CloseCard(settings)));
+        assert!(app.card_state(settings).unwrap().existence.is_open());
+        let title = app.card_state(first).unwrap().title.clone();
+        let notice = waiting_notice(&app, settings).expect("the wait is reported");
+        assert!(notice.contains(&title), "{notice}");
+        assert!(notice.contains("terminal to stop"), "{notice}");
+
+        app.completed_release = None;
+        drop(app.next_queued_card_close());
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|pending| pending.unmounting),
+            Some(settings)
+        );
+        assert_eq!(waiting_notice(&app, settings), None);
+        assert!(
+            !app.notices
+                .recent()
+                .any(|entry| entry.notice.key == Some(NoticeKey::CloseWaiting(settings)))
+        );
+    }
+
+    /// A removal reserved for a pane whose commit never arrives would hold
+    /// every later close in the window. The pane waiting behind it says so,
+    /// and closing it again gives the stranded reservation up: that pane
+    /// stays open, and its late commit, if it ever comes, changes nothing.
+    #[test]
+    fn closing_again_stops_waiting_for_a_stranded_removal() {
+        let (mut app, first) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        app.workspace.request_close(first).unwrap();
+        drop(app.update(Message::CloseCard(settings)));
+        assert!(app.card_state(settings).unwrap().existence.is_open());
+        let notice = waiting_notice(&app, settings).expect("the wait is reported");
+        assert!(notice.contains("Close this pane again"), "{notice}");
+
+        drop(app.update(Message::CloseCard(settings)));
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|pending| pending.unmounting),
+            Some(settings)
+        );
+        assert!(app.queued_card_closes.is_empty());
+        drop(app.update(Message::CommitClose(first)));
+        assert!(app.card_state(first).unwrap().existence.is_open());
+        drop(app.update(Message::CommitClose(settings)));
+        assert!(!app.card_state(settings).unwrap().existence.is_open());
+        assert!(app.card_state(first).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|card| card == first));
+        assert_eq!(waiting_notice(&app, settings), None);
+    }
+
+    /// A pane mid-close for a reason of its own is waited for however often
+    /// Close is pressed: only a stranded reservation is given up.
+    #[test]
+    fn closing_again_still_waits_for_a_close_that_is_running() {
+        let (mut app, first) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        app.workspace.request_close(first).unwrap();
+        app.completed_release = Some(first);
+        for _ in 0..2 {
+            drop(app.update(Message::CloseCard(settings)));
+            assert_eq!(
+                app.workspace
+                    .pending_close()
+                    .map(|pending| pending.unmounting),
+                Some(first)
+            );
+            let notice = waiting_notice(&app, settings).expect("the wait is reported");
+            assert!(!notice.contains("Close this pane again"), "{notice}");
+        }
+        assert_eq!(app.queued_card_closes.len(), 1);
+    }
+
+    /// A Close turned away by an update being prepared says why.
+    #[test]
+    fn a_close_during_update_preparation_says_why_it_waits() {
+        let (mut app, _) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        app.update_prepared = true;
+        drop(app.update(Message::CloseCard(settings)));
+        assert!(app.card_state(settings).unwrap().existence.is_open());
+        let notice = app.status.as_ref().expect("the refusal is reported");
+        assert!(
+            notice.message.contains("update is being prepared"),
+            "{notice:?}"
+        );
+    }
+
+    /// A Close behind a dialog says the dialog comes first.
+    #[test]
+    fn a_close_behind_a_dialog_says_the_dialog_comes_first() {
+        let (mut app, _) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        app.settings_reset_confirm = true;
+        drop(app.update(Message::CloseCard(settings)));
+        assert!(app.card_state(settings).unwrap().existence.is_open());
+        assert!(app.workspace.pending_close().is_none());
+        let notice = app.status.as_ref().expect("the refusal is reported");
+        assert!(notice.message.contains("open dialog first"), "{notice:?}");
+    }
+
+    /// A pane's Close pressed while a menu is open closes the menu and the
+    /// pane, rather than being swallowed by the menu.
+    #[test]
+    fn a_close_under_an_open_menu_closes_the_menu_and_the_pane() {
+        let (mut app, _) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        app.notices.record(TransientNotice::warning("first"));
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleNotices)));
+        assert!(app.chrome_ui.is_open());
+        drop(app.update(Message::CloseCard(settings)));
+        assert!(!app.chrome_ui.is_open());
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|pending| pending.unmounting),
+            Some(settings)
+        );
+        drop(app.update(Message::CommitClose(settings)));
+        assert!(!app.card_state(settings).unwrap().existence.is_open());
     }
 }

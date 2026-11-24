@@ -348,6 +348,8 @@ enum NoticeKey {
     TerminalStart(CardId),
     /// Restoring this card from the window's saved state at startup.
     CardRestore(CardId),
+    /// Closing this pane, which waits for another pane's close to finish.
+    CloseWaiting(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15512,6 +15514,16 @@ impl Cagents {
         {
             return self.begin_card_close(id);
         }
+        // A commit for a removal given up meanwhile, as a stranded one is when
+        // a pane waiting behind it is closed again, has nothing left to commit.
+        if !self
+            .workspace
+            .pending_close()
+            .is_some_and(|pending| pending.unmounting == id)
+        {
+            self.abandon_removal(id);
+            return self.next_queued_card_close();
+        }
         match self.commit_card_removal(id, None) {
             Some(task) => task,
             None => {
@@ -18019,6 +18031,10 @@ impl Cagents {
         }
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
+        let closes = matches!(
+            message,
+            Message::CloseCard(_) | Message::CloseCardUnasked(_)
+        );
         if self.update_prepared && user_message_blocked_during_update(&message) {
             // Nothing else would ever deliver this removal.
             if let Message::CommitClose(card) = message {
@@ -18028,6 +18044,12 @@ impl Cagents {
                 ));
                 return ControlFlow::Break(self.return_kept_panes());
             }
+            // A Close turned away says why, rather than doing nothing.
+            if closes {
+                self.status = Some(TransientNotice::warning(
+                    "Panes can't close while an update is being prepared. Close it again once the update finishes or is cancelled.",
+                ));
+            }
             return ControlFlow::Break(Task::none());
         }
         if self.modal_is_open() {
@@ -18036,9 +18058,25 @@ impl Cagents {
             && !matches!(&message, Message::ChromeUi(_))
             && user_workspace_message_blocked_while_modal(&message)
         {
-            return ControlFlow::Break(Task::none());
+            // A menu only dismisses itself under a click elsewhere, but a pane's
+            // Close is aimed at the pane: the menu goes and the close goes on.
+            if closes && !self.chrome_ui.renaming() {
+                self.chrome_ui.close();
+            } else {
+                if closes {
+                    self.status = Some(TransientNotice::warning(
+                        "Finish renaming the pane first, then close it.",
+                    ));
+                }
+                return ControlFlow::Break(Task::none());
+            }
         }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
+            if closes {
+                self.status = Some(TransientNotice::warning(
+                    "Close or answer the open dialog first, then close the pane.",
+                ));
+            }
             return ControlFlow::Break(Task::none());
         }
         if self.focused_repository_is_saving() && workspace_navigation_blocked_during_save(&message)

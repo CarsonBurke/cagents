@@ -2014,6 +2014,11 @@ impl State {
     pub(super) fn close(&mut self) {
         self.popup = None;
     }
+
+    /// Whether a pane is being renamed, which a click elsewhere does not end.
+    pub(super) fn renaming(&self) -> bool {
+        self.rename.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
