@@ -108,6 +108,8 @@ impl Registry {
         if dead.is_empty() {
             return Ok(None);
         }
+        #[cfg(test)]
+        super::super::pause(super::super::Pause::BeforeCompactionDelete);
         self.delete_compacted_scopes(&dead)
     }
 

@@ -79,7 +79,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
-/// Test pause points for interleaving another writer with `apply`/`model`.
+/// Test pause points for interleaving another writer with a registry operation.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Pause {
@@ -87,6 +87,7 @@ pub(super) enum Pause {
     MailboxRead,
     BeforeCommit,
     AfterCommit,
+    BeforeCompactionDelete,
 }
 
 #[cfg(test)]
