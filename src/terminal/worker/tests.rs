@@ -3342,11 +3342,18 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
             let _ = self.0.force_kill();
         }
     }
-    for (script, expected_code) in [
-        ("trap '' HUP; printf ready; while :; do sleep 1; done", None),
+    // A family that ignores its hangup waits out the grace, so it gets the
+    // product's; one that handles it ends the grace whenever it exits.
+    for (script, expected_code, budget) in [
+        (
+            "trap '' HUP; printf ready; while :; do sleep 1; done",
+            None,
+            ShutdownBudget::PATIENT_PRODUCT_GRACE,
+        ),
         (
             "trap 'exit 3' HUP; printf ready; while :; do sleep 0.05; done",
             Some(3),
+            ShutdownBudget::PATIENT,
         ),
     ] {
         let mut command = portable_pty::CommandBuilder::new("/bin/sh");
@@ -3415,7 +3422,6 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
         assert_eq!(&ready, b"ready");
         let root = RootIdentity::capture(held.child.pid(), None).unwrap();
         let started = std::time::Instant::now();
-        let budget = ShutdownBudget::PATIENT;
         let status = shutdown_child_exit(
             &held.child,
             &held.master,
