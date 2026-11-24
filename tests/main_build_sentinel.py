@@ -749,23 +749,83 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertIn("test lane_breaks ... FAILED", body)
         self.assertIn("the reason it broke", body)
 
-    def test_repeated_environmental_refusals_eventually_keep_a_failed_verdict(self):
+    def test_repeated_environmental_refusals_across_main_commits_keep_a_failed_verdict(self):
         root, marker = self.stray_fixture_root()
-        failing = self.commit("merge while a stray marker persists")
-        path = self.state / "verdicts" / f"{failing}.json"
+        verdicts = self.state / "verdicts"
         with patch.dict(os.environ, TMPDIR=str(root)):
-            for _ in range(3):
+            for attempt in range(3):
+                deferred = self.commit(f"merge during stray marker deferral {attempt + 1}")
                 self.tick()
-                self.assertFalse(path.exists())
+                self.assertIn([deferred, "host"], self.tested())
+                self.assertFalse((verdicts / f"{deferred}.json").exists())
                 self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
                 self.now += 1800
+
+            # An infrastructure stop with the same marker still present preserves the streak.
+            stop = self.origin / "refused-host"
+            stop.touch()
+            refused = self.commit("merge while the build host is full")
             self.tick()
-        verdict = json.loads(path.read_text())
+            self.assertIn([refused, "host"], self.tested())
+            self.assertFalse((verdicts / f"{refused}.json").exists())
+            self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+            self.now += 1800
+
+            stop.unlink()
+            failing = self.commit("merge after the build host recovers")
+            self.tick()
+        verdict = json.loads((verdicts / f"{failing}.json").read_text())
         self.assertFalse(verdict["passed"])
         self.assertNotIn("outside_code", verdict)
         body = (self.state / "test-issue.md").read_text()
         self.assertIn(str(marker), body)
         self.assertRegex(body, r"(?i)stray \.git")
+
+    def test_a_marker_only_lane_and_an_ordinary_failing_lane_keep_a_failed_verdict(self):
+        root, marker = self.stray_fixture_root()
+        deferred = self.commit("merge while a stray marker exists")
+        failure = self.origin / "failing-ui"
+        verdicts = self.state / "verdicts"
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            # Leave one deferral in reserve so the mixed failure must record its own verdict.
+            for _ in range(2):
+                self.tick()
+                self.assertFalse((verdicts / f"{deferred}.json").exists())
+                self.now += 1800
+
+            failure.touch()
+            failing = self.commit("a UI test fails while host fixtures refuse the marker")
+            self.tick()
+            verdict = json.loads((verdicts / f"{failing}.json").read_text())
+            self.assertFalse(verdict["passed"])
+            self.assertNotIn("outside_code", verdict)
+            self.assertEqual(verdict["lanes"]["host"]["stray_git_markers"], [str(marker)])
+            self.assertEqual(verdict["lanes"]["ui"]["status"], sentinel.CODE_FAILURE)
+            body = (self.state / "test-issue.md").read_text()
+            self.assertIn(f"enclosing Git marker {marker} exists;", body)
+            self.assertIn("the reason it broke", body)
+
+            failure.unlink()
+            recovered = self.commit("fix the UI test while the marker persists")
+            for _ in range(3):
+                self.now += 1800
+                self.tick()
+                self.assertFalse((verdicts / f"{recovered}.json").exists())
+            self.assertEqual(self.tested().count([recovered, "host"]), 3)
+
+    def test_replacing_a_marker_at_the_same_path_restarts_deferrals(self):
+        root, marker = self.stray_fixture_root()
+        failing = self.commit("merge while a stray marker exists")
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            for _ in range(3):
+                verdict = sentinel.require_tests(self.repo, self.state, failing)
+                self.assertEqual(verdict["outside_code"], ["host"])
+            replacement = marker.with_name(".git-replacement")
+            replacement.symlink_to("different-missing-gitdir")
+            replacement.replace(marker)
+            verdict = sentinel.require_tests(self.repo, self.state, failing)
+        self.assertEqual(verdict["outside_code"], ["host"])
+        self.assertFalse((self.state / "verdicts" / f"{failing}.json").exists())
 
     def test_a_removed_verdict_is_tested_again_by_the_watcher(self):
         self.tick()

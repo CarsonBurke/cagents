@@ -162,8 +162,8 @@ def prune_evidence(directory, state):
     protected.update([pending.get("sha"), bisecting.get("after"), *bisecting.get("commits", [])])
     cutoff = now - LOG_RETENTION_SECONDS
     expire_files(directory / "logs", LOG_NAME, cutoff, protected)
-    # A published verdict is a durable release decision. Keep retry counts for
-    # watched commits, and sweep abandoned retries and interrupted writes.
+    # Published verdicts are durable release decisions. Sweep interrupted writes
+    # and retry files left by older versions.
     expire_files(directory / "verdicts", TEMP_VERDICT_NAME, cutoff, protected)
     state["evidence_swept_at"] = now
     save(directory / "state.json", state)
@@ -526,10 +526,11 @@ def stray_git_markers(log, markers, repository):
     return []
 
 
-def test_commit(repository, directory, sha):
+def test_commit(repository, directory, state, sha):
     """Runs each test lane the commit has, in the sentinel's worktree, and
     returns the verdict: passed only when every lane's tests ran and passed.
-    It is recorded unless a lane failed for a reason outside the code."""
+    It is recorded unless a lane failed for a reason outside the code.
+    Persists the marker deferral count under the caller's state lock."""
     checkout = checkout_commit(repository, sha)
     (directory / "logs").mkdir(exist_ok=True)
     lanes = {}
@@ -568,24 +569,27 @@ def test_commit(repository, directory, sha):
     outside = [lane for lane, entry in lanes.items() if entry["status"] not in (0, CODE_FAILURE)]
     marker_lanes = {lane for lane, entry in lanes.items() if entry.get("stray_git_markers")}
     failed_lanes = {lane for lane, entry in lanes.items() if entry["status"] == CODE_FAILURE}
-    path = verdict_path(directory, sha)
-    retry = path.with_suffix(".retry")
+    state_path = directory / "state.json"
     if not outside and marker_lanes and marker_lanes == failed_lanes:
-        attempts = json.loads(retry.read_text()) if retry.exists() else 0
-        if attempts < STRAY_GIT_RETRIES:
-            retry.parent.mkdir(exist_ok=True)
-            save(retry, attempts + 1)
+        markers = {marker: list(markers_before[marker]) for entry in lanes.values()
+                   for marker in entry.get("stray_git_markers", [])}
+        previous = state.get("stray_git_deferrals", {})
+        count = previous["count"] if previous.get("markers") == markers else 0
+        if count < STRAY_GIT_RETRIES:
+            state["stray_git_deferrals"] = {"markers": markers, "count": count + 1}
+            save(state_path, state)
             outside = [lane for lane in lanes if lane in marker_lanes]
-    elif outside:
-        retry.unlink(missing_ok=True)
     if outside:
         verdict["outside_code"] = outside
         print(f"main-build-sentinel: {sha} {', '.join(outside)} stopped outside the code; "
               "no verdict is kept", flush=True)
         return verdict
+    path = verdict_path(directory, sha)
     path.parent.mkdir(exist_ok=True)
+    if state.pop("stray_git_deferrals", None) is not None:
+        # Clear the streak before publishing the verdict so a restart cannot reuse it.
+        save(state_path, state)
     save(path, verdict)
-    retry.unlink(missing_ok=True)
     return verdict
 
 
@@ -684,7 +688,7 @@ def test_main(repository, directory, state):
             return
         if time.time() < state.get("tests_retry_after", 0):
             return
-        verdict = read_verdict(directory, sha) or test_commit(repository, directory, sha)
+        verdict = read_verdict(directory, sha) or test_commit(repository, directory, state, sha)
         if verdict.get("outside_code"):
             # Not the code's verdict; tested again after a pause.
             state["tests_retry_after"] = time.time() + 1800
@@ -734,10 +738,10 @@ def require_tests(repository, directory, revision):
         sha = git(repository, "rev-parse", "--verify", commit)
         verdict = read_verdict(directory, sha)
         if verdict is None:
-            verdict = test_commit(repository, directory, sha)
-            # Back where the watcher left its checkout, which it builds from.
             path = directory / "state.json"
             state = json.loads(path.read_text()) if path.exists() else {}
+            verdict = test_commit(repository, directory, state, sha)
+            # Back where the watcher left its checkout, which it builds from.
             checked = state.get("checked")
             if checked:
                 checkout_commit(repository, checked)
