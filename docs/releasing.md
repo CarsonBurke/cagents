@@ -163,7 +163,48 @@ steps, each through `mise run release` (`scripts/release --help`):
    - signs the metadata with KEY (or `CAGENTS_RELEASE_SIGNING_KEY`); touch the
      security key when it asks. Without a key, it prints the signing command
      (see [Signing](#signing)).
-2. Rehearse the update from the previous release through a file feed (below).
+2. `mise run release -- rehearse VERSION` rehearses installed cagents updating
+   from the newest published release to the signed cut, on the build host,
+   the way a person updates in the app. It uses the released commit's
+   `scripts/rehearse-update`
+   ([Rehearsing an update](development.md#rehearsing-an-update)):
+   - a private user with its own headless desktop installs the published
+     release;
+   - it opens three windows, one holding nothing, and seeds chats, agents, a
+     channel, terminals with a long-lived child and a chat whose provider has
+     already stopped;
+   - the published build's own updater finds the cut in a file feed made
+     from the cut bundle, checks its signature against the release keys, and
+     updates;
+   - it requires every pane, chat, agent and terminal to survive, NEW to
+     serve, the windows to reopen on NEW, and no reopened window to show
+     "Update failed" or "Update not installed";
+   - then, as after a reboot, it closes the windows, stops NEW's daemon and
+     reopens them, and requires the same again.
+
+   It takes about 12 minutes, plus the published release's download the
+   first time. Interrupting it stops the run on the host too. The options
+   it passes come from this checkout and the harness from the cut commit, so
+   a cut older than the harness options (#3919, #3938) is refused by them.
+
+   Either way the update must end `Complete` with no refusal. A reopened
+   window reports anything else as "Update failed" or "Update not installed",
+   even when the work survived. In the app it is the published build's worker
+   that writes that status, so a worker that refuses the cut's protocol after
+   a good install fails the rehearsal (#3877). With `--staged` it instead runs
+   the cut's own staged `cagents daemon upgrade`, which needs no signature.
+
+   The rehearsal's private user goes in `/var/tmp/cr/release-VERSION` on the
+   host. If `/var/tmp` has a `.git` above it, such as the empty mountpoints
+   a sandbox masking `.git` leaves behind, it goes in `/dev/shm/cr` instead.
+   It takes about 700 MB and is removed once the rehearsal passes; the
+   report is kept in `~/.cache/cagents-release-rehearsal/passed-VERSION.txt`. If a
+   `.git` appears above the root while the rehearsal runs, a failure says
+   so instead of reporting it as a regression, and you rehearse again. A
+   rehearsal that fails in `/var/tmp` keeps its report, records and
+   screenshots there until the next rehearsal of that version replaces them.
+   One that fails in `/dev/shm`, which is memory, keeps only its report and
+   screenshots, in `~/.cache/cagents-release-rehearsal/failed-VERSION`.
 3. `mise run release -- publish VERSION` asks you to type the version, then
    runs `scripts/publish-release --push-tag`. It checks the signature against
    the keys the tag lists, the metadata against every asset, the checksums,

@@ -8,6 +8,15 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_HOST=${CAGENTS_RELEASE_BUILD_HOST:-fw16}
 BUNDLES=${CAGENTS_RELEASE_BUNDLES:-"${XDG_STATE_HOME:-$HOME/.local/state}/cagents-release"}
 GITHUB_REPOSITORY=${CAGENTS_RELEASE_GITHUB_REPOSITORY:-CarsonBurke/cagents}
+# The rehearsal's private user on the build host; by default
+# PARENT/release-VERSION, short as its sockets need, in the first of these
+# parents with no .git above it. A sandbox that masks .git in its writable
+# roots leaves empty .git mountpoints in /var/tmp, under which the harness
+# refuses to run; /dev/shm is memory, so a failed rehearsal there keeps only
+# its report and screenshots.
+REHEARSAL_ROOT=${CAGENTS_RELEASE_REHEARSAL_ROOT:-}
+# Separated by colons, as ssh splits its arguments at spaces.
+REHEARSAL_PARENTS=${CAGENTS_RELEASE_REHEARSAL_PARENTS:-/var/tmp/cr:/dev/shm/cr}
 VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 # Workspace members that carry the product version.
 MANIFESTS=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
@@ -47,6 +56,17 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
                    fixes and speedups since the previous tag here.
+  rehearse VERSION [--staged] [--build-host HOST]
+                   Rehearse installed cagents updating from the newest
+                   published release to the signed cut VERSION, on HOST,
+                   with that commit's scripts/rehearse-update: a private user
+                   with three windows, chats, agents and terminals updates
+                   as a person does in the app, the published build's own
+                   updater fetching the cut from a file feed. Its work must
+                   survive and no reopened window may show the update as
+                   failed. --staged instead runs the cut's own staged
+                   `cagents daemon upgrade`, which needs no signature, and
+                   requires the update to end Complete.
   feed VERSION --feed DIR
                    Add the signed bundle to a file feed, for rehearsing the
                    update before publishing (docs/releasing.md#rehearsing).
@@ -78,6 +98,7 @@ FEED=
 COMMIT=
 KEY=
 WAIT=false
+STAGED=false
 while (($#)); do
     case $1 in
         --notes|--build-host|--feed|--commit|--key)
@@ -89,12 +110,14 @@ while (($#)); do
             shift 2
             ;;
         --wait) WAIT=true; shift ;;
+        --staged) STAGED=true; shift ;;
         *) fail "unknown argument: $1 (see --help)" ;;
     esac
 done
 [[ $COMMAND == cut || ( -z $COMMIT && -z $KEY && $WAIT == false ) ]] \
     || fail '--commit, --key and --wait are for cut'
 [[ -z $COMMIT || $WAIT == false ]] || fail "--wait releases main's tip; --commit releases another bundle"
+[[ $COMMAND == rehearse || $STAGED == false ]] || fail '--staged is for rehearse'
 
 repository_git() (
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
@@ -439,11 +462,11 @@ cut() {
         printf '\nSigning with %s; touch the key if it asks.\n' "$key"
         ssh-keygen -Y sign -n cagents-release -f "$key" "$bundle/release-metadata.json" \
             || fail "$TAG is cut but not signed; sign it, then publish: ssh-keygen -Y sign -n cagents-release -f $(printf %q "$key") $(printf %q "$bundle/release-metadata.json")"
-        printf 'Rehearse it if you like (docs/releasing.md#rehearsing), then publish:\n  scripts/release publish %s\n' \
-            "$VERSION"
+        printf 'Rehearse the update, then publish:\n  scripts/release rehearse %s\n  scripts/release publish %s\n' \
+            "$VERSION" "$VERSION"
     else
-        printf '\nSign it, then publish:\n  ssh-keygen -Y sign -n cagents-release -f KEY %q\n  scripts/release publish %s\n' \
-            "$bundle/release-metadata.json" "$VERSION"
+        printf '\nSign it, rehearse the update, then publish:\n  ssh-keygen -Y sign -n cagents-release -f KEY %q\n  scripts/release rehearse %s\n  scripts/release publish %s\n' \
+            "$bundle/release-metadata.json" "$VERSION" "$VERSION"
     fi
 }
 
@@ -511,6 +534,184 @@ start_next_version() {
     [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
 }
 
+# The version is updated from what is published now to the bytes cut, copied
+# to the build host. By default the published build updates itself as a
+# person does, from a file feed of the signed cut; --staged runs the cut's
+# own staged upgrade instead.
+rehearse() {
+    local bundle=$BUNDLES/$VERSION sha previous root started mode=in-app files incoming status
+    [[ -f $bundle/release-metadata.json ]] || fail "cut $VERSION first: scripts/release cut"
+    if [[ $STAGED == true ]]; then
+        mode=staged
+        files=("$bundle/cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz" "$bundle/SHA256SUMS" "$bundle/install.sh")
+    else
+        # The published build trusts only the release keys.
+        [[ -f $bundle/release-metadata.json.sig ]] \
+            || fail "sign $bundle/release-metadata.json first (see --help), or rehearse the staged upgrade, which needs no signature: scripts/release rehearse $VERSION --staged"
+        files=("$bundle"/*)
+    fi
+    sha=$(jq -er .source_commit "$bundle/release-metadata.json") || fail "$bundle names no source commit"
+    previous=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName --jq .tagName) \
+        || fail 'cannot read the newest published release'
+    previous=${previous#v}
+    [[ $previous =~ $VERSION_PATTERN && $previous != "$VERSION" \
+        && $(printf '%s\n%s\n' "$previous" "$VERSION" | sort -V | tail -n1) == "$VERSION" ]] \
+        || fail "the newest published release is $previous, not older than $VERSION; there is nothing to rehearse"
+    # ssh would drop an empty argument, and the host's shell parses the rest.
+    root=${REHEARSAL_ROOT:--}
+    [[ $root =~ ^[A-Za-z0-9_./-]+$ && $REHEARSAL_PARENTS =~ ^[A-Za-z0-9_./:-]+$ ]] \
+        || fail 'CAGENTS_RELEASE_REHEARSAL_ROOT and _PARENTS may hold only letters, digits and _ . / - (and : between parents)'
+    printf 'Rehearsing the %s update from %s to %s on %s; it takes about 12 minutes.\n' \
+        "$mode" "$previous" "$VERSION" "$BUILD_HOST"
+    started=$SECONDS
+    # Copied apart from any rehearsal running there; the run moves it into
+    # place once it holds the lock.
+    incoming=incoming-$VERSION-$$-$RANDOM
+    on_host "$incoming" <<'HOST' || fail "cannot prepare $BUILD_HOST for the rehearsal"
+mkdir -p -- ~/.cache/cagents-release-rehearsal/"$2"
+HOST
+    # Interrupted here, stop the run there too: it would hold the lock and
+    # the desktop for minutes, its output going nowhere.
+    trap 'trap - INT TERM; printf "Stopping the rehearsal on %s.\n" "$BUILD_HOST" >&2
+          on_host "$incoming" <<<"kill -TERM -- -\$(cat ~/.cache/cagents-release-rehearsal/\$2.pid) 2>/dev/null; rm -rf -- ~/.cache/cagents-release-rehearsal/\$2" || :
+          exit 130' INT TERM
+    if ! scp -q -- "${files[@]}" "$BUILD_HOST:.cache/cagents-release-rehearsal/$incoming/"; then
+        on_host "$incoming" <<<'rm -rf -- ~/.cache/cagents-release-rehearsal/"$2"' || :
+        fail "cannot copy the cut to $BUILD_HOST"
+    fi
+    status=0
+    on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" "$REHEARSAL_PARENTS" "$incoming" <<'HOST' || status=$?
+# Parsed whole before it runs, so nothing it starts reads the rest of it.
+main() {
+set -euo pipefail
+cd ~/"$1"
+local cache=~/.cache/cagents-release-rehearsal
+# The harness, in its own process group, is what an interrupt stops.
+echo $$ > "$cache/$9.pid"
+trap "rm -rf -- '$cache/$9' '$cache/$9.pid'" EXIT
+main_run "$@"
+}
+main_run() {
+local repository=$PWD sha=$2 version=$3 previous=$4 github=$5 root=$6 mode=$7 cache=~/.cache/cagents-release-rehearsal
+local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release status=0 update
+local feed=$cache/feed-$3 path=() parents parent kept= marker before
+# The nearest .git above a path, or nothing.
+git_above() {
+    local ancestor=$1
+    while [[ ! -e $ancestor/.git && ! -L $ancestor/.git && $ancestor != / ]]; do ancestor=$(dirname -- "$ancestor"); done
+    [[ ! -e $ancestor/.git && ! -L $ancestor/.git ]] || echo "$ancestor/.git"
+}
+if [[ $root == - ]]; then
+    root=
+    IFS=: read -ra parents <<<"$8"
+    for parent in "${parents[@]}"; do
+        [[ -n $(git_above "$parent") ]] || { root=$parent/release-$version; break; }
+    done
+    [[ -n $root ]] || { echo "release: each of ${parents[*]} has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT" >&2; exit 1; }
+fi
+exec 9>>"$cache/lock"
+flock -n 9 || { echo "release: another rehearsal is running on $HOSTNAME" >&2; exit 1; }
+rm -rf -- "$new"
+mv -- "$cache/$9" "$new"
+(cd "$new" && sha256sum --check --strict --ignore-missing --quiet SHA256SUMS)
+if [[ ! -f $old/SHA256SUMS ]]; then
+    rm -rf -- "$old.partial"
+    mkdir -p -- "$old.partial"
+    gh release download "v$previous" -R "$github" -D "$old.partial" \
+        -p "cagents-$previous-x86_64-unknown-linux-gnu.tar.gz" -p SHA256SUMS -p install.sh
+    rm -rf -- "$old"
+    mv -- "$old.partial" "$old"
+fi
+(cd "$old" && sha256sum --check --strict --ignore-missing --quiet SHA256SUMS) \
+    || { rm -rf -- "$old"; echo "release: the download of $previous was damaged; run the rehearsal again" >&2; exit 1; }
+# The harness of the commit released, which knows what that build does; made
+# afresh, so that nothing else in the directory can redirect Git.
+git -C "$repository" worktree remove --force "$harness" 2>/dev/null || rm -rf -- "$harness"
+git -C "$repository" worktree prune
+git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main || :
+git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin "$sha"
+git -C "$repository" worktree add -q --detach "$harness" "$sha"
+local rehearse=$harness/scripts/rehearse-update
+if [[ $mode == in-app ]]; then
+    # The feed offers only the cut, whose signature the published build checks.
+    rm -rf -- "$feed"
+    "$harness/scripts/release-metadata" feed --dir "$new" --feed "$feed" >/dev/null
+    # A third window holding nothing reads the update's status as soon as it
+    # reopens, while the published build's worker is still verifying the cut.
+    # Then a reboot: the windows must still read the update as good.
+    path=(--feed "$feed" --empty-window --restart-after-update)
+fi
+if [[ -e $root ]]; then
+    echo "Replacing the earlier rehearsal in $root."
+    # Without its marker, init never finished, so nothing there runs.
+    "$rehearse" --root "$root" cleanup >/dev/null || [[ -e $root/.rehearse-update ]] || rm -rf -- "$root"
+    [[ ! -e $root ]] || { echo "release: cannot remove the earlier rehearsal in $root" >&2; exit 1; }
+fi
+before=$(git_above "$(dirname -- "$root")")
+[[ -z $before ]] || { echo "release: $before is above $root, and the product refuses a root inside a checkout; set CAGENTS_RELEASE_REHEARSAL_ROOT" >&2; exit 1; }
+# An interrupt stops the harness, which then stops what it started; the
+# lock stays held until it has.
+trap : TERM
+"$rehearse" --root "$root" run --old-dir "$old" --old-version "$previous" --old-installer "$old/install.sh" \
+    --new-dir "$new" --new-version "$version" --new-installer "$new/install.sh" --answer yes \
+    --ended-provider "${path[@]}" >/dev/null 9>&- || status=$?
+local report=$root/report.txt
+# A sandbox can leave a .git mountpoint above the root while the rehearsal
+# runs, which the product then refuses as a checkout: a failure that says
+# nothing about the cut.
+marker=$(git_above "$(dirname -- "$root")")
+[[ ! -f $report ]] || sed -n '/^Total duration:/p;/^Outcome:/p;/^Regressions/,/^Steps/{/^Steps/d;/^Notes:$/{N;/\n$/d;};p;}' "$report" || :
+# The update worker's own record: the cut's on the staged path, the
+# published build's in the app. A failed or refused job is what reopened
+# windows report as "Update failed" or "Update not installed".
+update=$(/usr/bin/python3 -I -c '
+import json, sys
+try:
+    job = json.load(open(sys.argv[1]))
+    print(job.get("phase"), *(["refused"] if job.get("refusal") else []))
+except (OSError, ValueError):
+    print("absent")' "$root/home/.local/share/cagents-install/.update/status.json")
+echo "Update status: $update"
+[[ $update == Complete ]] || echo "release: the update ended $update, not Complete; reopened windows would say the update failed" >&2
+# Either way a reopened window reports anything but Complete as a failed
+# or refused update, which is what the rehearsal must catch (#3877).
+if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == Complete ]]; then
+    # Its report is the evidence that it passed.
+    cp -- "$report" "$cache/passed-$version.txt"
+    "$rehearse" --root "$root" cleanup >/dev/null \
+        || echo "release: the rehearsal passed, but $root could not be removed" >&2
+    git -C "$repository" worktree remove --force "$harness" || :
+    rm -rf -- "$feed" "$new"
+    echo "Its report is in $cache/passed-$version.txt on $HOSTNAME."
+elif [[ -n $marker ]]; then
+    echo "release: $marker appeared above $root during the rehearsal, so its result says nothing" \
+        "about $version; rehearse again (its report is in $root on $HOSTNAME)" >&2
+    exit 1
+elif [[ $root == /dev/shm/* ]]; then
+    # Memory: keep the report and screenshots, and free the rest.
+    kept=$cache/failed-$version
+    rm -rf -- "$kept" && mkdir -p -- "$kept"
+    cp -a -- "$report" "$kept/" 2>/dev/null || :
+    [[ ! -d $root/shots ]] || cp -a -- "$root/shots" "$kept/"
+    "$rehearse" --root "$root" cleanup >/dev/null || :
+    echo "release: its report and screenshots are in $kept on $HOSTNAME" >&2
+    exit 1
+else
+    echo "release: its report, records and screenshots are in $root on $HOSTNAME" >&2
+    exit 1
+fi
+}
+setsid -w bash -c "$(declare -f main main_run); main \"\$@\"" bash "$@" </dev/null
+HOST
+    trap - INT TERM
+    if ((status == 0)); then
+        printf 'Rehearsed %s to %s in %d min %d s.\n' "$previous" "$VERSION" $(((SECONDS - started) / 60)) $(((SECONDS - started) % 60))
+    else
+        printf 'The rehearsal of %s to %s failed after %d min %d s.\n' "$previous" "$VERSION" $(((SECONDS - started) / 60)) $(((SECONDS - started) % 60))
+    fi
+    ((status == 0)) || fail "the rehearsal of $VERSION did not pass"
+}
+
 signed_bundle() {
     local bundle=$BUNDLES/$VERSION
     [[ -f $bundle/release-metadata.json.sig ]] \
@@ -522,6 +723,7 @@ case $COMMAND in
     bump) bump ;;
     build) build ;;
     cut) cut ;;
+    rehearse) rehearse ;;
     feed)
         [[ -n $FEED ]] || fail 'feed needs --feed DIR'
         "$ROOT_DIR/scripts/release-metadata" feed --dir "$(signed_bundle)" --feed "$FEED"
