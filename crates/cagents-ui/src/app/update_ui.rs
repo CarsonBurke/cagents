@@ -1387,8 +1387,6 @@ pub(in crate::app) mod tests {
         assert!(app.update_ui.error.is_none());
     }
 
-    /// A refusal names what held the update back, once, and the header keeps
-    /// reading as a refusal rather than a failure or a cancelled download.
     /// A window reopened by an older worker can first read that worker's
     /// failure while it still verifies this build. The update reports it as
     /// finishing, so the window keeps asking until the verdict is in.
@@ -1449,6 +1447,8 @@ pub(in crate::app) mod tests {
         assert!(app.notices.entries.is_empty());
     }
 
+    /// A refusal names what held the update back, once, and the header keeps
+    /// reading as a refusal rather than a failure or a cancelled download.
     #[test]
     fn a_refused_update_shows_its_reasons_not_a_cancellation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

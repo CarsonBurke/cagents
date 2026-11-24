@@ -1366,12 +1366,16 @@ fn present_for_ui(
         Reconciled::Shown => Some(job),
         Reconciled::Superseded => None,
         Reconciled::Finishing => Some(finishing_presentation(job)),
-        Reconciled::Completed { proof, state } => {
-            if let Err(error) = settle_as_completed(&state, &job, &proof) {
+        // Shown complete only once recorded so. A lease taken since, or a
+        // record or receipt changed since, is judged again at the next poll.
+        Reconciled::Completed { proof, state } => match settle_as_completed(&state, &job, &proof) {
+            Ok(true) => Some(completed_presentation(job)),
+            Ok(false) => Some(finishing_presentation(job)),
+            Err(error) => {
                 tracing::warn!(%error, "could not record the verified update as complete");
+                Some(job)
             }
-            Some(completed_presentation(job))
-        }
+        },
     }
 }
 
@@ -1444,14 +1448,51 @@ fn reconcile_failure(job: &UpdateJob) -> Result<Reconciled, UpdateError> {
     )
 }
 
-/// Whether `job` is a failure that an older worker can record after its target
-/// already took over: e8bbb84f2 and 0.2.3 re-check the successor with their
-/// own client, which cannot speak a newer protocol, and record no release.
-/// Windows that did not reopen stay reported: that part of such a failure is
-/// true whatever the protocol did.
+/// The refusals with which e8bbb84f2 and 0.2.3 workers fail the successor
+/// check through their own client, which cannot speak a newer protocol, each
+/// as the text that opens it and the text that closes it. Those releases are
+/// fixed, so these texts are too. The first is the connection refusal of the
+/// protocol discovery; the second is a handshake at another protocol.
+#[cfg(any(feature = "ui", feature = "host", test))]
+const PROTOCOL_REFUSALS: [(&str, &str); 2] = [
+    (
+        "could not configure the daemon connection: The running cagents service uses protocol ",
+        "without --restart-daemon, then reopen cagents.",
+    ),
+    (
+        "The confirmed successor does not serve this update's matched protocol",
+        "",
+    ),
+];
+
+/// What the worker reported after the protocol refusal that failed `job`,
+/// when that refusal is all that failed it: e8bbb84f2 and 0.2.3 record no
+/// release and lead their record with the refusal. Every other failure,
+/// including windows that did not reopen, an installer that failed, or a
+/// helper that exited early, opens with its own cause and stands.
+#[cfg(any(feature = "ui", feature = "host", test))]
+fn protocol_refusal_reports(job: &UpdateJob) -> Option<&str> {
+    if job.recorded_by.is_some() {
+        return None;
+    }
+    PROTOCOL_REFUSALS.iter().find_map(|(opening, closing)| {
+        let rest = job.message.strip_prefix(opening)?;
+        let (_, reports) = rest.split_once(closing)?;
+        // A worker that restarted the service adds that it was verified;
+        // completion says so already.
+        Some(
+            reports
+                .strip_prefix(
+                    " The terminal service is ready and its original terminal inventory was verified.",
+                )
+                .unwrap_or(reports),
+        )
+    })
+}
+
 #[cfg(any(feature = "ui", feature = "host", test))]
 fn protocol_check_could_have_failed_it(job: &UpdateJob) -> bool {
-    job.recorded_by.is_none() && !job.message.contains("did not reopen")
+    protocol_refusal_reports(job).is_some()
 }
 
 #[cfg(feature = "ui")]
@@ -1503,7 +1544,8 @@ const PENDING_RECEIPT_PATIENCE: Duration =
 
 /// How long after recording a failure the worker may still be reopening
 /// windows and verifying them before a window stops waiting for it. Past
-/// this, the receipt already saved decides.
+/// this, the failure is shown as recorded; the target's daemon still settles
+/// it once the worker lets go of the lease.
 #[cfg(any(feature = "ui", test))]
 const FINISHING_WORKER_PATIENCE: Duration = Duration::from_secs(3 * 60);
 
@@ -1512,8 +1554,8 @@ const FINISHING_WORKER_PATIENCE: Duration = Duration::from_secs(3 * 60);
 /// An older worker records the failure before it reopens windows, then saves
 /// a pending placeholder and runs the target's verifier once more, so a
 /// window opened in between can read either the earlier receipt or the
-/// placeholder. Only the receipt left by a finished worker, or one that
-/// outlived the bounds above, decides.
+/// placeholder. Only the receipt left by a worker that no longer holds the
+/// lease decides; a worker past the bounds above leaves its failure shown.
 #[cfg(any(feature = "ui", test))]
 fn judge_target_failure(evidence: &TargetEvidence, now: std::time::SystemTime) -> TargetFailure {
     // A timestamp in the future means the clock moved; stop waiting.
@@ -1521,8 +1563,6 @@ fn judge_target_failure(evidence: &TargetEvidence, now: std::time::SystemTime) -
         now.duration_since(since)
             .is_ok_and(|waited| waited < patience)
     };
-    let worker_finishing =
-        evidence.worker == Worker::Running && within(evidence.recorded, FINISHING_WORKER_PATIENCE);
     match &evidence.receipt {
         recovery::Reading::Pending { since }
             if evidence.worker != Worker::Finished && within(*since, PENDING_RECEIPT_PATIENCE) =>
@@ -1530,7 +1570,15 @@ fn judge_target_failure(evidence: &TargetEvidence, now: std::time::SystemTime) -
             TargetFailure::Finishing
         }
         recovery::Reading::Pending { .. } => TargetFailure::Unproven,
-        _ if worker_finishing => TargetFailure::Finishing,
+        // A worker still holding the lease has not given its last word: no
+        // receipt it may yet replace proves anything.
+        _ if evidence.worker == Worker::Running => {
+            if within(evidence.recorded, FINISHING_WORKER_PATIENCE) {
+                TargetFailure::Finishing
+            } else {
+                TargetFailure::Unproven
+            }
+        }
         recovery::Reading::Usable(proof) => TargetFailure::Reached(proof.clone()),
         recovery::Reading::Unusable => TargetFailure::Unproven,
     }
@@ -1562,9 +1610,14 @@ fn finishing_presentation(mut job: UpdateJob) -> UpdateJob {
 
 #[cfg(any(feature = "ui", feature = "host"))]
 fn completed_presentation(mut job: UpdateJob) -> UpdateJob {
+    // Keep what the worker reported about sessions it ended, paused or left
+    // running; the success notice shows it as details.
+    let reports = protocol_refusal_reports(&job)
+        .unwrap_or_default()
+        .to_owned();
     job.phase = UpdatePhase::Complete;
     job.message = format!(
-        "Update installed; cagents {} verified its terminal service",
+        "Update installed; cagents {} verified its terminal service{reports}",
         job.version
     );
     job.confirmation = None;
@@ -6599,12 +6652,14 @@ mod reconciliation_tests {
                 ),
                 TargetFailure::Finishing
             );
-            assert_ne!(
+            // A worker that holds the lease past its bound is stuck, not
+            // done: its failure stands, whatever its receipt says.
+            assert_eq!(
                 judge_target_failure(
                     &evidence(Worker::Running, receipt, recorded),
                     recorded + FINISHING_WORKER_PATIENCE
                 ),
-                TargetFailure::Finishing
+                TargetFailure::Unproven
             );
         }
         assert_eq!(
@@ -6621,32 +6676,81 @@ mod reconciliation_tests {
         );
     }
 
-    #[test]
-    fn only_a_protocol_checking_workers_failure_is_reconciled() {
-        let mut job = UpdateJob {
+    const CONNECTION_REFUSAL: &str = "could not configure the daemon connection: The running cagents service uses protocol 202; live updates support only protocol 198 and protocol 198. Run the downloaded release's `sh /home/user/Downloads/cagents/install.sh` without --restart-daemon, then reopen cagents.";
+
+    fn failed_with(message: &str) -> UpdateJob {
+        UpdateJob {
             id: uuid::Uuid::new_v4().to_string(),
             version: "0.2.4".into(),
             phase: UpdatePhase::Failed,
-            message: "The confirmed successor does not serve this update's matched protocol".into(),
+            message: message.into(),
             log_path: "/nonexistent/update.log".into(),
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
             recorded_by: None,
-        };
-        assert!(protocol_check_could_have_failed_it(&job));
-        job.recorded_by = Some("0.2.4".into());
-        assert!(!protocol_check_could_have_failed_it(&job));
-        job.recorded_by = None;
-        job.message = "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: no display. Run `cagents ui` to reopen the saved workspace.".into();
-        assert!(!protocol_check_could_have_failed_it(&job));
+        }
+    }
+
+    #[test]
+    fn only_a_protocol_checking_workers_failure_is_reconciled() {
+        for refusal in [
+            "The confirmed successor does not serve this update's matched protocol",
+            CONNECTION_REFUSAL,
+        ] {
+            let mut job = failed_with(refusal);
+            assert_eq!(protocol_refusal_reports(&job), Some(""), "{refusal}");
+            job.recorded_by = Some("0.2.4".into());
+            assert!(!protocol_check_could_have_failed_it(&job), "{refusal}");
+        }
+        // Failures with a cause of their own stand, from a worker of any
+        // release: windows that did not reopen, an installer that failed
+        // after committing, a helper that ended early, a foreign service, or
+        // a refusal that is not where the worker's record opens.
+        for message in [
+            "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: no display. Run `cagents ui` to reopen the saved workspace.",
+            "installer failed (exit status: 1)",
+            "Update helper exited before completion",
+            "The terminal service does not belong to the confirmed installation; restart it from the installed release.",
+            "could not configure the daemon connection: connection refused",
+            "installer failed (exit status: 1) The confirmed successor does not serve this update's matched protocol",
+        ] {
+            assert!(
+                !protocol_check_could_have_failed_it(&failed_with(message)),
+                "{message}"
+            );
+        }
         // What 0.2.3 workers record is read without the field.
         let recorded: UpdateJob = serde_json::from_value(serde_json::json!({
-            "id": job.id, "version": "0.2.4", "phase": "Failed", "message": "",
+            "id": uuid::Uuid::new_v4().to_string(), "version": "0.2.4", "phase": "Failed", "message": "",
             "log_path": "/nonexistent/update.log",
         }))
         .unwrap();
         assert_eq!(recorded.recorded_by, None);
+    }
+
+    /// Settling keeps what the worker reported after its refusal: the
+    /// sessions it ended, interrupted, paused or left running.
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn a_settled_update_keeps_the_workers_reports() {
+        let reports =
+            "\nEnded or stopped:\n- build (exited)\nStill running, not attached:\n- tests";
+        for refusal in [
+            "The confirmed successor does not serve this update's matched protocol".to_owned(),
+            format!(
+                "{CONNECTION_REFUSAL} The terminal service is ready and its original terminal inventory was verified."
+            ),
+        ] {
+            let job = failed_with(&format!("{refusal}{reports}"));
+            assert_eq!(protocol_refusal_reports(&job), Some(reports));
+            let completed = completed_presentation(job);
+            assert_eq!(completed.phase, UpdatePhase::Complete);
+            assert_eq!(
+                completed.message,
+                format!("Update installed; cagents 0.2.4 verified its terminal service{reports}")
+            );
+        }
     }
 
     #[cfg(feature = "ui")]
