@@ -4329,7 +4329,7 @@ mod tests {
             let cache = ui.into_cache();
             for message in messages {
                 if let Message::ResumeConversation(action) = message {
-                    let _ = app.update_resume(action);
+                    drop(app.update(Message::ResumeConversation(action)));
                 }
             }
             cache
@@ -4362,6 +4362,9 @@ mod tests {
                 .title
                 .clone()
         };
+        // The pointer crossing rows reaches only the picker, so no update
+        // it makes rebuilds the workspace's projection.
+        let projections = crate::app::terminal_output_tests::projections();
         let mut cache = Cache::new();
         let second = row(&app, "Row 2");
         cache = point(&mut app, cache, second);
@@ -4382,7 +4385,11 @@ mod tests {
         drop(cache);
         // A row reported after the matches changed under it selects nothing.
         let stale = app.resume_ui.rows[app.resume_ui.visible[7]].card;
-        let _ = app.update_resume(Action::Point(3, stale));
+        drop(app.update(Message::ResumeConversation(Action::Point(3, stale))));
         assert_eq!(selected(&app), "Row 4");
+        assert_eq!(
+            crate::app::terminal_output_tests::projections(),
+            projections
+        );
     }
 }

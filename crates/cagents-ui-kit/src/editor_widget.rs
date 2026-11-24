@@ -2178,19 +2178,38 @@ where
         }
         if self.on_hover.is_some() || self.on_definition.is_some() {
             let text_bounds = layout.bounds().shrink(self.text_padding());
-            let hit = pointer
-                .filter(|point| text_bounds.contains(*point))
-                .and_then(|point| {
-                    let internal = self.content.0.borrow();
-                    let point = point
-                        - text_bounds.position()
-                        - Vector::new(internal.horizontal_translation(), 0.0);
-                    let cursor = internal.editor.buffer().hit(point.x, point.y)?;
-                    Some(Position {
-                        line: cursor.line,
-                        column: cursor.index,
+            // Hit testing walks the buffer's layout, so only the events
+            // that read the character under the pointer pay for it.
+            let hit = || {
+                pointer
+                    .filter(|point| text_bounds.contains(*point))
+                    .and_then(|point| {
+                        let internal = self.content.0.borrow();
+                        let point = point
+                            - text_bounds.position()
+                            - Vector::new(internal.horizontal_translation(), 0.0);
+                        let cursor = internal.editor.buffer().hit(point.x, point.y)?;
+                        Some(Position {
+                            line: cursor.line,
+                            column: cursor.index,
+                        })
                     })
-                });
+            };
+            // A hover needs ending only when the application has something
+            // to dismiss: the hover was published, or a popup is anchored in
+            // the text, such as a diagnostic the keyboard opened. Otherwise a
+            // hover still dwelling never reached the application, and ending
+            // it would publish a message for every character the pointer
+            // crosses.
+            let popup_shown = self.popup.is_some() && self.popup_at.is_some();
+            let end_hover = |state: &mut State<Highlighter>, shell: &mut Shell<'_, Message>| {
+                if let Some((_, _, sent)) = state.hover.take()
+                    && (sent || popup_shown)
+                    && let Some(on_hover) = &self.on_hover
+                {
+                    shell.publish(on_hover(None));
+                }
+            };
             match event {
                 Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                     if pointer.is_some_and(|point| {
@@ -2200,12 +2219,9 @@ where
                     }) {
                         return;
                     }
+                    let hit = hit();
                     if state.hover.map(|hover| hover.0) != hit {
-                        if state.hover.take().is_some()
-                            && let Some(on_hover) = &self.on_hover
-                        {
-                            shell.publish(on_hover(None));
-                        }
+                        end_hover(state, shell);
                         state.hover = hit.map(|at| (at, Instant::now(), false));
                     }
                     if let Some((_, started, false)) = state.hover {
@@ -2223,23 +2239,17 @@ where
                     }
                 }
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                    if state.modifiers.command()
-                        && hit.is_some()
-                        && self.on_definition.is_some() =>
+                    if state.modifiers.command() && self.on_definition.is_some() =>
                 {
-                    shell.publish(self.on_definition.as_ref().unwrap()(hit.unwrap()));
-                    shell.capture_event();
-                    return;
+                    if let Some(at) = hit() {
+                        shell.publish(self.on_definition.as_ref().unwrap()(at));
+                        shell.capture_event();
+                        return;
+                    }
                 }
                 Event::Keyboard(keyboard::Event::KeyPressed { .. })
                 | Event::Mouse(mouse::Event::CursorLeft)
-                | Event::Window(window::Event::Unfocused) => {
-                    if state.hover.take().is_some()
-                        && let Some(on_hover) = &self.on_hover
-                    {
-                        shell.publish(on_hover(None));
-                    }
-                }
+                | Event::Window(window::Event::Unfocused) => end_hover(state, shell),
                 _ => {}
             }
         }
@@ -5634,6 +5644,144 @@ mod tests {
             .wrapping(wrapping)
             .height(Length::Fill)
             .on_action(|action| action)
+    }
+
+    /// Sweeping the pointer across text publishes nothing until it rests on
+    /// one character for the dwell: a hover that never reached the
+    /// application needs no ending, and each published message costs the
+    /// application an update. Moving off a published hover ends it once.
+    #[test]
+    fn only_a_published_hover_is_ended_when_the_pointer_moves_on() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Probe {
+            Edit,
+            Hover(Option<Position>),
+        }
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"abcdefghij".repeat(4));
+        let mut editor = TextEditor::new(&content)
+            .font(cosmic::iced::Font::MONOSPACE)
+            .size(16.0)
+            .wrapping(Wrapping::None)
+            .height(Length::Fill)
+            .on_action(|_| Probe::Edit)
+            .on_hover(Probe::Hover);
+        let mut tree =
+            widget::Tree::new(&editor as &dyn Widget<Probe, cosmic::Theme, cosmic::Renderer>);
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let deliver = |editor: &mut TextEditor<'_, highlighter::PlainText, Probe>,
+                       tree: &mut widget::Tree,
+                       event: Event,
+                       at: Point| {
+            let mut published = Vec::new();
+            let mut shell = Shell::new(&mut published);
+            editor.update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+            published
+        };
+        let moved = |x: f32| {
+            (
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(x, 12.0),
+                }),
+                Point::new(x, 12.0),
+            )
+        };
+        let mut swept = Vec::new();
+        for step in 0..12 {
+            let (event, at) = moved(20.0 + step as f32 * 9.0);
+            swept.extend(deliver(&mut editor, &mut tree, event, at));
+        }
+        assert_eq!(swept, [], "a sweep that never dwells publishes nothing");
+
+        let (_, rest) = moved(20.0 + 11.0 * 9.0);
+        let dwelt = deliver(
+            &mut editor,
+            &mut tree,
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + Duration::from_secs(1),
+            )),
+            rest,
+        );
+        assert!(
+            matches!(dwelt.as_slice(), [Probe::Hover(Some(_))]),
+            "a dwell publishes the hover: {dwelt:?}"
+        );
+
+        let (event, at) = moved(20.0);
+        assert_eq!(
+            deliver(&mut editor, &mut tree, event, at),
+            [Probe::Hover(None)],
+            "moving off a published hover ends it"
+        );
+        let (event, at) = moved(29.0);
+        assert_eq!(
+            deliver(&mut editor, &mut tree, event, at),
+            [],
+            "the hover it ended was the only one published"
+        );
+    }
+
+    /// A popup anchored in the text, such as a diagnostic the keyboard
+    /// opened, is still dismissed by the pointer moving on, though the
+    /// editor never published a hover of its own.
+    #[test]
+    fn moving_the_pointer_still_dismisses_an_anchored_popup() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Probe {
+            Edit,
+            Hover(Option<Position>),
+        }
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"abcdefghij".repeat(4));
+        let mut editor = TextEditor::new(&content)
+            .font(cosmic::iced::Font::MONOSPACE)
+            .size(16.0)
+            .wrapping(Wrapping::None)
+            .height(Length::Fill)
+            .on_action(|_| Probe::Edit)
+            .on_hover(Probe::Hover)
+            .popup(
+                Some(cosmic::widget::text("A diagnostic").into()),
+                Some(Position { line: 0, column: 2 }),
+            );
+        let mut tree =
+            widget::Tree::new(&editor as &dyn Widget<Probe, cosmic::Theme, cosmic::Renderer>);
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let mut published = Vec::new();
+        for x in [20.0, 29.0] {
+            let at = Point::new(x, 12.0);
+            let mut shell = Shell::new(&mut published);
+            editor.update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+        }
+        assert_eq!(published, [Probe::Hover(None)]);
     }
 
     #[test]

@@ -3604,6 +3604,55 @@ async fn reviewed_update_prepare_flushes_folder_editor_selection_before_handoff(
     assert!(!app.update_prepared);
 }
 
+/// Typing, caret moves and scrolling in an editor arrive once per key,
+/// wheel notch or dragged pointer move. While they leave everything the
+/// projection reads of the pane as it was they project nothing, rather than
+/// walking every card for each one; the projection oracle checks each such
+/// update. An action that changes what the pane shows still projects.
+#[test]
+fn editor_input_projects_only_when_it_changes_what_the_projection_reads() {
+    use cosmic::widget::text_editor::{Action as Editor, Edit, Motion};
+    let (mut app, card) = editing_repository_app();
+    let projections = super::terminal_output_tests::projections;
+    let edit = |action| Message::Repository(RepositoryAction::EditorAction { card, action });
+
+    // The pane's card does not yet name the file its editor shows, so the
+    // first action records it and projects.
+    let before = projections();
+    drop(app.update(edit(Editor::Move(Motion::Right))));
+    assert_eq!(projections(), before + 1, "the card took the shown file");
+
+    let before = projections();
+    for message in [
+        edit(Editor::Move(Motion::Right)),
+        edit(Editor::Select(Motion::Down)),
+        edit(Editor::Scroll { lines: 3 }),
+        edit(Editor::Edit(Edit::Insert('a'))),
+        edit(Editor::Edit(Edit::Insert('b'))),
+        Message::Repository(RepositoryAction::DiffViewport {
+            card,
+            offset: 40.0,
+            height: 400.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }),
+        Message::Repository(RepositoryAction::PreviewViewport { card, offset: 40.0 }),
+        Message::Repository(RepositoryAction::Language {
+            card,
+            action: repository_widget::EditorLspAction::Hover(None),
+        }),
+        Message::ContextSectionsMeasured(240.0),
+        Message::Palette(palette_ui::Action::Query("note".into())),
+        Message::ContextInspector(InspectorAction::Resize {
+            width: app.settings.inspector_width + 0.2,
+        }),
+    ] {
+        drop(app.update(message));
+    }
+    assert_eq!(projections(), before, "pane-local input projects nothing");
+    assert_eq!(app.context_sections_height, Some(240.0));
+}
+
 #[test]
 fn window_snapshots_capture_editor_selection_without_changing_shared_recipe() {
     let (mut app, card) = editing_repository_app();

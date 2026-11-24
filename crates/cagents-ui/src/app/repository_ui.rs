@@ -3,6 +3,66 @@
 use super::*;
 use std::ops::ControlFlow;
 
+/// What the workspace projection reads of one editor pane, captured on
+/// either side of an action that confines itself to the pane: typing, caret
+/// and selection moves, scrolling and the diff and preview viewports.
+///
+/// The projection reads the pane's card, the file it shows (its chrome
+/// title and caption, the source control's selected file, and the worktree
+/// protections) and its worktree, and where a saved navigation shows a file
+/// (the protections again). Each of those actions arrives once per key,
+/// wheel notch or dragged pointer move, so when none of these changed it
+/// leaves nothing to project, rather than walking every card the workspace
+/// ever held.
+#[derive(PartialEq)]
+pub(super) struct EditorProjectionInputs {
+    card: Option<CardState>,
+    selected_path: Option<PathBuf>,
+    worktree: PathBuf,
+    blocks_navigation: bool,
+    navigation: Option<(PathBuf, bool)>,
+    focused: Option<CardId>,
+    cards: usize,
+}
+
+impl EditorProjectionInputs {
+    /// The editor pane `action` confines itself to, if it is one such action.
+    pub(super) fn pane(action: &RepositoryAction) -> Option<CardId> {
+        matches!(
+            action,
+            RepositoryAction::EditorAction { .. }
+                | RepositoryAction::DiffViewport { .. }
+                | RepositoryAction::PreviewViewport { .. }
+        )
+        .then(|| action.card())
+    }
+
+    /// The inputs for the editor pane `card`; `None` for any other pane.
+    pub(super) fn capture(app: &Cagents, card: CardId) -> Option<Self> {
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            return None;
+        };
+        Some(Self {
+            card: app.card_state(card).cloned(),
+            selected_path: runtime.selected_path().map(Path::to_path_buf),
+            worktree: runtime.descriptor.worktree.clone(),
+            blocks_navigation: runtime.blocks_navigation(),
+            navigation: app
+                .durable
+                .repository_navigation
+                .get(&card)
+                .map(|navigation| {
+                    (
+                        navigation.worktree.clone(),
+                        navigation.selected_file.is_some(),
+                    )
+                }),
+            focused: app.workspace.focused(),
+            cards: app.durable.cards.len(),
+        })
+    }
+}
+
 impl Cagents {
     pub(super) fn update_repository(&mut self, action: RepositoryAction) -> Handled {
         self.retain_repository_operation(&action);
