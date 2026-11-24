@@ -675,13 +675,19 @@ impl<'a> View<'a> {
         }
         // Its pull requests open as a pane listing them, from which any can be
         // reviewed or checked out.
-        if project.kind == ProjectKind::Git && project.github_ready {
+        // A project whose folder cannot be read offers no list of its work,
+        // as the sidebar offers a retry instead.
+        if project.kind == ProjectKind::Git && project.github_ready && project.unreachable.is_none()
+        {
             title.push(
-                icon_button(Icon::PullRequest, "Pull requests")
-                    .on_press_maybe(self.sidebar(SidebarAction::BrowsePullRequests {
-                        project_id: project.id,
-                    }))
-                    .into(),
+                icon_button(
+                    Icon::PullRequest,
+                    format!("Pull requests in {}", project.name),
+                )
+                .on_press_maybe(self.sidebar(SidebarAction::BrowsePullRequests {
+                    project_id: project.id,
+                }))
+                .into(),
             );
         }
         if project.kind == ProjectKind::Git {
@@ -1494,5 +1500,57 @@ mod tests {
         state.refresh(2, &projects);
         assert_eq!(worktree_labels(&state, &projects), ["# cagents", "main"]);
         assert_eq!(state.menu, None, "the deleted worktree's menu closed");
+    }
+
+    /// The accessible names a project's header publishes, in tree order.
+    fn heading_names(project: &SidebarProject) -> Vec<String> {
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use cosmic::iced::Size;
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let state = State::default();
+        let projects = std::slice::from_ref(project);
+        let view = View {
+            state: &state,
+            projects,
+            editors: &[],
+            current: None,
+            modal_open: false,
+        };
+        let mut element = view.project_heading(project, true);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(800.0, 400.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    /// The pane is where a project's pull requests are listed from: a GitHub
+    /// project offers them, and one GitHub cannot answer for, or whose folder
+    /// cannot be read, does not.
+    #[test]
+    fn a_github_projects_heading_opens_its_pull_requests() {
+        let lists = |project: &SidebarProject| {
+            heading_names(project)
+                .iter()
+                .any(|name| name == "Pull requests in cagents")
+        };
+        let mut cagents = project("cagents", vec![worktree("/src/cagents", "main", 0)]);
+        assert!(!lists(&cagents), "not before GitHub answers");
+        cagents.github_ready = true;
+        assert!(lists(&cagents), "{:?}", heading_names(&cagents));
+        cagents.unreachable = Some("Missing folder".into());
+        assert!(!lists(&cagents), "not for a folder that cannot be read");
     }
 }
