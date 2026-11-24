@@ -233,6 +233,19 @@ pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String
     Ok(())
 }
 
+pub(super) fn migrate_courier_runs(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    // Returned receipts belong to the message even if the agent's origin
+    // changed. The general run idempotency index begins with origin.
+    let message_run_key = crate::agent_execution::MESSAGE_RUN_KEY;
+    tx.execute_batch(&format!(
+        "CREATE INDEX agent_runs_by_message ON agent_runs(idempotency_key)
+         WHERE idempotency_key GLOB '{message_run_key}*';
+         CREATE INDEX agent_runs_unfinished_by_agent ON agent_runs(agent)
+         WHERE state IN ('accepted', 'running', 'waiting');"
+    ))
+    .map_err(|error| error.to_string())
+}
+
 impl Registry {
     pub(in crate::host) fn inspect_resident_release(
         &mut self,

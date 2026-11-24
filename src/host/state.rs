@@ -6,13 +6,14 @@ mod retention;
 pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -334,6 +335,7 @@ pub(crate) struct HostState {
     model: Option<super::model::Registry>,
     /// Layout persistence and hydration never borrow the global terminal lock.
     pub(super) workspace_registry: Option<Arc<Mutex<super::model::Registry>>>,
+    pub(super) channel_titles: Option<super::workspace::titles::Updates>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
@@ -405,6 +407,8 @@ pub(crate) struct HostState {
     pub(super) native_chat_capacity: usize,
     /// How long each provider account's prompt caches last, as observed.
     pub(super) prompt_cache: Arc<super::agent_execution::prompt_cache::Calibration>,
+    /// Keyed sends survive replacement of a chat's process or attachment.
+    pub(super) chat_deliveries: Option<Arc<crate::chat::runtime::Deliveries>>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
@@ -492,10 +496,13 @@ impl Drop for PreparedTerminalInput {
 }
 
 impl HostState {
-    /// Tells the Work tracker about the chat `id`, just put in `chats`.
+    /// Publishes metadata from the chat `id`, just put in `chats`.
     pub(super) fn chat_added(&self, id: TerminalId) {
         if let (Some(work), Some(record)) = (&self.work, self.chats.get(&id)) {
             work.chat_added(record.session.launch.provider);
+        }
+        if let Some(titles) = &self.channel_titles {
+            titles.offer(super::workspace::titles::Target::Chat(id));
         }
     }
 
@@ -530,6 +537,7 @@ impl HostState {
             watchers: BTreeSet::new(),
             model: None,
             workspace_registry: None,
+            channel_titles: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             agent_client_authorities: BTreeMap::new(),
@@ -560,6 +568,7 @@ impl HostState {
             shutdown_capabilities: VecDeque::new(),
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
             prompt_cache: Arc::new(super::agent_execution::prompt_cache::Calibration::in_memory()),
+            chat_deliveries: None,
             chats: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
@@ -724,22 +733,29 @@ impl HostState {
         activation
     }
 
-    /// The sessions this publication adds to its window's live claim.
-    pub(super) fn notification_sessions_unclaimed(
+    /// Partition a window publication into new and existing live claims.
+    pub(super) fn partition_notification_sessions(
         &self,
         presence: &crate::notifications::Presence,
-    ) -> Vec<TerminalId> {
+    ) -> (Vec<TerminalId>, Vec<TerminalId>) {
+        if presence.sessions.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let claimed: HashSet<_> = self
+            .notification_watchers
+            .values()
+            .filter(|current| {
+                current.application == presence.application && current.window == presence.window
+            })
+            .flat_map(|current| current.sessions.iter().copied())
+            .collect();
+        let mut seen = HashSet::with_capacity(presence.sessions.len());
         presence
             .sessions
             .iter()
-            .filter(|session| {
-                !self.notification_watchers.values().any(|current| {
-                    current.destination() == presence.destination()
-                        && current.sessions.contains(session)
-                })
-            })
             .copied()
-            .collect()
+            .filter(|session| seen.insert(*session))
+            .partition(|session| !claimed.contains(session))
     }
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
@@ -945,6 +961,8 @@ impl HostState {
     }
 
     /// Checks the resident chat metadata that authorizes an inferred title.
+    /// Returns whether the provider explicitly removed its own title, allowing
+    /// the canonical fallback to replace that source.
     ///
     /// The workspace writer calls this while it holds SQL writer admission,
     /// after it acquired that admission off the host lock. Keep it free of
@@ -955,26 +973,54 @@ impl HostState {
         expected: crate::chat::Session,
         title: &str,
         source: crate::model::ChannelTitleSource,
-    ) -> Result<(), ProtocolError> {
-        let invalid = || {
-            ProtocolError::new(
-                ProtocolErrorCode::InvalidRequest,
-                "The conversation's current name or source changed; refresh before suggesting a title",
-                false,
-            )
-        };
-        let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
+    ) -> Result<bool, ProtocolError> {
+        let naming = self.title_conversation(&expected)?;
+        let cleared = naming.provider_cleared && source == crate::model::ChannelTitleSource::Prompt;
+        match naming.title() {
+            Some((current, kind)) if current == title && kind == source => Ok(cleared),
+            // Older retained helpers and window transcript readers may know an
+            // opening the resident hasn't read. A real opening supersedes the
+            // provisional title of a conversation without a meaningful prompt yet.
+            Some((_, crate::model::ChannelTitleSource::Prompt))
+                if source == crate::model::ChannelTitleSource::Prompt
+                    && naming
+                        .opening
+                        .as_ref()
+                        .is_some_and(crate::chat::OpeningTitle::provisional) =>
+            {
+                Ok(false)
+            }
+            None if source == crate::model::ChannelTitleSource::Prompt => {
+                Ok(cleared && title.is_empty())
+            }
+            _ => Err(Self::stale_title()),
+        }
+    }
+
+    fn stale_title() -> ProtocolError {
+        ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "The conversation's current name or source changed; refresh before suggesting a title",
+            false,
+        )
+    }
+
+    pub(super) fn title_conversation(
+        &self,
+        expected: &crate::chat::Session,
+    ) -> Result<crate::chat::runtime::ConversationNaming, ProtocolError> {
+        let actual = self.chats.get(&expected.id).ok_or_else(Self::stale_title)?;
         if expected.proof.as_ref() != Some(self.proof())
             || actual.session.launch.provider != expected.launch.provider
             || actual.session.launch.recipe != expected.launch.recipe
         {
-            return Err(invalid());
+            return Err(Self::stale_title());
         }
         // The request holds workspace writer admission and keeps this
         // resident identity guard through its SQLite commit. Read only current
         // metadata, not Store, history or files; no later workspace edit can
         // overtake the validated commit.
-        let (session, current_title) = actual.handle.conversation_title().map_err(|reason| {
+        let naming = actual.handle.conversation_naming().map_err(|reason| {
             let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
             ProtocolError::new(
                 if busy {
@@ -997,20 +1043,11 @@ impl HostState {
         // no snapshot, so its pane learns the conversation only when someone
         // opens it. A pane that recorded one names only that conversation.
         if let Some(recorded) = &expected.launch.session_id
-            && session.as_ref() != Some(recorded)
+            && naming.session.as_ref() != Some(recorded)
         {
-            return Err(invalid());
+            return Err(Self::stale_title());
         }
-        let current_title = current_title
-            .as_deref()
-            .and_then(crate::workspace_model::channel_title);
-        match source {
-            crate::model::ChannelTitleSource::Provider
-                if current_title.as_deref() == Some(title) => {}
-            crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
-            _ => return Err(invalid()),
-        }
-        Ok(())
+        Ok(naming)
     }
 
     #[cfg(test)]
@@ -1045,6 +1082,20 @@ impl HostState {
                         effects: effects.clone(),
                     },
                 ));
+            }
+        }
+        if let Some(titles) = &self.channel_titles {
+            for view in &effects.views {
+                if let crate::workspace_model::views::Scope::Channel(id) = view.scope
+                    && view.after.is_some()
+                {
+                    titles.offer(super::workspace::titles::Target::Channel(id));
+                }
+            }
+            if let ModelEdit::RetitleChannel { id, title } = edit.as_ref()
+                && title.is_empty()
+            {
+                titles.offer(super::workspace::titles::Target::Channel(*id));
             }
         }
     }
@@ -5216,11 +5267,11 @@ fn start_terminal_view_owned_reserved(
     } else {
         Default::default()
     };
-    let redraw = Arc::new(TerminalRedraw {
-        host: Arc::downgrade(shared),
+    let redraw = Arc::new(TerminalRedraw::new(
+        Arc::downgrade(shared),
         terminal_id,
-        worker: OnceLock::new(),
-    });
+        redraw_notifier().cloned(),
+    ));
     let config = TerminalConfig {
         agent_authority,
         console_startup_owner: (paired
@@ -5281,9 +5332,8 @@ fn start_terminal_view_owned_reserved(
                 .options = install_options;
             state.startup_custody.insert(terminal_id);
             let _ = install_redraw.worker.set(handle.downgrade());
-            let event_host = Arc::downgrade(shared);
             handle.set_event_observer(move |source, event| {
-                record_event_from(&event_host, terminal_id, event, Some(source));
+                install_redraw.record_event(source, event);
             });
             #[cfg(test)]
             if state.test_fail_startup_commit == Some(terminal_id) {
@@ -5391,15 +5441,8 @@ fn start_terminal_view_owned_reserved(
             .agent_activity_wake,
     );
     redraw_handle.set_agent_process_observer(move || activity_wake.notify());
-    let event_host = Arc::downgrade(shared);
     redraw_handle.set_event_observer(move |handle, event| {
-        let completed = matches!(event, TerminalEvent::Completed { .. });
-        record_event_from(&event_host, terminal_id, event, Some(handle));
-        if completed {
-            // Completed is emitted only after the final grid and parser
-            // teardown. Notify visible subscribers from that exact worker.
-            broadcast_redraw(&event_host, terminal_id, handle.generation(), handle);
-        }
+        redraw.record_event(handle, event);
     });
 
     let descriptor = match publish_installed_terminal(
@@ -5631,17 +5674,111 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
     }
 }
 
+type RedrawSender = crossbeam_channel::Sender<Weak<TerminalRedraw>>;
+
+/// One sleeping dispatcher for steady-state redraws, separate from terminal events.
+fn redraw_notifier() -> Option<&'static RedrawSender> {
+    static NOTIFIER: OnceLock<Option<RedrawSender>> = OnceLock::new();
+    NOTIFIER
+        .get_or_init(|| {
+            // Live workers need at most one slot each. Cap retired tickets
+            // too, in case terminals churn while delivery is delayed.
+            let (send, pending) = crossbeam_channel::bounded::<Weak<TerminalRedraw>>(MAX_TERMINALS);
+            match thread::Builder::new()
+                .name("terminal-redraw".into())
+                .spawn(move || {
+                    for redraw in pending {
+                        if let Some(redraw) = redraw.upgrade() {
+                            redraw.deliver_pending();
+                        }
+                    }
+                }) {
+                Ok(_) => Some(send),
+                Err(error) => {
+                    tracing::warn!(%error, "terminal redraws will run synchronously");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 /// Binds redraw wakes before Host publication without a strong callback cycle.
 struct TerminalRedraw {
     host: Weak<HostLock>,
     terminal_id: TerminalId,
     worker: OnceLock<crate::terminal::WeakTerminalHandle>,
+    pending_generation: AtomicU64,
+    notifier: Option<RedrawSender>,
 }
 
 impl TerminalRedraw {
-    fn publish(&self, generation: u64) {
-        if let Some(worker) = self.worker.get().and_then(|worker| worker.upgrade()) {
-            broadcast_redraw(&self.host, self.terminal_id, generation, &worker);
+    fn new(host: Weak<HostLock>, terminal_id: TerminalId, notifier: Option<RedrawSender>) -> Self {
+        Self {
+            host,
+            terminal_id,
+            worker: OnceLock::new(),
+            pending_generation: AtomicU64::new(0),
+            notifier,
+        }
+    }
+
+    fn publish(self: &Arc<Self>, generation: u64) {
+        if generation == 0 || self.worker.get().is_none() {
+            return;
+        }
+        // Queue one weak ticket for this worker. A newer wake can replace a
+        // queued generation, or enqueue another ticket while it is delivered.
+        if self
+            .pending_generation
+            .fetch_max(generation, Ordering::AcqRel)
+            == 0
+            && self
+                .notifier
+                .as_ref()
+                .is_none_or(|send| send.try_send(Arc::downgrade(self)).is_err())
+        {
+            // A full or unavailable dispatcher falls back to synchronous
+            // delivery. This wake is needed to return the worker's credit.
+            self.deliver_pending();
+        }
+    }
+
+    fn deliver_pending(&self) {
+        let generation = self.pending_generation.swap(0, Ordering::AcqRel);
+        if generation != 0
+            && let Some(worker) = self.worker.get().and_then(|worker| worker.upgrade())
+        {
+            self.broadcast(generation, &worker);
+        }
+    }
+
+    fn broadcast(&self, generation: u64, worker: &TerminalHandle) {
+        // A visual callback can fail without taking down the dispatcher or
+        // dropping a terminal event that still needs to be recorded.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            broadcast_redraw(&self.host, self.terminal_id, generation, worker);
+        }));
+    }
+
+    fn record_event(self: &Arc<Self>, worker: &TerminalHandle, event: TerminalEvent) {
+        let completed = matches!(event, TerminalEvent::Completed { .. });
+        let retires_surface = match &event {
+            TerminalEvent::Exited {
+                exit_code, signal, ..
+            } => *exit_code != 0 || signal.is_some(),
+            _ => completed,
+        };
+        if retires_surface {
+            // The published grid may still have a queued visual wake. Give
+            // visible readers its frame before the event can hibernate their
+            // surface. A clean root exit leaves presentation active.
+            self.broadcast(worker.generation(), worker);
+        }
+        record_event_from(&self.host, self.terminal_id, event, Some(worker));
+        if completed {
+            // Keep the follow-up wake for view changes during completion.
+            self.publish(worker.generation());
         }
     }
 }

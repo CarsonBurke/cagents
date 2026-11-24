@@ -20,8 +20,10 @@ fn unique_destination(
         .filter(|(session, _)| seen.insert(*session));
     match (matches.next(), matches.next()) {
         (Some((_, destination)), None) => Ok(destination),
-        (None, _) => Err(format!("Session {prefix} is no longer available.")),
-        _ => Err(format!("More than one session starts with {prefix}.")),
+        // The prefix is the CLI's address for the session, not a name the
+        // person was shown, so neither notice repeats it.
+        (None, _) => Err("That session is no longer open.".into()),
+        _ => Err("More than one open session matches this link.".into()),
     }
 }
 
@@ -36,9 +38,9 @@ impl Cagents {
             .iter()
             .filter(|agent| !agent.closed && agent.id.to_string().starts_with(prefix));
         let (agent, None) = (agents.next(), agents.next()) else {
-            self.status = Some(TransientNotice::warning(format!(
-                "More than one agent starts with {prefix}."
-            )));
+            self.status = Some(TransientNotice::warning(
+                "More than one open agent matches this link.",
+            ));
             return Task::none();
         };
         let Some(agent) = agent else {
@@ -334,18 +336,14 @@ mod tests {
             (first, Destination::Local(first)),
             (second, Destination::Window("other".into(), second)),
         ];
-        assert!(
-            unique_destination("12345678", candidates.clone())
-                .unwrap_err()
-                .contains("More than one")
-        );
+        // The prefix is an address the person was never shown.
+        let ambiguous = unique_destination("12345678", candidates.clone()).unwrap_err();
+        assert!(ambiguous.contains("More than one"), "{ambiguous}");
+        assert!(!ambiguous.contains("12345678"), "{ambiguous}");
         assert!(
             matches!(unique_destination(&second.to_string(), candidates), Ok(Destination::Window(slot, id)) if slot == "other" && id == second)
         );
-        assert!(
-            unique_destination("missing", Vec::new())
-                .unwrap_err()
-                .contains("no longer available")
-        );
+        let missing = unique_destination("missing", Vec::new()).unwrap_err();
+        assert_eq!(missing, "That session is no longer open.");
     }
 }

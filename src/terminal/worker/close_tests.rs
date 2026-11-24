@@ -360,7 +360,10 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     let child = shutdown_job(
         &shell,
-        b"trap ':' HUP; bash -c 'trap \"printf hup > stopped-hup; exit 0\" HUP; echo $$ > child.pid; while :; do sleep 0.05; done' &\n",
+        // The shell doesn't exit before its job, so bash's exit-time SIGCONT
+        // to stopped jobs can't be what resumes it, and it exits once the job
+        // does, which ends the grace there.
+        b"trap 'while kill -0 $(cat child.pid) 2>/dev/null; do sleep 0.05; done; exit 0' HUP; bash -c 'trap \"printf hup > stopped-hup; exit 0\" HUP; echo $$ > child.pid; while :; do sleep 0.05; done' &\n",
         "bash",
     );
     shell
@@ -374,7 +377,13 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
                 .is_some_and(|(_, fields)| fields.starts_with('T'))
         })
     });
+    let started = Instant::now();
     let outcome = shell.terminal.shutdown();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < ShutdownBudget::PATIENT.hangup_grace,
+        "a family that exits on hangup must end the grace early: {elapsed:?}"
+    );
     assert!(
         shell.home.path().join("stopped-hup").exists(),
         "an already-stopped job must run its HUP handler before shutdown completes: {outcome:?}"
@@ -390,7 +399,9 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
 #[test]
 fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
-    shell.terminal.input(b"trap 'sleep 0.1; printf hup > delayed-capture-hup' HUP; printf '%s' \"$$\" > root.pid; printf 'READY_%s\\n' DELAY; read reply\n").unwrap();
+    // The handler finishes only once the test releases it, so the shell
+    // can exit during the grace only if shutdown kills it.
+    shell.terminal.input(b"trap 'while [ ! -e release-hup ]; do sleep 0.01; done; printf hup > delayed-capture-hup; exit 0' HUP; printf '%s' \"$$\" > root.pid; printf 'READY_%s\\n' DELAY; read reply\n").unwrap();
     shell.wait_for_text("READY_DELAY");
     let root = pin_shutdown_process(
         fs::read_to_string(shell.home.path().join("root.pid"))
@@ -418,22 +429,24 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
     let terminal = shell.terminal.clone();
     let started = Instant::now();
     let shutdown = std::thread::spawn(move || terminal.shutdown());
-    let captured_at = capture_finished
+    capture_finished
         .recv_timeout(crate::test_timing::EVENTUALLY)
         .unwrap();
-    let killed_before_grace = holder::exits_within(
-        &root.0,
-        budget.hangup_grace.saturating_sub(captured_at.elapsed()),
-    )
-    .unwrap();
+    // Capture stops at its own half second, not at the deadline less the
+    // confirmation reserve, which would leave it the grace's 15 s as well.
+    let capture = started.elapsed();
+    assert!(
+        capture < budget.hangup_grace,
+        "capture must stop where the hangup grace begins: {capture:?}"
+    );
+    // Watching for a product grace's worth of time: a busy host can only
+    // shorten the watch relative to shutdown, never end the grace early.
+    let killed_during_grace = holder::exits_within(&root.0, CHILD_HANGUP_GRACE).unwrap();
+    fs::write(shell.home.path().join("release-hup"), b"").unwrap();
     let outcome = shutdown.join().unwrap();
     assert!(
-        shell.home.path().join("delayed-capture-hup").exists(),
-        "capture must leave time for the shell's HUP handler: {outcome:?}"
-    );
-    assert!(
-        !killed_before_grace,
-        "capture must not consume the shell's existing HUP grace"
+        !killed_during_grace,
+        "capture must not consume the shell's HUP grace: {outcome:?}"
     );
     assert!(
         outcome.is_ok(),
@@ -444,7 +457,8 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
     assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
     assert_eq!(
         fs::read(shell.home.path().join("delayed-capture-hup")).unwrap(),
-        b"hup"
+        b"hup",
+        "the shell's HUP handler must finish once released"
     );
 }
 
@@ -459,11 +473,12 @@ fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
     let started = Instant::now();
     let outcome = shell.terminal.shutdown();
     // A family that exits on hangup closes the PTY at once; shutdown must not
-    // wait out the drain budget kept for jobs that linger.
+    // wait out the hangup grace, let alone the drain budget kept for jobs
+    // that linger.
     let elapsed = started.elapsed();
     assert!(
-        elapsed < ShutdownBudget::PATIENT.deadline / 2,
-        "a family that exits on hangup must not wait for the drain deadline: {elapsed:?}"
+        elapsed < ShutdownBudget::PATIENT.hangup_grace,
+        "a family that exits on hangup must end the grace early: {elapsed:?}"
     );
     assert!(
         outcome.is_ok(),
@@ -483,19 +498,20 @@ fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
 fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     let child = shutdown_background_job(&shell);
+    let budget = ShutdownBudget::PATIENT_PRODUCT_GRACE;
+    shell.terminal.set_shutdown_budget_for_test(budget);
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_ok());
     assert!(
-        started.elapsed() >= ShutdownBudget::PATIENT.hangup_grace,
+        started.elapsed() >= budget.hangup_grace,
         "a HUP-ignoring job must receive the existing grace before escalation"
     );
     assert!(
-        started.elapsed()
-            < ShutdownBudget::PATIENT.deadline - ShutdownBudget::PATIENT.confirmation_reserve,
+        started.elapsed() < budget.deadline - budget.confirmation_reserve,
         "escalation must follow the hangup grace, not wait for the deadline"
     );
     assert!(
-        holder::exits_within(&child.0, Duration::from_secs(1)).unwrap(),
+        holder::exits_within(&child.0, Duration::ZERO).unwrap(),
         "ordinary shutdown reported success but left its HUP-ignoring background job running"
     );
 }
@@ -636,6 +652,10 @@ fn ordinary_shutdown_force_kills_its_pinned_root_when_the_census_fails() {
         .published
         .shutdown_census_failure
         .store(true, Ordering::Release);
+    // The root ignores its hangup, so it is killed once the grace runs out.
+    shell
+        .terminal
+        .set_shutdown_budget_for_test(ShutdownBudget::PATIENT_PRODUCT_GRACE);
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_ok());
     assert!(started.elapsed() < ShutdownBudget::PATIENT.join);

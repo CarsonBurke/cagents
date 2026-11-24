@@ -4250,59 +4250,57 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_ABANDONED_CLAUDE_RESUME_TEST";
     if std::env::var_os(MODE).is_none() {
-        for mode in ["abandoned", "survivor"] {
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-            let root = directory.path();
-            for path in [
-                "home/.claude",
-                "run",
-                "data",
-                "config",
-                "cache",
-                "bin",
-                "project",
-            ] {
-                fs::create_dir_all(root.join(path)).unwrap();
-            }
-            let test = thread::current().name().unwrap().to_owned();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test, "--nocapture"])
-                .env_clear()
-                .envs(crate::retained_fixture::owner_env())
-                .env(
-                    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
-                    retained_helper_executable(),
-                )
-                .env(MODE, mode)
-                .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-                .env("CAGENTS_HOLDER_ROOT", root)
-                .env("HOME", root.join("home"))
-                .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
-                .env("XDG_RUNTIME_DIR", root.join("run"))
-                .env("XDG_DATA_HOME", root.join("data"))
-                .env("XDG_CONFIG_HOME", root.join("config"))
-                .env("XDG_CACHE_HOME", root.join("cache"))
-                .env(
-                    "PATH",
-                    format!("{}:/usr/bin:/bin", root.join("bin").display()),
-                )
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "abandoned resume mode={mode} failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        for path in [
+            "home/.claude",
+            "run",
+            "data",
+            "config",
+            "cache",
+            "bin",
+            "project",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
         }
+        let test = thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env_clear()
+            .envs(crate::retained_fixture::owner_env())
+            .env(
+                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                retained_helper_executable(),
+            )
+            .env(MODE, "1")
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CAGENTS_HOLDER_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "abandoned resume fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
-    let survivor = std::env::var(MODE).unwrap() == "survivor";
     install_provider(&root.join("bin/claude"));
-    if survivor {
-        fs::write(root.join("leave-survivor"), "").unwrap();
-    }
+    // The provider leaves a process in its group. The successful prepare
+    // after that process exits is the same proof as an actor that left
+    // nothing behind: the survivor's refusal changes no state.
+    fs::write(root.join("leave-survivor"), "").unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     let proof = |incarnation| HostSessionProof {
         host_session_id: HostSessionId::new("abandoned-resume-fixture"),
@@ -4415,27 +4413,25 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
             },
         )
     };
-    if survivor {
-        let pid: i32 = fs::read_to_string(root.join("survivor-pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let refused = prepare()
-            .expect_err("a process left in the provider's group may still write the conversation");
-        assert!(
-            refused.message.contains("without verified retirement"),
-            "{}",
-            refused.message
-        );
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        wait_until(
-            || !Path::new(&format!("/proc/{pid}")).exists(),
-            "the survivor never exited",
-        );
+    let pid: i32 = fs::read_to_string(root.join("survivor-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let refused = prepare()
+        .expect_err("a process left in the provider's group may still write the conversation");
+    assert!(
+        refused.message.contains("without verified retirement"),
+        "{}",
+        refused.message
+    );
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
     }
+    wait_until(
+        || !Path::new(&format!("/proc/{pid}")).exists(),
+        "the survivor never exited",
+    );
     let ServerResponse::ChatResumePrepared { session } = prepare().unwrap() else {
         panic!("a proved abandoned actor must prepare its exact saved conversation");
     };

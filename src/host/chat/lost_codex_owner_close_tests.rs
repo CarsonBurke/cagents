@@ -917,33 +917,6 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
     assert!(!has_native_owner(&fixture.source).unwrap());
 }
 
-/// Reopening a conversation whose pane closed this way: its owner left no
-/// receipt, and the old refusal asked the user to restore the pane they had
-/// just closed and close it again.
-#[test]
-fn a_conversation_closed_after_losing_its_owner_reopens() {
-    let Some(root) = isolated("a_conversation_closed_after_losing_its_owner_reopens") else {
-        return;
-    };
-    let fixture = Fixture::new(&root);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
-    let ServerResponse::ChatResumePrepared { session } = process_inner(
-        &fixture.host,
-        0,
-        ClientRequest::ChatPrepareResume {
-            source: fixture.source.clone(),
-        },
-    )
-    .unwrap() else {
-        panic!("expected a prepared resume");
-    };
-    assert_ne!(session.id, fixture.source.id);
-    // The same conversation, on a listener of its own.
-    assert_eq!(session.launch.provider, Provider::Codex);
-    assert_eq!(session.launch.session_id, fixture.source.launch.session_id);
-    assert!(session.owned_codex_listener.is_none());
-}
-
 /// While anything of the old conversation may still run, reopening it keeps
 /// refusing, as it does without a receipt.
 #[test]
@@ -1377,6 +1350,9 @@ fn codex_start_paired_console_without_surviving_execution_starts() {
     assert_codex_started(&fixture, &root);
 }
 
+/// Reopening a conversation whose pane closed after losing its owner: that
+/// owner left no receipt, and the old refusal asked the user to restore the
+/// pane they had just closed and close it again. It reopens, and starts.
 #[test]
 fn codex_picker_resume_of_an_ended_pane_starts() {
     let Some(root) = isolated("codex_picker_resume_of_an_ended_pane_starts") else {
@@ -1395,7 +1371,10 @@ fn codex_picker_resume_of_an_ended_pane_starts() {
         panic!("expected a prepared resume");
     };
     assert_ne!(session.id, fixture.source.id);
+    // The same conversation, on a listener of its own.
+    assert_eq!(session.launch.provider, Provider::Codex);
     assert_eq!(session.launch.session_id, fixture.source.launch.session_id);
+    assert!(session.owned_codex_listener.is_none());
     fixture.source = session;
     assert_codex_started(&fixture, &root);
 }

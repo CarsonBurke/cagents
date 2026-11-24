@@ -34,15 +34,37 @@ pub(super) fn item_duration_ms(item: &chat::Item, now: Option<u64>) -> Option<u6
     Some(end.saturating_sub(start))
 }
 
-fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
+/// What a row's leading glyph reports: how a step stands, or how a group's
+/// steps stand together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Status {
+    Tool(chat::ToolStatus),
+    /// Some of a group's steps failed and the others did not. Its mark is
+    /// the error colour's, as a failure's is, so collapsing the group never
+    /// hides one, but half filled rather than the full error mark, which
+    /// stays for a group in which nothing worked.
+    PartlyFailed,
+}
+
+impl From<chat::ToolStatus> for Status {
+    fn from(status: chat::ToolStatus) -> Self {
+        Self::Tool(status)
+    }
+}
+
+fn status_glyph(kind: Icon, status: Option<Status>) -> Icon {
+    let Some(status) = status else {
+        return kind;
+    };
     match status {
-        Some(chat::ToolStatus::Failed) => Icon::Error,
-        Some(chat::ToolStatus::Denied) => Icon::Unavailable,
+        Status::PartlyFailed => Icon::PartlyFailed,
+        Status::Tool(chat::ToolStatus::Failed) => Icon::Error,
+        Status::Tool(chat::ToolStatus::Denied) => Icon::Unavailable,
         // Work that was stopped, or that ended without saying how it went,
         // has not failed. Its mark is a still one, unlike the Stop control.
-        Some(chat::ToolStatus::Stopped | chat::ToolStatus::Ended) => Icon::Ended,
-        Some(chat::ToolStatus::Waiting) => Icon::AgentBackground,
-        _ => kind,
+        Status::Tool(chat::ToolStatus::Stopped | chat::ToolStatus::Ended) => Icon::Ended,
+        Status::Tool(chat::ToolStatus::Waiting) => Icon::AgentBackground,
+        Status::Tool(chat::ToolStatus::Running | chat::ToolStatus::Succeeded) => kind,
     }
 }
 
@@ -164,7 +186,7 @@ pub(super) fn row(
     label: impl Into<Headline>,
     name: String,
     icon: Icon,
-    status: Option<chat::ToolStatus>,
+    status: Option<Status>,
     trailing: Option<String>,
     expanded: Option<bool>,
     toggle: Option<Action>,
@@ -212,25 +234,27 @@ pub(super) fn row_named(
     label: impl Into<Headline>,
     name: String,
     icon: Icon,
-    status: Option<chat::ToolStatus>,
+    status: Option<Status>,
     trailing: Option<Trailing>,
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
     let label = label.into();
     let indicator = match status {
-        Some(chat::ToolStatus::Running) => crate::ui_controls::activity_spinner(
+        Some(Status::Tool(chat::ToolStatus::Running)) => crate::ui_controls::activity_spinner(
             f32::from(design::LEADING_ICON_SIZE),
             design::muted_color,
         ),
-        Some(chat::ToolStatus::Failed) => widget::icon(Icon::Error.handle())
-            .size(design::LEADING_ICON_SIZE)
-            .class(cosmic::theme::Svg::Custom(Rc::new(|theme| {
-                iced::widget::svg::Style {
-                    color: Some(design::destructive_color(theme)),
-                }
-            })))
-            .into(),
+        Some(Status::Tool(chat::ToolStatus::Failed) | Status::PartlyFailed) => {
+            widget::icon(status_glyph(icon, status).handle())
+                .size(design::LEADING_ICON_SIZE)
+                .class(cosmic::theme::Svg::Custom(Rc::new(|theme| {
+                    iced::widget::svg::Style {
+                        color: Some(design::destructive_color(theme)),
+                    }
+                })))
+                .into()
+        }
         _ => {
             crate::ui_controls::passive_icon(status_glyph(icon, status), design::LEADING_ICON_SIZE)
         }
@@ -328,21 +352,33 @@ mod tests {
     #[test]
     fn non_success_states_stay_visible_when_the_summary_fades() {
         assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Succeeded)),
+            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Succeeded.into())),
             Icon::Terminal
         );
         assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Denied)),
+            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Denied.into())),
             Icon::Unavailable
         );
         // Stopping is not failing, and nor is ending unreported. Neither is
         // drawn as the Stop control, which reads as something to press.
         for status in [chat::ToolStatus::Stopped, chat::ToolStatus::Ended] {
-            assert_eq!(status_glyph(Icon::Terminal, Some(status)), Icon::Ended);
+            assert_eq!(
+                status_glyph(Icon::Terminal, Some(status.into())),
+                Icon::Ended
+            );
         }
         assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Waiting)),
+            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Waiting.into())),
             Icon::AgentBackground
+        );
+        assert_eq!(
+            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Failed.into())),
+            Icon::Error
+        );
+        // Some steps failing among others that did not is its own mark.
+        assert_eq!(
+            status_glyph(Icon::Terminal, Some(Status::PartlyFailed)),
+            Icon::PartlyFailed
         );
     }
 
@@ -388,7 +424,11 @@ mod tests {
             Some(chat::ToolStatus::Failed),
             Some(chat::ToolStatus::Succeeded),
             Some(chat::ToolStatus::Stopped),
-        ] {
+        ]
+        .map(|status| status.map(Status::from))
+        .into_iter()
+        .chain([Some(Status::PartlyFailed)])
+        {
             let mut element = row(
                 "Ran 2 commands".to_owned(),
                 "Ran 2 commands".into(),

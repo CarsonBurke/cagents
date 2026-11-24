@@ -492,6 +492,7 @@ fn create_inner(
             server_identity: None,
             retained_identity,
             thread: launch.session_id.clone(),
+            name_revision: 0,
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
@@ -569,7 +570,13 @@ enum Pending {
         revision: u64,
     },
     Initialize,
-    Attach,
+    Attach {
+        /// A verified connection may set or clear the name before resume answers.
+        renamed: Option<Option<String>>,
+    },
+    ReadThread {
+        name_revision: u64,
+    },
     Models,
     Skills,
     History {
@@ -698,6 +705,8 @@ struct Codex {
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
+    /// A rename notification can arrive while a metadata request is in flight.
+    name_revision: u64,
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
@@ -895,7 +904,7 @@ impl Codex {
             .get_or_insert_with(|| {
                 self.cwd
                     .ancestors()
-                    .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+                    .find(|dir| crate::git_marker::present(&dir.join(".git")).unwrap_or(false))
                     .map(std::path::Path::to_path_buf)
             })
             .clone()
@@ -1648,7 +1657,9 @@ impl Codex {
             step,
             "thread/read",
             json!({"threadId":self.thread,"includeTurns":false}),
-            Pending::Other,
+            Pending::ReadThread {
+                name_revision: self.name_revision,
+            },
         )?;
         self.history(step, None)
     }
@@ -1825,6 +1836,15 @@ impl Codex {
         // Refreshing the live end must not rewind the older-history traversal
         // through pages already cached. Commit only after validating the page;
         // a failed decode must preserve the cursor the reader can retry.
+        if !earlier
+            && !self.history_initialized
+            && !self.is_child
+            && page["nextCursor"].is_string()
+            && let Some(id) = &self.thread
+            && let Some(title) = rollout::opening_title(&self.expected_home, id)
+        {
+            step.events.push(Event::OpeningTitle(title));
+        }
         if earlier || !self.history_initialized {
             self.cursor = page["nextCursor"].as_str().map(str::to_owned);
             self.history_initialized = true;
@@ -2189,6 +2209,11 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    #[cfg(feature = "host")]
+    fn needs_private_temp(&self) -> bool {
+        true
+    }
+
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;
@@ -2327,6 +2352,7 @@ impl Adapter for Codex {
                 self.call(&mut step, method, json!({"threadId":self.thread,"queuedSubmissionId":id}), pending)?;
             }
             Command::SetInterruptMode { .. } => return Err("Codex uses explicit steer and queue operations".into()),
+            Command::SendQueuedNow => return Err("Codex cannot hand its queue to the running turn".into()),
             Command::ListBranches => self.history(&mut step, None)?,
             Command::Branch { id } => {
                 if self.busy || !self.direct_input { return Err("Fork requires an idle writable Codex conversation".into()); }
@@ -2582,7 +2608,7 @@ impl Codex {
                         detail: "Turn failed".into(),
                     });
                 }
-                let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
+                let fatal = matches!(pending, Pending::Initialize | Pending::Attach { .. });
                 let message = format!(
                     "{}: {}",
                     if matches!(pending, Pending::StopChild) {
@@ -2665,15 +2691,11 @@ impl Codex {
                     self.server_identity = identity;
                     step.writes
                         .push(json!({"method":"initialized","params":{}}));
+                    let pending = Pending::Attach { renamed: None };
                     if self.thread.is_some() {
-                        self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+                        self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), pending)?;
                     } else {
-                        self.call(
-                            &mut step,
-                            "thread/start",
-                            self.start.clone(),
-                            Pending::Attach,
-                        )?;
+                        self.call(&mut step, "thread/start", self.start.clone(), pending)?;
                     }
                     self.call(
                         &mut step,
@@ -2691,7 +2713,7 @@ impl Codex {
                     )?;
                     self.skills(&mut step)?;
                 }
-                Pending::Attach => {
+                Pending::Attach { renamed } => {
                     let thread = &result["thread"];
                     let id = string(thread, "id")?;
                     if self.thread.as_ref().is_some_and(|expected| expected != id) {
@@ -2700,7 +2722,8 @@ impl Codex {
                                 .into(),
                         );
                     }
-                    if self.thread.is_none() {
+                    let fresh = self.thread.is_none();
+                    if fresh {
                         self.cursor = None;
                         self.history_initialized = false;
                     }
@@ -2723,10 +2746,25 @@ impl Codex {
                     ));
                     step.events
                         .push(Event::Waiting(waiting_on_user(&thread["status"])));
+                    let cleared = matches!(renamed, Some(None));
+                    let title = match renamed {
+                        Some(title) => {
+                            self.name_revision = self.name_revision.wrapping_add(1);
+                            title
+                        }
+                        None => thread_name(&thread["name"]),
+                    };
                     step.events.push(Event::Session {
                         id: id.into(),
-                        title: thread["name"].as_str().map(str::to_owned),
+                        title,
                     });
+                    if fresh {
+                        step.events.push(Event::OpeningHistoryComplete);
+                    }
+                    if cleared {
+                        step.events
+                            .push(Event::ProviderTitleCleared { id: id.into() });
+                    }
                     step.events.push(Event::Status {
                         busy: self.busy,
                         detail: "Connected to Codex".into(),
@@ -3248,7 +3286,7 @@ impl Codex {
                             .filter(|model| !model.is_empty())
                             .map(str::to_owned)
                             .or_else(|| child.selected.clone());
-                        child.thread_state(&result["thread"], &mut content)?;
+                        child.thread_state(&result["thread"], true, &mut content)?;
                         child.ready = true;
                         child.materialized = true;
                         if result["initialTurnsPage"].is_object() {
@@ -3322,9 +3360,18 @@ impl Codex {
                 Pending::ChildRpc { .. } => unreachable!("child responses routed above"),
                 // The child's own turn completion reports how it ended.
                 Pending::StopChild | Pending::Prediction => {}
+                Pending::ReadThread { name_revision } => {
+                    if result["thread"].is_object() {
+                        self.thread_state(
+                            &result["thread"],
+                            name_revision == self.name_revision,
+                            &mut step,
+                        )?;
+                    }
+                }
                 Pending::Other => {
                     if result["thread"].is_object() {
-                        self.thread_state(&result["thread"], &mut step)?;
+                        self.thread_state(&result["thread"], true, &mut step)?;
                     }
                 }
             }
@@ -3428,7 +3475,7 @@ impl Codex {
         match method {
             "thread/started" => {
                 if self.ready {
-                    self.thread_state(&params["thread"], &mut step)?;
+                    self.thread_state(&params["thread"], self.name_revision == 0, &mut step)?;
                 }
             }
             "thread/status/changed" => {
@@ -3461,10 +3508,35 @@ impl Codex {
                     }
                 }
             }
-            "thread/name/updated" => step.events.push(Event::Session {
-                id: self.thread.clone().ok_or("Missing Codex thread")?,
-                title: params["threadName"].as_str().map(str::to_owned),
-            }),
+            "thread/name/updated" => {
+                if let Some(id) = params["threadId"].as_str()
+                    && self.thread.as_deref() == Some(id)
+                {
+                    let title = thread_name(&params["threadName"]);
+                    let cleared = params.get("threadName").is_some_and(Value::is_null);
+                    let changed = title.is_some() || cleared;
+                    if self.attached || self.is_child {
+                        if changed {
+                            self.name_revision = self.name_revision.wrapping_add(1);
+                        }
+                        step.events.push(if cleared {
+                            Event::ProviderTitleCleared { id: id.into() }
+                        } else {
+                            Event::Session {
+                                id: id.into(),
+                                title,
+                            }
+                        });
+                    } else if changed
+                        && let Some(Pending::Attach { renamed }) = self
+                            .pending
+                            .values_mut()
+                            .find(|pending| matches!(pending, Pending::Attach { .. }))
+                    {
+                        *renamed = Some(title);
+                    }
+                }
+            }
             "thread/settings/updated" => {
                 let settings = &params["threadSettings"];
                 if settings.get("model").is_some() {
@@ -4122,7 +4194,12 @@ impl Codex {
             _ => {}
         }
     }
-    fn thread_state(&mut self, thread: &Value, step: &mut Step) -> Result<(), String> {
+    fn thread_state(
+        &mut self,
+        thread: &Value,
+        read_name: bool,
+        step: &mut Step,
+    ) -> Result<(), String> {
         let id = string(thread, "id")?;
         if self.thread.as_deref() != Some(id) {
             return Err("Codex metadata belongs to a different thread".into());
@@ -4138,7 +4215,7 @@ impl Codex {
             .push(Event::Waiting(waiting_on_user(&thread["status"])));
         step.events.push(Event::Session {
             id: id.into(),
-            title: thread["name"].as_str().map(str::to_owned),
+            title: read_name.then(|| thread_name(&thread["name"])).flatten(),
         });
         step.events.push(Event::Status {
             busy: self.busy,
@@ -4147,6 +4224,13 @@ impl Codex {
         step.events.push(Event::Capabilities(self.capabilities()));
         Ok(())
     }
+}
+
+fn thread_name(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
 }
 /// The thread that spawned a subagent's thread, as its metadata names it.
 fn parent_thread(metadata: &Value) -> Option<&str> {

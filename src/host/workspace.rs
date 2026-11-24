@@ -22,6 +22,7 @@ mod pane_move;
 mod pending_tests;
 #[cfg(test)]
 mod tests;
+pub(super) mod titles;
 
 #[cfg(test)]
 thread_local! {
@@ -166,32 +167,8 @@ fn edit_then<T>(
     if !replay && super::chat::pane_start::requires_edit_check(&edit) {
         super::chat::pane_start::validate_edit(host, &registry, &edit)?;
     }
-    let applied = if let ModelEdit::SuggestConversationTitle {
-        id,
-        card,
-        expected_revision,
-        title,
-        source,
-    } = &edit
-    {
-        // BEGIN IMMEDIATE can wait for another SQLite writer for up to the
-        // registry busy timeout. Enter that wait before borrowing HostState;
-        // terminal delivery consequently stays live even while title inference
-        // is waiting to publish.
-        registry
-            .apply_delta_guarded_with(&edit, |_, sql| {
-                let expected = Registry::title_conversation_at(sql, *id, *card, *expected_revision)
-                    .map_err(TitleAdmission::from)?;
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                state
-                    .validate_title_conversation(expected, title, *source)
-                    .map_err(TitleAdmission)?;
-                // Keep resident identity admission through COMMIT. A
-                // conflicting resident edit cannot slip between validation
-                // and the durable title change.
-                Ok::<_, TitleAdmission>(state)
-            })
-            .map_err(|error| error.0)?
+    let applied = if matches!(&edit, ModelEdit::SuggestConversationTitle { .. }) {
+        apply_title(host, &mut registry, &edit)?
     } else if matches!(
         &edit,
         ModelEdit::ChangeView {
@@ -254,6 +231,36 @@ fn edit_then<T>(
     }
     let then = then(&registry)?;
     Ok((applied.receipt, then))
+}
+
+fn apply_title(
+    host: &SharedHost,
+    registry: &mut Registry,
+    edit: &ModelEdit,
+) -> Result<DeltaApplied, ProtocolError> {
+    let ModelEdit::SuggestConversationTitle {
+        id,
+        card,
+        expected_revision,
+        title,
+        source,
+    } = edit
+    else {
+        unreachable!();
+    };
+    // Get SQLite writer admission before borrowing HostState. The same guard
+    // keeps resident identity stable through commit, for window and daemon edits.
+    registry
+        .apply_title_delta(edit, |sql| {
+            let expected = Registry::title_conversation_at(sql, *id, *card, *expected_revision)
+                .map_err(TitleAdmission::from)?;
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let provider_title_cleared = state
+                .validate_title_conversation(expected, title, *source)
+                .map_err(TitleAdmission)?;
+            Ok::<_, TitleAdmission>((state, provider_title_cleared))
+        })
+        .map_err(|error| error.0)
 }
 
 /// Older CLI clients and windows that edit with full replies retain the

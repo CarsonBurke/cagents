@@ -1,17 +1,34 @@
 //! Where releases are published, and how an installed build reads them.
 //!
-//! Each release carries `release-metadata.json` and its signature. The latest
-//! one is read through github.com's public download redirect
-//! (`releases/latest/download/…`), and assets from `releases/download/v…/…`.
-//! Those are ordinary web downloads, so a check costs no GitHub API quota and
-//! needs no sign-in. Trust comes from the signature alone: the metadata names
-//! the SHA-256 of every file the updater downloads, including the installer.
+//! Each release carries its signed metadata, `release-metadata-2.json` and its
+//! signature. The latest one is read through github.com's public download
+//! redirect (`releases/latest/download/…`), and assets from
+//! `releases/download/v…/…`. Those are ordinary web downloads, so a check costs
+//! no GitHub API quota and needs no sign-in. Trust comes from the signature
+//! alone: the metadata names the SHA-256 of every file the updater downloads,
+//! including the installer.
+//!
+//! Releases belong to trust generations, each with its own metadata name. A
+//! build reads its own generation's name. A new generation begins when the
+//! keys change in a way older builds could not follow, such as dropping a key
+//! they rely on. Its first release is signed by a key every release of the
+//! previous generation trusts, and every later release keeps that first
+//! release's metadata under each older name. Builds of an older generation are
+//! offered that release, which they can verify, and from it reach the rest.
+//! Generation 1, up to 0.2.3, reads `release-metadata.json` and accepts one
+//! signature; 0.2.4 begins generation 2.
 use super::*;
 use std::collections::BTreeMap;
 
 const PUBLIC_FEED: &str = "https://github.com/CarsonBurke/cagents/releases";
-const METADATA: &str = "release-metadata.json";
-const SIGNATURE: &str = "release-metadata.json.sig";
+/// This build's trust generation. `scripts/publish-release` reads it from
+/// this line; a new generation adds its names to `GENERATIONS`.
+const GENERATION: usize = 2;
+/// The metadata and signature names of each generation, oldest first.
+const GENERATIONS: [(&str, &str); GENERATION] = [
+    ("release-metadata.json", "release-metadata.json.sig"),
+    ("release-metadata-2.json", "release-metadata-2.json.sig"),
+];
 const SCHEMA: u32 = 2;
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const PRODUCT: &str = "cagents";
@@ -93,7 +110,7 @@ impl Feed {
         newer: impl FnOnce(&str) -> Result<bool, UpdateError>,
         cancellation: &CancellationToken,
     ) -> Result<Option<Release>, UpdateError> {
-        let metadata = self.fetch_metadata("latest/download", cancellation)?;
+        let (metadata, _) = self.fetch_metadata("latest/download", cancellation)?;
         #[derive(Deserialize)]
         struct Announced {
             version: String,
@@ -114,9 +131,9 @@ impl Feed {
         cancellation: &CancellationToken,
     ) -> Result<Release, UpdateError> {
         let directory = format!("download/v{version}");
-        let metadata = self.fetch_metadata(&directory, cancellation)?;
+        let (metadata, signature) = self.fetch_metadata(&directory, cancellation)?;
         let signature = match self.fetch(
-            &format!("{directory}/{SIGNATURE}"),
+            &format!("{directory}/{signature}"),
             "reading the release's signature",
             SMALL_ASSET_LIMIT,
             Duration::from_secs(60),
@@ -144,24 +161,30 @@ impl Feed {
         Ok(release)
     }
 
+    /// The metadata in `directory`, and the name of the signature that goes
+    /// with it: this generation's, or what a release of an older generation
+    /// carries instead.
     fn fetch_metadata(
         &self,
         directory: &str,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<u8>, UpdateError> {
-        match self.fetch(
-            &format!("{directory}/{METADATA}"),
-            "checking for a new release",
-            METADATA_LIMIT,
-            Duration::from_secs(60),
-            cancellation,
-        ) {
-            Ok(file) => read_all(file),
-            Err(error) if self.missing(&error) => Err(invalid(
-                "no published release of cagents offers in-app updates yet",
-            )),
-            Err(error) => Err(error),
+    ) -> Result<(Vec<u8>, &'static str), UpdateError> {
+        for (metadata, signature) in GENERATIONS.into_iter().rev() {
+            match self.fetch(
+                &format!("{directory}/{metadata}"),
+                "checking for a new release",
+                METADATA_LIMIT,
+                Duration::from_secs(60),
+                cancellation,
+            ) {
+                Ok(file) => return Ok((read_all(file)?, signature)),
+                Err(error) if self.missing(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
+        Err(invalid(
+            "no published release of cagents offers in-app updates yet",
+        ))
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Release, UpdateError> {
@@ -351,6 +374,24 @@ fn curl_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// This build's own generation's names.
+    const METADATA: &str = GENERATIONS[GENERATION - 1].0;
+    const SIGNATURE: &str = GENERATIONS[GENERATION - 1].1;
+
+    /// The release scripts publish generation G's metadata as
+    /// `release-metadata.json` for 1 and `release-metadata-G.json` after; a
+    /// build that spelled its own name otherwise would never find it.
+    #[test]
+    fn each_generation_reads_the_name_the_release_scripts_publish() {
+        for (index, (metadata, signature)) in GENERATIONS.into_iter().enumerate() {
+            let expected = match index + 1 {
+                1 => "release-metadata.json".to_owned(),
+                generation => format!("release-metadata-{generation}.json"),
+            };
+            assert_eq!(metadata, expected);
+            assert_eq!(signature, format!("{expected}.sig"));
+        }
+    }
 
     fn feed() -> Feed {
         Feed {
@@ -551,6 +592,138 @@ mod tests {
             ..feed
         };
         assert!(untrusted.release(version, &cancellation).is_err());
+    }
+
+    /// Writes a signed release of `version` into `root/download/v{version}`
+    /// under `names`, signed by `signers`, and returns its metadata.
+    fn publish(
+        root: &std::path::Path,
+        version: &str,
+        names: &[(&str, &str)],
+        signers: &[&ed25519_dalek::SigningKey],
+    ) -> Vec<u8> {
+        let directory = root.join(format!("download/v{version}"));
+        fs::create_dir_all(&directory).unwrap();
+        let mut value = metadata(version);
+        let archive = format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz");
+        for (name, bytes) in [
+            (archive.as_str(), &b"archive"[..]),
+            ("SHA256SUMS", b"sums"),
+            ("install.sh", b"installer"),
+        ] {
+            fs::write(directory.join(name), bytes).unwrap();
+            value["assets"][name] = serde_json::json!({
+                "size": bytes.len(),
+                "sha256": format!("{:x}", Sha256::digest(bytes)),
+            });
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let signature: String = signers
+            .iter()
+            .map(|signer| signature::sign_for_test(signer, &bytes).1)
+            .collect();
+        for (metadata, sig) in names {
+            fs::write(directory.join(metadata), &bytes).unwrap();
+            fs::write(directory.join(sig), &signature).unwrap();
+        }
+        bytes
+    }
+
+    fn file_feed(root: &std::path::Path, signer: &ed25519_dalek::SigningKey) -> Feed {
+        Feed {
+            base: format!("file://{}", root.display()),
+            local: true,
+            keys: vec![signature::sign_for_test(signer, b"").0],
+        }
+    }
+
+    /// The published layout from 0.2.5 on: the release's own metadata as
+    /// `release-metadata-2.json`, and 0.2.4's, signed by the key 0.2.3
+    /// trusts, as `release-metadata.json`.
+    #[test]
+    fn builds_that_trust_only_the_old_key_are_led_to_the_release_that_trusts_the_new_one() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not installed");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let old = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        let new = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
+        let both = [(METADATA, SIGNATURE), GENERATIONS[0]];
+        let bridge = publish(root.path(), "0.2.4", &both, &[&old]);
+        publish(root.path(), "0.2.5", &[(METADATA, SIGNATURE)], &[&new]);
+        let latest = root.path().join("latest/download");
+        fs::create_dir_all(&latest).unwrap();
+        let current = root.path().join("download/v0.2.5");
+        for name in [METADATA, SIGNATURE] {
+            fs::copy(current.join(name), latest.join(name)).unwrap();
+        }
+        let bridged = root.path().join("download/v0.2.4");
+        for name in [GENERATIONS[0].0, GENERATIONS[0].1] {
+            fs::copy(bridged.join(name), current.join(name)).unwrap();
+            fs::copy(bridged.join(name), latest.join(name)).unwrap();
+        }
+        let cancellation = CancellationToken::new();
+        let newer = |installed: &'static str| {
+            move |version: &str| -> Result<bool, UpdateError> {
+                Ok(version_key(version) > version_key(installed))
+            }
+        };
+
+        // What 0.2.3 reads: only the legacy names, only the old key.
+        let legacy = fs::read(latest.join(GENERATIONS[0].0)).unwrap();
+        assert_eq!(legacy, bridge);
+        let announced: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        assert_eq!(announced["version"], "0.2.4");
+        let tagged = root.path().join("download/v0.2.4");
+        signature::verify(
+            &fs::read(tagged.join(GENERATIONS[0].0)).unwrap(),
+            &fs::read_to_string(tagged.join(GENERATIONS[0].1)).unwrap(),
+            &[signature::sign_for_test(&old, b"").0],
+        )
+        .unwrap();
+
+        // 0.2.4, which trusts the new key, finds 0.2.5.
+        let feed = file_feed(root.path(), &new);
+        let found = feed.latest(newer("0.2.4"), &cancellation).unwrap().unwrap();
+        assert_eq!(found.version, "0.2.5");
+        assert_eq!(feed.latest(newer("0.2.5"), &cancellation).unwrap(), None);
+    }
+
+    /// A feed whose newest release predates `release-metadata-2.json` still
+    /// reads, through the name that release carries.
+    #[test]
+    fn a_release_from_before_generation_2_metadata_still_reads() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not installed");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        publish(root.path(), "0.2.3", &[GENERATIONS[0]], &[&key]);
+        let latest = root.path().join("latest/download");
+        fs::create_dir_all(&latest).unwrap();
+        for name in [GENERATIONS[0].0, GENERATIONS[0].1] {
+            fs::copy(
+                root.path().join("download/v0.2.3").join(name),
+                latest.join(name),
+            )
+            .unwrap();
+        }
+        let feed = file_feed(root.path(), &key);
+        let cancellation = CancellationToken::new();
+        let found = feed
+            .latest(|version| Ok(version == "0.2.3"), &cancellation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.version, "0.2.3");
+    }
+
+    fn version_key(version: &str) -> Vec<u32> {
+        version
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect()
     }
 
     #[test]

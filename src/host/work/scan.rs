@@ -5,6 +5,7 @@
 //! ignored trees such as `node_modules` are never read. A scan woken by an
 //! edit in one worktree runs one `git status`.
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     os::unix::ffi::OsStrExt,
@@ -94,6 +95,8 @@ pub(super) struct Local {
     /// The worktree list and ref census as last read, reused until a
     /// topology or ref change says they moved.
     records: Arc<[WorktreeRecord]>,
+    /// Successful status reads and the metadata each one started with.
+    status_reads: HashMap<WorktreeId, git_watch::StatusRead>,
     base_ref: Option<String>,
     tips: Arc<[RefTip]>,
     /// When the worktree list was last read; a project the watcher cannot
@@ -220,16 +223,37 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         .map(|worktree| (worktree.id, worktree.git_dir.as_path()))
         .collect::<HashMap<_, _>>();
     let mut worktrees = Vec::new();
+    let mut status_reads = HashMap::with_capacity(records.len());
+    let mut rescanned = BTreeSet::new();
     for record in records.iter().filter(|record| !record.bare) {
         let old = retained.get(&record.id).copied();
+        let prior_status = previous.and_then(|previous| previous.status_reads.get(&record.id));
+        let listed_branch = record
+            .branch
+            .as_deref()
+            .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch));
+        let symbolic_branch = || {
+            git.symbolic_branch(&record.path, cancellation)
+                .map(|branch| branch.as_deref().map(branch_identity))
+        };
+        let listed_branch = if listed && listed_branch.is_some_and(|name| name.contains('\u{fffd}'))
+        {
+            symbolic_branch().map(|branch| branch.map(Cow::Owned))
+        } else {
+            Ok(listed_branch.map(Cow::Borrowed))
+        };
         // A shared ref change names no worktree; a commit, reset or branch
-        // switch moves the head `git worktree list` reports, or the tip of
-        // the branch checked out. A detached head moves only with the
-        // worktree's own `HEAD`, which names it.
+        // switch moves the head or branch `git worktree list` reports, or the
+        // tip of the branch checked out. A detached head moves only with
+        // the worktree's own `HEAD`, which names it.
         let moved = |old: &Worktree| {
             let head = old.head.as_ref().map(|head| &head.oid);
             if listed {
-                head != record.head_oid.as_ref()
+                old.path != record.path
+                    || head != record.head_oid.as_ref()
+                    || !listed_branch
+                        .as_ref()
+                        .is_ok_and(|branch| old.branch.as_deref() == branch.as_deref())
             } else {
                 old.branch
                     .as_deref()
@@ -238,9 +262,15 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         };
         let reread = full
             || change.worktrees.contains(&record.id)
-            || old.is_none_or(|old| old.error.is_some() || moved(old));
+            || old.is_none_or(|old| old.error.is_some() || moved(old))
+            || (change.rescan
+                && prior_status.is_none_or(|read| read.metadata_changed(&record.path)));
+        if !reread && let Some(read) = prior_status {
+            status_reads.insert(record.id, read.clone());
+        }
         if !reread
             && !listed
+            && !change.rescan
             && let Some(old) = old
         {
             // Nothing this scan read can have moved it.
@@ -257,12 +287,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             created_at_unix_ms: record
                 .created_at_unix_ms
                 .and_then(|at| u64::try_from(at).ok()),
-            branch: record.branch.as_deref().map(|branch| {
-                branch
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(branch)
-                    .to_owned()
-            }),
+            branch: listed_branch.ok().flatten().map(Cow::into_owned),
             head: record.head_oid.clone().map(|oid| Head {
                 oid,
                 committed_at_unix_ms: None,
@@ -280,10 +305,16 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             worktree.head = old.head.clone();
         }
         if reread {
-            match git.activity_status(&record.path, cancellation) {
-                Ok(status) => {
+            if change.rescan {
+                rescanned.insert(record.id);
+            }
+            match git_watch::StatusRead::read(&record.path, || {
+                git.activity_status(&record.path, cancellation)
+            }) {
+                Ok((status, read)) => {
+                    worktree.status_read_at = Some(read.completed_at);
                     apply_status(&mut worktree, &status);
-                    worktree.status_read_at = Some(Instant::now());
+                    status_reads.insert(record.id, read);
                 }
                 // Its own removal is often what the scan was woken for, and
                 // one missing checkout must not fail its siblings.
@@ -297,28 +328,29 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 worktree.head = old.head.clone();
             }
         }
-        // Worktree listing and status decode names for display. Resolve an
-        // ambiguous replacement character only after applying status, so an
-        // invalid name never acquires a literal U+FFFD branch's identity.
-        if worktree
-            .branch
-            .as_deref()
-            .is_some_and(|branch| branch.contains('\u{fffd}'))
+        // Status also decodes names for display. Resolve its ambiguous
+        // replacement character before using it as a branch identity.
+        if (reread || !listed)
+            && worktree
+                .branch
+                .as_deref()
+                .is_some_and(|branch| branch.contains('\u{fffd}'))
         {
-            match git.symbolic_branch(&record.path, cancellation) {
-                Ok(branch) => worktree.branch = branch.as_deref().map(branch_identity),
+            match symbolic_branch() {
+                Ok(branch) => worktree.branch = branch,
                 Err(error) => {
                     worktree.branch = None;
                     worktree.error = Some(error.to_string());
                 }
             }
         }
-        // The link lives in the worktree's Git directory, whose writes name
-        // the worktree, so an unread worktree keeps the one it had.
+        // A missed event could have changed the link without changing status.
+        // Its small local file can be read independently of Git status.
         worktree.link = match old {
-            Some(old) if !reread => old.link.clone(),
-            _ => planned
-                .get(&record.id)
+            Some(old) if !reread && !change.rescan => old.link.clone(),
+            _ => (!change.rescan)
+                .then(|| planned.get(&record.id))
+                .flatten()
                 .map(|git_dir| git_dir.to_path_buf())
                 .or_else(|| {
                     crate::project_location::git_directories(&record.path)
@@ -581,6 +613,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             .into_iter()
             .flatten()
             .chain(&change.worktrees)
+            .chain(&rescanned)
             .copied()
             .collect::<BTreeSet<_>>();
         match git_watch::Project::read_changed_with_interest(
@@ -619,6 +652,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         plan_retry,
         divergence,
         records,
+        status_reads,
         base_ref,
         tips,
         listed_at,
@@ -710,12 +744,10 @@ fn dirty(root: &Path, status: &StatusSnapshot) -> Dirty {
 /// checkout, as during `git worktree remove`; a permission or transient I/O
 /// failure is not evidence of that.
 fn checkout_removed(root: &Path) -> bool {
-    std::fs::symlink_metadata(root.join(".git")).is_err_and(|error| {
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        )
-    })
+    match crate::git_marker::present(&root.join(".git")) {
+        Ok(present) => !present,
+        Err(error) => error.kind() == std::io::ErrorKind::NotADirectory,
+    }
 }
 
 #[cfg(test)]
@@ -1114,7 +1146,11 @@ mod tests {
     fn a_removed_worktree_leaves_the_scan_and_its_siblings_intact() {
         let fixture = fixture();
         let first = run(&fixture, None, &git_watch::Change::default());
-        std::fs::remove_dir_all(&fixture.linked).unwrap();
+        // A sandbox placeholder at the removed marker does not keep the
+        // checkout in the scan while Git's worktree list still names it.
+        let marker = fixture.linked.join(".git");
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
         let second = run(
             &fixture,
             Some(&first),
@@ -1125,6 +1161,116 @@ mod tests {
         );
         assert_eq!(second.worktrees.len(), 1);
         assert!(second.worktrees[0].primary);
+    }
+
+    #[test]
+    fn rescan_checks_metadata_only_worktrees_without_rereading_unchanged_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn at<'a>(local: &'a Local, path: &Path) -> &'a Worktree {
+            local.worktrees.iter().find(|row| row.path == path).unwrap()
+        }
+
+        let fixture = fixture();
+        let same_head = fixture.root.parent().unwrap().join("same-head");
+        let link_only = fixture.root.parent().unwrap().join("link-only");
+        let file_mode = fixture.root.parent().unwrap().join("file-mode");
+        for (branch, path) in [
+            ("same-head", &same_head),
+            ("link-only", &link_only),
+            ("file-mode", &file_mode),
+        ] {
+            git(
+                &fixture.root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+        }
+        git(&fixture.root, &["branch", "same-tip", "same-head"]);
+        git(
+            &fixture.root,
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        git(
+            &file_mode,
+            &["config", "--worktree", "core.fileMode", "false"],
+        );
+        std::fs::set_permissions(
+            file_mode.join("README"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let now = crate::chat::now_ms().unwrap() + crate::work::ACTIVE_WINDOW_MS + 1;
+        let scan = |previous: Option<&Local>, change: &git_watch::Change| {
+            run_at(&fixture, previous, change, false, &BTreeSet::new(), now)
+        };
+        let first = scan(None, &git_watch::Change::default());
+        assert_eq!(at(&first, &file_mode).dirty.as_ref().unwrap().paths, 0);
+        assert!(
+            first
+                .plan
+                .as_ref()
+                .unwrap()
+                .worktrees
+                .iter()
+                .filter(|row| row.root != fixture.root)
+                .all(|row| row.interest() == git_watch::Interest::Metadata)
+        );
+
+        std::fs::write(fixture.linked.join("README"), "staged\n").unwrap();
+        git(&fixture.linked, &["add", "README"]);
+        // Switch between two branches at the same commit without a checkout
+        // rewriting the index, so the worktree listing must detect the move.
+        git(&same_head, &["symbolic-ref", "HEAD", "refs/heads/same-tip"]);
+        let issue = crate::linear::context::link_at(&link_only, "WORK-1", None).unwrap();
+        // A lost config.worktree event can change status without touching the
+        // index, HEAD, or an actual worktree file.
+        git(
+            &file_mode,
+            &["config", "--worktree", "core.fileMode", "true"],
+        );
+
+        let recovered = scan(
+            Some(&first),
+            &git_watch::Change {
+                rescan: true,
+                topology: true,
+                membership: true,
+                references: true,
+                worktrees: BTreeSet::from([at(&first, &fixture.root).id]),
+                ..git_watch::Change::default()
+            },
+        );
+        assert_eq!(
+            at(&recovered, &fixture.linked)
+                .dirty
+                .as_ref()
+                .unwrap()
+                .paths,
+            1
+        );
+        assert!(
+            at(&recovered, &fixture.linked).status_read_at
+                > at(&first, &fixture.linked).status_read_at
+        );
+        assert_eq!(
+            at(&recovered, &same_head).branch.as_deref(),
+            Some("same-tip")
+        );
+        assert!(at(&recovered, &same_head).status_read_at > at(&first, &same_head).status_read_at);
+        assert_eq!(at(&recovered, &file_mode).dirty.as_ref().unwrap().paths, 1);
+        assert!(at(&recovered, &file_mode).status_read_at > at(&first, &file_mode).status_read_at);
+        assert_eq!(at(&recovered, &link_only).link.as_ref(), Some(&issue));
+        assert_eq!(
+            at(&recovered, &link_only).status_read_at,
+            at(&first, &link_only).status_read_at
+        );
     }
 
     #[test]

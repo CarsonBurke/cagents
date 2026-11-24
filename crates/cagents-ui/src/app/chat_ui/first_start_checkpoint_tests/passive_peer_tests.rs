@@ -518,6 +518,7 @@ fn run(initialized: bool) {
     // Synthetic launch only: no process environment or account authority is
     // rewritten. Skills may inspect only these owned paths and stop at .git.
     std::fs::create_dir(directory.path().join(".git")).unwrap();
+    std::fs::write(directory.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     let home = directory.path().join("home");
     std::fs::create_dir(&home).unwrap();
     let source = chat::Session {

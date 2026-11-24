@@ -41,15 +41,16 @@ fn badge_with_width<'a, Message: 'a>(
     tone: Tone,
     width: Option<f32>,
 ) -> Element<'a, Message> {
-    let text = caption(label)
-        .wrapping(iced::widget::text::Wrapping::None)
-        .class(cosmic::theme::Text::Default);
-    let text = if width.is_some() {
-        text.ellipsize(iced::widget::text::Ellipsize::End(
-            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-        ))
+    // In the pill's own colour; one that is held to its cell fades there.
+    let text: Element<'a, Message> = if width.is_some() {
+        crate::ui_controls::FadeText::caption(label)
+            .class(cosmic::theme::Text::Default)
+            .into()
     } else {
-        text
+        caption(label)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .class(cosmic::theme::Text::Default)
+            .into()
     };
     let pill = widget::container(text)
         .padding(iced::Padding {
@@ -176,7 +177,7 @@ pub fn comment_card<'a, Message: 'a>(
 ///
 /// Every path this application shows lives under the user's home, so the
 /// absolute prefix is noise that costs the readable tail its space when the
-/// label has to ellipsize.
+/// label has to fade.
 pub fn display_path(path: &Path) -> Cow<'_, str> {
     static HOME: LazyLock<Option<PathBuf>> =
         LazyLock::new(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().to_owned()));

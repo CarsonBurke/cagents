@@ -1290,29 +1290,44 @@ fn retained_history_writer_refuses_future_schema_without_changes() {
 
 #[test]
 fn terminal_prelaunch_failure_and_dispatch_cancellation_prune_newly_eligible_history() {
-    for cancel_at_dispatch in [false, true] {
-        let (mut registry, _directory, mut definition) = fixture();
-        definition.precheck = None;
-        let automation = registry
-            .create_automation(definition, 0, test_identity())
-            .unwrap();
-        let (_, owner) = history_claim_manual(&mut registry, automation.id, 1, 1);
-        let accepted = owner.accepted.unwrap();
-        let mut oldest = None;
-        for now in 2..=501 {
-            let (request, skipped) = history_claim_manual(&mut registry, automation.id, 1, now);
-            assert_eq!(
-                skipped.firing.skip,
-                Some(crate::automations::SkipReason::Overlap)
-            );
-            assert!(skipped.accepted.is_none());
-            oldest.get_or_insert(request);
-        }
+    // Both terminal paths start from the same full history. Build it once and
+    // give each path a page-exact copy of the closed store.
+    let (mut registry, directory, mut definition) = fixture();
+    definition.precheck = None;
+    let automation = registry
+        .create_automation(definition, 0, test_identity())
+        .unwrap();
+    let (_, owner) = history_claim_manual(&mut registry, automation.id, 1, 1);
+    let accepted = owner.accepted.unwrap();
+    let mut oldest = None;
+    for now in 2..=501 {
+        let (request, skipped) = history_claim_manual(&mut registry, automation.id, 1, now);
         assert_eq!(
-            history_count(&registry, automation.id),
-            501,
-            "the Accepted owner is protected outside the 500 settled slots"
+            skipped.firing.skip,
+            Some(crate::automations::SkipReason::Overlap)
         );
+        assert!(skipped.accepted.is_none());
+        oldest.get_or_insert(request);
+    }
+    assert_eq!(
+        history_count(&registry, automation.id),
+        501,
+        "the Accepted owner is protected outside the 500 settled slots"
+    );
+    let busy: i64 = registry
+        .db
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(busy, 0, "the copies need every committed page");
+    let full = registry.path.clone();
+    drop(registry);
+    for cancel_at_dispatch in [false, true] {
+        let path = directory
+            .path()
+            .join(format!("cancel-at-dispatch-{cancel_at_dispatch}.sqlite3"));
+        std::fs::copy(&full, &path).unwrap();
+        let mut registry = Registry::at(&path).unwrap();
+        assert_eq!(history_count(&registry, automation.id), 501);
         if cancel_at_dispatch {
             let current = registry.automation(automation.id).unwrap();
             registry
@@ -1329,7 +1344,11 @@ fn terminal_prelaunch_failure_and_dispatch_cancellation_prune_newly_eligible_his
                 )
                 .unwrap();
         }
-        assert_eq!(history_count(&registry, automation.id), 500);
+        assert_eq!(
+            history_count(&registry, automation.id),
+            500,
+            "cancel_at_dispatch={cancel_at_dispatch}"
+        );
         let firing = registry.automation_firing(owner.firing.id).unwrap();
         assert_eq!(
             firing.state,
@@ -1443,8 +1462,14 @@ fn scoped_history_prune_work_does_not_grow_with_unrelated_inventory() {
     tx.commit().unwrap();
     let before = scoped_work(&mut registry, target);
 
+    // A scan of the unrelated inventory costs at least one VM step per row it
+    // visits: 100 definitions with 200 revisions and 1,000 firings are each far
+    // past the 128-step allowance, so a larger inventory adds only setup time.
+    const UNRELATED_FIRINGS: usize = 10;
     let tx = registry.db.transaction().unwrap();
-    let unrelated: Vec<_> = (0..100).map(|_| seed(&tx, &definition, 100)).collect();
+    let unrelated: Vec<_> = (0..100)
+        .map(|_| seed(&tx, &definition, UNRELATED_FIRINGS))
+        .collect();
     tx.commit().unwrap();
     let after = scoped_work(&mut registry, target);
     for (statement, (before, after)) in ["firing candidates", "revision deletion"]
@@ -1460,7 +1485,7 @@ fn scoped_history_prune_work_does_not_grow_with_unrelated_inventory() {
     history_prune_to(&mut registry, target, HISTORY_RETAINED_ROWS - 1, 1_000);
     assert_eq!(history_count(&registry, target), HISTORY_RETAINED_ROWS - 1);
     for &automation in &unrelated {
-        assert_eq!(history_count(&registry, automation), 100);
+        assert_eq!(history_count(&registry, automation), UNRELATED_FIRINGS);
         let revisions: usize = registry
             .db
             .query_row(
@@ -1485,6 +1510,6 @@ fn scoped_history_prune_work_does_not_grow_with_unrelated_inventory() {
     assert_eq!(revisions, unrelated.len() + 1);
     assert_eq!(history_count(&registry, target), HISTORY_RETAINED_ROWS - 1);
     for automation in unrelated {
-        assert_eq!(history_count(&registry, automation), 100);
+        assert_eq!(history_count(&registry, automation), UNRELATED_FIRINGS);
     }
 }

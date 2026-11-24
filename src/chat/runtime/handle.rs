@@ -183,6 +183,17 @@ impl Handle {
         RemoteActor::adopt_for_close(record, source, proof, notify)
             .map(|remote| Self(Owner::Remote(remote)))
     }
+    /// Lets the daemon open, with `recognizer`, the frames it sealed in what
+    /// a retained helper built before them shows as a person's prompts. A
+    /// conversation this process owns opens them itself.
+    pub(crate) fn open_frames_for_older_helper(
+        &self,
+        recognizer: &std::sync::Arc<crate::agent_execution::mailbox::Recognizer>,
+    ) {
+        if let Owner::Remote(remote) = &self.0 {
+            remote.open_frames_for_older_helper(recognizer);
+        }
+    }
     pub(crate) fn is_close_only(&self) -> bool {
         matches!(&self.0, Owner::Remote(remote) if remote.is_close_only())
     }
@@ -353,17 +364,18 @@ impl Handle {
             Owner::Remote(remote) => remote.submit(None, command),
         }
     }
-    /// Sends `command` once under `key`: asked again with the same key, it
-    /// reports what became of the first send instead of sending it twice. A
-    /// command that gives no work, such as a stop or a read, changes nothing
-    /// when it is repeated, so it goes as it is.
-    pub fn deliver(&self, command: Command, key: chat::DeliveryKey) -> Result<(), String> {
-        if !command.gives_work() {
-            return self.command(command);
-        }
+    /// Delivers work through the daemon's ledger, which outlives this owner.
+    pub(crate) fn deliver(
+        &self,
+        deliveries: &super::Deliveries,
+        chat: crate::model::TerminalId,
+        command: Command,
+        key: chat::DeliveryKey,
+        given_work: impl FnOnce(),
+    ) -> Result<(), String> {
         match &self.0 {
-            Owner::Local(local) => local.deliver(command, key),
-            Owner::Remote(remote) => remote.deliver(command, key),
+            Owner::Local(local) => local.deliver(deliveries, chat, command, key, given_work),
+            Owner::Remote(remote) => remote.deliver(deliveries, chat, command, key, given_work),
         }
         .map_err(String::from)
     }
@@ -840,12 +852,21 @@ impl Handle {
             Owner::Remote(remote) => remote.decline_answer(command),
         }
     }
+    #[cfg(test)]
     pub(crate) fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
         match &self.0 {
             Owner::Local(local) => local.conversation_title(),
             Owner::Remote(remote) => remote.conversation_title(),
+        }
+    }
+    pub(crate) fn conversation_naming(
+        &self,
+    ) -> Result<super::ConversationNaming, TitleUnavailable> {
+        match &self.0 {
+            Owner::Local(local) => local.conversation_naming(),
+            Owner::Remote(remote) => remote.conversation_naming(),
         }
     }
     #[cfg(test)]

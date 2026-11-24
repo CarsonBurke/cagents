@@ -88,6 +88,7 @@ pub(super) fn sync_view_pins(db: &Connection, panes: &[Pane]) -> Result<(), Stri
 
 const PINNED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM terminal_retention_pins WHERE terminal=?1)
          OR EXISTS(SELECT 1 FROM shared_terminal_retention_pins WHERE terminal=?1)";
+const PIN_GENERATION_SQL: &str = "SELECT generation FROM terminal_retention_pins WHERE terminal=?1";
 
 pub(super) fn pinned_terminals(
     db: &Connection,
@@ -118,13 +119,9 @@ pub(super) fn read_generation(
     db: &Connection,
     terminal: TerminalId,
 ) -> Result<Option<String>, String> {
-    db.query_row(
-        "SELECT generation FROM terminal_retention_pins WHERE terminal=?1",
-        [terminal.to_string()],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(|e| e.to_string())
+    db.query_row(PIN_GENERATION_SQL, [terminal.to_string()], |row| row.get(0))
+        .optional()
+        .map_err(|e| e.to_string())
 }
 
 impl Registry {
@@ -185,6 +182,34 @@ impl Registry {
         let generation = read_generation(&tx, terminal)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(generation)
+    }
+
+    /// Find held window claims that lost their saved pin in one checked snapshot.
+    pub(crate) fn missing_retention_pins(
+        &self,
+        terminals: &[TerminalId],
+    ) -> Result<Vec<TerminalId>, String> {
+        if terminals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)
+            .map_err(|error| error.to_string())?;
+        schema::require_current(&tx)?;
+        let mut missing = Vec::new();
+        {
+            let mut query = tx.prepare(PIN_GENERATION_SQL).map_err(|e| e.to_string())?;
+            for &terminal in terminals {
+                let generation: Option<String> = query
+                    .query_row([terminal.to_string()], |row| row.get(0))
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                if generation.is_none() {
+                    missing.push(terminal);
+                }
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(missing)
     }
 
     /// Only removes this saved membership generation. A successful metadata
@@ -938,6 +963,8 @@ mod tests {
                     .is_err()
             );
             assert!(registry.retention_pin_generation(terminal).is_err());
+            assert!(registry.missing_retention_pins(&[terminal]).is_err());
+            assert_eq!(registry.missing_retention_pins(&[]), Ok(Vec::new()));
             assert!(registry.pin_window_terminals(&[terminal]).is_err());
             assert!(
                 registry

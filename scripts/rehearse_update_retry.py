@@ -34,7 +34,8 @@ def sha256(path):
 
 def fixture_sources():
     repository = Path(__file__).resolve().parents[1]
-    names = ('scripts/rehearse-update', 'scripts/rehearse_update_retry.py', 'scripts/rehearse_update_pty.py',
+    names = ('scripts/rehearse-update', 'scripts/git-ancestry.sh',
+             'scripts/rehearse_update_retry.py', 'scripts/rehearse_update_pty.py',
              'scripts/rehearse_update_run.py', 'scripts/rehearse_update_records.py', 'scripts/rehearse_update_restart.py',
              'tests/fixtures/rehearsal-startup-bind.c', 'tests/fixtures/rehearsal-codex.py',
              'tests/fixtures/codex-tool-rows.py', 'tests/fixtures/chat-composer-claude.sh')

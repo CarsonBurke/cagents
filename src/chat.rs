@@ -1661,6 +1661,7 @@ impl PromptSuggestion {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Snapshot {
     /// Resident live-turn excerpt; never transcript serialization or wire state.
     #[serde(skip)]
@@ -1715,6 +1716,14 @@ pub struct Snapshot {
     #[serde(default)]
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
+    /// Whether the current conversation's provider explicitly cleared its name.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    pub(crate) provider_title_cleared: bool,
+    /// The first meaningful user prompt, kept independently of loaded pages.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    pub(crate) opening_title: Option<OpeningTitle>,
     pub error: Option<String>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
@@ -1771,6 +1780,58 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// How a request to hand the queued messages to the running turn stands.
+    /// Last, so that a client or source from before it reads the rest.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
+    )]
+    pub send_now: Option<SendNow>,
+}
+
+/// As derived, except that a client from before [`SendNow`] is sent the
+/// fields it decodes: see [`Snapshot::send_now`].
+impl Serialize for Snapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// As derived, except that one from a source before [`SendNow`] has no
+/// request to read and stands for none.
+impl<'de> Deserialize<'de> for Snapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
+        }
+        Self::deserialize(deserializer)
+    }
+}
+
+/// What became of a request to hand the queued messages to the running turn
+/// ([`Command::SendQueuedNow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendNow {
+    /// Asked for. The provider has not yet said how the turn will make way,
+    /// or is still admitting a queued message the request has to name.
+    Requested,
+    /// The turn takes the messages in without being stopped: whatever it was
+    /// waiting on carries on out of its way.
+    Delivering,
+    /// The turn could not take them in, so it was stopped and the messages
+    /// start the next one.
+    Stopped,
+    /// Nothing was waiting that could go early; what is queued goes when the
+    /// turn reaches it.
+    Declined,
+}
+
+impl SendNow {
+    /// Whether the request is still being carried out, so asking again would
+    /// only repeat it.
+    pub fn in_flight(self) -> bool {
+        self != Self::Declined
+    }
 }
 
 /// When a provider takes a message it is holding.
@@ -2223,7 +2284,10 @@ impl Command {
             | Self::LoadLater
             | Self::LoadFileChanges { .. }
             | Self::LoadFileChangePatches { .. }
-            | Self::ReadTextCopy { .. } => false,
+            | Self::ReadTextCopy { .. }
+            // The messages it hurries gave their work when they were queued,
+            // and asking twice changes nothing.
+            | Self::SendQueuedNow => false,
         }
     }
 
@@ -2255,7 +2319,8 @@ impl Command {
             | Self::SetInterruptMode { .. }
             | Self::ListBranches
             | Self::LoadLater
-            | Self::ReadTextCopy { .. } => false,
+            | Self::ReadTextCopy { .. }
+            | Self::SendQueuedNow => false,
         }
     }
 }
@@ -2344,6 +2409,11 @@ pub enum Command {
         source: TextCopySource,
         offset: u64,
     },
+    /// Hand everything queued to the running turn now, without stopping its
+    /// subagents or background work. Carried only where
+    /// [`Capabilities::send_queued_now`] says so; [`Snapshot::send_now`]
+    /// says how it went.
+    SendQueuedNow,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -3316,6 +3386,7 @@ pub struct Skill {
     pub invocation: String,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Capabilities {
     pub steer: bool,
     pub queue: bool,
@@ -3342,6 +3413,33 @@ pub struct Capabilities {
     /// background, rather than only the turn and the work inside it.
     #[serde(default)]
     pub interrupt_stops_background: bool,
+    /// Whether [`Command::SendQueuedNow`] is carried: the provider can hand
+    /// what is queued to a turn blocked on long work without stopping the
+    /// work. Last, so that a client or source from before it reads the rest.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
+    )]
+    pub send_queued_now: bool,
+}
+
+/// As derived, except that a client from before [`SendNow`] is sent the
+/// fields it decodes: see [`Capabilities::send_queued_now`].
+impl Serialize for Capabilities {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// As derived, except that one from a source before [`SendNow`] cannot send
+/// what is queued early.
+impl<'de> Deserialize<'de> for Capabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
+        }
+        Self::deserialize(deserializer)
+    }
 }
 /// Provider-confirmed speed setting, independent of model reasoning effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3675,6 +3773,9 @@ pub enum Event {
     },
     QueueChanged(Vec<QueuedMessage>),
     QueueRemoval(QueueRemoval),
+    /// How a request to send what is queued now stands, or `None` once it is
+    /// over: the messages it named left the queue or the turn ended.
+    SendNow(Option<SendNow>),
     /// Published until the provider has answered the asynchronous history
     /// request, independently of the command acknowledgement.
     HistoryLoading(bool),
@@ -3701,6 +3802,89 @@ pub enum Event {
     /// Live evidence about the main conversation's prompt cache. The
     /// runtime keeps it beside the transcript, never in it.
     PromptCache(prompt_cache::Evidence),
+    /// A prompt-derived title from the exact conversation's opening.
+    #[cfg(feature = "host")]
+    OpeningTitle(OpeningTitle),
+    /// The provider has established that no older messages can supply a name.
+    #[cfg(feature = "host")]
+    OpeningHistoryComplete,
+    /// An explicit removal of the provider name for this exact conversation.
+    #[cfg(feature = "host")]
+    ProviderTitleCleared {
+        id: String,
+    },
+}
+
+#[cfg(feature = "host")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A provider-independent title inferred from user content on the daemon.
+pub enum OpeningTitle {
+    Conversation,
+    Image,
+    Prompt(String),
+}
+
+#[cfg(feature = "host")]
+impl OpeningTitle {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Image => "Image conversation",
+            Self::Prompt(title) => title,
+        }
+    }
+
+    pub(crate) fn provisional(&self) -> bool {
+        !matches!(self, Self::Prompt(_))
+    }
+
+    pub(crate) fn from_text(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() || mailbox_prompt(text) {
+            return None;
+        }
+        let title = crate::workspace_model::channel_title_from_prompt(text)
+            .map(Self::Prompt)
+            .unwrap_or_else(|| {
+                if crate::workspace_model::image_placeholder_prompt(text) {
+                    Self::Image
+                } else {
+                    Self::Conversation
+                }
+            });
+        Some(title)
+    }
+
+    pub(crate) fn observe(current: &mut Option<Self>, item: &Item) {
+        if item.role != Role::User || current.as_ref().is_some_and(|title| !title.provisional()) {
+            return;
+        }
+        let candidate = match &item.content {
+            ItemContent::Text {
+                text,
+                thinking: false,
+                ..
+            } => Self::from_text(text),
+            ItemContent::Image { .. } => Some(Self::Image),
+            _ => None,
+        };
+        if let Some(candidate) = candidate
+            && (current.is_none() || !candidate.provisional())
+        {
+            *current = Some(candidate);
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn mailbox_prompt(text: &str) -> bool {
+    // This filters title candidates on replay. A seal grants no authority
+    // here. Only the daemon's recognizer can turn a prompt into a delivery.
+    text.starts_with("[cagents ")
+        && crate::agent_execution::mailbox::open(text, |_, seal| {
+            seal.len() == 32 && seal.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .is_some()
 }
 
 #[cfg(test)]

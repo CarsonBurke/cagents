@@ -293,10 +293,42 @@ sealed interface ItemBody {
     data class Delivery(
         val delivery: DeliveryKind = DeliveryKind.Unknown,
         val from: String = "",
+        /** Tells two senders of one name apart; never shown. A message's short session ID. */
+        val sender: String = "",
         val summary: String = "",
         val body: String = "",
         val clipped: Boolean = false,
-    ) : ItemBody
+    ) : ItemBody {
+        /**
+         * The heading the desktop gives it (`delivery_heading` in src/chat.rs):
+         * a named sender leads, as in `Message from tester: Suite passes`; an
+         * unnamed one is described by its own summary, such as
+         * `Agent "Review" finished`, or else by a short identifier.
+         */
+        val heading: String
+            get() {
+                val verb = when (delivery) {
+                    DeliveryKind.Report -> "Report from"
+                    DeliveryKind.Message -> "Message from"
+                    DeliveryKind.Notice, DeliveryKind.Unknown -> ""
+                }
+                return when {
+                    summary.isNotEmpty() && (verb.isEmpty() || from.isEmpty()) -> summary
+                    verb.isEmpty() -> "Background work changed state"
+                    summary.isNotEmpty() -> "$verb $from: $summary"
+                    else -> "$verb ${senderName()}"
+                }
+            }
+
+        private fun senderName(): String {
+            val short = sender.take(8)
+            return when {
+                from.isNotEmpty() -> from
+                short.isNotEmpty() -> "agent $short"
+                else -> "another agent"
+            }
+        }
+    }
 
     /** A kind this app doesn't know, from a newer server; shown as a placeholder. */
     data class Unknown(val kind: String) : ItemBody

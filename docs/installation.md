@@ -238,7 +238,7 @@ upgrades](daemon.md) for how the daemon, sessions, and upgrades interact.
 Full self-managed (`install.sh`) installations, including packages built
 locally with a `+local` version, check for a newer release at startup and every
 six hours, and whenever you choose **Check for updates** in About. A check
-reads the latest release's signed `release-metadata.json` through github.com's
+reads the latest release's signed `release-metadata-2.json` through github.com's
 public download links, so it needs `curl` but no GitHub sign-in, and spends no
 GitHub API quota. The update is offered only when that metadata carries a
 valid signature by a key the installed build trusts (see

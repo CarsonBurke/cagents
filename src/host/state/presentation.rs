@@ -318,35 +318,44 @@ pub(in crate::host) fn snapshot(
             .map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let source = capture.generation;
-        let Some(revision) = accept_pulled_capture(&mut state, client, id, &handle, epoch, source)?
-        else {
-            continue;
-        };
-        let mut capture = (*capture).clone();
-        capture.generation = revision;
-        let (capture, wire) = match state.subscriptions.last_sent(client, id) {
-            Some(base) if base.generation == after && after != 0 => {
+        let (capture, previous) = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let source = capture.generation;
+            let Some(revision) =
+                accept_pulled_capture(&mut state, client, id, &handle, epoch, source)?
+            else {
+                continue;
+            };
+            let mut capture = (*capture).clone();
+            capture.generation = revision;
+            // Keep the previous grid alive until after releasing the host lock,
+            // including when a full reply replaces it.
+            let previous = state.subscriptions.last_sent(client, id).cloned();
+            if let Some(base) = previous
+                .as_ref()
+                .filter(|base| base.generation == after && after != 0)
+            {
                 capture.share_unchanged_rows(base);
-                let capture = Arc::new(capture);
-                let wire = TerminalSnapshot::diff(&capture, base);
-                (capture, wire)
             }
-            _ => {
-                let capture = Arc::new(capture);
-                let wire = TerminalSnapshot::full(&capture);
-                (capture, wire)
-            }
+            let capture = Arc::new(capture);
+            state
+                .subscriptions
+                .viewports
+                .get_mut(&(client, id))
+                .expect("attached viewport")
+                .acknowledged_source = source;
+            // The connection queues this reply after the lock is released.
+            state
+                .subscriptions
+                .record_sent(client, id, Arc::clone(&capture), false);
+            (capture, previous)
         };
-        state
-            .subscriptions
-            .viewports
-            .get_mut(&(client, id))
-            .expect("attached viewport")
-            .acknowledged_source = source;
-        // The connection queues this reply after the lock is released.
-        state.subscriptions.record_sent(client, id, capture, false);
+        let wire = match previous {
+            Some(base) if base.generation == after && after != 0 => {
+                TerminalSnapshot::diff(&capture, &base)
+            }
+            _ => TerminalSnapshot::full(&capture),
+        };
         return Ok(Some(wire));
     }
     Err(ProtocolError::new(

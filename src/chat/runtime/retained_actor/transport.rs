@@ -168,6 +168,8 @@ pub(crate) struct Resident {
     pub generation: u64,
     pub session_id: Option<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub opening_title: Option<chat::OpeningTitle>,
     pub ready: bool,
     pub busy: bool,
     pub waiting: bool,
@@ -215,6 +217,9 @@ pub(crate) struct Resident {
     pub prompt_cache: chat::prompt_cache::Activity,
     next_input: u64,
     acknowledged_input_count: usize,
+    /// A helper that can retire unknown outcomes also publishes them here.
+    #[serde(default)]
+    terminal_input_count: Option<usize>,
     pub continuity_loss: Option<ContinuityLoss>,
     pub retained_runs: Vec<crate::model::RunId>,
     pub outbox_ack: u64,
@@ -222,6 +227,12 @@ pub(crate) struct Resident {
     changed: u64,
 }
 impl Resident {
+    fn has_retirable_inputs(&self) -> bool {
+        self.terminal_input_count
+            .unwrap_or(self.acknowledged_input_count)
+            > 0
+    }
+
     /// What holds the conversation. A helper that predates names reports its
     /// background subagents only as running ones it cannot name; it never
     /// reports one waiting.
@@ -353,6 +364,10 @@ struct Remote {
     desired_visible: Mutex<Option<bool>>,
     wake: Arc<push::Wake>,
     binary_codec: std::sync::OnceLock<bool>,
+    /// The daemon's recognizer, held only for a helper built before the
+    /// frames the daemon now seals: what it shows as a person's prompt is
+    /// opened here, as its own store would have.
+    frames: std::sync::OnceLock<Arc<crate::agent_execution::mailbox::Recognizer>>,
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
@@ -374,8 +389,6 @@ struct Remote {
     /// When the reader is next asked to read the conversation again, after a
     /// read failed while the helper was alive.
     reread_at: Mutex<Option<Instant>>,
-    /// What became of the messages sent under a key.
-    deliveries: super::super::delivery::Deliveries,
 }
 struct StartupOwner {
     control: Mutex<Option<UnixStream>>,
@@ -508,6 +521,7 @@ impl RemoteActor {
             generation: 1,
             session_id: None,
             title: None,
+            opening_title: None,
             ready: true,
             busy: false,
             waiting: false,
@@ -547,6 +561,7 @@ impl RemoteActor {
             prompt_cache: Default::default(),
             next_input: 1,
             acknowledged_input_count: 0,
+            terminal_input_count: Some(0),
             continuity_loss: None,
             retained_runs: Vec::new(),
             outbox_ack: 0,
@@ -586,6 +601,7 @@ impl RemoteActor {
             recovery_environment: Default::default(),
             desired_visible: Mutex::new(None),
             binary_codec: std::sync::OnceLock::new(),
+            frames: std::sync::OnceLock::new(),
             wake: Arc::new(push::Wake::new().unwrap()),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
@@ -604,7 +620,6 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(None),
             reread_at: Mutex::new(None),
-            deliveries: Default::default(),
         }))
     }
     /// Complete the actual proxy's pending envelope without any external
@@ -736,6 +751,10 @@ impl RemoteActor {
     }
     pub fn is_close_only(&self) -> bool {
         self.0.close_only
+    }
+    #[cfg(test)]
+    pub(crate) fn opens_frames_for_helper(&self) -> bool {
+        self.0.frames.get().is_some()
     }
     pub fn is_record(record: &Record) -> bool {
         record.kind == Kind::Native
@@ -961,14 +980,26 @@ impl RemoteActor {
             .map(|(_, content)| content.clone())
             .unwrap_or_default()
     }
+    #[cfg(test)]
     pub fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), super::super::TitleUnavailable> {
+        self.conversation_naming()
+            .map(|naming| (naming.session, naming.provider))
+    }
+    pub fn conversation_naming(
+        &self,
+    ) -> Result<super::super::ConversationNaming, super::super::TitleUnavailable> {
         let state = self.0.state.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => super::super::TitleUnavailable::Busy,
             std::sync::TryLockError::Poisoned(_) => super::super::TitleUnavailable::Poisoned,
         })?;
-        Ok((state.session_id.clone(), state.title.clone()))
+        Ok(super::super::ConversationNaming {
+            session: state.session_id.clone(),
+            provider: state.title.clone(),
+            provider_cleared: false,
+            opening: state.opening_title.clone(),
+        })
     }
     pub fn launch_account_scope(&self) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
         self.0.launch_account_scope.as_ref().map_err(String::as_str)
@@ -1256,7 +1287,7 @@ impl RemoteActor {
         socket: PathBuf,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let recovering_inputs = attached.resident.acknowledged_input_count > 0;
+        let recovering_inputs = attached.resident.has_retirable_inputs();
         let remote = Self(Arc::new(Remote {
             close_only: attached.close_only,
             source: attached.source,
@@ -1266,6 +1297,7 @@ impl RemoteActor {
             socket,
             desired_visible: Mutex::new(None),
             binary_codec: std::sync::OnceLock::new(),
+            frames: std::sync::OnceLock::new(),
             wake: Arc::new(push::Wake::new()?),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
@@ -1290,7 +1322,6 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
             reread_at: Mutex::new(None),
-            deliveries: Default::default(),
         }));
         let watch = remote.watch()?;
         let wake = remote.0.wake.clone();
@@ -1371,7 +1402,7 @@ impl RemoteActor {
                     {
                         break;
                     }
-                    retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
+                    retry_housekeeping |= actor.reconcile_terminal_inputs().is_err();
                     let identities: Vec<_> = actor
                         .0
                         .pending
@@ -1426,7 +1457,7 @@ impl RemoteActor {
         // failed, or has a scheduled retransmission, needs a timer.
         if failed
             || self.0.recovering_inputs.load(Ordering::Acquire)
-            || self.state().acknowledged_input_count > 0
+            || self.state().has_retirable_inputs()
             || self.0.desired_observe.load(Ordering::Acquire)
             || self
                 .0
@@ -1522,6 +1553,12 @@ impl RemoteActor {
             let mut updates = Vec::new();
             let generation = resident.generation;
             let identity_changed = resident.confirmed_session != state.confirmed_session;
+            if resident.session_id != state.session_id
+                || resident.title != state.title
+                || resident.opening_title != state.opening_title
+            {
+                updates.push(Update::ConversationNameChanged);
+            }
             if resident.changed != state.changed
                 || resident.generation != state.generation
                 || identity_changed
@@ -2200,6 +2237,7 @@ impl RemoteActor {
         self.answer("input", json!([identity, payload]))
     }
     fn apply_receipts(&self, receipts: &[InputReceipt]) {
+        let retire_unknown = self.state().terminal_input_count.is_some();
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
         let mut uncertain = self
             .0
@@ -2220,53 +2258,62 @@ impl RemoteActor {
             {
                 *uncertain = None;
             }
-            match &receipt.state {
+            let (result, retire) = match &receipt.state {
+                InputState::Accepted => return true,
                 InputState::Acknowledged(result) => {
-                    if let Some(reply) = pending.reply.take() {
-                        let _ = reply.send(result.clone().map_err(Rejection::Refused));
-                    }
-                    completed.push(pending.identity.clone());
-                    false
+                    (result.clone().map_err(Rejection::Refused), true)
                 }
-                InputState::Unknown(error) => {
-                    if let Some(reply) = pending.reply.take() {
-                        let _ = reply.send(Err(Rejection::Unacknowledged(error.clone())));
-                    }
-                    true
-                }
-                InputState::Accepted => true,
+                InputState::Unknown(error) => (
+                    Err(Rejection::Unacknowledged(error.clone())),
+                    retire_unknown,
+                ),
+            };
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(result);
             }
+            if retire {
+                completed.push(pending.identity.clone());
+            }
+            false
         });
         if uncertain.is_none() {
             self.0.input_settled.notify_all();
         }
         drop(uncertain);
+        if completed.is_empty() {
+            return;
+        }
         let mut retiring = self
             .0
             .retiring_inputs
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if !completed.is_empty() {
-            self.0.wake.notify();
-        }
         for identity in completed {
             if !retiring.contains(&identity) {
                 retiring.push(identity);
             }
         }
+        self.0.wake.notify();
     }
 
-    fn reconcile_acknowledged_inputs(&self) -> Result<(), String> {
-        if self.state().acknowledged_input_count == 0
-            && !self.0.recovering_inputs.load(Ordering::Acquire)
-        {
+    fn reconcile_terminal_inputs(&self) -> Result<(), String> {
+        let state = self.state();
+        if !state.has_retirable_inputs() && !self.0.recovering_inputs.load(Ordering::Acquire) {
             return Ok(());
         }
-        let receipts: Vec<InputReceipt> = self.call("acknowledged_inputs", Value::Null)?;
+        let retire_unknown = state.terminal_input_count.is_some();
+        let method = if retire_unknown {
+            "terminal_inputs"
+        } else {
+            "acknowledged_inputs"
+        };
+        let receipts: Vec<InputReceipt> = self.call(method, Value::Null)?;
         if receipts.len() > 64
-            || receipts
-                .iter()
-                .any(|receipt| !matches!(&receipt.state, InputState::Acknowledged(_)))
+            || receipts.iter().any(|receipt| match &receipt.state {
+                InputState::Accepted => true,
+                InputState::Acknowledged(_) => false,
+                InputState::Unknown(_) => !retire_unknown,
+            })
         {
             return Err("Helper returned an invalid terminal receipt page".into());
         }
@@ -2324,16 +2371,23 @@ impl RemoteActor {
             .recv_timeout(ACKNOWLEDGEMENT_WAIT)
             .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
-    /// Sends `command` once under `key`, as
-    /// [`delivery`](super::super::delivery) describes: asked again, it waits
-    /// on the input already admitted under that key rather than admitting
-    /// another, which the helper would run as well.
-    pub fn deliver(&self, command: Command, key: chat::DeliveryKey) -> Result<(), Rejection> {
-        self.0.deliveries.deliver(
+    pub fn deliver(
+        &self,
+        deliveries: &super::super::Deliveries,
+        chat: crate::model::TerminalId,
+        command: Command,
+        key: chat::DeliveryKey,
+        given_work: impl FnOnce(),
+    ) -> Result<(), Rejection> {
+        deliveries.deliver(
+            chat,
             key,
             ACKNOWLEDGEMENT_WAIT,
             || Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()),
-            || self.enqueue(None, command).map_err(Rejection::Refused),
+            || {
+                given_work();
+                self.enqueue(None, command).map_err(Rejection::Refused)
+            },
         )
     }
     /// The courier tries again later on its own, so it does not wait behind
@@ -2362,16 +2416,32 @@ impl RemoteActor {
     }
 
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
-        if let Some(snapshot) = self
+        let final_snapshot = self
             .0
             .final_snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            return (after != Some(snapshot.generation)).then(|| snapshot.as_ref().clone());
+            .clone();
+        let mut snapshot = match final_snapshot {
+            Some(snapshot) => {
+                (after != Some(snapshot.generation)).then(|| snapshot.as_ref().clone())
+            }
+            None => self.call("snapshot", json!([after])).ok().flatten(),
+        };
+        if let (Some(frames), Some(snapshot)) = (self.0.frames.get(), snapshot.as_mut()) {
+            frames.recognize_snapshot(snapshot);
         }
-        self.call("snapshot", json!([after])).ok().flatten()
+        snapshot
+    }
+    /// Lets the daemon open the frames it sealed in what this helper shows,
+    /// when the helper was built before those frames and cannot.
+    pub fn open_frames_for_older_helper(
+        &self,
+        recognizer: &Arc<crate::agent_execution::mailbox::Recognizer>,
+    ) {
+        if !reads_current_frames(&self.0.identity.record) {
+            let _ = self.0.frames.set(recognizer.clone());
+        }
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
@@ -2564,6 +2634,7 @@ fn close_only_method(method: &str) -> bool {
             | "input_receipt"
             | "input_receipts"
             | "acknowledged_inputs"
+            | "terminal_inputs"
             | "retire_acknowledged_inputs"
             | "ack_inputs"
             | "update_source"
@@ -2797,6 +2868,9 @@ impl Server {
             .map_err(|error| error.to_string())?;
         let mut build = registry::BuildIdentity::current(Kind::Native);
         build.capabilities.push(CAPABILITY.into());
+        build
+            .capabilities
+            .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
         let identity = ActorIdentity {
             instance: uuid::Uuid::new_v4(),
             record: Record {
@@ -2934,6 +3008,7 @@ impl Server {
         let exited = state.exited;
         let session_id = state.session_id.clone();
         let title = state.title.clone();
+        let opening_title = state.opening_title.clone();
         let ready = state.ready;
         let busy = state.busy;
         let waiting = state.waiting;
@@ -3009,6 +3084,7 @@ impl Server {
             generation,
             session_id,
             title,
+            opening_title,
             ready,
             busy,
             waiting,
@@ -3042,6 +3118,7 @@ impl Server {
             prompt_cache: self.actor.prompt_cache(),
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
+            terminal_input_count: Some(journal.terminal_input_count()),
             continuity_loss,
             retained_runs: journal.retained_runs()?,
             outbox_ack: journal.acknowledged()?,
@@ -3454,12 +3531,18 @@ impl Server {
                     .unwrap_or_else(|p| p.into_inner())
                     .acknowledged_input_page()?
             ),
+            "terminal_inputs" => value!(
+                self.journal
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .terminal_input_page()?
+            ),
             "retire_acknowledged_inputs" => {
                 let (identities,) = decode!((Vec<InputIdentity>,));
                 self.journal
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .retire_acknowledged_inputs(&identities)?;
+                    .retire_terminal_inputs(&identities)?;
                 self.changed.fetch_add(1, Ordering::Release);
                 Ok(Value::Null)
             }
@@ -4493,3 +4576,78 @@ mod push;
 
 #[path = "transport_binary.rs"]
 mod binary;
+
+/// Whether the helper `record` describes opens the frames this daemon seals.
+fn reads_current_frames(record: &Record) -> bool {
+    record.build.as_ref().is_some_and(|build| {
+        build
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::agent_execution::mailbox::FRAMES_CAPABILITY)
+    })
+}
+
+#[cfg(test)]
+mod frame_capability_tests {
+    use super::*;
+
+    #[test]
+    fn the_daemon_opens_frames_only_for_a_helper_built_before_them() {
+        let older = RemoteActor::completed_failure_fixture();
+        let mut record = older.identity().record;
+        record.build = None;
+        assert!(!reads_current_frames(&record), "a record without a build");
+        record.build = Some(registry::BuildIdentity::current(Kind::Native));
+        assert!(!reads_current_frames(&record), "a build before the frames");
+        record
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
+        assert!(reads_current_frames(&record));
+        let seal = crate::agent_execution::mailbox::Seal::new([2; 32]);
+        older.open_frames_for_older_helper(&Arc::new(seal.recognizer()));
+        assert!(older.opens_frames_for_helper());
+
+        // What that helper shows reaches a window opened.
+        use crate::agent_execution::mailbox::{Message, Party, State};
+        use crate::model::{MessageId, TerminalId};
+        let sent = Message {
+            id: MessageId::new(),
+            from: Party {
+                lineage: None,
+                session: Some(TerminalId::new()),
+                title: Some("Spectra analysis".into()),
+            },
+            to: Party::user(),
+            reply_to: None,
+            body: "Which of these fit your plan?".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: 0,
+        };
+        let framed = seal.seal(&sent, 0);
+        let shown = Snapshot {
+            generation: 3,
+            items: vec![Arc::new(crate::chat::Item {
+                id: "prompt".into(),
+                role: crate::chat::Role::User,
+                content: crate::chat::ItemContent::Text {
+                    text: framed,
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            })],
+            ..Default::default()
+        };
+        *older.0.final_snapshot.lock().unwrap() = Some(Arc::new(shown));
+        let read = older.snapshot(None).unwrap();
+        assert!(matches!(
+            read.items[0].content,
+            crate::chat::ItemContent::Delivery { .. }
+        ));
+    }
+}

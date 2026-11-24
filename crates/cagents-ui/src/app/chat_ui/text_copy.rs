@@ -108,12 +108,8 @@ impl CopyState {
             // would draw over the text it was copying in a narrow pane. The
             // whole of it is in the tooltip.
             Self::Refused(refusal) => Some(crate::interaction::tooltip(
-                design::caption(refusal.to_string())
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    )),
+                crate::ui_controls::FadeText::caption(refusal.to_string())
+                    .class(cosmic::theme::Text::Custom(design::warning_text)),
                 refusal.to_string(),
             )),
         }

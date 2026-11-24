@@ -607,7 +607,8 @@ TOOLS = ("build-host", "memory-capped", "cargo-gate-rustc-guard", "cargo-increme
 OPTIONAL_TOOLS = ("cargo-host-test-helper.py", "cargo_artifacts.py")
 
 
-REMOTE_AGENT = r'''
+# The lease checks Git ancestry before the remote slot receives any files.
+REMOTE_AGENT = Path(__file__).resolve().with_name("git_ancestry.py").read_text(encoding="utf-8") + r'''
 import base64, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
@@ -630,11 +631,9 @@ def temporary_directory(slot):
     the slot when the short one is unsafe. Tests bind Unix sockets several
     levels under it, within 108 bytes, so the HOST fixtures want a base of at
     most 28 bytes (docs/development.md). As in that document's recipe, it is
-    in the user's runtime directory: agent sandboxes leave `.git`
-    placeholders in /tmp, /var/tmp and ~/.cache, under which recovery
-    placement refuses by design, and fixtures refuse roots inside the home
-    directory. A host test lane leaves about 12 MB there, which the next
-    command in the slot removes."""
+    in the user's runtime directory, outside Git checkouts and the home
+    directory as recovery fixtures require. A host test lane leaves about
+    12 MB there, which the next command in the slot removes."""
     # The variable is for tests standing in for the build host; ssh does not
     # pass it on.
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -1319,15 +1318,6 @@ def written_since(slot):
     return [[base64.b64encode(name).decode(), name not in before]
             for name, state in sorted(checkout_state(os.path.join(slot, "src"), record["skip"]).items())
             if before.get(name) != state]
-
-def enclosing_checkout(path):
-    """A Git marker above `path`, under which tests that check Git ancestry
-    fail, or None."""
-    while path != os.path.dirname(path):
-        path = os.path.dirname(path)
-        if os.path.lexists(os.path.join(path, ".git")):
-            return os.path.join(path, ".git")
-    return None
 
 if command == "lease":
     slots, key, floor = int(sys.argv[3]), sys.argv[4], int(sys.argv[5]) * 2**30

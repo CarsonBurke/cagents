@@ -9886,3 +9886,59 @@ fn a_pane_reopening_in_a_channel_keeps_its_place_until_it_starts() {
     );
     assert_eq!(order(&app), [first.id, held, last.id]);
 }
+
+#[test]
+#[cfg(not(feature = "integrated-browser"))]
+fn settings_close_survives_a_view_edge_before_its_commit() {
+    let (mut app, source, _, pane) = presentation_fixture();
+    drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+    let settings = app.workspace.focused().unwrap();
+    drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+    drop(app.update(Message::CloseCard(settings)));
+    assert_eq!(
+        app.workspace.pending_close().map(|p| p.unmounting),
+        Some(settings)
+    );
+    let update = presentation_edge(&app, Scope::Channel(source), 24, "Mid close", 0.6);
+    drop(app.update(Message::WorkspaceModelObserved(update)));
+    assert_eq!(app.card_state(pane.id).unwrap().title, "Mid close");
+    drop(app.update(Message::CommitClose(settings)));
+    assert!(
+        !app.card_state(settings).unwrap().existence.is_open(),
+        "status: {:?}",
+        app.status
+    );
+    assert!(!app.workspace.order().any(|card| card == settings));
+}
+
+#[test]
+#[cfg(not(feature = "integrated-browser"))]
+fn settings_closed_in_a_shared_channel_stays_closed_across_view_edges() {
+    let (mut app, source, _, pane) = presentation_fixture();
+    drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+    let settings = app.workspace.focused().unwrap();
+    assert_eq!(app.card_state(settings).unwrap().kind, CardKind::Settings);
+    drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+    let channel = |app: &Cagents| {
+        app.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == source)
+            .unwrap()
+            .cards
+            .clone()
+    };
+    assert!(channel(&app).contains(&settings));
+    drop(app.update(Message::CloseCard(settings)));
+    drop(app.update(Message::CommitClose(settings)));
+    let closed = |app: &Cagents| {
+        !app.card_state(settings).unwrap().existence.is_open()
+            && !app.workspace.order().any(|card| card == settings)
+            && app.utility_card(&CardKind::Settings).is_none()
+    };
+    assert!(closed(&app), "status: {:?}", app.status);
+    let update = presentation_edge(&app, Scope::Channel(source), 24, "After settings", 0.6);
+    drop(app.update(Message::WorkspaceModelObserved(update)));
+    assert_eq!(app.card_state(pane.id).unwrap().title, "After settings");
+    assert!(closed(&app), "a view edge brought the settings pane back");
+}

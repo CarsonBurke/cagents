@@ -10,6 +10,9 @@ VARIANT=full
 # Cargo profile for the packaged executables; `local` keeps release identity.
 PROFILE=${CAGENTS_CARGO_PROFILE:-release}
 ARCHIVE_ONLY=0
+STAGE=
+PACKAGE_STAGE=
+REUSE_DICTATE=
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -19,9 +22,14 @@ fail() {
 USAGE='usage: package-linux.sh [--variant full|browserless] [--archive-only]'
 while [ "$#" -gt 0 ]; do
     case $1 in
-        --variant)
-            [ "$#" -ge 2 ] || fail "$USAGE"
-            VARIANT=$2
+        --variant|--stage|--package-stage|--reuse-dictate)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$USAGE"
+            case $1 in
+                --variant) VARIANT=$2 ;;
+                --stage) STAGE=$2 ;;
+                --package-stage) PACKAGE_STAGE=$2 ;;
+                --reuse-dictate) REUSE_DICTATE=$2 ;;
+            esac
             shift 2
             ;;
         # The portable archive and its checksums are all install.sh needs.
@@ -32,6 +40,17 @@ while [ "$#" -gt 0 ]; do
         *) fail "$USAGE" ;;
     esac
 done
+# The isolated release driver stages exact Cargo outputs so another variant
+# can build while this one packs its archives.
+if [ -n "$STAGE$PACKAGE_STAGE" ]; then
+    [ "$PROFILE" = release ] && [ "$ARCHIVE_ONLY" = 0 ] &&
+        [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ] || fail 'invalid staged release options'
+    [ -z "$STAGE" ] || [ -z "$PACKAGE_STAGE" ] || fail 'select one release stage'
+fi
+if [ -n "$REUSE_DICTATE" ]; then
+    [ -n "$STAGE" ] && [ "$VARIANT" = browserless ] && [ -x "$REUSE_DICTATE" ] ||
+        fail 'reusing the dictation helper requires a browserless build stage and an executable'
+fi
 case $PROFILE in
     ''|*[!0-9A-Za-z_-]*) fail "unsafe Cargo profile: $PROFILE" ;;
 esac
@@ -108,7 +127,20 @@ else
 fi
 
 BUILD_SECONDS=skipped
-if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
+if [ -n "$PACKAGE_STAGE" ]; then
+    CLI_BINARY=$PACKAGE_STAGE/cagents
+    HOST_BINARY=$PACKAGE_STAGE/cagentsd
+    UI_BINARY=$PACKAGE_STAGE/cagents-ui
+    DICTATE_BINARY=$PACKAGE_STAGE/cagents-dictate
+    BUILD_SECONDS=$(cat "$PACKAGE_STAGE/build-seconds")
+    RESOLVED_PACKAGE_IDS=$(cat "$PACKAGE_STAGE/resolved-package-ids")
+    case $BUILD_SECONDS in
+        ''|*[!0-9]*) fail 'invalid staged build time' ;;
+    esac
+    case $RESOLVED_PACKAGE_IDS in
+        ''|*[!0-9]*) fail 'invalid staged package count' ;;
+    esac
+elif [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_STARTED=$(date +%s)
     [ -x /usr/bin/python3 ] || fail 'required command not found: /usr/bin/python3'
     command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
@@ -146,7 +178,7 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     # Link the dictation helper against sherpa-onnx's verified libraries,
     # never ones its build script downloads unchecked, unless the caller
     # names the libraries to use.
-    if [ -z "${SHERPA_ONNX_LIB_DIR:-}" ]; then
+    if [ -z "$REUSE_DICTATE" ] && [ -z "${SHERPA_ONNX_LIB_DIR:-}" ]; then
         SHERPA_ONNX_LIB_DIR=$("$SCRIPT_DIR/sherpa-onnx-libs" "$TARGET_DIR/sherpa-onnx") \
             || fail 'could not provide the verified sherpa-onnx libraries'
     fi
@@ -178,7 +210,10 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
         UI_BINARY=$(build_target cagents-ui -p cagents-ui --features integrated-browser --bin cagents-ui)
     fi
     # Both variants ship the same helper: it has no browser.
-    DICTATE_BINARY=$(build_target cagents-dictate -p cagents-dictate --features engine --bin cagents-dictate)
+    DICTATE_BINARY=$REUSE_DICTATE
+    if [ -z "$DICTATE_BINARY" ]; then
+        DICTATE_BINARY=$(build_target cagents-dictate -p cagents-dictate --features engine --bin cagents-dictate)
+    fi
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
 else
@@ -190,7 +225,7 @@ else
 fi
 
 # Only the release size report reads this.
-if [ "$ARCHIVE_ONLY" = 0 ]; then
+if [ "$ARCHIVE_ONLY" = 0 ] && [ -z "$PACKAGE_STAGE" ]; then
     # Report the package's whole resolved graph: the union of the lanes built above.
     # `cargo tree` only reads Cargo.lock, so unifying the features here resolves
     # nothing that a build would compile. Never copy these feature sets into a
@@ -222,7 +257,19 @@ fi
 for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY" "$DICTATE_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
-if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ]; then
+if [ -n "$STAGE" ]; then
+    mkdir -- "$STAGE"
+    # Cargo may overwrite a reported executable the next time its name
+    # builds with another feature set. Archive workers get their own copies.
+    cp --reflink=auto -- "$CLI_BINARY" "$STAGE/cagents"
+    cp --reflink=auto -- "$HOST_BINARY" "$STAGE/cagentsd"
+    cp --reflink=auto -- "$UI_BINARY" "$STAGE/cagents-ui"
+    cp --reflink=auto -- "$DICTATE_BINARY" "$STAGE/cagents-dictate"
+    printf '%s\n' "$BUILD_SECONDS" > "$STAGE/build-seconds"
+    printf '%s\n' "$RESOLVED_PACKAGE_IDS" > "$STAGE/resolved-package-ids"
+    exit 0
+fi
+if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ] || [ -n "$PACKAGE_STAGE" ]; then
     require_prebuilt_version() {
         # Preserve output through command substitution so extra lines cannot
         # disappear. Accept the exact line with or without its final newline.

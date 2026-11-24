@@ -89,6 +89,7 @@ print(next(package['version'] for package in metadata['packages'] if package['na
         self.environment = {
             "PATH": str(self.tools) + os.pathsep + os.defpath,
             "HOME": str(self.directory / "home"),
+            "TMPDIR": str(self.directory),
             "CARGO_TARGET_DIR": str(self.target), "CAGENTS_DIST_DIR": str(self.dist),
             "SOURCE_DATE_EPOCH": "0",
             "MOCK_CALLS": str(self.calls),

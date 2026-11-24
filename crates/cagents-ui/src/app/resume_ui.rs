@@ -2454,10 +2454,8 @@ impl Cagents {
         let state = &self.resume_ui;
         let summary = row.summary.as_deref();
         let mut column = widget::column::with_children(vec![
-            design::heading(&row.title)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(3),
-                ))
+            crate::ui_controls::FadeText::heading(&row.title)
+                .lines(3)
                 .into(),
         ])
         .spacing(space::XS)
@@ -2495,12 +2493,12 @@ impl Cagents {
             );
         }
         let section = |label: &'static str, text: &'a str, lines: usize| {
+            let (text, limit) = scan::shown_excerpt(text);
             widget::column::with_children(vec![
                 design::caption(label).into(),
-                design::body(text)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(lines),
-                    ))
+                crate::ui_controls::fade_text(text)
+                    .lines(lines)
+                    .limit(limit)
                     .into(),
             ])
             .spacing(space::XXS)

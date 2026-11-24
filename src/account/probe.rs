@@ -310,10 +310,7 @@ async fn run_reading(
         // post-consume refresh collide with this probe's unfinished write.
         // A cache write failure still leaves the observed answer usable.
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = cache.store_observed(&key, entry, fingerprint);
-            if let Some(catalog) = catalog {
-                let _ = cache.store_catalog(provider, catalog);
-            }
+            cache.store_probe(&key, entry, fingerprint, provider, catalog);
             drop(lock);
         })
         .await;
@@ -914,6 +911,7 @@ struct Group {
     child: Child,
     /// The group's id - the child's pid - until the group has been killed.
     id: Option<i32>,
+    temp_dir: Option<crate::daemon::codex_temp::PrivateDir>,
 }
 
 impl Group {
@@ -921,15 +919,48 @@ impl Group {
     /// just installed or updated, or inherited for an instant by a process
     /// another thread is forking - is busy rather than missing, so it is
     /// tried again a few times before the start counts as failed.
-    async fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(command: Command) -> Result<Self, String> {
+        Self::spawn_inner(command, false).await
+    }
+
+    async fn spawn_inner(mut command: Command, codex_temp: bool) -> Result<Self, String> {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
         let mut delay = Duration::from_millis(10);
         loop {
             let (returned, spawned) = tokio::task::spawn_blocking(move || {
+                // The blocking attempt can outlive its caller. Create the
+                // directory here so the spawned group's owner always has it.
                 let _account = super::registry::authorize_command(command.as_std())
                     .map_err(|error| error.to_string())?;
+                let mut temp_dir = if codex_temp {
+                    let inherited = command
+                        .as_std()
+                        .get_envs()
+                        .find_map(|(key, value)| (key == "TMPDIR").then_some(value));
+                    let ambient = std::env::var_os("TMPDIR");
+                    let directory = PrivateDir::create(
+                        inherited.unwrap_or(ambient.as_deref()),
+                        command.as_std().get_current_dir(),
+                    )
+                    .map_err(|error| {
+                        format!("Cannot prepare Codex's temporary directory: {error}")
+                    })?;
+                    command.envs(TEMP_ENV_KEYS.map(|key| (key, directory.path())));
+                    Some(directory)
+                } else {
+                    None
+                };
                 let spawned = command.spawn().map(|child| {
+                    if let Some(directory) = &mut temp_dir {
+                        directory.launched();
+                    }
                     let id = child.id().and_then(|id| i32::try_from(id).ok());
-                    Self { child, id }
+                    Self {
+                        child,
+                        id,
+                        temp_dir,
+                    }
                 });
                 Ok::<_, String>((command, spawned))
             })
@@ -969,6 +1000,11 @@ impl Group {
         }
         self.kill();
         let _ = self.child.wait().await;
+        if let Some(cleanup) = self.temp_dir.take().and_then(|temp| temp.defer_cleanup())
+            && let Ok(Err(error)) = cleanup.await
+        {
+            tracing::warn!(%error, "Codex probe temporary directory could not be cleaned up");
+        }
     }
 
     /// Whether the leader has exited, without reaping it: until it is
@@ -1011,6 +1047,9 @@ impl Drop for Group {
         // timeout most of all. `kill_on_drop` covers the child; this covers
         // anything it started.
         self.kill();
+        if let Some(temp) = self.temp_dir.take() {
+            let _ = temp.defer_cleanup();
+        }
     }
 }
 
@@ -1022,9 +1061,23 @@ struct Session {
 }
 
 impl Session {
-    async fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(command: Command) -> Result<Self, String> {
+        Self::spawn_inner(command, false).await
+    }
+
+    async fn spawn_codex(
+        account: &Account,
+        program: &Path,
+        search_path: Option<&OsStr>,
+    ) -> Result<Self, String> {
+        let mut command = command_with_path(account, program, search_path);
+        command.arg("app-server");
+        Self::spawn_inner(command, true).await
+    }
+
+    async fn spawn_inner(mut command: Command, codex_temp: bool) -> Result<Self, String> {
         command.stdin(Stdio::piped());
-        let mut group = Group::spawn(command).await?;
+        let mut group = Group::spawn_inner(command, codex_temp).await?;
         let stdin = group.child.stdin.take();
         let stdout = group.stdout()?;
         Ok(Self {
@@ -1554,29 +1607,52 @@ async fn probe_codex_with_path(
     program: &Path,
     search_path: Option<&OsStr>,
 ) -> Result<Probed, String> {
-    let mut command = command_with_path(account, program, search_path);
-    command.arg("app-server");
-    let mut session = Session::spawn(command).await?;
+    let mut session = Session::spawn_codex(account, program, search_path).await?;
     let result = codex_exchange(&mut session).await;
     finish_codex_probe(after_close(result, session.close()).await)
 }
 
-fn codex_catalog(answer: &Observed<RpcResult>) -> Option<Catalog> {
+/// The models Codex lists, with the one a conversation that names none runs.
+///
+/// `model/list` flags Codex's built-in default and ignores `config.toml`,
+/// which Codex itself honours, so the resolved configuration decides: its
+/// `model` when set, the flagged model when it sets none, and nothing when it
+/// could not be read, so the picker leaves an unknown default unnamed.
+fn codex_catalog(
+    answer: &Observed<RpcResult>,
+    config: Option<&Observed<RpcResult>>,
+) -> Option<Catalog> {
     let result = answer.value.as_ref().ok()?;
     let entries = result["data"].as_array();
     let mut catalog =
         observed_catalog(self::models(entries, Model::from_codex), answer.observed_at)?;
+    let mut flagged = None;
     for entry in entries.into_iter().flatten() {
         let Some(id) = entry["model"].as_str() else {
             continue;
         };
         if entry["isDefault"].as_bool() == Some(true) {
-            catalog.default_model = Some(id.to_owned());
+            flagged = Some(id);
         }
         if let Some(effort) = entry["defaultReasoningEffort"].as_str() {
             catalog
                 .reasoning_defaults
                 .insert(id.to_owned(), effort.to_owned());
+        }
+    }
+    let Some(config) = config.and_then(|read| read.value.as_ref().ok()?.get("config")) else {
+        return Some(catalog);
+    };
+    let configured = |key: &str| config[key].as_str();
+    catalog.default_model = configured("model").or(flagged).map(str::to_owned);
+    // A configured effort applies to every model that offers it.
+    if let Some(effort) = configured("model_reasoning_effort") {
+        for model in &catalog.models {
+            if model.reasoning.iter().any(|level| level == effort) {
+                catalog
+                    .reasoning_defaults
+                    .insert(model.id.clone(), effort.to_owned());
+            }
         }
     }
     Some(catalog)
@@ -1587,8 +1663,11 @@ fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, St
         account: account_read,
         limits: limits_read,
         models,
+        config,
     } = result?;
-    let catalog = models.as_ref().and_then(codex_catalog);
+    let catalog = models
+        .as_ref()
+        .and_then(|models| codex_catalog(models, config.as_ref()));
     let identity = match account_read.value {
         Ok(result) => match super::codex::parse_account(&result) {
             Ok(identity) => Some(identity),
@@ -1642,6 +1721,10 @@ struct CodexSession {
     /// in one page of this size. A version without it answers an error, and
     /// one that did not answer within [`MODELS_GRACE`] reads as one.
     models: Option<Observed<RpcResult>>,
+    /// `config/read`: the configuration Codex resolved for this home, which
+    /// names the model a conversation runs when it asks for none. Waited for
+    /// like the listing.
+    config: Option<Observed<RpcResult>>,
 }
 
 async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
@@ -1663,14 +1746,18 @@ async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
     session
         .send(&json!({"id": 4, "method": "model/list", "params": {"limit": 100}}))
         .await?;
+    session
+        .send(&json!({"id": 5, "method": "config/read", "params": {}}))
+        .await?;
     let mut answers = CodexAnswers::default();
     while answers.account.is_none() || answers.limits.is_none() {
         answers.take(session.next().await?, now_ms);
     }
-    // The usage is what the probe is for, so the listing is only waited for
-    // a little longer, and a probe that has its answer never fails for it.
+    // The usage is what the probe is for, so the listing and configuration are
+    // only waited for a little longer, and a probe that has its answer never
+    // fails for them.
     let _ = tokio::time::timeout(MODELS_GRACE, async {
-        while answers.models.is_none() {
+        while answers.models.is_none() || answers.config.is_none() {
             answers.take(session.next().await?, now_ms);
         }
         Ok::<(), String>(())
@@ -1684,6 +1771,7 @@ struct CodexAnswers {
     account: Option<Observed<RpcResult>>,
     limits: Option<Observed<RpcResult>>,
     models: Option<Observed<RpcResult>>,
+    config: Option<Observed<RpcResult>>,
 }
 
 impl CodexAnswers {
@@ -1696,6 +1784,7 @@ impl CodexAnswers {
             Some(2) => &mut self.account,
             Some(3) => &mut self.limits,
             Some(4) => &mut self.models,
+            Some(5) => &mut self.config,
             _ => return,
         };
         *slot = Some(Observed {
@@ -1709,6 +1798,7 @@ impl CodexAnswers {
             account: self.account.unwrap(),
             limits: self.limits.unwrap(),
             models: self.models,
+            config: self.config,
         }
     }
 }
@@ -2015,22 +2105,58 @@ mod tests {
         assert!(models(None, Model::from_codex).is_empty());
     }
 
-    #[test]
-    fn codex_catalog_keeps_advertised_default_efforts_for_drafts() {
-        let answer = Observed {
+    fn codex_models() -> Observed<RpcResult> {
+        Observed {
             observed_at: 7,
             value: Ok(json!({"data": [
                 {"model":"mini", "displayName":"Mini", "isDefault":true,
                  "defaultReasoningEffort":"medium", "supportedReasoningEfforts":[
                      {"reasoningEffort":"medium"}, {"reasoningEffort":"high"}]},
-                {"model":"other", "defaultReasoningEffort":"high"}
+                {"model":"other", "defaultReasoningEffort":"high",
+                 "supportedReasoningEfforts":[{"reasoningEffort":"high"}]}
             ]})),
-        };
-        let catalog = codex_catalog(&answer).unwrap();
+        }
+    }
+
+    fn codex_config(value: RpcResult) -> Observed<RpcResult> {
+        Observed {
+            observed_at: 8,
+            value,
+        }
+    }
+
+    #[test]
+    fn codex_catalog_keeps_advertised_default_efforts_for_drafts() {
+        let config = codex_config(Ok(json!({"config": {"model": null}})));
+        let catalog = codex_catalog(&codex_models(), Some(&config)).unwrap();
+        assert_eq!(catalog.default_model.as_deref(), Some("mini"));
         assert_eq!(catalog.default_effort(None), Some("medium"));
         assert_eq!(catalog.default_effort(Some("mini")), Some("medium"));
         assert_eq!(catalog.default_effort(Some("other")), Some("high"));
         assert_eq!(catalog.observed_at, 7);
+    }
+
+    /// Codex flags its built-in default in `model/list` even when
+    /// `config.toml` names another model, and runs the configured one.
+    #[test]
+    fn codex_default_is_the_configured_model_not_the_flagged_one() {
+        let config = codex_config(Ok(json!({"config": {
+            "model": "other", "model_reasoning_effort": "high"}})));
+        let catalog = codex_catalog(&codex_models(), Some(&config)).unwrap();
+        assert_eq!(catalog.default_model.as_deref(), Some("other"));
+        assert_eq!(catalog.default_effort(None), Some("high"));
+        // The configured effort applies to every model that offers it.
+        assert_eq!(catalog.default_effort(Some("mini")), Some("high"));
+    }
+
+    #[test]
+    fn codex_default_is_unnamed_when_its_configuration_is_unknown() {
+        let refused = codex_config(Err(json!({"code": -32601})));
+        for config in [None, Some(&refused)] {
+            let catalog = codex_catalog(&codex_models(), config).unwrap();
+            assert_eq!(catalog.default_model, None);
+            assert_eq!(catalog.default_effort(Some("mini")), Some("medium"));
+        }
     }
 
     #[test]
@@ -2814,6 +2940,50 @@ cat >/dev/null
         assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
         assert!(snapshot.windows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_account_sessions_use_private_temp_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let script = fixture.path().join("codex");
+        let record = fixture.path().join("temp-dir");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+test "$1" = app-server || exit 1
+test "$TMP" = "$TMPDIR" && test "$TEMP" = "$TMPDIR" || exit 1
+printf '%s' "$TMPDIR" > "${0%/*}/temp-dir"
+printf '%s\n' '{"ready":true}'
+exec /bin/cat >/dev/null
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        let account = Account::system(Provider::Codex);
+        let read_temp = || PathBuf::from(OsString::from_vec(std::fs::read(&record).unwrap()));
+
+        let mut first = Session::spawn_codex(&account, &script, None).await.unwrap();
+        assert_eq!(first.next().await.unwrap()["ready"], true);
+        let first_path = read_temp();
+        assert!(first_path.is_absolute());
+        assert_ne!(first_path, std::env::temp_dir());
+        assert_eq!(
+            std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::write(first_path.join("marker"), b"temporary").unwrap();
+
+        let mut second = Session::spawn_codex(&account, &script, None).await.unwrap();
+        assert_eq!(second.next().await.unwrap()["ready"], true);
+        let second_path = read_temp();
+        assert_ne!(first_path, second_path);
+        first.close().await;
+        assert!(!first_path.exists());
+        assert!(second_path.is_dir());
+        second.close().await;
+        assert!(!second_path.exists());
     }
 
     #[tokio::test]

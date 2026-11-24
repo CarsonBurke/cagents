@@ -274,7 +274,7 @@ pub fn item(item: &chat::Item) -> api::Item {
         chat::ItemContent::Delivery {
             kind,
             from,
-            sender: _,
+            sender,
             summary,
             body,
         } => {
@@ -286,6 +286,7 @@ pub fn item(item: &chat::Item) -> api::Item {
                     chat::DeliveryKind::Notice => api::DeliveryKind::Notice,
                 },
                 from: from.clone(),
+                sender: sender.clone(),
                 summary: summary.clone(),
                 body: body.into(),
                 clipped,

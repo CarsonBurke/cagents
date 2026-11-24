@@ -53,6 +53,9 @@ impl Budget<'_> {
         };
         // Presence and read eligibility are different. A FIFO, broken link or
         // unreadable descriptor is an uncertain project boundary, not absence.
+        if path.file_name() == Some(OsStr::new(".git")) {
+            return cagents::git_marker::present(path).unwrap_or(true);
+        }
         !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
     }
     fn read(&mut self, path: &Path) -> Option<Vec<u8>> {

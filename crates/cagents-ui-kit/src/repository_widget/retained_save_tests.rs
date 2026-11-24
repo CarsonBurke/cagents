@@ -370,6 +370,7 @@ async fn rejected_sticky_candidate_does_not_hide_a_safe_outside_ancestor() {
     let mut shared = enclosing.clone();
     std::fs::create_dir(&enclosing).unwrap();
     std::fs::create_dir(enclosing.join(".git")).unwrap();
+    std::fs::write(enclosing.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     // More sticky candidates than the bootstrap allowance must not consume
     // the preexisting protected-parent discovery allowance.
     for index in 0..10 {
@@ -521,6 +522,7 @@ async fn root_scope_saves_owned_private_and_sticky_parent_files() {
         // The marker exercises nested checkout ancestor cleanup leasing; no
         // Git subprocess or host repository discovery is involved.
         std::fs::create_dir(inner.join(".git")).unwrap();
+        std::fs::write(inner.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let path = inner.join("file.txt");
         std::fs::write(&path, "baseline").unwrap();
         root_scope_owned_file_round_trip(&path).await;
