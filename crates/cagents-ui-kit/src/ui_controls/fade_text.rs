@@ -57,7 +57,8 @@ pub enum FadeEdge {
 /// once, untouched. The fade stays inside the text's own bounds, so a status
 /// icon or control after it in the row is never faded.
 ///
-/// Accessibility and any tooltip see the whole text: only the drawing is cut.
+/// Accessibility and any tooltip see the whole text: only the drawing is cut,
+/// and a text held to [`FadeText::limit`] is still named in full.
 ///
 /// The colour comes from [`FadeText::class`], never from the text itself, so
 /// the faded steps always match the unfaded part.
@@ -291,6 +292,8 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
         } else {
             one_line(text.content)
         };
+        // What a budget cuts from the drawing is still read out.
+        let name = text.limit.map(|_| content.clone().into_owned());
         let (content, cut) = within(content, text.limit);
         let mut line = text
             .role
@@ -317,6 +320,7 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
             line: line.into(),
             class: Some(text.class),
             edge: text.edge,
+            name: name.filter(|_| cut),
             cut,
             whole: text.whole && !wraps,
             lines: text.lines,
@@ -356,12 +360,32 @@ struct Faded<'a, Message> {
     /// The text colour, or the inherited one when the line brings its own.
     class: Option<cosmic::theme::Text>,
     edge: FadeEdge,
+    /// The whole text, when a budget cut what is drawn of it.
+    name: Option<String>,
     /// The text was cut to a budget, so it fades even where it fits.
     cut: bool,
     /// The text is drawn whole or not at all.
     whole: bool,
     /// The most lines the text wraps over; one does not wrap.
     lines: usize,
+}
+
+/// A text read out as `name`, over `bounds`, whatever of it is drawn.
+fn paragraph_node(bounds: Rectangle, name: &str, id: Id) -> iced_accessibility::A11yTree {
+    use iced_accessibility::{
+        A11yTree,
+        accesskit::{Live, Node, Rect, Role},
+    };
+    let mut node = Node::new(Role::Paragraph);
+    node.set_label(name.to_owned().into_boxed_str());
+    node.set_bounds(Rect::new(
+        f64::from(bounds.x),
+        f64::from(bounds.y),
+        f64::from(bounds.x + bounds.width),
+        f64::from(bounds.y + bounds.height),
+    ));
+    node.set_live(Live::Polite);
+    A11yTree::leaf(node, id)
 }
 
 /// What layout measured of the text.
@@ -377,6 +401,9 @@ struct Measured {
 /// The last line a wrapped text shows, from the text's top left.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LastLine {
+    /// The bottom of the last line shown, which may be blank.
+    bottom: f32,
+    /// The box of the last shown line with ink, which fades.
     top: f32,
     height: f32,
     /// Across, from the start of its first glyph to the end of its last,
@@ -483,9 +510,15 @@ struct Region {
     shift: f32,
 }
 
-/// The clips that draw a line `natural` wide, overflowing `bounds`, giving
-/// way at `edge`. Together they tile `bounds` across, each drawn once.
+/// The clips that draw a line `natural` wide, overflowing `bounds` or cut to
+/// a budget, giving way at `edge`. Together they tile, each drawn once, the
+/// part of `bounds` the line reaches across: a line cut short of its slot's
+/// end fades over its own last glyphs, not over the empty room after them.
 fn regions(bounds: Rectangle, edge: FadeEdge, natural: f32) -> Vec<Region> {
+    let bounds = Rectangle {
+        width: bounds.width.min(natural),
+        ..bounds
+    };
     // A line that keeps its end is drawn moved back so its end meets the
     // far edge.
     let back = (natural - bounds.width).max(0.0);
@@ -525,34 +558,43 @@ fn regions(bounds: Rectangle, edge: FadeEdge, natural: f32) -> Vec<Region> {
 
 /// The last of `lines` lines that `buffer`'s wrapped text shows, when it
 /// takes more lines than that or was `cut` to a budget; `None` when it shows
-/// all of itself.
+/// all of itself. A blank line, such as one between paragraphs, cannot show
+/// that more follows, so the fade goes on the last shown line with ink.
 fn last_line(
     buffer: &cosmic::iced::advanced::graphics::text::cosmic_text::Buffer,
     lines: usize,
     cut: bool,
 ) -> Option<LastLine> {
     let mut runs = buffer.layout_runs();
-    let last = runs.by_ref().take(lines).last()?;
+    let shown: Vec<_> = runs.by_ref().take(lines).collect();
+    let bottom = shown.last()?;
     if runs.next().is_none() && !cut {
         return None;
     }
-    let ink = last
-        .glyphs
-        .iter()
-        .filter(|glyph| {
-            last.text
-                .get(glyph.start..glyph.end)
-                .is_some_and(|text| !text.chars().all(char::is_whitespace))
-        })
-        .fold(None::<(f32, f32)>, |ink, glyph| {
-            let (start, end) = (glyph.x, glyph.x + glyph.w);
-            Some(match ink {
-                Some((from, to)) => (from.min(start), to.max(end)),
-                None => (start, end),
+    let ink = |run: &cosmic::iced::advanced::graphics::text::cosmic_text::LayoutRun<'_>| {
+        run.glyphs
+            .iter()
+            .filter(|glyph| {
+                run.text
+                    .get(glyph.start..glyph.end)
+                    .is_some_and(|text| !text.chars().all(char::is_whitespace))
             })
-        })
-        .unwrap_or((0.0, 0.0));
+            .fold(None::<(f32, f32)>, |ink, glyph| {
+                let (start, end) = (glyph.x, glyph.x + glyph.w);
+                Some(match ink {
+                    Some((from, to)) => (from.min(start), to.max(end)),
+                    None => (start, end),
+                })
+            })
+    };
+    let (last, ink) = shown
+        .iter()
+        .rev()
+        .find_map(|run| ink(run).map(|ink| (run, ink)))
+        // Nothing but blank lines shown: none fades, and none past them shows.
+        .unwrap_or((bottom, (0.0, 0.0)));
     Some(LastLine {
+        bottom: bottom.line_top + bottom.line_height,
         top: last.line_top,
         height: last.line_height,
         ink,
@@ -611,7 +653,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
                 .raw()
                 .buffer();
             let last = last_line(buffer, self.lines, self.cut);
-            let height = last.map_or(node.size().height, |last| last.top + last.height);
+            let height = last.map_or(node.size().height, |last| last.bottom);
             *tree.state.downcast_mut::<Measured>() = Measured {
                 natural: node.size().width,
                 last,
@@ -824,9 +866,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.line
-            .as_widget()
-            .a11y_nodes(layout, &tree.children[0], cursor)
+        match (&self.name, self.line.as_widget().id()) {
+            (Some(name), Some(id)) => paragraph_node(layout.bounds(), name, id),
+            _ => self
+                .line
+                .as_widget()
+                .a11y_nodes(layout, &tree.children[0], cursor),
+        }
     }
 
     fn id(&self) -> Option<Id> {
@@ -965,7 +1011,8 @@ mod tests {
         };
         let natural = 320.0;
         for edge in [FadeEdge::End, FadeEdge::Start, FadeEdge::Middle] {
-            let regions = regions(bounds, edge, natural);
+            let mut regions = regions(bounds, edge, natural);
+            regions.sort_by(|a, b| a.clip.x.total_cmp(&b.clip.x));
             let mut at = bounds.x;
             for region in &regions {
                 assert!((region.clip.x - at).abs() < 1e-3, "{edge:?}: {regions:?}");
@@ -1038,5 +1085,98 @@ mod tests {
         // A text cut to a budget fades its last line even where it fits.
         let (last, _) = last_shown(fade_text(summary).lines(3).limit(20), 2000.0);
         assert!(last.is_some());
+        // A blank last line cannot show that more follows: the line above
+        // it fades, and the box still takes the lines shown.
+        let (last, size) = last_shown(fade_text("One\n\nThree").lines(2), 2000.0);
+        let last = last.expect("a third line is hidden");
+        assert_eq!(last.top, 0.0, "{last:?}");
+        assert!(last.ink.1 > last.ink.0, "{last:?}");
+        assert_eq!(size.height, 2.0 * design::LINE_BODY);
+    }
+
+    /// A budget cuts what is drawn, not what a screen reader is told.
+    #[test]
+    fn a_budget_cut_line_is_read_out_whole() {
+        let label = |text: FadeText<'static>| {
+            let mut text: Element<'_, ()> = text.into();
+            let renderer = headless_renderer();
+            let mut tree = Tree::new(text.as_widget());
+            let node = text.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+            );
+            let nodes =
+                text.as_widget()
+                    .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find_map(|node| node.node().label().map(str::to_owned))
+                .expect("a labelled node")
+        };
+        let whole = "Key the response cache by locale";
+        assert_eq!(label(fade_text(whole).limit(12)), whole);
+        assert_eq!(
+            label(
+                fade_text(whole)
+                    .limit(12)
+                    .highlight(&[0..3], cosmic::theme::Text::Default)
+            ),
+            whole
+        );
+        assert_eq!(label(fade_text(whole)), whole);
+    }
+
+    /// A line cut to a budget short of a wide slot fades over its own last
+    /// glyphs, so its end reads as cut rather than ending at full strength
+    /// in empty room.
+    #[test]
+    fn a_budget_cut_line_fades_at_its_own_end_in_a_wide_slot() {
+        let bounds = Rectangle {
+            x: 10.0,
+            y: 0.0,
+            width: 400.0,
+            height: 20.0,
+        };
+        let natural = 120.0;
+        for edge in [FadeEdge::End, FadeEdge::Start, FadeEdge::Middle] {
+            let regions = regions(bounds, edge, natural);
+            let reach = regions
+                .iter()
+                .map(|region| region.clip.x + region.clip.width)
+                .fold(f32::MIN, f32::max);
+            assert!(
+                (reach - (bounds.x + natural)).abs() < 1e-3,
+                "{edge:?} reaches {reach}"
+            );
+            assert!(regions.iter().all(|region| region.shift == 0.0), "{edge:?}");
+        }
+        let end = regions(bounds, FadeEdge::End, natural);
+        let faintest = end
+            .iter()
+            .min_by(|a, b| a.alpha.total_cmp(&b.alpha))
+            .unwrap();
+        assert!(
+            faintest.clip.x + faintest.clip.width > bounds.x + natural - 3.0,
+            "{faintest:?}"
+        );
+        // Through the widget: a budget-cut line in a Fill slot measures
+        // narrower than the slot, which is what the fade is held to.
+        let mut line: Element<'_, ()> = fade_text("Key the response cache by locale")
+            .limit(12)
+            .width(Length::Fill)
+            .into();
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(line.as_widget());
+        let node = line.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+        );
+        let natural = tree.state.downcast_ref::<Measured>().natural;
+        assert_eq!(node.size().width, 400.0);
+        assert!(natural > 0.0 && natural < 200.0, "{natural}");
     }
 }

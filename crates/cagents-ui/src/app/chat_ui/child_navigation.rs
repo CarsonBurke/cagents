@@ -149,6 +149,11 @@ fn direct_tabs<'a>(
 /// How many characters of its name a child's tab shows.
 pub(super) const TAB_CHARS: usize = 24;
 
+/// The most characters a chooser row's activity line shows of a report or
+/// detail; past it the line fades out, as it does where the row runs out of
+/// room.
+const ACTIVITY_CHARS: usize = 160;
+
 /// What a tab shows of `name` before any number: the name itself, or its
 /// first [`TAB_CHARS`] characters when the tab cuts it, which is then marked.
 /// Two names that read the same there are namesakes, so two tasks that start
@@ -735,7 +740,7 @@ impl Runtime {
             report
                 .and_then(report_text)
                 .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
-                .map(|line| Self::short_description(line, 160))
+                .map(|line| line.chars().take(ACTIVITY_CHARS + 1).collect())
         };
         let failure = || {
             chat::failure::Failure::parse(self.session.launch.provider, detail)
@@ -780,7 +785,7 @@ impl Runtime {
                     .lines()
                     .map(str::trim)
                     .find(|line| !line.is_empty())
-                    .map(|line| Self::short_description(line, 160))
+                    .map(|line| line.chars().take(ACTIVITY_CHARS + 1).collect())
             })),
         }
     }
@@ -971,6 +976,8 @@ impl Runtime {
         let chosen = self.selected_subagent.as_ref() == Some(&child.id);
         let label = self.child_label(child, 80);
         let name = self.child_choice_name(child, &label);
+        // Shown in full, to fade where the row runs out of room.
+        let label = self.child_label(child, usize::MAX);
         let line = |text: String, muted: bool| {
             let text = crate::ui_controls::FadeText::caption(text);
             if muted {
@@ -987,6 +994,7 @@ impl Runtime {
             widget::column::with_children(vec![
                 title.width(Length::Fill).into(),
                 line(self.child_activity(child, report), true)
+                    .limit(ACTIVITY_CHARS)
                     .width(Length::Fill)
                     .into(),
             ])

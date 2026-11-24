@@ -3155,10 +3155,17 @@ impl Runtime {
             ];
             match Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
                 Some(task) => summary.push(
-                    crate::ui_controls::FadeText::caption(format!("· {task}"))
-                        .limit(TASK_CHARS)
-                        .width(Length::Fill)
-                        .into(),
+                    // Only what the budget can show, and a character past
+                    // it to say there is more, is copied on each frame.
+                    crate::ui_controls::FadeText::caption(format!(
+                        "· {}",
+                        task.char_indices()
+                            .nth(TASK_CHARS - 1)
+                            .map_or(task, |(end, _)| &task[..end])
+                    ))
+                    .limit(TASK_CHARS)
+                    .width(Length::Fill)
+                    .into(),
                 ),
                 None => summary.push(widget::Space::new().width(Length::Fill).into()),
             }

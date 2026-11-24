@@ -35,6 +35,8 @@ pub(super) fn element<'a, Message: 'a>(text: FadeText<'a>) -> Element<'a, Messag
         content if content.contains(['\n', '\r']) => content.replace(['\n', '\r'], " ").into(),
         content => content,
     };
+    // What a budget cuts from the drawing is still read out.
+    let name = text.limit.map(|_| content.clone().into_owned());
     let (content, cut) = within(content, text.limit);
     let content = content.into_owned();
     let (size, line_height, font) = text.role.format();
@@ -71,6 +73,7 @@ pub(super) fn element<'a, Message: 'a>(text: FadeText<'a>) -> Element<'a, Messag
         class: text.class,
         width: text.width,
         edge: text.edge,
+        name: name.filter(|_| cut),
         cut,
         whole: text.whole,
         id: Id::unique(),
@@ -117,6 +120,8 @@ struct Highlighted {
     class: cosmic::theme::Text,
     width: Length,
     edge: super::FadeEdge,
+    /// The whole text, when a budget cut what is drawn of it.
+    name: Option<String>,
     cut: bool,
     whole: bool,
     id: Id,
@@ -293,22 +298,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Highlighted {
         _tree: &Tree,
         _cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        use iced_accessibility::{
-            A11yTree,
-            accesskit::{Live, Node, Rect, Role},
-        };
         // Read as plain text is: the whole of it, whatever is drawn.
-        let bounds = layout.bounds();
-        let mut node = Node::new(Role::Paragraph);
-        node.set_label(self.content.clone().into_boxed_str());
-        node.set_bounds(Rect::new(
-            f64::from(bounds.x),
-            f64::from(bounds.y),
-            f64::from(bounds.x + bounds.width),
-            f64::from(bounds.y + bounds.height),
-        ));
-        node.set_live(Live::Polite);
-        A11yTree::leaf(node, self.id.clone())
+        super::paragraph_node(
+            layout.bounds(),
+            self.name.as_deref().unwrap_or(&self.content),
+            self.id.clone(),
+        )
     }
 
     fn id(&self) -> Option<Id> {

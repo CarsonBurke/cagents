@@ -2493,9 +2493,13 @@ impl Cagents {
             );
         }
         let section = |label: &'static str, text: &'a str, lines: usize| {
+            let (text, limit) = scan::shown_excerpt(text);
             widget::column::with_children(vec![
                 design::caption(label).into(),
-                crate::ui_controls::fade_text(text).lines(lines).into(),
+                crate::ui_controls::fade_text(text)
+                    .lines(lines)
+                    .limit(limit)
+                    .into(),
             ])
             .spacing(space::XXS)
         };

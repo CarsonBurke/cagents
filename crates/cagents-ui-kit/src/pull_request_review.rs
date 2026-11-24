@@ -4054,49 +4054,37 @@ pub(crate) mod tests {
     use super::*;
     use crate::github::RemoteValue;
 
+    /// A long title takes the summary's three lines and no more, the last
+    /// fading where it runs out, while a short one keeps its own height.
     #[test]
-    fn summary_title_ellipsis_preserves_ordinary_word_wrap_geometry() {
-        use cosmic::iced::advanced::graphics::text::cosmic_text::{
-            Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
-            ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
-        };
+    fn summary_title_is_held_to_its_lines() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{layout, widget::Tree};
 
-        // Exercise the text engine reexported by the UI, so removing or
-        // bypassing the temporary dependency patch also fails an app test.
-        let mut db = fontdb::Database::new();
-        db.load_font_data(
-            include_bytes!("../../../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
-        );
-        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
-        let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow.";
-        let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
-        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
-        let layout = |ellipsize| {
-            let mut lines = Vec::new();
-            shaped.layout_to_buffer(
-                &mut ShapeBuffer::default(),
-                18.0,
-                Some(110.0),
-                Wrap::WordOrGlyph,
-                ellipsize,
-                None,
-                &mut lines,
-                None,
-                Hinting::Disabled,
-            );
-            lines
+        let height = |title: &'static str| {
+            let mut title: Element<'_, ()> = crate::ui_controls::FadeText::heading(title)
+                .lines(SUMMARY_TITLE_LINES)
+                .width(Length::Fill)
+                .into();
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut tree = Tree::new(title.as_widget());
+            title
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(160.0, 1000.0)),
+                )
+                .size()
+                .height
         };
-        let ordinary = layout(Ellipsize::None);
-        let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
-            SUMMARY_TITLE_LINES,
-        )));
-        assert!(ordinary.len() > SUMMARY_TITLE_LINES);
-        assert_eq!(limited.len(), SUMMARY_TITLE_LINES);
-        let expected = &ordinary[SUMMARY_TITLE_LINES - 1].glyphs[0];
-        let actual = &limited[SUMMARY_TITLE_LINES - 1].glyphs[0];
-        assert_eq!(actual.start, expected.start);
-        assert_eq!(actual.x, expected.x);
-        assert!(!text[actual.start..actual.end].starts_with(' '));
+        let line = height("Fix it");
+        assert!(line > 0.0);
+        let long = height(
+            "Pack my box with five dozen liquor jugs. Sphinx of black quartz, \
+             judge my vow. The five boxing wizards jump quickly over the lazy dog.",
+        );
+        assert_eq!(long, SUMMARY_TITLE_LINES as f32 * line);
     }
 
     fn open_with(state: &mut State, loaded: Loaded) {
