@@ -22,6 +22,7 @@ mod dispatch_tests;
 mod ingress;
 mod inspector_activity;
 mod inspector_rail;
+mod phone_ui;
 use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
@@ -4969,6 +4970,7 @@ fn grouped_digits(value: usize) -> String {
 #[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
+    Phone(phone_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
         collapsed: bool,
@@ -5951,6 +5953,7 @@ struct HoverFocus {
 pub struct Cagents {
     startup_gate: startup_gate::State,
     device_ui: device_ui::State,
+    phone_ui: phone_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
@@ -10981,6 +10984,12 @@ impl Cagents {
             && let Some(task) = self.resume_key_event(&event)
         {
             return (task, Projection::Full);
+        }
+        if is_escape_press(&event) && self.phone_ui.open && !self.modal_is_open() {
+            return (
+                self.update_phone(phone_ui::Action::Menu(false)),
+                Projection::Full,
+            );
         }
         if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
             return (
@@ -16399,6 +16408,7 @@ impl Cagents {
         if previous.show_status_bar != self.settings.show_status_bar {
             self.account_ui.set_turned_off(&self.settings);
             self.device_ui.menu_open = false;
+            self.phone_ui.open = false;
             tasks.push(self.accounts_surface_changed());
         } else if self.account_ui.set_turned_off(&self.settings) {
             // A provider turned back on is read again at once, rather than
@@ -16789,6 +16799,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
+            phone_ui: phone_ui::State::default(),
             account_ui: account_ui::State::installation().into(),
             sign_ins: account_ui::SignIns::default(),
             automation_ui: crate::automation_ui::State::default(),
@@ -17173,6 +17184,7 @@ impl Application for Cagents {
             },
         ));
         subscriptions.extend(operation_subscriptions);
+        subscriptions.push(self.phone_subscription());
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.pane_inspectors.is_animating())
         {
@@ -18157,6 +18169,7 @@ impl Cagents {
             Message::TerminalSave(action) => self.update_terminal_save(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
+            Message::Phone(action) => self.update_phone(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
                 self.run_workspace_command(command, keyboard::Modifiers::empty())
@@ -19250,7 +19263,8 @@ impl Cagents {
                 if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
                     && (!self.settings.focus_follows_mouse
                         || self.chat_menu_open()
-                        || self.device_ui.menu_open)
+                        || self.device_ui.menu_open
+                        || self.phone_ui.open)
                 {
                     return Task::none();
                 }
