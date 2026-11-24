@@ -918,7 +918,7 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
     if reading.cli {
         match (&spawn.placement, &spawn.channel) {
             // A channel is known here only by its ID, which is no name to
-            // show; the row's own place in the sidebar says which it is.
+            // show.
             (Some(crate::agent_execution::Placement::Channel(_)), _) | (None, Some(_)) => {}
             (Some(crate::agent_execution::Placement::Worktree { path, .. }), _) => {
                 parts.push(format!("Worktree view {}", path.display()))
@@ -1274,14 +1274,11 @@ impl RowStatus {
     }
 }
 
-/// How a run stands, as a row's status, naming the agent that runs it in
-/// the tooltip.
+/// How a run stands, as a row's status. The agent that runs it is known
+/// here only by its ID, an address rather than a name, so it is not said.
 fn run_status(run: &Run) -> RowStatus {
     let Some(state) = run.state else {
-        return RowStatus {
-            detail: (!run.agent.is_empty()).then(|| format!("As agent {}", run.agent)),
-            ..RowStatus::plain("Launch accepted")
-        };
+        return RowStatus::plain("Launch accepted");
     };
     let mut status = match state {
         State::Failed | State::Interrupted => RowStatus::error(state_phrase(state)),
@@ -1289,14 +1286,7 @@ fn run_status(run: &Run) -> RowStatus {
         State::Accepted | State::Running | State::Waiting => RowStatus::live(state_phrase(state)),
         State::Succeeded => RowStatus::plain(state_phrase(state)),
     };
-    let mut detail = Vec::new();
-    if run.timed_out {
-        detail.push("The wait timed out".to_owned());
-    }
-    if !run.agent.is_empty() {
-        detail.push(format!("As agent {}", run.agent));
-    }
-    status.detail = (!detail.is_empty()).then(|| detail.join(". "));
+    status.detail = run.timed_out.then(|| "The wait timed out".to_owned());
     status
 }
 
@@ -3040,7 +3030,8 @@ mod identity_tests {
         spawn.channel = Some(channel);
         assert_eq!(
             spawn_details(&reading, &spawn, None),
-            format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
+            "cagents agent · codex · gpt-reported · low",
+            "a channel's ID is no name to show"
         );
         spawn.placement = Some(crate::agent_execution::Placement::Worktree {
             repository: "/repo".into(),
