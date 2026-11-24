@@ -445,7 +445,15 @@ class Comparison(unittest.TestCase):
         rollback_after = copy.deepcopy(after)
         rollback_after['agents']['agent']['agent']['console']['launch']['environment'] = {'TOKEN':'value'}
         self.assertTrue(records.console_relaunch(rollback_before,rollback_after,'terminal'))
+        # In the app an older worker records Failed when it does not know NEW's
+        # protocol (#3877); NEW's usable recovery still decides.
+        old_worker = copy.deepcopy(after)
+        old_worker['update_status'].update(phase='Failed',message='could not configure the daemon connection: '
+                                           'The running cagents service uses protocol 203; live updates support only 198.')
+        self.assertTrue(records.console_relaunch(before,old_worker,'terminal'))
         mutations = {
+            'refused-old-worker':lambda a:a['update_status'].update(
+                phase='Failed',message='uses protocol 203; live updates support only 198',refusal={'kind':'busy'}),
             'wrong-target':lambda a:a['target'].update(version='other'),
             'failed-update':lambda a:a['update_status'].update(phase='Failed'),
             'new-run':lambda a:a['agents']['agent'].update(run='new-run'),
@@ -1211,6 +1219,145 @@ class UpdateCompleted(unittest.TestCase):
                     status.write_text(json.dumps({"phase": phase, "version": version, "refusal": refusal,
                                                   "message": "could not configure the daemon connection"}))
                     self.assertEqual(len(run.update_completed(directory, "2.0.0")), failures)
+
+
+class ShownUpdateOutcome(unittest.TestCase):
+    def observation(self, *texts):
+        return {"runs": [{"text": text} for text in texts]}
+
+    def test_a_window_showing_a_failure_or_refusal_fails_and_a_confirmation_is_read(self):
+        import rehearse_update_run as run
+        failed, updated = run.shown_update_outcome({
+            "main": self.observation("Update failed: the running cagents service uses protocol 203."),
+            "second": self.observation("Updated", "to cagents", "2.0.0"),
+            "empty": self.observation("Update not installed: 1 agent is working"),
+            "quiet": self.observation("Channels", "New chat"),
+        }, "2.0.0")
+        self.assertEqual(failed, {"main": "Update failed", "empty": "Update not installed"})
+        self.assertEqual(updated, ["second"])
+
+    def test_a_confirmation_for_another_version_is_not_this_update(self):
+        import rehearse_update_run as run
+        self.assertEqual(run.shown_update_outcome({"main": self.observation("Updated to cagents 1.9.0")}, "2.0.0"),
+                         ({}, []))
+
+    def test_a_notices_control_fails_on_an_error_or_an_update_warning_only(self):
+        import rehearse_update_run as run
+        self.assertEqual(run.notices_problem("Application errors", "Could not open a file", "2.0.0"),
+                         "Application errors")
+        self.assertIsNone(run.notices_problem("Application notices: success", "Updated to cagents 2.0.0", "2.0.0"))
+        self.assertEqual(run.notices_problem("Application notices",
+                                             "The update couldn't reopen every saved session, so", "2.0.0"),
+                         "Application notices")
+        self.assertIsNone(run.notices_problem("Application notices", "Provider login expires soon", "2.0.0"))
+        self.assertEqual(run.shown_update_outcome({"main": self.observation("Updated to cagents 2.0.41")}, "2.0.4"),
+                         ({}, []))
+
+    def rehearsal(self, root, status, tooltips, shown=None):
+        """A rehearsal whose one window shows SHOWN while watched, then TOOLTIPS[x] when its header is hovered at x."""
+        import rehearse_update_run as run
+        state = root / "home/.local/share/cagents-install/.update"
+        state.mkdir(parents=True)
+        (state / "status.json").write_text(json.dumps(status))
+        rehearsal = run.Rehearsal.__new__(run.Rehearsal)
+        rehearsal.root, rehearsal.errors = root, []
+        rehearsal.update_worker_running = lambda: False
+        rehearsal.mapped = lambda: {"main": {"id": 1}}
+        rehearsal.actions = []
+        pointer = {"x": None, "popover": False}
+        def call(*args, **_):
+            rehearsal.actions.append(args)
+            if args[:2] == ("drive", "hover"):
+                pointer["x"] = int(args[2].split(",")[0])
+            elif args[:2] == ("drive", "click"):
+                pointer["popover"] = tooltips.get("opens", True)
+            elif args[:2] == ("drive", "key"):
+                pointer["popover"] = False
+            elif args[:2] == ("drive", "--json"):
+                text = tooltips.get(pointer["x"], shown or "Channels")
+                if pointer["popover"]:
+                    text = "Application notices " + tooltips.get("popover", "")
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": text}]})
+            return 0, ""
+        rehearsal.call = call
+        return rehearsal
+
+    def test_a_failure_only_in_a_header_tooltip_fails_the_rehearsal(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Failed", "version": "2.0.0"},
+                                       {1136: "Update failed: protocol 203. Check again"})
+            with patch.object(run.time, "sleep"):
+                failed, _ = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual(failed, {"main": "Update failed"})
+            self.assertIn('main window shows "Update failed"', rehearsal.errors[0])
+            self.assertIn(("drive", "hover", "1136,21"), rehearsal.actions)
+
+    def test_a_success_notice_is_opened_read_and_closed_and_does_not_fail(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"},
+                                       {1136: "Application notices: success",
+                                        "popover": "Updated to cagents 2.0.0"})
+            with patch.object(run.time, "sleep"):
+                failed, updated = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual((failed, updated, rehearsal.errors), ({}, ["main"], []))
+            self.assertIn(("drive", "key", "Escape"), rehearsal.actions)
+
+    def test_the_header_scan_must_find_the_offered_update_before_it_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Starting", "version": "2.0.0"},
+                                       {1112: "Update to 2.0.0 (saves and restarts application windows)"})
+            self.assertIn("Update to 2.0.0", rehearsal.header_offers_update("2.0.0"))
+            self.assertEqual(rehearsal.errors, [])
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Starting", "version": "2.0.0"}, {})
+            self.assertIsNone(rehearsal.header_offers_update("2.0.0"))
+            self.assertIn("would prove nothing", rehearsal.errors[0])
+
+    def test_a_notices_popover_that_does_not_open_is_an_unknown_outcome(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"},
+                                       {1136: "Application notices", "opens": False})
+            with patch.object(run.time, "sleep"):
+                rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertIn("main window could not be observed", rehearsal.errors[0])
+
+    def test_a_window_never_observed_is_an_unknown_outcome(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"}, {})
+            rehearsal.mapped = lambda: {"main": {"id": 2}}
+            with patch.object(run.time, "sleep"):
+                rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertIn("main window could not be observed", rehearsal.errors[0])
+
+    def test_watching_waits_for_the_worker_to_exit_before_settling(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "home/.local/share/cagents-install/.update"
+            state.mkdir(parents=True)
+            (state / "status.json").write_text(json.dumps({"phase": "Failed", "version": "2.0.0"}))
+            rehearsal = run.Rehearsal.__new__(run.Rehearsal)
+            rehearsal.root, rehearsal.errors = root, []
+            # OLD's worker records Failed early, then verifies the reopened windows.
+            working = iter([True, True, False])
+            rehearsal.update_worker_running = lambda: next(working, False)
+            rehearsal.mapped = lambda: {"main": {"id": 1}, "ceditor": {"id": 9}}
+            shown = iter(["Channels", "Channels", "Update failed: protocol 203"])
+            def call(*args, **_):
+                if args[:2] == ("drive", "--json"):
+                    return 0, json.dumps({"window": {"id": 1}, "runs": [{"text": next(shown, "Channels")}]})
+                return 0, ""
+            rehearsal.call = call
+            with patch.object(run.time, "sleep"):
+                failed, updated = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual((failed, updated), ({"main": "Update failed"}, []))
+            self.assertIn('main window shows "Update failed"', rehearsal.errors[0])
+            evidence = json.loads((root / "records/after/update-shown.json").read_text())
+            self.assertEqual([row["worker"] for row in evidence["rounds"]], [True, True, False])
 
 
 class CandidateNamespace(unittest.TestCase):
