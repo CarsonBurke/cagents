@@ -75,14 +75,7 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
             Target::Automation { .. } => "Open history",
             _ => "Open conversation",
         },
-        needs_input: matches!(
-            event.evidence.kind,
-            Kind::Waiting
-                | Kind::ReviewRequested
-                | Kind::MessageReceived
-                | Kind::AutomationPaused
-                | Kind::AutomationBlocked
-        ),
+        needs_input: event.evidence.kind.asks(),
     }
 }
 

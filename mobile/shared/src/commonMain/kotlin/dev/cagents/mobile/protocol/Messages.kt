@@ -405,6 +405,7 @@ data class NoticeList(val notices: List<Notice> = emptyList())
 data class Notice(
     val id: String,
     val kind: NoticeKind = NoticeKind.Unknown,
+    val asks: Boolean = kind.legacyAsks,
     val title: String = "",
     val session: String? = null,
     val conversation: String? = null,
@@ -425,6 +426,13 @@ enum class NoticeKind(override val wire: String) : WireEnum {
     AutomationPaused("automation_paused"),
     AutomationBlocked("automation_blocked"),
     Unknown("");
+
+    /** Classification for bridges that omit `asks`. */
+    internal val legacyAsks: Boolean
+        get() = when (this) {
+            Waiting, ReviewRequested, MessageReceived, AutomationPaused, AutomationBlocked -> true
+            else -> false
+        }
 
     object Serializer : WireEnumSerializer<NoticeKind>("NoticeKind", entries, Unknown)
 }

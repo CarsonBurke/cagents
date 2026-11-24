@@ -66,7 +66,7 @@ data class SessionOverview(
             // Notices arrive newest first. Only those asking something of the
             // person are cards; an outcome is marked on its session's row, and
             // one notice per session stands for the older ones.
-            val (asks, outcomeNotices) = notices.partition { it.kind in ASKS }
+            val (asks, outcomeNotices) = notices.partition { it.asks }
             val (reviews, requests) = asks.partition { it.kind == NoticeKind.ReviewRequested }
             // A request whose session has moved on (answered, or closed)
             // no longer asks anything.
@@ -110,14 +110,5 @@ data class SessionOverview(
                 outcomes = outcomes,
             )
         }
-
-        /** Notice kinds that ask something of the person, as on the desktop. */
-        private val ASKS = setOf(
-            NoticeKind.Waiting,
-            NoticeKind.ReviewRequested,
-            NoticeKind.MessageReceived,
-            NoticeKind.AutomationPaused,
-            NoticeKind.AutomationBlocked,
-        )
     }
 }

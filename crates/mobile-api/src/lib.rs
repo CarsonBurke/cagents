@@ -720,6 +720,9 @@ pub struct Notifications {
 pub struct Notice {
     pub id: String,
     pub kind: NoticeKind,
+    /// Whether the notice asks something of the person reading it.
+    #[serde(default)]
+    pub asks: bool,
     /// A short heading, such as `Agent needs your attention`.
     pub title: String,
     /// The session it is about, when it is about one.
