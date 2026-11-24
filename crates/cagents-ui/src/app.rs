@@ -9642,6 +9642,8 @@ impl Cagents {
         }
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = projection_stage!("chrome", self.sync_chrome());
+        // The open palette lists panes by their chrome's titles.
+        projection_stage!("palette", self.refresh_palette());
         let terminal_probes =
             projection_stage!("transcript_probes", self.terminal_transcript_probes());
         // Another project shown, or a review or the workspace switcher closed.
@@ -20482,6 +20484,7 @@ impl Cagents {
                     }
                     _ => projection_stage!("chrome", self.sync_chrome()),
                 };
+                projection_stage!("palette", self.refresh_palette());
                 phase.mark("selected_chrome");
                 let snapshot = if matches!(projection, Projection::ScopedChrome(_)) {
                     self.arm_replica_capture()

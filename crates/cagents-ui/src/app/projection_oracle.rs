@@ -174,6 +174,8 @@ pub(super) struct Snapshot {
     /// The source control, branch comparison and history reads that are
     /// current: binding the source control to other work cancels them.
     source_reads: String,
+    /// The open palette's results, which name panes as their chrome does.
+    palette: String,
 }
 
 impl Snapshot {
@@ -233,6 +235,7 @@ impl Snapshot {
                 app.branch_ui.projection_view(),
                 app.history_ui.projection_view(),
             ),
+            palette: app.palette.projection_view(),
         }
     }
 
@@ -274,6 +277,7 @@ impl Snapshot {
             terminal_directories,
             terminal_finds,
             source_reads,
+            palette,
         );
         differences
     }
