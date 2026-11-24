@@ -3846,6 +3846,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         self.git_read(worktree, arguments)
     }
 
+    /// Resolve the current worktree without gathering repository metadata.
+    /// Selecting the Git directory itself still uses full discovery to find
+    /// its registered checkout.
+    pub fn discover_worktree_root(
+        &self,
+        selected_path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PathBuf>, RepositoryError> {
+        match self.invocation_worktree(selected_path, cancellation) {
+            Ok(root) => Ok(Some(root)),
+            Err(error) if cancellation.is_cancelled() => Err(error),
+            Err(_) => Ok(self.discover(selected_path, cancellation)?.worktree_root),
+        }
+    }
+
     pub fn discover(
         &self,
         selected_path: &Path,
@@ -3878,12 +3893,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 &inside_output,
             )?;
             Some(if inside_work_tree {
-                let command = self.worktree_root_command(selected_path);
-                let output = self.run_checked(&command, cancellation)?;
-                attach_repository_process(
-                    parse_path_line(&output.stdout, "worktree_root"),
-                    &output,
-                )?
+                self.invocation_worktree(selected_path, cancellation)?
             } else {
                 // The selected path is the Git directory itself, which has no
                 // current work tree to be asked about. The repository still
