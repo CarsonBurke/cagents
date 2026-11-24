@@ -1,9 +1,10 @@
-//! One attachment in the composer's tray: a thumbnail, or a chip for a file,
-//! that the keyboard reaches with Tab.
+//! One attachment in the composer's tray: an image's chip or a file's, that
+//! the keyboard reaches with Tab.
 //!
-//! At rest it shows only its face. While the pointer is over it, while it
-//! holds keyboard focus, or while the composer's caret is on its `[Image N]`
-//! reference, it also shows its label and its remove (×) button. Click,
+//! At rest it shows only its face, which names the attachment itself. While
+//! the pointer is over it, while it holds keyboard focus, or while the
+//! composer's caret is on its `[Image N]` reference, it also shows its
+//! overlay, where one is given, and its remove (×) button. Click,
 //! Enter or Space opens it; Delete or Backspace removes it; the message's
 //! undo and redo chords reach the message's history. The × sits
 //! inside the tile, so it never reaches over a neighbour or the tray's edge.
