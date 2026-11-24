@@ -747,5 +747,50 @@ class ReleaseCut(unittest.TestCase):
         self.assertFalse(any(line.startswith("pr ") for line in self.log("gh.log")))
 
 
+    def test_cut_for_actions_tags_the_chosen_commit_and_copies_and_signs_nothing(self):
+        self.bundle(self.fix)
+        result = self.release("cut", "--actions")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), self.fix)
+        self.assertIn("Something people asked for", result.stdout)
+        self.assertIn("scripts/release publish 0.2.4 --actions", result.stdout)
+        self.assertFalse((self.root / "bundles/0.2.4").exists())
+        self.assertFalse(any(line.startswith("ssh-keygen") for line in self.log("calls.log")))
+        # Actions signs; a local key has no place in it.
+        refused = self.release("cut", "--actions", "--key", str(self.root / "key"))
+        self.assertIn("drop --key", refused.stderr)
+
+    def test_publish_in_actions_pushes_the_tag_and_starts_the_next_version_once_published(self):
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--actions").returncode, 0)
+        self.git("push", "-q", "origin", "main")
+        self.assertIn("not published", self.release("publish", "0.2.4", "--actions", stdin="0.2.3\n").stderr)
+        self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}", cwd=self.origin), self.fix)
+        self.assertIn("run scripts/release publish 0.2.4 --actions again", result.stdout)
+        # Nothing is published here, and main keeps its version until Actions publishes.
+        self.assertFalse(any(line.startswith(("publish-release", "land-pr")) for line in self.log("calls.log")))
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertIn("is pushed and not published yet", result.stdout)
+        self.assertFalse(any(line.startswith("land-pr") for line in self.log("calls.log")))
+        (self.root / "release-draft").write_text("false\n")
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("published already", result.stdout)
+        self.assertIn("land-pr 77 -R CarsonBurke/cagents", self.log("calls.log"))
+
+    def test_publish_in_actions_refuses_a_tag_off_main(self):
+        self.git("checkout", "-q", "-b", "side")
+        side = self.commit("feat(side): never merged")
+        self.git("checkout", "-q", "main")
+        self.git("tag", "-a", "v0.2.4", "-m", "v0.2.4", side)
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a commit on main", result.stderr)
+        self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
+
+
 if __name__ == "__main__":
     unittest.main()

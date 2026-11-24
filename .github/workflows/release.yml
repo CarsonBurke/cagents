@@ -1,0 +1,145 @@
+name: Release
+
+# A pushed release tag on a main commit is built, signed and published here,
+# once the release before it trusts the Actions signing key. Until then (the
+# 0.2.4 release), and for any change of trusted keys, admission says so and a
+# release is signed locally. Run by hand, it only builds the chosen commit, to
+# rehearse a release build. See docs/releasing.md#signing-in-github-actions.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time, and a started one always finishes.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  admit:
+    name: Admit the tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.admit.outputs.version }}
+      commit: ${{ steps.admit.outputs.commit }}
+      sign: ${{ steps.admit.outputs.sign }}
+    steps:
+      - name: Check out the tagged commit with its history and tags
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide whether Actions signs it
+        id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY }}
+          RELEASE_TRUSTED_KEYS: ${{ vars.RELEASE_TRUSTED_KEYS }}
+        run: scripts/release-actions admit "$GITHUB_REF_NAME"
+
+  build:
+    name: Build the release
+    needs: admit
+    # A rehearsal, run by hand, has no admission and is never signed.
+    if: >-
+      !cancelled() && (needs.admit.outputs.sign == 'true'
+      || (github.event_name == 'workflow_dispatch' && needs.admit.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Check out the tagged commit with its history and tags
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the runner for rootless release builds
+        run: .github/release-runner-setup
+      - name: Build, package and smoke-test the tagged source
+        env:
+          CAGENTS_RELEASE_CACHE: /mnt/cagents/release-cache
+          CAGENTS_RELEASE_SMOKE_CACHE: /mnt/cagents/smoke-cache
+          TMPDIR: /mnt/cagents/tmp
+          REF: ${{ github.event_name == 'push' && github.ref_name || github.sha }}
+        run: scripts/build-release-linux --ref "$REF" --output /mnt/cagents/dist
+      - name: Keep the bundle for signing
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle
+          path: /mnt/cagents/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Sign the metadata
+    needs: [admit, build]
+    if: github.event_name == 'push' && needs.admit.outputs.sign == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Only this job can read the signing key, and only for a tag that the
+    # environment's deployment policy allows.
+    environment: release
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Take this run's bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle
+          path: ${{ runner.temp }}/dist
+      - name: Check the bundle and sign its metadata
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY }}
+          VERSION: ${{ needs.admit.outputs.version }}
+          COMMIT: ${{ needs.admit.outputs.commit }}
+        run: scripts/release-actions sign "$RUNNER_TEMP/dist" "$VERSION" "$COMMIT"
+      - name: Keep the signature
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signature
+          path: ${{ runner.temp }}/dist/release-metadata.json.sig
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the release
+    needs: [admit, build, sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tagged commit with its history and tags
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the runner for the offline smoke install
+        run: .github/release-runner-setup
+      - name: Take this run's bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle
+          path: /mnt/cagents/dist
+      - name: Take its signature
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signature
+          path: /mnt/cagents/dist
+      - name: Verify everything again, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CAGENTS_RELEASE_SMOKE_CACHE: /mnt/cagents/smoke-cache
+          TMPDIR: /mnt/cagents/tmp
+          VERSION: ${{ needs.admit.outputs.version }}
+        run: |
+          scripts/prepare-release-smoke-rootfs >/dev/null
+          scripts/publish-release --version "$VERSION" --dist /mnt/cagents/dist

@@ -150,7 +150,9 @@ smoke-tested: fw16 prebuilds main's newest compiled commit in the background
 ([Prebuilding release bundles](development.md#prebuilding-release-bundles)).
 Main always declares the next version: publishing a release opens and lands the
 pull request that starts the next patch version. A release goes out in three
-steps, each through `mise run release` (`scripts/release --help`):
+steps, each through `mise run release` (`scripts/release --help`). From 0.2.5
+on, GitHub Actions builds, signs and publishes it instead; see
+[Signing in GitHub Actions](#signing-in-github-actions).
 
 1. `mise run release -- cut --key KEY` picks the newest bundle of main whose
    tests passed in main's sentinel. It shows how many commits that bundle is
@@ -330,6 +332,103 @@ that release with a key that every build of the current generation trusts,
 such as the security key, then sign later releases with the remaining keys.
 Builds that have not yet installed it still trust the dropped key, and its
 holder can sign updates for them until they do.
+
+### Signing in GitHub Actions
+
+From 0.2.5 on, releases are built, signed and published by the Release
+workflow (`.github/workflows/release.yml`) with a plain `ssh-ed25519` key that
+only GitHub holds, so publishing needs no touch. The security key stays listed
+in `release-keys.pub` as the recovery key, and signs locally whatever Actions
+may not:
+
+1. `mise run release -- cut --actions` picks the commit as above and tags it
+   `vVERSION` locally. It copies and signs nothing.
+2. `mise run release -- publish VERSION --actions` checks the tag as the
+   workflow's admission will, and pushes it only if Actions would sign it.
+   That starts the workflow, and the command prints the run's page. Run it
+   again once the release is published: it then lands the next version's bump
+   as `publish` does. Until then it exits non-zero.
+
+The workflow's jobs:
+
+- **admit** proceeds only for a tag on a commit on main whose manifests declare
+  the tag's version, which is newer than every published release and not
+  published itself. It signs in Actions only when all of these hold:
+  - the previous release trusts the Actions key;
+  - the tag is of the previous release's trust generation;
+  - the tagged `release-keys.pub` lists exactly the repository variable
+    `RELEASE_TRUSTED_KEYS`.
+
+  Otherwise it stops and says why, and the release is cut, signed and
+  published locally as above, under the same tag. That is the case for 0.2.4,
+  for any change of trusted keys or generation, and when no Actions key is
+  configured.
+- **build** has no secrets. It builds, packages and smoke-tests the tagged
+  source with `scripts/build-release-linux`, as fw16 does.
+- **sign** is the only job that can read the key: the environment secret
+  `RELEASE_SIGNING_KEY` of the `release` environment, which deploys only from
+  `v*` tags. It checks this run's bundle against its metadata, version and
+  commit, signs the metadata in memory-backed storage, and checks the signature
+  against `RELEASE_SIGNING_PUBLIC_KEY`.
+- **publish** runs `scripts/publish-release` with the workflow's token. It
+  repeats every check, including the keys of every build that reads the
+  release and the bridges it carries.
+
+Run by hand (`gh workflow run release.yml --ref main`), the workflow only
+builds that commit, to rehearse a release build; nothing is signed.
+
+One-time setup, by the repository owner. First make a fine-grained personal
+access token at <https://github.com/settings/personal-access-tokens/new>:
+
+- Repository access: only `CarsonBurke/cagents`.
+- Expiration: one day.
+- Repository permissions: Environments, Secrets and Variables, read and write.
+
+Then run:
+
+```sh
+repo=CarsonBurke/cagents
+# The environment that holds the key, usable only from release tags.
+gh api -X PUT repos/$repo/environments/release --input - <<< \
+  '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
+gh api -X POST repos/$repo/environments/release/deployment-branch-policies -f name='v*' -f type=tag
+# Release tags cannot be moved or deleted.
+gh api -X POST repos/$repo/rulesets --input - <<< \
+  '{"name":"Release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"update"}]}'
+# The token, usable only by a workflow on main.
+gh api -X PUT repos/$repo/environments/release-keygen --input - <<< \
+  '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
+gh api -X POST repos/$repo/environments/release-keygen/deployment-branch-policies -f name=main -f type=branch
+gh secret set RELEASE_KEYGEN_TOKEN --env release-keygen -R $repo   # paste the token
+# Make the key inside a workflow run, so nobody sees its private half.
+gh workflow run release-signing-key.yml -R $repo --ref main
+```
+
+The Release signing key workflow (`scripts/release-actions keygen`) refuses
+if a key exists. It stores the private key as the `release` environment's
+secret. It stores the public key, and the keys releases may trust, as the
+repository variables `RELEASE_SIGNING_PUBLIC_KEY` and `RELEASE_TRUSTED_KEYS`.
+However it ends, it deletes `RELEASE_KEYGEN_TOKEN`. It then prints the line to
+add to `release-keys.pub`. GITHUB_TOKEN cannot write secrets, hence the
+temporary token; revoke it once the run is done. Merge that line before
+cutting 0.2.4, which the security key signs. From 0.2.5 on, Actions signs.
+
+What this does not protect against: GitHub, and whoever can administer the
+repository, are trusted. A holder of an admin or write token can push a tag
+whose workflow is changed, change the environment's policy, or have a job
+print the secret, and so sign any release. The checks above stop mistakes
+and a tag off main, not a determined administrator.
+
+To recover from a leaked Actions key:
+
+1. Delete the secret and the variables.
+2. Run the key workflow again for a new key.
+3. Begin a new trust generation (above) whose `release-keys.pub` lists the
+   security key and the new key, but not the leaked one. Set
+   `RELEASE_TRUSTED_KEYS` to that list, then cut, sign with the security key,
+   and publish it locally.
+
+Releases after it are signed in Actions again.
 
 A signature proves who made a release, not that it is the newest. Whoever can
 publish on GitHub can point `latest` at an older signed release: installed

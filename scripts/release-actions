@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# The checks and the signing step of the release workflow
+# (.github/workflows/release.yml). See docs/releasing.md#signing-in-github-actions.
+#
+#   admit TAG     Decide whether GitHub Actions signs the release tagged TAG,
+#                 which this checkout has: its commit is on main, it declares
+#                 the tag's version, that version is newer than every
+#                 published release and not published itself, the release
+#                 before it trusts the Actions key (else it is signed locally
+#                 with a key that release trusts), and the keys its source
+#                 trusts are exactly RELEASE_TRUSTED_KEYS. Writes version=
+#                 and sign=true|false to $GITHUB_OUTPUT when set.
+#   keygen        Make the Actions signing key in memory, store it as the
+#                 release environment's secret RELEASE_SIGNING_KEY, and its
+#                 public half and the keys releases may then trust as the
+#                 repository variables RELEASE_SIGNING_PUBLIC_KEY and
+#                 RELEASE_TRUSTED_KEYS (the security key main lists, and this
+#                 one), with GH_TOKEN, which must be allowed to write them.
+#                 Refuses when the secret exists. Deletes the repository
+#                 secret RELEASE_KEYGEN_TOKEN afterwards.
+#   sign DIR VERSION COMMIT
+#                 Check the bundle DIR against its metadata, then sign the
+#                 metadata with the key in RELEASE_SIGNING_KEY and check the
+#                 signature against RELEASE_SIGNING_PUBLIC_KEY.
+set -euo pipefail
+
+PROGRAM=release-actions
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPOSITORY=${CAGENTS_RELEASE_GITHUB_REPOSITORY:-CarsonBurke/cagents}
+VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+MANIFESTS=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
+export LC_ALL=C
+SCRATCH=
+
+# Memory-backed scratch for a private key, removed however the script ends.
+make_scratch() {
+    SCRATCH=$(mktemp -d "${CAGENTS_SIGNING_SCRATCH:-/dev/shm}/cagents-$1.XXXXXX")
+    trap 'rm -rf -- "$SCRATCH"' EXIT
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+notice() {
+    printf '%s: %s\n' "$PROGRAM" "$*"
+    if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; fi
+}
+
+output() {
+    if [[ -n ${GITHUB_OUTPUT:-} ]]; then printf '%s\n' "$@" >> "$GITHUB_OUTPUT"; fi
+}
+
+repository_git() (
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    git -C "$ROOT_DIR" "$@"
+)
+
+# A key list's keys, `TYPE BASE64` per line, sorted, without comments.
+keys_of() {
+    sed -n 's/^[[:space:]]*\(ssh-ed25519\|sk-ssh-ed25519@openssh\.com\) \([A-Za-z0-9+/=]*\).*$/\1 \2/p' <<< "$1" | sort -u
+}
+
+keys_at() {
+    keys_of "$(repository_git show "$1:src/update/release-keys.pub" 2>/dev/null || :)"
+}
+
+# Whether version $1 comes after version $2.
+version_after() {
+    [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
+}
+
+admit() {
+    local tag=$1 version sha manifest declared published newest previous actions trusted at_commit
+    [[ $tag =~ ^v(.*)$ && ${BASH_REMATCH[1]} =~ $VERSION_PATTERN ]] || fail "$tag is not a release tag"
+    version=${tag#v}
+    sha=$(repository_git rev-parse --verify --quiet "refs/tags/$tag^{commit}") || fail "this checkout has no tag $tag"
+    if [[ -n ${GITHUB_SHA:-} && $GITHUB_SHA != "$sha" ]]; then
+        fail "$tag resolves to $sha, not the pushed $GITHUB_SHA"
+    fi
+    for manifest in "${MANIFESTS[@]}"; do
+        repository_git cat-file -e "$sha:$manifest" 2>/dev/null || continue
+        declared=$(repository_git show "$sha:$manifest" | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}')
+        [[ $declared == "$version" ]] || fail "$manifest at $tag declares ${declared:-no version}, not $version"
+    done
+    repository_git fetch --quiet origin main || fail 'cannot fetch main'
+    repository_git merge-base --is-ancestor "$sha" FETCH_HEAD || fail "$tag is not a commit on main"
+    published=$(gh release list -R "$REPOSITORY" --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName') \
+        || fail 'cannot list the published releases'
+    if grep -qxF -- "$tag" <<< "$published"; then
+        fail "$tag is published already; a version is signed once"
+    fi
+    newest=$(sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' <<< "$published" | sort -V | tail -n1)
+    if [[ -n $newest ]]; then
+        version_after "$version" "$newest" || fail "$version is not newer than the published $newest"
+    fi
+    output "version=$version" "commit=$sha"
+
+    actions=$(keys_of "${RELEASE_SIGNING_PUBLIC_KEY:-}")
+    if [[ -z $actions ]]; then
+        notice "No Actions signing key is configured (RELEASE_SIGNING_PUBLIC_KEY), so $tag is signed locally."
+        output sign=false
+        return
+    fi
+    [[ $(wc -l <<< "$actions") == 1 ]] || fail 'RELEASE_SIGNING_PUBLIC_KEY must be one key'
+    previous=$(repository_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) || previous=
+    # Builds of the previous release verify this one with that release's keys.
+    if [[ -z $previous ]] || ! grep -qxF -- "$actions" <(keys_at "$previous"); then
+        notice "${previous:-No earlier release} does not trust the Actions key, so its builds could not verify $tag: it is signed locally with a key they trust."
+        output sign=false
+        return
+    fi
+    at_commit=$(keys_at "$sha")
+    if ! grep -qxF -- "$actions" <<< "$at_commit"; then
+        notice "$tag no longer trusts the Actions key, so it is signed locally."
+        output sign=false
+        return
+    fi
+    trusted=$(keys_of "${RELEASE_TRUSTED_KEYS:-}")
+    [[ -n $trusted ]] || fail 'RELEASE_TRUSTED_KEYS is not configured'
+    [[ $at_commit == "$trusted" ]] \
+        || fail "src/update/release-keys.pub at $tag lists other keys than RELEASE_TRUSTED_KEYS; a change of trusted keys is signed locally with the security key"
+    notice "Admitted $tag ($sha) for signing in Actions."
+    output sign=true
+}
+
+sign() {
+    local dist=$1 version=$2 commit=$3 private public
+    [[ $version =~ $VERSION_PATTERN && $commit =~ ^[0-9a-f]{40}$ ]] || fail 'sign needs DIR VERSION COMMIT'
+    [[ ! -e $dist/release-metadata.json.sig ]] || fail "$dist is signed already"
+    "$ROOT_DIR/scripts/release-metadata" check --dir "$dist" --version "$version" --source-commit "$commit" >/dev/null \
+        || fail 'the bundle does not match its metadata, version or commit'
+    public=$(keys_of "${RELEASE_SIGNING_PUBLIC_KEY:-}")
+    [[ -n $public && $(wc -l <<< "$public") == 1 ]] || fail 'RELEASE_SIGNING_PUBLIC_KEY must be one key'
+    [[ -n ${RELEASE_SIGNING_KEY:-} ]] || fail 'RELEASE_SIGNING_KEY is not available to this job'
+    # The key lives only in memory-backed storage, and only while it signs.
+    make_scratch sign
+    private=$SCRATCH/key
+    (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$private")
+    ssh-keygen -q -Y sign -n cagents-release -f "$private" "$dist/release-metadata.json" >/dev/null 2>&1 \
+        || fail 'cannot sign the metadata'
+    rm -f -- "$private"
+    printf 'cagents-release namespaces="cagents-release" %s\n' "$public" > "$SCRATCH/allowed"
+    ssh-keygen -q -Y verify -f "$SCRATCH/allowed" -I cagents-release -n cagents-release \
+        -s "$dist/release-metadata.json.sig" < "$dist/release-metadata.json" >/dev/null \
+        || { rm -f -- "$dist/release-metadata.json.sig"; fail 'the signature does not verify with RELEASE_SIGNING_PUBLIC_KEY'; }
+    notice "Signed the metadata of $version ($(sha256sum < "$dist/release-metadata.json" | cut -d' ' -f1))."
+}
+
+keygen() {
+    local repository=$REPOSITORY public trusted
+    [[ -n ${GH_TOKEN:-} ]] || fail 'keygen needs GH_TOKEN (the RELEASE_KEYGEN_TOKEN secret)'
+    if gh secret list --env release -R "$repository" --json name --jq '.[].name' | grep -qx RELEASE_SIGNING_KEY; then
+        fail 'the release environment has a signing key already; delete it first to make another'
+    fi
+    make_scratch keygen
+    ssh-keygen -q -t ed25519 -N '' -C cagents-release-actions -f "$SCRATCH/key"
+    public=$(keys_of "$(cat "$SCRATCH/key.pub")")
+    gh secret set RELEASE_SIGNING_KEY --env release -R "$repository" < "$SCRATCH/key" >/dev/null \
+        || fail 'cannot store the signing key'
+    rm -f -- "$SCRATCH/key"
+    trusted=$(printf '%s\n%s\n' "$(keys_at HEAD)" "$public" | sed '/^$/d' | sort -u)
+    gh variable set RELEASE_SIGNING_PUBLIC_KEY -R "$repository" --body "$public" >/dev/null \
+        || fail 'cannot store the public key'
+    gh variable set RELEASE_TRUSTED_KEYS -R "$repository" --body "$trusted" >/dev/null \
+        || fail 'cannot store the trusted keys'
+    gh secret delete RELEASE_KEYGEN_TOKEN -R "$repository" >/dev/null 2>&1 \
+        || notice 'Delete the repository secret RELEASE_KEYGEN_TOKEN; it is no longer needed.'
+    notice "Stored the Actions release signing key. Add this line to src/update/release-keys.pub:"
+    notice ""
+    notice "    $public cagents-release-actions"
+}
+
+case ${1:-} in
+    keygen) (($# == 1)) || fail 'usage: keygen'; keygen ;;
+    admit) (($# == 2)) || fail 'usage: admit TAG'; admit "$2" ;;
+    sign) (($# == 4)) || fail 'usage: sign DIR VERSION COMMIT'; sign "$2" "$3" "$4" ;;
+    -h|--help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p;}' "$0" ;;
+    *) fail 'usage: release-actions admit TAG | sign DIR VERSION COMMIT | keygen' ;;
+esac
