@@ -439,10 +439,9 @@ impl Store {
     ))]
     fn remove_orphans(&self, registry: &Registry) -> Result<(), String> {
         let mut unrecognized = false;
-        // One past the bound is enough to report that it was exceeded.
-        let names =
-            fs_safety::directory_entries_beneath(&self.root, Path::new(""), MAX_STORE_IMAGES + 130)
-                .map_err(storage_error)?;
+        // The entry one past the bound is the first this ever refuses.
+        let (names, _) = fs_safety::first_entries_within(&self.root, MAX_STORE_IMAGES + 130)
+            .map_err(storage_error)?;
         for (count, name) in names.into_iter().enumerate() {
             if count > MAX_STORE_IMAGES + 128 {
                 return Err("Image storage has too many unrecognized files.".into());

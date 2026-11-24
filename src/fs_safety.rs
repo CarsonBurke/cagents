@@ -628,8 +628,9 @@ pub(crate) fn directory_unlinked(directory: &Root) -> io::Result<bool> {
 /// APFS keeps a removed directory's link count, and `F_GETPATH` keeps its last
 /// name, so Darwin asks the filesystem to name the object id instead: a
 /// renamed directory has a path and a removed one has none. The descriptor
-/// keeps the id from being reused. A filesystem that cannot look up object
-/// ids reports an error rather than a guess.
+/// keeps the id from being reused. Only APFS and HFS+ are trusted to answer:
+/// elsewhere an inode number need not be an object id, so a missing path
+/// proves nothing and the directory is reported as not shown removed.
 #[cfg(target_os = "macos")]
 pub(crate) fn directory_unlinked(directory: &Root) -> io::Result<bool> {
     unsafe extern "C" {
@@ -640,7 +641,13 @@ pub(crate) fn directory_unlinked(directory: &Root) -> io::Result<bool> {
             object: u64,
         ) -> libc::ssize_t;
     }
-    let mut fsid = filesystem_id(directory)?;
+    let filesystem = filesystem_of(directory)?;
+    // SAFETY: statfs NUL-terminates the type name within its array.
+    let kind = unsafe { std::ffi::CStr::from_ptr(filesystem.f_fstypename.as_ptr()) };
+    if !matches!(kind.to_bytes(), b"apfs" | b"hfs") {
+        return Ok(false);
+    }
+    let mut fsid = filesystem.f_fsid;
     let object = std::os::unix::fs::MetadataExt::ino(&directory.metadata()?);
     let mut path = vec![0 as libc::c_char; libc::PATH_MAX as usize];
     // SAFETY: the buffer and fsid outlive the call, which writes at most
@@ -655,16 +662,16 @@ pub(crate) fn directory_unlinked(directory: &Root) -> io::Result<bool> {
     Err(error)
 }
 
-/// The mounted filesystem instance holding a retained descriptor.
+/// The mounted filesystem holding a retained descriptor.
 #[cfg(target_os = "macos")]
-fn filesystem_id(directory: &Root) -> io::Result<libc::fsid_t> {
+fn filesystem_of(directory: &Root) -> io::Result<libc::statfs> {
     let mut metadata = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     // SAFETY: the Root retains its descriptor and fstatfs fills the buffer.
     if unsafe { libc::fstatfs(directory.descriptor(), metadata.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: fstatfs succeeded, so the buffer is initialized.
-    Ok(unsafe { metadata.assume_init() }.f_fsid)
+    Ok(unsafe { metadata.assume_init() })
 }
 
 /// Removes only an empty direct child through its retained parent.
@@ -745,7 +752,23 @@ pub fn directory_entries_beneath(
     } else {
         resolve_directory(root, relative)?
     };
-    entry_names(&directory, limit)
+    match entry_names(&directory, limit)? {
+        (names, false) => Ok(names),
+        (_, true) => Err(ResolveError::message(
+            directory.path(),
+            "directory entry limit exceeded",
+        )),
+    }
+}
+
+/// The first `limit` direct child names of a retained directory, and whether
+/// it holds more, for a caller that handles an oversized directory itself.
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+pub(crate) fn first_entries_within(
+    directory: &Root,
+    limit: usize,
+) -> Result<(Vec<OsString>, bool), ResolveError> {
+    entry_names(directory, limit)
 }
 
 /// Lists the direct children of a retained directory through that descriptor,
@@ -754,7 +777,7 @@ pub fn directory_entries_beneath(
 /// The directory is reopened for reading through its descriptor (see
 /// [`reopen_directory_for_reading`]), and `fdopendir` then owns that new
 /// descriptor for the whole enumeration.
-pub(crate) fn entry_names(directory: &Root, limit: usize) -> Result<Vec<OsString>, ResolveError> {
+fn entry_names(directory: &Root, limit: usize) -> Result<(Vec<OsString>, bool), ResolveError> {
     let reported = directory.path();
     let descriptor = reopen_directory_for_reading(directory)
         .map_err(|error| ResolveError::io(reported, &error))?;
@@ -777,7 +800,7 @@ pub(crate) fn entry_names(directory: &Root, limit: usize) -> Result<Vec<OsString
         if entry.is_null() {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(0) {
-                return Ok(names);
+                return Ok((names, false));
             }
             return Err(ResolveError::io(reported, &error));
         }
@@ -788,10 +811,7 @@ pub(crate) fn entry_names(directory: &Root, limit: usize) -> Result<Vec<OsString
             continue;
         }
         if names.len() == limit {
-            return Err(ResolveError::message(
-                reported,
-                "directory entry limit exceeded",
-            ));
+            return Ok((names, true));
         }
         names.push(OsString::from_vec(name.to_vec()));
     }

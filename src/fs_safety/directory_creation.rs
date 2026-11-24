@@ -1000,7 +1000,18 @@ fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveEr
     if granted != 0 {
         return Err(ResolveError::io(&reported, &io::Error::last_os_error()));
     }
-    let directory = resolve_directory(parent, name)?;
+    let directory = resolve_directory(parent, name).inspect_err(|_| {
+        // Best effort: withdraw the grant from the entry that received it.
+        // SAFETY: as above.
+        unsafe {
+            libc::fchmodat(
+                parent.descriptor(),
+                leaf.as_ptr(),
+                permissions,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+    })?;
     let metadata = directory
         .metadata()
         .map_err(|error| ResolveError::io(&reported, &error))?;
