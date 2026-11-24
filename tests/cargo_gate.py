@@ -1106,6 +1106,19 @@ exec sleep {10 * HANG_GUARD}
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("waiting", result.stderr)
 
+    @unittest.skipIf(os.geteuid() == 0, "root writes read-only files")
+    def test_a_slot_the_caller_holds_read_only_is_its_slot(self):
+        # As in a sandbox that mounts the lock's directory read-only.
+        self.lock.touch()
+        self.lock.chmod(0o444)
+        self.addCleanup(self.lock.chmod, 0o644)
+        result = subprocess.run(
+            ["sh", "-c", f'exec 7<"{self.lock}"; flock 7; exec "{self.gate}" exec true'],
+            env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
     def under_flock(self, slot, *inner, env=None):
         """A gated `exec true` under `flock --close slot`, through `inner`, without waiting long."""
         return subprocess.run(
