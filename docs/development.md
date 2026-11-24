@@ -1533,6 +1533,7 @@ anything it left running in its scope, such as a test's daemon that was never
 shut down, is stopped. Each stopped process is named, with its age and command
 line, on stderr and in `~/.local/state/cagents/leftover-processes.log` on the
 host that ran the tests, so the test that leaked it can be found and fixed.
+The log keeps the active file and one rotated `.log.1` file, each at most 1 MiB.
 
 A script's `cargo test` under `cargo-gate exec` reaches the gate's `cargo`, so it is
 covered, and so is its compile, which runs inside the limit there. A UI test rebuild
@@ -2164,9 +2165,10 @@ caller process ancestry/session IDs, subcommands, GraphQL operation shapes,
 invocation metadata and, when `--http` supports the operation, HTTP status,
 duration and allowlisted rate-limit headers. Credentials,
 arguments, GraphQL variables and response bodies are discarded. Operation
-names and endpoint paths can identify private repositories; keep raw logs
-local and publish only the needed aggregates. Remove old daily logs when the
-measurement no longer needs them.
+names and endpoint paths can identify private repositories. Keep raw logs local
+and publish only the needed aggregates. The first recorded event of each UTC
+day removes daily logs outside the latest 30 UTC calendar days. Reports
+written to files outside the log directory keep their own lifetime.
 
 Normal observation execs the real gh with its original arguments, environment,
 stdin, stdout, stderr and exit status; it does not enable HTTP debug or filter
