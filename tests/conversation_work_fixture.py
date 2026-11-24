@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +109,29 @@ class ConversationWork(unittest.TestCase):
         # The Work board lists only the viewer's own.
         authored = self.gh("pr", "list", "--state", "all", "--author", "@me", "--json", "number")
         self.assertEqual([row["number"] for row in authored], [41, 38, 35])
+
+    def test_spent_graphql_quota_preserves_rest_and_expires(self):
+        self.helper()
+        marker = self.fixture / "home" / ".config" / "fixture-forge-graphql-reset"
+        reset = int(time.time()) + 3600
+        marker.write_text(f"{reset}\n")
+        for arguments, output in (
+            (("api", "--include", "graphql", "-f", "query=query Test { viewer { login } }"), "stdout"),
+            (("pr", "view", "41", "-R", "octo-org/fixture-app", "--json", "number"), "stderr"),
+            (("repo", "view", "octo-org/fixture-app", "--json", "nameWithOwner,url"), "stderr"),
+        ):
+            with self.subTest(arguments=arguments):
+                refused = subprocess.run(["gh", *arguments], text=True, capture_output=True,
+                                         env=self.environment())
+                self.assertEqual(refused.returncode, 1)
+                self.assertIn("GraphQL: API rate limit already exceeded", refused.stderr)
+                headers = getattr(refused, output)
+                self.assertIn("X-Ratelimit-Remaining: 0", headers)
+                self.assertIn("X-Ratelimit-Resource: graphql", headers)
+                self.assertIn(f"X-Ratelimit-Reset: {reset}", headers)
+        self.assertEqual(self.gh("api", "repos/octo-org/fixture-app/releases"), [])
+        marker.write_text("1\n")
+        self.assertEqual(self.gh("pr", "view", "41", "--json", "number"), {"number": 41})
 
     def test_the_frames_name_this_fixture_s_paths_and_commits(self):
         self.helper()
