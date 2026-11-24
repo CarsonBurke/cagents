@@ -95,7 +95,7 @@ pub(super) struct Local {
     /// The worktree list and ref census as last read, reused until a
     /// topology or ref change says they moved.
     records: Arc<[WorktreeRecord]>,
-    /// Successful status reads and the index each one started with.
+    /// Successful status reads and the metadata each one started with.
     status_reads: HashMap<WorktreeId, git_watch::StatusRead>,
     base_ref: Option<String>,
     tips: Arc<[RefTip]>,
@@ -263,9 +263,10 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         let reread = full
             || change.worktrees.contains(&record.id)
             || old.is_none_or(|old| old.error.is_some() || moved(old))
-            || (change.rescan && prior_status.is_none_or(|read| read.index_changed(&record.path)));
+            || (change.rescan
+                && prior_status.is_none_or(|read| read.metadata_changed(&record.path)));
         if !reread && let Some(read) = prior_status {
-            status_reads.insert(record.id, *read);
+            status_reads.insert(record.id, read.clone());
         }
         if !reread
             && !listed
@@ -1164,6 +1165,8 @@ mod tests {
 
     #[test]
     fn rescan_checks_metadata_only_worktrees_without_rereading_unchanged_status() {
+        use std::os::unix::fs::PermissionsExt;
+
         fn at<'a>(local: &'a Local, path: &Path) -> &'a Worktree {
             local.worktrees.iter().find(|row| row.path == path).unwrap()
         }
@@ -1171,7 +1174,12 @@ mod tests {
         let fixture = fixture();
         let same_head = fixture.root.parent().unwrap().join("same-head");
         let link_only = fixture.root.parent().unwrap().join("link-only");
-        for (branch, path) in [("same-head", &same_head), ("link-only", &link_only)] {
+        let file_mode = fixture.root.parent().unwrap().join("file-mode");
+        for (branch, path) in [
+            ("same-head", &same_head),
+            ("link-only", &link_only),
+            ("file-mode", &file_mode),
+        ] {
             git(
                 &fixture.root,
                 &[
@@ -1185,11 +1193,25 @@ mod tests {
             );
         }
         git(&fixture.root, &["branch", "same-tip", "same-head"]);
+        git(
+            &fixture.root,
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        git(
+            &file_mode,
+            &["config", "--worktree", "core.fileMode", "false"],
+        );
+        std::fs::set_permissions(
+            file_mode.join("README"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let now = crate::chat::now_ms().unwrap() + crate::work::ACTIVE_WINDOW_MS + 1;
         let scan = |previous: Option<&Local>, change: &git_watch::Change| {
             run_at(&fixture, previous, change, false, &BTreeSet::new(), now)
         };
         let first = scan(None, &git_watch::Change::default());
+        assert_eq!(at(&first, &file_mode).dirty.as_ref().unwrap().paths, 0);
         assert!(
             first
                 .plan
@@ -1207,6 +1229,12 @@ mod tests {
         // rewriting the index, so the worktree listing must detect the move.
         git(&same_head, &["symbolic-ref", "HEAD", "refs/heads/same-tip"]);
         let issue = crate::linear::context::link_at(&link_only, "WORK-1", None).unwrap();
+        // A lost config.worktree event can change status without touching the
+        // index, HEAD, or an actual worktree file.
+        git(
+            &file_mode,
+            &["config", "--worktree", "core.fileMode", "true"],
+        );
 
         let recovered = scan(
             Some(&first),
@@ -1236,6 +1264,8 @@ mod tests {
             Some("same-tip")
         );
         assert!(at(&recovered, &same_head).status_read_at > at(&first, &same_head).status_read_at);
+        assert_eq!(at(&recovered, &file_mode).dirty.as_ref().unwrap().paths, 1);
+        assert!(at(&recovered, &file_mode).status_read_at > at(&first, &file_mode).status_read_at);
         assert_eq!(at(&recovered, &link_only).link.as_ref(), Some(&issue));
         assert_eq!(
             at(&recovered, &link_only).status_read_at,

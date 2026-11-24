@@ -633,8 +633,8 @@ impl Cagents {
         state.changed(
             project,
             git_watch::Change {
-                // A new watch requests the baseline after registration. A
-                // reload already has a watch, or has to start by polling.
+                // Registration requests the baseline. Read it here when
+                // replacing a live entry or falling back to polling.
                 topology: old.is_some() || state.watch.is_none(),
                 membership: true,
                 ..Default::default()
@@ -953,7 +953,10 @@ impl Cagents {
                             || entry.plan.is_none()
                             || entry.read_full_scan;
                         let archived = snapshot.archived.associations.clone();
-                        if let Some(plan) = plan {
+                        if let Some(mut plan) = plan {
+                            // A reload needs a baseline even when registration
+                            // keeps all the previous generation's watches.
+                            plan.set_baseline_generation(generation);
                             entry.plan = Some(Arc::new(plan));
                         }
                         let Some(row) = self
@@ -1237,7 +1240,7 @@ fn read_local_snapshot(
                 && snapshot
                     .status_reads
                     .get(&record.id)
-                    .is_none_or(|read| read.index_changed(&record.path)));
+                    .is_none_or(|read| read.metadata_changed(&record.path)));
         // Shared refs move every worktree's upstream comparison.
         if !listed && !change.references && !changed {
             continue;
@@ -2624,9 +2627,9 @@ mod tests {
         let mut state = State::default();
         let mut entry = Entry::new(snapshot, 1, None);
         let start = entry.last_full_scan;
-        let mut read = entry.snapshot.status_reads[&own];
+        let mut read = entry.snapshot.status_reads[&own].clone();
         read.completed_at = start;
-        entry.snapshot.status_reads = ids.iter().map(|id| (*id, read)).collect();
+        entry.snapshot.status_reads = ids.iter().map(|id| (*id, read.clone())).collect();
         state.entries.insert(project, entry);
         state.set_work(
             [
@@ -4133,7 +4136,7 @@ mod tests {
         .unwrap();
         monitor.configure(vec![plan.clone()]);
         registered.recv_timeout(Duration::from_secs(5)).unwrap();
-        let initial = monitor.drain().remove(&project).unwrap();
+        let mut initial = monitor.drain().remove(&project).unwrap();
         assert!(initial.rescan && initial.topology);
         let started = Instant::now();
         let (baseline, _) = read_local_with_plan(
@@ -4163,12 +4166,13 @@ mod tests {
         let linked_id = linked_record.id;
         let clean_id = row(&clean).0.id;
         assert_eq!(staged.as_ref().unwrap().dirty.staged, 1);
-        assert!(!initial.worktrees.contains(&linked_id));
-        assert!(!initial.worktrees.contains(&clean_id));
-
         git(&linked, &["restore", "--staged", "tracked.txt"]);
         let linked_read = baseline.status_reads[&linked_id].completed_at;
         let clean_read = baseline.status_reads[&clean_id].completed_at;
+        // In a later overflow, only the content-watched checkout might
+        // have lost a file event. The linked ones compare their metadata.
+        initial.worktrees.remove(&linked_id);
+        initial.worktrees.remove(&clean_id);
         let (recovered, _) = read_local_with_plan(
             project,
             baseline,
@@ -4187,5 +4191,90 @@ mod tests {
         assert_eq!(status.as_ref().unwrap().dirty.unstaged, 1);
         assert!(recovered.status_reads[&linked_id].completed_at > linked_read);
         assert_eq!(recovered.status_reads[&clean_id].completed_at, clean_read);
+    }
+
+    #[test]
+    fn reloading_with_unchanged_watches_restores_checkout_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let snapshot = fixture(&root);
+        let id = snapshot.worktrees[0].0.id;
+        git(&root, &["branch", "upstream"]);
+        git(&root, &["branch", "--set-upstream-to=upstream", "main"]);
+        git(&root, &["commit", "--allow-empty", "-m", "ahead"]);
+        fs::write(root.join("tracked.txt"), "dirty\n").unwrap();
+
+        let (mut app, project) = catalog_app(&snapshot);
+        let project = project.id;
+        let cancellation = CancellationToken::default();
+        let (snapshot, plan) = read_local_with_plan(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                worktrees: [id].into(),
+                ..Default::default()
+            },
+            cancellation.clone(),
+            None,
+            &HashMap::from([(id, git_watch::Interest::Shown)]),
+        )
+        .unwrap();
+        app.refresh_ui.git.watch = Some(Watch::start().unwrap());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((snapshot, plan).into()),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let wait_for_watch = |app: &Cagents| {
+            let receiver = &app.refresh_ui.git.watch.as_ref().unwrap().receiver;
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        };
+        wait_for_watch(&app);
+        let watch = app.refresh_ui.git.watch.as_ref().unwrap();
+        assert_eq!(watch.monitor.drain()[&project].coverage, Some(true));
+        let checkout = &app.sidebar_model.project(project).unwrap().worktrees[0];
+        assert_eq!(checkout.dirty.as_ref().unwrap().unstaged, 1);
+        assert_eq!((checkout.ahead, checkout.behind), (Some(1), Some(0)));
+
+        // The UI forgets the old entry, but the monitor can coalesce its
+        // removal with the next plan and keep the existing watches.
+        app.refresh_ui.git.entries.remove(&project);
+        app.repository_generations.insert(project, 2);
+        let loaded = super::super::load_repository(&root, Some(project), cancellation).unwrap();
+        let _ = app.repository_loaded(false, project, 2, Ok(Box::new(loaded)));
+        let checkout = &app.sidebar_model.project(project).unwrap().worktrees[0];
+        assert!(checkout.dirty.is_none());
+        assert_eq!((checkout.ahead, checkout.behind), (None, None));
+        let complete_read = |app: &mut Cagents, task| {
+            let Message::GitUi(action) = super::super::tests::task_app_message(task) else {
+                panic!("expected a Git read result");
+            };
+            drop(app.update_git(action));
+        };
+        let task = app.start_git_reads();
+        complete_read(&mut app, task);
+        assert!(
+            app.refresh_ui.git.entries[&project]
+                .snapshot
+                .status_reads
+                .is_empty()
+        );
+        wait_for_watch(&app);
+
+        let task = app.update_git(Action::Changed);
+        complete_read(&mut app, task);
+        let checkout = &app.sidebar_model.project(project).unwrap().worktrees[0];
+        assert_eq!(checkout.dirty.as_ref().unwrap().unstaged, 1);
+        assert_eq!((checkout.ahead, checkout.behind), (Some(1), Some(0)));
     }
 }
