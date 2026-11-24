@@ -249,7 +249,7 @@ impl Turn {
                 }),
                 None => "1 step".to_owned(),
             },
-            steps => summarize_steps(steps, items, presented)
+            steps => summarize_steps(steps, items, presented, self.failed + self.denied > 0)
                 .unwrap_or_else(|| format!("{} steps", steps.len())),
         };
         self.summary.push_str(&self.state_suffix());
@@ -1082,8 +1082,12 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     steps: &[Placed],
     items: &[T],
     presented: &impl Presented<'c>,
+    counts_steps: bool,
 ) -> Option<String> {
     let mut edited = std::collections::BTreeSet::new();
+    // Edits are named by the files they changed, which is not how many
+    // edits there were: a failed edit retried on the same file is two.
+    let mut edits = 0;
     let (mut ran, mut read, mut searched, mut listed, mut web, mut used, mut viewed) =
         (0, 0, 0, 0, 0, 0, 0);
     // An edit whose input is still arriving names no file yet, and a
@@ -1108,6 +1112,7 @@ fn summarize_steps<'c, T: Borrow<Item>>(
                 preparing += 1
             }
             ItemContent::Changes { changes, .. } => {
+                edits += 1;
                 edited.extend(changes.iter().map(|change| change.path.as_str()));
             }
             ItemContent::Command { action, .. } => match action {
@@ -1131,7 +1136,17 @@ fn summarize_steps<'c, T: Borrow<Item>>(
         count => format!("{count} {many}"),
     };
     let mut parts = Vec::new();
-    if !edited.is_empty() {
+    // Where the line goes on to count failed or refused steps, it counts
+    // edits too, so "1 failed" is one of the edits it names and not one of
+    // the files: "Made 2 edits to a file · 1 failed".
+    if counts_steps && edits != edited.len() {
+        let files = counted(edited.len().max(1), "file", "files");
+        let edits = match edits {
+            1 => "an edit".to_owned(),
+            edits => format!("{edits} edits"),
+        };
+        parts.push(format!("made {edits} to {files}"));
+    } else if !edited.is_empty() {
         parts.push(format!("edited {}", counted(edited.len(), "file", "files")));
     }
     if preparing > 0 {
@@ -1637,6 +1652,37 @@ mod tests {
                 "Edited 2 files · 1 failed".to_owned(),
                 Some(Status::PartlyFailed)
             )
+        );
+        // A failed edit retried on the same file is two edits to one file,
+        // so the count of failures lines up with what the line counted.
+        assert_eq!(
+            summary_and_glyph(vec![
+                edit("e1", "a.rs", Failed),
+                edit("e2", "a.rs", Succeeded),
+            ]),
+            (
+                "Made 2 edits to a file · 1 failed".to_owned(),
+                Some(Status::PartlyFailed)
+            )
+        );
+        assert_eq!(
+            summary_and_glyph(vec![
+                edit("e1", "a.rs", Succeeded),
+                edit("e2", "a.rs", Succeeded),
+            ])
+            .0,
+            "Edited a file",
+            "with nothing to count against them, edits are named by their files"
+        );
+        let mut patch = edit("e1", "a.rs", Failed);
+        if let ItemContent::Changes { changes, .. } = &mut patch.content {
+            let mut other = changes[0].clone();
+            other.path = "b.rs".into();
+            changes.push(other);
+        }
+        assert_eq!(
+            summary_and_glyph(vec![patch, command("c1", Succeeded)]).0,
+            "Made an edit to 2 files, ran a command · 1 failed"
         );
         assert_eq!(
             summary_and_glyph(vec![read("r1", Failed), read("r2", Failed)]),
