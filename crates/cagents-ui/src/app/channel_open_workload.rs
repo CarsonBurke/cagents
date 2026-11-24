@@ -593,6 +593,56 @@ fn settle_seeds(app: &mut Cagents) {
     }
 }
 
+/// Answers every view edit the window has published as the registry would,
+/// applying each to the model's view and acknowledging it, until a
+/// reconciliation publishes no more. Without a daemon they would stay pending,
+/// and every later pass would project its own unacknowledged inserts again.
+fn answer_view_edits(app: &mut Cagents) {
+    for _ in 0..8 {
+        let pending = std::mem::take(&mut app.shared_views.pending);
+        if pending.is_empty() {
+            return;
+        }
+        for (operation, scope, change) in pending {
+            let views = &mut app.workspace_model.views;
+            if !views.iter().any(|view| view.scope == scope) {
+                let mut view = View::empty(ChannelId::new());
+                view.scope = scope.clone();
+                views.push(view);
+            }
+            if let crate::workspace_model::views::Change::Transfer {
+                id,
+                destination,
+                before,
+            } = &change
+            {
+                if !views.iter().any(|view| &view.scope == destination) {
+                    let mut view = View::empty(ChannelId::new());
+                    view.scope = destination.clone();
+                    views.push(view);
+                }
+                crate::workspace_model::views::transfer(views, &scope, *id, destination, *before)
+                    .unwrap();
+            } else {
+                let view = views.iter_mut().find(|view| view.scope == scope).unwrap();
+                drop(view.apply(&change));
+            }
+            for view in views.iter_mut().filter(|view| {
+                view.scope == scope
+                    || matches!(&change, crate::workspace_model::views::Change::Transfer { destination, .. } if *destination == view.scope)
+            }) {
+                view.revision += 1;
+            }
+            app.shared_views
+                .pending
+                .push((operation, scope.clone(), change));
+            app.acknowledge_view_edit(scope, Some(operation));
+        }
+        drop(app.reconcile_workspace_model());
+    }
+    panic!("the window kept publishing view edits");
+}
+
 /// The save a terminal's start makes once its surface attaches: the start
 /// changes the terminal's saved session, and `persist()` publishes that
 /// change before the handoff is committed. Each round opens a channel with a
@@ -1158,6 +1208,61 @@ fn observed_edge_burst_timing() {
     summary(&format!("update per run of {BURST} edges"), &mut runs);
     let phases = save_phases(&directory, || {
         for edge in agent_edges(&app, BURST) {
+            drop(app.update(Message::WorkspaceModelObserved(edge)));
+        }
+    });
+    report_phases(phases);
+}
+
+/// Edges that change something, as an agent start brings them: an agent
+/// record, renamed each time, for an agent placed in one channel. Each runs
+/// the complete reconciliation, which the phases split.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn changing_edge_timing() {
+    super::projection_oracle::disable();
+    let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
+    app.shared_views.skip_rediscovery_check();
+    settle_seeds(&mut app);
+    answer_view_edits(&mut app);
+    let mut agent = crate::agent_execution::Agent::fixture_placed_in(channels[0]);
+    agent.spec.target.repository = app.workspace_model.channels[0].repository.clone();
+    let mut renamed = 0;
+    let mut edges = |app: &Cagents, count: usize| {
+        let identity = app.workspace_model.identity;
+        let sequence = app
+            .workspace_model
+            .sequence
+            .max(app.shared_views.snapshot_sequence);
+        (1..=count as u64)
+            .map(|offset| {
+                renamed += 1;
+                agent.name = Some(format!("worker {renamed}"));
+                workspace_model_sync::ModelUpdate::Changed {
+                    sequence: sequence + offset,
+                    edit: crate::workspace_model::ModelEdit::AgentsChanged,
+                    changes: workspace_model_sync::EdgeChanges {
+                        identity: Some(identity),
+                        effects: crate::workspace_model::delta::EditEffects {
+                            agents: vec![agent.clone()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut apart = Vec::new();
+    for edge in edges(&app, 12) {
+        let started = Instant::now();
+        drop(app.update(Message::WorkspaceModelObserved(edge)));
+        apart.push(started.elapsed());
+    }
+    summary("update per changing edge", &mut apart);
+    let batch = edges(&app, 12);
+    let phases = save_phases(&directory, || {
+        for edge in batch {
             drop(app.update(Message::WorkspaceModelObserved(edge)));
         }
     });

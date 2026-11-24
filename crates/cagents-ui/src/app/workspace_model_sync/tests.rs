@@ -5734,10 +5734,9 @@ fn a_receipt_confirming_a_held_project_neither_reconciles_nor_projects() {
         edit: edit.clone(),
         views: ViewChanges::default(),
     };
-    // The discovery a complete pass publishes through is kept between passes,
-    // so its topology is built once rather than for each.
-    app.prime_view_discovery();
+    // Discovery is not primed, so a save would build a topology.
     app.shared_views.topology_build_count.set(0);
+    app.shared_views.structural_pass_count.set(0);
 
     let (_, projection) =
         app.apply_workspace_model_update_projection(receipt(held_project(&repository)));
@@ -5750,6 +5749,7 @@ fn a_receipt_confirming_a_held_project_neither_reconciles_nor_projects() {
             &repository,
         )))),
     );
+    assert_eq!(app.shared_views.structural_pass_count.get(), 0);
     assert_eq!(app.shared_views.topology_build_count.get(), 0);
     assert_eq!(app.workspace_model, held);
     assert_eq!(
@@ -5763,7 +5763,7 @@ fn a_receipt_confirming_a_held_project_neither_reconciles_nor_projects() {
     renamed.name = "renamed".into();
     let (_, projection) = app.apply_workspace_model_update_projection(receipt(renamed));
     assert_eq!(projection, Projection::Full);
-    assert_eq!(app.shared_views.topology_build_count.get(), 1);
+    assert_eq!(app.shared_views.structural_pass_count.get(), 1);
     assert_eq!(app.workspace_model.projects[0].name, "renamed");
 }
 
@@ -5778,15 +5778,15 @@ fn a_deferred_repository_reconciliation_runs_before_any_other_message() {
     drop(app.defer_repository_reconciliation(repository.clone()));
     drop(app.defer_repository_reconciliation(repository.clone()));
     assert_eq!(app.pending_repository_reconciliation, vec![repository]);
-    app.shared_views.topology_build_count.set(0);
+    app.shared_views.structural_pass_count.set(0);
 
     drop(app.update(Message::ReportedTitleSaveDue));
 
     assert!(app.pending_repository_reconciliation.is_empty());
-    assert_eq!(app.shared_views.topology_build_count.get(), 1);
+    assert_eq!(app.shared_views.structural_pass_count.get(), 1);
     // The armed message finds nothing left to do.
     drop(app.update(Message::RepositoryReconciliationDue));
-    assert_eq!(app.shared_views.topology_build_count.get(), 1);
+    assert_eq!(app.shared_views.structural_pass_count.get(), 1);
 }
 
 /// A connection that delivers the registry's model is a message like any
@@ -5799,10 +5799,7 @@ fn a_connection_while_loads_wait_reconciles_them_first() {
     app.workspace_model.projects.push(held_project(&repository));
     Arc::make_mut(&mut app.durable).workspace_model_identity = Some(app.workspace_model.identity);
     drop(app.defer_repository_reconciliation(repository.clone()));
-    // The discovery a complete pass publishes through is kept between passes,
-    // so its topology is built once rather than for each.
-    app.prime_view_discovery();
-    app.shared_views.topology_build_count.set(0);
+    app.shared_views.structural_pass_count.set(0);
     let mut model = app.workspace_model.clone();
     model.sequence += 1;
 
@@ -5815,12 +5812,12 @@ fn a_connection_while_loads_wait_reconciles_them_first() {
 
     assert!(app.pending_repository_reconciliation.is_empty());
     assert_eq!(
-        app.shared_views.topology_build_count.get(),
+        app.shared_views.structural_pass_count.get(),
         2,
         "the waiting repository pass, then the connection's complete one"
     );
     drop(app.update(Message::RepositoryReconciliationDue));
-    assert_eq!(app.shared_views.topology_build_count.get(), 2);
+    assert_eq!(app.shared_views.structural_pass_count.get(), 2);
 }
 
 /// Without a registry a repository load has nothing to reconcile against,
@@ -5845,6 +5842,7 @@ fn a_confirming_receipt_ahead_of_the_model_advances_only_its_clocks() {
     app.workspace_model.projects.push(held_project(&repository));
     let held = app.workspace_model.clone();
     app.shared_views.topology_build_count.set(0);
+    app.shared_views.structural_pass_count.set(0);
 
     drop(
         app.update(Message::WorkspaceModelObserved(ModelUpdate::Committed {
@@ -5865,6 +5863,8 @@ fn a_confirming_receipt_ahead_of_the_model_advances_only_its_clocks() {
         })),
     );
 
+    // Discovery is not primed, so a save would have built a topology.
+    assert_eq!(app.shared_views.structural_pass_count.get(), 0);
     assert_eq!(app.shared_views.topology_build_count.get(), 0);
     assert_eq!(app.workspace_model.sequence, 12);
     assert_eq!(

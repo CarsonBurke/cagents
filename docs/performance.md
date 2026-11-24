@@ -642,7 +642,12 @@ into phases: `edge_install` for installing an edge's rows and views,
 `edge_apply` for the rest of its handling, and `run_settle` for the one
 complete reconciliation a run of edges owes. That reconciliation is split again,
 from `reconcile_projects` to `reconcile_naming`, so its own walks show apart
-from the shared views' projection (`reconcile_shared_views`). An edge that
+from the shared views' projection (`reconcile_shared_views`). The structural
+projection is split in turn, from `shared_topology` to `shared_postlude`, so
+its admission, overlay, per-view projection, save and release stages show
+apart. The ignored `changing_edge_timing` workload in
+`channel_open_workload.rs` reports these stages offline for edges that each
+rename one agent in the large workspace. An edge that
 changes nothing the window holds, such as the observer's copy of this window's
 own receipt, skips the reconciliation and the projection after it. At
 `cagents::workspace_projection=trace`, each such edge is logged as "Skipped an
