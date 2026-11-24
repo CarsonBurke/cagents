@@ -1305,13 +1305,16 @@ class Rehearsal:
 
     def restart_after_update(self, version, slots, *, settle=12):
         """Closes every window, stops NEW's daemon and reopens the windows,
-        as after a reboot, and requires the update to read the same.
+        as after a reboot, and requires the update to read Complete.
 
         A window that hid OLD's Failed record only while the daemon it saw
         finish the update was serving shows the failure again here (#3877).
-        A Complete record must stay Complete.
+        After a restart nothing excuses that record: NEW has had its chance
+        to settle it, so the status must be Complete with no refusal, even
+        when no window's words are matched as a failure.
         """
         started = time.monotonic()
+        errors = len(self.errors)
         before, _ = update_status(self.root)
         windows = self.mapped()
         closed = {slot: process_identity(windows[slot]['pid']) for slot in slots if slot in windows}
@@ -1345,13 +1348,11 @@ class Rehearsal:
         failed, updated = self.watch_shown_update(version,settle=settle,name='update-shown-after-restart')
         after, _ = update_status(self.root)
         phases = [(row or {}).get('phase') for row in (before, after)]
-        regressed = (phases[0] == 'Complete' and (before or {}).get('version') == version
-                     and (phases[1] != 'Complete' or (after or {}).get('version') != version))
-        if regressed:
-            self.errors.append(f'the update read Complete before the restart and {phases[1]} after it')
+        self.errors += [f'after the restart following the update, {reason}'
+                        for reason in update_completed(self.root, version)]
         self.notes.append(f'update status across the restart after the update: {phases[0]} -> {phases[1]}')
         self.steps.append({'command':['restart-after-update'],'seconds':round(time.monotonic()-started,3),
-                           'exit':int(bool(failed or regressed)),
+                           'exit':int(len(self.errors) > errors),
                            'output':json.dumps({'phases':phases,'failed':failed,'updated':updated,
                                                 'daemon':[owner,successor],'windows':closed})})
 

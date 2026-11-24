@@ -1402,22 +1402,27 @@ class ShownUpdateOutcome(unittest.TestCase):
         return rehearsal, [error.split(";")[0] for error in rehearsal.errors]
 
     def test_a_restart_after_the_update_must_keep_it_complete_and_unshown(self):
+        stale = "after the restart following the update, the update status is Failed for 2.0.0, not Complete for 2.0.0: None"
         for before, after, shown, errors in (
                 ("Complete", "Complete", "Channels", []),
                 # OLD's worker recorded Failed and NEW settles it (#3877).
                 ("Failed", "Complete", "Channels", []),
-                ("Complete", "Failed", "Channels", ["the update read Complete before the restart and Failed after it"]),
-                ("Failed", "Failed", "Update failed: protocol 203", ['the reopened main window shows "Update failed"'])):
+                ("Complete", "Failed", "Channels", [stale]),
+                # A window whose words miss the failure still fails on the record.
+                ("Failed", "Failed", "Channels", [stale]),
+                ("Failed", "Failed", "Update failed: protocol 203", ['the reopened main window shows "Update failed"', stale])):
             with self.subTest(before=before, after=after), tempfile.TemporaryDirectory() as directory:
                 rehearsal, found = self.restarted(Path(directory), before, after, shown)
                 self.assertEqual(found, errors)
+                self.assertEqual(rehearsal.steps[-1]["exit"], int(bool(errors)))
                 self.assertEqual(rehearsal.notes, [f"update status across the restart after the update: {before} -> {after}"])
                 self.assertTrue((Path(directory) / "records/after/update-shown-after-restart.json").exists())
 
     def test_a_restart_needs_fresh_window_processes_and_a_fresh_daemon(self):
         with tempfile.TemporaryDirectory() as directory:
-            _, found = self.restarted(Path(directory), "Complete", "Complete", same_daemon=True)
+            rehearsal, found = self.restarted(Path(directory), "Complete", "Complete", same_daemon=True)
             self.assertEqual(found, ["a fresh NEW 2.0.0 daemon is not serving after the restart following the update"])
+            self.assertEqual(rehearsal.steps[-1]["exit"], 1)
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(RuntimeError, "did not close"):
                 self.restarted(Path(directory), "Complete", "Complete", same_window=True)
