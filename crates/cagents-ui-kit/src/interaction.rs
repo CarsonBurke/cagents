@@ -165,7 +165,15 @@ pub fn keyboard_list_row<'a, Message: 'a>(
 pub fn keyed_list_rows<'a, Message: 'a>(
     rows: Vec<([u8; 32], Element<'a, Message>)>,
 ) -> Element<'a, Message> {
-    keyed_list::view(rows)
+    keyed_list_rows_with_spacing(rows, 0.0)
+}
+
+/// Keyed rows with the requested spacing between children.
+pub fn keyed_list_rows_with_spacing<'a, Message: 'a>(
+    rows: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+) -> Element<'a, Message> {
+    keyed_list::view(rows, spacing)
 }
 
 /// Keyed horizontal controls retain native focus when their order changes.

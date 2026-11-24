@@ -207,6 +207,12 @@ pub struct State {
     confirmed: Option<Arc<Board>>,
     /// Each card's searchable text, lowercase, in board order.
     search: Vec<String>,
+    /// The cards in the order shown, as indexes into the board's: the
+    /// daemon's newest-activity-first order as of the last sort, which
+    /// [`settled_order`] keeps until cards come or go or a minute passes.
+    order: Vec<usize>,
+    /// The board time the cards were last sorted at.
+    sorted_at_unix_ms: Option<u64>,
     revision: u64,
     /// Why the subscription is down, while it is retried.
     lost: Option<String>,
@@ -287,6 +293,15 @@ impl State {
                     self.revision = revision;
                     self.now_unix_ms = board.generated_at_unix_ms.max(now_unix_ms());
                     self.search = board.items.iter().map(search_text).collect();
+                    let (order, sorted_at) = settled_order(
+                        self.confirmed
+                            .as_deref()
+                            .map(|shown| (shown, self.order.as_slice())),
+                        self.sorted_at_unix_ms,
+                        &board,
+                    );
+                    self.order = order;
+                    self.sorted_at_unix_ms = Some(sorted_at);
                     if self
                         .scope
                         .as_ref()
@@ -462,12 +477,17 @@ impl State {
             .find(|item| card.names(item))
     }
 
-    /// The cards in scope that match the query, newest activity first.
+    /// The cards in scope that match the query, newest activity first as of
+    /// the last sort.
     fn visible(&self) -> impl Iterator<Item = &Item> {
         let query = self.query.trim().to_lowercase();
         self.board
             .iter()
-            .flat_map(|board| board.items.iter().zip(&self.search))
+            .flat_map(|board| {
+                self.order
+                    .iter()
+                    .filter_map(|index| Some((board.items.get(*index)?, self.search.get(*index)?)))
+            })
             .filter(move |(item, _)| {
                 self.scope
                     .as_ref()
@@ -1441,6 +1461,53 @@ fn search_text(item: &Item) -> String {
         fields.extend(ticket.title.clone());
     }
     fields.join("\n").to_lowercase()
+}
+
+/// How long the cards keep their order once sorted. Each edit an agent makes
+/// renews its card's activity, so two agents at work would otherwise swap
+/// their cards on every board.
+const RESORT_AFTER_MS: u64 = 60 * 1000;
+
+/// The order to show `board`'s cards in, and when it was sorted. The
+/// daemon's order is newest activity first; it is taken when cards come or
+/// go, and once [`RESORT_AFTER_MS`] has passed since `sorted_at_unix_ms`.
+/// Until then each card keeps its place in `shown`, the board before and its
+/// order, so a card the user is about to press holds still while its
+/// activity changes.
+fn settled_order(
+    shown: Option<(&Board, &[usize])>,
+    sorted_at_unix_ms: Option<u64>,
+    board: &Board,
+) -> (Vec<usize>, u64) {
+    let now = board.generated_at_unix_ms;
+    let sorted = || ((0..board.items.len()).collect(), now);
+    let Some((shown, order)) = shown else {
+        return sorted();
+    };
+    if sorted_at_unix_ms.is_none_or(|at| now.saturating_sub(at) >= RESORT_AFTER_MS)
+        || shown.items.len() != board.items.len()
+        || order.len() != board.items.len()
+    {
+        return sorted();
+    }
+    let at: std::collections::HashMap<(&std::path::Path, &ItemKey), usize> = board
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| ((item.project.as_path(), &item.key), index))
+        .collect();
+    let kept: Option<Vec<usize>> = order
+        .iter()
+        .map(|index| {
+            let item = shown.items.get(*index)?;
+            at.get(&(item.project.as_path(), &item.key)).copied()
+        })
+        .collect();
+    match kept {
+        Some(kept) => (kept, sorted_at_unix_ms.unwrap_or(now)),
+        // A card left and another came: the board is a different one.
+        None => sorted(),
+    }
 }
 
 fn column_index(column: Column) -> usize {
@@ -2513,6 +2580,40 @@ mod tests {
         );
         watched(&mut state, 2, board(vec![item("fix/login", "redact")]));
         assert_eq!(state.scope, None);
+    }
+
+    /// The daemon sends each board newest activity first. While agents edit
+    /// two cards by turns, the cards hold still until a minute has passed
+    /// since they were sorted, or a card comes or goes.
+    #[test]
+    fn cards_hold_their_order_between_sorts() {
+        const MINUTE: u64 = 60 * 1000;
+        let at = |names: &[&str], now: u64| {
+            let mut board = board(names.iter().map(|name| item(name, "cagents")).collect());
+            Arc::make_mut(&mut board).generated_at_unix_ms = now;
+            board
+        };
+        let shown = |state: &State| {
+            state
+                .visible()
+                .map(|item| item.branch.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mut state = State::default();
+        connected(&mut state, 1, at(&["a", "b"], 10 * MINUTE));
+        assert_eq!(shown(&state), ["a", "b"]);
+        watched(&mut state, 2, at(&["b", "a"], 10 * MINUTE + 1_000));
+        assert_eq!(shown(&state), ["a", "b"], "held within the minute");
+        // A pin changes the card in place, not the order.
+        let card = CardRef::of(state.visible().next().unwrap());
+        state.update(Action::Pin(card, Some(Column::Stale)));
+        assert_eq!(shown(&state), ["a", "b"]);
+        watched(&mut state, 3, at(&["b", "a"], 11 * MINUTE));
+        assert_eq!(shown(&state), ["b", "a"], "sorted again after it");
+        watched(&mut state, 4, at(&["a", "b"], 11 * MINUTE + 1_000));
+        assert_eq!(shown(&state), ["b", "a"]);
+        watched(&mut state, 5, at(&["c", "a", "b"], 11 * MINUTE + 2_000));
+        assert_eq!(shown(&state), ["c", "a", "b"], "a new card sorts them");
     }
 
     #[test]
