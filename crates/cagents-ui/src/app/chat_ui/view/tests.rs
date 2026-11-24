@@ -6104,7 +6104,7 @@ fn footer_picker_rows_center_single_lines_and_subtitled_blocks() {
     ] {
         let mut row = picker_choice_row(
             "High".into(),
-            detail,
+            detail.map(Cow::Borrowed),
             "High".into(),
             widget::Id::unique(),
             true,
@@ -11408,6 +11408,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Opus 5.5"
@@ -11461,6 +11462,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Default (Opus 5.5)"
@@ -11474,6 +11476,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Default (Opus 5.5) · High"
@@ -11534,6 +11537,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
                 false,
                 Provider::Claude,
                 fit,
+                None,
                 None
             ),
             "Opus 5.5"
@@ -11545,6 +11549,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
                 true,
                 Provider::Claude,
                 fit,
+                None,
                 None
             ),
             "Default (Opus 5.5)"
@@ -11558,6 +11563,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             true,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Default (Opus 5.5)"
@@ -11570,6 +11576,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Opus 5.5"
@@ -11582,6 +11589,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "next-turn-model"
@@ -11593,6 +11601,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             true,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "next-turn-model"
@@ -11682,6 +11691,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            None,
             catalog.default_effort(snapshot.selected_model.as_deref())
         ),
         "Offline Mini"
@@ -11693,6 +11703,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            None,
             None
         ),
         "Offline Mini · Medium",
@@ -11706,10 +11717,30 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            advertised_default(&snapshot.models, Some(&catalog)),
             catalog.default_effort(None)
         ),
-        "ChatGPT · Default model"
+        "Default (Offline Mini)",
+        "the default reads as the model it resolves to, as Claude's does"
     );
+    for (fit, unknown) in [
+        (FooterFit::Wide, "ChatGPT · Default model"),
+        (FooterFit::Narrow, "Default model"),
+    ] {
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                true,
+                Provider::Codex,
+                fit,
+                None,
+                catalog.default_effort(None)
+            ),
+            unknown,
+            "a default the provider has not named still says whose it is"
+        );
+    }
     snapshot.selected_model = Some("offline-mini".into());
     snapshot.reasoning = Some("high".into());
     assert_eq!(
@@ -11719,6 +11750,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            None,
             catalog.default_effort(snapshot.selected_model.as_deref())
         ),
         "Offline Mini · High"
@@ -11747,6 +11779,7 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Resolved model"
@@ -11759,6 +11792,7 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Resolved model"
@@ -11771,6 +11805,7 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Resolved model · High"
@@ -11812,6 +11847,174 @@ fn a_draft_offers_each_providers_default_ahead_of_its_models() {
     assert_eq!(
         listed(&model_rows(&offers, "gpt-b", true)),
         [(Provider::Codex, vec!["gpt-b"])]
+    );
+}
+
+/// Every provider's default reads one way: "Default" and the model it
+/// resolves to, whether the provider lists the default as an alias, as
+/// Claude does, or marks one of its models, as Codex, ACP agents and Muse
+/// do. Where it hasn't said, the row says what the default is instead.
+#[test]
+fn every_providers_default_names_the_model_it_resolves_to() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, value: &str) {
+            self.0.push(value.to_owned());
+        }
+    }
+    let catalog = |models: &[chat::Model], default: Option<&str>| crate::account::cache::Catalog {
+        models: models.to_vec(),
+        observed_at: 1,
+        default_model: default.map(str::to_owned),
+        reasoning_defaults: Default::default(),
+    };
+    let codex = [model("gpt-5.4", "GPT-5.4"), model("gpt-5.5", "GPT-5.5")];
+    let codex_catalog = catalog(&codex, Some("gpt-5.5"));
+    let claude = [
+        model("default", "Default (Opus 5.5)"),
+        model("opus", "Opus 5.5"),
+    ];
+    let gemini = [model("gemini-4-neon", "Gemini 4 Neon")];
+    let gemini_catalog = catalog(&gemini, Some("gemini-4-neon"));
+    let omp = [model("kimi", "Kimi")];
+    // A default naming a model the provider no longer lists is unknown.
+    let omp_catalog = catalog(&omp, Some("retired"));
+    let offers = [
+        Offer {
+            provider: Provider::Codex,
+            models: &codex,
+            catalog: Some(&codex_catalog),
+        },
+        Offer {
+            provider: Provider::Claude,
+            models: &claude,
+            catalog: None,
+        },
+        Offer {
+            provider: Provider::Antigravity,
+            models: &gemini,
+            catalog: Some(&gemini_catalog),
+        },
+        Offer {
+            provider: Provider::Omp,
+            models: &omp,
+            catalog: Some(&omp_catalog),
+        },
+        Offer {
+            provider: Provider::Muse,
+            models: &[],
+            catalog: None,
+        },
+    ];
+    let renderer = crate::app::tests::headless_renderer();
+    let mut list = model_list(
+        Target {
+            card: CardId::new(),
+            generation: 1,
+        },
+        &offers,
+        true,
+        (Provider::Codex, None),
+        "",
+    );
+    let mut tree = Tree::new(list.as_widget());
+    let node = list.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 4000.0)),
+    );
+    let mut texts = Texts(Vec::new());
+    list.as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    let texts = texts.0;
+    let after = |heading: &str| {
+        let at = texts.iter().position(|text| text == heading).unwrap();
+        texts[at + 1..].iter().take(2).cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(
+        after("ChatGPT"),
+        ["Default (GPT-5.5)", "GPT-5.4"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Claude"),
+        ["Default (Opus 5.5)", "Opus 5.5"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Antigravity"),
+        ["Default (Gemini 4 Neon)", "Gemini 4 Neon"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Other models"),
+        ["Default model", "Whichever its settings choose"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Muse"),
+        ["Default model", "Its models are listed once it has run"],
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("would choose itself")),
+        "{texts:?}"
+    );
+    // The default is found by the model it resolves to, as Claude's
+    // `default` alias is found by its label, but after the model the search
+    // names, so Enter takes that model rather than whatever the provider's
+    // setting next makes its default.
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "5.5", true)),
+        [(Provider::Codex, vec!["gpt-5.5", "default"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[1..2], "opus", true)),
+        [(Provider::Claude, vec!["opus", "default"])]
+    );
+    // A search for the default itself, or for the provider, still heads
+    // with it.
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "def", true)),
+        [(Provider::Codex, vec!["default"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "chatgpt", true)),
+        [(Provider::Codex, vec!["default", "gpt-5.4", "gpt-5.5"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "5.4", true)),
+        [(Provider::Codex, vec!["gpt-5.4"])]
+    );
+}
+
+#[test]
+fn a_default_label_names_what_it_resolves_to_once() {
+    assert_eq!(
+        default_choice_label(Some("GPT-5.5"), "Default model"),
+        "Default (GPT-5.5)"
+    );
+    assert_eq!(
+        default_choice_label(Some("Default (recommended)"), "Default model"),
+        "Default (recommended)"
+    );
+    assert_eq!(default_choice_label(None, "Default model"), "Default model");
+    assert_eq!(
+        model_choice_label(&model("default", "Opus 5.5")),
+        "Default (Opus 5.5)"
+    );
+    assert_eq!(
+        model_choice_label(&model("default", "Default (Opus 5.5)")),
+        "Default (Opus 5.5)"
     );
 }
 
@@ -13472,6 +13675,7 @@ fn draft_label_names_only_a_reasoning_level_the_chosen_model_offers() {
             true,
             provider,
             FooterFit::Wide,
+            None,
             None,
         )
         .into_owned()

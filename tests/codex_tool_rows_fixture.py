@@ -320,6 +320,21 @@ class CodexToolRowsFixture(unittest.TestCase):
                 "threadId": restored.thread}}, home)
             self.assertEqual(resumed["result"]["reasoningEffort"], "low")
 
+    def test_a_configured_model_is_what_runs_though_model_list_flags_another(self):
+        import json
+        catalog = {"data": [{"model": "offline-mini", "isDefault": True},
+                            {"model": "offline-max"}], "nextCursor": None}
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-models.json").write_text(json.dumps(catalog))
+            scenario = PEER["Scenario"]()
+            [unset] = scenario.request({"id": 1, "method": "config/read", "params": {}}, home)
+            self.assertEqual(unset["result"]["config"]["model"], None)
+            Path(home, "config.toml").write_text('model = "offline-max"\n')
+            [read] = scenario.request({"id": 2, "method": "config/read", "params": {}}, home)
+            self.assertEqual(read["result"]["config"]["model"], "offline-max")
+            [started] = scenario.request({"id": 3, "method": "thread/start", "params": {}}, home)
+            self.assertEqual(started["result"]["model"], "offline-max")
+
     def test_unconfirmed_model_preserves_busy_turn_and_reports_when_resumed_after_marker_removal(self):
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
             marker = Path(home, "fixture-unconfirmed-model")

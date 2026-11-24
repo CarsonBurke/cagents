@@ -60,6 +60,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import uuid
 
 sys.dont_write_bytecode = True
@@ -505,7 +506,8 @@ class Scenario:
             if method == "thread/start":
                 catalog = self.models(codex_home)["data"]
                 default = next((model for model in catalog if model.get("isDefault")), catalog[0])
-                self.model = params.get("model") or default["model"]
+                self.model = params.get("model") or self.config(codex_home).get("model") \
+                    or default["model"]
                 self.reasoning = params.get("config", {}).get("model_reasoning_effort")
             result = {"thread": self.metadata(thread), "model": self.model,
                       "reasoningEffort": self.reasoning,
@@ -519,6 +521,11 @@ class Scenario:
             result = {"thread": self.metadata(params["threadId"])}
         elif method == "model/list":
             result = self.models(codex_home)
+        elif method == "config/read":
+            # Like Codex: the configured model and effort, which model/list's
+            # isDefault ignores.
+            config = self.config(codex_home)
+            result = {"config": {key: config.get(key) for key in ("model", "model_reasoning_effort")}}
         elif method == "thread/list":
             result = {"data": [] if script or any((Path(codex_home) / marker).is_file()
                                                  for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
@@ -663,6 +670,11 @@ class Scenario:
         else:
             return [{"id": identifier, "error": {"code": -32601, "message": "Unsupported offline fixture method"}}]
         return [{"id": identifier, "result": result}, *after]
+
+    def config(self, codex_home):
+        """The home's config.toml, as Codex reads it."""
+        config = Path(codex_home) / "config.toml"
+        return tomllib.loads(config.read_text()) if config.is_file() else {}
 
     def models(self, codex_home):
         """Optional recorded model/list result, private to this fixture's home."""
