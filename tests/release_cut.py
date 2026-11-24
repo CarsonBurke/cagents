@@ -109,6 +109,7 @@ case $command in
         [[ $outcome == PASS ]] || printf 'Regressions / evidence gaps:\nthe shell terminal is gone\n\nSteps\n' >> "$root/report.txt"
         cat "$FIXTURE/rehearse-status" 2>/dev/null > "$root/home/.local/share/cagents-install/.update/status.json" \
             || echo '{"phase": "Complete"}' > "$root/home/.local/share/cagents-install/.update/status.json"
+        [[ ! -e $FIXTURE/rehearse-plants ]] || mkdir -p "$(cat "$FIXTURE/rehearse-plants")"
         [[ $outcome == PASS ]] ;;
 esac
 """
@@ -481,6 +482,16 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("Outcome: FAIL", (kept / "report.txt").read_text())
         self.assertFalse((memory / "cr/release-0.2.4").exists())
         (self.root / "rehearse-outcome").unlink()
+        # A .git that appears above the root while it runs taints a failure.
+        tainted = self.root / "tainted"
+        self.env["CAGENTS_RELEASE_REHEARSAL_PARENTS"] = f"{tainted}/cr"
+        (self.root / "rehearse-outcome").write_text("FAIL\n")
+        (self.root / "rehearse-plants").write_text(str(tainted / ".git"))
+        result = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{tainted}/.git appeared above {tainted}/cr/release-0.2.4 during the rehearsal", result.stderr)
+        (self.root / "rehearse-outcome").unlink()
+        (self.root / "rehearse-plants").unlink()
         # Every parent marked: it says so rather than guess.
         self.env["CAGENTS_RELEASE_REHEARSAL_PARENTS"] = f"{marked}/cr"
         result = self.release("rehearse", "0.2.4")

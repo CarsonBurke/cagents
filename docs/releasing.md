@@ -190,7 +190,9 @@ steps, each through `mise run release` (`scripts/release --help`):
    The rehearsal's private user goes in `/var/tmp/cr/release-VERSION` on the
    host. If `/var/tmp` has a `.git` above it, such as the empty mountpoints
    a sandbox masking `.git` leaves behind, it goes in `/dev/shm/cr` instead.
-   It takes about 700 MB and is removed once the rehearsal passes. A
+   It takes about 700 MB and is removed once the rehearsal passes. If a
+   `.git` appears above the root while the rehearsal runs, a failure says
+   so instead of reporting it as a regression, and you rehearse again. A
    rehearsal that fails in `/var/tmp` keeps its report, records and
    screenshots there until the next rehearsal of that version replaces them.
    One that fails in `/dev/shm`, which is memory, keeps only its report and

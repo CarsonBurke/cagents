@@ -574,14 +574,18 @@ set -euo pipefail
 cd ~/"$1"
 local repository=$PWD sha=$2 version=$3 previous=$4 github=$5 root=$6 mode=$7 cache=~/.cache/cagents-release-rehearsal
 local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release status=0 update
-local feed=$cache/feed-$3 path=() parents parent ancestor kept=
+local feed=$cache/feed-$3 path=() parents parent kept= marker
+# The nearest .git above a path, or nothing.
+git_above() {
+    local ancestor=$1
+    while [[ ! -e $ancestor/.git && ! -L $ancestor/.git && $ancestor != / ]]; do ancestor=$(dirname -- "$ancestor"); done
+    [[ ! -e $ancestor/.git && ! -L $ancestor/.git ]] || echo "$ancestor/.git"
+}
 if [[ $root == - ]]; then
     root=
     IFS=: read -ra parents <<<"$8"
     for parent in "${parents[@]}"; do
-        ancestor=$parent
-        while [[ ! -e $ancestor/.git && ! -L $ancestor/.git && $ancestor != / ]]; do ancestor=$(dirname -- "$ancestor"); done
-        [[ -e $ancestor/.git || -L $ancestor/.git ]] || { root=$parent/release-$version; break; }
+        [[ -n $(git_above "$parent") ]] || { root=$parent/release-$version; break; }
     done
     [[ -n $root ]] || { echo "release: each of ${parents[*]} has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT" >&2; exit 1; }
 fi
@@ -623,6 +627,10 @@ fi
     --new-dir "$new" --new-version "$version" --new-installer "$new/install.sh" --answer yes \
     --ended-provider "${path[@]}" >/dev/null 9>&- || status=$?
 local report=$root/report.txt
+# A sandbox can leave a .git mountpoint above the root while the rehearsal
+# runs, which the product then refuses as a checkout: a failure that says
+# nothing about the cut.
+marker=$(git_above "$(dirname -- "$root")")
 [[ ! -f $report ]] || sed -n '/^Total duration:/p;/^Outcome:/p;/^Regressions/,/^Steps/{/^Steps/d;p;}' "$report"
 # The update worker's own record: the cut's on the staged path, the
 # published build's in the app. A failed or refused job is what reopened
@@ -642,6 +650,10 @@ if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == Comple
         || echo "release: the rehearsal passed, but $root could not be removed" >&2
     git -C "$repository" worktree remove --force "$harness" || :
     rm -rf -- "$feed"
+elif [[ -n $marker ]]; then
+    echo "release: $marker appeared above $root during the rehearsal, so its result says nothing" \
+        "about $version; rehearse again (its report is in $root on $HOSTNAME)" >&2
+    exit 1
 elif [[ $root == /dev/shm/* ]]; then
     # Memory: keep the report and screenshots, and free the rest.
     kept=$cache/failed-$version
