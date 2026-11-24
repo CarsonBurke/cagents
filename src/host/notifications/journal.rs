@@ -13,7 +13,7 @@ use crate::notifications::{Event, Notice, Target};
 
 mod session_attention;
 
-const MAX_SESSIONS: i64 = 2048;
+const MAX_OWNERS: i64 = 2048;
 const KEYS_PER_SESSION: i64 = 32;
 
 mod schema {
@@ -116,7 +116,7 @@ impl Journal {
             .0
             .transaction::<_, diesel::result::Error, _>(|connection| {
                 if let Target::PullRequest(request) = &event.target {
-                    // Immutable review identity outlives bounded payloads and
+                    // Immutable review identity outlives retired notices and
                     // dismissal; every new request node receives its own alert.
                     debug_assert!(request.validate().is_ok());
                     review::record_route(connection, request, &session)?;
@@ -200,23 +200,8 @@ impl Journal {
                     ),
                 )
                 .execute(connection)?;
-                let recent_notices = diesel::alias!(notices as recent_notices);
-                diesel::delete(
-                    notices::table.filter(
-                        notices::session.ne_all(
-                            recent_notices
-                                .select(recent_notices.field(notices::session))
-                                .order(recent_notices.field(notices::ordinal).desc())
-                                .limit(MAX_SESSIONS),
-                        ),
-                    ),
-                )
-                .execute(connection)?;
-                diesel::delete(
-                    seen::table
-                        .filter(seen::session.ne_all(notices::table.select(notices::session))),
-                )
-                .execute(connection)?;
+                // Only lifecycle reconciliation can retire durable attention.
+                // Age says nothing about whether a target is live or restorable.
                 prune_owners(connection)?;
                 Ok(Some(notice))
             });
@@ -355,7 +340,7 @@ fn prune_owners(connection: &mut SqliteConnection) -> QueryResult<()> {
                 recent_owners
                     .select(recent_owners.field(owners::session))
                     .order(recent_owners.field(owners::ordinal).desc())
-                    .limit(MAX_SESSIONS),
+                    .limit(MAX_OWNERS),
             ),
         ),
     )
@@ -536,8 +521,57 @@ mod tests {
         assert!(!notices[0].acknowledged);
     }
 
+    #[test]
+    fn newer_notices_cannot_evict_unread_session_attention_by_age() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let original = event(TerminalId::new(), "old");
+        let old = journal.record(original.clone(), false).unwrap().unwrap();
+        let former_notice_limit = 2048;
+        let rows: Vec<_> = (2..=former_notice_limit)
+            .map(|ordinal| {
+                let terminal = TerminalId::new();
+                (
+                    notices::session.eq(terminal.to_string()),
+                    notices::id.eq(Uuid::new_v4().to_string()),
+                    notices::event.eq(serde_json::to_string(&event(terminal, "later")).unwrap()),
+                    notices::delivered.eq(true),
+                    notices::acknowledged.eq(false),
+                    notices::ordinal.eq(ordinal),
+                )
+            })
+            .collect();
+        diesel::insert_into(notices::table)
+            .values(rows)
+            .execute(&mut journal.0)
+            .unwrap();
+        diesel::insert_into(seen::table)
+            .values((
+                seen::session.eq("fixture"),
+                seen::evidence.eq("fixture"),
+                seen::ordinal.eq(former_notice_limit),
+            ))
+            .execute(&mut journal.0)
+            .unwrap();
+        journal
+            .record(event(TerminalId::new(), "newest"), false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+
+        let mut journal = Journal::open(&path).unwrap();
+        let (retained, _) = journal
+            .notice_for_target(&old.event.target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.id, old.id);
+        assert!(!retained.acknowledged);
+        assert!(journal.record(original, false).unwrap().is_none());
+    }
+
     fn seed_owners(journal: &mut Journal) {
-        let rows: Vec<_> = (1..MAX_SESSIONS)
+        let rows: Vec<_> = (1..MAX_OWNERS)
             .map(|i| {
                 (
                     owners::session.eq(format!("old-{i}")),

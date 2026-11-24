@@ -90,6 +90,7 @@ fn a_conversation_that_goes_away_ends_its_watch_and_answers_what_was_in_flight()
     let chat_id = session.id;
     let watch = Watch::start(
         1,
+        11,
         session.clone(),
         bridge,
         proof(),
@@ -118,17 +119,20 @@ fn a_conversation_that_goes_away_ends_its_watch_and_answers_what_was_in_flight()
     assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1 });
     assert!(matches!(
         next_line(&lines),
-        api::ServerLine::Event(api::Event::Conversation(update)) if update.reset
+        api::ServerLine::Event(api::Event::Conversation(update))
+            if update.reset && update.watch_id == Some(11)
     ));
+    let read = daemon.receive();
+    assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+    assert!(watch.send(Command::Acknowledge { id: 6 }));
     let acknowledgement = daemon.receive();
     assert!(matches!(
         acknowledgement.request,
         ClientRequest::AcknowledgeSessionNotifications { session } if session == chat_id
     ));
     daemon.respond(&acknowledgement, ServerResponse::Accepted);
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 6 });
 
-    let read = daemon.receive();
-    assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
     assert!(watch.send(Command::Chat {
         id: 7,
         command: chat::Command::Interrupt,
@@ -160,6 +164,49 @@ fn a_conversation_that_goes_away_ends_its_watch_and_answers_what_was_in_flight()
 }
 
 #[test]
+fn disconnecting_before_reading_the_reset_does_not_acknowledge_attention() {
+    let (bridge, daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(WAIT)).unwrap();
+    let (outbox, _unread_lines) = Outbox::new();
+    let (ended, ending) = mpsc::channel();
+    let session = session();
+    let watch = Watch::start(
+        1,
+        11,
+        session.clone(),
+        bridge,
+        proof(),
+        outbox,
+        move |_, why| {
+            ended.send(why).unwrap();
+        },
+    );
+    let mut daemon = Daemon(daemon);
+    let attach = daemon.receive();
+    daemon.respond(
+        &attach,
+        ServerResponse::ChatAttached {
+            session,
+            snapshot: chat::Snapshot::default(),
+        },
+    );
+    let visibility = daemon.receive();
+    daemon.respond(&visibility, ServerResponse::Accepted);
+    // The reset is queued before the watch begins reading chat updates.
+    assert!(matches!(
+        daemon.receive().request,
+        ClientRequest::ChatRead { .. }
+    ));
+    drop(watch);
+    assert_eq!(ending.recv_timeout(WAIT).unwrap(), None);
+    assert!(
+        read_frame::<ClientEnvelope>(&mut daemon.0)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn a_watch_stopped_while_attaching_answers_once_and_sends_no_conversation() {
     let (bridge, daemon) = UnixStream::pair().unwrap();
     let (outbox, lines) = Outbox::new();
@@ -167,6 +214,7 @@ fn a_watch_stopped_while_attaching_answers_once_and_sends_no_conversation() {
     let session = session();
     let watch = Watch::start(
         1,
+        11,
         session.clone(),
         bridge,
         proof(),

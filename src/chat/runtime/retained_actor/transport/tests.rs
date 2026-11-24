@@ -1211,6 +1211,86 @@ fn stopped_provider_keeps_its_semantic_journal_until_outcome_and_loss_ack() {
     }
 }
 #[test]
+fn legacy_daemon_drains_outcomes_and_retires_with_pending_attention_clears() {
+    #[derive(Deserialize)]
+    struct LegacyEntry {
+        sequence: u64,
+        update: LegacyUpdate,
+    }
+    #[derive(Deserialize)]
+    enum LegacyUpdate {
+        Execution {
+            run: crate::model::RunId,
+            update: crate::agent_execution::Update,
+        },
+    }
+    let mut fixture = resident_fixture();
+    let server = &mut fixture.server;
+    server.installed = false;
+    let run = crate::model::RunId::new();
+    let started = crate::agent_execution::Update::Started {
+        provider_key: "review".into(),
+    };
+    let finished = crate::agent_execution::Update::Finished {
+        state: crate::agent_execution::State::Succeeded,
+        result: Default::default(),
+    };
+    let clear = Update::AttentionCleared(crate::agent::observe::AttentionClear::TurnStarted);
+    let notify = server.notifier();
+    notify(Update::Execution {
+        run,
+        update: started.clone(),
+    });
+    notify(clear.clone());
+    notify(Update::Execution {
+        run,
+        update: finished.clone(),
+    });
+
+    let call = |server: &mut Server, method: &str, args: Value| {
+        server.invoke(Invocation {
+            proof: server.proof.clone(),
+            epoch: Some(server.epoch),
+            method: method.into(),
+            args,
+        })
+    };
+    let read_new = |server: &mut Server| -> SemanticPage {
+        serde_json::from_value(call(server, "outbox_unacked", Value::Bool(true)).unwrap()).unwrap()
+    };
+    let SemanticPage::Outcomes(first) = read_new(server) else {
+        panic!("the new daemon must commit the preceding run start before it clears attention");
+    };
+    assert_eq!(first.len(), 1);
+
+    let entries: Vec<LegacyEntry> =
+        serde_json::from_value(call(server, "outbox_unacked", Value::Null).unwrap()).unwrap();
+    assert_eq!(entries.len(), 2);
+    for (i, (entry, expected)) in entries.into_iter().zip([started, finished]).enumerate() {
+        assert_eq!(entry.sequence, i as u64 + 1);
+        let LegacyUpdate::Execution {
+            run: actual,
+            update,
+        } = entry.update;
+        assert_eq!(actual, run);
+        assert_eq!(update, expected);
+    }
+
+    // A downgrade can consume a page and crash before acknowledging it.
+    // Its previously queued clear cannot later overwrite a newer committed outcome.
+    let SemanticPage::Outcomes(replayed) = read_new(server) else {
+        panic!("re-upgrading must replay the compatible run outcomes");
+    };
+    assert_eq!(replayed.len(), 2);
+    call(server, "ack_outbox", json!([2])).unwrap();
+
+    notify(clear);
+    server.actor.close().unwrap();
+    server.closed_snapshot = Some(Arc::new(server.actor.snapshot(None).unwrap()));
+    assert!(call(server, "retire", Value::Bool(true)).is_err());
+    call(server, "retire", Value::Null).unwrap();
+}
+#[test]
 fn courier_input_completion_persists_uncertainty_and_retains_affected_runs() {
     for uncertain in [false, true] {
         let mut fixture = resident_fixture();

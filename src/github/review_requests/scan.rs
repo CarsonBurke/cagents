@@ -400,6 +400,8 @@ pub struct Scan {
     cursors: BTreeSet<String>,
     seen: BTreeSet<u64>,
     histories: VecDeque<PendingHistory>,
+    #[serde(default)]
+    deferred_histories: VecDeque<PendingHistory>,
     history_next: bool,
     /// Whether the current pass has reached the last repository page.
     censused: bool,
@@ -423,6 +425,9 @@ impl Scan {
         }
         self.history_next = true;
         if self.cursor.is_none() {
+            if self.settled() {
+                self.histories.append(&mut self.deferred_histories);
+            }
             self.censused = false;
             self.started_at = None;
             self.completed = None;
@@ -441,11 +446,17 @@ impl Scan {
         changed
     }
 
+    fn forget_history(&mut self, number: u64) {
+        self.histories.retain(|history| history.number != number);
+        self.deferred_histories
+            .retain(|history| history.number != number);
+    }
+
     fn observe(&mut self, entry: Entry) {
         let number = entry.number;
         let Some(current) = entry.viewer_latest_review_request.clone() else {
             self.requested.remove(&number);
-            self.histories.retain(|history| history.number != number);
+            self.forget_history(number);
             return;
         };
         if let Some(previous) = self.requested.get_mut(&number)
@@ -454,7 +465,7 @@ impl Scan {
             previous.entry = entry;
             return;
         }
-        self.histories.retain(|history| history.number != number);
+        self.forget_history(number);
         // Unknown union members still confer current request authority, but
         // cannot be matched to historical identities we cannot represent.
         if current
@@ -510,6 +521,8 @@ impl Scan {
             self.requested
                 .retain(|number, _| self.seen.contains(number));
             self.histories
+                .retain(|history| self.seen.contains(&history.number));
+            self.deferred_histories
                 .retain(|history| self.seen.contains(&history.number));
             self.seen.clear();
             self.cursors.clear();
@@ -572,13 +585,12 @@ impl Scan {
         } else {
             let cursor = page.previous_cursor.unwrap();
             if !pending.cursors.insert(cursor.clone()) {
-                // This response consumed the queue entry. Retain it for a
-                // fresh traversal after the monitor's backoff; otherwise an
-                // unchanged current request could remain Unknown forever.
+                // Retry malformed pagination from the beginning on the next
+                // census, without losing the known current request.
                 pending.before = None;
                 pending.cursors.clear();
                 pending.matching.clear();
-                self.histories.push_back(pending);
+                self.deferred_histories.push_back(pending);
                 return Err("GitHub repeated a review history cursor".into());
             }
             pending.before = Some(cursor);
@@ -588,9 +600,9 @@ impl Scan {
         Ok(())
     }
 
-    /// Whether this pass has read every page and classified every request it
-    /// found. Until then it has work worth doing as soon as the budget allows.
-    /// A scan reset for a new viewer has read nothing, so it is not settled.
+    /// Whether this pass has read every discovery page and tried the histories
+    /// it found. Discovery establishes the current requests even when a
+    /// timeline is unavailable, so deferred histories wait for the next pass.
     pub fn settled(&self) -> bool {
         self.censused && self.cursor.is_none() && self.histories.is_empty()
     }
@@ -643,18 +655,21 @@ impl Scan {
     }
 
     /// An unavailable timeline never revokes the authoritative current request.
-    /// Retry it after other pending requests and discovery get a turn.
-    pub fn failed_history(&mut self, work: &Work) {
+    /// Retry it on the next pass, after this one has read every discovery page.
+    pub(super) fn failed_history(&mut self, work: &Work) {
         if let Work::History {
-            number, request, ..
+            number,
+            request,
+            before,
         } = work
-            && self
-                .histories
-                .front()
-                .is_some_and(|pending| pending.number == *number && pending.request == *request)
+            && self.histories.front().is_some_and(|pending| {
+                pending.number == *number
+                    && pending.request == *request
+                    && pending.before == *before
+            })
         {
             let history = self.histories.pop_front().unwrap();
-            self.histories.push_back(history);
+            self.deferred_histories.push_back(history);
         }
     }
 }

@@ -126,6 +126,9 @@ pub enum Call {
     /// change. Only sessions with `watchable` set can be watched.
     #[serde(rename = "conversation.watch")]
     WatchConversation { session: String },
+    /// Clear the session's notices after the phone applies the watch's reset.
+    #[serde(rename = "conversation.acknowledge")]
+    AcknowledgeConversation { session: String, watch_id: u64 },
     #[serde(rename = "conversation.unwatch")]
     UnwatchConversation { session: String },
     /// Extend a watched conversation's window with older items, when its
@@ -168,6 +171,7 @@ impl Call {
         "notifications.unwatch",
         "notification.acknowledge",
         "conversation.watch",
+        "conversation.acknowledge",
         "conversation.unwatch",
         "conversation.load_earlier",
         "conversation.send",
@@ -401,6 +405,10 @@ pub struct ConversationUpdate {
     /// Replace everything held for this conversation: `items` is the whole
     /// window and `order` is present.
     pub reset: bool,
+    /// Identifies the active watch for conversation acknowledgement. Sent
+    /// with its reset by bridges that support explicit acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_id: Option<u64>,
     /// The conversation's current state, sent whole with every update.
     pub state: ConversationState,
     /// Every item's ID in display order, when it changed.

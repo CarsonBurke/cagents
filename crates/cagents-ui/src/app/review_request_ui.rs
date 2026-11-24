@@ -17,14 +17,21 @@ fn review_interval(focused: bool, daemon_unavailable: bool) -> Duration {
 }
 
 impl Cagents {
-    fn watches_review_requests(&self) -> bool {
-        self.github_availability
-            .values()
-            .any(|availability| availability.repository_key().is_some())
+    pub(super) fn sync_review_watch(
+        &mut self,
+        project: ProjectId,
+        availability: &GitHubAvailability,
+    ) {
+        let repositories = &mut self.refresh_ui.review_watch_repositories;
+        if let Some(repository) = availability.repository_key() {
+            repositories.insert(project, repository.clone());
+        } else if matches!(availability, GitHubAvailability::NotAssociated) {
+            repositories.remove(&project);
+        }
     }
 
     pub(super) fn review_request_subscription(&self) -> Subscription<Message> {
-        if !self.watches_review_requests() {
+        if self.refresh_ui.review_watch_repositories.is_empty() {
             return Subscription::none();
         }
         cosmic::iced::time::every(review_interval(
@@ -37,23 +44,14 @@ impl Cagents {
     /// The interval timer restarts at its full length when focus returns, so
     /// whatever fell due while the window ticked slowly is read now instead.
     pub(super) fn review_requests_focus_regained(&mut self) -> Task<Message> {
-        if !self.watches_review_requests() {
+        if self.refresh_ui.review_watch_repositories.is_empty() {
             return Task::none();
         }
         self.update_review_requests(Action::Tick)
     }
 
     pub(super) fn update_review_requests(&mut self, action: Action) -> Task<Message> {
-        let repositories = self
-            .github_availability
-            .iter()
-            .filter_map(|(&project, availability)| {
-                availability
-                    .repository_key()
-                    .cloned()
-                    .map(|key| (project, key))
-            })
-            .collect::<HashMap<_, _>>();
+        let repositories = &self.refresh_ui.review_watch_repositories;
         let revision = self.refresh_ui.review_requests.revision();
         let task = self
             .refresh_ui
@@ -192,14 +190,13 @@ mod tests {
     fn watching_one_repository() -> Cagents {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let project = ProjectId::new();
-        app.github_availability.insert(
-            project,
-            GitHubAvailability::Ready {
-                repository_key: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
-                pull_requests: Vec::new(),
-                refreshed_at: 1,
-            },
-        );
+        let availability = GitHubAvailability::Ready {
+            repository_key: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
+            pull_requests: Vec::new(),
+            refreshed_at: 1,
+        };
+        app.sync_review_watch(project, &availability);
+        app.github_availability.insert(project, availability);
         let row = sidebar::SidebarPullRequest::new(
             project,
             7,
@@ -300,6 +297,51 @@ mod tests {
                 hasher.finish()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_failed_github_status_refresh_keeps_the_review_watch() {
+        let mut app = watching_one_repository();
+        let project = app.sidebar_model.projects[0].id;
+        let expected = app.refresh_ui.review_watch_repositories[&project].clone();
+        app.repository_generations.insert(project, 1);
+        app.complete_review_read_for_test(&[7]);
+
+        let malformed = GitHubAvailability::from_error(
+            crate::github::GitHubValidationError::InvalidPullRequestUrl("unexpected URL".into())
+                .into(),
+        );
+        assert!(matches!(malformed, GitHubAvailability::Failed { .. }));
+        drop(app.update_git(git_ui::Action::Remote {
+            project,
+            generation: 1,
+            result: Ok((malformed, Vec::new())),
+        }));
+        assert!(app.github_availability[&project].repository_key().is_none());
+        assert_eq!(
+            recipe_identities(app.review_request_subscription()).len(),
+            1
+        );
+        assert!(app.sidebar_model.projects[0].display_pull_requests()[0].needs_review);
+
+        app.refresh_ui.review_requests.make_due_for_test();
+        drop(app.update_review_requests(Action::Tick));
+        assert_eq!(
+            app.refresh_ui
+                .review_requests
+                .in_flight_for_test()
+                .map(|(repository, _)| repository),
+            Some(&expected),
+        );
+
+        drop(app.update_git(git_ui::Action::Remote {
+            project,
+            generation: 1,
+            result: Ok((GitHubAvailability::NotAssociated, Vec::new())),
+        }));
+        assert!(recipe_identities(app.review_request_subscription()).is_empty());
+        assert!(app.refresh_ui.review_requests.snapshots().next().is_none());
+        assert!(!app.sidebar_model.projects[0].display_pull_requests()[0].needs_review);
     }
 
     #[test]

@@ -16234,6 +16234,7 @@ fn a_restored_pull_request_reopens_even_under_a_dialog() {
 #[test]
 fn a_review_opened_without_a_durable_change_republishes_its_alert_focus() {
     let (mut app, project) = pull_request_test_app(&[7]);
+    app.sync_review_watch(project, &app.github_availability[&project].clone());
     app.core.set_main_window_id(Some(window::Id::RESERVED));
     app.refresh_ui.focused = true;
     let (card, _) = app.add_pull_requests_card("/repo".into());

@@ -1505,7 +1505,6 @@ impl GitHubAvailability {
             GitHubError::AuthenticationRequired { .. } | GitHubError::NoActiveAccount(_) => {
                 Self::Unauthenticated
             }
-            GitHubError::Validation(_) => Self::NotAssociated,
             GitHubError::InvalidResponse { source, .. } => Self::from_error(*source),
             error => Self::Failed {
                 detail: error.to_string(),

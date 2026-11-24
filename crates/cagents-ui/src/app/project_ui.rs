@@ -942,6 +942,7 @@ impl Cagents {
         }
         self.github_availability.remove(&id);
         self.review_repositories.remove(&id);
+        self.refresh_ui.review_watch_repositories.remove(&id);
         self.project_ui.projects.remove(&id);
         self.repository_generations.remove(&id);
         if let Some(cancellation) = self.repository_pr_cancellations.remove(&id) {

@@ -166,6 +166,13 @@ sealed class Call(val op: String) {
     }
 
     data class WatchConversation(override val session: String) : OnSession("conversation.watch")
+    data class AcknowledgeConversation(override val session: String, val watchId: Long) :
+        OnSession("conversation.acknowledge") {
+        override fun params() = buildJsonObject {
+            put("session", session)
+            put("watch_id", watchId)
+        }
+    }
     data class UnwatchConversation(override val session: String) : OnSession("conversation.unwatch")
     data class LoadEarlier(override val session: String) : OnSession("conversation.load_earlier")
     data class Interrupt(override val session: String) : OnSession("conversation.interrupt")

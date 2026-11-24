@@ -1,6 +1,7 @@
 //! Private semantic outcomes and stable input receipts. The live reducer and
 //! transcript remain in the holder; this is never a stdout/reducer replay log.
 use super::super::Update;
+use crate::agent::observe::AttentionClear;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path};
@@ -47,6 +48,14 @@ pub(crate) struct OutboxEntry {
     /// and the daemon then requires the helper's current conversation instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_session: Option<String>,
+}
+
+/// A clear follows all original outcomes up to its recorded boundary. Its
+/// independent cursor leaves the run outcome sequences readable by older daemons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AttentionClearEntry {
+    pub sequence: u64,
+    pub clear: AttentionClear,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +108,8 @@ pub(super) struct Journal {
     acknowledged_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
+    attention_ack: u64,
+    attention_latest: u64,
     published_sources: Vec<crate::chat::Session>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
@@ -145,6 +156,7 @@ impl Journal {
         // size and mtime, so the cache could never reclaim it.
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;
             CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL,confirmed_session TEXT);
+            CREATE TABLE attention_clears(sequence INTEGER PRIMARY KEY AUTOINCREMENT,after_outcome INTEGER NOT NULL,clear BLOB NOT NULL,UNIQUE(after_outcome,clear));
             CREATE TABLE retained_runs(run TEXT PRIMARY KEY,finished INTEGER);
             CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL);
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL);
@@ -162,6 +174,8 @@ impl Journal {
             acknowledged_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
+            attention_ack: 0,
+            attention_latest: 0,
             published_sources: Vec::new(),
         })
     }
@@ -285,8 +299,26 @@ impl Journal {
         ) {
             return Ok(());
         }
-        if self.retirement_sealed {
-            return Err(SEALED.into());
+        self.ensure_writable()?;
+        if self.loss()?.is_some() {
+            return Err("Actor outcome journal already has a recorded loss".into());
+        }
+        if let Update::AttentionCleared(clear) = update {
+            let bytes = serde_json::to_vec(clear).map_err(|error| error.to_string())?;
+            // At most one of each kind between two outcomes. Repeating a
+            // clear while there is no new outcome changes no attention.
+            if self
+                .db
+                .execute(
+                    "INSERT OR IGNORE INTO attention_clears(after_outcome,clear) VALUES(?1,?2)",
+                    params![self.outcome_latest, bytes],
+                )
+                .map_err(|error| error.to_string())?
+                > 0
+            {
+                self.attention_latest = self.db.last_insert_rowid() as u64;
+            }
+            return Ok(());
         }
         // Keep bounded supplied context byte-for-byte. Never consult a later
         // snapshot or modify evidence to repair malformed optional display data.
@@ -301,9 +333,6 @@ impl Journal {
             _ => None,
         };
         let update = metadata_only.as_ref().unwrap_or(update);
-        if self.loss()?.is_some() {
-            return Err("Actor outcome journal already has a recorded loss".into());
-        }
         if let Update::Execution { run, .. } = update {
             if self.run_ids.len() >= MAX_ENTRIES && !self.run_ids.contains(run) {
                 self.run_ids.insert(*run);
@@ -372,15 +401,19 @@ impl Journal {
         Ok(())
     }
     pub fn page(&self, after: u64) -> Result<Vec<OutboxEntry>, String> {
+        self.outcome_page(after, i64::MAX as u64)
+    }
+
+    fn outcome_page(&self, after: u64, through: u64) -> Result<Vec<OutboxEntry>, String> {
         let ack = self.number("outcome_ack")?;
         if after < ack {
             return Err("Outcome cursor predates already committed updates".into());
         }
         let after = i64::try_from(after).map_err(|_| "Outcome cursor is out of range")?;
-        let mut query=self.db.prepare("SELECT sequence,payload,confirmed_session FROM outcomes WHERE sequence>?1 ORDER BY sequence LIMIT 64")
+        let mut query=self.db.prepare("SELECT sequence,payload,confirmed_session FROM outcomes WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 64")
             .map_err(|error|error.to_string())?;
         let rows = query
-            .query_map([after], |row| {
+            .query_map(params![after, through], |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
@@ -403,6 +436,77 @@ impl Journal {
             });
         }
         Ok(result)
+    }
+
+    pub fn next_attention_page(&self) -> Result<Vec<AttentionClearEntry>, String> {
+        let mut query = self.db.prepare(
+            "SELECT sequence,clear FROM attention_clears WHERE after_outcome<=?1 ORDER BY sequence LIMIT 64"
+        ).map_err(|error| error.to_string())?;
+        let rows = query
+            .query_map([self.outcome_ack], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (sequence, bytes) = row.map_err(|error| error.to_string())?;
+            Ok(AttentionClearEntry {
+                sequence,
+                clear: serde_json::from_slice(&bytes).map_err(|error| error.to_string())?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn next_outcome_page(&self) -> Result<Vec<OutboxEntry>, String> {
+        let through = self
+            .db
+            .query_row(
+                "SELECT MIN(after_outcome) FROM attention_clears",
+                [],
+                |row| row.get::<_, Option<u64>>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        self.outcome_page(self.outcome_ack, through.unwrap_or(self.outcome_latest))
+    }
+
+    pub fn attention_clock(&self) -> (u64, u64) {
+        (self.attention_ack, self.attention_latest)
+    }
+
+    pub fn ack_attention(&mut self, through: u64) -> Result<(), String> {
+        self.ensure_writable()?;
+        if through <= self.attention_ack {
+            return Ok(());
+        }
+        let ready = self
+            .db
+            .query_row(
+                "SELECT after_outcome FROM attention_clears WHERE sequence=?1",
+                [through],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if ready.is_none_or(|after| after > self.outcome_ack) {
+            return Err("Attention clear acknowledgement exceeds the available sequence".into());
+        }
+        self.discard_attention_through(through)
+    }
+
+    pub fn discard_attention(&mut self) -> Result<(), String> {
+        self.discard_attention_through(self.attention_latest)
+    }
+
+    fn discard_attention_through(&mut self, through: u64) -> Result<(), String> {
+        if through <= self.attention_ack {
+            return Ok(());
+        }
+        self.ensure_writable()?;
+        self.db
+            .execute("DELETE FROM attention_clears WHERE sequence<=?1", [through])
+            .map_err(|error| error.to_string())?;
+        self.attention_ack = through;
+        Ok(())
     }
     /// Every conversation an unacknowledged outcome followed. Each was this
     /// helper's confirmed conversation when it journaled that outcome, so its
@@ -764,10 +868,15 @@ impl Journal {
         // clocks; storage faults may make a cache an insufficient disposition.
         let queued: u64 = self
             .db
-            .query_row("SELECT COUNT(*) FROM outcomes", [], |row| row.get(0))
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM outcomes) + (SELECT COUNT(*) FROM attention_clears)",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|error| error.to_string())?;
         if queued != 0
             || self.acknowledged()? != self.latest()?
+            || self.attention_ack != self.attention_latest
             || self
                 .last_loss
                 .as_ref()
@@ -823,26 +932,41 @@ mod tests {
 
     #[test]
     fn outbox_keeps_attention_clears_in_outcome_order_until_acknowledged() {
-        use crate::agent::observe::AttentionClear;
         let root = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(root.path()).unwrap();
         let start = Update::AttentionCleared(AttentionClear::TurnStarted);
         let answer = Update::AttentionCleared(AttentionClear::LeftWaiting);
-        let outcome = Update::Attention(crate::notifications::Evidence {
-            key: "new-turn".into(),
-            kind: crate::notifications::Kind::Succeeded,
-        });
-        for update in [&start, &answer, &outcome] {
+        let outcome = |key: &str| {
+            Update::Attention(crate::notifications::Evidence {
+                key: key.into(),
+                kind: crate::notifications::Kind::Waiting,
+            })
+        };
+        let first = outcome("first");
+        let second = outcome("second");
+        for update in [&start, &start, &first, &answer, &second] {
             journal.append(update, Some("conversation")).unwrap();
         }
-        let page = journal.page(journal.acknowledged().unwrap()).unwrap();
-        assert_eq!(
-            page.iter().map(|entry| &entry.update).collect::<Vec<_>>(),
-            [&start, &answer, &outcome]
-        );
-        journal.ack(page[1].sequence).unwrap();
-        let remaining = journal.page(journal.acknowledged().unwrap()).unwrap();
-        assert_eq!(remaining[0].update, outcome);
+        assert!(journal.next_outcome_page().unwrap().is_empty());
+        let clears = journal.next_attention_page().unwrap();
+        assert_eq!(clears.len(), 1);
+        assert_eq!(clears[0].clear, AttentionClear::TurnStarted);
+        assert_eq!(clears, journal.next_attention_page().unwrap());
+        journal.ack_attention(clears[0].sequence).unwrap();
+        let page = journal.next_outcome_page().unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].update, first);
+        assert_eq!(page[0].sequence, 1);
+        assert!(journal.next_attention_page().unwrap().is_empty());
+        journal.ack(1).unwrap();
+        let clears = journal.next_attention_page().unwrap();
+        assert_eq!(clears.len(), 1);
+        assert_eq!(clears[0].clear, AttentionClear::LeftWaiting);
+        journal.ack_attention(clears[0].sequence).unwrap();
+        let page = journal.next_outcome_page().unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].update, second);
+        assert_eq!(page[0].sequence, 2);
     }
 
     #[test]

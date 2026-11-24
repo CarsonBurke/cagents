@@ -104,8 +104,9 @@ pub(crate) fn request_key(host: &str, port: Option<u16>, viewer: &str, request: 
     format!("review:{:x}", digest.finalize())
 }
 
-/// A complete, error-free monitor pass for one viewer. An empty set is an
-/// authoritative observation. Partial, failed and cancelled reads send no set.
+/// A complete discovery pass for one viewer. An empty set is authoritative.
+/// Partial, failed and cancelled discovery sends no set. Optional timeline
+/// enrichment does not determine whether a request is current.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Census {
     pub viewer: String,

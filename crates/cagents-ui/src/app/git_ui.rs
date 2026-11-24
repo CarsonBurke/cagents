@@ -815,6 +815,7 @@ impl Cagents {
                     row.revoke_github();
                 }
                 row.github_status = availability.label().into();
+                self.sync_review_watch(project, &availability);
                 self.github_availability.insert(project, availability);
                 return Task::batch([
                     self.open_pending_pull_requests(project),

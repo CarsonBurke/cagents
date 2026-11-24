@@ -34,8 +34,16 @@ private const val S = "8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"
 private fun sessionsEvent(activity: String) =
     """{"type":"event","event":"sessions","data":{"sessions":[{"id":"$S","lineage":"$S","surface":"chat","title":"Fix the build","activity":"$activity","exited":false,"watchable":true,"new_field":{"x":1}}]}}"""
 
-private fun conversation(reset: Boolean, order: String?, items: String, appends: String = "[]", busy: Boolean = true) =
+private fun conversation(
+    reset: Boolean,
+    order: String?,
+    items: String,
+    appends: String = "[]",
+    busy: Boolean = true,
+    watchId: Long? = null,
+) =
     """{"type":"event","event":"conversation","data":{"session":"$S","reset":$reset,""" +
+        (watchId?.let { """"watch_id":$it,""" } ?: "") +
         """"state":{"activity":"working","busy":$busy,"ready":true,"exited":false,"has_earlier":false,"loading_earlier":false},""" +
         (order?.let { """"order":$it,""" } ?: "") +
         """"items":$items,"appends":$appends}}"""
@@ -91,6 +99,108 @@ class RemoteControllerTest {
         assertEquals("On it, done.", (held.items[1].body as ItemBody.Text).text)
         assertEquals(9L, held.items[1].at)
         assertIs<ItemBody.Command>(held.items[2].body)
+    }
+
+    @Test
+    fun acknowledgesOnlyAfterApplyingTheFirstAvailableReset() = runTest {
+        val controller = controller()
+        controller.open(S)
+        controller.start()
+        val first = bridge.acceptWelcomed()
+        first.ok(first.expect("conversation.watch"))
+        first.hangUp()
+
+        controller.await { it.connection is ConnectionState.Retrying }
+        assertEquals(false, controller.state.value.conversations[S]?.loaded)
+        assertTrue(first.isClosedByClient(), "a watch reply alone must not acknowledge the conversation")
+
+        val second = bridge.acceptWelcomed()
+        second.ok(second.expect("conversation.watch"))
+        second.send(conversation(reset = true, order = "[]", items = "[]", watchId = 11))
+        val acknowledgement = second.nextRequest()
+        assertEquals("conversation.acknowledge", acknowledgement.op)
+        assertEquals(S, acknowledgement.params["session"]!!.jsonPrimitive.content)
+        assertEquals("11", acknowledgement.params["watch_id"]!!.jsonPrimitive.content)
+        assertEquals(true, controller.state.value.conversations[S]?.loaded)
+        second.ok(acknowledgement)
+        testScheduler.runCurrent()
+        second.hangUp()
+
+        // A reconnect refreshes the same open conversation without reading new notices.
+        val third = bridge.acceptWelcomed()
+        third.ok(third.expect("conversation.watch"))
+        third.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Back")}]", watchId = 12))
+        controller.await { it.conversations[S]?.items?.singleOrNull()?.id == "a" }
+        testScheduler.runCurrent()
+        controller.close(S)
+        assertEquals("conversation.unwatch", third.nextRequest().op)
+    }
+
+    @Test
+    fun aResetThatCannotBeAppliedDoesNotAcknowledgeTheConversation() = runTest {
+        val controller = controller()
+        controller.open(S)
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(
+            conversation(
+                reset = true,
+                order = "[]",
+                items = "[]",
+                appends = """[{"id":"missing","offset":5,"text":"!"}]""",
+                watchId = 10,
+            ),
+        )
+        val recovery = connection.nextRequest()
+        assertEquals("conversation.watch", recovery.op)
+        connection.ok(recovery)
+        connection.send(conversation(reset = true, order = "[]", items = "[]", watchId = 11))
+        val acknowledgement = connection.nextRequest()
+        assertEquals("conversation.acknowledge", acknowledgement.op)
+        assertEquals("11", acknowledgement.params["watch_id"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun reconnectDoesNotAcknowledgeAgainWhenTheReplyWasLost() = runTest {
+        val controller = controller()
+        controller.open(S)
+        controller.start()
+        val first = bridge.acceptWelcomed()
+        first.ok(first.expect("conversation.watch"))
+        first.send(conversation(reset = true, order = "[]", items = "[]", watchId = 11))
+        assertEquals("conversation.acknowledge", first.nextRequest().op)
+        // The bridge might have cleared the notices before the connection was lost.
+        first.hangUp()
+
+        val second = bridge.acceptWelcomed()
+        second.ok(second.expect("conversation.watch"))
+        second.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Back")}]", watchId = 12))
+        controller.await { it.conversations[S]?.items?.singleOrNull()?.id == "a" }
+        testScheduler.runCurrent()
+        controller.close(S)
+        assertEquals("conversation.unwatch", second.nextRequest().op)
+    }
+
+    @Test
+    fun aStaleWatchRefusalLetsTheReplacementAcknowledgeTheOpen() = runTest {
+        val controller = controller()
+        controller.open(S)
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = "[]", items = "[]", watchId = 11))
+        val refused = connection.nextRequest()
+        assertEquals("conversation.acknowledge", refused.op)
+        connection.error(refused, "not_watching", "That watch ended.")
+        controller.rewatch(S)
+        val newWatch = connection.nextRequest()
+        assertEquals("conversation.watch", newWatch.op)
+        connection.ok(newWatch)
+        connection.send(conversation(reset = true, order = "[]", items = "[]", watchId = 12))
+        val acknowledgement = connection.nextRequest()
+        assertEquals("conversation.acknowledge", acknowledgement.op)
+        assertEquals("12", acknowledgement.params["watch_id"]!!.jsonPrimitive.content)
     }
 
     @Test

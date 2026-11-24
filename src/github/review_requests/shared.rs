@@ -398,20 +398,32 @@ fn poll_with(
             .as_ref()
             .is_some_and(|viewer| &viewer.id != previous)
     });
-    if applied.is_err() {
-        stored.scan.failed_history(&work);
-        stored.scan.restart_census();
-        stored.pending = None;
+    let error = applied.err().and_then(|error| {
         observed.clear();
-        stored.failures = stored.failures.saturating_add(1);
-    } else if viewer_changed {
+        match &work {
+            Work::Page { .. } => {
+                stored.scan.restart_census();
+                stored.pending = None;
+                stored.failures = stored.failures.saturating_add(1);
+                Some(error)
+            }
+            Work::History { number, .. } => {
+                stored.scan.failed_history(&work);
+                tracing::debug!(number, %error, "could not read review request history");
+                // The discovery pages are still authoritative. A host rate
+                // limit can stop all reads, but one timeline cannot.
+                rate_limit.as_ref().map(|_| error)
+            }
+        }
+    });
+    if viewer_changed {
         // Even a one-page result on the account-switch read carries no
         // withdrawal authority. The next pass can settle for the new viewer.
         stored.validator = None;
         stored.census_at = 0;
         stored.pending = None;
         stored.observed.clear();
-    } else if stored.scan.settled() {
+    } else if error.is_none() && stored.scan.settled() {
         stored.scan.record_settlement(completed);
         stored.failures = 0;
         if let Some((validator, at)) = stored.pending.take() {
@@ -419,7 +431,7 @@ fn poll_with(
             stored.census_at = at;
         }
     }
-    stored.error = applied.err();
+    stored.error = error;
     stored.due = completed.saturating_add(if stored.failures > 0 {
         REFRESH
             .saturating_mul(1 << stored.failures.saturating_sub(1).min(16))
@@ -919,6 +931,84 @@ pub(crate) mod tests {
             fresh.scan.requested.keys().copied().collect::<Vec<_>>(),
             [51]
         );
+    }
+
+    #[test]
+    fn persistent_history_failure_keeps_later_discovery_pages_and_the_census() {
+        use crate::github::review_requests::{Reviewer, scan::History};
+
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let read = |at, expected, reply| {
+            poll_with(
+                root.path(),
+                "history-failure-test",
+                &repository(),
+                &cancel,
+                || at,
+                |work, _| {
+                    assert_eq!(*work, expected);
+                    reply
+                },
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        let Reply::Page(mut first_page) = page("viewer", &[1], Some("next")) else {
+            unreachable!();
+        };
+        let current = first_page.entries[0]
+            .viewer_latest_review_request
+            .as_mut()
+            .unwrap();
+        current.requested_reviewer = Some(Reviewer {
+            kind: "User".into(),
+            id: Some("viewer".into()),
+        });
+        let history = Work::History {
+            number: 1,
+            request: current.clone(),
+            before: None,
+        };
+        let mut start = 1000;
+        for number in [51, 52] {
+            let first = read(
+                start,
+                Work::Page { cursor: None },
+                Ok(Reply::Page(first_page.clone())),
+            );
+            let failed = read(
+                first.due,
+                history.clone(),
+                Err(GitHubError::Inspection("timeline unavailable".into())),
+            );
+            assert_eq!(failed.due, first.due + PACE);
+            assert!(failed.scan.settled_census().is_none());
+            assert!(failed.error.is_none());
+            assert_eq!(failed.scan.requested[&1].history, History::Unknown);
+            assert!(failed.observed.iter().any(|page| {
+                page.revision == first.observation.1 && page.requests == [(1, "request-1".into())]
+            }));
+
+            let second = read(
+                failed.due,
+                Work::Page {
+                    cursor: Some("next".into()),
+                },
+                Ok(page("viewer", &[number], None)),
+            );
+            let request = (number, format!("request-{number}"));
+            assert!(second.observed.iter().any(|page| {
+                page.revision == second.observation.1
+                    && page.requests.as_slice() == std::slice::from_ref(&request)
+            }));
+            let census = second.scan.settled_census().unwrap();
+            assert_eq!(census.started_at, start);
+            assert_eq!(census.requests, [(1, "request-1".into()), request]);
+            assert_eq!(second.due, failed.due + REFRESH);
+            start = second.due;
+        }
     }
 
     #[test]

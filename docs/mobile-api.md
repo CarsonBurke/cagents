@@ -117,6 +117,7 @@ first event.
 | `notifications.unwatch` | | Stops those events. |
 | `notification.acknowledge` | `id` | Dismisses a notification everywhere. |
 | `conversation.watch` | `session` | Sends a reset `conversation`, then its changes. Watching again restarts it. |
+| `conversation.acknowledge` | `session`, `watch_id` | Dismisses the conversation's unread notices after the phone opens it. |
 | `conversation.unwatch` | `session` | Stops following it. |
 | `conversation.load_earlier` | `session` | Extends the window to older items. |
 | `conversation.send` | `session`, `text`, `mode` | Sends a message. `mode` is `send` (default), `steer` (into the running turn) or `queue` (after it). |
@@ -127,6 +128,10 @@ The `conversation.load_earlier`, `send`, `interrupt` and `answer` ops need the
 conversation to be watched. Several conversations can be watched at once.
 A watched conversation counts as being looked at, so the computer keeps its
 history current; unwatch it when the app goes to the background.
+To acknowledge notices when the person opens a conversation, first apply the
+reset and then pass its `watch_id` to `conversation.acknowledge`. If the reset
+has no `watch_id`, the bridge does not support the op. An ended or replaced
+watch returns `not_watching`.
 
 A request that a watch was still carrying out when the watch ended, such as
 when it was unwatched or watched again, is answered with `unavailable`: the

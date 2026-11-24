@@ -1,6 +1,7 @@
 //! One handle for a daemon-local actor or its authenticated retained owner.
+#[cfg(test)]
 use super::retained_actor::journal::OutboxEntry;
-use super::retained_actor::transport::{ActorIdentity, RemoteActor};
+use super::retained_actor::transport::{ActorIdentity, RemoteActor, SemanticClocks, SemanticPage};
 use super::{LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness};
 use crate::chat::{
     self, Command, Snapshot,
@@ -243,22 +244,41 @@ impl Handle {
         }
     }
     /// See [`RemoteActor::uncommitted_outcomes`].
+    #[cfg(test)]
     pub(crate) fn uncommitted_outcomes(&self) -> Result<Vec<OutboxEntry>, String> {
         match &self.0 {
             Owner::Remote(remote) => remote.uncommitted_outcomes(),
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
-    pub(crate) fn retained_outcome_clock_until(
+    pub(crate) fn retained_semantic_clocks_until(
         &self,
         deadline: std::time::Instant,
-    ) -> Result<(u64, u64), String> {
+    ) -> Result<SemanticClocks, String> {
         let Owner::Remote(remote) = &self.0 else {
             return Err("This actor has no retained outcome outbox".into());
         };
         remote.outcome_clock_until(deadline)
     }
+    #[cfg(test)]
+    pub(crate) fn retained_outcome_clock_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(u64, u64), String> {
+        let clocks = self.retained_semantic_clocks_until(deadline)?;
+        Ok((clocks.outcomes.acknowledged, clocks.outcomes.latest))
+    }
+    pub(crate) fn retained_semantic_page_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<SemanticPage, String> {
+        let Owner::Remote(remote) = &self.0 else {
+            return Err("This actor has no retained outcome outbox".into());
+        };
+        remote.semantic_page_until(deadline)
+    }
     /// See [`RemoteActor::uncommitted_outcomes_until`].
+    #[cfg(test)]
     pub(crate) fn uncommitted_outcomes_until(
         &self,
         deadline: std::time::Instant,
@@ -310,6 +330,20 @@ impl Handle {
             }
             _ => Err("This actor has no retained outcome outbox".into()),
         }
+    }
+    pub(crate) fn commit_retained_attention_until(
+        &self,
+        through: u64,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let Owner::Remote(remote) = &self.0 else {
+            return Err("This actor has no retained attention outbox".into());
+        };
+        remote.call_until(
+            "ack_attention_clears",
+            serde_json::json!([through]),
+            deadline,
+        )
     }
     #[cfg(test)]
     pub(crate) fn pending_retained_inputs(

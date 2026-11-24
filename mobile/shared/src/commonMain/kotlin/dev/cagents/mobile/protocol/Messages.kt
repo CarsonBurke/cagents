@@ -125,6 +125,7 @@ enum class RunState(override val wire: String) : WireEnum {
 data class ConversationUpdate(
     val session: String,
     val reset: Boolean = false,
+    @SerialName("watch_id") val watchId: Long? = null,
     val state: ConversationState = ConversationState(),
     val order: List<String>? = null,
     val items: List<Item> = emptyList(),

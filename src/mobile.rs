@@ -430,6 +430,11 @@ impl Bridge {
                 self.watch_conversation(id, session)?;
                 Ok(Answered::Later)
             }
+            api::Call::AcknowledgeConversation { session, watch_id } => self.watched_command(
+                &session,
+                Some(watch_id),
+                conversation::Command::Acknowledge { id },
+            ),
             api::Call::UnwatchConversation { session } => {
                 let session = parse_session(&session)?;
                 self.conversations.lock().unwrap().remove(&session);
@@ -530,6 +535,7 @@ impl Bridge {
         let outbox = self.outbox.clone();
         let watch = conversation::Watch::start(
             id,
+            generation,
             chat,
             stream,
             proof,
@@ -563,15 +569,24 @@ impl Bridge {
 
     /// Send `command` to a watched conversation; its watch answers.
     fn command(&self, id: u64, session: &str, command: chat::Command) -> Result<Answered, Failure> {
+        self.watched_command(session, None, conversation::Command::Chat { id, command })
+    }
+
+    fn watched_command(
+        &self,
+        session: &str,
+        watch_id: Option<u64>,
+        command: conversation::Command,
+    ) -> Result<Answered, Failure> {
         let session = parse_session(session)?;
         let conversations = self.conversations.lock().unwrap();
-        let Some((_, watch)) = conversations.get(&session) else {
+        let Some((current, watch)) = conversations.get(&session) else {
             return Err(Failure::Refused(api::Error {
                 code: api::ErrorCode::NotWatching,
                 message: "Open the conversation before acting on it.".into(),
             }));
         };
-        if !watch.send(conversation::Command::Chat { id, command }) {
+        if watch_id.is_some_and(|id| id != *current) || !watch.send(command) {
             return Err(Failure::Refused(api::Error {
                 code: api::ErrorCode::NotWatching,
                 message: "The conversation is no longer followed; open it again.".into(),

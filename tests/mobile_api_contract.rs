@@ -173,6 +173,16 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             request(7, Call::WatchConversation { session: session() }),
         ),
         (
+            "conversation.acknowledge",
+            request(
+                13,
+                Call::AcknowledgeConversation {
+                    session: session(),
+                    watch_id: 11,
+                },
+            ),
+        ),
+        (
             "conversation.unwatch",
             request(8, Call::UnwatchConversation { session: session() }),
         ),
@@ -270,6 +280,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: true,
+                watch_id: Some(11),
                 state: state(),
                 order: Some(vec!["i1".into(), "i2".into()]),
                 items: vec![
@@ -310,6 +321,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: false,
+                watch_id: None,
                 state: state(),
                 order: None,
                 items: vec![

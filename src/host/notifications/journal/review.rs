@@ -11,7 +11,7 @@ use diesel::{
     prelude::*,
     result::Error,
     sql_query,
-    sql_types::{BigInt, Nullable, Text},
+    sql_types::{BigInt, Text},
     sqlite::SqliteConnection,
 };
 use std::collections::HashSet;
@@ -21,8 +21,8 @@ const UNWATCHED: i64 = 7 * 24 * 60 * 60;
 const CENSUS_FRESHNESS: u64 = 5 * 60;
 
 // Additive bookkeeping keeps the existing attention and dedup schemas
-// readable by an older daemon. The route index includes evicted notices so
-// expiry can retire their dedup entries too.
+// readable by an older daemon. Watch leases and evidence of request absence
+// are independent: an expired lease only means nobody renewed the watch.
 pub(super) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS review_watches (
         repository TEXT PRIMARY KEY, watched_at INTEGER NOT NULL);
@@ -33,12 +33,6 @@ pub(super) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS review_censuses (
         repository TEXT NOT NULL, viewer TEXT NOT NULL, started_at INTEGER NOT NULL,
         PRIMARY KEY (repository, viewer));";
-
-#[derive(diesel::QueryableByName)]
-struct Repository {
-    #[diesel(sql_type = Text)]
-    repository: String,
-}
 
 #[derive(diesel::QueryableByName)]
 struct StoredNotice {
@@ -130,30 +124,27 @@ impl Journal {
         &mut self,
         repository: &GitHubRepoKey,
         now: i64,
-    ) -> Result<Vec<(Uuid, Target)>, String> {
-        let repository = scope(repository);
-        self.0
-            .transaction::<_, Error, _>(|connection| {
-                let retired = expire_reviews(connection, Some(&repository), now)?;
-                sql_query(
-                    "INSERT INTO review_watches (repository, watched_at) VALUES (?1, ?2)
-                     ON CONFLICT (repository) DO UPDATE SET watched_at=excluded.watched_at
-                     WHERE review_watches.watched_at < excluded.watched_at",
-                )
-                .bind::<Text, _>(repository)
-                .bind::<BigInt, _>(now)
-                .execute(connection)?;
-                Ok(retired)
-            })
-            .map_err(|error| error.to_string())
+    ) -> Result<(), String> {
+        sql_query(
+            "INSERT INTO review_watches (repository, watched_at) VALUES (?1, ?2)
+             ON CONFLICT (repository) DO UPDATE SET watched_at=excluded.watched_at
+             WHERE review_watches.watched_at < excluded.watched_at",
+        )
+        .bind::<Text, _>(scope(repository))
+        .bind::<BigInt, _>(now)
+        .execute(&mut self.0)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     pub(in crate::host::notifications) fn expire_review_watches(
         &mut self,
         now: i64,
-    ) -> Result<Vec<(Uuid, Target)>, String> {
-        self.0
-            .transaction::<_, Error, _>(|connection| expire_reviews(connection, None, now))
+    ) -> Result<(), String> {
+        sql_query("DELETE FROM review_watches WHERE watched_at <= ?1")
+            .bind::<BigInt, _>(now.saturating_sub(UNWATCHED))
+            .execute(&mut self.0)
+            .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
@@ -194,8 +185,8 @@ impl Journal {
                 let rows = review_notices(
                     connection,
                     &repository,
-                    Some(&census.viewer),
-                    Some(census.started_at as i64),
+                    &census.viewer,
+                    census.started_at as i64,
                 )?;
                 retire_reviews(connection, rows.into_iter().filter(|row| !active.contains(&row.session)))
             })
@@ -206,18 +197,17 @@ impl Journal {
 fn review_notices(
     connection: &mut SqliteConnection,
     repository: &str,
-    viewer: Option<&str>,
-    before: Option<i64>,
+    viewer: &str,
+    before: i64,
 ) -> QueryResult<Vec<StoredNotice>> {
     sql_query(
         "SELECT n.session, n.id, n.event FROM review_routes AS r
          JOIN notices AS n ON n.session = r.identity
-         WHERE r.repository = ?1 AND (?2 IS NULL OR r.viewer = ?2)
-         AND (?3 IS NULL OR r.first_observed_at < ?3)",
+         WHERE r.repository = ?1 AND r.viewer = ?2 AND r.first_observed_at < ?3",
     )
     .bind::<Text, _>(repository)
-    .bind::<Nullable<Text>, _>(viewer)
-    .bind::<Nullable<BigInt>, _>(before)
+    .bind::<Text, _>(viewer)
+    .bind::<BigInt, _>(before)
     .load(connection)
 }
 
@@ -238,40 +228,6 @@ fn retire_reviews(
         diesel::delete(seen::table.filter(seen::session.eq(&row.session))).execute(connection)?;
         diesel::delete(owners::table.find(&row.session)).execute(connection)?;
         retired.push((id, target));
-    }
-    Ok(retired)
-}
-
-fn expire_reviews(
-    connection: &mut SqliteConnection,
-    repository: Option<&str>,
-    now: i64,
-) -> QueryResult<Vec<(Uuid, Target)>> {
-    let expired = sql_query(
-        "SELECT repository FROM review_watches WHERE watched_at <= ?1
-         AND (?2 IS NULL OR repository = ?2)",
-    )
-    .bind::<BigInt, _>(now.saturating_sub(UNWATCHED))
-    .bind::<Nullable<Text>, _>(repository)
-    .load::<Repository>(connection)?;
-    let mut retired = Vec::new();
-    for row in expired {
-        let repository = row.repository;
-        let rows = review_notices(connection, &repository, None, None)?;
-        retired.extend(retire_reviews(connection, rows)?);
-        // Expiry re-arms alerts for requests that still exist when a project
-        // is reopened. Ordinary reconciliation preserves immutable dedup.
-        for delete in [
-            "DELETE FROM review_requests_seen WHERE identity IN (
-                 SELECT identity FROM review_routes WHERE repository = ?1)",
-            "DELETE FROM review_routes WHERE repository = ?1",
-            "DELETE FROM review_censuses WHERE repository = ?1",
-            "DELETE FROM review_watches WHERE repository = ?1",
-        ] {
-            sql_query(delete)
-                .bind::<Text, _>(&repository)
-                .execute(connection)?;
-        }
     }
     Ok(retired)
 }
@@ -354,12 +310,7 @@ mod tests {
         }
         .validate()
         .unwrap();
-        assert!(
-            journal
-                .renew_review_watch(&repository, now)
-                .unwrap()
-                .is_empty()
-        );
+        journal.renew_review_watch(&repository, now).unwrap();
         assert_eq!(
             journal.list().unwrap().len(),
             5,
@@ -440,112 +391,100 @@ mod tests {
         assert_eq!(removed[0].1, Target::PullRequest(new));
     }
 
-    fn fill_notice_cap_after_oldest_review(journal: &mut Journal) {
-        use crate::{
-            agent::Provider,
-            model::TerminalId,
-            notifications::{Evidence, Kind},
-        };
-        let fillers: Vec<_> = (2..=super::super::MAX_SESSIONS)
-            .map(|ordinal| {
-                let terminal = TerminalId::new();
-                let event = Event::session(
-                    terminal,
-                    Provider::Codex,
-                    "/project".into(),
-                    Evidence {
-                        key: "finished".into(),
-                        kind: Kind::Succeeded,
-                    },
-                );
-                (
-                    notices::session.eq(terminal.to_string()),
-                    notices::id.eq(Uuid::new_v4().to_string()),
-                    notices::event.eq(serde_json::to_string(&event).unwrap()),
-                    notices::delivered.eq(true),
-                    notices::acknowledged.eq(false),
-                    notices::ordinal.eq(ordinal),
-                )
-            })
-            .collect();
-        journal
-            .0
-            .transaction::<_, Error, _>(|connection| {
-                diesel::insert_into(notices::table)
-                    .values(fillers)
-                    .execute(connection)?;
-                diesel::insert_into(seen::table)
-                    .values((
-                        seen::session.eq("sequence"),
-                        seen::evidence.eq("sequence"),
-                        seen::ordinal.eq(super::super::MAX_SESSIONS),
-                    ))
-                    .execute(connection)?;
-                Ok(())
-            })
-            .unwrap();
-    }
-
     #[test]
-    fn a_week_unwatched_retires_notices_and_rearms_the_reopened_repository() {
+    fn expired_watch_preserves_unread_notices_and_dedup_until_settled_absence() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attention.sqlite3");
         let mut journal = Journal::open(&path).unwrap();
         let request = request();
         let repo = request.repository_key();
-        let kept = ReviewRequest {
+        let watched = ReviewRequest {
             repository: "watched".into(),
             request: "watched-request".into(),
             ..request.clone()
         };
-        let evicted = ReviewRequest {
-            request: "evicted-request".into(),
+        let unknown = ReviewRequest {
+            repository: "unknown".into(),
+            request: "unknown-request".into(),
             ..request.clone()
         };
-        journal
-            .record(event(evicted.clone()), false)
+        let original = journal
+            .record(event(request.clone()), false)
             .unwrap()
             .unwrap();
-        fill_notice_cap_after_oldest_review(&mut journal);
-        for request in [&request, &kept] {
-            journal
-                .record(event(request.clone()), false)
-                .unwrap()
-                .unwrap();
-        }
-        let at = unix_time();
-        let notices = journal.list().unwrap();
-        assert_eq!(notices.len(), super::super::MAX_SESSIONS as usize);
-        assert!(
-            notices
-                .iter()
-                .all(|notice| notice.event.target != Target::PullRequest(evicted.clone()))
-        );
-        assert!(
-            journal
-                .record(event(evicted.clone()), false)
-                .unwrap()
-                .is_none()
-        );
+        let uncertain = journal
+            .record(event(unknown.clone()), false)
+            .unwrap()
+            .unwrap();
+        journal
+            .record(event(watched.clone()), false)
+            .unwrap()
+            .unwrap();
+
+        let at = unix_time() + 2;
         journal.renew_review_watch(&repo, at).unwrap();
         journal
-            .renew_review_watch(&kept.repository_key(), at + UNWATCHED / 2)
+            .renew_review_watch(&watched.repository_key(), at + UNWATCHED / 2)
             .unwrap();
-        drop(journal);
-        let mut journal = Journal::open(&path).unwrap();
+        let live = Census {
+            viewer: request.viewer.clone(),
+            started_at: at as u64,
+            completed_at: at as u64,
+            requests: vec![(request.number, request.request.clone())],
+        };
         assert!(
             journal
-                .expire_review_watches(at + UNWATCHED - 1)
+                .reconcile_review_census(&repo, live.clone(), at)
                 .unwrap()
                 .is_empty()
         );
-        let removed = journal.renew_review_watch(&repo, at + UNWATCHED).unwrap();
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].1, Target::PullRequest(request.clone()));
+        let expired_at = at + UNWATCHED;
+        journal.expire_review_watches(expired_at).unwrap();
+        for repository in [&repo, &unknown.repository_key()] {
+            assert_eq!(
+                sql_query(
+                    "UPDATE review_watches SET watched_at = watched_at WHERE repository = ?1"
+                )
+                .bind::<Text, _>(scope(repository))
+                .execute(&mut journal.0)
+                .unwrap(),
+                0
+            );
+        }
+        // A heartbeat after expiry has no new evidence about the request.
+        journal
+            .renew_review_watch(&repo, expired_at + UNWATCHED)
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
         let notices = journal.list().unwrap();
-        assert_eq!(notices.len(), super::super::MAX_SESSIONS as usize - 1);
-        assert_eq!(notices[0].event.target, Target::PullRequest(kept));
-        assert!(journal.record(event(request), false).unwrap().is_some());
-        assert!(journal.record(event(evicted), false).unwrap().is_some());
+        assert_eq!(notices.len(), 3);
+        for id in [original.id, uncertain.id] {
+            assert!(
+                notices
+                    .iter()
+                    .any(|notice| notice.id == id && !notice.acknowledged)
+            );
+        }
+        assert!(
+            journal
+                .record(event(request.clone()), false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(journal.record(event(unknown), false).unwrap().is_none());
+        let absent = Census {
+            started_at: expired_at as u64,
+            completed_at: expired_at as u64,
+            requests: Vec::new(),
+            ..live
+        };
+        assert_eq!(
+            journal
+                .reconcile_review_census(&repo, absent, expired_at)
+                .unwrap(),
+            vec![(original.id, Target::PullRequest(request))]
+        );
+        assert_eq!(journal.list().unwrap().len(), 2);
     }
 }

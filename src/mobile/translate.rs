@@ -464,6 +464,7 @@ impl Mirror {
         Some(api::ConversationUpdate {
             session: session.into(),
             reset,
+            watch_id: None,
             state,
             order: order_changed.then_some(order),
             items,

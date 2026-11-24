@@ -40,6 +40,8 @@ use crate::{
 pub enum Command {
     /// A chat command, answered on the phone's request `id`.
     Chat { id: u64, command: chat::Command },
+    /// Acknowledge notices for the conversation the phone has opened.
+    Acknowledge { id: u64 },
     /// End the watch.
     Stop,
 }
@@ -87,6 +89,7 @@ impl Watch {
     /// was replaced or stopped meanwhile.
     pub fn start(
         id: u64,
+        watch_id: u64,
         session: chat::Session,
         stream: UnixStream,
         proof: HostSessionProof,
@@ -111,7 +114,7 @@ impl Watch {
                     inputs,
                     pending: HashMap::new(),
                 };
-                let end = connection.run(id, session, feed);
+                let end = connection.run(id, watch_id, session, feed);
                 let _ = connection.stream.shutdown(std::net::Shutdown::Both);
                 let unfollowable = match &end {
                     End::Conversation(message) => Some(message.clone()),
@@ -158,7 +161,7 @@ enum Input {
 /// What a daemon request in flight was for.
 enum Pending {
     Read,
-    Chat { id: u64 },
+    PhoneRequest { id: u64 },
 }
 
 struct Connection {
@@ -187,7 +190,7 @@ struct Followed {
 impl Connection {
     /// Follow the chat until the phone, the conversation or the daemon ends
     /// the watch.
-    fn run(&mut self, id: u64, session: chat::Session, feed: Sender<Input>) -> End {
+    fn run(&mut self, id: u64, watch_id: u64, session: chat::Session, feed: Sender<Input>) -> End {
         let snapshot = match self.attach(session) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -208,11 +211,12 @@ impl Connection {
         // attaching; then neither the answer nor the conversation is wanted.
         let opened = self.current.send(|| {
             self.outbox.ok(id);
-            if let Some(update) =
+            if let Some(mut update) =
                 followed
                     .mirror
                     .update(&followed.session, &followed.snapshot, true)
             {
+                update.watch_id = Some(watch_id);
                 self.outbox
                     .event(api::Event::Conversation(Box::new(update)));
             }
@@ -226,13 +230,6 @@ impl Connection {
                 ),
             );
             return End::Phone;
-        }
-        // The watch has shown its first snapshot. A watch cancelled during
-        // attachment must leave the conversation's attention unread.
-        if let Err(error) = self.request(ClientRequest::AcknowledgeSessionNotifications {
-            session: self.chat_id,
-        }) {
-            return End::Daemon(lost(&error));
         }
         // From here on the reader thread waits for frames for as long as the
         // conversation is followed.
@@ -291,6 +288,12 @@ impl Connection {
                 Ok(Input::Command(Command::Chat { id, command })) => {
                     self.command(&mut followed, id, command)
                 }
+                Ok(Input::Command(Command::Acknowledge { id })) => self.forward(
+                    id,
+                    ClientRequest::AcknowledgeSessionNotifications {
+                        session: self.chat_id,
+                    },
+                ),
                 Ok(Input::Frame(frame)) => match *frame {
                     Ok(Some(envelope)) => self.envelope(&mut followed, envelope),
                     Ok(None) => Err(End::Daemon("The computer's cagents daemon stopped.".into())),
@@ -327,13 +330,13 @@ impl Connection {
         };
         let pending = std::mem::take(&mut self.pending);
         let waiting = self.inputs.try_iter().filter_map(|input| match input {
-            Input::Command(Command::Chat { id, .. }) => Some(id),
+            Input::Command(Command::Chat { id, .. } | Command::Acknowledge { id }) => Some(id),
             _ => None,
         });
         for id in pending
             .into_values()
             .filter_map(|pending| match pending {
-                Pending::Chat { id } => Some(id),
+                Pending::PhoneRequest { id } => Some(id),
                 Pending::Read => None,
             })
             .chain(waiting)
@@ -356,12 +359,20 @@ impl Connection {
                 return Ok(());
             }
         };
-        match self.request(ClientRequest::ChatCommand {
-            chat_id: self.chat_id,
-            command,
-        }) {
+        self.forward(
+            id,
+            ClientRequest::ChatCommand {
+                chat_id: self.chat_id,
+                command,
+            },
+        )
+    }
+
+    fn forward(&mut self, id: u64, request: ClientRequest) -> Result<(), End> {
+        match self.request(request) {
             Ok(request_id) => {
-                self.pending.insert(request_id, Pending::Chat { id });
+                self.pending
+                    .insert(request_id, Pending::PhoneRequest { id });
                 Ok(())
             }
             Err(error) => {
@@ -439,7 +450,7 @@ impl Connection {
                 }
                 self.publish(followed);
             }
-            Some(Pending::Chat { id }) => match envelope.message {
+            Some(Pending::PhoneRequest { id }) => match envelope.message {
                 ServerMessage::Response { .. } => self.outbox.ok(id),
                 ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),
                 _ => self

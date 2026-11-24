@@ -25,6 +25,9 @@ const RECONCILIATION_RETRY: Duration = Duration::from_secs(10);
 pub(super) struct State {
     pub(super) git: git_ui::State,
     pub(super) review_requests: review_request_ui::State,
+    /// The review monitor keeps watching a project's resolved GitHub repository
+    /// even while the sidebar cannot refresh its listing or mutation authority.
+    pub(super) review_watch_repositories: HashMap<ProjectId, GitHubRepoKey>,
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,

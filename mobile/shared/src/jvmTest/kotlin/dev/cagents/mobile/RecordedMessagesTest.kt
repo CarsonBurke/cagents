@@ -217,6 +217,7 @@ class RecordedMessagesTest {
             "notifications.unwatch" to Call.UnwatchNotifications,
             "notification.acknowledge" to Call.AcknowledgeNotification("0b0e7a52-6f6b-4f7c-8a35-5c9f3f0e2d11"),
             "conversation.watch" to Call.WatchConversation(session),
+            "conversation.acknowledge" to Call.AcknowledgeConversation(session, 11),
             "conversation.unwatch" to Call.UnwatchConversation(session),
             "conversation.load_earlier" to Call.LoadEarlier(session),
             "conversation.send" to Call.Send(session, "Run the tests", SendMode.Steer),

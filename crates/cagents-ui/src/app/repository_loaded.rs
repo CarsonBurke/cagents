@@ -131,6 +131,9 @@ impl Cagents {
                     }
                     self.github_availability.remove(&project_id);
                     self.review_repositories.remove(&project_id);
+                    self.refresh_ui
+                        .review_watch_repositories
+                        .remove(&project_id);
                     self.sync_worktree_operation_rows();
                     self.sidebar_model.data_state = SidebarDataState::Ready;
                     if open_cards && !self.refuse_in_deleting_worktree(&worktree) {
@@ -227,6 +230,7 @@ impl Cagents {
                 } else {
                     self.review_repositories.remove(&project_id);
                 }
+                self.sync_review_watch(project_id, &loaded.github);
                 self.github_availability
                     .insert(project_id, loaded.github.clone());
                 if let Some(existing) = self

@@ -2,7 +2,9 @@
 //! callbacks only wake it; neither callback return nor enqueueing acknowledges
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
-use crate::chat::runtime::{OutboxEntry, RetirementInspection, VerifiedRetirement};
+use crate::chat::runtime::{
+    AttentionClearEntry, OutboxEntry, RetirementInspection, SemanticPage, VerifiedRetirement,
+};
 use crate::host::model::NativeActorEvent;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -613,41 +615,43 @@ impl AnswerSync {
     pub(in crate::host) fn complete(mut self, host: &SharedHost) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         self.require_current(host)?;
-        let (mut acknowledged, through) =
-            self.target.handle.retained_outcome_clock_until(deadline)?;
-        // The journal admits at most 4096 entries; a byte-limited page may
-        // contain just one. The deadline also bounds every RPC and receipt wait.
-        for _ in 0..=4096 {
+        let through = self
+            .target
+            .handle
+            .retained_semantic_clocks_until(deadline)?;
+        let mut progress = (
+            through.outcomes.acknowledged,
+            through.attention.acknowledged,
+        );
+        loop {
             self.require_current(host)?;
-            if acknowledged >= through {
-                return self.require_committed_through(through);
+            if progress.0 >= through.outcomes.latest && progress.1 >= through.attention.latest {
+                return self.require_committed_through(through.outcomes.latest);
             }
             if Instant::now() >= deadline {
-                break;
+                return Err("Retained Answer semantic watermark remains uncommitted".into());
             }
-            let page = self.target.handle.uncommitted_outcomes_until(deadline)?;
-            for entry in page
-                .into_iter()
-                .take_while(|entry| entry.sequence <= through)
-            {
-                self.require_current(host)?;
-                commit_semantic_entry(
-                    host,
-                    &self.target,
-                    &self.registry,
-                    &mut self.owner,
-                    entry,
-                    false,
-                    deadline,
-                )?;
-            }
-            let (next, _) = self.target.handle.retained_outcome_clock_until(deadline)?;
-            if next <= acknowledged {
+            let mut page = self.target.handle.retained_semantic_page_until(deadline)?;
+            page.retain_through(&through);
+            commit_semantic_page(
+                host,
+                &self.target,
+                &self.registry,
+                &mut self.owner,
+                page,
+                false,
+                deadline,
+            )?;
+            let next = self
+                .target
+                .handle
+                .retained_semantic_clocks_until(deadline)?;
+            let next = (next.outcomes.acknowledged, next.attention.acknowledged);
+            if next.0 <= progress.0 && next.1 <= progress.1 {
                 return Err("Retained Answer semantic watermark made no committed progress".into());
             }
-            acknowledged = next;
+            progress = next;
         }
-        Err("Retained Answer semantic watermark remains uncommitted".into())
     }
 }
 
@@ -835,20 +839,18 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     }
     // Always ask the HELPER for its unacknowledged page. The local cursor alone
     // cannot prove that a notification committed before a previous daemon died.
-    let page = handle.uncommitted_outcomes()?;
-    let more = !page.is_empty();
     let deadline = Instant::now() + Duration::from_secs(30);
-    for entry in page {
-        commit_semantic_entry(
-            host,
-            &target,
-            &registry,
-            &mut execution_owner,
-            entry,
-            loss.is_some(),
-            deadline,
-        )?;
-    }
+    let page = handle.retained_semantic_page_until(deadline)?;
+    let more = !page.is_empty();
+    commit_semantic_page(
+        host,
+        &target,
+        &registry,
+        &mut execution_owner,
+        page,
+        loss.is_some(),
+        deadline,
+    )?;
     if more {
         // An outcome that followed a conversation since reset republished it.
         persist_confirmed_identity(host, &target, &registry)?;
@@ -937,6 +939,67 @@ fn commit_attention_clear(
         .map_err(|_| "The notification journal has not confirmed this attention change")?
 }
 
+fn commit_retained_attention(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    registry: &super::super::agent_execution::SharedRegistry,
+    entry: AttentionClearEntry,
+    deadline: Instant,
+) -> Result<(), String> {
+    target.require_current(host)?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("Retained semantic acknowledgement deadline expired")?;
+    let automation = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(target.source.id)?
+        .is_some_and(|agent| {
+            matches!(
+                agent.origin,
+                crate::agent_execution::Origin::Automation { .. }
+            )
+        });
+    if !automation {
+        commit_attention_clear(
+            target.notifications.as_ref(),
+            target.source.id,
+            target.identity.instance,
+            entry.sequence,
+            entry.clear,
+            remaining.min(Duration::from_secs(10)),
+        )?;
+    }
+    target.require_current(host)?;
+    target
+        .handle
+        .commit_retained_attention_until(entry.sequence, deadline)
+}
+
+fn commit_semantic_page(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    registry: &super::super::agent_execution::SharedRegistry,
+    owner: &mut Option<ExecutionOwner>,
+    page: SemanticPage,
+    lost: bool,
+    deadline: Instant,
+) -> Result<(), String> {
+    match page {
+        SemanticPage::Outcomes(entries) => {
+            for entry in entries {
+                commit_semantic_entry(host, target, registry, owner, entry, lost, deadline)?;
+            }
+        }
+        SemanticPage::Attention { clears } => {
+            for clear in clears {
+                commit_retained_attention(host, target, registry, clear, deadline)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The broker and synchronous Answer boundary share the same semantic writes,
 /// exact owner checks, notification receipts and commit-before-ACK ordering.
 fn commit_semantic_entry(
@@ -963,7 +1026,6 @@ fn commit_semantic_entry(
         Update::AttentionContext { evidence, content } => {
             NativeActorEvent::AttentionContext { evidence, content }
         }
-        Update::AttentionCleared(clear) => NativeActorEvent::AttentionCleared(clear),
         _ => return Err("The retained semantic outbox contains an unsupported event".into()),
     };
     let execution = matches!(semantic, NativeActorEvent::Execution { .. });
@@ -1009,21 +1071,6 @@ fn commit_semantic_entry(
     };
     if changed {
         super::super::agent_execution::announce(host, registry);
-    }
-    if let NativeActorEvent::AttentionCleared(clear) = semantic
-        && !automation
-    {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or("Retained semantic acknowledgement deadline expired")?;
-        commit_attention_clear(
-            target.notifications.as_ref(),
-            target.source.id,
-            target.identity.instance,
-            sequence,
-            clear,
-            remaining.min(Duration::from_secs(10)),
-        )?;
     }
     if let Some((evidence, content)) = semantic.attention()
         && !automation
@@ -3310,6 +3357,8 @@ pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Res
                 || !inspection.state.installed
                 || inspection.state.owns_work
                 || inspection.state.outbox_ack != inspection.state.outbox_latest
+                || inspection.state.attention_clears.acknowledged
+                    != inspection.state.attention_clears.latest
                 || inspection.state.continuity_loss.is_some()
             {
                 continue;
@@ -3699,11 +3748,20 @@ pub(in crate::host) fn finish_close(
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let page = handle.uncommitted_outcomes()?;
+        let page = handle.retained_semantic_page_until(deadline)?;
         if page.is_empty() {
             break;
         }
-        for entry in page {
+        let entries = match page {
+            SemanticPage::Outcomes(entries) => entries,
+            SemanticPage::Attention { clears } => {
+                for clear in clears {
+                    commit_retained_attention(host, &target, &registry, clear, deadline)?;
+                }
+                continue;
+            }
+        };
+        for entry in entries {
             let followed = entry.confirmed_session;
             let event = match entry.update {
                 Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
@@ -3711,7 +3769,6 @@ pub(in crate::host) fn finish_close(
                 Update::AttentionContext { evidence, content } => {
                     NativeActorEvent::AttentionContext { evidence, content }
                 }
-                Update::AttentionCleared(clear) => NativeActorEvent::AttentionCleared(clear),
                 _ => {
                     return Err(
                         "Closing actor journal contains an unsupported semantic event".into(),
@@ -3753,18 +3810,6 @@ pub(in crate::host) fn finish_close(
             };
             if changed {
                 super::super::agent_execution::announce(host, &registry);
-            }
-            if let NativeActorEvent::AttentionCleared(clear) = event
-                && !automation
-            {
-                commit_attention_clear(
-                    notifications.as_ref(),
-                    source.id,
-                    identity.instance,
-                    entry.sequence,
-                    clear,
-                    Duration::from_secs(10),
-                )?;
             }
             if let Some((evidence, content)) = event.attention()
                 && !automation

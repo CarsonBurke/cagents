@@ -1458,21 +1458,15 @@ async fn run(
         }
         let review_watches = std::mem::take(&mut pending.review_watches);
         for (at, update) in &review_watches {
-            apply_review_retirements(
-                journal.renew_review_watch(&update.repository, *at),
-                &mut snapshot,
-                &mut delivery,
-                &mut withdrawals,
-            );
+            if let Err(error) = journal.renew_review_watch(&update.repository, *at) {
+                snapshot.diagnostic = Some(error);
+            }
         }
         if Instant::now() >= review_expiry {
             review_expiry = Instant::now() + REVIEW_EXPIRY_INTERVAL;
-            apply_review_retirements(
-                journal.expire_review_watches(review_watch_time()),
-                &mut snapshot,
-                &mut delivery,
-                &mut withdrawals,
-            );
+            if let Err(error) = journal.expire_review_watches(review_watch_time()) {
+                snapshot.diagnostic = Some(error);
+            }
         }
         if let Some(inboxes) = pending.inboxes.take() {
             // A complete durable pending snapshot retires inbox attention only
@@ -1650,8 +1644,7 @@ async fn run(
                 *notice = current.clone();
             }
         }
-        // Journal eviction also bounds retries across multiple disconnected
-        // batches. Never announce an event whose durable identity was evicted.
+        // Never announce an event whose durable identity was retired.
         let retained = snapshot
             .notices
             .iter()

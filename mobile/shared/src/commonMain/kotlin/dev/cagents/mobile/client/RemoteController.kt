@@ -1,6 +1,7 @@
 package dev.cagents.mobile.client
 
 import dev.cagents.mobile.protocol.Call
+import dev.cagents.mobile.protocol.ErrorCode
 import dev.cagents.mobile.protocol.Event
 import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.Notice
@@ -107,16 +108,25 @@ class RemoteController(
     /** A conversation to bring in line, and why. */
     private data class Sync(val session: String, val kind: SyncKind)
 
-    private enum class SyncKind {
+    private sealed interface SyncKind {
         /** Watch it if held and not ended, unwatch it otherwise. */
-        Settle,
+        data object Settle : SyncKind
 
         /** Watch it if held, even when ended or already watched, for a fresh reset. */
-        Watch,
+        data object Watch : SyncKind
 
         /** Like [Watch], unless the recovery that asked for it was settled meanwhile. */
-        Resync,
+        data object Resync : SyncKind
+
+        /** The bridge's current watch has been applied to this open conversation. */
+        data class Acknowledge(val watchId: Long, val opening: Opening) : SyncKind
     }
+
+    /** Identifies a particular opening, even if the same conversation is closed and opened again. */
+    private class Opening
+
+    /** Opens yet to be acknowledged. Resets from reconnecting don't add entries. Guarded by [locked]. */
+    private val unacknowledgedOpens = HashMap<String, Opening>()
 
     /** Conversations watched again to recover, whose updates wait for the reset. Guarded by [locked]. */
     private val resyncing = HashSet<String>()
@@ -187,23 +197,21 @@ class RemoteController(
     }
 
     /** Follows a conversation, now and after every reconnect. */
-    fun open(session: String) {
-        var added = false
+    fun open(session: String) = locked {
+        if (session in _state.value.conversations) return@locked
+        unacknowledgedOpens[session] = Opening()
         _state.update { state ->
-            if (session in state.conversations) return@update state
-            added = true
             state.copy(conversations = state.conversations + (session to Conversation(session)))
         }
-        if (added) sync(session, SyncKind.Watch)
+        sync(session, SyncKind.Watch)
     }
 
     /** Stops following a conversation. */
-    fun close(session: String) {
+    fun close(session: String) = locked {
         _state.update { it.copy(conversations = it.conversations - session) }
-        locked {
-            resyncing -= session
-            recoveries -= session
-        }
+        unacknowledgedOpens -= session
+        resyncing -= session
+        recoveries -= session
         sync(session, SyncKind.Settle)
     }
 
@@ -281,7 +289,7 @@ class RemoteController(
             wake.tryReceive()
             val queue = Channel<Sync>(Channel.UNLIMITED)
             return coroutineScope {
-                val reader = async { bridge.run { event -> handle(event) } }
+                val reader = async { bridge.run { event -> handle(event, queue) } }
                 locked {
                     resyncing.clear()
                     recoveries.clear()
@@ -319,6 +327,24 @@ class RemoteController(
     private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) {
         val watched = HashSet<String>()
         for ((session, kind) in queue) {
+            if (kind is SyncKind.Acknowledge) {
+                if (!locked { unacknowledgedOpens[session] === kind.opening }) continue
+                var watchReplaced = false
+                try {
+                    bridge.call(Call.AcknowledgeConversation(session, kind.watchId))
+                } catch (e: ConnectionLost) {
+                    return
+                } catch (e: RequestFailed) {
+                    // A stale watch was refused before the daemon could clear any notices.
+                    watchReplaced = e.code == ErrorCode.NotWatching
+                } finally {
+                    // A lost reply may hide a successful clear. Do not clear again on reconnect.
+                    if (!watchReplaced) locked {
+                        if (unacknowledgedOpens[session] === kind.opening) unacknowledgedOpens -= session
+                    }
+                }
+                continue
+            }
             // A recovery given up on, or closed, since it was queued.
             if (kind == SyncKind.Resync && locked { session !in resyncing }) continue
             val force = kind != SyncKind.Settle
@@ -378,7 +404,7 @@ class RemoteController(
         }
     }
 
-    private fun handle(event: Event) {
+    private fun handle(event: Event, queue: Channel<Sync>) {
         when (event) {
             is Event.Sessions -> _state.update { it.copy(sessions = event.sessions) }
             is Event.Notifications -> _state.update { it.copy(notices = event.notices) }
@@ -387,17 +413,26 @@ class RemoteController(
                 val session = update.session
                 // Recovering: the updates in flight before the reset no longer line up.
                 if (!update.reset && locked { session in resyncing }) return
-                var desynced = false
+                val watchId = update.watchId
+                val opening = if (update.reset && watchId != null) locked { unacknowledgedOpens[session] } else null
+                var desynced: Boolean? = null
                 _state.update { state ->
+                    desynced = null
                     val held = state.conversations[session] ?: return@update state
                     val applied = held.apply(update)
                     desynced = applied.desynced
-                    if (desynced) return@update state
+                    if (applied.desynced) return@update state
                     state.copy(conversations = state.conversations + (session to applied.conversation))
                 }
                 when {
-                    desynced -> resync(session, "This conversation keeps falling out of step.")
-                    update.reset -> locked { resyncing -= session }
+                    desynced == null -> Unit
+                    desynced == true -> resync(session, "This conversation keeps falling out of step.")
+                    update.reset -> {
+                        locked { resyncing -= session }
+                        if (watchId != null && opening != null) {
+                            queue.trySend(Sync(session, SyncKind.Acknowledge(watchId, opening)))
+                        }
+                    }
                     // Back in step: a later slip starts the count over.
                     else -> locked { recoveries -= session }
                 }

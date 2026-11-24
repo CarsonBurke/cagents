@@ -2,7 +2,9 @@
 use super::super::{LocalHandle, QueueRefusal, Rejection, Update};
 pub(crate) use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
 use super::journal::Journal;
-use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState, OutboxEntry};
+use super::journal::{
+    AttentionClearEntry, ContinuityLoss, InputIdentity, InputReceipt, InputState, OutboxEntry,
+};
 use super::{MAX_FRAME, deadline_io, final_snapshot, journal};
 use crate::{
     chat::{
@@ -221,7 +223,49 @@ pub(crate) struct Resident {
     pub retained_runs: Vec<crate::model::RunId>,
     pub outbox_ack: u64,
     pub outbox_latest: u64,
+    #[serde(default)]
+    pub attention_clears: OutcomeClock,
     changed: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub(crate) struct OutcomeClock {
+    pub acknowledged: u64,
+    pub latest: u64,
+}
+
+pub(crate) struct SemanticClocks {
+    pub outcomes: OutcomeClock,
+    pub attention: OutcomeClock,
+}
+
+/// The older helper returns the original array regardless of the request's
+/// optional flag. A newer helper only sends the additional form on request.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum SemanticPage {
+    Outcomes(Vec<OutboxEntry>),
+    Attention { clears: Vec<AttentionClearEntry> },
+}
+
+impl SemanticPage {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Outcomes(entries) => entries.is_empty(),
+            Self::Attention { clears } => clears.is_empty(),
+        }
+    }
+
+    pub fn retain_through(&mut self, clocks: &SemanticClocks) {
+        match self {
+            Self::Outcomes(entries) => {
+                entries.retain(|entry| entry.sequence <= clocks.outcomes.latest)
+            }
+            Self::Attention { clears } => {
+                clears.retain(|clear| clear.sequence <= clocks.attention.latest)
+            }
+        }
+    }
 }
 impl Resident {
     /// What holds the conversation. A helper that predates names reports its
@@ -554,6 +598,7 @@ impl RemoteActor {
             retained_runs: Vec::new(),
             outbox_ack: 0,
             outbox_latest: 0,
+            attention_clears: OutcomeClock::default(),
             changed: 1,
         };
         Self(Arc::new(Remote {
@@ -752,6 +797,7 @@ impl RemoteActor {
     pub fn wake_outcomes(&self) {
         let state = self.state();
         if state.outbox_latest > state.outbox_ack
+            || state.attention_clears.latest > state.attention_clears.acknowledged
             || state
                 .continuity_loss
                 .as_ref()
@@ -880,21 +926,29 @@ impl RemoteActor {
     /// that follow, so the identity refreshed after the page is at least as
     /// new as every outcome in it. The daemon requires that identity to be
     /// durable before it settles a run from the page.
+    #[cfg(test)]
     pub fn uncommitted_outcomes(&self) -> Result<Vec<OutboxEntry>, String> {
-        let page = self.call("outbox_unacked", Value::Null)?;
+        let page = self.call("outbox_unacked", Value::Bool(false))?;
         self.refresh_state()?;
         Ok(page)
     }
     /// [`Self::uncommitted_outcomes`], bounded by `deadline`.
+    #[cfg(test)]
     pub fn uncommitted_outcomes_until(
         &self,
         deadline: Instant,
     ) -> Result<Vec<OutboxEntry>, String> {
-        let page = self.call_until("outbox_unacked", Value::Null, deadline)?;
+        let page = self.call_until("outbox_unacked", Value::Bool(false), deadline)?;
         self.refresh_state_until(deadline)?;
         Ok(page)
     }
-    pub fn outcome_clock_until(&self, deadline: Instant) -> Result<(u64, u64), String> {
+    pub fn semantic_page_until(&self, deadline: Instant) -> Result<SemanticPage, String> {
+        let page = self.call_until("outbox_unacked", Value::Bool(true), deadline)?;
+        self.refresh_state_until(deadline)?;
+        Ok(page)
+    }
+
+    pub fn outcome_clock_until(&self, deadline: Instant) -> Result<SemanticClocks, String> {
         if self.0.stop.load(Ordering::Acquire) {
             return Err("This retained Answer attachment is no longer authoritative".into());
         }
@@ -904,20 +958,29 @@ impl RemoteActor {
         let state = self
             .call_until::<Option<Resident>>("state", json!([0]), deadline)?
             .ok_or("The retained helper omitted its Answer semantic watermark")?;
-        if state.continuity_loss.is_some() || state.outbox_ack > state.outbox_latest {
+        if state.continuity_loss.is_some()
+            || state.outbox_ack > state.outbox_latest
+            || state.attention_clears.acknowledged > state.attention_clears.latest
+        {
             return Err(
                 "Retained semantic continuity is unconfirmed; the answer must not be repeated"
                     .into(),
             );
         }
-        let clock = (state.outbox_ack, state.outbox_latest);
+        let clocks = SemanticClocks {
+            outcomes: OutcomeClock {
+                acknowledged: state.outbox_ack,
+                latest: state.outbox_latest,
+            },
+            attention: state.attention_clears,
+        };
         self.publish_resident(state);
         if self.0.stop.load(Ordering::Acquire) {
             return Err(
                 "The retained Answer attachment changed during semantic synchronization".into(),
             );
         }
-        Ok(clock)
+        Ok(clocks)
     }
     pub fn set_visible(&self, visible: bool) {
         *self
@@ -1572,6 +1635,8 @@ impl RemoteActor {
             if identity_changed
                 || (resident.outbox_latest > resident.outbox_ack
                     && resident.outbox_latest != state.outbox_latest)
+                || (resident.attention_clears.latest > resident.attention_clears.acknowledged
+                    && resident.attention_clears.latest != state.attention_clears.latest)
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -2464,7 +2529,7 @@ impl RemoteActor {
         Ok(())
     }
     pub fn finish_close(&self) -> Result<(), String> {
-        if let Err(error) = self.call::<()>("retire", Value::Null) {
+        if let Err(error) = self.call::<()>("retire", Value::Bool(true)) {
             if !final_snapshot::retirement_proved(&self.0.identity, &self.0.proof)? {
                 return Err(error);
             }
@@ -2579,6 +2644,7 @@ fn close_only_method(method: &str) -> bool {
             | "readiness"
             | "outbox"
             | "outbox_unacked"
+            | "ack_attention_clears"
             | "ack_loss"
             | "ack_outbox"
             | "input_receipt"
@@ -3025,6 +3091,7 @@ impl Server {
             .as_ref()
             .map(|loss| loss.reason.clone())
             .or(actor_failure);
+        let (attention_ack, attention_latest) = journal.attention_clock();
         Ok(Resident {
             provider_process,
             generation,
@@ -3068,6 +3135,10 @@ impl Server {
             retained_runs: journal.retained_runs()?,
             outbox_ack: journal.acknowledged()?,
             outbox_latest: journal.latest()?,
+            attention_clears: OutcomeClock {
+                acknowledged: attention_ack,
+                latest: attention_latest,
+            },
             changed,
         })
     }
@@ -3417,17 +3488,36 @@ impl Server {
                 }
             }
             "outbox_unacked" => {
-                let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+                if request.args == Value::Bool(true) {
+                    let clears = journal.next_attention_page()?;
+                    return if clears.is_empty() {
+                        value!(SemanticPage::Outcomes(journal.next_outcome_page()?))
+                    } else {
+                        value!(SemanticPage::Attention { clears })
+                    };
+                }
+                // An older daemon can commit this page and stop before ACK.
+                // Drop preexisting clears before it sees any later outcomes.
+                if request.args.is_null() {
+                    journal.discard_attention()?;
+                }
                 value!(journal.page(journal.acknowledged()?)?)
             }
             "outbox" => {
                 let (after,) = decode!((u64,));
-                value!(
-                    self.journal
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .page(after)?
-                )
+                let mut journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+                journal.discard_attention()?;
+                value!(journal.page(after)?)
+            }
+            "ack_attention_clears" => {
+                let (through,) = decode!((u64,));
+                self.journal
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .ack_attention(through)?;
+                self.changed.fetch_add(1, Ordering::Release);
+                Ok(Value::Null)
             }
             "ack_loss" => {
                 let (id,) = decode!((uuid::Uuid,));
@@ -3847,6 +3937,9 @@ impl Server {
                 }
                 let confirmed = self.actor.confirmed_session_id();
                 let mut journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+                if request.args.is_null() {
+                    journal.discard_attention()?;
+                }
                 journal.seal_for_retirement()?;
                 let source = published_source(
                     &self.source,

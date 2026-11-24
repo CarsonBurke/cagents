@@ -40,11 +40,11 @@ pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_aband
 pub(crate) use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
 #[cfg(test)]
 pub(crate) use retained_actor::journal::ContinuityLoss;
-pub(crate) use retained_actor::journal::OutboxEntry;
+pub(crate) use retained_actor::journal::{AttentionClearEntry, OutboxEntry};
 #[cfg(test)]
 pub(crate) use retained_actor::transport::scripted_helper::{Script, ScriptedHelper};
 pub(crate) use retained_actor::transport::{
-    ActorIdentity, RetirementInspection, VerifiedRetirement,
+    ActorIdentity, RetirementInspection, SemanticPage, VerifiedRetirement,
 };
 mod retained_actor;
 /// Synthetic retained-actor receipts for the daemon's collection tests.
