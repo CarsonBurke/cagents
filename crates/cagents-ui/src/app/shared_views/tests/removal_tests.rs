@@ -1,5 +1,16 @@
 use super::*;
 
+/// What the person is told when a close of `card` was refused: the pane, by
+/// its title, closed here and may still show in other windows.
+fn closed_here_notice(app: &Cagents, card: CardId) -> String {
+    let title = app
+        .pane_notice_title(card)
+        .expect("a closed pane keeps the title it is named by");
+    let notice = pane_closed_here_kept_elsewhere(Some(&title));
+    assert!(notice.starts_with(&format!("\u{201c}{title}\u{201d} closed here")));
+    notice
+}
+
 #[test]
 fn refused_shared_close_readmits_only_its_obsolete_surface_without_retargeting_intent() {
     use crate::workspace_model::views::TerminalRemovalBasis;
@@ -739,7 +750,7 @@ fn a_refused_close_keeps_the_pane_closed_and_says_other_windows_may_show_it() {
         registry_refuses(&mut app, operation, change, held);
         assert_eq!(
             notices(&app),
-            [PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()],
+            [closed_here_notice(&app, original.id)],
             "{name}"
         );
         assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
@@ -791,7 +802,7 @@ fn a_close_refused_without_a_view_says_only_what_happened_to_the_pane() {
         let expected: Vec<String> = if retired {
             Vec::new()
         } else {
-            vec![PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()]
+            vec![closed_here_notice(&app, original.id)]
         };
         assert_eq!(notices(&app), expected, "retired={retired}");
         assert!(
@@ -852,7 +863,7 @@ fn a_terminal_whose_close_was_refused_stays_closed() {
         .expect("the Close is published");
     let held = view_holding(&app, &scope);
     registry_refuses(&mut app, operation, change, held);
-    assert_eq!(notices(&app), [PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()]);
+    assert_eq!(notices(&app), [closed_here_notice(&app, card)]);
     assert!(!app.workspace.order().any(|id| id == card));
     assert!(
         !app.cards.contains_key(&card),
@@ -883,7 +894,7 @@ fn a_close_refused_for_a_successor_stays_closed_here_and_says_so() {
     browser.current_url = "https://example.com/next".parse().unwrap();
     assert_eq!(scope, Scope::Channel(channel));
     registry_refuses(&mut app, operation, change, successor);
-    assert_eq!(notices(&app), [PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()]);
+    assert_eq!(notices(&app), [closed_here_notice(&app, original.id)]);
     assert!(!app.workspace.order().any(|id| id == original.id));
     let card = app.card_state(original.id).unwrap();
     assert!(!card.existence.is_open());

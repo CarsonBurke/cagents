@@ -131,6 +131,12 @@ impl From<SaveFailureCategory> for crate::diagnostics::Failure {
     }
 }
 
+/// Why nothing more can be saved once the window has begun to close.
+const WRITER_CLOSED: &str = "this window is closing and can't save any more changes";
+
+/// Why nothing can be saved after the writer's queue was lost to a panic.
+const WRITER_FAILED: &str = "saving stopped after an internal error; restart cagents to save again";
+
 /// What to do about writes storage refused by construction. Retrying the same
 /// content cannot help, so the remedy is changing it.
 pub const QUARANTINE_GUIDANCE: &str = "Storage refused these changes and will not retry them on \
@@ -572,6 +578,13 @@ pub enum PaneSaveRefusal {
         category: SaveFailureCategory,
         rule: crate::diagnostics::Check,
     },
+    /// Storage refused to record the pane's new conversation identity: what
+    /// it holds for the pane is not the identity the draft started from.
+    /// Changing the draft cannot repair that.
+    Identity {
+        category: SaveFailureCategory,
+        rule: crate::diagnostics::Check,
+    },
 }
 
 impl std::fmt::Display for PaneSaveRefusal {
@@ -593,6 +606,11 @@ impl std::fmt::Display for PaneSaveRefusal {
                     category.label()
                 )
             }
+            Self::Identity { category, rule } => write!(
+                formatter,
+                "storage refused the pane's conversation identity ({}; refused by rule: {rule})",
+                category.label()
+            ),
         }
     }
 }
@@ -911,9 +929,9 @@ impl SessionRuntime {
             .changes
             .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (lock, changed) = &*self.queue;
-        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("Session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.admit_staged_adoptions();
         queue.record_snapshot_changes(changes);
@@ -936,9 +954,9 @@ impl SessionRuntime {
             .changes
             .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (lock, changed) = &*self.queue;
-        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("Session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.keep_writes_in_order();
         queue.record_snapshot_changes(changes);
@@ -976,9 +994,9 @@ impl SessionRuntime {
             .changes
             .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (lock, changed) = &*self.queue;
-        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("Session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.keep_writes_in_order();
         queue.record_snapshot_changes(changes);
@@ -1008,9 +1026,9 @@ impl SessionRuntime {
             .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let (lock, changed) = &*self.queue;
-        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("Session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.keep_writes_in_order();
         queue.record_snapshot_changes(changes);
@@ -1102,9 +1120,9 @@ impl SessionRuntime {
             .changes
             .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (lock, changed) = &*self.queue;
-        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("Session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.admit_staged_adoptions();
         queue.queue_identity_replacement(IdentityReplacement {
@@ -1186,9 +1204,9 @@ impl SessionRuntime {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let change_time = SnapshotChanges::at(Instant::now());
         let (lock, changed) = &*self.queue;
-        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("Session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.keep_writes_in_order();
         queue
@@ -1231,9 +1249,9 @@ impl SessionRuntime {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let change_time = SnapshotChanges::at(Instant::now());
         let (lock, changed) = &*self.queue;
-        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("Session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.keep_writes_in_order();
         queue
@@ -1351,11 +1369,9 @@ impl SessionRuntime {
     {
         let (response, receiver) = std::sync::mpsc::sync_channel(1);
         let (lock, changed) = &*self.queue;
-        let mut queue = lock
-            .lock()
-            .map_err(|_| "session writer queue unavailable")?;
+        let mut queue = lock.lock().map_err(|_| WRITER_FAILED)?;
         if queue.shutdown {
-            return Err("session writer is shutting down".into());
+            return Err(WRITER_CLOSED.into());
         }
         queue.checkpoints.push(Checkpoint::Window(response));
         changed.notify_one();
@@ -1379,11 +1395,9 @@ impl SessionRuntime {
         let (lock, changed) = &*self.queue;
         let mut queue = lock
             .lock()
-            .map_err(|_| PaneSaveRefusal::Unsaved("session writer queue unavailable".into()))?;
+            .map_err(|_| PaneSaveRefusal::Unsaved(WRITER_FAILED.into()))?;
         if queue.shutdown {
-            return Err(PaneSaveRefusal::Unsaved(
-                "session writer is shutting down".into(),
-            ));
+            return Err(PaneSaveRefusal::Unsaved(WRITER_CLOSED.into()));
         }
         queue.checkpoints.push(Checkpoint::Pane(card, response));
         changed.notify_one();
@@ -1670,26 +1684,27 @@ impl Quarantine {
     /// Why `card`'s own state is not saved, when a refusal is the reason: a
     /// refused window snapshot, which held it, or a refused write of the
     /// card itself. Another pane's refused write leaves it saved.
-    fn pane_state(
-        &self,
-        card: CardId,
-    ) -> Option<(
-        Option<CardId>,
-        SaveFailureCategory,
-        crate::diagnostics::Check,
-    )> {
+    fn pane_state(&self, card: CardId) -> Option<PaneSaveRefusal> {
         if let Some((_, refused, refusal)) = &self.workspace {
-            return Some((*refused, refusal.category, refusal.check.clone()));
+            return Some(PaneSaveRefusal::Refused {
+                pane: *refused,
+                category: refusal.category,
+                rule: refusal.check.clone(),
+            });
         }
-        self.panes
-            .as_ref()
-            .and_then(|(_, panes)| panes.get(&card))
-            .or_else(|| {
-                self.identity_replacements
-                    .get(&card)
-                    .map(|(_, refusal)| refusal)
+        if let Some(refusal) = self.panes.as_ref().and_then(|(_, panes)| panes.get(&card)) {
+            return Some(PaneSaveRefusal::Refused {
+                pane: Some(card),
+                category: refusal.category,
+                rule: refusal.check.clone(),
+            });
+        }
+        self.identity_replacements
+            .get(&card)
+            .map(|(_, refusal)| PaneSaveRefusal::Identity {
+                category: refusal.category,
+                rule: refusal.check.clone(),
             })
-            .map(|refusal| (Some(card), refusal.category, refusal.check.clone()))
     }
 
     /// Rewrites a replacement that continues from a refused one to start at the
@@ -3282,13 +3297,7 @@ fn persistence_loop(
                 Checkpoint::Pane(card, reply) => {
                     let result = if !writes.is_settled() {
                         Err(PaneSaveRefusal::Unsaved(save_refusal(failure)))
-                    } else if let Some((pane, category, rule)) = writes.quarantine.pane_state(card)
-                    {
-                        let refusal = PaneSaveRefusal::Refused {
-                            pane,
-                            category,
-                            rule,
-                        };
+                    } else if let Some(refusal) = writes.quarantine.pane_state(card) {
                         tracing::warn!(%card, %refusal, "a pane's save barrier was refused");
                         Err(refusal)
                     } else {
@@ -3532,7 +3541,7 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
             category.label(),
             category.guidance()
         ),
-        None => "workspace could not be saved; its last attempt is still pending".to_owned(),
+        None => "the workspace hasn't finished saving yet; try again in a moment".to_owned(),
     }
 }
 

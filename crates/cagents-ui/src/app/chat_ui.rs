@@ -12267,6 +12267,12 @@ impl Cagents {
                     .unwrap_or_default();
                 format!("{LEAD} {reason}")
             }
+            // What storage holds for the pane is not where this draft
+            // started from, so no edit of the draft can make it save here.
+            PaneSaveRefusal::Identity { category, .. } => format!(
+                "{LEAD} Storage would not record the new conversation for this pane ({}). Copy your draft into a new chat and send it there.",
+                category.label()
+            ),
             PaneSaveRefusal::Refused { pane, category, .. } => {
                 let label = category.label();
                 match pane {
@@ -12274,14 +12280,10 @@ impl Cagents {
                         "{LEAD} Storage refused this pane's changes ({label}). Change the draft or its options, then send again."
                     ),
                     Some(pane) => {
-                        let what = self
-                            .card_state(*pane)
-                            .map(|state| self.card_display_title(state))
-                            .filter(|title| !title.is_empty())
-                            .map_or_else(
-                                || "another pane".to_owned(),
-                                |title| format!("the pane \u{201c}{title}\u{201d}"),
-                            );
+                        let what = self.pane_notice_title(*pane).map_or_else(
+                            || "another pane".to_owned(),
+                            |title| format!("the pane \u{201c}{title}\u{201d}"),
+                        );
                         format!(
                             "{LEAD} Storage refused changes to {what} ({label}). Close or change {what}, then send again."
                         )

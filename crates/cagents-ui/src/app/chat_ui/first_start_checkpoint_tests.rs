@@ -1073,6 +1073,61 @@ fn deliberate_retry_does_not_rearm_an_unrelated_refused_identity() {
     assert_ne!(stored(&app, other), refused);
 }
 
+/// A first save that landed but whose answer never came - the receipt
+/// timed out - starts nothing. Its identity goes back to the one the reader
+/// still sees, so the composer keeps saving as they edit.
+#[test]
+fn a_first_save_whose_answer_timed_out_returns_its_identity_and_keeps_autosaving() {
+    let (mut app, _directory, card, target) = fixture();
+    let source = stored(&app, card);
+    let task = app.start_chat_draft(target);
+    let candidate = app.chat_ui.draft_checkpoints[&card].candidate.clone();
+    let (target, attempt, result) = checkpoint(task);
+    assert!(result.is_ok());
+    assert_eq!(stored(&app, card), candidate, "the candidate landed");
+    drop(app.draft_start_checkpointed(
+        target,
+        attempt,
+        Err(crate::session::PaneSaveRefusal::Unsaved(
+            "the save had not finished after 30 seconds. Send again to retry.".into(),
+        )),
+    ));
+    no_starter(&app, card);
+    assert_eq!(runtime(&app, card).session, source);
+    assert_eq!(
+        runtime(&app, card).composer.text(),
+        "First prompt remains local"
+    );
+    // The failed receipt queued the return to the reader's identity.
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(stored(&app, card), source);
+    match app.cards.get_mut(&card).unwrap() {
+        CardRuntime::Chat(runtime) => {
+            runtime.replace_draft(text_editor::Content::with_text("Autosaved after failure"))
+        }
+        _ => unreachable!(),
+    }
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    let saved = app
+        .session
+        .as_ref()
+        .unwrap()
+        .operation_store()
+        .load_workspace(app.durable.id, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.chat_drafts[&card], "Autosaved after failure");
+}
+
 #[test]
 fn declined_first_start_leaves_a_provider_switch_its_expected_identity() {
     // A landed B whose start was declined must not strand storage on B: the

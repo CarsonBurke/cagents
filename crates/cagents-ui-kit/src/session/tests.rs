@@ -3501,6 +3501,8 @@ fn a_closed_pane_offered_open_again_stays_closed_and_fails_no_barrier() {
     let resurrected = closed_card.id;
     state.cards.insert(0, closed_card);
     state.cards[1].title = "renamed beside it".into();
+    // Even focused, as a pane back in view would be.
+    state.focused = Some(resurrected);
     runtime.snapshot(Arc::new(state.clone()));
     runtime
         .flush(timeout)
@@ -3529,6 +3531,7 @@ fn a_closed_pane_offered_open_again_stays_closed_and_fails_no_barrier() {
             .map(|card| &card.existence),
         Some(Existence::Closed { .. })
     ));
+    assert_eq!(saved.focused, None, "storage focuses no closed card");
     assert_eq!(
         saved
             .cards
