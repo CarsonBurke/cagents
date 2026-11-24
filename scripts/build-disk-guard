@@ -114,9 +114,6 @@ read_space() {
 state=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}.prune
 pruner_state=${CAGENTS_BUILD_PRUNE_STATE:-/var/tmp/cagents-prune-build-dirs-$(id -u)}
 here=$(dirname -- "$(readlink -f -- "$0")")
-quote() {
-    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
 # Opens descriptor 7 on $1, or fails without ending the guard.
 open7() {
     { command exec 7>>"$1"; } 2>/dev/null
@@ -130,27 +127,24 @@ urgent='--orphan-hours 0 --evidence-hours 1'
 # CAGENTS_BUILD_PRUNE runs only before a build, below twice the floor.
 pruner= offload=
 if [ -z "$prune" ] && [ -x "$here/prune-build-dirs" ]; then
-    pruner="$(quote "$here/prune-build-dirs") --apply --max-idle $idle"
-    pruner="$pruner --lock $(quote "$pruner_state.lock") --log $(quote "$pruner_state.tsv")"
-    # A run that searched everything stamps the schedule.
-    pruner="$pruner --stamp $(quote "$pruner_state.scheduled")"
-    # Never the build this guard runs for.
-    pruner="$pruner --keep $(quote "$build_dir")"
+    pruner=$here/prune-build-dirs
+    # Trim idle slots under their lease locks alongside the directory prune.
+    [ ! -x "$here/cargo-offload" ] || offload=$here/cargo-offload
+fi
+
+# Look up the checkout only when this process is about to run the pruner.
+run_pruner() {
+    set -- "$@" --apply --max-idle "$idle" --lock "$pruner_state.lock" \
+        --log "$pruner_state.tsv" --stamp "$pruner_state.scheduled" --keep "$build_dir"
     # Worktrees' build output lives in the repository's main checkout, whose
     # own build seeds theirs and stays. A bare repository's parent holds
     # other repositories, so only a checkout's is searched.
     common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
     case $common in
-        */.git) pruner="$pruner --root $(quote "${common%/.git}") --keep-checkout $(quote "${common%/.git}")" ;;
+        */.git) set -- "$@" --root "${common%/.git}" --keep-checkout "${common%/.git}" ;;
     esac
-    # Out of room, a removed workspace's build directory goes at once, and
-    # the build waits for the pruner, or one already running, only so long.
-    prune="$pruner $urgent --budget $budget --wait"
-    # The pruner leaves the offload build slots here to their leases, which
-    # bound each slot as they take it. Those no lease holds now are trimmed
-    # the same way, under their leases' locks, by the helper beside this.
-    [ ! -x "$here/cargo-offload" ] || offload=$(quote "$here/cargo-offload")
-fi
+    exec "$@"
+}
 
 # Starts the pruner, with the arguments after the first three, detached and
 # at a lower priority, unless a run is under way or one searched everything
@@ -177,10 +171,10 @@ detach() {
         # of the build's for longer than it did, and the trim closes what
         # it inherited as it starts.
         if [ -n "$offload" ]; then
-            eval "exec $setsid nice -n $niceness $ionice $offload --trim-slots $floor" \
+            $setsid nice -n "$niceness" $ionice "$offload" --trim-slots "$floor" \
                 >"$pruner_state.slots.log" 2>&1 &
         fi
-        eval "exec $setsid nice -n $niceness $ionice $pruner --output $(quote "$pruner_state.log") $*"
+        run_pruner $setsid nice -n "$niceness" $ionice "$pruner" --output "$pruner_state.log" "$@"
     ) &
 }
 
@@ -209,7 +203,7 @@ if [ "$free" -ge "$floor" ] && [ -n "$pruner" ]; then
     exit 0
 fi
 
-if [ -z "$prune" ]; then
+if [ -z "$prune$pruner" ]; then
     printf '%s: %s GiB free on %s, and nothing to reclaim build directories with: %s is missing and CAGENTS_BUILD_PRUNE is unset\n' \
         "$program" "$free" "$directory" "$here/prune-build-dirs" >&2
 fi
@@ -221,7 +215,7 @@ fi
 # One reclaim at a time across the host, and at most every ten minutes: a
 # queue of builds would otherwise each scan every build directory. The stamp
 # is a separate file, whose time a full disk can still update.
-if [ -n "$prune" ] && open7 "$state"; then
+if [ -n "$prune$pruner" ] && open7 "$state"; then
     if flock -n 7; then
         if [ -z "$(find "$state.done" -mmin -10 2>/dev/null)" ]; then
             printf '%s: %s GiB free on %s; reclaiming unused build directories\n' \
@@ -233,16 +227,20 @@ if [ -n "$prune" ] && open7 "$state"; then
                 # Without timeout, nothing bounds a wait, so it runs on its
                 # own like the scheduled one.
                 if command -v timeout >/dev/null 2>&1; then
-                    eval "timeout $budget $offload --trim-slots $floor --wait" >&2 &
+                    timeout "$budget" "$offload" --trim-slots "$floor" --wait >&2 &
                     trimming=$!
                 else
                     (
                         exec </dev/null >>"$pruner_state.slots.log" 2>&1 7>&-
-                        eval "exec $offload --trim-slots $floor"
+                        exec "$offload" --trim-slots "$floor"
                     ) &
                 fi
             fi
-            sh -c "$prune" >&2 || :
+            if [ -n "$pruner" ]; then
+                (run_pruner "$pruner" $urgent --budget "$budget" --wait) >&2 || :
+            else
+                sh -c "$prune" >&2 || :
+            fi
             [ -z "$trimming" ] || wait "$trimming" || :
             touch -- "$state.done" 2>/dev/null || :
         fi
