@@ -49,3 +49,8 @@ jobs:
 
       - name: Test the shared protocol client and the app
         run: ./gradlew --console=plain :shared:jvmTest :androidApp:testDebugUnitTest
+
+      # The phone runs the minified build. Building it here catches R8
+      # configuration errors; a missing keep rule shows only at run time.
+      - name: Build the minified preview
+        run: ./gradlew --console=plain :androidApp:assemblePreview

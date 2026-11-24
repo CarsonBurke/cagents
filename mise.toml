@@ -230,7 +230,12 @@ dir = "mobile"
 run = 'ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain :androidApp:assembleDebug'
 
 [tasks."mobile:install"]
-description = "Build the debug APK and install it on the connected phone (set ANDROID_SERIAL to choose one)"
+description = "Build the minified preview APK and install it on the connected phone, over the debug build (set ANDROID_SERIAL to choose one)"
+dir = "mobile"
+run = 'ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain :androidApp:installPreview'
+
+[tasks."mobile:install-debug"]
+description = "Build the debuggable APK and install it on the connected phone, for run-as and the debugger; it runs slower"
 dir = "mobile"
 run = 'ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain :androidApp:installDebug'
 
