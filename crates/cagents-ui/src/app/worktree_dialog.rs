@@ -541,14 +541,20 @@ impl Cagents {
                     "It was removed from {project}. This checks out its branch again in the folder it was in."
                 ))
                 .into(),
-                // The folder's own name is at its end, which stays in view.
-                design::caption(format!("Folder: {}", dialog.draft.destination.trim()))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::Start(
-                        cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
+                // The label stays whole and the path gives way at its start,
+                // so the folder's own name, at its end, stays in view.
+                widget::row::with_children(vec![
+                    design::caption("Folder").into(),
+                    design::caption(dialog.draft.destination.trim())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::Start(
+                            cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .into(),
             ],
             None => vec![
                 design::title(format!("New worktree in {project}")).into(),
