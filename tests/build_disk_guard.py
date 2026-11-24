@@ -470,6 +470,22 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
         self.assertEqual(len(self.calls(calls, 2)), 2)
 
+    def test_a_fresh_schedule_skips_pruner_checkout_discovery(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        (self.root / "pruner.scheduled").touch()
+        queried = self.root / "git-called"
+        git = self.root / "git"
+        git.write_text(f"#!/bin/sh\ntouch '{queried}'\nexit 1\n")
+        git.chmod(0o755)
+        self.env["PATH"] = f"{self.root}{os.pathsep}{os.environ['PATH']}"
+
+        result = self.guard(1, guard=guard)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.reap()
+        self.assertFalse(queried.exists())
+        self.assertFalse(calls.exists())
+
     def test_the_build_does_not_wait_for_the_scheduled_prune(self):
         guard = self.alone()
         pruner = guard.with_name("prune-build-dirs")
