@@ -373,6 +373,7 @@ struct State {
     quarantined: Vec<Option<u64>>,
     free: Vec<usize>,
     next_ticket: u64,
+    // Every suspended entry has a recorded fault until recovery rearms it.
     failure: Option<String>,
     fatal: bool,
     worker_alive: bool,
@@ -383,6 +384,9 @@ struct State {
 }
 impl State {
     fn can_seal_exit(&self) -> bool {
+        if !self.admission_closed {
+            return false;
+        }
         ExitReadiness {
             capacity: self.entries.len(),
             free: self.free.len(),
@@ -390,7 +394,6 @@ impl State {
             fatal: self.fatal,
             worker_alive: self.worker_alive,
             stopping: self.stopping,
-            admission_closed: self.admission_closed,
             quarantined: self.quarantined.iter().any(Option::is_some),
         }
         .can_seal_exit(self.entries.iter().flatten().map(|entry| ExitCustody {
@@ -415,7 +418,6 @@ struct ExitReadiness {
     fatal: bool,
     worker_alive: bool,
     stopping: bool,
-    admission_closed: bool,
     quarantined: bool,
 }
 
@@ -440,7 +442,7 @@ impl ExitReadiness {
             && !self.stopping
             && self.free + retained == self.capacity
             && all_recoverable;
-        self.admission_closed && (absent || recoverable) && !self.quarantined
+        (absent || recoverable) && !self.quarantined
     }
 }
 struct Service {
@@ -568,7 +570,8 @@ impl Service {
     }
     fn has_suspended_custody(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.worker_alive
+        state.failure.is_some()
+            && state.worker_alive
             && !state.fatal
             && !state.stopping
             && state.entries.iter().flatten().any(|entry| entry.suspended)
@@ -792,11 +795,11 @@ impl Service {
                         false
                     }
                 };
-                let empty = reaped && state.free.len() == state.entries.len();
-                let exit_ready = reaped && state.can_seal_exit();
+                let should_wake_daemon =
+                    !reaped || state.free.len() == state.entries.len() || state.can_seal_exit();
                 self.progress(&mut state);
                 drop(state);
-                if empty || exit_ready || !reaped {
+                if should_wake_daemon {
                     crate::daemon::wake();
                 }
             }
@@ -1103,7 +1106,6 @@ mod tests {
             fatal: false,
             worker_alive: true,
             stopping: false,
-            admission_closed: true,
             quarantined: false,
         }
     }
