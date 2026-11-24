@@ -57,6 +57,9 @@ pub(super) enum WorkScope {
         number: u64,
         url: Option<Url>,
     },
+    /// The channel's worktree, removed from disk. Nothing here is its to
+    /// show or commit until it is recreated.
+    Removed(Box<super::channel_ui::missing_checkout::Missing>),
 }
 
 impl WorkScope {
@@ -69,6 +72,7 @@ impl WorkScope {
                 Some((crate::sidebar::worktree_icon(), label))
             }
             Self::Elsewhere { label, .. } => Some((Icon::PullRequest.handle(), label)),
+            Self::Removed(missing) => Some((crate::sidebar::worktree_icon(), missing.label())),
         }
     }
 }
@@ -378,6 +382,18 @@ impl Cagents {
     /// What `card`'s Work and Mentioned sections and the section beneath
     /// them need of its conversation's work, worked out once per use.
     pub(super) fn work_summary(&self, card: CardId) -> WorkSummary {
+        let mut summary = self.conversation_work_summary(card);
+        // A pane whose channel's worktree was removed runs in another
+        // checkout; it has no worktree of its own to show.
+        if summary.scope == WorkScope::Focus
+            && let Some(missing) = self.card_missing_checkout(card)
+        {
+            summary.scope = WorkScope::Removed(Box::new(missing));
+        }
+        summary
+    }
+
+    fn conversation_work_summary(&self, card: CardId) -> WorkSummary {
         // With neither section followed there is no work to choose, so none
         // scopes the changes and files.
         if !self.tracks_work(card) && !self.tracks_mentions(card) {
@@ -444,7 +460,10 @@ impl Cagents {
                 .card_state(owner)
                 .and_then(super::worktree_ui::card_directory)
                 .map(Path::to_path_buf),
-            WorkScope::Focus | WorkScope::Unlisted { .. } | WorkScope::Elsewhere { .. } => None,
+            WorkScope::Focus
+            | WorkScope::Unlisted { .. }
+            | WorkScope::Elsewhere { .. }
+            | WorkScope::Removed(_) => None,
         }
     }
 

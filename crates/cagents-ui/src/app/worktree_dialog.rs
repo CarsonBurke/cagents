@@ -21,6 +21,9 @@ pub struct WorktreeDraft {
     pub base: String,
     pub destination: String,
     pub(super) pr_checkout: Option<super::pr_checkout_ui::PrCheckoutOrigin>,
+    /// The removed worktree this draft makes again, by its name, in the
+    /// folder `destination` names.
+    pub(super) recreates: Option<String>,
 }
 
 impl WorktreeDraft {
@@ -206,7 +209,9 @@ impl WorktreeDialog {
         Self {
             project_id,
             repository,
-            advanced: draft.uses_options(),
+            // A recreated worktree's folder is shown beneath the title, so
+            // the options holding it start folded.
+            advanced: draft.uses_options() && draft.recreates.is_none(),
             checkout_notice: draft
                 .pr_checkout
                 .as_ref()
@@ -529,16 +534,40 @@ impl Cagents {
                     .branch_preview()
                     .map(|branch| design::caption(format!("Branch: {branch}")).into())
             });
-        let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::column::with_children(vec![
+        let heading: Vec<Element<'_, Message>> = match &dialog.draft.recreates {
+            Some(name) => vec![
+                design::title(format!("Recreate worktree {name}")).into(),
+                design::caption(format!(
+                    "It was removed from {project}. This checks out its branch again in the folder it was in."
+                ))
+                .into(),
+                // The label stays whole and the path gives way at its start,
+                // so the folder's own name, at its end, stays in view.
+                widget::row::with_children(vec![
+                    design::caption("Folder").into(),
+                    design::caption(dialog.draft.destination.trim())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::Start(
+                            cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .into(),
+            ],
+            None => vec![
                 design::title(format!("New worktree in {project}")).into(),
                 design::caption(
                     "Create a branch, check out an existing one, or start from a Linear issue ID or URL.",
                 )
                 .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
+            ],
+        };
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::column::with_children(heading)
+                .spacing(space::XS)
+                .into(),
             field(
                 "Branch or Linear issue",
                 input(
@@ -629,11 +658,15 @@ impl Cagents {
                 .id(widget::Id::new("dialog.worktree.cancel"))
                 .on_press(Message::CancelDialog)
                 .into(),
-            crate::ui_controls::button::primary("Create worktree")
-                .instead("Creating…", dialog.resolving.is_some())
-                .id(widget::Id::new("dialog.worktree.create"))
-                .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree))
-                .into(),
+            crate::ui_controls::button::primary(if dialog.draft.recreates.is_some() {
+                "Recreate worktree"
+            } else {
+                "Create worktree"
+            })
+            .instead("Creating…", dialog.resolving.is_some())
+            .id(widget::Id::new("dialog.worktree.create"))
+            .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree))
+            .into(),
         ])
         .spacing(space::S)
         .align_y(Alignment::Center);

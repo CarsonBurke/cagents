@@ -13441,6 +13441,18 @@ impl Cagents {
     /// page - is [`SidebarFocus::None`], which leaves the panel where it is
     /// rather than tearing it down.
     fn sidebar_focus(&self) -> SidebarFocus {
+        // A worktree channel binds its own checkout, read from the latest
+        // listing rather than from the strip it installed: the worktree may
+        // have been removed or listed again since. Until the listing confirms
+        // it, the panel binds nothing; the main checkout the panes fall back
+        // to is not the channel's to commit.
+        if let Some(focus) = self
+            .durable
+            .active_channel
+            .and_then(|channel| self.channel_checkout_focus(channel))
+        {
+            return focus;
+        }
         if let Some(worktree) = &self.active_workspace {
             return SidebarFocus::Repository {
                 worktree: worktree.clone(),
@@ -17772,6 +17784,14 @@ impl Application for Cagents {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
+        // The notice about the shown channel's removed worktree heads the
+        // panes it concerns. Always present, as the bars below are, so its
+        // coming and going does not shift the strip's widget state.
+        let workspace: Element<'_, Message> =
+            widget::column::with_children(vec![self.missing_checkout_banner(), workspace])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         drop(workspace_part);
         let workspace = crate::performance::ui_trace::region("workspace", workspace);
         let chrome_part =
@@ -17802,7 +17822,6 @@ impl Application for Cagents {
             self.daemon_health_banner(),
             self.update_resume_banner(),
             self.pane_follow_banner(),
-            self.missing_checkout_banner(),
             self.automation_approval_banner(),
             self.dictation_banner(),
             bar,

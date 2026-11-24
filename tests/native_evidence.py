@@ -473,7 +473,18 @@ class Evidence(unittest.TestCase):
             self.assertNotRegex(source, rf"(unset|env -u|-u)\s+{name}")
 
     def test_task_directory_must_be_outside_git_ancestry(self) -> None:
-        (self.root / ".git").mkdir()
+        git = self.root / ".git"
+        # The empty mount point a sandbox leaves is no repository to Git.
+        git.mkdir()
+        self.run_tool("status")
+        (git / "HEAD").write_text("ref: refs/heads/main\n")
+        result = self.run_tool("status", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("outside Git ancestry", result.stderr)
+        # A linked worktree's gitfile is one too.
+        (git / "HEAD").unlink()
+        git.rmdir()
+        git.write_text("gitdir: /elsewhere/.git/worktrees/x\n")
         result = self.run_tool("status", check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("outside Git ancestry", result.stderr)
