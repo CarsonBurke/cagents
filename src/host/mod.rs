@@ -513,6 +513,49 @@ fn save_abandoned_identities(host: &SharedHost) {
     }
 }
 
+fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
+    use crate::chat::runtime::Deliveries;
+
+    match Deliveries::open() {
+        Ok(deliveries) => return Some(Arc::new(deliveries)),
+        Err(error) => {
+            tracing::warn!(%error, "cannot open the message delivery ledger; using memory")
+        }
+    }
+    let deliveries = match Deliveries::in_memory() {
+        Ok(deliveries) => Arc::new(deliveries),
+        Err(error) => {
+            tracing::error!(%error, "cannot open an in-memory message delivery ledger");
+            return None;
+        }
+    };
+    let fallback = Arc::downgrade(&deliveries);
+    let interval = std::time::Duration::from_secs(1);
+    let mut backoff = service::Backoff::new(interval);
+    let mut wait = backoff.fail();
+    if let Err(error) = service::spawn("cagents-chat-deliveries", interval, move || {
+        thread::sleep(wait);
+        let Some(deliveries) = fallback.upgrade() else {
+            return service::Next::Stop;
+        };
+        match deliveries.restore_persistence() {
+            Ok(()) => {
+                tracing::info!("the persistent message delivery ledger is available again");
+                service::Next::Stop
+            }
+            Err(error) => {
+                wait = backoff.fail();
+                tracing::warn!(%error, retry_seconds = wait.as_secs(),
+                               "the message delivery ledger is still unavailable; using memory");
+                service::Next::Continue
+            }
+        }
+    }) {
+        tracing::error!(%error, "cannot schedule reopening the message delivery ledger");
+    }
+    Some(deliveries)
+}
+
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("host run entered", None);
@@ -548,10 +591,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut initial = HostState::new(proof);
     initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
-    match crate::chat::runtime::Deliveries::open() {
-        Ok(deliveries) => initial.chat_deliveries = Some(Arc::new(deliveries)),
-        Err(error) => tracing::error!(%error, "cannot open the message delivery ledger"),
-    }
+    initial.chat_deliveries = open_chat_deliveries();
     initial.prompt_cache = Arc::new(agent_execution::prompt_cache::Calibration::installation());
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()

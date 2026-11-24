@@ -689,9 +689,12 @@ delivery_outcomes! {
     /// A delivery whose acknowledgement was lost before it could be saved.
     unknown send LOST_DELIVERY_OUTCOME: "The outcome of this message could not be confirmed.",
         "It may have gone through. Check the conversation before sending it again.";
-    /// Reading or recording a keyed delivery failed before admission could be decided.
+    /// The outcome of work already admitted could not be recorded.
     unknown send DELIVERY_HISTORY_UNAVAILABLE: "Message delivery history is unavailable.",
         "Check the conversation before sending this message again.";
+    /// The daemon could not check or reserve the key before sending the message.
+    refused send DELIVERY_NOT_SENT: "Message delivery history is unavailable, so your message wasn't sent.",
+        "Try sending it again in a moment.";
     /// A new input while an earlier one is still unconfirmed.
     refused send UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
         "Try again in a moment.";
@@ -806,6 +809,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unavailable_delivery_history_distinguishes_refusal_from_an_unknown_outcome() {
+        let refused = DeliveryOutcome::parse(delivery::DELIVERY_NOT_SENT).unwrap();
+        assert!(refused.notice);
+        assert!(!refused.unknown);
+        let unacknowledged =
+            DeliveryOutcome::parse(delivery::DELIVERY_HISTORY_UNAVAILABLE).unwrap();
+        assert!(unacknowledged.notice);
+        assert!(unacknowledged.unknown);
+    }
+
     /// A turn an ACP provider refused for a login with no allowance says so,
     /// keeps the provider's reason in view, and is not a usage limit even
     /// when the reason mentions a quota.
@@ -869,6 +883,7 @@ mod tests {
             UNACKNOWLEDGED_STOP,
             LOST_DELIVERY_OUTCOME,
             DELIVERY_HISTORY_UNAVAILABLE,
+            DELIVERY_NOT_SENT,
             UNSETTLED_INPUT,
             RECONNECTING_INPUT,
             CROWDED_INPUT,

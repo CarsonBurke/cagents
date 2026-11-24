@@ -466,7 +466,9 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
             Ok(Step::default())
         }
     }
-    let root = tempfile::tempdir().unwrap();
+    // Use the build gate's private TMPDIR when it provides one.
+    let base = std::env::var_os("TMPDIR").unwrap_or_else(|| "/var/tmp".into());
+    let root = tempfile::tempdir_in(base).unwrap();
     let remote = RemoteActor::fixture();
     let mut identity = remote.identity();
     let proof = remote.0.proof.clone();

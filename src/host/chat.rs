@@ -4021,18 +4021,18 @@ fn chat_command(
         });
     }
     if let Some(key) = delivery {
-        use chat::failure::delivery::DELIVERY_HISTORY_UNAVAILABLE;
-        let deliveries = deliveries.ok_or_else(|| unavailable(DELIVERY_HISTORY_UNAVAILABLE))?;
+        use chat::failure::delivery::DELIVERY_NOT_SENT;
+        let deliveries = deliveries.ok_or_else(|| unavailable(DELIVERY_NOT_SENT))?;
         // Explicit resume can allocate a new chat ID for the same lineage.
         // Look it up outside the host lock, just like the ledger writes.
-        let registry = registry.ok_or_else(|| unavailable(DELIVERY_HISTORY_UNAVAILABLE))?;
+        let registry = registry.ok_or_else(|| unavailable(DELIVERY_NOT_SENT))?;
         let lineage = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .session_lineage(chat_id)
             .map_err(|error| {
                 tracing::error!(%chat_id, %error, "cannot read the message delivery lineage");
-                unavailable(DELIVERY_HISTORY_UNAVAILABLE)
+                unavailable(DELIVERY_NOT_SENT)
             })?
             .map_or(chat_id, |lineage| lineage.0);
         handle.deliver(&deliveries, lineage, command, key, || {

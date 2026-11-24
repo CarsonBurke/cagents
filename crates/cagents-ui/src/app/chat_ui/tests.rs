@@ -10509,6 +10509,8 @@ fn a_declined_send_is_a_notice_unless_the_conversation_cannot_go_on() {
         (delivery::UNACKNOWLEDGED_INPUT, false),
         (delivery::UNACKNOWLEDGED_ANSWER, false),
         (delivery::UNACKNOWLEDGED_STOP, false),
+        (delivery::DELIVERY_HISTORY_UNAVAILABLE, false),
+        (delivery::DELIVERY_NOT_SENT, false),
         (delivery::UNSETTLED_INPUT, false),
         (delivery::RECONNECTING_INPUT, false),
         (delivery::CROWDED_INPUT, false),
