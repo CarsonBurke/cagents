@@ -506,6 +506,7 @@ fn job(directory: &Path) -> UpdateJob {
         confirmation: None,
         refusal: None,
         in_flight: Vec::new(),
+        recorded_by: None,
     };
     let file = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
     serde_json::to_writer(
@@ -816,7 +817,7 @@ listener.bind(sys.argv[2]);listener.listen()
         &installation,
         &state,
         &mut job,
-        &Err(invalid(original)),
+        &mut Err(invalid(original)),
         &mut handoff,
         &recovery,
         &mut survivors,

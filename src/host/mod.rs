@@ -675,6 +675,14 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("admission released", None);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
+    // An older worker may record the update that started this daemon as
+    // failed; once it finishes, this daemon's own receipt settles that.
+    crate::update::settle_as_successor(
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone(),
+    );
     // After restore, so the first pass covers every conversation it carried.
     if let Err(error) = chat::keep_legacy_codex_listeners_fresh(&host) {
         tracing::warn!(%error, "Codex listeners in the temporary directory will not be kept fresh");
