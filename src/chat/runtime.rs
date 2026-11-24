@@ -29,6 +29,7 @@ mod child_text_copy;
 pub(crate) mod courier_tests;
 mod delivery;
 use crate::chat::DeliveryKey;
+pub(crate) use delivery::Deliveries;
 mod execution;
 mod handle;
 pub use handle::Handle;
@@ -406,8 +407,6 @@ struct Inner {
     /// file lock before accepting. See [`Handle::startup_lock_wait`].
     startup_lock_wait: Arc<AtomicU64>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
-    /// What became of the messages sent under a key.
-    deliveries: delivery::Deliveries,
     #[cfg(test)]
     idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
@@ -725,7 +724,6 @@ impl LocalHandle {
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
-            deliveries: delivery::Deliveries::default(),
             #[cfg(test)]
             idle_frame_buffer_capacity: idle_frame_buffer_capacity.clone(),
         });
@@ -1114,17 +1112,28 @@ impl LocalHandle {
         })
     }
 
-    /// Sends `command` once under `key`, as [`delivery`] describes.
-    pub(crate) fn deliver(&self, command: Command, key: DeliveryKey) -> Result<(), Rejection> {
-        self.0
-            .deliveries
-            .deliver(key, COMMAND_ACKNOWLEDGEMENT, unacknowledged_command, || {
+    fn deliver(
+        &self,
+        deliveries: &Deliveries,
+        chat: crate::model::TerminalId,
+        command: Command,
+        key: DeliveryKey,
+        given_work: impl FnOnce(),
+    ) -> Result<(), Rejection> {
+        deliveries.deliver(
+            chat,
+            key,
+            COMMAND_ACKNOWLEDGEMENT,
+            unacknowledged_command,
+            || {
+                given_work();
                 self.enqueue_actor_command(ActorCommand::Provider {
                     run: None,
                     command,
                     decline_only: false,
                 })
-            })
+            },
+        )
     }
 
     fn submit_actor_command(&self, command: ActorCommand) -> Result<(), Rejection> {
