@@ -131,11 +131,16 @@ impl From<SaveFailureCategory> for crate::diagnostics::Failure {
     }
 }
 
-/// Why nothing more can be saved once the window has begun to close.
-const WRITER_CLOSED: &str = "this window is closing and can't save any more changes";
+/// Why nothing more can be saved once the writer has shut down. It shuts
+/// down only as the window process ends: the person closed the window, quit
+/// cagents, or an update closed its windows. Each of those closes this one.
+///
+/// Like every reason the writer gives, this is a complete sentence that a
+/// caller may capitalize, append after its own, or quote after a colon.
+const WRITER_CLOSED: &str = "saving has stopped because cagents is closing this window.";
 
 /// Why nothing can be saved after the writer's queue was lost to a panic.
-const WRITER_FAILED: &str = "saving stopped after an internal error; restart cagents to save again";
+const WRITER_FAILED: &str = "saving stopped after an internal error. Copy anything unsaved, then restart cagents to save again.";
 
 /// What to do about writes storage refused by construction. Retrying the same
 /// content cannot help, so the remedy is changing it.
@@ -578,9 +583,10 @@ pub enum PaneSaveRefusal {
         category: SaveFailureCategory,
         rule: crate::diagnostics::Check,
     },
-    /// Storage refused to record the pane's new conversation identity: what
-    /// it holds for the pane is not the identity the draft started from.
-    /// Changing the draft cannot repair that.
+    /// Storage refused to record the pane's new conversation identity, as
+    /// when what it holds for the pane is not the identity the draft started
+    /// from, or the conversation it replaces already began. Changing the
+    /// draft cannot repair that; a new chat starts from no identity at all.
     Identity {
         category: SaveFailureCategory,
         rule: crate::diagnostics::Check,
@@ -1685,23 +1691,33 @@ impl Quarantine {
     /// refused window snapshot, which held it, or a refused write of the
     /// card itself. Another pane's refused write leaves it saved.
     fn pane_state(&self, card: CardId) -> Option<PaneSaveRefusal> {
-        if let Some((_, refused, refusal)) = &self.workspace {
+        let window = self
+            .workspace
+            .as_ref()
+            .map(|(_, refused, refusal)| (*refused, refusal));
+        // A whole window refused over another pane, or over no pane, is what
+        // this pane's save waits on first.
+        if let Some((refused, refusal)) = window.filter(|(refused, _)| *refused != Some(card)) {
             return Some(PaneSaveRefusal::Refused {
-                pane: *refused,
+                pane: refused,
                 category: refusal.category,
                 rule: refusal.check.clone(),
             });
         }
-        if let Some(refusal) = self.panes.as_ref().and_then(|(_, panes)| panes.get(&card)) {
-            return Some(PaneSaveRefusal::Refused {
+        // A refused identity replacement also gets the card's own content
+        // refused - the window offers it at the new identity - so it is the
+        // cause to report: no edit of the content repairs it.
+        if let Some((_, refusal)) = self.identity_replacements.get(&card) {
+            return Some(PaneSaveRefusal::Identity {
+                category: refusal.category,
+                rule: refusal.check.clone(),
+            });
+        }
+        window
+            .map(|(_, refusal)| refusal)
+            .or_else(|| self.panes.as_ref().and_then(|(_, panes)| panes.get(&card)))
+            .map(|refusal| PaneSaveRefusal::Refused {
                 pane: Some(card),
-                category: refusal.category,
-                rule: refusal.check.clone(),
-            });
-        }
-        self.identity_replacements
-            .get(&card)
-            .map(|(_, refusal)| PaneSaveRefusal::Identity {
                 category: refusal.category,
                 rule: refusal.check.clone(),
             })
@@ -3541,7 +3557,7 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
             category.label(),
             category.guidance()
         ),
-        None => "the workspace hasn't finished saving yet; try again in a moment".to_owned(),
+        None => "the workspace hasn't finished saving yet. Try again in a moment.".to_owned(),
     }
 }
 

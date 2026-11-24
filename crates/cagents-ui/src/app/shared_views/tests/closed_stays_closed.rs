@@ -230,6 +230,10 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
             matches!(&completion, Action::DraftStartCheckpointed(_, _, Ok(()))),
             "{refusal}: {completion:?}"
         );
+        assert!(
+            app.session.as_ref().unwrap().flush(WAIT).is_err(),
+            "{refusal}: the other chat is still refused"
+        );
         drop(app.handle_chat_ui(completion));
         assert!(app.chat_start_pending(fresh), "{refusal}");
     }
@@ -314,6 +318,10 @@ fn a_closed_card_back_in_memory_blocks_neither_an_update_nor_a_new_chat() {
         matches!(&completion, Action::DraftStartCheckpointed(_, _, Ok(()))),
         "neither the closed pane back in memory nor another pane's refusal fails this draft's save: \
          {completion:?}"
+    );
+    assert!(
+        app.session.as_ref().unwrap().flush(WAIT).is_err(),
+        "the other chat is still refused"
     );
     let _ = channel;
 

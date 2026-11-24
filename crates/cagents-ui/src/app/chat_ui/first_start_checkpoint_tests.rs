@@ -343,7 +343,23 @@ fn refused_or_unavailable_first_start_checkpoint_preserves_draft_and_never_start
         let task = app.start_chat_draft(target);
         no_starter(&app, card);
         let (target, attempt, result) = checkpoint(task);
-        assert!(result.is_err());
+        if unavailable {
+            assert!(result.is_err());
+        } else {
+            // Storage holding another identity is reported as that, not as
+            // content the reader could change.
+            assert!(
+                matches!(
+                    &result,
+                    Err(crate::session::PaneSaveRefusal::Identity { .. })
+                ),
+                "{result:?}"
+            );
+            assert!(
+                app.draft_start_save_failure(card, result.as_ref().unwrap_err())
+                    .contains("Copy your draft into a new chat")
+            );
+        }
         drop(app.draft_start_checkpointed(target, attempt, result));
         no_starter(&app, card);
         assert!(
@@ -369,6 +385,82 @@ fn refused_or_unavailable_first_start_checkpoint_preserves_draft_and_never_start
     drop(app.start_chat_draft(target));
     no_starter(&app, card);
     assert!(app.chat_ui.draft_checkpoints.is_empty());
+}
+
+#[test]
+fn every_first_save_failure_reads_as_whole_sentences() {
+    use crate::session::{PaneSaveRefusal, SaveFailureCategory};
+
+    let (mut app, directory, card, _) = fixture();
+    let other = CardId::new();
+    // The reasons a writer gives before any storage write, from real
+    // writers: one shut down as a window closes, one whose queue was lost.
+    let unsaved = |writer: &crate::session::SessionRuntime| match writer.request_pane_flush(card) {
+        Err(PaneSaveRefusal::Unsaved(reason)) => reason,
+        other => panic!("{other:?}"),
+    };
+    let mut closed = crate::session::SessionRuntime::open(
+        directory.path().join("closed.sqlite3"),
+        crate::model::BootId::new("closed"),
+    )
+    .unwrap()
+    .0;
+    closed.shutdown();
+    let failed = crate::session::SessionRuntime::open(
+        directory.path().join("failed.sqlite3"),
+        crate::model::BootId::new("failed"),
+    )
+    .unwrap()
+    .0;
+    failed.poison_queue_for_test();
+    let mut refusals = vec![
+        PaneSaveRefusal::Unsaved(unsaved(&closed)),
+        PaneSaveRefusal::Unsaved(unsaved(&failed)),
+        PaneSaveRefusal::Unsaved(
+            "the save had not finished after 30 seconds. Send again to retry.".into(),
+        ),
+    ];
+    let rule = crate::diagnostics::Check::new("a fixture rule");
+    for category in [
+        SaveFailureCategory::Busy,
+        SaveFailureCategory::Conflict,
+        SaveFailureCategory::InvalidData,
+        SaveFailureCategory::Corrupt,
+    ] {
+        refusals.push(PaneSaveRefusal::Identity {
+            category,
+            rule: rule.clone(),
+        });
+        for pane in [Some(card), Some(other), None] {
+            refusals.push(PaneSaveRefusal::Refused {
+                pane,
+                category,
+                rule: rule.clone(),
+            });
+        }
+    }
+    // Shown by title, which must not break the sentence around it.
+    app.card_state_mut(card).unwrap().title = "Release notes".into();
+    refusals.push(PaneSaveRefusal::Refused {
+        pane: Some(card),
+        category: SaveFailureCategory::InvalidData,
+        rule,
+    });
+    for refusal in &refusals {
+        let message = app.draft_start_save_failure(other, refusal);
+        assert!(message.ends_with('.'), "{message:?}");
+        for sentence in message.split(". ") {
+            assert!(
+                sentence.starts_with(|first: char| first.is_uppercase()),
+                "{sentence:?} in {message:?}"
+            );
+        }
+    }
+    let closed_message = app.draft_start_save_failure(card, &refusals[0]);
+    assert!(
+        closed_message.ends_with("Saving has stopped because cagents is closing this window."),
+        "{closed_message:?}"
+    );
 }
 
 #[test]

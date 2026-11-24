@@ -12267,10 +12267,14 @@ impl Cagents {
                     .unwrap_or_default();
                 format!("{LEAD} {reason}")
             }
-            // What storage holds for the pane is not where this draft
-            // started from, so no edit of the draft can make it save here.
+            // Storage would not move the pane to this conversation, as when
+            // it holds another identity for it. Storage refuses that by rule
+            // (never `Conflict`, which the writer retries itself), so neither
+            // an edit of the draft nor Send or Retry save repairs it: each
+            // offers storage the same move from the same identity. A new chat
+            // starts from no identity at all, so nothing is moved.
             PaneSaveRefusal::Identity { category, .. } => format!(
-                "{LEAD} Storage would not record the new conversation for this pane ({}). Copy your draft into a new chat and send it there.",
+                "{LEAD} Storage would not record the new conversation for this pane ({}), and sending here again would be refused the same way. Copy your draft into a new chat and send it there.",
                 category.label()
             ),
             PaneSaveRefusal::Refused { pane, category, .. } => {

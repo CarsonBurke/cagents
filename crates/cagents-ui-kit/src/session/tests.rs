@@ -4733,3 +4733,78 @@ fn pruning_removes_nothing_when_the_daemon_cannot_name_its_terminals() {
     assert!(matches!(error, SessionError::ResidentTerminalsUnknown(_)));
     assert!(unclaimed.is_file());
 }
+
+/// Whether `reason`, as a caller shows it with its first letter capitalized,
+/// reads as whole sentences: each begins with a capital and the last ends.
+fn reads_as_sentences(reason: &str) -> bool {
+    let mut letters = reason.chars();
+    let Some(first) = letters.next() else {
+        return false;
+    };
+    let shown = first.to_uppercase().chain(letters).collect::<String>();
+    shown.ends_with(['.', '?', '!'])
+        && shown
+            .split(". ")
+            .all(|sentence| sentence.starts_with(|first: char| first.is_uppercase()))
+}
+
+#[test]
+fn every_reason_the_writer_gives_is_a_complete_sentence() {
+    let mut reasons = vec![
+        WRITER_CLOSED.to_owned(),
+        WRITER_FAILED.to_owned(),
+        save_refusal(None),
+    ];
+    let categories = [
+        SaveFailureCategory::Busy,
+        SaveFailureCategory::ReadOnly,
+        SaveFailureCategory::DiskFull,
+        SaveFailureCategory::PermissionDenied,
+        SaveFailureCategory::StorageUnavailable,
+        SaveFailureCategory::Corrupt,
+        SaveFailureCategory::Conflict,
+        SaveFailureCategory::Serialization,
+        SaveFailureCategory::InvalidData,
+        SaveFailureCategory::Io,
+        SaveFailureCategory::Database,
+    ];
+    for category in categories {
+        reasons.push(save_refusal(Some(category)));
+        reasons.push(window_state_refusal(
+            category,
+            &[QuarantinedWrite {
+                subject: WriteSubject::Pane {
+                    card: CardId::new(),
+                },
+                category,
+                check: crate::diagnostics::Check::new("a fixture rule"),
+                refused_at_unix_ms: 0,
+                held_back: 0,
+            }],
+        ));
+    }
+
+    // The two the runtime gives without reaching the writer, as a draft's
+    // save barrier receives them.
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let (mut closed, _) = SessionRuntime::open(&path, BootId::new("boot-closed")).unwrap();
+    closed.shutdown();
+    let Err(PaneSaveRefusal::Unsaved(reason)) = closed.request_pane_flush(CardId::new()) else {
+        panic!("a closed writer accepts no barrier");
+    };
+    assert_eq!(reason, WRITER_CLOSED);
+    reasons.push(reason);
+    let failed_path = directory.path().join("failed.sqlite3");
+    let (failed, _) = SessionRuntime::open(&failed_path, BootId::new("boot-failed")).unwrap();
+    failed.poison_queue_for_test();
+    let Err(PaneSaveRefusal::Unsaved(reason)) = failed.request_pane_flush(CardId::new()) else {
+        panic!("a lost queue accepts no barrier");
+    };
+    assert_eq!(reason, WRITER_FAILED);
+    reasons.push(reason);
+
+    for reason in reasons {
+        assert!(reads_as_sentences(&reason), "{reason:?}");
+    }
+}
