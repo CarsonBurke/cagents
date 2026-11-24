@@ -664,7 +664,7 @@ fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure
             })
         }
     }
-    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
         followed: false,
