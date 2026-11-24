@@ -1470,24 +1470,71 @@ const PROTOCOL_REFUSALS: [(&str, &str); 2] = [
 /// release and lead their record with the refusal. Every other failure,
 /// including windows that did not reopen, an installer that failed, or a
 /// helper that exited early, opens with its own cause and stands.
+///
+/// Those workers append any later failure to the record after a space, so
+/// beyond the refusal only the reports they write are allowed: a line they
+/// did not write is a failure of its own, and the record stands.
 #[cfg(any(feature = "ui", feature = "host", test))]
-fn protocol_refusal_reports(job: &UpdateJob) -> Option<&str> {
+fn protocol_refusal_reports(job: &UpdateJob) -> Option<String> {
     if job.recorded_by.is_some() {
         return None;
     }
-    PROTOCOL_REFUSALS.iter().find_map(|(opening, closing)| {
-        let rest = job.message.strip_prefix(opening)?;
-        let (_, reports) = rest.split_once(closing)?;
-        // A worker that restarted the service adds that it was verified;
-        // completion says so already.
-        Some(
-            reports
-                .strip_prefix(
-                    " The terminal service is ready and its original terminal inventory was verified.",
-                )
-                .unwrap_or(reports),
-        )
-    })
+    let reports = PROTOCOL_REFUSALS.iter().find_map(|(opening, closing)| {
+        job.message
+            .strip_prefix(opening)?
+            .split_once(closing)
+            .map(|(_, reports)| reports)
+    })?;
+    let mut lines = reports.split('\n');
+    // The refusal's own line ends with it, or with the verified service
+    // when the worker restarted it and had no reports to write first.
+    if !matches!(lines.next(), Some("" | SERVICE_VERIFIED)) {
+        return None;
+    }
+    for line in lines {
+        // The worker lists what still runs last; those lines name processes.
+        if line == "Still running, not attached:"
+            || line == "Still running; attachment could not be checked:"
+        {
+            break;
+        }
+        if !(line.is_empty()
+            || line.starts_with("  ")
+            || line == SERVICE_VERIFIED
+            || REPORT_LINES.contains(&line)
+            || stopped_background_tasks(line))
+        {
+            return None;
+        }
+    }
+    // Completion says the service was verified already.
+    Some(reports.replacen(SERVICE_VERIFIED, "", 1))
+}
+
+/// What e8bbb84f2 and 0.2.3 workers add once they restarted and verified
+/// the target's service.
+#[cfg(any(feature = "ui", feature = "host", test))]
+const SERVICE_VERIFIED: &str =
+    " The terminal service is ready and its original terminal inventory was verified.";
+
+/// The unindented lines of the reports e8bbb84f2 and 0.2.3 workers append to
+/// a failure, other than the stopped background tasks; their items are
+/// indented.
+#[cfg(any(feature = "ui", feature = "host", test))]
+const REPORT_LINES: [&str; 5] = [
+    "The terminal service accepted the stop.",
+    "Ended or stopped:",
+    "Current turns interrupted:",
+    "Interruption was not confirmed:",
+    "Paused after update recovery:",
+];
+
+#[cfg(any(feature = "ui", feature = "host", test))]
+fn stopped_background_tasks(line: &str) -> bool {
+    line == "1 background task stopped; it does not resume automatically."
+        || line
+            .strip_suffix(" background tasks stopped; they do not resume automatically.")
+            .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(any(feature = "ui", feature = "host", test))]
@@ -1556,6 +1603,14 @@ const FINISHING_WORKER_PATIENCE: Duration = Duration::from_secs(3 * 60);
 /// window opened in between can read either the earlier receipt or the
 /// placeholder. Only the receipt left by a worker that no longer holds the
 /// lease decides; a worker past the bounds above leaves its failure shown.
+///
+/// A worker killed right after recording the failure, or one whose last
+/// verification failed before it saved the placeholder, reads the same as
+/// one that finished. If it left the placeholder, nothing proved the service.
+/// If it left a usable receipt, its verifier proved this build's daemon and
+/// lease owner, which the caller matches to the live daemon, so the update
+/// did install and serve; only its window reopening and session reports are
+/// missing, and those were never written.
 #[cfg(any(feature = "ui", test))]
 fn judge_target_failure(evidence: &TargetEvidence, now: std::time::SystemTime) -> TargetFailure {
     // A timestamp in the future means the clock moved; stop waiting.
@@ -1612,9 +1667,7 @@ fn finishing_presentation(mut job: UpdateJob) -> UpdateJob {
 fn completed_presentation(mut job: UpdateJob) -> UpdateJob {
     // Keep what the worker reported about sessions it ended, paused or left
     // running; the success notice shows it as details.
-    let reports = protocol_refusal_reports(&job)
-        .unwrap_or_default()
-        .to_owned();
+    let reports = protocol_refusal_reports(&job).unwrap_or_default();
     job.phase = UpdatePhase::Complete;
     job.message = format!(
         "Update installed; cagents {} verified its terminal service{reports}",
@@ -6676,7 +6729,17 @@ mod reconciliation_tests {
         );
     }
 
-    const CONNECTION_REFUSAL: &str = "could not configure the daemon connection: The running cagents service uses protocol 202; live updates support only protocol 198 and protocol 198. Run the downloaded release's `sh /home/user/Downloads/cagents/install.sh` without --restart-daemon, then reopen cagents.";
+    /// The connection refusal 0.2.3 records, as it formats it.
+    const CONNECTION_REFUSAL: &str = "could not configure the daemon connection: The running cagents service uses protocol 202; live updates support only protocol 196 (0.2.2) and protocol 198. This source check did not request preparation or shutdown, or create an update checkpoint. Choose a newer release for the cold install. To cold-install safely: save your work, finish or close every hosted session, and quit every cagents window. Using the running build's matching CLI, run `cagents --no-start daemon stop --require-empty` (it refuses while sessions remain), then verify `cagents --no-start daemon status` reports stopped. Run the downloaded release's `sh /path/to/install.sh` without --restart-daemon, then reopen cagents.";
+
+    const HANDSHAKE_REFUSAL: &str =
+        "The confirmed successor does not serve this update's matched protocol";
+
+    /// What 0.2.3 appends to a recorded failure, in its order: the recovery
+    /// and prepared reports, the verified service once it restarted it, then
+    /// the paused report and what still runs.
+    const RECORD_REPORTS: &str = "\nThe terminal service accepted the stop.\n2 background tasks stopped; they do not resume automatically.\nEnded or stopped:\n  build: ended with the update\n\nCurrent turns interrupted:\n  review: current turn interrupted; resume it from its tab\n1 background task stopped; it does not resume automatically.\n\nInterruption was not confirmed:\n  notes: check its current turn in the running daemon\n";
+    const WORKER_REPORTS: &str = "\nPaused after update recovery:\n  review: open its tab to continue\n\nStill running, not attached:\nnpm run dev (pid 4242)\nStill running; attachment could not be checked:\ncargo watch: rebuilding";
 
     fn failed_with(message: &str) -> UpdateJob {
         UpdateJob {
@@ -6694,12 +6757,13 @@ mod reconciliation_tests {
 
     #[test]
     fn only_a_protocol_checking_workers_failure_is_reconciled() {
-        for refusal in [
-            "The confirmed successor does not serve this update's matched protocol",
-            CONNECTION_REFUSAL,
-        ] {
+        for refusal in [HANDSHAKE_REFUSAL, CONNECTION_REFUSAL] {
             let mut job = failed_with(refusal);
-            assert_eq!(protocol_refusal_reports(&job), Some(""), "{refusal}");
+            assert_eq!(
+                protocol_refusal_reports(&job).as_deref(),
+                Some(""),
+                "{refusal}"
+            );
             job.recorded_by = Some("0.2.4".into());
             assert!(!protocol_check_could_have_failed_it(&job), "{refusal}");
         }
@@ -6720,6 +6784,25 @@ mod reconciliation_tests {
                 "{message}"
             );
         }
+        // 0.2.3 appends a later failure to the refusal after a space; it
+        // stands, wherever among the reports it lands.
+        let could_not_record = " The daemon is Ready and its original inventory was verified, but the update could not record recovery: No space left on device (os error 28). Run `cagents --no-start daemon status` and `cagents --no-start terminal list`; repair the update-state directory permissions or free disk space before retrying.";
+        let start_failed = " The daemon is Ready and its original inventory was verified, but its startup command reported failure: exit status: 1. Run `cagents --no-start daemon status` and inspect the update log before retrying.";
+        for refusal in [HANDSHAKE_REFUSAL, CONNECTION_REFUSAL] {
+            for message in [
+                format!("{refusal}{start_failed}"),
+                format!("{refusal}{RECORD_REPORTS}{start_failed}"),
+                format!("{refusal}{RECORD_REPORTS}{SERVICE_VERIFIED}{could_not_record}"),
+                format!("{refusal}{SERVICE_VERIFIED}{could_not_record}{WORKER_REPORTS}"),
+                format!("{refusal}: protocol 202"),
+                format!("{refusal}\nThe update stopped."),
+            ] {
+                assert!(
+                    !protocol_check_could_have_failed_it(&failed_with(&message)),
+                    "{message}"
+                );
+            }
+        }
         // What 0.2.3 workers record is read without the field.
         let recorded: UpdateJob = serde_json::from_value(serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(), "version": "0.2.4", "phase": "Failed", "message": "",
@@ -6734,22 +6817,34 @@ mod reconciliation_tests {
     #[cfg(any(feature = "ui", feature = "host"))]
     #[test]
     fn a_settled_update_keeps_the_workers_reports() {
-        let reports =
-            "\nEnded or stopped:\n- build (exited)\nStill running, not attached:\n- tests";
-        for refusal in [
-            "The confirmed successor does not serve this update's matched protocol".to_owned(),
-            format!(
-                "{CONNECTION_REFUSAL} The terminal service is ready and its original terminal inventory was verified."
-            ),
+        for (refusal, verified) in [
+            (HANDSHAKE_REFUSAL, ""),
+            (CONNECTION_REFUSAL, SERVICE_VERIFIED),
         ] {
-            let job = failed_with(&format!("{refusal}{reports}"));
-            assert_eq!(protocol_refusal_reports(&job), Some(reports));
-            let completed = completed_presentation(job);
-            assert_eq!(completed.phase, UpdatePhase::Complete);
-            assert_eq!(
-                completed.message,
-                format!("Update installed; cagents 0.2.4 verified its terminal service{reports}")
-            );
+            for (record, kept) in [
+                (
+                    format!("{refusal}{RECORD_REPORTS}{verified}{WORKER_REPORTS}"),
+                    format!("{RECORD_REPORTS}{WORKER_REPORTS}"),
+                ),
+                (format!("{refusal}{verified}"), String::new()),
+                (
+                    format!("{refusal}{verified}{WORKER_REPORTS}"),
+                    WORKER_REPORTS.to_owned(),
+                ),
+            ] {
+                let job = failed_with(&record);
+                assert_eq!(
+                    protocol_refusal_reports(&job).as_ref(),
+                    Some(&kept),
+                    "{record}"
+                );
+                let completed = completed_presentation(job);
+                assert_eq!(completed.phase, UpdatePhase::Complete);
+                assert_eq!(
+                    completed.message,
+                    format!("Update installed; cagents 0.2.4 verified its terminal service{kept}")
+                );
+            }
         }
     }
 
@@ -6889,11 +6984,32 @@ mod reconciliation_tests {
             assert_eq!(shown.message, job.message);
             assert_eq!(state.recorded().phase, UpdatePhase::Failed);
 
-            // A worker still holding the lease records its own verdict.
+            // A worker still holding the lease records its own verdict; a
+            // window judged before it took the lease keeps asking.
             let worker = acquire_lock(&state.path).unwrap();
             assert!(!settle_as_completed(&state.path, &job, &proof).unwrap());
+            let completed = || {
+                Ok(Reconciled::Completed {
+                    proof: proof.clone(),
+                    state: state.path.clone(),
+                })
+            };
+            let shown = present_for_ui(job.clone(), |_| completed()).unwrap();
+            assert!(!shown.phase.is_terminal(), "{shown:?}");
             assert_eq!(state.recorded().phase, UpdatePhase::Failed);
             drop(worker);
+
+            // A settlement that cannot be recorded is not shown.
+            let gone = state.path.join("gone");
+            let shown = present_for_ui(job.clone(), |_| {
+                Ok(Reconciled::Completed {
+                    proof: proof.clone(),
+                    state: gone.clone(),
+                })
+            })
+            .unwrap();
+            assert_eq!(shown.phase, UpdatePhase::Failed);
+            assert_eq!(shown.message, job.message);
 
             // A receipt that changed since the judgement proves nothing.
             state.receipt("pending.json");
