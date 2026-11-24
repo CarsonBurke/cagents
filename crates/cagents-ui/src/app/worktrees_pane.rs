@@ -156,13 +156,13 @@ impl Cagents {
                 continue;
             };
             let folder;
-            let rows = match index.resolve(directory) {
-                Some(root) => index.rows(root),
-                None => match index.folder_row(directory) {
-                    Some(row) => {
-                        folder = [row];
-                        &folder[..]
-                    }
+            let rows = match index.folder_row(directory) {
+                Some(row) => {
+                    folder = [row];
+                    &folder[..]
+                }
+                None => match index.resolve(directory) {
+                    Some(root) => index.rows(root),
                     None => continue,
                 },
             };
@@ -353,13 +353,19 @@ mod tests {
             if let CardKind::Terminal(session) = &mut app.card_state_mut(shell).unwrap().kind {
                 session.launch.working_directory = directory.into();
             }
+            // As a pane started there would be: its owner is matched once.
+            app.worktree_owners.remove(&shell);
             drop(app.project_workspace(false));
         };
         drop(app.open_worktrees());
 
         work_in(&mut app, "/notes/drafts");
         let agents = app.worktrees_ui.agents();
-        assert_eq!(agents[&root][0].card, shell, "{agents:?}");
+        assert_eq!(
+            agents.get(&root).map(|listed| listed[0].card),
+            Some(shell),
+            "{agents:?}"
+        );
         assert!(!agents.contains_key(&(nested, nested_main)));
         assert_eq!(app.worktrees_ui.current([shell]), Some(root));
 
