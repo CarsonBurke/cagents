@@ -24,6 +24,10 @@ data class ConversationRoute(val session: String) : NavKey
 @Serializable
 data object SettingsRoute : NavKey
 
+/** Pairing with a computer: scanning its code, or confirming [link], one another app opened. */
+@Serializable
+data class PairingRoute(val link: String? = null) : NavKey
+
 @Composable
 fun CagentsApp(vm: MainViewModel = viewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
@@ -33,6 +37,16 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
 
     LaunchedEffect(vm) {
         vm.messages.collect { snackbar.showSnackbar(it) }
+    }
+
+    val pairingLink by vm.pairingLink.collectAsStateWithLifecycle()
+    LaunchedEffect(pairingLink) {
+        val link = pairingLink ?: return@LaunchedEffect
+        vm.openPairingLink(null)
+        // One pairing at a time: a newer link replaces a pairing screen already open.
+        backStack.removeAll { it is PairingRoute }
+        if (backStack.isEmpty()) backStack.add(SettingsRoute)
+        backStack.add(PairingRoute(link))
     }
 
     HostKeyDialogs(vm)
@@ -68,6 +82,7 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
                     snackbar = snackbar,
                     canGoBack = backStack.size > 1,
                     onBack = { backStack.removeAt(backStack.lastIndex) },
+                    onScan = { backStack.add(PairingRoute()) },
                     onConnected = {
                         // From first-run setup, saving leads on to the sessions.
                         if (backStack.size == 1) {
@@ -76,6 +91,24 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
                         } else {
                             backStack.removeAt(backStack.lastIndex)
                         }
+                    },
+                )
+            }
+            entry<PairingRoute> { route ->
+                PairingScreen(
+                    main = vm,
+                    link = route.link,
+                    onBack = { backStack.removeAt(backStack.lastIndex) },
+                    onPaired = {
+                        // Paired: on to the new computer's sessions, with nothing to go back to.
+                        backStack.add(SessionsRoute)
+                        while (backStack.size > 1) backStack.removeAt(0)
+                        vm.showManualSetup(false)
+                    },
+                    onManual = {
+                        vm.showManualSetup()
+                        backStack.removeAt(backStack.lastIndex)
+                        if (backStack.lastOrNull() != SettingsRoute) backStack.add(SettingsRoute)
                     },
                 )
             }

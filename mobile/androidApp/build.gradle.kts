@@ -86,6 +86,11 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.navigation3)
     implementation(libs.kotlinx.coroutines.android)
 
+    implementation(libs.camera.camera2)
+    implementation(libs.camera.lifecycle)
+    implementation(libs.camera.view)
+    implementation(libs.zxing.core)
+
     implementation(libs.sshj)
     implementation(libs.bouncycastle.prov)
     implementation(libs.bouncycastle.pkix)

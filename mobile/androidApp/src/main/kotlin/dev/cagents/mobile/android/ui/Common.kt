@@ -131,7 +131,7 @@ fun HostKeyDialogs(vm: MainViewModel) {
             AlertDialog(
                 onDismissRequest = { vm.dismissHostKey(failure.fingerprint) },
                 icon = { Icon(Icons.Outlined.Key, contentDescription = null) },
-                title = { Text("Trust ${settings.host}?") },
+                title = { Text("Trust ${failure.host.ifEmpty { settings.host }}?") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("This is the first connection to this computer. Check that its fingerprint matches before trusting it.")
@@ -151,7 +151,7 @@ fun HostKeyDialogs(vm: MainViewModel) {
             AlertDialog(
                 onDismissRequest = { vm.dismissHostKey(failure.fingerprint) },
                 icon = { Icon(Icons.Outlined.WarningAmber, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
-                title = { Text("${settings.host} changed its identity") },
+                title = { Text("${failure.host.ifEmpty { settings.host }} changed its identity") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Its host key differs from the one you trusted. If you didn't reinstall the computer or its SSH server, someone may be impersonating it.")

@@ -11,13 +11,14 @@ import java.security.PrivateKey
 import java.security.PublicKey
 
 /**
- * `ssh-ed25519` for sshj: signs with the [PhoneKey], wherever it lives, and
- * verifies the computer's host key signatures with BouncyCastle.
+ * `ssh-ed25519` for sshj: signs with a [SigningKey], such as the [PhoneKey]
+ * wherever it lives, and verifies the computer's host key signatures with
+ * BouncyCastle.
  */
-internal class PhoneKeySignature(private val key: PhoneKey) : Signature {
-    class Factory(private val key: PhoneKey) : net.schmizz.sshj.common.Factory.Named<Signature> {
+internal class Ed25519Signature(private val key: SigningKey) : Signature {
+    class Factory(private val key: SigningKey) : net.schmizz.sshj.common.Factory.Named<Signature> {
         override fun getName() = KeyType.ED25519.toString()
-        override fun create(): Signature = PhoneKeySignature(key)
+        override fun create(): Signature = Ed25519Signature(key)
     }
 
     private companion object {

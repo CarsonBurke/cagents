@@ -24,14 +24,42 @@ Terminal sessions are listed but can't be opened; the API follows native chats.
 
 ## Connect a computer
 
-The computer needs cagents 0.2.3 or later and an SSH server the phone can
-reach.
+The computer needs cagents with phone pairing (the phone icon in its status
+bar) and an SSH server the phone can reach, running OpenSSH 8.7 or later.
 
 1. Install the app and open it. It makes its own Ed25519 key. Where the phone
    supports it (Android 13 and later), the private key stays in the Android
    Keystore's secure hardware. Elsewhere it is encrypted with a Keystore key.
-2. Enter the computer's address, SSH port and user.
-3. Copy the `authorized_keys` line the app shows, or share it to the computer,
+2. On the computer, click the phone icon in the status bar, then **Pair a
+   phone**. It shows a pairing code.
+3. In the app, tap **Scan pairing code** and point the camera at the code.
+   The app asks for the camera then, and uses it only on that screen.
+4. The computer asks whether to allow the phone, showing the phone's key
+   fingerprint, which the app shows too. Check that they match and click
+   **Allow**.
+
+The app then connects to the computer and shows its sessions. The code gave
+it the computer's addresses, SSH port and user, and its host key, which the
+app trusts at each address instead of asking on first connection. The
+computer authorized the phone's key for the bridge alone, with `command=` and
+`restrict`. A code lasts five minutes and works once; a photo of it pairs
+nothing without **Allow** on the computer.
+
+The app tries the addresses in the code's order, Tailscale first, giving
+each a moment before trying the next as well, so it reaches the computer
+from home or away.
+
+If the system camera app reads the code, it can open it in cagents, which
+asks before pairing. **Paste a pairing code** takes one copied as text.
+
+### Set up by hand
+
+Without pairing, or for a computer whose cagents can't pair yet, tap **Set up
+by hand instead**:
+
+1. Enter the computer's address, SSH port and user. Several addresses,
+   separated by commas, are tried in order.
+2. Copy the `authorized_keys` line the app shows, or share it to the computer,
    and append it to `~/.ssh/authorized_keys` there:
 
    ```text
@@ -40,7 +68,7 @@ reach.
 
    The command must be the absolute path of the installed `cagents`. With
    `command=` and `restrict`, the key can run the bridge and nothing else.
-4. Tap **Connect**. On first connection the app shows the computer's host key
+3. Tap **Connect**. On first connection the app shows the computer's host key
    fingerprint. Compare it with
    `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the computer before
    trusting it. A later change of key is refused until you forget the old one

@@ -4,12 +4,15 @@ import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
+import android.os.Build
+import android.provider.Settings as AndroidSettings
 import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import dev.cagents.mobile.android.data.SettingsStore
 import dev.cagents.mobile.android.ssh.HostKeyStore
+import dev.cagents.mobile.android.ssh.Pairing
 import dev.cagents.mobile.android.ssh.PhoneKey
 import dev.cagents.mobile.android.ssh.SshBridgeTransport
 import dev.cagents.mobile.client.ControllerConfig
@@ -60,6 +63,18 @@ class AppGraph(private val app: Application) {
         ),
         config = ControllerConfig(clientVersion = BuildConfig.VERSION_NAME),
     )
+    val pairing = Pairing(
+        phoneKey = { PhoneKey.get(app) },
+        deviceName = ::deviceName,
+        settings = settings,
+        hostKeys = hostKeys,
+    )
+
+    /** What the computer will call this phone: the name it was given in system settings, or its model. */
+    private fun deviceName(): String =
+        AndroidSettings.Global.getString(app.contentResolver, AndroidSettings.Global.DEVICE_NAME)
+            ?.takeIf { it.isNotBlank() }
+            ?: Build.MODEL
 
     init {
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
