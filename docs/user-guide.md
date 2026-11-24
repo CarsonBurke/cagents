@@ -68,8 +68,8 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   readable branch basename; tooltips and search keep the full branch name.
   Rows show matching pull requests and their CI status. Unread updates stay
   emphasized until acknowledged. **Waiting for input** stays visible until the
-  agent resumes or finishes. The All, Attention, and Pull requests views keep separate
-  scroll positions.
+  agent resumes or finishes. The All and Attention views keep separate scroll
+  positions.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
   after 300 milliseconds.
 - Deleting a worktree warns about uncommitted files and unsaved editor changes.
@@ -577,7 +577,9 @@ chats and terminals working in it; pressing one of those goes to it. Clicking a
 row opens the checkout. Its menu, also on right-click, starts a thread or
 terminal there, copies the branch or path, creates a worktree from the branch,
 opens or creates its pull request, opens the folder or an editor, and deletes the
-worktree after the usual checks. The project's own menu opens its folder,
+worktree after the usual checks. A GitHub project's heading has a pull request
+button that lists its open pull requests, including those with no worktree,
+to review or check out. The project's own menu opens its folder,
 editors and GitHub repository, and removes the project; the folder button
 beside the view switch adds one. The filter matches projects, branches, pull
 request titles and worktrees being created, listing rows that spell the query
