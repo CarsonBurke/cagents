@@ -66,10 +66,13 @@ class Wakeups:
     through the signal wakeup descriptor, and the receipt by inotify on its
     directory. The only timeout left is the admission deadline. Whatever is
     unavailable falls back to the former interval, never to sleeping on.
+    poll(), unlike select(), takes descriptors above FD_SETSIZE, which a
+    caller with many inherited descriptors leaves these with.
     """
 
     def __init__(self, receipt, ctypes, libc, os, signal):
-        self.os, self.select = os, __import__("select")
+        import select
+        self.os, self.select, self.poller = os, select, select.poll()
         self.descriptors = []
         self.polling = False
         reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -93,23 +96,29 @@ class Wakeups:
                     raise OSError(error, "cannot watch the receipt")
                 self.receipt_watch = watch
                 self.descriptors.append(watch)
-        except OSError:
+        except (AttributeError, OSError):
+            # AttributeError: a libc without inotify.
             self.polling = True
+        for descriptor in self.descriptors:
+            self.poller.register(descriptor, select.POLLIN)
 
     def watch_exit(self, pid):
         try:
-            self.descriptors.append(self.os.pidfd_open(pid))
+            pidfd = self.os.pidfd_open(pid)
         except (AttributeError, OSError):
             # SIGCHLD still wakes us, but a missed one must not hang the loop.
             self.polling = True
+        else:
+            self.poller.register(pidfd, self.select.POLLIN)
 
     def wait(self, deadline):
         timeout = POLL_SECONDS if self.polling else None
         if deadline is not None:
             remaining = max(0, deadline - time.monotonic_ns()) / 1e9
             timeout = remaining if timeout is None else min(timeout, remaining)
-        ready, _, _ = self.select.select(self.descriptors, [], [], timeout)
-        for descriptor in ready:
+        # poll() takes milliseconds; round up, so a deadline is not missed early.
+        milliseconds = None if timeout is None else int(timeout * 1000) + 1
+        for descriptor, _events in self.poller.poll(milliseconds):
             if descriptor == self.descriptors[0] or descriptor == self.receipt_watch:
                 try:
                     while self.os.read(descriptor, 4096):
