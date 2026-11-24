@@ -78,13 +78,12 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    released, and tag it here, for GitHub Actions to build
                    and sign once publish --actions pushes the tag.
   publish VERSION --actions [--yes] [--build-host HOST]
-                   Push the tag cut --actions made, which starts the release
-                   workflow (docs/releasing.md#signing-in-github-actions); it
-                   leaves the signed release as a draft. Run again once
-                   rehearse VERSION --from-draft has passed on HOST for that
-                   draft, it publishes the draft, then opens and lands the
-                   next version's pull request. --yes does each without
-                   asking you to type the version.
+                   Record the tagged commit's passing test verdict from HOST,
+                   then push the tag to start the release workflow. It leaves
+                   the signed release as a draft. Run again after rehearse
+                   VERSION --from-draft passes on HOST to publish the draft
+                   and land the next version's pull request. --yes skips
+                   typing the version (docs/releasing.md#signing-in-github-actions).
   publish VERSION  Verify the signed bundle, then push its tag and publish it
                    on GitHub, after you confirm by typing the version. Then
                    open and land the pull request that starts the next patch
@@ -835,15 +834,28 @@ HOST
     ((status == 0)) || fail "the rehearsal of $VERSION did not pass"
 }
 
-# Pushes the tag cut --actions made, which starts the release workflow: it
-# admits the tag only when the release before it trusts the Actions key, and
-# then builds and signs it and leaves it as a draft. Run again once that
-# draft's update has been rehearsed, it publishes the draft. Succeeds once
-# the release is published; until then it says what is next.
+# The hosted signing workflow checks the status reported from fw16's verdict.
+record_fw16_tests() {
+    local sha=$1 verdict
+    verdict=$(on_host "$sha" <<'HOST'
+set -euo pipefail
+cd ~/"$1"
+scripts/main-build-sentinel --repository "$PWD" --require-tests "$2" </dev/null >/dev/null
+cat "$HOME/.local/state/cagents-main-sentinel/verdicts/$2.json"
+HOST
+    ) || fail "no passing fw16 sentinel verdict for $sha; see the sentinel logs on $BUILD_HOST"
+    CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
+        "$ROOT_DIR/scripts/release-actions" record-tests "$sha" <<< "$verdict" \
+        || fail "the fw16 test status for $TAG could not be recorded"
+}
+
+# Records the admitted tag's test verdict before pushing it to start the
+# workflow. A later invocation publishes the rehearsed draft.
 publish_in_actions() {
-    local sha answer state admitted variables
-    sha=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
+    local tag_object sha answer state admitted variables pushed status=0
+    tag_object=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG") \
         || fail "tag $TAG does not exist here; make it with scripts/release cut --actions"
+    sha=$(repository_git rev-parse --verify "$tag_object^{commit}") || fail "$TAG does not tag a commit"
     state=$(release_state) || exit 1
     if [[ $state == published ]]; then
         printf '%s is published already.\n' "$TAG"
@@ -853,10 +865,18 @@ publish_in_actions() {
         publish_draft
         return
     fi
-    if [[ -n $(repository_git ls-remote --tags origin "refs/tags/$TAG") ]]; then
-        printf '%s is pushed and has no draft yet; the release workflow is building it, or failed:\n' "$TAG" >&2
-        printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY" >&2
-        return 1
+    pushed=$(repository_git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" \
+        | sort -k2 | tail -n1 | cut -f1) || fail "cannot determine whether $TAG is on origin"
+    if [[ -n $pushed ]]; then
+        [[ $pushed == "$sha" ]] || fail "$TAG on origin points at $pushed, while the local tag points at $sha"
+        CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
+            "$ROOT_DIR/scripts/release-actions" require-tests "$sha" || status=$?
+        if ((status == 0)); then
+            printf '%s is pushed and has no draft yet; the release workflow is building it, or failed:\n' "$TAG" >&2
+            printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY" >&2
+            return 1
+        fi
+        ((status == 3)) || fail "cannot verify the fw16 test status for $TAG on origin"
     fi
     # A pushed tag cannot be moved or deleted, so ask first what the
     # workflow's admission will: a refused tag would leave its version used.
@@ -864,7 +884,7 @@ publish_in_actions() {
     variables=$(gh variable list -R "$GITHUB_REPOSITORY" --json name,value) \
         || fail "cannot read the repository variables of $GITHUB_REPOSITORY"
     admitted=$(mktemp "${TMPDIR:-/tmp}/cagents-admit.XXXXXX")
-    if ! GITHUB_OUTPUT=$admitted CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
+    if ! GITHUB_OUTPUT=$admitted GITHUB_SHA=$sha CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
         RELEASE_SIGNING_PUBLIC_KEY=$(jq -r '.[] | select(.name == "RELEASE_SIGNING_PUBLIC_KEY") | .value' <<< "$variables") \
         RELEASE_TRUSTED_KEYS=$(jq -r '.[] | select(.name == "RELEASE_TRUSTED_KEYS") | .value' <<< "$variables") \
         "$ROOT_DIR/scripts/release-actions" admit "$TAG"; then
@@ -876,12 +896,18 @@ publish_in_actions() {
         fail "GitHub Actions would not sign $TAG, so nothing is pushed; cut and sign it here: scripts/release cut --commit $sha --key KEY"
     fi
     rm -f -- "$admitted"
-    if [[ $YES == false ]]; then
-        printf 'Pushing %s releases %s: GitHub Actions builds and signs it, and the tag cannot be moved.\n' "$TAG" "$VERSION"
+    if [[ -z $pushed && $YES == false ]]; then
+        printf 'Pushing %s starts the build for its signed release draft. The tag cannot be moved.\n' "$TAG"
         read -r -p "Type $VERSION to push it: " answer
         [[ $answer == "$VERSION" ]] || fail 'not pushed'
     fi
-    repository_git push --quiet origin "refs/tags/$TAG" || fail "cannot push $TAG to origin"
+    record_fw16_tests "$sha"
+    if [[ -n $pushed ]]; then
+        printf 'Recorded the passing fw16 verdict for %s. Rerun the failed Release workflow:\n' "$TAG"
+        printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY"
+        return 1
+    fi
+    repository_git push --quiet origin "$tag_object:refs/tags/$TAG" || fail "cannot push $TAG to origin"
     printf 'Pushed %s. The release workflow builds and signs it in a few hours, and leaves it as a draft:\n' "$TAG"
     printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY"
     printf 'Then rehearse its update, and publish it:\n  scripts/release rehearse %s --from-draft\n  scripts/release publish %s --actions\n' \
