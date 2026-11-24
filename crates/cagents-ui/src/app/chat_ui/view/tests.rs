@@ -1893,8 +1893,11 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     // newest work, so the strip keeps its glyph and the closing line
     // keeps its place empty.
     assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running.into()));
-    assert!(turn.summary.ends_with(" · working"));
-    assert_eq!(runtime.strip_status(turn), None);
+    assert!(!turn.summary.contains(" · working"));
+    assert_eq!(
+        runtime.strip_status(turn),
+        Some(disclosure::Status::Working)
+    );
     assert!(runtime.work_shown(None));
     assert_eq!(closing(&runtime), blank);
     assert_eq!(
@@ -1945,7 +1948,10 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     assert_eq!(runtime.turns.len(), 2);
     let (older, newer) = (&runtime.turns[0], &runtime.turns[1]);
     assert_eq!(older.glyph(), Some(chat::ToolStatus::Running.into()));
-    assert_eq!(runtime.strip_status(older), None);
+    assert_eq!(
+        runtime.strip_status(older),
+        Some(disclosure::Status::Working)
+    );
     assert_eq!(
         runtime.strip_status(newer),
         Some(chat::ToolStatus::Running.into())
@@ -1985,7 +1991,10 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     // spins for them and the background command's group keeps its glyph.
     Arc::make_mut(&mut runtime.snapshot).subagents = vec![native_child_fixture()];
     assert!(runtime.closing_spins());
-    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(disclosure::Status::Working)
+    );
     Arc::make_mut(&mut runtime.snapshot).subagents.clear();
 
     // A running coordination card states its run in words, so while the
@@ -5610,7 +5619,7 @@ fn drawing_and_regrouping_a_tool_row_do_not_read_its_input_again() {
     );
     let reads = || crate::app::chat_ui::tool_title::READS.with(std::cell::Cell::get);
     let before = reads();
-    let name = "Tried to write docs/large-report.md · Denied";
+    let name = "Tried to write docs/large-report.md · denied";
     for open in [false, true, false] {
         if open {
             runtime.expanded.edit().insert(item.id.clone());
@@ -5814,11 +5823,11 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
                 .iter()
                 .chain(accessible.children())
                 .collect();
+            // Then what its trailing mark says.
+            let named = format!("{name} · finished");
             assert!(
-                nodes
-                    .iter()
-                    .any(|node| node.node().role() == Role::Button
-                        && node.node().label() == Some(name)),
+                nodes.iter().any(|node| node.node().role() == Role::Button
+                    && node.node().label() == Some(named.as_str())),
                 "row action must name its exact target"
             );
             // RichText has no separate accessible leaf in this pinned
@@ -5826,7 +5835,7 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
             // target, while the preview cache preserves the drawn bytes.
             let row = nodes
                 .iter()
-                .find(|node| node.node().label() == Some(name))
+                .find(|node| node.node().label() == Some(named.as_str()))
                 .unwrap()
                 .id()
                 .clone();
@@ -8321,6 +8330,16 @@ fn an_agents_report_says_how_the_agent_stands_now() {
             Some("waiting on scripts/restart-check")
         );
         assert!(!waiting.failed);
+        // Beside its time, the mark of waiting on its own work, and what
+        // that is, after the name as every row's words are: lowercase.
+        assert_eq!(
+            waiting.mark,
+            Some(disclosure::Mark::WaitingOnBackgroundWork)
+        );
+        assert_eq!(
+            waiting.detail.as_deref(),
+            Some("waiting on scripts/restart-check")
+        );
         // Its tooltip and accessible name keep what the report said.
         assert_eq!(
             waiting.heading,
@@ -8337,12 +8356,15 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     assert_eq!(failed.outcome.as_deref(), Some("failed"));
     assert!(failed.failed);
     assert_eq!(failed.glyph, Icon::Error);
+    // Marked once, at the leading edge.
+    assert_eq!((failed.mark, failed.detail.as_deref()), (None, None));
     // Run again and finished, its earlier failure no longer reads as its state.
     set(&mut runtime, chat::ToolStatus::Succeeded);
     let finished = read(&runtime, chat::DeliveryKind::Report, "a-review");
     assert_eq!(finished.outcome.as_deref(), Some("finished"));
     assert!(!finished.failed);
     assert_eq!(finished.glyph, Icon::Chat);
+    assert_eq!(finished.mark, Some(disclosure::Mark::Finished));
     // A report agreeing with how the agent stands says it once.
     assert_eq!(
         finished.heading,
@@ -8379,8 +8401,10 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     );
     assert_eq!(stopped.outcome.as_deref(), Some("stopped"));
     assert_eq!(stopped.heading, "Agent \"Review restart safety\" stopped");
-    // Marked as its row and tab mark a stopped agent.
-    assert_eq!(stopped.glyph, Icon::Ended);
+    // A report keeps its kind's glyph, and marks the stop beside its time,
+    // where every row marks how its work stands.
+    assert_eq!(stopped.glyph, Icon::Attention);
+    assert_eq!(stopped.mark, Some(disclosure::Mark::Stopped));
     // Resumed after it was stopped, the notice keeps its own words.
     Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Running;
     runtime.agent_work.observe(&runtime.snapshot.subagents);
@@ -8439,6 +8463,42 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     );
     assert_eq!(notice.outcome.as_deref(), Some("failed (exit 1)"));
     assert!(notice.failed);
+    // Its failure is the leading glyph's to mark; its exit status stays.
+    assert_eq!(
+        (notice.mark, notice.detail.as_deref()),
+        (None, Some("exit 1"))
+    );
+}
+
+/// An agent's time runs from its first step to its last, and to now while
+/// it works or waits on its own work; one without times has none.
+#[test]
+fn an_agents_time_counts_while_it_works_and_stops_when_it_ends() {
+    let step = |started_at, at| {
+        Arc::new(chat::Item {
+            id: format!("step-{at:?}"),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "work".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at,
+            at,
+        })
+    };
+    let mut agent = native_child_fixture();
+    agent.items = vec![step(Some(1_000), Some(2_000)), step(None, Some(65_000))];
+    agent.status = chat::ToolStatus::Succeeded;
+    assert_eq!(agent_elapsed_ms(&agent, Some(900_000)), Some(64_000));
+    for live in [chat::ToolStatus::Running, chat::ToolStatus::Waiting] {
+        agent.status = live;
+        assert_eq!(agent_elapsed_ms(&agent, Some(91_000)), Some(90_000));
+        assert_eq!(agent_elapsed_ms(&agent, None), None);
+    }
+    agent.items = vec![step(None, None)];
+    agent.status = chat::ToolStatus::Succeeded;
+    assert_eq!(agent_elapsed_ms(&agent, Some(91_000)), None);
 }
 
 /// A drawn report is redrawn when its agent's state, or what it waits on,
@@ -9552,7 +9612,7 @@ fn reasoning_rows_use_the_selected_subagents_completion_and_duration() {
     };
     assert_eq!(
         label(&runtime),
-        "Reasoning: Latest line",
+        "Reasoning: Latest line · working",
         "parent activity cannot finish a child thought"
     );
     Arc::make_mut(&mut runtime.snapshot).subagents[0]
@@ -9767,7 +9827,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
             .iter()
             .chain(accessible.children())
             .any(|node| node.node().role() == Role::Button
-                && node.node().label() == Some("Reasoning: Latest line"))
+                && node.node().label() == Some("Reasoning: Latest line · working"))
     );
 }
 
@@ -10008,7 +10068,10 @@ fn a_kept_strip_stops_spinning_when_a_message_follows_its_step() {
             2_000,
         )));
     });
-    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(disclosure::Status::Working)
+    );
     let after = row_fingerprints(&runtime, 0);
     assert_eq!(after[0], before[0], "the prompt keeps its row");
     assert_ne!(strip(&after), strip(&before), "the strip is drawn again");
@@ -13309,20 +13372,13 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             }
         }
         let outcomes = |word: &str| probe.texts.iter().filter(|(text, _)| text == word).count();
-        if scenario.starts_with("agents reporting") {
-            assert_eq!(
-                outcomes("finished"),
-                if narrow { 0 } else { 2 },
-                "{scenario}: the reports' outcome"
-            );
-        }
-        if narrow {
-            assert_eq!(
-                outcomes("Finished"),
-                0,
-                "{scenario}: the started agents' state"
-            );
-        }
+        // A report's outcome, and a started agent's state, are marked
+        // beside the time rather than said, however wide the pane.
+        assert_eq!(
+            outcomes("finished") + outcomes("Finished"),
+            0,
+            "{scenario}: the outcome is a mark"
+        );
         let tops: Vec<f32> = rows.iter().map(|(_, bounds)| bounds.y).collect();
         for pair in tops.windows(2) {
             pitches.push((scenario, pair[1] - pair[0]));
@@ -13599,7 +13655,8 @@ fn a_run_of_messages_opens_over_the_message_the_reader_opened() {
     let texts = turn_texts(runtime);
     assert_eq!(
         texts[..4],
-        ["Messaged", "2 agents", "Main is green again.", "Delivered"],
+        // How they stand reads on from the row's words, muted.
+        ["Messaged", "2 agents", "Main is green again.", "delivered"],
         "{texts:?}"
     );
     let first = texts.iter().position(|text| text == "docs-review");
@@ -13649,12 +13706,15 @@ fn a_lone_coordinating_step_still_running_says_so() {
     runtime.refresh();
     preparation::drain_fixture(&mut runtime);
     assert!(runtime.cache["toolu_sessions"].coordination.is_some());
-    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(disclosure::Status::Working)
+    );
     let texts = turn_texts(&runtime);
     assert!(
         texts
             .iter()
-            .any(|text| text.contains("live sessions · working")),
+            .any(|text| text.contains("live sessions") && !text.contains("· working")),
         "{texts:?}"
     );
 }

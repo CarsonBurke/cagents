@@ -10511,9 +10511,13 @@ impl Cagents {
         }) {
             subscriptions.push(preparation::availability());
         }
+        // A turn's time counts while it runs, and an agent's while it works
+        // or waits on its own work after the turn that started it ended.
         if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime)
-            if runtime.snapshot.busy && runtime.visible.load(Ordering::Relaxed))
+            if runtime.visible.load(Ordering::Relaxed)
+                && (runtime.snapshot.busy
+                    || runtime.snapshot.subagents.iter().any(|agent| agent.status.is_live())))
         }) {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),

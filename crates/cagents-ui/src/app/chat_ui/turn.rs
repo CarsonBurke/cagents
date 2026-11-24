@@ -260,9 +260,10 @@ impl Turn {
     /// How the group stands, as the end of its summary line.
     pub(super) fn state_suffix(&self) -> Cow<'static, str> {
         // Still working outranks how the finished steps went, because a
-        // reader deciding whether to wait needs that first.
+        // reader deciding whether to wait needs that first. The row's mark
+        // says it, beside the counting time, so the words do not.
         if self.running {
-            return Cow::Borrowed(" · working");
+            return Cow::Borrowed("");
         }
         // Several steps say how many of them failed or were refused, after
         // the line that counted them: "Ran 3 commands · 1 failed", and
@@ -1528,7 +1529,7 @@ mod tests {
             "a live group reports that it is live; the step that failed says so on its own row"
         );
         assert_eq!(
-            turns[0].summary, "Ran 2 commands · working",
+            turns[0].summary, "Ran 2 commands",
             "still working outranks how the finished steps went"
         );
     }
@@ -2210,7 +2211,7 @@ mod tests {
             "the hidden thought is work still going on"
         );
         assert_eq!(turns[0].working_for(20_000), Some(19_000));
-        assert_eq!(turns[0].summary, "Ran 2 commands · working");
+        assert_eq!(turns[0].summary, "Ran 2 commands");
         // Once the agent stops, the group ends where its thinking did.
         let turns = group(&items, &unasked(), plain);
         assert!(!turns[0].running);
@@ -2231,7 +2232,7 @@ mod tests {
         let turns = group(&items, &unasked(), Working);
         assert!(turns[0].thinking);
         assert!(
-            turns[0].summary.ends_with(" · working"),
+            turns[0].running && !turns[0].summary.contains(" · "),
             "{}",
             turns[0].summary
         );
@@ -2718,10 +2719,7 @@ mod tests {
             },
         ];
         let turns = group(&items, &unasked(), plain);
-        assert_eq!(
-            turns[0].summary,
-            "Preparing an edit, ran a command · working"
-        );
+        assert_eq!(turns[0].summary, "Preparing an edit, ran a command");
     }
 
     /// A skill is told as read and context as added, not as tools used.

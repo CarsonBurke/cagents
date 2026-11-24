@@ -746,7 +746,10 @@ fn rollup(states: Vec<RowStatus>) -> RowStatus {
     let tone = counted.first().map_or(Tone::Plain, |(state, _)| state.tone);
     let live = counted.iter().any(|(state, _)| state.live);
     if let [(only, _)] = counted.as_slice() {
-        return RowStatus::with(only.text.clone(), tone, live);
+        return RowStatus {
+            detail: None,
+            ..only.clone()
+        };
     }
     let text = counted
         .iter()
@@ -792,22 +795,26 @@ fn message_state(
             detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
             ..RowStatus::error("Not sent")
         },
-        _ if answered => RowStatus::plain("Answered"),
+        _ if answered => RowStatus::plain("Answered").marked(disclosure::Mark::Finished),
         (_, Some(receipt)) => received(receipt.arrival),
         _ => match (reading.outcome.delivery, reading.outcome.run.as_ref()) {
             (Some(delivery), _) => RowStatus {
                 // "Delivered" says all "Sent" would.
                 detail: (!matches!(delivery, Delivery::Sent))
                     .then(|| delivered(delivery).to_owned()),
-                ..RowStatus::plain(match delivery {
-                    Delivery::Queued => "Queued",
-                    Delivery::Resumed => "Resumed",
-                    Delivery::Inbox | Delivery::Sent => "Delivered",
-                })
+                ..match delivery {
+                    Delivery::Queued => RowStatus::plain("Queued"),
+                    Delivery::Resumed => {
+                        RowStatus::plain("Resumed").marked(disclosure::Mark::Finished)
+                    }
+                    Delivery::Inbox | Delivery::Sent => {
+                        RowStatus::plain("Delivered").marked(disclosure::Mark::Finished)
+                    }
+                }
             },
             // A prompt to an agent starts a run of it.
             (None, Some(run)) => run_status(run),
-            (None, None) => RowStatus::plain("Delivered"),
+            (None, None) => RowStatus::plain("Delivered").marked(disclosure::Mark::Finished),
         },
     }
 }
@@ -840,7 +847,7 @@ fn received(arrival_of: Arrival) -> RowStatus {
             | Arrival::NoSlot => RowStatus::plain("Queued"),
             // A run that ended had the message all the same.
             Arrival::Inbox | Arrival::User | Arrival::Started | Arrival::Ended => {
-                RowStatus::plain("Delivered")
+                RowStatus::plain("Delivered").marked(disclosure::Mark::Finished)
             }
             Arrival::Unknown => RowStatus::warning("Not confirmed"),
         }
@@ -947,10 +954,6 @@ const LABEL_CHARS: usize = 32;
 /// where it runs short; this bounds only the text shaped for it.
 const ROW_NAME_CHARS: usize = 80;
 
-/// How much of its status a row shows, a caption naming what an agent waits
-/// on included, so that the status leaves room for the agent's name. An
-/// agent's caption is already held to it, so the row and tab say the same.
-const STATUS_CHARS: usize = super::view::AGENT_CAPTION_CHARS;
 /// The room a row keeps at its trailing edge for the open arrow: the glyph
 /// and the gap before it, as a step row keeps for its chevron, so statuses
 /// end in line with step durations.
@@ -1158,6 +1161,9 @@ struct Row {
     /// The whole of it, for the tooltip.
     full: String,
     state: RowStatus,
+    /// How long the work it started took, where that is not the step's own
+    /// time: an agent's, which runs on after the step that started it.
+    elapsed: Option<u64>,
     /// What opening the row does, where this conversation can open the agent.
     open: Option<Action>,
     /// Where it cannot, why: there is none, or there are several.
@@ -1236,6 +1242,12 @@ struct RowStatus {
     /// Still under way, which a still dot beside its caption marks.
     live: bool,
     detail: Option<String>,
+    /// The state's mark beside the row's time, where its tone and liveness
+    /// do not say it.
+    mark: Option<disclosure::Mark>,
+    /// Whether the mark says all the words would, so the row draws only
+    /// the mark; the words stay in the row's accessible name and tooltip.
+    quiet: bool,
 }
 
 impl RowStatus {
@@ -1245,6 +1257,44 @@ impl RowStatus {
             tone,
             live,
             detail: None,
+            mark: None,
+            quiet: false,
+        }
+    }
+    /// Marked beside the time, with its words still drawn.
+    fn marked(self, mark: disclosure::Mark) -> Self {
+        Self {
+            mark: Some(mark),
+            ..self
+        }
+    }
+    /// Told by its mark alone, or for a failure by the row's leading glyph.
+    fn quiet(self) -> Self {
+        Self {
+            quiet: true,
+            ..self
+        }
+    }
+    /// What the row's trailing column draws of this state, beside `elapsed`.
+    fn trailing(&self, elapsed: Option<String>) -> disclosure::Trailing {
+        use disclosure::Mark;
+        let mark = self.mark.or(match (self.tone, self.live) {
+            (Tone::Plain, true) => Some(Mark::Working),
+            (Tone::Warning, _) => Some(Mark::Attention),
+            _ => None,
+        });
+        // After the row's name, the words read on from it.
+        let detail = (!self.quiet && !self.text.is_empty()).then(|| {
+            let mut words = self.text.chars();
+            words
+                .next()
+                .map(|initial| initial.to_lowercase().chain(words).collect())
+                .unwrap_or_default()
+        });
+        disclosure::Trailing {
+            detail,
+            mark,
+            elapsed,
         }
     }
     fn plain(text: impl Into<Cow<'static, str>>) -> Self {
@@ -1281,10 +1331,14 @@ fn run_status(run: &Run) -> RowStatus {
         return RowStatus::plain("Launch accepted");
     };
     let mut status = match state {
-        State::Failed | State::Interrupted => RowStatus::error(state_phrase(state)),
+        State::Failed => RowStatus::error(state_phrase(state)).quiet(),
+        State::Interrupted => RowStatus::error(state_phrase(state)),
         State::Cancelled => RowStatus::warning(state_phrase(state)),
-        State::Accepted | State::Running | State::Waiting => RowStatus::live(state_phrase(state)),
-        State::Succeeded => RowStatus::plain(state_phrase(state)),
+        State::Running => RowStatus::live(state_phrase(state)).quiet(),
+        State::Accepted | State::Waiting => RowStatus::live(state_phrase(state)),
+        State::Succeeded => RowStatus::plain(state_phrase(state))
+            .marked(disclosure::Mark::Finished)
+            .quiet(),
     };
     status.detail = run.timed_out.then(|| "The wait timed out".to_owned());
     status
@@ -1412,12 +1466,16 @@ fn row_words(
 }
 
 /// A row's glyph, its words and its status, on the step list's grid: the
-/// glyph in the error colour where it failed, and the status kept whole
-/// while the words fade, down to what of them must stay.
+/// glyph in the error colour where it failed, and after the words, as every
+/// transcript row has, the state's mark and the time, with any words the
+/// state still needs before them, muted, so they never outweigh the row's.
+/// The trailing column stays whole while the words fade, down to what of
+/// them must stay, and then keeps only its mark.
 fn row_content(
     glyph: Icon,
     (words, kept): (Element<'static, Message>, Element<'static, Message>),
     state: &RowStatus,
+    elapsed: Option<String>,
 ) -> Element<'static, Message> {
     let lead: Element<'static, Message> = if state.tone == Tone::Error {
         widget::icon(Icon::Error.handle())
@@ -1431,44 +1489,8 @@ fn row_content(
     } else {
         muted_glyph(glyph, design::LEADING_ICON_SIZE)
     };
-    // Work under way is marked by a still dot beside its caption; the
-    // transcript's one activity indicator says that something moves.
-    let live = state.live && matches!(state.tone, Tone::Plain);
-    let mut status_cells = Vec::new();
-    if live {
-        status_cells.push(disclosure::state_dot(design::accent_color));
-    }
-    // A caption naming what an agent waits on is held to the bound its
-    // tab's caption is, so the row says what the tab says.
-    let status = crate::ui_controls::FadeText::transcript(state.text.clone()).limit(STATUS_CHARS);
-    let status = match state.tone {
-        Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
-        Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
-        Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
-    };
-    if !state.text.is_empty() {
-        status_cells.push(status.into());
-    }
-    // Where the agent's name and its state no longer both fit, the state
-    // keeps only its mark: the dot of work under way, or one in the
-    // warning colour. A failure keeps the row's leading glyph in the
-    // error colour, and a settled state is told by the absence of either.
-    // A warning's words stay in the row's tooltip, and every state's in
-    // its accessible name.
-    let compact = match state.tone {
-        Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
-        Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
-        Tone::Plain | Tone::Error => None,
-    };
-    let content = crate::ui_controls::yielding(
-        words,
-        kept,
-        widget::row::with_children(status_cells)
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center),
-        compact,
-        step::GAP_S,
-    );
+    let (column, compact) = state.trailing(elapsed).view();
+    let content = crate::ui_controls::yielding(words, kept, column, compact, step::GAP_S);
     widget::row::with_children(vec![lead, content])
         .spacing(step::GAP_S)
         .align_y(Alignment::Center)
@@ -1477,7 +1499,7 @@ fn row_content(
 }
 
 /// A tracked task's state is independent of the tool that launched it.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum BackgroundState<'a> {
     Working,
     Waiting,
@@ -1508,12 +1530,23 @@ impl BackgroundState<'_> {
 
     /// The row's status for this state: a live caption while the agent works,
     /// and a warning while it waits on the person.
+    ///
+    /// The mark says each state but what an agent waits on, which its words
+    /// name; a failure is the row's leading glyph's to mark.
     fn status(self) -> RowStatus {
+        use disclosure::Mark;
+        let caption = self.caption();
         match self {
-            Self::Working => RowStatus::live(self.caption()),
-            Self::Waiting => RowStatus::warning(self.caption()),
-            Self::Failed => RowStatus::error(self.caption()),
-            _ => RowStatus::plain(self.caption()),
+            Self::Working => RowStatus::live(caption).quiet(),
+            Self::Waiting => RowStatus::warning(caption).quiet(),
+            Self::Failed => RowStatus::error(caption).quiet(),
+            Self::OnBackgroundWork(work) => RowStatus {
+                quiet: work.is_none(),
+                ..RowStatus::plain(caption).marked(Mark::WaitingOnBackgroundWork)
+            },
+            Self::Stopped | Self::Ended => RowStatus::plain(caption).marked(Mark::Stopped).quiet(),
+            Self::Denied => RowStatus::plain(caption).marked(Mark::Denied).quiet(),
+            Self::Finished => RowStatus::plain(caption).marked(Mark::Finished).quiet(),
         }
     }
 }
@@ -1667,6 +1700,7 @@ impl Runtime {
             term: false,
             full: full.join("\n\n").trim().to_owned(),
             state,
+            elapsed: None,
             several: open.is_none() && listed.len() > 1,
             open,
             // Without the text inline, copying takes the raw call.
@@ -1810,9 +1844,11 @@ impl Runtime {
                 state.status()
             }
             None => match status {
-                ToolStatus::Running if spawn.waits => RowStatus::live("Working"),
+                ToolStatus::Running if spawn.waits => RowStatus::live("Working").quiet(),
                 ToolStatus::Running => RowStatus::live("Starting"),
-                ToolStatus::Stopped => RowStatus::plain("Stopped"),
+                ToolStatus::Stopped => RowStatus::plain("Stopped")
+                    .marked(disclosure::Mark::Stopped)
+                    .quiet(),
                 // The verb says it: the agent never started.
                 ToolStatus::Failed | ToolStatus::Denied if unstarted => RowStatus {
                     detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
@@ -1820,7 +1856,7 @@ impl Runtime {
                 },
                 ToolStatus::Failed | ToolStatus::Denied => RowStatus {
                     detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
-                    ..RowStatus::error("Failed")
+                    ..RowStatus::error("Failed").quiet()
                 },
                 // Completing the launch command does not complete the
                 // separate session: say how it stands, or only that it
@@ -1829,7 +1865,14 @@ impl Runtime {
                     Some(run) => run_status(run),
                     None => RowStatus::plain("Launch accepted"),
                 },
-                _ => run.map_or_else(|| RowStatus::plain("Finished"), run_status),
+                _ => run.map_or_else(
+                    || {
+                        RowStatus::plain("Finished")
+                            .marked(disclosure::Mark::Finished)
+                            .quiet()
+                    },
+                    run_status,
+                ),
             },
         };
         let open = if reading.cli {
@@ -1860,6 +1903,10 @@ impl Runtime {
             term,
             full: full.join("\n\n"),
             state,
+            // A background agent's time, not its launch's.
+            elapsed: listed
+                .filter(|_| !unstarted)
+                .and_then(|agent| view::agent_elapsed_ms(agent, self.source_now_ms())),
             several: open.is_none() && self.listed_subagents(coordinated).nth(1).is_some(),
             open,
             copy: if spawn
@@ -1884,7 +1931,11 @@ impl Runtime {
             row.preview.clone(),
             row.term,
         );
-        let content = row_content(row.glyph, words, &row.state);
+        let elapsed = row
+            .elapsed
+            .or_else(|| disclosure::item_duration_ms(item, self.source_now_ms()))
+            .map(disclosure::duration);
+        let content = row_content(row.glyph, words, &row.state, elapsed);
         let open_tool = self.item_expanded(&item.id);
         // The detail holds what was said and reported in full, then the
         // command or tool call that carried it.
@@ -1994,7 +2045,12 @@ impl Runtime {
             run.preview.clone(),
             false,
         );
-        let content = row_content(Icon::Send, words, &run.state);
+        // The messages' time together, as a strip of steps counts its own.
+        let elapsed = self
+            .source_now_ms()
+            .and_then(|now| turn.working_for(now))
+            .map(disclosure::duration);
+        let content = row_content(Icon::Send, words, &run.state, elapsed);
         let arrow = crate::ui_controls::passive_icon(
             if open {
                 Icon::ChevronDown
@@ -2511,6 +2567,16 @@ mod identity_tests {
             .push(running_command("soak", "scripts/soak").into());
         observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Waiting on 2 commands");
+        // Drawn muted after the agent's name, beside the mark of waiting on
+        // its own work, reading on from the name.
+        assert_eq!(
+            row(&runtime).state.trailing(None),
+            disclosure::Trailing {
+                detail: Some("waiting on 2 commands".into()),
+                mark: Some(disclosure::Mark::WaitingOnBackgroundWork),
+                elapsed: None,
+            }
+        );
         // A long command is cut once, where the tab cuts it, and the row's
         // bound leaves that cut whole.
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].items =
@@ -2518,16 +2584,26 @@ mod identity_tests {
         observe(&mut runtime);
         let long = row(&runtime).state.text;
         assert_eq!(long, "Waiting on scripts/restart-check-ev…");
-        assert_eq!(long.chars().count(), STATUS_CHARS);
+        assert_eq!(long.chars().count(), disclosure::STATUS_CHARS);
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
             .items
             .clear();
         observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Waiting on background work");
+        // Work it does not name is told by the mark alone.
+        assert_eq!(row(&runtime).state.trailing(None).detail, None);
         // Settled, it names no work.
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].status = ToolStatus::Succeeded;
         observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Finished");
+        assert_eq!(
+            row(&runtime).state.trailing(Some("4m 2s".into())),
+            disclosure::Trailing {
+                detail: None,
+                mark: Some(disclosure::Mark::Finished),
+                elapsed: Some("4m 2s".into()),
+            }
+        );
     }
 
     /// A row for several agents names what one waits on only when it is the
@@ -2656,6 +2732,8 @@ mod identity_tests {
             if worked {
                 assert_eq!(row.verb, "Started");
                 assert_eq!(row.state.text, "Failed");
+                // Its failure is marked once, by the row's leading glyph.
+                assert_eq!(row.state.trailing(None), disclosure::Trailing::default());
                 // The tooltip names the agent whole, then how it stands.
                 assert!(
                     tip.starts_with(&format!("Started {}\n\nFailed: {refusal}", row.label)),
@@ -3056,6 +3134,7 @@ mod identity_tests {
             term: false,
             full: "The repo is now at /srv/repos/t3code.".to_owned(),
             state,
+            elapsed: None,
             open,
             several: false,
             copy: "Copy message",

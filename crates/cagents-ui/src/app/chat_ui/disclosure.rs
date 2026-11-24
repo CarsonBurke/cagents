@@ -34,8 +34,7 @@ pub(super) fn item_duration_ms(item: &chat::Item, now: Option<u64>) -> Option<u6
     Some(end.saturating_sub(start))
 }
 
-/// What a row's leading glyph reports: how a step stands, or how a group's
-/// steps stand together.
+/// How a row's work stands, or how a group's steps stand together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Status {
     Tool(chat::ToolStatus),
@@ -44,6 +43,9 @@ pub(super) enum Status {
     /// hides one, but half filled rather than the full error mark, which
     /// stays for a group in which nothing worked.
     PartlyFailed,
+    /// Under way, where another row carries the transcript's one activity
+    /// indicator: a still mark rather than a second spinner.
+    Working,
 }
 
 impl From<chat::ToolStatus> for Status {
@@ -52,21 +54,171 @@ impl From<chat::ToolStatus> for Status {
     }
 }
 
+/// A row's leading glyph: what kind of work it is, or, where it failed, the
+/// failure, in the error colour. A failure is marked there and only there,
+/// so the eye finds every one down the row's leading edge.
 fn status_glyph(kind: Icon, status: Option<Status>) -> Icon {
-    let Some(status) = status else {
-        return kind;
-    };
     match status {
-        Status::PartlyFailed => Icon::PartlyFailed,
-        Status::Tool(chat::ToolStatus::Failed) => Icon::Error,
-        Status::Tool(chat::ToolStatus::Denied) => Icon::Unavailable,
-        // Work that was stopped, or that ended without saying how it went,
-        // has not failed. Its mark is a still one, unlike the Stop control.
-        Status::Tool(chat::ToolStatus::Stopped | chat::ToolStatus::Ended) => Icon::Ended,
-        Status::Tool(chat::ToolStatus::Waiting) => Icon::AgentBackground,
-        Status::Tool(chat::ToolStatus::Running | chat::ToolStatus::Succeeded) => kind,
+        Some(Status::PartlyFailed) => Icon::PartlyFailed,
+        Some(Status::Tool(chat::ToolStatus::Failed)) => Icon::Error,
+        _ => kind,
     }
 }
+
+fn failed(status: Option<Status>) -> bool {
+    matches!(
+        status,
+        Some(Status::Tool(chat::ToolStatus::Failed) | Status::PartlyFailed)
+    )
+}
+
+/// How a row's work stands, marked small in its trailing column, just
+/// before its time, so every row says it in the same place and at the
+/// same weight. A failure has no mark here: the leading glyph tells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Mark {
+    /// The transcript's one activity indicator.
+    Spinning,
+    /// Under way, without it: a still dot in the accent colour.
+    Working,
+    Finished,
+    /// Stopped, or ended without saying how it went. Neither has failed.
+    Stopped,
+    WaitingOnBackgroundWork,
+    Denied,
+    /// Waiting on the person: a still dot in the warning colour.
+    Attention,
+}
+
+impl Mark {
+    pub(super) fn of(status: Status) -> Option<Self> {
+        Some(match status {
+            Status::Tool(chat::ToolStatus::Running) => Self::Spinning,
+            Status::Working => Self::Working,
+            Status::Tool(chat::ToolStatus::Succeeded) => Self::Finished,
+            Status::Tool(chat::ToolStatus::Stopped | chat::ToolStatus::Ended) => Self::Stopped,
+            Status::Tool(chat::ToolStatus::Waiting) => Self::WaitingOnBackgroundWork,
+            Status::Tool(chat::ToolStatus::Denied) => Self::Denied,
+            Status::Tool(chat::ToolStatus::Failed) | Status::PartlyFailed => return None,
+        })
+    }
+
+    /// The mark in words, for the row's accessible name and tooltip.
+    pub(super) fn word(self) -> &'static str {
+        match self {
+            Self::Spinning | Self::Working => "working",
+            Self::Finished => "finished",
+            Self::Stopped => "stopped",
+            Self::WaitingOnBackgroundWork => "waiting on background work",
+            Self::Denied => "denied",
+            Self::Attention => "waiting",
+        }
+    }
+
+    /// The mark, named in words for assistive technology, where a row with
+    /// nothing to open has no accessible name of its own to carry them.
+    pub(super) fn view(self) -> Element<'static, Message> {
+        crate::ui_controls::labelled(self.glyph(), self.word())
+    }
+
+    fn glyph(self) -> Element<'static, Message> {
+        let size = design::COMPACT_ICON_SIZE;
+        let centred = |dot: Element<'static, Message>| {
+            widget::container(dot)
+                .width(Length::Fixed(f32::from(size)))
+                .height(Length::Fixed(f32::from(size)))
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        match self {
+            Self::Spinning => {
+                crate::ui_controls::activity_spinner(f32::from(size), design::muted_color)
+            }
+            Self::Working => centred(state_dot(design::accent_color)),
+            Self::Attention => centred(state_dot(design::warning_color)),
+            Self::Finished => crate::ui_controls::passive_icon(Icon::Check, size),
+            Self::Stopped => crate::ui_controls::passive_icon(Icon::Ended, size),
+            Self::WaitingOnBackgroundWork => {
+                crate::ui_controls::passive_icon(Icon::AgentBackground, size)
+            }
+            Self::Denied => crate::ui_controls::passive_icon(Icon::Unavailable, size),
+        }
+    }
+}
+
+/// A row's trailing column: any words its state still needs, such as what
+/// an agent waits on, then the state's mark, then how long the work took.
+/// All of it is a muted caption, so it never outweighs the row's own words.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Trailing {
+    pub(super) detail: Option<String>,
+    pub(super) mark: Option<Mark>,
+    pub(super) elapsed: Option<String>,
+}
+
+impl Trailing {
+    pub(super) fn is_empty(&self) -> bool {
+        self.detail.is_none() && self.mark.is_none() && self.elapsed.is_none()
+    }
+
+    /// What the column says, after the row's name: " · finished · 3m 2s".
+    pub(super) fn described(&self) -> String {
+        let mut words = String::new();
+        if let Some(detail) = &self.detail {
+            words.push_str(&format!(" · {detail}"));
+        } else if let Some(mark) = self.mark {
+            words.push_str(&format!(" · {}", mark.word()));
+        }
+        if let Some(elapsed) = &self.elapsed {
+            words.push_str(&format!(" · {elapsed}"));
+        }
+        words
+    }
+
+    /// The column, and what of it stays where the row's name needs the
+    /// room: its mark, but for a finish, without the words or the time.
+    pub(super) fn view(self) -> (Element<'static, Message>, Option<Element<'static, Message>>) {
+        let caption = |text: String| {
+            design::caption(text)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .wrapping(iced::widget::text::Wrapping::None)
+        };
+        let mut cells: Vec<Element<'static, Message>> = Vec::new();
+        // Narrow, a finish gives way with the rest: it is how work most
+        // often stands, so a row without a mark reads as finished, and the
+        // name keeps the room. Every other mark stays.
+        let compact = self
+            .mark
+            .filter(|mark| *mark != Mark::Finished)
+            .map(Mark::view);
+        if let Some(detail) = self.detail {
+            cells.push(
+                crate::ui_controls::FadeText::caption(detail)
+                    .limit(STATUS_CHARS)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            );
+        }
+        if let Some(mark) = self.mark {
+            cells.push(mark.view());
+        }
+        if let Some(elapsed) = self.elapsed {
+            cells.push(caption(elapsed).into());
+        }
+        (
+            widget::row::with_children(cells)
+                .spacing(space::XS)
+                .align_y(Alignment::Center)
+                .into(),
+            compact,
+        )
+    }
+}
+
+/// How many characters of a state's words a row shows: as many as its tab's
+/// caption, so the row says what the tab says.
+pub(super) const STATUS_CHARS: usize = super::view::AGENT_CAPTION_CHARS;
 
 /// What a row says. A path is told apart from its neighbours by its last
 /// components, so a row that names one keeps those in view and lets the
@@ -171,39 +323,31 @@ fn anchor(path: &str) -> usize {
     if anchor < path.len() { anchor } else { 0 }
 }
 
-/// What a row's trailing cell says.
-pub(super) enum Trailing {
-    /// How long the work took, which is secondary, as a timestamp is.
-    Elapsed(String),
-    /// What became of it, such as "finished": the row's state, read at the
-    /// transcript's size as an agent's state is.
-    Outcome(String),
-}
-
-/// One disclosure row. Its accessible name carries the trailing metadata,
-/// which is drawn in a cell of its own.
+/// One disclosure row. Its accessible name carries what its trailing
+/// column marks, which is drawn in a cell of its own.
 pub(super) fn row(
     label: impl Into<Headline>,
     name: String,
     icon: Icon,
     status: Option<Status>,
-    trailing: Option<String>,
+    elapsed: Option<String>,
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
-    let name = match &trailing {
-        Some(trailing) => format!("{name} · {trailing}"),
-        None => name,
+    let trailing = Trailing {
+        detail: None,
+        mark: status.and_then(Mark::of),
+        elapsed,
     };
-    row_named(
-        label,
-        name,
-        icon,
-        status,
-        trailing.map(Trailing::Elapsed),
-        expanded,
-        toggle,
-    )
+    // A failure is marked by the leading glyph alone, so its words are the
+    // accessible name's to carry. A group failing in part says how many of
+    // its steps failed in its own words.
+    let failure = match status {
+        Some(Status::Tool(chat::ToolStatus::Failed)) => " · failed",
+        _ => "",
+    };
+    let name = format!("{name}{failure}{}", trailing.described());
+    row_named(label, name, icon, status, trailing, expanded, toggle)
 }
 
 /// The still mark of a state, in a dot the size of a caption's lowercase
@@ -235,58 +379,46 @@ pub(super) fn row_named(
     name: String,
     icon: Icon,
     status: Option<Status>,
-    trailing: Option<Trailing>,
+    trailing: Trailing,
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
     let label = label.into();
-    let indicator = match status {
-        Some(Status::Tool(chat::ToolStatus::Running)) => crate::ui_controls::activity_spinner(
-            f32::from(design::LEADING_ICON_SIZE),
-            design::muted_color,
-        ),
-        Some(Status::Tool(chat::ToolStatus::Failed) | Status::PartlyFailed) => {
-            widget::icon(status_glyph(icon, status).handle())
-                .size(design::LEADING_ICON_SIZE)
-                .class(cosmic::theme::Svg::Custom(Rc::new(|theme| {
-                    iced::widget::svg::Style {
-                        color: Some(design::destructive_color(theme)),
-                    }
-                })))
-                .into()
-        }
-        _ => {
-            crate::ui_controls::passive_icon(status_glyph(icon, status), design::LEADING_ICON_SIZE)
-        }
+    let glyph = status_glyph(icon, status);
+    let indicator = if failed(status) {
+        widget::icon(glyph.handle())
+            .size(design::LEADING_ICON_SIZE)
+            .class(cosmic::theme::Svg::Custom(Rc::new(|theme| {
+                iced::widget::svg::Style {
+                    color: Some(design::destructive_color(theme)),
+                }
+            })))
+            .into()
+    } else {
+        crate::ui_controls::passive_icon(glyph, design::LEADING_ICON_SIZE)
     };
     let mut cells = vec![indicator];
-    let trailing_text = |text: iced::widget::Text<'static, cosmic::Theme, cosmic::Renderer>| {
-        text.class(cosmic::theme::Text::Custom(design::muted_text))
-            .wrapping(iced::widget::text::Wrapping::None)
-    };
-    match trailing {
-        // A duration is a caption, short enough to keep its place.
-        Some(Trailing::Elapsed(elapsed)) => {
-            cells.push(label.view());
-            cells.push(trailing_text(design::caption(elapsed)).into());
-        }
-        // An outcome gives way to the headline where both no longer fit:
-        // the row's name is what a reader needs. A failure is still told by
-        // the leading glyph, and a stop by a dot in the warning colour, as a
-        // cancelled agent's row marks it. The outcome stays in the row's
-        // accessible name and tooltip.
-        Some(Trailing::Outcome(outcome)) => {
-            let measure = label.measure();
-            let stopped = matches!(outcome.as_str(), "stopped" | "was stopped");
-            cells.push(crate::ui_controls::yielding(
-                label.view(),
-                measure,
-                trailing_text(design::transcript(outcome)),
-                stopped.then(|| state_dot(design::warning_color)),
-                step::GAP_S,
-            ));
-        }
-        None => cells.push(label.view()),
+    if trailing.is_empty() {
+        cells.push(label.view());
+    } else if trailing.detail.is_some() || matches!(label, Headline::Name(_)) {
+        // Words about the state, and the time beside an agent's name, give
+        // way to the headline where both no longer fit: the row's name is
+        // what a reader needs. Its mark stays, and the words stay in the
+        // row's accessible name and tooltip.
+        let measure = label.measure();
+        let (column, compact) = trailing.view();
+        cells.push(crate::ui_controls::yielding(
+            label.view(),
+            measure,
+            column,
+            compact,
+            step::GAP_S,
+        ));
+    } else {
+        // A mark and a time are short enough to keep their place, beside
+        // words that fade where they run short.
+        cells.push(label.view());
+        cells.push(trailing.view().0);
     }
     if let Some(expanded) = expanded {
         cells.push(crate::ui_controls::passive_icon(
@@ -350,29 +482,17 @@ mod tests {
     }
 
     #[test]
-    fn non_success_states_stay_visible_when_the_summary_fades() {
-        assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Succeeded.into())),
-            Icon::Terminal
-        );
-        assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Denied.into())),
-            Icon::Unavailable
-        );
-        // Stopping is not failing, and nor is ending unreported. Neither is
-        // drawn as the Stop control, which reads as something to press.
-        for status in [chat::ToolStatus::Stopped, chat::ToolStatus::Ended] {
+    fn a_failure_is_marked_at_the_leading_edge_and_every_other_state_beside_the_time() {
+        use chat::ToolStatus::*;
+        for status in [Running, Succeeded, Stopped, Ended, Waiting, Denied] {
             assert_eq!(
                 status_glyph(Icon::Terminal, Some(status.into())),
-                Icon::Ended
+                Icon::Terminal,
+                "{status:?} keeps the kind glyph"
             );
         }
         assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Waiting.into())),
-            Icon::AgentBackground
-        );
-        assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Failed.into())),
+            status_glyph(Icon::Terminal, Some(Failed.into())),
             Icon::Error
         );
         // Some steps failing among others that did not is its own mark.
@@ -380,6 +500,39 @@ mod tests {
             status_glyph(Icon::Terminal, Some(Status::PartlyFailed)),
             Icon::PartlyFailed
         );
+        // A failure is marked once, so not again in the trailing column.
+        assert_eq!(Mark::of(Failed.into()), None);
+        assert_eq!(Mark::of(Status::PartlyFailed), None);
+        assert_eq!(Mark::of(Running.into()), Some(Mark::Spinning));
+        assert_eq!(Mark::of(Status::Working), Some(Mark::Working));
+        assert_eq!(Mark::of(Succeeded.into()), Some(Mark::Finished));
+        // Stopping is not failing, and nor is ending unreported.
+        assert_eq!(Mark::of(Stopped.into()), Some(Mark::Stopped));
+        assert_eq!(Mark::of(Ended.into()), Some(Mark::Stopped));
+        assert_eq!(
+            Mark::of(Waiting.into()),
+            Some(Mark::WaitingOnBackgroundWork)
+        );
+        assert_eq!(Mark::of(Denied.into()), Some(Mark::Denied));
+    }
+
+    /// The column's words reach the row's accessible name, so the mark is
+    /// never the only way the state is told.
+    #[test]
+    fn a_rows_name_says_what_its_trailing_column_marks() {
+        let trailing = Trailing {
+            detail: None,
+            mark: Some(Mark::Finished),
+            elapsed: Some("3m 2s".into()),
+        };
+        assert_eq!(trailing.described(), " · finished · 3m 2s");
+        let waiting = Trailing {
+            detail: Some("waiting on scripts/restart-check".into()),
+            mark: Some(Mark::WaitingOnBackgroundWork),
+            elapsed: None,
+        };
+        assert_eq!(waiting.described(), " · waiting on scripts/restart-check");
+        assert_eq!(Trailing::default().described(), "");
     }
 
     #[test]
@@ -453,26 +606,32 @@ mod tests {
         assert!(words.windows(2).all(|pair| pair[0] == pair[1]), "{words:?}");
     }
 
-    /// Where an outcome gives way to the name, a stop keeps a warning dot
-    /// in its place, as a cancelled agent's row does, while a finish leaves
-    /// nothing: the two must not read alike in a narrow pane.
+    /// Where a state's words give way to the name, its mark stays in
+    /// their place, so a narrow pane still tells a finish from a stop.
     #[test]
-    fn a_narrow_report_marks_a_stop_but_not_a_finish() {
+    fn a_narrow_row_keeps_its_mark_when_its_words_give_way() {
         use iced::advanced::{Layout, layout, widget::Tree};
-        fn dots(layout: Layout<'_>) -> usize {
+        fn marks(layout: Layout<'_>) -> usize {
             let bounds = layout.bounds();
-            usize::from(bounds.width == 6.0 && bounds.height == 6.0)
-                + layout.children().map(dots).sum::<usize>()
+            let size = f32::from(design::COMPACT_ICON_SIZE);
+            usize::from(
+                bounds.width == size && bounds.height == size && layout.children().count() > 0,
+            ) + layout.children().map(marks).sum::<usize>()
         }
         let renderer = crate::app::tests::headless_renderer();
-        let drawn = |outcome: &str, width: f32| {
+        let drawn = |width: f32| {
             let mut element = row_named(
                 Headline::Name("Consolidate the directions".into()),
-                format!("Agent \"Consolidate the directions\" {outcome}"),
+                "Agent \"Consolidate the directions\" waiting on scripts/check".into(),
                 Icon::Chat,
                 None,
-                Some(Trailing::Outcome(outcome.into())),
-                Some(false),
+                Trailing {
+                    detail: Some("waiting on scripts/check".into()),
+                    mark: Some(Mark::WaitingOnBackgroundWork),
+                    elapsed: Some("6m 12s".into()),
+                },
+                // No disclosure arrow, whose glyph is the mark's size.
+                None,
                 None,
             );
             let mut tree = Tree::new(element.as_widget());
@@ -481,11 +640,9 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 80.0)),
             );
-            dots(Layout::new(&node))
+            marks(Layout::new(&node))
         };
-        assert_eq!(drawn("was stopped", 160.0), 1);
-        assert_eq!(drawn("stopped", 160.0), 1);
-        assert_eq!(drawn("finished", 160.0), 0);
-        assert_eq!(drawn("was stopped", 600.0), 0, "wide, the words show");
+        assert_eq!(drawn(160.0), 1, "narrow, the mark stays");
+        assert_eq!(drawn(600.0), 1, "wide, the mark shows with its words");
     }
 }

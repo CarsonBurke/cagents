@@ -1413,12 +1413,11 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         !initial.iter().any(|label| label.contains("not reported")),
         "{initial:?}"
     );
+    // How it stands is marked beside its time, not said in words.
     assert!(
-        initial.iter().any(|label| label == "Working"),
-        "{initial:?}"
-    );
-    assert!(
-        !initial.iter().any(|label| label == "Starting"),
+        !initial
+            .iter()
+            .any(|label| label == "Working" || label == "Starting"),
         "{initial:?}"
     );
     let unrelated = runtime.turn_fingerprint(&runtime.turns[1], dark);
@@ -1428,27 +1427,20 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     Arc::make_mut(&mut runtime.snapshot).subagents[0].model = Some("gpt-child-reported".into());
     assert_ne!(runtime.turn_fingerprint(&runtime.turns[0], dark), before);
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
+    // Each change of state changes the row's mark, so the retained
+    // exchange is drawn again, and the other is not.
+    let working = runtime.turn_fingerprint(&runtime.turns[0], dark);
     Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
-    let waiting = labels(&runtime, &mut tree);
-    assert!(
-        waiting.iter().any(|label| label == "Waiting"),
-        "{waiting:?}"
-    );
-    assert!(
-        !waiting.iter().any(|label| label == "Working"),
-        "{waiting:?}"
-    );
+    let waiting = runtime.turn_fingerprint(&runtime.turns[0], dark);
+    assert_ne!(waiting, working);
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
     Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Stopped;
+    assert_ne!(runtime.turn_fingerprint(&runtime.turns[0], dark), waiting);
     let stopped = labels(&runtime, &mut tree);
-    assert!(
-        stopped.iter().any(|label| label == "Stopped"),
-        "{stopped:?}"
-    );
     assert!(
         !stopped
             .iter()
-            .any(|label| label == "Starting" || label == "Working" || label == "Waiting"),
+            .any(|label| ["Starting", "Working", "Waiting", "Stopped"].contains(&label.as_str())),
         "{stopped:?}"
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);

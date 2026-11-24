@@ -1940,6 +1940,64 @@ fn agent_caption<'a>(agent: &chat::Subagent, work: Option<&'a str>) -> &'a str {
     }
 }
 
+/// How `agent` stands, as a row's trailing column marks it, with the words
+/// of what it waits on where its transcript names that. A failure has no
+/// mark there: the row's leading glyph tells it.
+pub(super) fn agent_mark(
+    agent: &chat::Subagent,
+    work: Option<&str>,
+) -> (Option<disclosure::Mark>, Option<String>) {
+    use disclosure::Mark;
+    let mark = match agent.status {
+        chat::ToolStatus::Running if agent.waiting => Mark::Attention,
+        chat::ToolStatus::Running => Mark::Working,
+        chat::ToolStatus::Waiting => {
+            return (
+                Some(Mark::WaitingOnBackgroundWork),
+                work.map(lowercase_initial),
+            );
+        }
+        chat::ToolStatus::Succeeded => Mark::Finished,
+        chat::ToolStatus::Failed => return (None, None),
+        chat::ToolStatus::Denied => Mark::Denied,
+        chat::ToolStatus::Stopped | chat::ToolStatus::Ended => Mark::Stopped,
+    };
+    (Some(mark), None)
+}
+
+/// How long `agent` has worked: from its first step to its last, or to now
+/// while it has yet to end. `None` where its transcript carries no times.
+pub(super) fn agent_elapsed_ms(agent: &chat::Subagent, now: Option<u64>) -> Option<u64> {
+    let first = agent.items.first()?;
+    let start = first.started_at.or(first.at)?;
+    let end = if agent.status.is_live() {
+        now?
+    } else {
+        agent
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| item.at.or(item.started_at))?
+    };
+    Some(end.saturating_sub(start))
+}
+
+/// How a background command's notice marks its outcome: a failure by the
+/// row's leading glyph, with its exit status, where it gave one, as words.
+fn command_mark(outcome: &str) -> (Option<disclosure::Mark>, Option<String>) {
+    match outcome {
+        "finished" => (Some(disclosure::Mark::Finished), None),
+        "stopped" => (Some(disclosure::Mark::Stopped), None),
+        failed => (
+            None,
+            failed
+                .strip_prefix("failed (")
+                .and_then(|status| status.strip_suffix(')'))
+                .map(str::to_owned),
+        ),
+    }
+}
+
 /// What each listed agent waiting on its own background work waits on, as
 /// its caption says it, named once per installed publication so that
 /// drawing and fingerprinting only look it up.
@@ -1973,6 +2031,10 @@ struct DeliveryOutcome<'a> {
     outcome: Option<Cow<'a, str>>,
     failed: bool,
     glyph: Icon,
+    /// How the outcome is marked beside the row's time, and any words it
+    /// still needs there.
+    mark: Option<disclosure::Mark>,
+    detail: Option<String>,
     heading: String,
     /// Whether it is an agent's report, whose row names the agent.
     report: bool,
@@ -2547,8 +2609,8 @@ impl Runtime {
     /// newest row; otherwise a newer row or the closing line does. When the
     /// lead is idle, the group with the newest running step, such as a
     /// background command, carries it unless the closing line already
-    /// spins. A strip that does not keeps its kind glyph, and its caption and
-    /// counting time still say it is working.
+    /// spins. A strip that does not is marked as working by a still dot,
+    /// beside its counting time.
     pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<disclosure::Status> {
         let status = turn.glyph();
         if status != Some(chat::ToolStatus::Running.into()) {
@@ -2564,7 +2626,11 @@ impl Runtime {
         } else {
             turn.newest_running && !self.closing_spins()
         };
-        carries.then_some(chat::ToolStatus::Running.into())
+        Some(if carries {
+            chat::ToolStatus::Running.into()
+        } else {
+            disclosure::Status::Working
+        })
     }
 
     /// The glyph and words of the line that closes a working transcript.
@@ -6461,7 +6527,7 @@ impl Runtime {
         if coordinating {
             for agent in &self.snapshot.subagents {
                 (&agent.id, &agent.kind, &agent.description, &agent.model).hash(&mut hasher);
-                self.hash_agent_state(agent, &mut hasher);
+                self.hash_agent_state(agent, now, &mut hasher);
             }
             // The client replaces its map whenever it learns an address, and a
             // new handle brings its own.
@@ -6471,9 +6537,18 @@ impl Runtime {
     }
 
     /// What a row saying how `agent` stands draws from it.
-    fn hash_agent_state(&self, agent: &chat::Subagent, hasher: &mut crate::fingerprint::Hasher) {
+    fn hash_agent_state(
+        &self,
+        agent: &chat::Subagent,
+        now: Option<u64>,
+        hasher: &mut crate::fingerprint::Hasher,
+    ) {
         use std::hash::Hash;
         (agent.status, agent.waiting, self.agent_work.get(&agent.id)).hash(hasher);
+        // Its time counts up while it works, at the second it is shown to.
+        agent_elapsed_ms(agent, now)
+            .map(|millis| millis / 1_000)
+            .hash(hasher);
     }
 
     /// What one item of an exchange, drawn from `cached`, contributes to its
@@ -6568,7 +6643,7 @@ impl Runtime {
         {
             if delivery_names_agent(from, sender, summary) {
                 if let Some(agent) = self.subagent(sender) {
-                    self.hash_agent_state(agent, hasher);
+                    self.hash_agent_state(agent, now, hasher);
                 }
                 std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
             }
@@ -7632,19 +7707,12 @@ impl Runtime {
                     || report.is_some_and(|(_, outcome)| outcome == "failed")
             }
         };
-        // Where a turn was stopped, and an agent that was stopped or ended
-        // without saying how it went, are marked as other stopped work is,
-        // by a still mark unlike the Stop control, as the agent's row and
-        // tab mark it.
-        let ended = agent.is_some_and(|agent| {
-            matches!(
-                agent.status,
-                chat::ToolStatus::Stopped | chat::ToolStatus::Ended
-            )
-        });
+        // Where a turn was stopped is marked as other stopped work is, by a
+        // still mark unlike the Stop control. A report keeps its kind's
+        // glyph, and says how its agent stands beside its time.
         let glyph = if failed {
             Icon::Error
-        } else if stopped || ended {
+        } else if stopped {
             Icon::Ended
         } else if notice && delivery_command_outcome(heading).is_some() {
             Icon::Terminal
@@ -7663,6 +7731,13 @@ impl Runtime {
             ),
             (None, Some((title, outcome)), None) => (title, Some(Cow::Borrowed(outcome))),
             (None, None, _) => (first, None),
+        };
+        let (mark, detail) = match (command, report, agent) {
+            (Some((_, outcome)), ..) => command_mark(outcome),
+            (None, _, Some(agent)) => agent_mark(agent, self.agent_work.get(&agent.id)),
+            (None, Some((_, "finished")), None) => (Some(disclosure::Mark::Finished), None),
+            (None, Some((_, "was stopped")), None) => (Some(disclosure::Mark::Stopped), None),
+            _ => (None, None),
         };
         // Its tooltip and accessible name say it in the same words, and keep
         // what the report said where the agent has since moved on.
@@ -7686,6 +7761,8 @@ impl Runtime {
             outcome,
             failed,
             glyph,
+            mark,
+            detail,
             heading,
             report: report.is_some(),
         }
@@ -7735,9 +7812,11 @@ impl Runtime {
         let has_body = delivery_has_body(notice, body, remainder);
         let DeliveryOutcome {
             title,
-            outcome,
+            outcome: _,
             failed,
             glyph,
+            mark,
+            detail,
             heading,
             report,
         } = self.delivery_outcome(
@@ -7765,19 +7844,34 @@ impl Runtime {
             monitor,
             notice.is_some_and(|notice| notice.body.long),
         );
+        // An agent's report counts the agent's time, as a step's row does.
+        let elapsed = report
+            .then(|| self.subagent(sender))
+            .flatten()
+            .and_then(|agent| agent_elapsed_ms(agent, self.source_now_ms()))
+            .map(disclosure::duration);
+        let named = match &elapsed {
+            Some(elapsed) => format!("{heading} · {elapsed}"),
+            None => heading.clone(),
+        };
+        let trailing = disclosure::Trailing {
+            detail,
+            mark,
+            elapsed,
+        };
         let heading_row = disclosure::row_named(
             headline,
             if disclosure {
                 format!(
-                    "{} delivery details: {heading}",
+                    "{} delivery details: {named}",
                     if expanded { "Hide" } else { "Show" }
                 )
             } else {
-                heading.clone()
+                named
             },
             glyph,
             failed.then_some(chat::ToolStatus::Failed.into()),
-            outcome.map(|outcome| disclosure::Trailing::Outcome(outcome.into_owned())),
+            trailing,
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );
