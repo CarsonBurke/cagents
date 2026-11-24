@@ -1,26 +1,36 @@
 //! Where releases are published, and how an installed build reads them.
 //!
-//! Each release carries `release-metadata-2.json` and its signature. The latest
-//! one is read through github.com's public download redirect
-//! (`releases/latest/download/…`), and assets from `releases/download/v…/…`.
-//! Those are ordinary web downloads, so a check costs no GitHub API quota and
-//! needs no sign-in. Trust comes from the signature alone: the metadata names
-//! the SHA-256 of every file the updater downloads, including the installer.
+//! Each release carries its signed metadata, `release-metadata-2.json` and its
+//! signature. The latest one is read through github.com's public download
+//! redirect (`releases/latest/download/…`), and assets from
+//! `releases/download/v…/…`. Those are ordinary web downloads, so a check costs
+//! no GitHub API quota and needs no sign-in. Trust comes from the signature
+//! alone: the metadata names the SHA-256 of every file the updater downloads,
+//! including the installer.
 //!
-//! Releases up to 0.2.4 carry their metadata as `release-metadata.json`, the
-//! only name 0.2.3 reads, and 0.2.3 trusts only the key 0.2.4 is signed with.
-//! Every later release keeps 0.2.4's own signed metadata under that name, so
-//! 0.2.3 finds 0.2.4 as its update, and from 0.2.4 reaches the rest, which
-//! keys 0.2.3 does not know may sign.
+//! Releases belong to trust generations, each with its own metadata name. A
+//! build reads its own generation's name. A new generation begins when the
+//! keys change in a way older builds could not follow, such as dropping a key
+//! they rely on. Its first release is signed by a key every release of the
+//! previous generation trusts, and every later release keeps that first
+//! release's metadata under each older name. Builds of an older generation are
+//! offered that release, which they can verify, and from it reach the rest.
+//! Generation 1, up to 0.2.3, reads `release-metadata.json` and accepts one
+//! signature; 0.2.4 begins generation 2.
 use super::*;
 use std::collections::BTreeMap;
 
 const PUBLIC_FEED: &str = "https://github.com/CarsonBurke/cagents/releases";
-const METADATA: &str = "release-metadata-2.json";
-const SIGNATURE: &str = "release-metadata-2.json.sig";
-/// What a release from before `release-metadata-2.json` carries instead.
-const LEGACY_METADATA: &str = "release-metadata.json";
-const LEGACY_SIGNATURE: &str = "release-metadata.json.sig";
+/// This build's trust generation. `scripts/publish-release` reads it from
+/// this line; a new generation adds its names to `GENERATIONS`.
+const GENERATION: usize = 2;
+/// The metadata and signature names of each generation, oldest first.
+const GENERATIONS: [(&str, &str); GENERATION] = [
+    ("release-metadata.json", "release-metadata.json.sig"),
+    ("release-metadata-2.json", "release-metadata-2.json.sig"),
+];
+const METADATA: &str = GENERATIONS[GENERATION - 1].0;
+const SIGNATURE: &str = GENERATIONS[GENERATION - 1].1;
 const SCHEMA: u32 = 2;
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const PRODUCT: &str = "cagents";
@@ -154,14 +164,14 @@ impl Feed {
     }
 
     /// The metadata in `directory`, and the name of the signature that goes
-    /// with it: `release-metadata-2.json`, or what a release from before it
-    /// carries.
+    /// with it: this generation's, or what a release of an older generation
+    /// carries instead.
     fn fetch_metadata(
         &self,
         directory: &str,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<u8>, &'static str), UpdateError> {
-        for (metadata, signature) in [(METADATA, SIGNATURE), (LEGACY_METADATA, LEGACY_SIGNATURE)] {
+        for (metadata, signature) in GENERATIONS.into_iter().rev() {
             match self.fetch(
                 &format!("{directory}/{metadata}"),
                 "checking for a new release",
@@ -623,7 +633,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let old = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
         let new = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
-        let both = [(METADATA, SIGNATURE), (LEGACY_METADATA, LEGACY_SIGNATURE)];
+        let both = [(METADATA, SIGNATURE), GENERATIONS[0]];
         let bridge = publish(root.path(), "0.2.4", &both, &[&old]);
         publish(root.path(), "0.2.5", &[(METADATA, SIGNATURE)], &[&new]);
         let latest = root.path().join("latest/download");
@@ -633,7 +643,7 @@ mod tests {
             fs::copy(current.join(name), latest.join(name)).unwrap();
         }
         let bridged = root.path().join("download/v0.2.4");
-        for name in [LEGACY_METADATA, LEGACY_SIGNATURE] {
+        for name in [GENERATIONS[0].0, GENERATIONS[0].1] {
             fs::copy(bridged.join(name), current.join(name)).unwrap();
             fs::copy(bridged.join(name), latest.join(name)).unwrap();
         }
@@ -645,14 +655,14 @@ mod tests {
         };
 
         // What 0.2.3 reads: only the legacy names, only the old key.
-        let legacy = fs::read(latest.join(LEGACY_METADATA)).unwrap();
+        let legacy = fs::read(latest.join(GENERATIONS[0].0)).unwrap();
         assert_eq!(legacy, bridge);
         let announced: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
         assert_eq!(announced["version"], "0.2.4");
         let tagged = root.path().join("download/v0.2.4");
         signature::verify(
-            &fs::read(tagged.join(LEGACY_METADATA)).unwrap(),
-            &fs::read_to_string(tagged.join(LEGACY_SIGNATURE)).unwrap(),
+            &fs::read(tagged.join(GENERATIONS[0].0)).unwrap(),
+            &fs::read_to_string(tagged.join(GENERATIONS[0].1)).unwrap(),
             &[signature::sign_for_test(&old, b"").0],
         )
         .unwrap();
@@ -674,15 +684,10 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
-        publish(
-            root.path(),
-            "0.2.3",
-            &[(LEGACY_METADATA, LEGACY_SIGNATURE)],
-            &[&key],
-        );
+        publish(root.path(), "0.2.3", &[GENERATIONS[0]], &[&key]);
         let latest = root.path().join("latest/download");
         fs::create_dir_all(&latest).unwrap();
-        for name in [LEGACY_METADATA, LEGACY_SIGNATURE] {
+        for name in [GENERATIONS[0].0, GENERATIONS[0].1] {
             fs::copy(
                 root.path().join("download/v0.2.3").join(name),
                 latest.join(name),

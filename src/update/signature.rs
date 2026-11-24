@@ -100,12 +100,16 @@ pub(crate) fn verify(
     Err(refusal.unwrap_or_else(malformed))
 }
 
-/// The armored signatures in `armored`, in order. Text between or around
-/// them is refused, so a file is exactly a sequence of signatures.
+/// The armored signatures in `armored`, in order, at most
+/// `MAX_SIGNATURES`. Anything but whitespace before, between or after them is
+/// refused, so a file is exactly a sequence of signatures.
 fn split_armor(armored: &str) -> Result<Vec<&str>, UpdateError> {
     let mut blocks = Vec::new();
     let mut rest = armored.trim();
     while !rest.is_empty() {
+        if !rest.starts_with(ARMOR_BEGIN) {
+            return Err(malformed());
+        }
         let end = rest.find(ARMOR_END).ok_or_else(malformed)? + ARMOR_END.len();
         if blocks.len() == MAX_SIGNATURES {
             return Err(invalid("the release signature holds too many signatures"));
@@ -372,6 +376,8 @@ C3NzaC1lZDI1NTE5AAAAQN78ij9Uzlbw0snfB4xB3nG/5JxHYL+AGf36GrJFJIbn9j7/wU
         // Only signatures: no other text, and not too many of them.
         let good = sign(&incoming, message, NAMESPACE);
         assert!(verify(message, &format!("{good}trailing text"), &trusted).is_err());
+        assert!(verify(message, &format!("{good}text between{good}"), &trusted).is_err());
+        assert!(verify(message, &format!("leading text{good}"), &trusted).is_err());
         assert!(verify(message, &format!("{good}{}", &good[..40]), &trusted).is_err());
         assert!(verify(message, &good.repeat(MAX_SIGNATURES), &trusted).is_ok());
         assert!(

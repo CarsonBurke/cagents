@@ -28,8 +28,8 @@ usage() {
         '--verify-only validates local files and the local tag without network access.' \
         'Both modes install/run/remove artifacts in private offline rootfs copies before publication.' \
         '--smoke-rootfs overrides the runtime image prepared by the local release builder.' \
-        "After the bridge release, the old metadata names carry the bridge's own signed metadata:" \
-        '--bridge DIR supplies it (release-metadata.json and .sig); publication otherwise downloads it.' \
+        "Older trust generations' metadata names carry the metadata of the release that began the next generation:" \
+        '--verify-only reads those files, as published, from --bridge DIR; publication downloads them and compares any --bridge.' \
         'Publication requires the identical existing tag on github.com/CarsonBurke/cagents.' \
         '--push-tag pushes the local tag to origin once the local checks pass, so a refused bundle leaves none there.' \
         'Only drafts owned by this local publisher for this exact bundle may be resumed.' \
@@ -113,20 +113,59 @@ PAYLOADS=(
     "$EDITOR_ARCHIVE" SHA256SUMS-browserless SHA256SUMS-ceditor install.sh
 )
 # The signed metadata names every other asset with its size and digest. A
-# bundle holds it as release-metadata.json; published, it is
-# release-metadata-2.json, which builds from 0.2.4 on read. Builds up to 0.2.3
-# read only release-metadata.json and trust only the key the bridge release,
-# 0.2.4, is signed with, so every later release carries 0.2.4's own signed
-# metadata under that name: those builds update to 0.2.4, and from it onward.
-BRIDGE_VERSION=0.2.4
+# bundle holds it as release-metadata.json. Published, each trust generation
+# has its own name (src/update/feed.rs): a release carries its own metadata
+# under its generation's name, and under each older generation's name the
+# metadata of the first release of the generation after it, which builds of
+# that older generation can verify and update to. Generation 1, up to 0.2.3,
+# reads release-metadata.json and accepts exactly one signature.
+metadata_name() {
+    if (($1 == 1)); then printf 'release-metadata.json\n'; else printf 'release-metadata-%s.json\n' "$1"; fi
+}
+
+# The trust generation of a tagged source; generation 1 predates them.
+generation_at() {
+    local generation
+    generation=$(checkout_git show "$1:src/update/feed.rs" 2>/dev/null \
+        | sed -n 's/^const GENERATION: usize = \([1-9][0-9]*\);$/\1/p')
+    printf '%s\n' "${generation:-1}"
+}
+
+GENERATION=$(generation_at "$SOURCE_COMMIT")
 BUNDLE_ASSETS=("${PAYLOADS[@]}" SHA256SUMS release-metadata.json release-metadata.json.sig)
-ASSETS=("${PAYLOADS[@]}" SHA256SUMS release-metadata-2.json release-metadata-2.json.sig
-    release-metadata.json release-metadata.json.sig)
+ASSETS=("${PAYLOADS[@]}" SHA256SUMS)
+for ((generation = 1; generation <= GENERATION; generation++)); do
+    name=$(metadata_name "$generation")
+    ASSETS+=("$name" "$name.sig")
+done
+OWN_METADATA=$(metadata_name "$GENERATION")
 EXPECTED_BUNDLE=$(printf '%s\n' "${BUNDLE_ASSETS[@]}" | sort)
 EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
 
 version_after() {
     [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
+}
+
+# The release tags before this one in its history whose builds check
+# updates, oldest first, as `TAG GENERATION` lines.
+EARLIER=()
+while IFS= read -r earlier; do
+    [[ $earlier =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    version_after "$VERSION" "${earlier#v}" || continue
+    checkout_git cat-file -e "$earlier:src/update/release-keys.pub" 2>/dev/null || continue
+    EARLIER+=("$earlier $(generation_at "$earlier")")
+done < <(checkout_git tag --merged "$SOURCE_COMMIT" --list 'v[0-9]*' | sort -V)
+PREVIOUS_GENERATION=1
+if ((${#EARLIER[@]})); then PREVIOUS_GENERATION=${EARLIER[-1]##* }; fi
+((GENERATION >= PREVIOUS_GENERATION && GENERATION <= PREVIOUS_GENERATION + 1)) \
+    || fail "$TAG is trust generation $GENERATION after generation $PREVIOUS_GENERATION; a generation follows the one before it"
+
+# The earlier release tags of GENERATION.
+tags_of_generation() {
+    local entry
+    for entry in "${EARLIER[@]}"; do
+        [[ ${entry##* } != "$1" ]] || printf '%s\n' "${entry% *}"
+    done
 }
 
 # DIRECTORY holds exactly the bundle's files, or with --published exactly the
@@ -227,7 +266,7 @@ tagged_signers() {
 }
 
 check_metadata() {
-    local keys source protocol previous
+    local keys source protocol
     source=$(checkout_git show "$SOURCE_COMMIT:src/terminal/ipc.rs") || fail "$TAG has no src/terminal/ipc.rs"
     protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9]*\);$/\1/p' <<< "$source")
     [[ $protocol =~ ^[1-9][0-9]*$ ]] || fail "cannot read the daemon protocol at $TAG"
@@ -244,14 +283,19 @@ check_metadata() {
         || fail "$TAG trusts no release signing key; see docs/releasing.md#signing"
     verify_signature "$1/release-metadata.json" "$1/release-metadata.json.sig" "$WORK_DIR/allowed-signers" \
         || fail 'release-metadata.json.sig is not a signature by a key the tagged source trusts'
-    # Installed builds of the previous release verify this one with that
-    # release's keys, so a rotation must still be signed by a key it lists.
-    previous=$(checkout_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$SOURCE_COMMIT^" 2>/dev/null) \
-        || previous=
-    if [[ -n $previous ]] && tagged_signers "$previous" "$WORK_DIR/previous-signers"; then
-        verify_signature "$1/release-metadata.json" "$1/release-metadata.json.sig" "$WORK_DIR/previous-signers" \
-            || fail "release-metadata.json.sig is not signed by a key $previous trusts, so its users could not update"
+    # Every build of this generation reads this release, and so does every
+    # build of the generation before when this release begins its own: each
+    # must find a signature by a key it trusts, or it is stranded.
+    local readers=() reader
+    mapfile -t readers < <(tags_of_generation "$GENERATION")
+    if ((${#readers[@]} == 0 && GENERATION > 1)); then
+        mapfile -t readers < <(tags_of_generation "$((GENERATION - 1))")
     fi
+    for reader in "${readers[@]}"; do
+        tagged_signers "$reader" "$WORK_DIR/reader-signers" || fail "$reader trusts no release signing key"
+        verify_signature "$1/release-metadata.json" "$1/release-metadata.json.sig" "$WORK_DIR/reader-signers" \
+            || fail "release-metadata.json.sig is not signed by a key $reader trusts, so its users could not update"
+    done
     [[ $(sed -n '/^DEFAULT_REPOSITORY=/p' "$1/install.sh") == "DEFAULT_REPOSITORY='$REPOSITORY'" ]] \
         || fail 'installer is not stamped for the canonical repository'
 }
@@ -343,23 +387,25 @@ check_archive() {
     fi
 }
 
-# The bridge release's own metadata, which the old names carry once it is
-# published: signed once, by a key the release before it trusts, for builds
-# that read only one signature.
+# Under generation GENERATION's name, DIRECTORY holds the metadata of the first
+# release of the generation after it, BRIDGE, which every build of GENERATION
+# must verify; generation 1 reads exactly one signature.
 check_bridge() {
-    local directory=$1 before
-    [[ -f $directory/release-metadata.json && ! -L $directory/release-metadata.json &&
-        -f $directory/release-metadata.json.sig && ! -L $directory/release-metadata.json.sig ]] \
-        || fail "the bridge must hold release-metadata.json and release-metadata.json.sig"
-    jq -e --arg version "$BRIDGE_VERSION" '.version == $version' "$directory/release-metadata.json" >/dev/null 2>&1 \
-        || fail "the bridge metadata is not $BRIDGE_VERSION's"
-    [[ $(split_signatures "$directory/release-metadata.json.sig" "$WORK_DIR/bridge-signatures") == 1 ]] \
-        || fail "the bridge signature must be exactly one signature, the only form builds before $BRIDGE_VERSION read"
-    before=$(checkout_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "v$BRIDGE_VERSION^" 2>/dev/null) \
-        || fail "cannot find the release before v$BRIDGE_VERSION here"
-    tagged_signers "$before" "$WORK_DIR/bridge-signers" || fail "$before trusts no release signing key"
-    verify_signature "$directory/release-metadata.json" "$directory/release-metadata.json.sig" "$WORK_DIR/bridge-signers" \
-        || fail "the bridge metadata is not signed by a key $before trusts"
+    local generation=$1 bridge=$2 directory=$3 name reader
+    name=$(metadata_name "$generation")
+    [[ -f $directory/$name && ! -L $directory/$name && -f $directory/$name.sig && ! -L $directory/$name.sig ]] \
+        || fail "the bridge for generation $generation must hold $name and $name.sig"
+    jq -e --arg version "${bridge#v}" '.version == $version' "$directory/$name" >/dev/null 2>&1 \
+        || fail "the bridge metadata $name is not $bridge's"
+    if ((generation == 1)); then
+        [[ $(split_signatures "$directory/$name.sig" "$WORK_DIR/bridge-signatures") == 1 ]] \
+            || fail "the bridge signature $name.sig must be exactly one signature, the only form generation 1 reads"
+    fi
+    while IFS= read -r reader; do
+        tagged_signers "$reader" "$WORK_DIR/bridge-signers" || fail "$reader trusts no release signing key"
+        verify_signature "$directory/$name" "$directory/$name.sig" "$WORK_DIR/bridge-signers" \
+            || fail "the bridge metadata $name is not signed by a key $reader trusts"
+    done < <(tags_of_generation "$generation")
 }
 
 check_asset_set "$DIST_DIR"
@@ -384,24 +430,46 @@ smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
 if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
 "$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
 
-# What builds up to 0.2.3 read under the old names: this release's own
-# metadata up to the bridge release, which must then be signed once, and the
-# bridge release's after it.
-if version_after "$VERSION" "$BRIDGE_VERSION"; then
-    if [[ -z $BRIDGE_DIR ]]; then
-        "$VERIFY_ONLY" && fail "$TAG comes after the bridge release $BRIDGE_VERSION; pass its signed metadata with --bridge DIR"
-        BRIDGE_DIR=$WORK_DIR/bridge-download
-        command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
-        GH_HOST=github.com GH_PROMPT_DISABLED=1 gh release download "v$BRIDGE_VERSION" --repo "$REPOSITORY" \
-            --dir "$BRIDGE_DIR" --pattern release-metadata.json --pattern release-metadata.json.sig \
-            || fail "cannot download the bridge release v$BRIDGE_VERSION's metadata"
+# What builds of older generations read under their names: the first release
+# of the generation after theirs, which may be this one.
+mkdir "$WORK_DIR/bridges"
+for ((generation = 1; generation < GENERATION; generation++)); do
+    name=$(metadata_name "$generation")
+    bridge=$(tags_of_generation "$((generation + 1))" | head -n1)
+    if [[ -z $bridge ]]; then
+        # This release begins its generation, so builds of the one before
+        # read its own metadata, which must then be signed the way they read.
+        ((generation == GENERATION - 1)) || fail "no release begins trust generation $((generation + 1))"
+        if ((generation == 1)); then
+            [[ $(split_signatures "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/own-signatures") == 1 ]] \
+                || fail "$TAG begins generation $GENERATION, so its signature must be exactly one signature, the only form generation 1 reads"
+        fi
+        cp -- "$DIST_DIR/release-metadata.json" "$WORK_DIR/bridges/$name"
+        cp -- "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/bridges/$name.sig"
+        continue
     fi
-    check_bridge "$BRIDGE_DIR"
-    LEGACY_DIR=$BRIDGE_DIR
-else
+    if "$VERIFY_ONLY"; then
+        [[ -n $BRIDGE_DIR ]] || fail "$TAG carries $bridge's metadata as $name; pass the published files with --bridge DIR"
+        cp -- "$BRIDGE_DIR/$name" "$BRIDGE_DIR/$name.sig" "$WORK_DIR/bridges/" 2>/dev/null \
+            || fail "--bridge $BRIDGE_DIR must hold $name and $name.sig, as $bridge published them"
+    else
+        # Publication carries the bytes the bridge release serves, and a
+        # supplied copy must match them.
+        command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
+        GH_HOST=github.com GH_PROMPT_DISABLED=1 gh release download "$bridge" --repo "$REPOSITORY" \
+            --dir "$WORK_DIR/bridges" --pattern "$name" --pattern "$name.sig" \
+            || fail "cannot download $name from the published $bridge"
+        if [[ -n $BRIDGE_DIR ]]; then
+            cmp -s -- "$BRIDGE_DIR/$name" "$WORK_DIR/bridges/$name" \
+                && cmp -s -- "$BRIDGE_DIR/$name.sig" "$WORK_DIR/bridges/$name.sig" \
+                || fail "--bridge $BRIDGE_DIR differs from what $bridge publishes as $name"
+        fi
+    fi
+    check_bridge "$generation" "$bridge" "$WORK_DIR/bridges"
+done
+if ((GENERATION == 1)); then
     [[ $(split_signatures "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/own-signatures") == 1 ]] \
-        || fail "up to the bridge release $BRIDGE_VERSION, release-metadata.json.sig must be exactly one signature"
-    LEGACY_DIR=$DIST_DIR
+        || fail "generation 1 reads exactly one signature in release-metadata.json.sig"
 fi
 # The release as published: its own metadata under the new names, and what
 # older builds read under the old ones.
@@ -409,10 +477,9 @@ mkdir "$WORK_DIR/upload"
 for asset in "${PAYLOADS[@]}" SHA256SUMS; do
     cp --reflink=auto --preserve=mode -- "$DIST_DIR/$asset" "$WORK_DIR/upload/$asset"
 done
-cp -- "$DIST_DIR/release-metadata.json" "$WORK_DIR/upload/release-metadata-2.json"
-cp -- "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/upload/release-metadata-2.json.sig"
-cp -- "$LEGACY_DIR/release-metadata.json" "$WORK_DIR/upload/release-metadata.json"
-cp -- "$LEGACY_DIR/release-metadata.json.sig" "$WORK_DIR/upload/release-metadata.json.sig"
+cp -- "$WORK_DIR/bridges/"* "$WORK_DIR/upload/" 2>/dev/null || :
+cp -- "$DIST_DIR/release-metadata.json" "$WORK_DIR/upload/$OWN_METADATA"
+cp -- "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/upload/$OWN_METADATA.sig"
 check_asset_set "$WORK_DIR/upload" --published
 printf 'Validated %s: %s assets, the signed metadata, checksums, archive layouts, and source %s\n' \
     "$TAG" "${#ASSETS[@]}" "$SOURCE_COMMIT"
@@ -501,8 +568,8 @@ ceditor archive unpacks into \`~/.local\`:
 \`tar -xzf $EDITOR_ARCHIVE --strip-components=1 -C ~/.local\`.
 
 $BUILT_BY \`$SOURCE_COMMIT\`.
-\`release-metadata-2.json\` lists every asset with its SHA-256 and is signed in
-\`release-metadata-2.json.sig\` (\`ssh-keygen -Y verify -n cagents-release\`).
+\`$OWN_METADATA\` lists every asset with its SHA-256 and is signed in
+\`$OWN_METADATA.sig\` (\`ssh-keygen -Y verify -n cagents-release\`).
 EOF
 } > "$NOTES"
 
@@ -571,12 +638,21 @@ mkdir "$WORK_DIR/served"
 for asset in "${PAYLOADS[@]}" SHA256SUMS; do
     cp -- "$WORK_DIR/downloaded/$asset" "$WORK_DIR/served/$asset"
 done
-cp -- "$WORK_DIR/downloaded/release-metadata-2.json" "$WORK_DIR/served/release-metadata.json"
-cp -- "$WORK_DIR/downloaded/release-metadata-2.json.sig" "$WORK_DIR/served/release-metadata.json.sig"
+cp -- "$WORK_DIR/downloaded/$OWN_METADATA" "$WORK_DIR/served/release-metadata.json"
+cp -- "$WORK_DIR/downloaded/$OWN_METADATA.sig" "$WORK_DIR/served/release-metadata.json.sig"
 check_checksums "$WORK_DIR/served"
 check_metadata "$WORK_DIR/served"
 check_remote_tag
 assert_current_draft
+# Publishing makes this the latest release; never above a newer one, nor a
+# second release of a version.
+newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
+    jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' |
+    sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' |
+    while IFS= read -r published; do
+        version_after "$VERSION" "$published" || printf '%s\n' "$published"
+    done)
+[[ -z $newer ]] || fail "refusing to publish $TAG: $(head -n1 <<< "$newer") is published already"
 gh api --hostname github.com --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
     -F draft=false --jq .html_url
 printf 'Published %s from verified local assets.\n' "$TAG"

@@ -245,10 +245,16 @@ cmd_feed() {
     [[ $feed =~ ^/[A-Za-z0-9._/-]+$ ]] || die "feed path has unsupported characters: $feed" 2
     # The updater refuses a release whose SHA256SUMS omits the installer, as
     # an --archive-only package's does; say so before the rehearsal installs.
-    local latest sums metadata=$feed/latest/download/release-metadata-2.json
-    # A feed from before release-metadata-2.json names its latest release only
-    # under the old name, which later feeds keep for older builds.
-    [ -f "$metadata" ] || metadata=$feed/latest/download/release-metadata.json
+    # The latest release's own metadata is under its trust generation's name,
+    # the newest one there; older names carry bridges for older builds.
+    local latest sums metadata=$feed/latest/download/release-metadata.json candidate newest=1
+    for candidate in "$feed"/latest/download/release-metadata-*.json; do
+        [[ ${candidate##*/} =~ ^release-metadata-([1-9][0-9]*)\.json$ ]] || continue
+        if ((BASH_REMATCH[1] > newest)); then
+            newest=${BASH_REMATCH[1]}
+            metadata=$candidate
+        fi
+    done
     latest=$(/usr/bin/python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' \
         "$metadata" 2>/dev/null) ||
         die "the feed's latest/download/${metadata##*/} names no version" 2
