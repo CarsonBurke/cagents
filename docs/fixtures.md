@@ -413,8 +413,10 @@ outside the app's clock, so the app's next save of the review replaces it, and
 running the script again rewrites the cache and keeps the commits. Other seeds
 in `fixture-forge-prs.json` are kept.
 
-To open the review as a person does, show the sidebar's search, choose its
-**Pull requests** filter and click the `fix/cache-key` row. The draft's
+To open the review as a person does, open the Worktrees pane
+(`Ctrl+Shift+E`), press the project heading's pull requests button (its tooltip
+reads *Pull requests in project*) and click #57, "Key the response cache by
+locale", in the list it opens. The draft's
 composer sits under line 23; its buttons are below the fold at the default
 height, so scroll the diff to reach them. Don't click a diff gutter in a
 revision without the fix for #3417: that starts a comment the cached review has
@@ -424,18 +426,18 @@ no authority for, and the app panics. A steps file:
 evidence env python3 -I "$tool/tests/fixtures/offline-review-cache.py" >/dev/null
 evidence cli project open '{fixture}/project' >/dev/null
 evidence drive wait 'Worktrees' --timeout 60 >/dev/null
-evidence drive click 206,67 >/dev/null    # the sidebar's search
-evidence drive wait 'Pull requests' --timeout 10 >/dev/null
-evidence drive click 'Pull requests' >/dev/null
-evidence drive wait 'cache-key' --timeout 60 >/dev/null
-evidence drive click 'cache-key' >/dev/null
+evidence drive key ctrl+shift+e >/dev/null
+evidence drive wait 'Pull requests in project' --timeout 60 >/dev/null
+evidence drive click 'Pull requests in project' >/dev/null
+evidence drive wait 'Key the response cache' --timeout 60 >/dev/null
+evidence drive click 'Key the response cache' >/dev/null
 evidence drive wait 'read only' --timeout 30 >/dev/null
 evidence drive wait 'empty locale' --timeout 30 >/dev/null
 evidence shot offline-review
 ```
 
-If `Worktrees` is collapsed, the filter shows no `fix/cache-key` row until it
-is expanded. `tests/offline_review_cache_fixture.py` checks the rows the
+The button appears once the app has read the project's GitHub remote.
+`tests/offline_review_cache_fixture.py` checks the rows the
 script writes against the tables `src/persistence.rs` creates, and that the
 forge lists #57 at the cached head; the native review is what shows the app
 reads them.

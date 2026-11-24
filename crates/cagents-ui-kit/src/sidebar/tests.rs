@@ -2092,21 +2092,8 @@ fn search_finds_pane_rows_by_title_or_checkout() {
 }
 
 #[test]
-fn hidden_checkouts_leave_pull_requests_folders_and_unowned_news_alone() {
+fn hidden_checkouts_leave_folders_and_unowned_news_alone() {
     let (mut model, mut state, [idle, unread, _]) = hidden_checkouts_scene();
-    let project = model.projects[0].id;
-    let linked = model.projects[0].worktrees[1].id;
-
-    // The pull request filter lists pull requests by their checkouts.
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
-    let rows = visible_selection_rows(&model, &state, false);
-    assert!(
-        rows.contains(&SelectionRow::Worktree(project, linked)),
-        "{rows:?}"
-    );
-    assert!(!rows.iter().any(|row| matches!(row, SelectionRow::Card(_))));
-    assert_eq!(drawn_rows(&model, &state, false), rows);
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
 
     // The unread news shows once: on its pane's row, or on the header
     // while a search leaves that row out. An unread badge carries its
@@ -2280,7 +2267,7 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
                 .expect("the toggle takes keyboard focus");
             assert_eq!(
                 focusable.get(toggle.wrapping_sub(1)),
-                Some(&filter_id(SidebarFilter::Attention)),
+                Some(&attention_filter_focus_id()),
                 "it follows the bell"
             );
         }
@@ -2288,25 +2275,25 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
 }
 
 /// Only the All view lists checkouts. The setting persists, so the
-/// toggle stays live in the other views and says which view it changes.
+/// toggle stays live in the Attention view and says which view it changes.
 #[test]
-fn the_checkouts_toggle_names_the_all_view_from_the_others() {
-    let mut state = SidebarState::default();
-    for filter in [SidebarFilter::Attention, SidebarFilter::PullRequests] {
-        state.filter = filter;
-        for (mode, tooltip) in [
-            (
-                crate::settings::SidebarWorktrees::Grouped,
-                "Hide checkouts in the All view",
-            ),
-            (
-                crate::settings::SidebarWorktrees::Hidden,
-                "Show checkouts in the All view (hidden in every project)",
-            ),
-        ] {
-            state.set_sidebar_worktrees(mode);
-            assert_eq!(checkouts_toggle_tooltip(&state), tooltip, "{filter:?}");
-        }
+fn the_checkouts_toggle_names_the_all_view_from_attention() {
+    let mut state = SidebarState {
+        filter: SidebarFilter::Attention,
+        ..SidebarState::default()
+    };
+    for (mode, tooltip) in [
+        (
+            crate::settings::SidebarWorktrees::Grouped,
+            "Hide checkouts in the All view",
+        ),
+        (
+            crate::settings::SidebarWorktrees::Hidden,
+            "Show checkouts in the All view (hidden in every project)",
+        ),
+    ] {
+        state.set_sidebar_worktrees(mode);
+        assert_eq!(checkouts_toggle_tooltip(&state), tooltip, "{mode:?}");
     }
 }
 
@@ -2330,11 +2317,7 @@ fn worktree_display_operations_survive_search_filters_and_unreachable_projects()
             });
             let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
             for mode in crate::settings::SidebarWorktrees::ALL {
-                for filter in [
-                    SidebarFilter::All,
-                    SidebarFilter::Attention,
-                    SidebarFilter::PullRequests,
-                ] {
+                for filter in [SidebarFilter::All, SidebarFilter::Attention] {
                     let mut state = SidebarState::default();
                     state.set_sidebar_worktrees(mode);
                     state.apply(&SidebarAction::SetFilter(filter));
@@ -3260,7 +3243,6 @@ fn row_quick_delete_centers_its_glyph_in_the_whole_hit_area() {
             project_id(1),
             &worktree,
             false,
-            false,
             None,
             false,
             true,
@@ -3296,7 +3278,6 @@ fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
             worktree_view(
                 project_id(1),
                 &worktree,
-                false,
                 false,
                 None,
                 false,
@@ -3356,7 +3337,6 @@ fn only_merged_nonprimary_worktree_rows_expose_delete_quick_action() {
             project_id(1),
             &worktree,
             primary,
-            false,
             None,
             false,
             true,
@@ -3710,11 +3690,9 @@ fn project_filters_restore_native_scroll_without_viewport_messages() {
 
     for (filter, height, expected, scroll_to) in [
         (SidebarFilter::Attention, 500.0, 0.0, Some(170.0)),
-        (SidebarFilter::PullRequests, 1_000.0, 0.0, Some(330.0)),
         (SidebarFilter::All, 1_000.0, 640.0, None),
         (SidebarFilter::Attention, 500.0, 170.0, None),
         (SidebarFilter::All, 1_000.0, 640.0, None),
-        (SidebarFilter::PullRequests, 1_000.0, 330.0, None),
         (SidebarFilter::Attention, 0.0, 0.0, None),
         (SidebarFilter::All, 1_000.0, 640.0, None),
     ] {
@@ -3901,7 +3879,6 @@ fn long_worktree_labels_cannot_paint_over_status_or_badges() {
             project_id(1),
             worktree,
             true,
-            false,
             None,
             false,
             false,
@@ -3989,7 +3966,7 @@ fn navigation_rows_share_one_content_grid() {
     // the group hands it.
     let header = |compact: bool, width: f32| {
         laid_out(
-            &mut project_identity_row(&model.projects[0], false, false, compact, false, "", None),
+            &mut project_identity_row(&model.projects[0], false, false, compact, "", None),
             width,
         )
     };
@@ -4125,7 +4102,7 @@ fn project_hover_commands_preserve_disclosure_position_and_reserve_only_visible_
     let width = design::NAVIGATION_DEFAULT_WIDTH;
     let limits = layout::Limits::new(Size::ZERO, Size::new(width, PROJECT_HEADER_HEIGHT));
     let mut element = project_header_row(
-        project_identity_row(&model.projects[0], false, false, false, false, "", None),
+        project_identity_row(&model.projects[0], false, false, false, "", None),
         vec![
             icon_action(
                 Icon::ChannelAdd,
@@ -7266,26 +7243,20 @@ fn hiding_the_search_controls_ends_the_search_they_held() {
     let mut state = SidebarState::default();
     state.apply(&SidebarAction::ToggleControls);
     state.apply(&SidebarAction::SearchChanged("sidebar".into()));
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
-    assert!(state.search_filters_active());
+    assert!(state.has_search_query());
     assert_eq!(state.saved_view().query, "sidebar");
 
     state.apply(&SidebarAction::ToggleControls);
     assert!(!state.controls_expanded());
     assert_eq!(state.query(), "");
-    assert_eq!(
-        state.filter(),
-        SidebarFilter::All,
-        "a hidden pull request filter would silently change row clicks"
-    );
-    assert!(!state.search_filters_active());
+    assert!(!state.has_search_query());
 
     // Attention keeps its own always-visible header toggle.
     state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
     state.apply(&SidebarAction::ToggleControls);
     state.apply(&SidebarAction::ToggleControls);
     assert_eq!(state.filter(), SidebarFilter::Attention);
-    assert!(!state.search_filters_active());
+    assert!(!state.has_search_query());
 }
 
 #[test]
@@ -7311,17 +7282,39 @@ fn a_hidden_query_is_neither_saved_nor_restored() {
     assert_eq!(restored.saved_view().query, "");
 }
 
+/// The sidebar once had a Pull requests filter; that list now opens from
+/// each project's Worktrees pane header. A view saved with it, the search
+/// controls open or not, restores the rest of the view under All.
 #[test]
-fn the_search_toggle_is_lit_while_any_search_filter_applies() {
+fn a_saved_pull_request_filter_restores_as_all() {
+    for controls_expanded in [false, true] {
+        let saved: SidebarView = serde_json::from_value(serde_json::json!({
+            "query": "kept",
+            "controls_expanded": controls_expanded,
+            "collapsed_projects": [],
+            "selection": null,
+            "filter": "PullRequests",
+            "in_progress_collapsed": true,
+        }))
+        .unwrap();
+        let mut restored = SidebarState::default();
+        restored.restore_view(saved);
+        assert_eq!(restored.filter(), SidebarFilter::All, "{controls_expanded}");
+        assert!(restored.in_progress_collapsed, "{controls_expanded}");
+        assert_eq!(restored.controls_expanded(), controls_expanded);
+    }
+}
+
+#[test]
+fn the_search_toggle_is_lit_while_open_or_searching() {
     for (controls_expanded, query, filter, lit) in [
         (false, "", SidebarFilter::All, false),
         (false, "", SidebarFilter::Attention, false),
         (false, "  ", SidebarFilter::All, false),
         (true, "", SidebarFilter::All, true),
-        // Neither can arise through the pane any more, but a state that
-        // holds one must still show it.
+        // This cannot arise through the pane any more, but a state that
+        // holds it must still show it.
         (false, "q", SidebarFilter::All, true),
-        (false, "", SidebarFilter::PullRequests, true),
     ] {
         let state = SidebarState {
             controls_expanded,
@@ -8426,14 +8419,12 @@ fn reading_outside_attention_retains_nothing() {
         channels: vec![channel],
         listed: &listed,
     };
-    for filter in [SidebarFilter::All, SidebarFilter::PullRequests] {
-        let mut state = SidebarState::default();
-        state.apply(&SidebarAction::SetFilter(filter));
-        state.observe_agent_update(card, project, worktree);
-        state.acknowledge_agent_update(card, &everywhere);
-        assert!(!state.has_card_update(card), "{filter:?}");
-        assert!(state.retained_attention.is_empty(), "{filter:?}");
-    }
+    let mut state = SidebarState::default();
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
+    state.observe_agent_update(card, project, worktree);
+    state.acknowledge_agent_update(card, &everywhere);
+    assert!(!state.has_card_update(card));
+    assert!(state.retained_attention.is_empty());
 }
 
 #[test]
@@ -10944,11 +10935,7 @@ fn a_filter_cannot_hide_a_project_that_cannot_be_read() {
     entry.unreachable = Some("fatal: not a git repository".into());
     let id = entry.id;
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-    for filter in [
-        SidebarFilter::All,
-        SidebarFilter::Attention,
-        SidebarFilter::PullRequests,
-    ] {
+    for filter in [SidebarFilter::All, SidebarFilter::Attention] {
         let state = SidebarState {
             filter,
             ..SidebarState::default()
@@ -11194,41 +11181,18 @@ fn the_sidebar_header_keeps_its_titlebar_gestures_in_every_state() {
 }
 
 #[test]
-fn pr_browser_keeps_authenticated_projects_without_matching_worktrees() {
-    let mut entry = project();
-    entry.github_ready = true;
-    entry.pull_requests.clear();
-    entry.worktrees.clear();
-    entry.channels.clear();
-    let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-    let state = SidebarState {
-        filter: SidebarFilter::PullRequests,
-        ..SidebarState::default()
-    };
-    for compact in [false, true] {
-        assert_eq!(filtered_projects(&model, &state, compact).len(), 1);
-    }
-}
-
-#[test]
-fn compact_search_and_pr_filter_apply_while_the_popover_is_open() {
+fn compact_search_applies_while_the_popover_is_open() {
     let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
     let mut state = SidebarState::default();
     state.apply(&SidebarAction::ToggleControls);
     state.apply(&SidebarAction::SearchChanged("fix-sidebar".into()));
-    assert_eq!(
-        filtered_projects(&model, &state, true)[0].worktrees.len(),
-        1
-    );
-    state.apply(&SidebarAction::SearchChanged(String::new()));
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
     let filtered = filtered_projects(&model, &state, true);
+    assert_eq!(filtered[0].worktrees.len(), 1);
     assert_eq!(
         filtered[0].worktrees[0].branch.as_deref(),
         Some("fix-sidebar")
     );
-    assert_eq!(filtered[0].worktrees.len(), 1);
-    // Dismissing the popover ends both.
+    // Dismissing the popover ends it.
     state.apply(&SidebarAction::ToggleControls);
     assert_eq!(
         filtered_projects(&model, &state, true)[0].worktrees.len(),
@@ -11363,7 +11327,6 @@ fn terminal_pull_request_rows_hide_retained_review_and_check_badges() {
         let mut element = worktree_view(
             project_id(1),
             row,
-            false,
             false,
             None,
             false,
@@ -11501,26 +11464,18 @@ fn live_and_reopened_pull_request_rows_keep_review_and_check_status() {
     assert!(!row.chrome.accessible_name.contains("review re-requested"));
 }
 
+/// A checkout's pull request opens from the project's pull request list in
+/// the Worktrees pane; the sidebar row always opens the checkout.
 #[test]
-fn pull_request_filter_rows_open_reviews_and_other_rows_open_worktrees() {
+fn worktree_rows_open_their_worktree_with_or_without_a_pull_request() {
     let project = project();
     let mut worktree = project.worktrees[0].clone();
-    let pr = project.pull_requests[0].clone();
-    worktree.set_pull_request(pr.clone());
-    assert!(
-        matches!(worktree_primary_action(project.id, &worktree, true),
-        SidebarAction::OpenPullRequest { project_id, number, url }
-        if project_id == project.id && number == pr.number && url == pr.url)
-    );
-    assert!(
-        matches!(worktree_primary_action(project.id, &worktree, false),
-        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id)
-    );
+    worktree.set_pull_request(project.pull_requests[0].clone());
+    assert!(matches!(worktree_primary_action(project.id, &worktree),
+        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id));
     worktree.clear_pull_request();
-    assert!(
-        matches!(worktree_primary_action(project.id, &worktree, true),
-        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id)
-    );
+    assert!(matches!(worktree_primary_action(project.id, &worktree),
+        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id));
 }
 
 #[test]

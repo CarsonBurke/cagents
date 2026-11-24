@@ -164,13 +164,14 @@ impl SidebarMode {
     }
 }
 
-/// Coarse filters which can be combined with the free-text query.
+/// Coarse filters which can be combined with the free-text query. A view
+/// saved by a build that had a pull request filter restores as `All`; its
+/// list now lives in the Worktrees pane (see `known_or_default`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SidebarFilter {
     #[default]
     All,
     Attention,
-    PullRequests,
 }
 
 /// Where a card's attention shows, as only the application knows it. The
@@ -3407,12 +3408,9 @@ impl SidebarState {
             && !self.worktree_display(project.id).shows_checkouts()
     }
 
-    /// Whether the checkout rows the filter asks for are drawn. The pull
-    /// request filter lists pull requests by their checkouts, so hiding
-    /// checkouts would empty it; it draws them whatever the display.
+    /// Whether `project`'s checkout rows are drawn.
     fn shows_checkouts(&self, project: ProjectId) -> bool {
-        self.filter == SidebarFilter::PullRequests
-            || self.worktree_display(project).shows_checkouts()
+        self.worktree_display(project).shows_checkouts()
     }
 
     /// Whether any project's pane rows may be drawn, and so which of them
@@ -3420,7 +3418,6 @@ impl SidebarState {
     fn draws_pane_rows(&self) -> bool {
         match self.filter {
             SidebarFilter::Attention => true,
-            SidebarFilter::PullRequests => false,
             SidebarFilter::All => {
                 !self.sidebar_worktrees.shows_checkouts()
                     || self
@@ -3517,21 +3514,10 @@ impl SidebarState {
     pub fn has_row_selection(&self) -> bool {
         !self.rows.is_empty()
     }
-    /// Whether the search controls narrow the list: a query, or the pull
-    /// request filter that lives beside it. Attention is not counted; its
-    /// toggle stays in the header whether or not the controls show.
-    pub fn search_filters_active(&self) -> bool {
-        !self.query.trim().is_empty() || self.filter == SidebarFilter::PullRequests
-    }
-
-    /// Hiding the search controls ends the search. A query or filter nobody
-    /// can see would keep hiding rows, and the pull request filter would keep
-    /// changing what a click on a row does, with nothing on screen to say so.
-    fn clear_search_filters(&mut self) {
-        self.query.clear();
-        if self.filter == SidebarFilter::PullRequests {
-            self.set_filter(SidebarFilter::All);
-        }
+    /// Whether a search query narrows the list. Attention is not counted;
+    /// its toggle stays in the header whether or not the search shows.
+    pub fn has_search_query(&self) -> bool {
+        !self.query.trim().is_empty()
     }
 
     /// Choosing a filter starts a fresh list, so rows kept only because they
@@ -3578,13 +3564,7 @@ impl SidebarState {
             String::new()
         };
         self.controls_expanded = view.controls_expanded;
-        // Like the query, the pull request filter belongs to the search
-        // controls and ends with them; see `clear_search_filters`.
-        self.filter = if !view.controls_expanded && view.filter == SidebarFilter::PullRequests {
-            SidebarFilter::All
-        } else {
-            view.filter
-        };
+        self.filter = view.filter;
         self.toggled_sections = view.toggled_sections;
         self.panel_open = view.panel_open;
         self.files_query = view.files_query;
@@ -4793,8 +4773,10 @@ impl SidebarState {
             }
             SidebarAction::ToggleControls => {
                 self.controls_expanded = !self.controls_expanded;
+                // Hiding the search controls ends the search: a query nobody
+                // can see would keep hiding rows.
                 if !self.controls_expanded {
-                    self.clear_search_filters();
+                    self.query.clear();
                 }
             }
             SidebarAction::ToggleWorktrees(project_id) => {
@@ -5381,7 +5363,7 @@ pub fn search_toggle_focus_id() -> Id {
 /// Hiding read Attention rows removes the control that did it, so focus
 /// returns to the filter those rows were kept for, in both densities.
 pub fn attention_filter_focus_id() -> Id {
-    filter_id(SidebarFilter::Attention)
+    stable_id("filter.attention")
 }
 
 /// The focus target of the pane's resize handle.
@@ -6076,7 +6058,7 @@ fn view_inner<'a>(
 
     if !compact && state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
-            widget::container(controls(state, modal_open))
+            widget::container(search(state, modal_open))
                 .class(theme::Container::Primary)
                 .padding(space::S),
         );
@@ -6144,7 +6126,7 @@ fn header<'a>(
             crate::interaction::pressed(
                 centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
                     .class(sidebar_button_style(attention))
-                    .id(filter_id(SidebarFilter::Attention))
+                    .id(attention_filter_focus_id())
                     .name("Show projects needing attention")
                     .selected(attention)
                     .on_press_maybe(gated(
@@ -6176,7 +6158,7 @@ fn header<'a>(
                 selected,
             ),
             // Closing the controls also ends the search, so say so.
-            if state.controls_expanded && state.search_filters_active() {
+            if state.controls_expanded && state.has_search_query() {
                 "Close and clear search".to_owned()
             } else {
                 crate::workspace_widget::shortcut_tooltip(
@@ -6189,7 +6171,7 @@ fn header<'a>(
             actions.push(crate::ui_controls::popover(
                 search_button,
                 (state.controls_expanded && !modal_open).then(|| {
-                    widget::container(controls(state, false))
+                    widget::container(search(state, false))
                         .width(DEFAULT_EXPANDED_WIDTH)
                         .into()
                 }),
@@ -6247,15 +6229,15 @@ pub fn checkouts_toggle_focus_id() -> Id {
 /// The checkouts toggle's accessible name, whatever its state.
 const CHECKOUTS_TOGGLE_NAME: &str = "Hide checkouts";
 
-/// Shows or hides every project's checkouts. Like the filters beside it, it
-/// is lit while it narrows the list, so a list without checkouts never
+/// Shows or hides every project's checkouts. Like the Attention bell beside
+/// it, it is lit while it narrows the list, so a list without checkouts never
 /// passes for the whole one. Its name stays fixed and its pressed state says
 /// whether checkouts are hidden, as the bell's does for its filter; the
 /// tooltip says what a press does. Hiding them by default overrides each
 /// project's own mode, which the hidden tooltip says.
 ///
-/// Only the All view lists checkouts: Attention names panes instead and Pull
-/// requests always shows them. The setting persists, so the toggle stays
+/// Only the All view lists checkouts: Attention names panes instead. The
+/// setting persists, so the toggle stays
 /// live elsewhere and its tooltip names the view it changes.
 fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, SidebarAction> {
     let hidden = !state.sidebar_worktrees.shows_checkouts();
@@ -6287,7 +6269,7 @@ fn checkouts_toggle_tooltip(state: &SidebarState) -> &'static str {
 /// The search toggle is lit whenever the controls narrow the list, not only
 /// while they show, so an active search can never pass for the full list.
 fn search_toggle_lit(state: &SidebarState) -> bool {
-    state.controls_expanded || state.search_filters_active()
+    state.controls_expanded || state.has_search_query()
 }
 
 /// The pane's top strip is part of the titlebar.
@@ -6336,26 +6318,6 @@ pub fn files_scroll_id(key: &ActiveWorktreeKey) -> Id {
 
 pub fn files_filter_focus_id(key: &ActiveWorktreeKey) -> Id {
     entity_id("panel.files.query", key.worktree_id)
-}
-
-fn controls<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarAction> {
-    let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
-    actions.push(filters(state.filter, modal_open));
-    actions.push(
-        cosmic::iced::widget::Space::new()
-            .width(Length::Fill)
-            .into(),
-    );
-    widget::column::with_children(vec![
-        search(state, modal_open),
-        widget::row::with_children(actions)
-            .align_y(Alignment::Center)
-            .spacing(space::XS)
-            .into(),
-    ])
-    .spacing(space::XS)
-    .width(Length::Fill)
-    .into()
 }
 
 fn utilities<'a>(
@@ -6471,34 +6433,6 @@ fn search<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarA
         }
     }
     RowInteraction::search(input.id(search_focus_id()).into(), !modal_open)
-}
-
-/// Secondary filters live beside the search input. Attention has its own
-/// independent header toggle rather than a duplicate control here.
-const FILTER_CHOICES: [(SidebarFilter, &str, &str); 2] = [
-    (SidebarFilter::All, "All", "Show all projects"),
-    (
-        SidebarFilter::PullRequests,
-        "Pull requests",
-        "Show projects with pull requests",
-    ),
-];
-
-fn filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, SidebarAction> {
-    let mut row = widget::row::with_capacity(FILTER_CHOICES.len())
-        .spacing(space::XS)
-        .align_y(Alignment::Center);
-    for (value, visible_label, accessible_label) in FILTER_CHOICES {
-        row = row.push(
-            button::custom(design::caption(visible_label))
-                .class(sidebar_button_style(filter == value))
-                .id(filter_id(value))
-                .name(accessible_label)
-                .selected(filter == value)
-                .on_press_maybe(gated(SidebarAction::SetFilter(value), modal_open)),
-        );
-    }
-    row.into()
 }
 
 fn body<'a>(
@@ -6766,13 +6700,6 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
                 "Show all",
                 SidebarAction::SetFilter(SidebarFilter::All),
             ),
-            SidebarFilter::PullRequests => (
-                Icon::PullRequest,
-                "No pull requests",
-                "Open a repository or change the current filter.",
-                "Show all",
-                SidebarAction::SetFilter(SidebarFilter::All),
-            ),
         }
     };
     if compact {
@@ -7017,16 +6944,13 @@ fn project_identity_row(
     selected: bool,
     modal_open: bool,
     compact: bool,
-    review_mode: bool,
     query: &str,
     activity: Option<crate::agent::ActivityState>,
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
     let label = (!compact).then(|| project_name_label(project, query));
-    let mut name = if review_mode && project.github_ready {
-        format!("Browse pull requests in {}", project.name)
-    } else if compact {
+    let mut name = if compact {
         chrome.compact_open_name.to_string()
     } else {
         chrome.open_name.to_string()
@@ -7047,19 +6971,9 @@ fn project_identity_row(
         .id(chrome.open_id.clone())
         .name(name)
         .on_press_maybe(
-            project_primary_action(
-                project,
-                if review_mode {
-                    SidebarFilter::PullRequests
-                } else {
-                    SidebarFilter::All
-                },
-            )
-            .and_then(|action| gated(action, modal_open)),
+            project_primary_action(project).and_then(|action| gated(action, modal_open)),
         );
-    let tip: Cow<'static, str> = if review_mode && project.github_ready {
-        Cow::Owned(format!("Browse pull requests in {}", project.name))
-    } else if compact {
+    let tip: Cow<'static, str> = if compact {
         Cow::Owned(chrome.compact_open_name.to_string())
     } else {
         Cow::Owned(project.repository.display().to_string())
@@ -7069,30 +6983,21 @@ fn project_identity_row(
 
 /// The primary action for a project row, shared by pointer and keyboard
 /// activation. An unreadable project offers retry rather than navigation.
-pub fn project_primary_action(
-    project: &SidebarProject,
-    filter: SidebarFilter,
-) -> Option<SidebarAction> {
+pub fn project_primary_action(project: &SidebarProject) -> Option<SidebarAction> {
     if project.unreachable.is_some() {
         return (!project.reloading).then(|| SidebarAction::RefreshProject {
             project_id: project.id,
             repository: project.repository.clone(),
         });
     }
-    Some(
-        if filter == SidebarFilter::PullRequests && project.github_ready {
-            SidebarAction::BrowsePullRequests {
-                project_id: project.id,
-            }
-        } else if project.kind == ProjectKind::Folder {
-            SidebarAction::OpenRepository {
-                project_id: project.id,
-                repository: project.repository.clone(),
-            }
-        } else {
-            SidebarAction::ToggleProject(project.id)
-        },
-    )
+    Some(if project.kind == ProjectKind::Folder {
+        SidebarAction::OpenRepository {
+            project_id: project.id,
+            repository: project.repository.clone(),
+        }
+    } else {
+        SidebarAction::ToggleProject(project.id)
+    })
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -7298,8 +7203,7 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload =
-        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
+    let reload = project_primary_action(project).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -7628,7 +7532,6 @@ fn project_view<'a>(
         selection == Some(SidebarSelection::Project(project_id)),
         modal_open,
         false,
-        project.state.filter == SidebarFilter::PullRequests,
         &project.state.query,
         if project.state.worktree_display(project_id) == crate::settings::SidebarWorktrees::Hidden
             || project.state.filter == SidebarFilter::Attention
@@ -7771,7 +7674,6 @@ fn project_view<'a>(
                         project_id,
                         worktree,
                         is_primary_worktree(&entity.repository, &worktree.path),
-                        project.state.filter == SidebarFilter::PullRequests,
                         selection,
                         modal_open,
                         entity.github_ready,
@@ -7960,8 +7862,7 @@ fn compact_project_identity(
         .id(project.chrome.open_id.clone())
         .name(description)
         .on_press_maybe(
-            project_primary_action(project, state.filter)
-                .and_then(|action| gated(action, modal_open)),
+            project_primary_action(project).and_then(|action| gated(action, modal_open)),
         );
     grid.mount(crate::interaction::tooltip(control, tip))
 }
@@ -8031,7 +7932,6 @@ fn compact_project<'a>(
                     entity.id,
                     worktree,
                     is_primary_worktree(&entity.repository, &worktree.path),
-                    project.state.filter == SidebarFilter::PullRequests,
                     selection,
                     modal_open,
                     entity.github_ready,
@@ -9243,7 +9143,6 @@ fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
     primary: bool,
-    review_mode: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
     github_ready: bool,
@@ -9377,15 +9276,7 @@ fn worktree_view<'a>(
         == Some(SidebarSelection::Worktree {
             project_id,
             worktree_id: worktree.id,
-        })
-        || (review_mode
-            && worktree.pull_request().is_some_and(|pr| {
-                selection
-                    == Some(SidebarSelection::PullRequest {
-                        project_id,
-                        number: pr.number,
-                    })
-            }));
+        });
     // A worktree on its way out is not somewhere to go: opening it would start
     // sessions in a directory Git is about to remove.
     let inert = modal_open || deleting;
@@ -9398,10 +9289,7 @@ fn worktree_view<'a>(
             &chrome.label,
             deletion,
         ))
-        .on_press_maybe(gated(
-            worktree_primary_action(project_id, worktree, review_mode),
-            inert,
-        ));
+        .on_press_maybe(gated(worktree_primary_action(project_id, worktree), inert));
     let action: Element<'static, SidebarAction> = if compact {
         action.into()
     } else {
@@ -9454,23 +9342,11 @@ fn worktree_view<'a>(
     ))
 }
 
-fn worktree_primary_action(
-    project_id: ProjectId,
-    worktree: &SidebarWorktree,
-    review_mode: bool,
-) -> SidebarAction {
-    if review_mode && let Some(pr) = worktree.pull_request() {
-        SidebarAction::OpenPullRequest {
-            project_id,
-            number: pr.number,
-            url: pr.url.clone(),
-        }
-    } else {
-        SidebarAction::OpenWorktree {
-            project_id,
-            worktree_id: worktree.id,
-            path: worktree.path.clone(),
-        }
+fn worktree_primary_action(project_id: ProjectId, worktree: &SidebarWorktree) -> SidebarAction {
+    SidebarAction::OpenWorktree {
+        project_id,
+        worktree_id: worktree.id,
+        path: worktree.path.clone(),
     }
 }
 
@@ -13250,8 +13126,8 @@ fn filtered_projects<'a>(
         .filter_map(|project| {
             let project_matches = query.is_empty() || project.matches(query.as_ref());
             // An unreachable project draws none of its children, so it must
-            // not be matched or counted through them either: an attention or
-            // pull-request filter asks which worktrees need looking at, and
+            // not be matched or counted through them either: the attention
+            // filter asks which worktrees need looking at, and
             // rows from a read that has since failed cannot answer that. The
             // project itself survives every filter, because a project that
             // cannot be read is exactly something needing attention, and
@@ -13275,7 +13151,6 @@ fn filtered_projects<'a>(
                         && match state.filter {
                             SidebarFilter::All => true,
                             SidebarFilter::Attention => state.lists_channel(channel),
-                            SidebarFilter::PullRequests => false,
                         }
                 }));
             // The Attention list names the panes needing the user instead of
@@ -13301,15 +13176,7 @@ fn filtered_projects<'a>(
                 project
                     .worktrees
                     .iter()
-                    .filter(|_| shows_checkouts)
-                    .filter(|worktree| match state.filter {
-                        SidebarFilter::All => true,
-                        SidebarFilter::PullRequests => {
-                            state.selected_worktree(project) == Some(worktree.id)
-                                || worktree.pull_request().is_some()
-                        }
-                        SidebarFilter::Attention => false,
-                    })
+                    .filter(|_| shows_checkouts && state.filter == SidebarFilter::All)
                     .filter(|worktree| {
                         state.selected_worktree(project) == Some(worktree.id)
                             || project_matches
@@ -13330,9 +13197,6 @@ fn filtered_projects<'a>(
                         || !worktrees.is_empty()
                         || !channels.is_empty()
                         || !cards.is_empty()
-                }
-                SidebarFilter::PullRequests => {
-                    (project_matches && project.github_ready) || !worktrees.is_empty()
                 }
                 SidebarFilter::Attention => !channels.is_empty() || !cards.is_empty(),
             };
@@ -13934,14 +13798,6 @@ fn entity_id(kind: &str, id: impl std::fmt::Display) -> Id {
     stable_id(format!("{kind}.{id}"))
 }
 
-fn filter_id(filter: SidebarFilter) -> Id {
-    stable_id(match filter {
-        SidebarFilter::All => "filter.all",
-        SidebarFilter::Attention => "filter.attention",
-        SidebarFilter::PullRequests => "filter.pull_requests",
-    })
-}
-
 /// Event decorators keep native buttons, focus operations, menus and accessible
 /// names intact instead of replacing rows with mouse-only hit targets.
 mod row_interaction {
@@ -14130,7 +13986,7 @@ mod row_interaction {
 
     struct FilterScrollState {
         active: SidebarFilter,
-        saved: [Option<tree::State>; 3],
+        saved: [Option<tree::State>; 2],
     }
 
     impl FilterScrollState {
@@ -14138,7 +13994,6 @@ mod row_interaction {
             match filter {
                 SidebarFilter::All => 0,
                 SidebarFilter::Attention => 1,
-                SidebarFilter::PullRequests => 2,
             }
         }
     }
@@ -14410,7 +14265,7 @@ mod row_interaction {
                     Kind::FilteredScroll { filter: active, .. } => {
                         Some(Box::new(FilterScrollState {
                             active,
-                            saved: [None, None, None],
+                            saved: [None, None],
                         }))
                     }
                     _ => None,
