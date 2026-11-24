@@ -2519,6 +2519,13 @@ fn next_newline(bytes: &[u8], scanned: &mut usize) -> Option<usize> {
     }
 }
 
+/// One serialized frame waiting for the provider's stdin.
+struct QueuedWrite {
+    bytes: Vec<u8>,
+    /// See [`Adapter::expendable_write`].
+    expendable: bool,
+}
+
 fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     let raw = fd.as_raw_fd();
     let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
@@ -2563,7 +2570,7 @@ struct Actor {
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
-    pending: VecDeque<Vec<u8>>,
+    pending: VecDeque<QueuedWrite>,
     offset: usize,
     queued: usize,
     stderr: VecDeque<u8>,
@@ -3117,8 +3124,15 @@ impl Actor {
                                 &last_ignored,
                             ));
                         }
-                        // A clean exit still lost any input it never read.
-                        return stdin_closed.map_or(Ok(()), Err);
+                        // A clean exit still lost any input it never read,
+                        // unless all it left unread was the adapter's own
+                        // requests for display data.
+                        return match stdin_closed {
+                            Some(error) if self.pending.iter().any(|write| !write.expendable) => {
+                                Err(error)
+                            }
+                            _ => Ok(()),
+                        };
                     }
                     let report = exit_report(
                         self.child.as_ref().ok_or("Provider process unavailable")?,
@@ -3228,7 +3242,7 @@ impl Actor {
             }
             self.report_command_stops();
             if fds[3].revents != 0
-                && let Some(line) = self.pending.front()
+                && let Some(QueuedWrite { bytes: line, .. }) = self.pending.front()
             {
                 match stdin.write(&line[self.offset..]) {
                     Ok(0) => return Err("Provider closed stdin".into()),
@@ -3252,7 +3266,10 @@ impl Actor {
                     // The provider closed its input, ordinarily by exiting.
                     // Drain its output to EOF so its exit status, and any
                     // final frames, explain the failure instead of EPIPE.
+                    // Nobody waits on the adapter's own requests for display
+                    // data, so they no longer hold the actor busy either.
                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                        self.drop_expendable_writes();
                         stdin_closed = Some(format!("Provider stdin: {e}"));
                     }
                     Err(e) => return Err(format!("Provider stdin: {e}")),
@@ -3289,6 +3306,27 @@ impl Actor {
                 }
             }
             self.refresh_metadata(fds[4].revents != 0)?;
+        }
+    }
+    /// Forgets the queued writes the provider can no longer read and nobody
+    /// waits on: see [`Adapter::expendable_write`].
+    fn drop_expendable_writes(&mut self) {
+        // The front write may be partly sent, and only its rest is queued.
+        let mut sent = self.offset;
+        if self.pending.front().is_some_and(|write| write.expendable) {
+            self.offset = 0;
+        }
+        let mut unsent = 0;
+        self.pending.retain(|write| {
+            let already = std::mem::take(&mut sent);
+            if write.expendable {
+                unsent += write.bytes.len() - already;
+            }
+            !write.expendable
+        });
+        self.queued -= unsent;
+        if self.pending.is_empty() {
+            self.write_started = None;
         }
     }
     /// The provider read input or wrote output, so it may be about to start
@@ -3819,6 +3857,7 @@ impl Actor {
             context.verify_directory(&self.working_directory)?;
         }
         for value in step.writes {
+            let expendable = self.adapter.expendable_write(&value);
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)
                 .map_err(|error| format!("Provider JSON request: {error}"))?;
@@ -3831,7 +3870,7 @@ impl Actor {
                 return Err("Provider stdin queue exceeds 64 MiB; no frames discarded".into());
             }
             self.queued += bytes.len();
-            self.pending.push_back(bytes);
+            self.pending.push_back(QueuedWrite { bytes, expendable });
             if self.write_started.is_none() {
                 self.write_started = Some(Instant::now());
             }

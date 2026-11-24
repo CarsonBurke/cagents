@@ -15455,6 +15455,8 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     // A refresh the reader asked for says why it got nothing.
     let refresh = adapter.command(Command::Refresh).unwrap();
     assert_eq!(refresh.writes[0]["request"].get("_cagents_automatic"), None);
+    // Losing it unread is losing the reader's input.
+    assert!(!adapter.expendable_write(&refresh.writes[0]));
     let asked = refresh.writes[0]["request_id"].as_str().unwrap().to_owned();
     let refused = adapter
         .receive(json!({"type":"control_response","response":{"subtype":"error","request_id":asked,"error":"Unsupported"}}))
@@ -15482,6 +15484,8 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         .find(|frame| frame["request"]["subtype"] == "get_context_usage")
         .unwrap();
     assert_eq!(asked["request"].get("_cagents_automatic"), None);
+    // A provider that exits before reading this one lost no input (#3888).
+    assert!(adapter.expendable_write(asked));
     let asked = asked["request_id"].as_str().unwrap().to_owned();
     let refused = adapter
         .receive(json!({"type":"control_response","response":{"subtype":"error","request_id":asked,"error":"Unsupported"}}))
