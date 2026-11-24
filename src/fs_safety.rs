@@ -763,7 +763,10 @@ pub fn directory_entries_beneath(
 
 /// The first `limit` direct child names of a retained directory, and whether
 /// it holds more, for a caller that handles an oversized directory itself.
-#[cfg(any(feature = "ui", all(test, feature = "host")))]
+#[cfg(any(
+    feature = "ui",
+    all(any(test, feature = "test-support"), feature = "host")
+))]
 pub(crate) fn first_entries_within(
     directory: &Root,
     limit: usize,
