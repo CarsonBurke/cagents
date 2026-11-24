@@ -226,10 +226,7 @@ impl Registry {
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
-        let view = views::store::owner(&self.db, pane)?
-            .map(|scope| views::store::read_stored(&self.db, &scope))
-            .transpose()?
-            .flatten();
+        let view = self.pane_view_in_snapshot(pane)?;
         snapshot.commit().map_err(|error| error.to_string())?;
         Ok(view)
     }
@@ -251,6 +248,28 @@ impl Registry {
         channel_row(&self.db, id)
     }
 
+    fn pane_view_in_snapshot(
+        &self,
+        pane: crate::model::CardId,
+    ) -> Result<Option<crate::workspace_model::views::View>, String> {
+        views::store::owner(&self.db, pane)?
+            .map(|scope| views::store::read_stored(&self.db, &scope))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn identity(&self) -> Result<Uuid, String> {
+        let identity: String = self
+            .db
+            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        identity
+            .parse()
+            .map_err(|error: uuid::Error| error.to_string())
+    }
+
     /// Metadata-only queries pin the same coherent WAL snapshot as full reads.
     pub(crate) fn metadata(
         &self,
@@ -261,15 +280,7 @@ impl Registry {
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
-        let identity: String = self
-            .db
-            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| error.to_string())?;
-        let identity = identity
-            .parse()
-            .map_err(|error: uuid::Error| error.to_string())?;
+        let identity = self.identity()?;
         let reply = match query {
             Query::Identity => Reply::Identity(identity),
             Query::Projects => Reply::Projects {

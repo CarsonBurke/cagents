@@ -12,6 +12,12 @@ pub(in crate::host) struct Binding {
     pub current: TerminalId,
 }
 
+pub(in crate::host) struct StartView {
+    pub identity: Uuid,
+    pub view: Option<crate::workspace_model::views::View>,
+    pub retired: bool,
+}
+
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "CREATE TABLE pane_chat_starts(
@@ -28,6 +34,27 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
 }
 
 impl Registry {
+    /// Read the live owner or a retained tombstone in one SQLite snapshot.
+    pub(in crate::host) fn pane_chat_start_view(&self, pane: CardId) -> Result<StartView, String> {
+        let snapshot = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let identity = self.identity()?;
+        let view = self.pane_view_in_snapshot(pane)?;
+        // Transfers leave a tombstone in the former scope. The current owner
+        // takes precedence and requires no scan of retired panes.
+        let retired = view.is_none()
+            && self
+                .db
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM retired_panes WHERE pane=?1)")
+                .and_then(|mut stmt| stmt.query_row([pane.to_string()], |row| row.get(0)))
+                .map_err(|e| e.to_string())?;
+        snapshot.commit().map_err(|e| e.to_string())?;
+        Ok(StartView {
+            identity,
+            view,
+            retired,
+        })
+    }
+
     pub(in crate::host) fn pane_chat_start(&self, pane: CardId) -> Result<Option<Binding>, String> {
         let raw: Option<(String, String)> = self
             .db
