@@ -1,4 +1,5 @@
 use super::fields::{self, Detail, Row as Fields};
+use super::format::listing_output;
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
@@ -53,8 +54,10 @@ pub(super) fn whoami(arguments: FieldsArgs) -> Result<CommandOutput, AppError> {
     let now = now_ms();
     Ok(listing_output(
         "whoami",
-        || whoami_human(&directory, &peers, &super::format::program(), now),
-        || {
+        &directory,
+        super::human_output(),
+        |directory| whoami_human(directory, &peers, &super::format::program(), now),
+        |directory| {
             listing_json(
                 json!({ "scope": fields::word(&directory.scope) }),
                 directory.caller.iter().chain(peers.iter().copied()),
@@ -170,8 +173,10 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     let now = now_ms();
     Ok(listing_output(
         "sessions",
-        || sessions_human(&directory, &unshown, &super::format::program(), now),
-        || {
+        &directory,
+        super::human_output(),
+        |directory| sessions_human(directory, &unshown, &super::format::program(), now),
+        |directory| {
             let mut data = listing_json(
                 json!({ "scope": fields::word(&directory.scope) }),
                 directory.caller.iter().chain(&directory.sessions),
@@ -185,23 +190,6 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
             data
         },
     ))
-}
-
-fn listing_output(
-    command: &'static str,
-    human: impl FnOnce() -> String,
-    data: impl FnOnce() -> Value,
-) -> CommandOutput {
-    let (human, data) = if super::human_output() {
-        (human(), Value::Null)
-    } else {
-        (String::new(), data())
-    };
-    CommandOutput {
-        command,
-        human,
-        data,
-    }
 }
 
 /// Marks each listed row no saved pane shows with `"no_pane": true`.
@@ -628,16 +616,18 @@ fn members(channel: Option<ChannelId>, selected: &[String]) -> Result<CommandOut
         Reply::Members(members) => Some(members),
         _ => None,
     })?;
-    let Members {
-        channel,
-        caller,
-        sessions,
-    } = &members;
     let now = now_ms();
     Ok(listing_output(
         "sessions",
-        || members_human(&members, &super::format::program(), now),
-        || {
+        &members,
+        super::human_output(),
+        |members| members_human(members, &super::format::program(), now),
+        |members| {
+            let Members {
+                channel,
+                caller,
+                sessions,
+            } = members;
             listing_json(
                 json!({ "channel": channel }),
                 caller.iter().chain(sessions),
