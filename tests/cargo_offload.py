@@ -686,7 +686,7 @@ class StandInHost(unittest.TestCase):
         python_tools.mkdir()
         (python_tools / "python3").symlink_to(Path(sys.executable).resolve())
         for name in ("build-host", "cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
-                     "cargo-offload", "memory-capped"):
+                     "cargo-incremental-retry.py", "cargo-offload", "memory-capped"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
         (tools / "ssh").write_text(STAND_IN_SSH)
         (tools / "ssh").chmod(0o755)
@@ -2023,7 +2023,7 @@ def incremental_session(slot, crate, *, age, size=64 * 1024, profile="debug"):
 
 # What a gate sends the build host to run each command with.
 TOOLS = {name: (ROOT / "scripts" / name).read_text()
-         for name in ("build-host", "memory-capped", "cargo-gate-rustc-guard")}
+         for name in ("build-host", "memory-capped", "cargo-gate-rustc-guard", "cargo-incremental-retry.py")}
 
 
 def wait_until(condition, timeout=HANG_GUARD):
@@ -2048,6 +2048,45 @@ class RemoteRun(unittest.TestCase):
                               "CAGENTS_BUILD_LOCK": str(Path(scope.name, "shares.lock")),
                               "CAGENTS_BUILD_SLOTS": "4", "CAGENTS_BUILD_SCOPE": "0"}
             | (env or {}), **options)
+
+    def test_a_build_repairs_interrupted_state_before_cargo_runs(self):
+        with FixtureDirectory() as scope:
+            slot = Path(scope.name, "slot-0")
+            target = slot / "src/target"
+            build = target / "intermediates"
+            (build / "local/incremental").mkdir(parents=True)
+            (build / ".cagents-incremental-verified").write_text("epoch\n")
+            package = {"id": "probe", "manifest_path": str(slot / "src/Cargo.toml")}
+            metadata = {"target_directory": str(target), "build_directory": str(build),
+                        "workspace_members": ["probe"], "packages": [package]}
+            cargo = slot / "cargo"
+            cargo.write_text(f"#!/bin/sh\ntest \"$1\" = metadata\nprintf '%s\\n' '{json.dumps(metadata)}'\n")
+            cargo.chmod(0o755)
+            for previous in ("checkout-a", "checkout-b"):
+                with self.subTest(previous=previous):
+                    # The next command may come from another worktree or be
+                    # another command within the same hold, with no new trim.
+                    owner = slot / "owner"
+                    owner.write_text(previous + "\n")
+                    (slot / "incremental-epoch").write_text(f"{owner.stat().st_mtime_ns} epoch\n")
+                    crate = build / "local/incremental/probe-1"
+                    (crate / "s-a-0-finished").mkdir(parents=True)
+                    (crate / "s-b-0-working").mkdir()
+                    healthy = build / "local/incremental/healthy-1/s-a-0-finished"
+                    healthy.mkdir(parents=True, exist_ok=True)
+                    host = ("import os\n"
+                            f"assert not os.path.exists({str(crate)!r})\n"
+                            f"assert os.path.isdir({str(healthy)!r})\n"
+                            f"assert os.environ['CAGENTS_BUILD_OFFLOAD_BUILD_DIR'] == {str(build)!r}\n")
+                    agent = self.agent(scope, "run", str(slot), ".", str(cargo), "check",
+                                       stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                    request = {"environment": {}, "tools": {"build-host": host},
+                               "metadata": [[], []]}
+                    agent.stdin.write(json.dumps(request).encode() + b"\n")
+                    agent.stdin.flush()
+                    self.assertEqual(agent.wait(timeout=HANG_GUARD), 0, agent.stderr.read().decode())
+                    agent.stdin.close()
+                    self.assertFalse(crate.exists())
 
     def test_the_build_host_uses_the_fixtures_private_gate(self):
         for override in (False, True):
@@ -2449,8 +2488,65 @@ class Trim(unittest.TestCase):
         self.slot = Path(directory.name, "slot-0")
         self.slot.mkdir()
 
+    def repair_incremental(self, build, epoch="epoch"):
+        # Exercise the rename without launching an idle remover in this process.
+        repair = self.agent["repair_incremental"]
+        with patch.dict(repair.__globals__, {"remove_evicted": lambda _slots: None}):
+            return repair(str(self.slot), str(build), epoch)
+
     def trim(self, budget, pressed=False):
         return self.agent["trim"](str(self.slot), budget, pressed)
+
+    def test_incremental_repair_evicts_legacy_state_once_but_keeps_compiled_outputs(self):
+        build = self.slot / "src/target"
+        output = build / "debug/deps/libcached.rlib"
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"compiled")
+        legacy = incremental_session(self.slot, "legacy-1", age=60)
+        self.assertTrue(self.repair_incremental(build))
+        self.assertFalse(legacy.exists())
+        fresh = incremental_session(self.slot, "fresh-2", age=10)
+        self.assertTrue(self.repair_incremental(build))
+        self.assertTrue(fresh.exists())
+        self.assertEqual(output.read_bytes(), b"compiled")
+        # A lease from an older gate cannot attest to what it built.
+        self.assertTrue(self.repair_incremental(build, "new epoch"))
+        self.assertFalse(fresh.exists())
+        self.assertEqual(output.read_bytes(), b"compiled")
+
+    def test_incremental_repair_evicts_the_crate_with_an_overwritten_finalized_session(self):
+        build = self.slot / "src/target"
+        self.assertTrue(self.repair_incremental(build))
+        clean = incremental_session(self.slot, "clean-1", age=60)
+        completed = clean / "s-b-0-finished"
+        next(path for path in clean.iterdir() if path.is_dir()).rename(completed)
+        keys = completed / "thin-lto-past-keys.bin"
+        keys.touch()
+        os.utime(keys, (1, 1))
+        (completed / "work-products.bin").touch()
+        (clean / "s-a-0-working").mkdir()
+        for artifact in ("thin-lto-past-keys.bin", "codegen-unit.pre-lto.bc"):
+            with self.subTest(artifact=artifact):
+                crate = incremental_session(self.slot, "damaged-2", age=60,
+                                            profile="build-triple/local")
+                finalized = crate / "s-a-0-finished"
+                next(path for path in crate.iterdir() if path.is_dir()).rename(finalized)
+                index = finalized / "work-products.bin"
+                index.touch()
+                working = crate / "s-zzzzzzzz-0-working"
+                working.mkdir()
+                saved = finalized / artifact
+                saved.write_bytes(b"previous build")
+                linked = working / artifact
+                os.link(saved, linked)
+                linked.write_bytes(b"interrupted build")
+                # The check also handles an orphan that was already cleaned.
+                shutil.rmtree(working)
+                os.utime(index, (1, 1))
+                self.assertEqual(saved.read_bytes(), b"interrupted build")
+                self.assertTrue(self.repair_incremental(build))
+                self.assertFalse(crate.exists())
+                self.assertTrue(clean.exists())
 
     def session_size(self, crate):
         """What trim counts for `crate`: what its sessions hold, not the

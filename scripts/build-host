@@ -146,6 +146,7 @@ PROBE_SECONDS = 60
 PROBED = ("build", "b", "check", "c", "clippy")
 # The compiler wrapper that ends a probe at its first compile.
 PROBE_WRAPPER = os.path.join(HERE, "cargo-gate-rustc-guard")
+RETRY_WRAPPER = os.path.join(HERE, "cargo-incremental-retry.py")
 
 
 def say(message):
@@ -1025,6 +1026,7 @@ class Build:
     def __init__(self, shares, deadline, runner=None):
         self.shares, self.deadline, self.runner = shares, deadline, runner
         self.probe = None
+        self.retry_links = False
 
     def complete(self, steps, probed=False):
         """Runs `steps`, which build with `run`, and returns what they return.
@@ -1089,10 +1091,13 @@ class Build:
             raise SystemExit(124)
 
     def run(self, command, capture=False):
+        environment = os.environ
+        if self.retry_links:
+            environment = dict(environment, RUSTC_WRAPPER=RETRY_WRAPPER)
         if self.probe:
-            return self.probe.run(command, build_environment(os.environ, None), capture)
+            return self.probe.run(command, build_environment(environment, None), capture)
         auth = self.jobserver.auth if self.jobserver else None
-        return run(command, build_environment(os.environ, auth), self.scoped,
+        return run(command, build_environment(environment, auth), self.scoped,
                    group=not self.nested, capture=capture, idle=idle())
 
 
@@ -1150,6 +1155,50 @@ def probed(arguments, index, tests):
             and arguments[first:first + 1] in [[name] for name in (*PROBED, "test", "bench")])
 
 
+def retry_links(arguments):
+    """Use the retry wrapper only in a leased slot and only as a default."""
+    if (not os.environ.get("CAGENTS_BUILD_OFFLOAD_BUILD_DIR")
+            or not os.environ.get("CAGENTS_BUILD_OFFLOAD_WORKSPACE_DIRS")
+            or not os.access(RETRY_WRAPPER, os.X_OK)
+            or "RUSTC_WRAPPER" in os.environ or "CARGO_BUILD_RUSTC_WRAPPER" in os.environ):
+        return False
+    from pathlib import Path
+    try:
+        import tomllib
+    except ImportError:
+        return False
+
+    def specifies_wrapper(config):
+        # An include might supply a wrapper as well: leave that configuration
+        # to Cargo, along with files we cannot read or interpret.
+        return ("include" in config or "rustc-wrapper" in config.get("build", {})
+                or {"RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"}.intersection(config.get("env", {})))
+
+    here = Path.cwd()
+    cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    folders = [cargo_home, *(parent / ".cargo" for parent in (here, *here.parents))]
+    configs = [folder / name for folder in folders for name in ("config", "config.toml")]
+    try:
+        options = iter(arguments)
+        for option in options:
+            if option == "--":
+                break
+            if option == "--config":
+                value = next(options, "")
+            elif option.startswith("--config="):
+                value = option.partition("=")[2]
+            else:
+                continue
+            if "=" not in value:
+                configs.append(Path(value))
+            elif specifies_wrapper(tomllib.loads(value)):
+                return False
+        return not any(specifies_wrapper(tomllib.loads(path.read_text(encoding="utf-8")))
+                       for path in configs if path.is_file())
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def cargo_command(build, cargo, arguments):
     index = 1 if arguments[:1] and arguments[0].startswith("+") else 0
     if arguments[index:index + 1] and arguments[index] in ALIASES:
@@ -1157,6 +1206,7 @@ def cargo_command(build, cargo, arguments):
     tests = runs_tests(arguments, index)
     if build.runner and arguments[index:index + 1] in (["run"], ["test"], ["bench"]):
         arguments = [*arguments[:index + 1], "--config", build.runner, *arguments[index + 1:]]
+    build.retry_links = retry_links(arguments)
     index = separate(arguments)
 
     def steps():
