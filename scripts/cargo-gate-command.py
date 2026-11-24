@@ -49,6 +49,76 @@ def admission_expired(deadline):
     return 0
 
 
+POLL_SECONDS = 0.02
+# inotify_init1's flags are the open(2) flags of the same names.
+INOTIFY_FLAGS = 0o4000 | 0o2000000  # IN_NONBLOCK | IN_CLOEXEC
+# A receipt is created, written and closed, or renamed into place.
+RECEIPT_EVENTS = 0x2 | 0x8 | 0x80 | 0x100  # MODIFY, CLOSE_WRITE, MOVED_TO, CREATE
+
+
+class Wakeups:
+    """Sleep until something the supervision loop checks may have changed.
+
+    Supervising a build used to wake fifty times a second for as long as it
+    ran, and a gate's waiting commands each kept one of these. What the loop
+    checks is announced by the kernel instead: the primary's exit by its
+    pidfd, an adopted descendant's exit and a direct cancellation by a signal,
+    through the signal wakeup descriptor, and the receipt by inotify on its
+    directory. The only timeout left is the admission deadline. Whatever is
+    unavailable falls back to the former interval, never to sleeping on.
+    """
+
+    def __init__(self, receipt, ctypes, libc, os, signal):
+        self.os, self.select = os, __import__("select")
+        self.descriptors = []
+        self.polling = False
+        reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.descriptors.append(reader)
+        # PEP 475 retries a select a handler interrupted, so a handler alone
+        # wakes nothing: the wakeup descriptor makes the signal readable.
+        signal.set_wakeup_fd(writer, warn_on_full_buffer=False)
+        # A handler, unlike SIG_IGN, still leaves children to be reaped, and
+        # exec restores the default for the command.
+        signal.signal(signal.SIGCHLD, lambda _number, _frame: None)
+        self.receipt_watch = None
+        try:
+            # /dev/null, as a wrapper passes, is never written: nothing to watch.
+            if not receipt.exists() or receipt.is_file():
+                watch = libc.inotify_init1(INOTIFY_FLAGS)
+                if watch < 0:
+                    raise OSError(ctypes.get_errno(), "inotify unavailable")
+                if libc.inotify_add_watch(watch, bytes(receipt.parent), RECEIPT_EVENTS) < 0:
+                    error = ctypes.get_errno()
+                    os.close(watch)
+                    raise OSError(error, "cannot watch the receipt")
+                self.receipt_watch = watch
+                self.descriptors.append(watch)
+        except OSError:
+            self.polling = True
+
+    def watch_exit(self, pid):
+        try:
+            self.descriptors.append(self.os.pidfd_open(pid))
+        except (AttributeError, OSError):
+            # SIGCHLD still wakes us, but a missed one must not hang the loop.
+            self.polling = True
+
+    def wait(self, deadline):
+        timeout = POLL_SECONDS if self.polling else None
+        if deadline is not None:
+            remaining = max(0, deadline - time.monotonic_ns()) / 1e9
+            timeout = remaining if timeout is None else min(timeout, remaining)
+        ready, _, _ = self.select.select(self.descriptors, [], [], timeout)
+        for descriptor in ready:
+            if descriptor == self.descriptors[0] or descriptor == self.receipt_watch:
+                try:
+                    while self.os.read(descriptor, 4096):
+                        pass
+                except BlockingIOError:
+                    pass
+        # A readable pidfd stays readable; the loop finds the exit next.
+
+
 def main():
     # Clock-only admission checks do not need command supervision's imports.
     import ctypes
@@ -115,6 +185,8 @@ def main():
             os.kill(os.getpid(), cancellation)
         return 128 + cancellation
 
+    # Watched before the first read, so a receipt written after it wakes us.
+    wakeups = Wakeups(receipt, ctypes, libc, os, signal)
     if cancellation_requested():
         return cancelled_status()
     if admission_expired(admission_deadline):
@@ -188,6 +260,7 @@ def main():
                 return
             time.sleep(0.02)
 
+    wakeups.watch_exit(primary.pid)
     try:
         while True:
             if cancellation_requested():
@@ -204,7 +277,7 @@ def main():
                 status = primary.wait()
                 return status if status >= 0 else 128 - status
             reap_exited_adoptees()
-            time.sleep(0.02)
+            wakeups.wait(admission_deadline)
     except BaseException:
         # A supervisor failure after launch must not release a live build.
         drain()
