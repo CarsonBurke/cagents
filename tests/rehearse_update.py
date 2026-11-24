@@ -1233,6 +1233,78 @@ class ShownUpdateOutcome(unittest.TestCase):
         self.assertEqual(run.shown_update_outcome({"main": self.observation("Updated to cagents 1.9.0")}, "2.0.0"),
                          ({}, []))
 
+    def test_a_notices_control_fails_on_an_error_or_an_update_warning_only(self):
+        import rehearse_update_run as run
+        self.assertEqual(run.notices_problem("Application errors", "Could not open a file", "2.0.0"),
+                         "Application errors")
+        self.assertIsNone(run.notices_problem("Application notices: success", "Updated to cagents 2.0.0", "2.0.0"))
+        self.assertEqual(run.notices_problem("Application notices",
+                                             "The update couldn't reopen every saved session, so", "2.0.0"),
+                         "Application notices")
+        self.assertIsNone(run.notices_problem("Application notices", "Provider login expires soon", "2.0.0"))
+        self.assertEqual(run.shown_update_outcome({"main": self.observation("Updated to cagents 2.0.41")}, "2.0.4"),
+                         ({}, []))
+
+    def rehearsal(self, root, status, tooltips, shown=None):
+        """A rehearsal whose one window shows SHOWN while watched, then TOOLTIPS[x] when its header is hovered at x."""
+        import rehearse_update_run as run
+        state = root / "home/.local/share/cagents-install/.update"
+        state.mkdir(parents=True)
+        (state / "status.json").write_text(json.dumps(status))
+        rehearsal = run.Rehearsal.__new__(run.Rehearsal)
+        rehearsal.root, rehearsal.errors = root, []
+        rehearsal.update_worker_running = lambda: False
+        rehearsal.mapped = lambda: {"main": {"id": 1}}
+        rehearsal.actions = []
+        pointer = {"x": None, "popover": False}
+        def call(*args, **_):
+            rehearsal.actions.append(args)
+            if args[:2] == ("drive", "hover"):
+                pointer["x"] = int(args[2].split(",")[0])
+            elif args[:2] == ("drive", "click"):
+                pointer["popover"] = True
+            elif args[:2] == ("drive", "key"):
+                pointer["popover"] = False
+            elif args[:2] == ("drive", "--json"):
+                text = tooltips.get(pointer["x"], shown or "Channels")
+                if pointer["popover"]:
+                    text = tooltips.get("popover", "")
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": text}]})
+            return 0, ""
+        rehearsal.call = call
+        return rehearsal
+
+    def test_a_failure_only_in_a_header_tooltip_fails_the_rehearsal(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Failed", "version": "2.0.0"},
+                                       {1136: "Update failed: protocol 203. Check again"})
+            with patch.object(run.time, "sleep"):
+                failed, _ = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual(failed, {"main": "Update failed"})
+            self.assertIn('main window shows "Update failed"', rehearsal.errors[0])
+            self.assertIn(("drive", "hover", "1136,21"), rehearsal.actions)
+
+    def test_a_success_notice_is_opened_read_and_closed_and_does_not_fail(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"},
+                                       {1136: "Application notices: success",
+                                        "popover": "Updated to cagents 2.0.0"})
+            with patch.object(run.time, "sleep"):
+                failed, updated = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual((failed, updated, rehearsal.errors), ({}, ["main"], []))
+            self.assertIn(("drive", "key", "Escape"), rehearsal.actions)
+
+    def test_a_window_never_observed_is_an_unknown_outcome(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"}, {})
+            rehearsal.mapped = lambda: {"main": {"id": 2}}
+            with patch.object(run.time, "sleep"):
+                rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertIn("main window could not be observed", rehearsal.errors[0])
+
     def test_watching_waits_for_the_worker_to_exit_before_settling(self):
         import rehearse_update_run as run
         with tempfile.TemporaryDirectory() as directory:

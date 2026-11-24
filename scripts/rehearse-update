@@ -396,7 +396,7 @@ cmd_update() {
             die "the feed serves a different $name than DIR" 2
         [ ! -e "$prefix/versions/$version" ] && [ ! -L "$prefix/versions/$version" ] ||
             die "$prefix/versions/$version exists; the in-app update installs it" 2
-        staged_cli=cagents
+        staged_cli=$user_home/.local/bin/cagents
         upgrade_args=(--version "$version" "${upgrade_args[@]}")
         printf 'updating in the app from the feed to %s\n' "$version" | tee -a "$transcript"
     elif [ "$use_staged" -eq 1 ]; then

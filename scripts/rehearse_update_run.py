@@ -293,6 +293,41 @@ def update_completed(root, version):
 SHOWN_UPDATE_FAILURES = ('Update failed', 'Update not installed')
 
 
+# An older worker's verdict on a successor whose protocol it does not know:
+# the update installed and NEW serves, yet OLD records Failed (#3877).
+OLD_PROTOCOL_VERDICT = re.compile(r'uses protocol \d+; live updates support only')
+
+# What hovering a header control can say that the person would read as the
+# update going wrong: the update control's failure or retry labels, and the
+# notices control of a window holding an error or warning.
+HEADER_PROBLEMS = (*SHOWN_UPDATE_FAILURES, 'reopen windows to use it', 'Application errors',
+                   'Application notices')
+
+
+# What a warning in the notices popover says when the update went wrong:
+# the retained-sessions hold, or a failure or refusal.
+UPDATE_WARNINGS = re.compile(r"Update (failed|not installed)|couldn.?t reopen every saved session|"
+                             r"has not been verified|reopen windows to use it", re.I)
+
+
+def notices_problem(tooltip, popover, version):
+    """Whether an opened notices control shows the update going wrong.
+
+    After an update any error is one. A success control is not; a warning
+    is only when it speaks of the update (UPDATE_WARNINGS).
+    """
+    if visible_phrase(tooltip, 'Application errors'):
+        return 'Application errors'
+    if visible_phrase(tooltip, 'Application notices success'):
+        return None
+    return 'Application notices' if UPDATE_WARNINGS.search(popover) else None
+
+
+def header_problem(words):
+    """The first HEADER_PROBLEMS phrase WORDS show, or None."""
+    return next((phrase for phrase in HEADER_PROBLEMS if visible_phrase(words, phrase)), None)
+
+
 def shown_update_outcome(observations, version):
     """Reads one round of window observations as the person would.
 
@@ -306,7 +341,8 @@ def shown_update_outcome(observations, version):
         if shown:
             failed[slot] = shown[0]
         # visible_phrase reads letters only, so the version is matched apart.
-        if visible_phrase(words, 'Updated to cagents') and version in words:
+        if (visible_phrase(words, 'Updated to cagents')
+                and re.search(rf'(?<![\w.]){re.escape(version)}(?![\w]|\.\d)', words)):
             updated.append(slot)
     return failed, updated
 
@@ -1084,6 +1120,54 @@ class Rehearsal:
         Path(output).write_text(json.dumps(observed, indent=2, sort_keys=True)+'\n')
         return observed
 
+    def observe_window(self, window):
+        """Focuses WINDOW and observes its text, or None if another was observed."""
+        self.call('wm', 'action', 'focus-window', '--id', window['id'])
+        _, text = self.call('drive', '--json', 'observe', timeout=30)
+        observation = json.loads(text)
+        return observation if observation['window']['id'] == window['id'] else None
+
+    def inspect_header(self, slot, window, *, row=21, step=24, span=420, right=120):
+        """Hovers each place a control can sit in WINDOW's header, right to
+        left from just before the window controls, and reads what it says.
+
+        The update control's label ("Update failed: …") and the notices
+        control's ("Application errors") are tooltips only; a notices
+        control is also opened, and its popover read, then closed.
+        """
+        evidence = {'observed': False, 'controls': [], 'updated': False}
+        observation = self.observe_window(window)
+        if observation is None:
+            return evidence
+        evidence['observed'] = True
+        width = observation['window']['size'][0]
+        seen = set()
+        for x in range(width-right, max(width-right-span, 0), -step):
+            self.call('drive', 'hover', f'{x},{row}', timeout=30)
+            observation = self.observe_window(window)
+            if observation is None:
+                evidence['observed'] = False
+                break
+            words = ' '.join(run.get('text','') for run in observation.get('runs',[]))
+            problem = header_problem(words)
+            if problem is None or problem in seen:
+                continue
+            seen.add(problem)
+            control = {'x': x, 'problem': problem, 'words': words}
+            if problem.startswith('Application'):
+                self.call('drive', 'click', f'{x},{row}', timeout=30)
+                opened = self.observe_window(window)
+                popover = ' '.join(run.get('text','') for run in (opened or {}).get('runs',[]))
+                control['popover'] = popover
+                self.call('drive', 'key', 'Escape', timeout=30)
+                control['problem'] = notices_problem(words, popover, self.update_version)
+                evidence['updated'] = evidence['updated'] or bool(shown_update_outcome(
+                    {slot: {'runs': [{'text': popover}]}}, self.update_version)[1])
+            evidence['controls'].append(control)
+        self.call('drive', 'hover', '850,750', timeout=30, check=False)
+        self.call('shot', f'after-update-header-{slot}', timeout=45, check=False)
+        return evidence
+
     def update_worker_running(self):
         """Whether this private user's `cagents update-worker` still runs."""
         for entry in Path('/proc').iterdir():
@@ -1109,9 +1193,10 @@ class Rehearsal:
         so it is recorded when seen but not required. Watching goes on until
         the worker's job is terminal and SETTLE seconds have passed.
         """
+        self.update_version = version
         output = self.root/'records/after/update-shown.json'
         output.parent.mkdir(parents=True, exist_ok=True)
-        rounds, failed, updated = [], {}, set()
+        rounds, failed, updated, unobserved, headers = [], {}, set(), set(), {}
         deadline = time.monotonic()+limit
         settled_at = None
         while time.monotonic() < deadline:
@@ -1119,13 +1204,12 @@ class Rehearsal:
             phase = (status or {}).get('phase')
             working = self.update_worker_running()
             observations = {}
-            for slot, window in sorted(self.mapped().items()):
-                if slot == 'ceditor':
-                    continue
-                self.call('wm', 'action', 'focus-window', '--id', window['id'])
-                _, text = self.call('drive', '--json', 'observe', timeout=30)
-                observation = json.loads(text)
-                if observation['window']['id'] == window['id']:
+            mapped = {slot: window for slot, window in self.mapped().items() if slot != 'ceditor'}
+            for slot, window in sorted(mapped.items()):
+                observation = self.observe_window(window)
+                if observation is None:
+                    unobserved.add(slot)
+                else:
                     observations[slot] = observation
             shown_failed, shown_updated = shown_update_outcome(observations, version)
             rounds.append({'at': time.time(), 'phase': phase, 'worker': working, 'failed': shown_failed, 'updated': shown_updated,
@@ -1148,7 +1232,24 @@ class Rehearsal:
             time.sleep(.5)
         else:
             self.errors.append(f'the update job never settled within {limit:.0f} s of the windows reopening')
+        if not failed:
+            # Neither the update control's label nor the notices are on the
+            # screen until hovered or opened, so read each header control.
+            for slot, window in sorted(self.mapped().items()):
+                if slot == 'ceditor':
+                    continue
+                headers[slot] = self.inspect_header(slot, window)
+                problem = next((row for row in headers[slot]['controls'] if row['problem']), None)
+                if problem:
+                    failed[slot] = problem['problem']
+                    self.call('shot', f'after-update-shown-failed-{slot}', timeout=45, check=False)
+                updated.update([slot] if headers[slot]['updated'] else [])
+                if not headers[slot]['observed']:
+                    unobserved.add(slot)
+        for slot in sorted(unobserved):
+            self.errors.append(f'the reopened {slot} window could not be observed; its update outcome is unknown')
         output.write_text(json.dumps({'version': version, 'failed': failed, 'updated': sorted(updated),
+                                      'unobserved': sorted(unobserved), 'headers': headers,
                                       'rounds': rounds}, indent=2, sort_keys=True)+'\n')
         for slot, phrase in sorted(failed.items()):
             self.errors.append(f'the reopened {slot} window shows "{phrase}"; see {output}')
@@ -2049,7 +2150,9 @@ class Rehearsal:
                 # On the in-app path OLD's CLI follows OLD's worker, whose
                 # record may call an update Failed that NEW's windows accept
                 # (#3877). NEW serving and NEW's windows decide; the exit is noted.
-                if code:
+                if code == 124:
+                    self.errors.append('the in-app update timed out')
+                elif code:
                     self.notes.append(f'OLD\'s `daemon upgrade` exited {code}')
                 serving_code, serving = self.cli('--no-start','daemon','status',check=False)
                 if (serving_code or serving.get('data',{}).get('running') is not True
@@ -2067,11 +2170,9 @@ class Rehearsal:
                 # may record Failed for an update NEW's windows rightly accept.
                 _, self.shown_updated = self.watch_shown_update(args.new_version)
                 incomplete = update_completed(self.root,args.new_version)
-                if incomplete and args.feed:
-                    self.notes += [f'OLD\'s worker recorded: {reason}' for reason in incomplete]
-                    self.notes.append('the reopened windows showed no update failure')
-                else:
-                    self.errors.extend(incomplete)
+                known = [reason for reason in incomplete if args.feed and OLD_PROTOCOL_VERDICT.search(reason)]
+                self.notes += [f'OLD\'s worker recorded (#3877): {reason}' for reason in known]
+                self.errors += [reason for reason in incomplete if reason not in known]
                 self.notes.append('a window confirmed "Updated to cagents '+args.new_version+'": '
                                   +(', '.join(self.shown_updated) or 'none seen'))
             # The shared recovery verifier qualifies paused presentations before

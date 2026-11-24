@@ -2772,7 +2772,8 @@ runs the whole update, including the checks after NEW starts. Add `--feed DIR`
 to rehearse that path: DIR is a file feed holding NEW's signed bundle
 (`scripts/release feed`), and the feed's archive must match `--new-dir`. OLD's
 own `cagents daemon upgrade --version NEW` then finds NEW in the feed and starts
-the same update worker as the app's Update button. A rehearsal or development
+the update worker the app's Update button starts; the CLI, rather than a window,
+answers its review. A rehearsal or development
 build reads the feed as `CAGENTS_UPDATE_FEED`. An unmodified published build
 ignores that variable and asks github.com, and the private user's curl answers
 those release URLs from the feed, so the published previous release can be the
@@ -2781,14 +2782,18 @@ OLD side when NEW's bundle carries a signature from a key in
 staged path, an update that exits 0 passes only when its status ends `Complete`
 for NEW with no refusal. On the in-app path OLD's worker writes that status and
 OLD's CLI exits on it, and a worker older than NEW may record Failed for an
-update NEW's windows rightly accept (#3877). There NEW must be serving, every
-window must reopen on NEW, and no window may show "Update failed" or "Update not
-installed" while the harness watches them, from their reopening until the worker
-has exited and 12 seconds more (`records/after/update-shown.json`). The report's
-Notes keep OLD's verdict and whether a window confirmed "Updated to cagents
-NEW". Add `--empty-window` to open a third window holding nothing: reopened, it
-reports ready at once, so its first read of the status races OLD's worker still
-verifying NEW.
+update NEW's windows rightly accept (#3877). There NEW must be serving and every
+window must reopen on NEW. No window may show "Update failed" or "Update not
+installed" from reopening until the worker has exited and 12 seconds more.
+After that, the harness hovers each header control to read its tooltip, and
+opens any notices control. An update control asking to retry or reopen fails
+the run, and so do any error notice and any warning about the update. All of
+it is kept in `records/after/update-shown.json`. Only OLD's protocol refusal
+of NEW becomes a note in the report; any other status that is not `Complete`
+still fails the run. The Notes also say whether a window confirmed "Updated to
+cagents NEW". Add `--empty-window` to open a third window holding nothing:
+reopened, it reports ready at once, so its first read of the status races
+OLD's worker still verifying NEW.
 
 `init` refuses a root with a `.git` in its ancestry, as recovery storage does.
 A sandbox that masks `.git` in its writable roots (Codex's does) leaves an empty
