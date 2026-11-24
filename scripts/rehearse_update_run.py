@@ -325,13 +325,15 @@ UPDATE_WARNINGS = re.compile(r"Update (failed|not installed)|couldn.?t reopen ev
                              r"has not been verified|reopen windows to use it", re.I)
 
 
-def notices_problem(tooltip, popover, version):
+def notices_problem(tooltip, popover, version, *, any_error=True):
     """Whether an opened notices control shows the update going wrong.
 
-    After an update any error is one. A success control is not; a warning
-    is only when it speaks of the update (UPDATE_WARNINGS).
+    Right after an update any error is one. A success control is not; a
+    warning is only when it speaks of the update (UPDATE_WARNINGS), and so
+    is an error without ANY_ERROR: after a deliberate restart, terminals
+    whose daemon stopped rightly say so.
     """
-    if visible_phrase(tooltip, 'Application errors'):
+    if visible_phrase(tooltip, 'Application errors') and (any_error or UPDATE_WARNINGS.search(popover)):
         return 'Application errors'
     if visible_phrase(tooltip, 'Application notices success'):
         return None
@@ -1166,7 +1168,7 @@ class Rehearsal:
         return None
 
     def inspect_header(self, slot, window, *, row=HEADER['row'], step=HEADER['step'], span=HEADER['span'],
-                       right=HEADER['right'], shot='after-update-header'):
+                       right=HEADER['right'], shot='after-update-header', any_error=True):
         """Hovers each place a control can sit in WINDOW's header, right to
         left from just before the window controls, and reads what it says.
 
@@ -1208,7 +1210,7 @@ class Rehearsal:
                         or visible_phrase(after, 'Application notices')):
                     control['unread'] = True
                     evidence['observed'] = False
-                control['problem'] = notices_problem(words, popover, self.update_version)
+                control['problem'] = notices_problem(words, popover, self.update_version, any_error=any_error)
                 evidence['updated'] = evidence['updated'] or bool(shown_update_outcome(
                     {slot: {'runs': [{'text': popover}]}}, self.update_version)[1])
             evidence['controls'].append(control)
@@ -1230,7 +1232,7 @@ class Rehearsal:
                 return True
         return False
 
-    def watch_shown_update(self, version, *, settle=12, limit=180, name='update-shown'):
+    def watch_shown_update(self, version, *, settle=12, limit=180, name='update-shown', any_error=True):
         """Watches every reopened window until the update has settled, and
         fails the rehearsal if any of them shows the update as failed.
 
@@ -1286,7 +1288,7 @@ class Rehearsal:
             for slot, window in sorted(self.mapped().items()):
                 if slot == 'ceditor':
                     continue
-                headers[slot] = self.inspect_header(slot, window, shot=f'after-{name}-header')
+                headers[slot] = self.inspect_header(slot, window, shot=f'after-{name}-header', any_error=any_error)
                 problem = next((row for row in headers[slot]['controls'] if row['problem']), None)
                 if problem:
                     failed[slot] = problem['problem']
@@ -1345,7 +1347,16 @@ class Rehearsal:
         if (serving.get('data',{}).get('running') is not True or serving.get('data',{}).get('daemon_version') != version
                 or not successor or successor == owner):
             self.errors.append(f'a fresh NEW {version} daemon is not serving after the restart following the update')
-        failed, updated = self.watch_shown_update(version,settle=settle,name='update-shown-after-restart')
+        # Stopping the daemon ends its terminals, as a reboot does, and the
+        # windows rightly say so; only what they say of the update counts.
+        failed, updated = self.watch_shown_update(version,settle=settle,name='update-shown-after-restart',
+                                                  any_error=False)
+        shown = json.loads((self.root/'records/after/update-shown-after-restart.json').read_text())
+        for slot, header in sorted(shown['headers'].items()):
+            for control in header['controls']:
+                if control.get('popover') and not control['problem'] and visible_phrase(control['words'], 'Application errors'):
+                    self.notes.append(f'after the restart the {slot} window holds errors not about the update: '
+                                      +control['popover'][:400])
         after, _ = update_status(self.root)
         phases = [(row or {}).get('phase') for row in (before, after)]
         self.errors += [f'after the restart following the update, {reason}'
