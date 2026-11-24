@@ -170,8 +170,9 @@ JOBS = (
         Suite("pull request landing", "tests/land_pr.py",
               sources=("scripts/land-pr", "scripts/check-older-clients")),
         Suite("output token counts", "tests/output_tokens.py", sources=("scripts/output-tokens",)),
-        Suite("Android builds on the build host", "tests/gradle_remote.py", sources=("scripts/gradle-remote",),
-              syntax=(("bash", "scripts/gradle-remote"),)),
+        Suite("Android builds on the build host", "tests/gradle_remote.py",
+              sources=("scripts/gradle-remote", "mobile/gradlew"),
+              syntax=(("bash", "scripts/gradle-remote"), ("sh", "mobile/gradlew"))),
         # Reads the whole checkout's source text; compiles nothing.
         Suite("provider credential guard", "tests/check_credential_guard.py",
               sources=("scripts/check-credential-guard", "src/account.rs")),

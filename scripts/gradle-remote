@@ -16,9 +16,12 @@
 # 3. Test reports and results, and each --fetch PATH (relative to mobile/),
 #    come back into this checkout's mobile/.
 #
-# On the build host itself, or with CAGENTS_BUILD_REMOTE=local, Gradle runs
-# here with the same settings. Installing on a phone stays here, since that
-# is where the phone is: see the mobile:install tasks.
+# Nothing else runs Gradle on this machine: mobile/gradlew refuses unless
+# CAGENTS_GRADLE_LOCAL=1, which this sets only where Gradle should run. On
+# the build host itself, Gradle runs in place. Elsewhere it runs here only
+# when the caller sets CAGENTS_GRADLE_LOCAL=1 deliberately; an unreachable
+# build host is an error, never a reason to build here. Installing on a phone
+# stays here, since that is where the phone is: see the mobile:install tasks.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -42,9 +45,13 @@ done
 
 remote=${CAGENTS_BUILD_REMOTE:-fw16}
 short_host=$(hostname -s 2>/dev/null || hostname)
-if [ "$remote" = local ] || [ "$remote" = "$short_host" ]; then
+if [ "$remote" = "$short_host" ] || [ "${CAGENTS_GRADLE_LOCAL-}" = 1 ]; then
     cd "$root/mobile"
-    ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain "$@"
+    CAGENTS_GRADLE_LOCAL=1 ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain "$@"
+fi
+if [ "$remote" = local ]; then
+    echo "gradle-remote: Gradle doesn't run on this machine even with CAGENTS_BUILD_REMOTE=local; set CAGENTS_GRADLE_LOCAL=1 to build here deliberately." >&2
+    exit 64
 fi
 
 # One directory per checkout, named for its path, so worktrees don't share
@@ -69,6 +76,7 @@ ssh -o BatchMode=yes "$remote" bash -s <<SCRIPT || status=$?
 set -e
 cd $(quoted "$base/mobile")
 export ANDROID_HOME="\${ANDROID_HOME:-\$HOME/Android/Sdk}"
+export CAGENTS_GRADLE_LOCAL=1
 exec flock ../.lock ./gradlew --console=plain $(quoted "$@") </dev/null
 SCRIPT
 

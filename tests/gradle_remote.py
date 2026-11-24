@@ -42,7 +42,7 @@ sys.exit(subprocess.run([os.environ["REAL_RSYNC"], *args]).returncode)
 
 # Records its arguments and working directory, and writes what a build makes.
 FAKE_GRADLEW = '''#!/bin/sh
-printf '%s\\n' "gradlew $* in $(pwd) home=$ANDROID_HOME" >>"$FAKE_GRADLE_RECORD"
+printf '%s\\n' "gradlew $* in $(pwd) home=$ANDROID_HOME local=$CAGENTS_GRADLE_LOCAL" >>"$FAKE_GRADLE_RECORD"
 mkdir -p shared/build/test-results/jvmTest androidApp/build/outputs/apk/debug
 echo report >shared/build/test-results/jvmTest/TEST-a.xml
 echo apk >androidApp/build/outputs/apk/debug/app-debug.apk
@@ -86,6 +86,7 @@ class GradleRemoteTest(unittest.TestCase):
             "CAGENTS_BUILD_REMOTE": "buildhost",
         }
         self.env.pop("ANDROID_HOME", None)
+        self.env.pop("CAGENTS_GRADLE_LOCAL", None)
 
     def run_script(self, *args, **env):
         return subprocess.run([str(self.checkout / "scripts/gradle-remote"), *args],
@@ -108,7 +109,7 @@ class GradleRemoteTest(unittest.TestCase):
         # Gradle ran there, with the arguments intact and the SDK default.
         gradle = self.gradle_record.read_text()
         self.assertIn(f"gradlew --console=plain :a:b it's in {remote}", gradle)
-        self.assertIn(f"home={self.home}/Android/Sdk", gradle)
+        self.assertIn(f"home={self.home}/Android/Sdk local=1", gradle)
         # The script went to bash, not the login shell, under the lock.
         scripts = [line for line in self.record.read_text().splitlines() if '"script": "' in line]
         self.assertEqual(len(scripts), 1)
@@ -125,12 +126,24 @@ class GradleRemoteTest(unittest.TestCase):
         self.assertTrue((mobile / "shared/build/test-results/jvmTest/TEST-a.xml").is_file())
         self.assertFalse((mobile / "androidApp/build/outputs/apk/debug/app-debug.apk").exists())
 
-    def test_local_runs_gradle_here(self):
-        result = self.run_script(":a", CAGENTS_BUILD_REMOTE="local", ANDROID_HOME="/sdk")
+    def test_runs_here_only_when_asked_to(self):
+        result = self.run_script(":a", CAGENTS_BUILD_REMOTE="local")
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("CAGENTS_GRADLE_LOCAL=1", result.stderr)
+        self.assertFalse(self.gradle_record.exists(), "Gradle didn't run")
+        result = self.run_script(":a", CAGENTS_GRADLE_LOCAL="1", ANDROID_HOME="/sdk")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"gradlew --console=plain :a in {self.checkout / 'mobile'} home=/sdk",
+        self.assertIn(f"gradlew --console=plain :a in {self.checkout / 'mobile'} home=/sdk local=1",
                       self.gradle_record.read_text())
         self.assertFalse(self.record.exists(), "nothing went to a host")
+
+    def test_the_wrapper_refuses_to_start_gradle_unless_told_to(self):
+        gradlew = ROOT / "mobile/gradlew"
+        env = {key: value for key, value in self.env.items() if key != "CAGENTS_GRADLE_LOCAL"}
+        result = subprocess.run([str(gradlew), "--version"], env=env, cwd=ROOT / "mobile",
+                                capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("mise run mobile:test", result.stderr)
 
     def test_refuses_no_gradle_arguments(self):
         self.assertEqual(self.run_script().returncode, 2)
