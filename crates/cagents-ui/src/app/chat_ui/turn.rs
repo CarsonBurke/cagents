@@ -169,8 +169,10 @@ impl Turn {
         if self.partly_failed() {
             return Some(Status::PartlyFailed);
         }
-        // A refusal is not hidden behind later success either.
-        if self.denied > 0 && self.outcome == Some(ToolStatus::Succeeded) {
+        // A refusal is not hidden behind later success, nor behind a stop
+        // or an unreported end. Work still waiting on the background keeps
+        // its mark, since the group has not finished.
+        if self.denied > 0 && self.failed == 0 && self.outcome != Some(ToolStatus::Waiting) {
             return Some(ToolStatus::Denied.into());
         }
         self.outcome.map(Status::from)
@@ -265,7 +267,19 @@ impl Turn {
         // Several steps say how many of them failed or were refused, after
         // the line that counted them: "Ran 3 commands · 1 failed", and
         // "all failed" where none went otherwise. A lone step's line is
-        // about that step, so the bare word says it.
+        // about that step, so the bare word says it. How the group ended,
+        // where that is more than finishing, still follows the counts:
+        // "Ran 2 commands · 1 denied · stopped".
+        let ending = match self.outcome {
+            Some(ToolStatus::Stopped) => " · stopped",
+            Some(ToolStatus::Ended) => " · ended",
+            Some(ToolStatus::Waiting) => " · waiting on background work",
+            Some(ToolStatus::Failed)
+            | Some(ToolStatus::Denied)
+            | Some(ToolStatus::Running)
+            | Some(ToolStatus::Succeeded)
+            | None => "",
+        };
         let steps = self.steps.len();
         if steps > 1 {
             let counted = |count: usize, word: &str| match count {
@@ -279,16 +293,13 @@ impl Turn {
             ];
             let counts: Vec<String> = counts.into_iter().flatten().collect();
             if !counts.is_empty() {
-                return Cow::Owned(format!(" · {}", counts.join(", ")));
+                return Cow::Owned(format!(" · {}{ending}", counts.join(", ")));
             }
         }
         Cow::Borrowed(match self.outcome {
             Some(ToolStatus::Failed) => " · failed",
             Some(ToolStatus::Denied) => " · denied",
-            Some(ToolStatus::Stopped) => " · stopped",
-            Some(ToolStatus::Ended) => " · ended",
-            Some(ToolStatus::Waiting) => " · waiting on background work",
-            Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => "",
+            _ => ending,
         })
     }
 
@@ -1140,12 +1151,16 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     // edits too, so "1 failed" is one of the edits it names and not one of
     // the files: "Made 2 edits to a file · 1 failed".
     if counts_steps && edits != edited.len() {
-        let files = counted(edited.len().max(1), "file", "files");
         let edits = match edits {
             1 => "an edit".to_owned(),
             edits => format!("{edits} edits"),
         };
-        parts.push(format!("made {edits} to {files}"));
+        // An edit that named no file says only that it was made.
+        parts.push(if edited.is_empty() {
+            format!("made {edits}")
+        } else {
+            format!("made {edits} to {}", counted(edited.len(), "file", "files"))
+        });
     } else if !edited.is_empty() {
         parts.push(format!("edited {}", counted(edited.len(), "file", "files")));
     }
@@ -1684,6 +1699,22 @@ mod tests {
             summary_and_glyph(vec![patch, command("c1", Succeeded)]).0,
             "Made an edit to 2 files, ran a command · 1 failed"
         );
+        // An edit that named no file is counted without one.
+        let unnamed = |id: &str, status: ToolStatus| {
+            let mut item = edit(id, "a.rs", status);
+            if let ItemContent::Changes { changes, .. } = &mut item.content {
+                changes.clear();
+            }
+            item
+        };
+        assert_eq!(
+            summary_and_glyph(vec![unnamed("e1", Failed), command("c1", Succeeded)]).0,
+            "Made an edit, ran a command · 1 failed"
+        );
+        assert_eq!(
+            summary_and_glyph(vec![unnamed("e1", Failed), unnamed("e2", Succeeded)]).0,
+            "Made 2 edits · 1 failed"
+        );
         assert_eq!(
             summary_and_glyph(vec![read("r1", Failed), read("r2", Failed)]),
             ("Read 2 files · all failed".to_owned(), Some(Failed.into()))
@@ -1756,6 +1787,45 @@ mod tests {
             "where nothing went through, the group keeps the full error mark"
         );
         assert_eq!(summary(&[Denied]), "Tried to run cargo check · denied");
+    }
+
+    #[test]
+    fn a_counted_refusal_keeps_how_its_group_ended() {
+        let summary_and_glyph = |statuses: &[ToolStatus]| {
+            let mut items = vec![text("u1", Role::User, Phase::Final, false)];
+            items.extend(
+                statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, status)| command(&format!("c{index}"), *status)),
+            );
+            let turns = group(&items, &unasked(), plain);
+            (turns[0].summary.clone(), turns[0].glyph())
+        };
+        use ToolStatus::{Denied, Ended, Stopped, Waiting};
+        assert_eq!(
+            summary_and_glyph(&[Denied, Waiting]),
+            (
+                "Ran 2 commands · 1 denied · waiting on background work".to_owned(),
+                Some(Waiting.into())
+            ),
+            "work still waiting on the background says so, in words and in its mark"
+        );
+        assert_eq!(
+            summary_and_glyph(&[Denied, Stopped]),
+            (
+                "Ran 2 commands · 1 denied · stopped".to_owned(),
+                Some(Denied.into())
+            ),
+            "a stop after a refusal is still said, and the refusal keeps its mark"
+        );
+        assert_eq!(
+            summary_and_glyph(&[Denied, Ended]),
+            (
+                "Ran 2 commands · 1 denied · ended".to_owned(),
+                Some(Denied.into())
+            )
+        );
     }
 
     #[test]
@@ -2979,7 +3049,8 @@ mod tests {
         assert_eq!(
             turns[1].glyph(),
             Some(Status::PartlyFailed),
-            "one message not sent among three is a partial failure"
+            "one message not sent among three is a partial failure; the folded \
+             message row draws its own state from the run, not this mark"
         );
         // Different words are told apart by whom they went to.
         assert_eq!(
