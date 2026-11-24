@@ -416,7 +416,9 @@ mod tests {
         assert!(!first.has_earlier);
         assert_eq!(first.items[0].id, "b0");
         assert!(first.items.len() < count);
+        assert!(first.more);
         let rest = store.unread(&[]).unwrap();
+        assert!(!rest.more);
         assert!(!rest.restarted && !rest.has_earlier);
         assert_eq!(first.items.len() + rest.items.len(), count);
         assert_eq!(
@@ -491,7 +493,9 @@ mod tests {
         }
         let first = store.unread(&[]).unwrap();
         assert!(first.items.len() < count);
+        assert!(first.more);
         let rest = store.unread(&[]).unwrap();
+        assert!(!rest.more);
         assert_eq!(first.items.len() + rest.items.len(), count);
         assert_eq!(
             rest.items.last().map(|item| item.id.as_str()),
