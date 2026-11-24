@@ -370,6 +370,16 @@ fn a_phone_that_hangs_up_withdraws_its_request() {
 }
 
 #[test]
+fn a_request_nobody_answered_in_time_is_told_apart_from_a_phone_that_hung_up() {
+    let scene = scene();
+    // As the bridge leaves it when its decision window runs out.
+    fs::write(scene.pairing.directory.join(WITHDRAWN), UNANSWERED).unwrap();
+    assert_eq!(scene.pairing.progress(scene.now), Progress::Unanswered);
+    fs::write(scene.pairing.directory.join(WITHDRAWN), "").unwrap();
+    assert_eq!(scene.pairing.progress(scene.now), Progress::Withdrawn);
+}
+
+#[test]
 fn a_code_works_once_and_only_until_it_expires() {
     let scene = scene();
     let (_first, bridge_one) = bridge(&scene, Some(request_line()));

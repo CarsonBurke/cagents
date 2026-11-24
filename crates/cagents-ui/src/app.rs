@@ -3346,6 +3346,12 @@ fn background_poll(message: &Message) -> bool {
         Message::AutomationApproval(
             automation_approval::Action::Tick | automation_approval::Action::Read { .. }
         ) | Message::AccountUi(account_ui::Action::Tick | account_ui::Action::OmpRead(_))
+            // The phone's status is read only by its own control and popover.
+            | Message::Phone(
+                phone_ui::Action::Tick
+                    | phone_ui::Action::Probed(_)
+                    | phone_ui::Action::Progressed(_)
+            )
     )
 }
 

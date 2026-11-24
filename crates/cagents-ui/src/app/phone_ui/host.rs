@@ -611,11 +611,14 @@ mod fixture {
 
         pub(super) fn connections(&self, network: Option<&Network>) -> Option<Vec<Connection>> {
             let connections = self.connections.as_ref()?;
+            // The address a phone reaches outside Tailscale, as a real
+            // bridge's SSH connection reports it.
+            let server = self.lan.first().map_or("", String::as_str);
             Some(
                 connections
                     .iter()
                     .map(|from| Connection {
-                        route: route("", from, network),
+                        route: route(server, from, network),
                         from: from.clone(),
                     })
                     .collect(),
@@ -661,6 +664,21 @@ mod tests {
                 addresses: vec!["100.1.2.3".into()],
             }
         );
+    }
+
+    #[test]
+    fn a_fixture_connection_takes_the_route_a_real_bridge_would() {
+        let fixture: fixture::Fixture = serde_json::from_str(
+            r#"{"lan":["192.168.1.20"],"connections":["192.168.1.44","100.88.1.4"]}"#,
+        )
+        .unwrap();
+        let routes: Vec<Route> = fixture
+            .connections(None)
+            .unwrap()
+            .into_iter()
+            .map(|connection| connection.route)
+            .collect();
+        assert_eq!(routes, [Route::Lan, Route::Tailscale]);
     }
 
     #[test]

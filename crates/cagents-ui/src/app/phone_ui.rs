@@ -75,6 +75,8 @@ pub(super) struct State {
     /// The fingerprint of the phone whose removal awaits confirmation.
     removing: Option<String>,
     notice: Option<Result<String, String>>,
+    /// The phone just allowed, until it connects with its own key.
+    joining: Option<String>,
     /// Whether leftover pairings were cleaned up.
     swept: bool,
 }
@@ -166,8 +168,18 @@ impl Cagents {
                     return self.phone_probe(true);
                 }
                 self.phone_ui.removing = None;
+                if self
+                    .phone_ui
+                    .pairing
+                    .as_ref()
+                    .is_some_and(|pairing| pairing.ending && !self.phone_ui.busy)
+                {
+                    // Its code can't be used any more; nothing is left to show.
+                    self.phone_ui.pairing = None;
+                }
                 if self.phone_ui.pairing.is_none() {
                     self.phone_ui.notice = None;
+                    self.phone_ui.joining = None;
                 }
                 Task::none()
             }
@@ -197,6 +209,9 @@ impl Cagents {
                 if status.network.is_some() {
                     state.network_at = state.probed_at;
                 }
+                if !status.connections.is_empty() {
+                    state.joining = None;
+                }
                 state.status = Some(host::Status { network, ..*status });
                 Task::none()
             }
@@ -220,6 +235,7 @@ impl Cagents {
                 }
                 self.phone_ui.busy = true;
                 self.phone_ui.notice = None;
+                self.phone_ui.joining = None;
                 self.phone_ui.removing = None;
                 blocking(
                     move || {
@@ -268,7 +284,10 @@ impl Cagents {
                 }
                 let arrived = matches!(progress, Progress::Requested(_))
                     && !matches!(pairing.progress, Progress::Requested(_));
-                let over = matches!(progress, Progress::Withdrawn | Progress::Expired);
+                let over = matches!(
+                    progress,
+                    Progress::Withdrawn | Progress::Unanswered | Progress::Expired
+                );
                 pairing.progress = progress;
                 let mut tasks = Vec::new();
                 if over {
@@ -284,6 +303,11 @@ impl Cagents {
                         },
                         Err,
                     ));
+                }
+                if over && !self.phone_ui.open {
+                    // Nobody is looking: put it away, rather than leave the
+                    // status bar saying a phone is pairing.
+                    self.phone_ui.pairing = None;
                 }
                 if arrived && !self.phone_ui.open {
                     // The person is looking at the phone; bring the question
@@ -303,6 +327,7 @@ impl Cagents {
                     return Task::none();
                 }
                 self.phone_ui.busy = true;
+                self.phone_ui.joining = Some(request.name.clone());
                 pairing.ending = true;
                 let started = pairing.started.clone();
                 blocking(
@@ -367,6 +392,9 @@ impl Cagents {
                 )
             }
             Action::Finished(result) => {
+                if result.is_err() {
+                    self.phone_ui.joining = None;
+                }
                 self.phone_ui.busy = false;
                 self.phone_ui.pairing = None;
                 self.phone_ui.removing = None;
@@ -568,10 +596,20 @@ impl Cagents {
                 .spacing(space::S)
                 .into()
             }
-            Progress::Withdrawn | Progress::Expired | Progress::Requested(_) => {
+            Progress::Withdrawn
+            | Progress::Unanswered
+            | Progress::Expired
+            | Progress::Requested(_) => {
                 let message = match pairing.progress {
-                    Progress::Withdrawn => "The phone stopped pairing before you answered.",
-                    _ => "The code expired.",
+                    Progress::Withdrawn => {
+                        "The phone stopped pairing before you answered.".to_owned()
+                    }
+                    Progress::Unanswered => format!(
+                        "Nobody answered on this computer within {} minutes, so it ended the \
+                         request.",
+                        pairing::PAIRING_LIFETIME.as_secs() / 60
+                    ),
+                    _ => "The code expired.".to_owned(),
                 };
                 widget::column::with_children(vec![
                     design::body(message).into(),
@@ -702,7 +740,13 @@ fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Element<'a,
             .into(),
         );
     } else if status.connections.is_empty() {
-        rows.push(design::caption("No phone is connected now.").into());
+        rows.push(
+            design::caption(match &state.joining {
+                Some(name) => format!("Waiting for {name} to connect…"),
+                None => "No phone is connected now.".to_owned(),
+            })
+            .into(),
+        );
     }
     for phone in phones {
         let fingerprint = phone.key.fingerprint();
@@ -829,7 +873,7 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
             .into()
     };
     rows.push(fact(
-        "Network",
+        "Local network",
         if network.lan.is_empty() && network.blocked.is_empty() {
             muted("No local address".into())
         } else {

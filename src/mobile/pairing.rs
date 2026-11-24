@@ -50,6 +50,8 @@ const EXPIRES: &str = "expires";
 const REQUEST: &str = "request.json";
 const DECISION: &str = "decision";
 const WITHDRAWN: &str = "withdrawn";
+/// What `WITHDRAWN` holds when nobody answered on the computer in time.
+const UNANSWERED: &str = "unanswered";
 
 fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions.
@@ -754,6 +756,8 @@ pub enum Progress {
     Requested(Request),
     /// The phone that used it hung up.
     Withdrawn,
+    /// Nobody answered the phone's request on the computer in time.
+    Unanswered,
     Expired,
 }
 
@@ -899,8 +903,12 @@ impl Pairing {
 
     /// Where it stands at `now`.
     pub fn progress(&self, now: SystemTime) -> Progress {
-        if self.directory.join(WITHDRAWN).exists() {
-            return Progress::Withdrawn;
+        if let Ok(withdrawn) = fs::read_to_string(self.directory.join(WITHDRAWN)) {
+            return if withdrawn.trim() == UNANSWERED {
+                Progress::Unanswered
+            } else {
+                Progress::Withdrawn
+            };
         }
         if let Some(request) = fs::read(self.directory.join(REQUEST))
             .ok()
@@ -1185,7 +1193,7 @@ fn pair(
             .ok()
             .filter(|left| !left.is_zero())
         else {
-            let _ = fs::write(directory.join(WITHDRAWN), "");
+            let _ = fs::write(directory.join(WITHDRAWN), UNANSWERED);
             return pair_error("Nobody answered on the computer. Show a new code there.");
         };
         match input.recv_timeout(DECISION_POLL.min(left)) {
