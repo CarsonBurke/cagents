@@ -795,9 +795,9 @@ def evict(slot, path):
 
 
 def session_time(name):
-    """When rustc started `s-TIME-RANDOM-SVH` or `s-TIME-RANDOM-working`."""
+    """When rustc started the finalized session `s-TIME-RANDOM-SVH`."""
     parts = name.split("-")
-    if len(parts) != 4 or parts[0] != "s":
+    if len(parts) != 4 or parts[0] != "s" or parts[3] == "working":
         return None
     try:
         return int(parts[1], 36)
@@ -814,8 +814,7 @@ def superseded(crate):
     sessions = []
     for entry in os.scandir(crate):
         started = session_time(entry.name)
-        if (started is not None and not entry.name.endswith("-working")
-                and entry.is_dir(follow_symlinks=False)):
+        if started is not None and entry.is_dir(follow_symlinks=False):
             sessions.append((started, entry.name))
     return [name for _, name in sorted(sessions)[:-1]]
 
@@ -825,24 +824,19 @@ def interrupted_incremental(crate):
 
     Rustc 1.93 hard-links the previous session into its working directory,
     then can overwrite linked ThinLTO keys and pre-LTO bitcode before it
-    publishes a new work-product index. A newer working session or an input
-    written after the last index means the old cache may mix two builds.
+    publishes a new work-product index. Ordinary compile errors also leave
+    those links behind. An input written after the last index means the old
+    cache may mix two builds.
     See rust-lang/rust#159287.
     """
-    working, finalized = [], []
+    finalized = []
     for entry in os.scandir(crate):
         started = session_time(entry.name)
-        if started is None or not entry.is_dir(follow_symlinks=False):
-            continue
-        if entry.name.endswith("-working"):
-            working.append(started)
-        else:
+        if started is not None and entry.is_dir(follow_symlinks=False):
             finalized.append((started, entry.path))
     if not finalized:
         return False
-    started, last = max(finalized)
-    if working and max(working) >= started:
-        return True
+    _, last = max(finalized)
     try:
         indexed = os.stat(os.path.join(last, "work-products.bin")).st_mtime_ns
     except FileNotFoundError:

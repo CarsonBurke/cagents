@@ -2514,6 +2514,28 @@ class Trim(unittest.TestCase):
         self.assertFalse(fresh.exists())
         self.assertEqual(output.read_bytes(), b"compiled")
 
+    def test_incremental_repair_keeps_the_cache_after_a_compile_error(self):
+        build = self.slot / "src/target"
+        self.assertTrue(self.repair_incremental(build))
+        crate = build / "debug/incremental/checked-1"
+        finalized = crate / "s-a-0-finished"
+        finalized.mkdir(parents=True)
+        keys = finalized / "thin-lto-past-keys.bin"
+        keys.write_bytes(b"previous build")
+        os.utime(keys, (1, 1))
+        index = finalized / "work-products.bin"
+        index.touch()
+        # rustc links the previous cache before compiling, and an error can
+        # leave the working session behind without overwriting these files.
+        working = crate / "s-b-0-working"
+        working.mkdir()
+        os.link(keys, working / keys.name)
+        os.link(index, working / index.name)
+
+        self.assertTrue(self.repair_incremental(build))
+        self.assertEqual(keys.read_bytes(), b"previous build")
+        self.assertTrue(working.is_dir())
+
     def test_incremental_repair_evicts_the_crate_with_an_overwritten_finalized_session(self):
         build = self.slot / "src/target"
         self.assertTrue(self.repair_incremental(build))

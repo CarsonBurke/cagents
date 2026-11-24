@@ -127,8 +127,13 @@ class IncrementalLinkRecovery(unittest.TestCase):
             from pathlib import Path
             stale = Path(os.environ["FIXTURE_CACHE"]).is_dir()
             print("compiled with", "cached" if stale else "fresh", "state", flush=True)
-            if os.environ.get("FIXTURE_SIGNAL"):
-                os.kill(os.getpid(), int(os.environ["FIXTURE_SIGNAL"]))
+            signal = os.environ.get("FIXTURE_SIGNAL" if stale else "FIXTURE_RETRY_SIGNAL")
+            if signal:
+                os.kill(os.getpid(), int(signal))
+            if os.environ.get("FIXTURE_WARNING"):
+                print(os.environ["FIXTURE_WARNING"], file=sys.stderr)
+            if not stale and os.environ.get("FIXTURE_RETRY_WARNING"):
+                print(os.environ["FIXTURE_RETRY_WARNING"], file=sys.stderr)
             if stale or os.environ.get("FIXTURE_PERSISTENT"):
                 print(os.environ["FIXTURE_DIAGNOSTIC"], file=sys.stderr)
                 sys.exit(1)
@@ -175,11 +180,23 @@ class IncrementalLinkRecovery(unittest.TestCase):
         self.assertTrue(evicted.name.endswith(self.cache.name))
 
     def test_a_second_undefined_symbol_failure_is_returned_without_another_retry(self):
-        result = self.compile(environment={"FIXTURE_PERSISTENT": "1"})
+        warning = json.dumps({"level": "warning", "message": "fixture warning"})
+        result = self.compile(environment={"FIXTURE_PERSISTENT": "1", "FIXTURE_WARNING": warning})
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout.count("compiled with"), 2)
         self.assertEqual(result.stderr.count("retrying fixture"), 1)
         self.assertEqual(result.stderr.count(self.undefined), 1)
+        self.assertEqual(result.stderr.count(warning), 1)
+
+    def test_retry_preserves_a_new_multiline_warning_with_shared_context(self):
+        context = ("\n --> fixture.rs:1:1\n  |\n1 | fixture();\n  | ^^^^^^^^^\n"
+                   "note: fixture declared here\n --> fixture.rs:2:4\n  |\n2 | fn fixture() {}\n  |    ^^^^^^^\n")
+        repeated = "warning: fixture warning" + context
+        new = "warning: retry-only warning" + context
+        result = self.compile(environment={"FIXTURE_WARNING": repeated, "FIXTURE_RETRY_WARNING": new})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count(repeated), 1)
+        self.assertEqual(result.stderr.count(new), 1)
 
     def test_a_human_linker_error_also_retries(self):
         result = self.compile(environment={"FIXTURE_DIAGNOSTIC":
@@ -209,14 +226,16 @@ class IncrementalLinkRecovery(unittest.TestCase):
         self.assertTrue(self.cache.exists())
 
     def test_cargo_can_distinguish_a_signalled_compiler_from_an_exit_code(self):
-        result = subprocess.run(
-            [str(ROOT / "scripts/cargo-incremental-retry.py"), *self.arguments()],
-            env=self.env | {"FIXTURE_SIGNAL": str(signal.SIGTERM)}, cwd=self.source,
-            capture_output=True, text=True, timeout=HANG_GUARD,
-        )
-        self.assertEqual(result.returncode, -signal.SIGTERM)
-        self.assertNotIn("retrying fixture", result.stderr)
-        self.assertTrue(self.cache.exists())
+        for attempt, setting in enumerate(("FIXTURE_SIGNAL", "FIXTURE_RETRY_SIGNAL")):
+            with self.subTest(setting=setting):
+                result = subprocess.run(
+                    [str(ROOT / "scripts/cargo-incremental-retry.py"), *self.arguments()],
+                    env=self.env | {setting: str(signal.SIGTERM)}, cwd=self.source,
+                    capture_output=True, text=True, timeout=HANG_GUARD,
+                )
+                self.assertEqual(result.returncode, -signal.SIGTERM)
+                self.assertEqual(result.stderr.count("retrying fixture"), attempt)
+                self.assertEqual(self.cache.exists(), attempt == 0)
 
     def test_an_explicit_rustc_wrapper_is_preserved(self):
         self.assertIn("wrapper: true", self.compile(environment={"RUSTC_WRAPPER": "/bin/true"}).stdout)
