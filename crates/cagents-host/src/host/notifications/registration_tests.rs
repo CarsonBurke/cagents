@@ -84,11 +84,29 @@ fn isolated(name: &str) -> bool {
     if std::env::var_os(MARKER).as_deref() == Some(std::ffi::OsStr::new(name)) {
         return false;
     }
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = tempfile::tempdir().unwrap();
     for leaf in ["home", "run", "config", "data", "cache"] {
         crate::secure_file::prepare_private_directory(&root.path().join(leaf)).unwrap();
     }
+    // The default bus configuration binds under /tmp. A relative socket in
+    // this private working directory also fits under a long TMPDIR.
+    std::fs::write(
+        root.path().join("bus.conf"),
+        r#"<busconfig>
+  <type>session</type>
+  <listen>unix:path=bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>"#,
+    )
+    .unwrap();
     let mut command = crate::process::CommandSpec::new("/usr/bin/dbus-run-session")
+        .cwd(root.path())
+        .arg("--config-file=bus.conf")
         .arg("--")
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"]);
