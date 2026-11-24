@@ -5,6 +5,7 @@ use crate::workspace_model::{
 };
 
 pub(in crate::host::model) mod bindings;
+mod compaction;
 pub(in crate::host::model) mod store;
 pub(super) use store::{all, occupied, occupied_for_start, operation_seen, read};
 
@@ -1333,6 +1334,7 @@ mod tests {
     use crate::workspace_model::views::Pane;
 
     mod bindings;
+    mod compaction;
     mod effects;
     fn setup() -> (Registry, tempfile::TempDir, ChannelId, ChannelId) {
         let dir = tempfile::tempdir().unwrap();
