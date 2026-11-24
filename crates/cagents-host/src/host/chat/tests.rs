@@ -334,6 +334,11 @@ fn hidden_completion_wakes_parked_daemon_after_rearm_is_consumed_and_fences_old_
     assert!(failed.failure().is_some() && failed.owns_work());
     let failed_instance = uuid::Uuid::new_v4();
     completion_wake_record(&host, id, failed_instance, failed.clone(), launch);
+    host.lock().unwrap().install_model(
+        super::super::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap(),
+    );
+    let courier = super::super::agent_execution::mailbox::Courier::start(&host).unwrap();
+    courier.wait_for_scan(0);
     changed_owned(
         &Arc::downgrade(&host),
         id,
@@ -349,6 +354,7 @@ fn hidden_completion_wakes_parked_daemon_after_rearm_is_consumed_and_fences_old_
         ),
         "failed owner announced released work"
     );
+    courier.wait_for_scan(1); // Completion nevertheless changes the live mailbox directory.
     let _client = std::os::unix::net::UnixStream::connect(&listener_path).unwrap();
     returned
         .recv_timeout(Duration::from_secs(2))

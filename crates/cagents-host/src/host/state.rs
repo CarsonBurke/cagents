@@ -1951,6 +1951,10 @@ impl HostState {
                 working_directory: None,
             },
         );
+        // This is the live terminal even if saving its pane fails later.
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
         let Some(client_id) = subscriber else {
             return self.descriptor_as(false, terminal_id);
         };
@@ -5396,7 +5400,11 @@ fn start_terminal_view_owned_reserved(
             let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
             if adopting {
                 state.startup_custody.remove(&terminal_id);
-                state.terminals.remove(&terminal_id);
+                if state.terminals.remove(&terminal_id).is_some()
+                    && let Some(courier) = &state.mailbox
+                {
+                    courier.wake();
+                }
             }
             drop(state);
             shared
@@ -5479,7 +5487,6 @@ fn start_terminal_view_owned_reserved(
             return Err(error);
         }
     };
-    super::agent_execution::mailbox::wake(shared);
     Ok((descriptor, redraw_handle))
 }
 

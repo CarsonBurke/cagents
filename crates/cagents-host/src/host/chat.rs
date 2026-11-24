@@ -637,10 +637,10 @@ fn changed_for_instance(
     // Check the exact current producer under HostState; a failed/retained owner
     // must not masquerade as released work. Remote proxies publish Resident
     // metadata before this callback, so this reads no helper or transcript.
-    let wake_completed = instance.is_some()
+    let completed = instance.is_some()
         && matches!(update, Update::Observed { .. })
-        && record.handle.is_completed()
-        && !record.handle.owns_work();
+        && record.handle.is_completed();
+    let wake_exit = completed && !record.handle.owns_work();
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
             &Update::Activity { state, generation } => ServerMessage::ChatActivity {
@@ -709,8 +709,12 @@ fn changed_for_instance(
         record.handle.observe_next_update();
     }
     drop(state);
-    if wake_completed {
+    if completed {
+        // A completed conversation leaves the live mailbox directory even
+        // when its failed owner still holds work for recovery.
         super::agent_execution::mailbox::wake(&host);
+    }
+    if wake_exit {
         crate::daemon::wake();
     }
 }

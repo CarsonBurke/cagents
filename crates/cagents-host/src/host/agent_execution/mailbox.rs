@@ -1081,7 +1081,7 @@ impl Handle {
         let queued_failed = self.start_queued(host);
         let (released, delivery_failed) = self.deliver_messages(host, &limits)?;
         let retry = (queued_failed || delivery_failed || !watching_accounts && !limits.is_empty())
-            .then(|| now.saturating_add(RETRY.as_millis() as u64));
+            .then(|| super::now().saturating_add(RETRY.as_millis() as u64));
         Ok([released, reset, retry].into_iter().flatten().min())
     }
 
