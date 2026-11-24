@@ -1384,7 +1384,8 @@ impl Store {
         )
     }
 
-    pub(crate) fn path(&self) -> PathBuf {
+    /// Path of the account registry file.
+    pub fn path(&self) -> PathBuf {
         self.directory.join(FILE_NAME)
     }
 
