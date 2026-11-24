@@ -41,6 +41,10 @@ turn/start response and the turn's notifications, so a prompt can be seen
 accepted before its turn has begun. A steer of the active turn is accepted.
 With CODEX_HOME/fixture-user-items present, each prompt and steer is reported
 as a userMessage item of its turn, as Codex reports them.
+With CODEX_HOME/fixture-turn.json present, the thread takes its "name" and
+each prompt instead plays that file's "items", completed app-server items such
+as commandExecution and fileChange, then answers with its "answer" text, with
+no child or other rows, so a capture can show an ordinary Codex turn.
 With CODEX_HOME/fixture-unnamed-child present, the collaboration calls and the
 thread listing report the child without a nickname, as Codex can before it has
 named one; only the child's own thread read reports it as Quinn.
@@ -162,6 +166,20 @@ def web_items():
     ]})]
 
 
+def scripted_turn(codex_home):
+    """The ordinary turn CODEX_HOME/fixture-turn.json describes, if any."""
+    path = Path(codex_home) / "fixture-turn.json"
+    if not path.is_file():
+        return None
+    turn = json.loads(path.read_text())
+    if not (isinstance(turn.get("name"), str) and isinstance(turn.get("answer"), str)
+            and isinstance(turn.get("items"), list)
+            and all(isinstance(item, dict) and item.get("id") and item.get("type")
+                    for item in turn["items"])):
+        raise ValueError('fixture-turn.json needs a "name", an "answer" and "items" with ids and types')
+    return turn
+
+
 def echoes(codex_home):
     """Whether this home's peer reports each prompt and steer as a userMessage
     item of its turn, as Codex does."""
@@ -205,6 +223,7 @@ class Scenario:
         self.child_latest = None
         self.model = "fixture-mini"
         self.reasoning = None
+        self.name = "Offline tool rows"
         self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
         self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
         # Replayed once, by the thread's first turn.
@@ -285,7 +304,7 @@ class Scenario:
         child = thread == self.child
         latest = self.child_latest if child else self.latest
         active = latest and latest["status"] == "inProgress"
-        return {"id": thread, "name": "Child review" if child else "Offline tool rows",
+        return {"id": thread, "name": "Child review" if child else self.name,
                 "parentThreadId": self.thread if child else None,
                 "agentNickname": "Quinn" if child else None,
                 "status": {"type": "active" if active
@@ -390,8 +409,8 @@ class Scenario:
                         publish(response)
 
     def notifications(self, turn, starts_child=True, *, pause=PAUSE, web_rows=False, diagnostics=False, plan=None,
-                      unnamed_child=False, user=None):
-        starts_child = starts_child and not (web_rows or diagnostics)
+                      unnamed_child=False, user=None, script=None):
+        starts_child = starts_child and not (web_rows or diagnostics or script)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
         if diagnostics:
@@ -405,7 +424,8 @@ class Scenario:
                     notify("turn/completed", turn={"id": turn, "status": "failed", "items": [],
                                                    "error": {"message": raw}})]
         started, completed = [], []
-        pairs = web_items() if web_rows else items(self.child)
+        pairs = (web_items() if web_rows
+                 else [(None, item) for item in script["items"]] if script else items(self.child))
         if unnamed_child:
             pairs = [tuple(unnamed(item) for item in pair) for pair in pairs]
         for begin, end in pairs:
@@ -414,6 +434,7 @@ class Scenario:
             completed.append(notify("item/completed", turnId=turn, item=end))
         diff = notify("turn/diff/updated", turnId=turn,
                       diff="diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n")
+        quiet = web_rows or script is not None
         history, self.history = self.history, []
         replayed = [notify("item/completed", turnId=turn, item=item) for item in history]
         # The prompt itself, as Codex reports it at the start of its turn.
@@ -421,7 +442,8 @@ class Scenario:
         settled = [*history, *echoed, *(end for _, end in pairs)]
         finished = {"id": turn, "status": "completed", "items": settled}
         answer = {"id": "answer", "type": "agentMessage",
-                  "text": "Web references ready." if web_rows else "Done.", "phase": None}
+                  "text": ("Web references ready." if web_rows else script["answer"] if script
+                           else "Done."), "phase": None}
         child_started = [notify("turn/started", threadId=self.child,
                                turn={"id": f"{turn}-child", "status": "inProgress", "items": []})] if starts_child else []
         child_completed = [notify("turn/completed", threadId=self.child,
@@ -439,7 +461,7 @@ class Scenario:
                 *replayed,
                 *(notify("item/completed", turnId=turn, item=item) for item in echoed),
                 *child_started,
-                *started, *([] if web_rows else [diff]),
+                *started, *([] if quiet else [diff]),
                 {"_sleep": pause if plan is None else plan}, *completed, *settling,
                 # A subAgentActivity item only renders a row. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
@@ -458,6 +480,9 @@ class Scenario:
         if identifier is None:
             return []
         after = []
+        script = scripted_turn(codex_home)
+        if script:
+            self.name = script["name"]
         if method == "initialize":
             result = {"userAgent": "cagents-offline-tool-rows", "codexHome": codex_home}
         elif method in ("thread/start", "thread/resume"):
@@ -495,8 +520,8 @@ class Scenario:
         elif method == "model/list":
             result = self.models(codex_home)
         elif method == "thread/list":
-            result = {"data": [] if any((Path(codex_home) / marker).is_file()
-                                       for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
+            result = {"data": [] if script or any((Path(codex_home) / marker).is_file()
+                                                 for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
                       else [self._metadata(self.child)], "nextCursor": None}
             if result["data"] and (Path(codex_home) / "fixture-nested-child").is_file():
                 # Newest first, as Codex lists them.
@@ -577,7 +602,7 @@ class Scenario:
             self._advance(self.thread)
             web_rows = (Path(codex_home) / "fixture-web-rows").is_file()
             diagnostics = (Path(codex_home) / "fixture-row-diagnostics").is_file()
-            starts_child = not (web_rows or diagnostics) and (not self.child_latest or self.child_latest["status"] != "inProgress")
+            starts_child = not (web_rows or diagnostics or script) and (not self.child_latest or self.child_latest["status"] != "inProgress")
             if starts_child:
                 self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
                 self._advance(self.child)
@@ -589,7 +614,8 @@ class Scenario:
             after = self.notifications(turn, starts_child, pause=pause, web_rows=web_rows,
                                        diagnostics=diagnostics, plan=plan,
                                        unnamed_child=(Path(codex_home) / "fixture-unnamed-child").is_file(),
-                                       user=params.get("input", []) if echoes(codex_home) else None)
+                                       user=params.get("input", []) if echoes(codex_home) else None,
+                                       script=script)
             held = Path(codex_home) / "fixture-turn-start-delay"
             if held.is_file():
                 # Codex learns a turn's id only from this response or its
