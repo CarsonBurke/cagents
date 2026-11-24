@@ -4287,7 +4287,9 @@ fn env_recipe(environment: BTreeMap<String, String>) -> LaunchRecipe {
 }
 
 #[test]
-fn codex_terminal_uses_a_private_tmpdir_and_cleans_it_up_on_exit() {
+fn codex_terminal_uses_private_temp_variables_and_cleans_up_on_exit() {
+    use std::path::Path;
+
     let directory = tempdir().unwrap();
     let shared = directory.path().join("shared");
     let runtime = directory.path().join("runtime");
@@ -4302,7 +4304,7 @@ fn codex_terminal_uses_a_private_tmpdir_and_cleans_it_up_on_exit() {
         fs::write(
             &entrypoint,
             "#!/bin/sh\n\
-             printf '%s' \"$TMPDIR\" > tmpdir.part\n\
+             printf '%s\\n' \"$TMPDIR\" \"$TMP\" \"$TEMP\" > tmpdir.part\n\
              /bin/mv tmpdir.part reported-tmpdir\n\
              read -r line\n",
         )
@@ -4310,7 +4312,9 @@ fn codex_terminal_uses_a_private_tmpdir_and_cleans_it_up_on_exit() {
         fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
         let mut recipe = env_recipe(BTreeMap::from([
             ("HOME".into(), directory.path().to_str().unwrap().into()),
-            ("TMPDIR".into(), shared.to_str().unwrap().into()),
+            ("TMPDIR".into(), "shared".into()),
+            ("TMP".into(), "original-tmp".into()),
+            ("TEMP".into(), "original-temp".into()),
             ("XDG_RUNTIME_DIR".into(), runtime.to_str().unwrap().into()),
         ]));
         recipe.program = entrypoint.to_str().unwrap().into();
@@ -4327,11 +4331,15 @@ fn codex_terminal_uses_a_private_tmpdir_and_cleans_it_up_on_exit() {
         }
         let (worker, _) = capture_worker_with(recipe, config);
         crate::test_timing::eventually("the terminal's TMPDIR report", || reported.is_file());
-        let tmpdir = PathBuf::from(fs::read_to_string(&reported).unwrap());
+        let values = fs::read_to_string(&reported).unwrap();
+        let [tmpdir, tmp, temp]: [&str; 3] = values.lines().collect::<Vec<_>>().try_into().unwrap();
+        let tmpdir = PathBuf::from(tmpdir);
         fs::remove_file(&reported).unwrap();
 
         if program == "codex" {
             assert_eq!(tmpdir.parent(), Some(physical_shared.as_path()));
+            assert_eq!(Path::new(tmp), tmpdir);
+            assert_eq!(Path::new(temp), tmpdir);
             assert_ne!(Some(&tmpdir), previous_tmpdir.as_ref());
             assert_eq!(
                 fs::metadata(&tmpdir).unwrap().permissions().mode() & 0o777,
@@ -4339,7 +4347,9 @@ fn codex_terminal_uses_a_private_tmpdir_and_cleans_it_up_on_exit() {
             );
             fs::create_dir(tmpdir.join(".git")).unwrap();
         } else {
-            assert_eq!(tmpdir, shared);
+            assert_eq!(tmpdir, Path::new("shared"));
+            assert_eq!(tmp, "original-tmp");
+            assert_eq!(temp, "original-temp");
         }
 
         std::io::Write::write_all(

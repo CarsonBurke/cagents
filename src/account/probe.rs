@@ -914,7 +914,7 @@ struct Group {
     child: Child,
     /// The group's id - the child's pid - until the group has been killed.
     id: Option<i32>,
-    _temp_dir: Option<crate::daemon::codex_temp::PrivateDir>,
+    temp_dir: Option<crate::daemon::codex_temp::PrivateDir>,
 }
 
 impl Group {
@@ -927,6 +927,8 @@ impl Group {
     }
 
     async fn spawn_inner(mut command: Command, codex_temp: bool) -> Result<Self, String> {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
         let mut delay = Duration::from_millis(10);
         loop {
             let (returned, spawned) = tokio::task::spawn_blocking(move || {
@@ -935,15 +937,19 @@ impl Group {
                 let _account = super::registry::authorize_command(command.as_std())
                     .map_err(|error| error.to_string())?;
                 let mut temp_dir = if codex_temp {
-                    let inherited = std::env::var_os("TMPDIR");
-                    let directory = crate::daemon::codex_temp::PrivateDir::create(
-                        inherited.as_deref(),
+                    let inherited = command
+                        .as_std()
+                        .get_envs()
+                        .find_map(|(key, value)| (key == "TMPDIR").then_some(value));
+                    let ambient = std::env::var_os("TMPDIR");
+                    let directory = PrivateDir::create(
+                        inherited.unwrap_or(ambient.as_deref()),
                         command.as_std().get_current_dir(),
                     )
                     .map_err(|error| {
                         format!("Cannot prepare Codex's temporary directory: {error}")
                     })?;
-                    command.env("TMPDIR", directory.path());
+                    command.envs(TEMP_ENV_KEYS.map(|key| (key, directory.path())));
                     Some(directory)
                 } else {
                     None
@@ -956,7 +962,7 @@ impl Group {
                     Self {
                         child,
                         id,
-                        _temp_dir: temp_dir,
+                        temp_dir,
                     }
                 });
                 Ok::<_, String>((command, spawned))
@@ -997,6 +1003,11 @@ impl Group {
         }
         self.kill();
         let _ = self.child.wait().await;
+        if let Some(cleanup) = self.temp_dir.take().and_then(|temp| temp.defer_cleanup())
+            && let Ok(Err(error)) = cleanup.await
+        {
+            tracing::warn!(%error, "Codex probe temporary directory could not be cleaned up");
+        }
     }
 
     /// Whether the leader has exited, without reaping it: until it is
@@ -1039,6 +1050,9 @@ impl Drop for Group {
         // timeout most of all. `kill_on_drop` covers the child; this covers
         // anything it started.
         self.kill();
+        if let Some(temp) = self.temp_dir.take() {
+            let _ = temp.defer_cleanup();
+        }
     }
 }
 
@@ -2867,6 +2881,7 @@ cat >/dev/null
             &script,
             r#"#!/bin/sh
 test "$1" = app-server || exit 1
+test "$TMP" = "$TMPDIR" && test "$TEMP" = "$TMPDIR" || exit 1
 printf '%s' "$TMPDIR" > "${0%/*}/temp-dir"
 printf '%s\n' '{"ready":true}'
 exec /bin/cat >/dev/null

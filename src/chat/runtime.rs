@@ -2199,13 +2199,13 @@ fn spawn_provider(
         return Err("Provider startup was cancelled before process creation".into());
     }
     let mut temp = if private_temp {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
         let inherited = spec.environment.get("TMPDIR").map(std::ffi::OsStr::new);
-        let temporary =
-            crate::daemon::codex_temp::PrivateDir::create(inherited, Some(&spec.working_directory))
-                .map_err(|error| {
-                    format!("Cannot create private Codex temporary directory: {error}")
-                })?;
-        process.env("TMPDIR", temporary.path());
+        let cwd = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let temporary = PrivateDir::create(inherited, Some(&cwd))
+            .map_err(|error| format!("Cannot create private Codex temporary directory: {error}"))?;
+        process.envs(TEMP_ENV_KEYS.map(|key| (key, temporary.path())));
         Some(temporary)
     } else {
         None

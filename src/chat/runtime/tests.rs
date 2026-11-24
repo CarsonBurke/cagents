@@ -5806,18 +5806,19 @@ fn direct_provider_non_reaping_observation_preserves_exit_status() {
 }
 
 #[test]
-fn codex_stdio_replaces_tmpdir_and_cleans_it_after_exit() {
+fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
     use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
 
     let working = tempfile::tempdir().unwrap();
     let recipe = crate::model::LaunchRecipe {
         program: "/usr/bin/printenv".into(),
-        arguments: vec!["TMPDIR".into()],
+        arguments: ["TMPDIR", "TMP", "TEMP"].map(str::to_owned).to_vec(),
         working_directory: working.path().to_path_buf(),
-        environment: BTreeMap::from([(
-            "TMPDIR".into(),
-            working.path().to_str().unwrap().to_owned(),
-        )]),
+        environment: BTreeMap::from([
+            ("TMPDIR".into(), ".".into()),
+            ("TMP".into(), "/original-tmp".into()),
+            ("TEMP".into(), "/original-temp".into()),
+        ]),
         unset_environment: Default::default(),
     };
     let spec = ProcessSpec::from(&recipe);
@@ -5826,8 +5827,13 @@ fn codex_stdio_replaces_tmpdir_and_cleans_it_after_exit() {
         .unwrap();
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut child.child.stdout.take().unwrap(), &mut bytes).unwrap();
-    assert_eq!(bytes.pop(), Some(b'\n'));
-    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    let paths: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
+    let [first, second, third, []] = paths.as_slice() else {
+        panic!("expected three environment paths");
+    };
+    assert_eq!(first, second);
+    assert_eq!(first, third);
+    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(first.to_vec()));
     assert_eq!(
         temp.parent(),
         Some(working.path().canonicalize().unwrap().as_path())

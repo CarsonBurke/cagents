@@ -1369,11 +1369,14 @@ fn serve(control: UnixStream) -> i32 {
         return fail(error);
     }
     // The holder survives daemon replacement, as does the directory it
-    // owns. Codex exposes TMPDIR to sandboxed commands as a writable root.
+    // owns. Resolve a relative TMPDIR from the pinned cwd just entered.
     let mut private_tmp = if isolate_codex_tmp {
-        match crate::daemon::codex_temp::PrivateDir::create(command.get_env("TMPDIR"), None) {
+        let cwd = command.get_cwd().map(Path::new);
+        match crate::daemon::codex_temp::PrivateDir::create(command.get_env("TMPDIR"), cwd) {
             Ok(directory) => {
-                command.env("TMPDIR", directory.path());
+                for key in crate::daemon::codex_temp::TEMP_ENV_KEYS {
+                    command.env(key, directory.path());
+                }
                 Some(directory)
             }
             Err(error) => return fail(format!("create private Codex terminal directory: {error}")),
