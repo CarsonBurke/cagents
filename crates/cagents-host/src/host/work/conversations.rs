@@ -229,6 +229,31 @@ fn sooner(next: &mut Option<Instant>, at: Instant) {
     *next = Some(next.map_or(at, |pending| pending.min(at)));
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NextPass {
+    deadline: Option<Instant>,
+    reset: Option<u64>,
+}
+
+impl NextPass {
+    fn due(&self) -> bool {
+        self.deadline.is_some_and(|at| Instant::now() >= at)
+            || self.reset.is_some_and(super::pause_over)
+    }
+
+    fn wait_for(&self) -> Option<Duration> {
+        self.deadline
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .into_iter()
+            .chain(self.reset.map(|until| {
+                super::pause_ends(until)
+                    .saturating_duration_since(Instant::now())
+                    .min(super::PAUSED_WAKE)
+            }))
+            .min()
+    }
+}
+
 /// Where a pass found the conversation's transcript.
 enum Location {
     /// As before, or not looked for this pass.
@@ -705,26 +730,34 @@ impl Handle {
                 Handle(inner).input_changed(id);
             }
         });
-        while let Some(observed) = self.0.conversations.signal.observe() {
+        let signal = &self.0.conversations.signal;
+        while let Some(observed) = signal.observe() {
             let Some(host) = self.0.host.upgrade() else {
                 break;
             };
-            let delay = super::super::service::attempt("Conversation pull requests", || {
+            let next = super::super::service::attempt("Conversation pull requests", || {
                 Ok(self.conversation_pass(&host, &mut files))
             })
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, "conversation pull requests are temporarily unavailable");
-                Some(TICK)
+                NextPass {
+                    deadline: Some(Instant::now() + TICK),
+                    reset: None,
+                }
             });
             drop(host);
-            self.0.conversations.signal.wait_for_change(observed, delay);
+            // A monotonic wait sleeps through suspend. Check the wall clock
+            // during a quota pause without running another conversation pass.
+            while signal.observe() == Some(observed) && !next.due() {
+                signal.wait_for_change(observed, next.wait_for());
+            }
         }
     }
 
     /// Reads changed records and watched transcripts, then publishes any
     /// changed lists. Only watches, retention and incomplete record reads
     /// can need another pass without input.
-    fn conversation_pass(&self, host: &SharedHost, files: &mut files::Watches) -> Option<Duration> {
+    fn conversation_pass(&self, host: &SharedHost, files: &mut files::Watches) -> NextPass {
         let dirty = std::mem::take(
             &mut *self
                 .0
@@ -903,11 +936,14 @@ impl Handle {
                 watched.apply(scanned, facts.get(conversation).and_then(Option::as_deref));
             }
         }
-        let delay = self.conversation_delay(&followed);
+        let deadline = self.conversation_deadline(&followed);
         if conversations.is_empty() {
-            return delay;
+            return NextPass {
+                deadline,
+                reset: None,
+            };
         }
-        let next_lookup = self.look_up(&conversations, &facts);
+        let mut next = self.look_up(&conversations, &facts);
         let more_diffs = self.measure(&conversations, &facts);
         let proof = Arc::new(
             host.lock()
@@ -959,14 +995,16 @@ impl Handle {
                 self.0.conversations.signal.notify();
             }
         }
-        delay
-            .into_iter()
-            .chain(next_lookup.map(|at| at.saturating_duration_since(Instant::now())))
-            .chain(more_diffs.then_some(TICK))
-            .min()
+        if let Some(deadline) = deadline {
+            sooner(&mut next.deadline, deadline);
+        }
+        if more_diffs {
+            sooner(&mut next.deadline, Instant::now() + TICK);
+        }
+        next
     }
 
-    fn conversation_delay(&self, followed: &BTreeSet<TerminalId>) -> Option<Duration> {
+    fn conversation_deadline(&self, followed: &BTreeSet<TerminalId>) -> Option<Instant> {
         self.conversations()
             .watched
             .iter()
@@ -982,7 +1020,6 @@ impl Handle {
                 }
             })
             .min()
-            .map(|due| due.saturating_duration_since(Instant::now()))
     }
 
     /// Project placement reads the workspace registry and Git metadata.
@@ -1110,14 +1147,17 @@ impl Handle {
         &self,
         conversations: &[TerminalId],
         facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
-    ) -> Option<Instant> {
-        let mut next = None;
+    ) -> NextPass {
+        let mut cached_deadline = None;
         // In rank order across conversations, so the budget goes to what
         // they worked on before what they mentioned.
         let lookups = {
             let state = self.conversations();
             if let Some(due) = state.lookup_retry() {
-                return Some(due);
+                return NextPass {
+                    deadline: Some(due),
+                    reset: None,
+                };
             }
             let now = Instant::now();
             let mut lookups: Vec<(Relation, Lookup)> = Vec::new();
@@ -1151,7 +1191,7 @@ impl Handle {
                                 .and_then(|read| read.refresh_at(worked_on))
                                 .filter(|&due| due > now)
                             {
-                                sooner(&mut next, due);
+                                sooner(&mut cached_deadline, due);
                                 continue;
                             }
                             Lookup::PullRequest(key)
@@ -1175,7 +1215,7 @@ impl Handle {
                             branch,
                         },
                         Resolved::Deferred(due) => {
-                            sooner(&mut next, due);
+                            sooner(&mut cached_deadline, due);
                             continue;
                         }
                         Resolved::Nothing => continue,
@@ -1189,8 +1229,9 @@ impl Handle {
             lookups.sort_by_key(|(relation, _)| *relation);
             lookups
         };
-        if let Some(due) = self.run_lookups(&GitHubService::system("gh"), lookups) {
-            sooner(&mut next, due);
+        let mut next = self.run_lookups(&GitHubService::system("gh"), lookups);
+        if let Some(due) = cached_deadline {
+            sooner(&mut next.deadline, due);
         }
         next
     }
@@ -1199,12 +1240,12 @@ impl Handle {
         &self,
         gh: &GitHubService<E>,
         lookups: impl IntoIterator<Item = (Relation, Lookup)>,
-    ) -> Option<Instant> {
+    ) -> NextPass {
         let cancellation = &self.0.cancellation;
         let mut checked_hosts = BTreeSet::new();
         let mut limited = BTreeMap::new();
         let mut reads = 0;
-        let mut next = None;
+        let mut next = NextPass::default();
         for (relation, lookup) in lookups {
             let repository = lookup.repository();
             let authority = repository.authority();
@@ -1220,7 +1261,7 @@ impl Handle {
                 continue;
             }
             if reads == LOOKUPS_PER_PASS {
-                sooner(&mut next, Instant::now() + TICK);
+                sooner(&mut next.deadline, Instant::now() + TICK);
                 continue;
             }
 
@@ -1233,11 +1274,14 @@ impl Handle {
                     .map(Some),
             };
             reads += 1;
-            // An applicable shared pause leaves both the observations and
-            // their ordinary failure backoff alone. Other hosts can continue.
+            // A fresh rate limit answers the lookup without invalidating
+            // existing observations or holding up other hosts. A reset too
+            // close to trust uses the same outage backoff as the board.
             if let Err(error) = &result
                 && let Some(limit) = error.rate_limit()
+                && super::rate_limit_pause(limit.retry_at).is_some()
             {
+                self.conversations().succeeded();
                 limited.insert(authority, limit);
             } else {
                 let mut state = self.conversations();
@@ -1254,7 +1298,8 @@ impl Handle {
                             entry.failures = entry.failures.saturating_add(1);
                         }
                         state.failed(&error);
-                        return state.lookup_retry();
+                        next.deadline = state.lookup_retry();
+                        return next;
                     }
                 };
                 match lookup {
@@ -1264,13 +1309,13 @@ impl Handle {
                         {
                             let read = observed_now(found);
                             if let Some(due) = read.refresh_at(relation.worked_on()) {
-                                sooner(&mut next, due);
+                                sooner(&mut next.deadline, due);
                             }
                             state.observed.insert((&key).into(), read);
                         }
                         let checked = Instant::now();
                         if found.is_none() {
-                            sooner(&mut next, checked + BRANCH_MISSING_FOR);
+                            sooner(&mut next.deadline, checked + BRANCH_MISSING_FOR);
                         }
                         state.branches.insert(
                             (base, branch),
@@ -1290,21 +1335,20 @@ impl Handle {
                             entry.failures = 0;
                         }
                         if let Some(due) = entry.refresh_at(relation.worked_on()) {
-                            sooner(&mut next, due);
+                            sooner(&mut next.deadline, due);
                         }
                     }
                 }
             }
         }
         let limit = limited.values().min_by_key(|limit| limit.retry_at);
-        if let Some(limit) = limit {
-            let reset_in = limit
-                .retry_at
-                .saturating_mul(1000)
-                .saturating_sub(now_unix_ms());
-            let delay = Duration::from_millis(reset_in).max(Duration::from_secs(1));
-            sooner(&mut next, Instant::now() + delay);
-        }
+        next.reset = limit.map(|limit| {
+            // The shared budget can already be ending. Wait for it when it
+            // reports a near reset before admission; only a new refusal at
+            // that time demonstrates clock skew.
+            super::rate_limit_pause(limit.retry_at)
+                .unwrap_or_else(|| limit.retry_at.saturating_add(1))
+        });
         self.conversations().forge_error = limit.map(ToString::to_string);
         next
     }

@@ -532,8 +532,8 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
         })
     };
 
-    let deadline = polling::with_scope(scope, || {
-        let reset = polling::now() + 600;
+    let reset = polling::now() + 600;
+    let next = polling::with_scope(scope, || {
         for (repository, resource) in [(&spent, "graphql"), (&rest_spent, "core")] {
             polling::failed(
                 &repository.authority(),
@@ -551,8 +551,8 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
         .chain([view(&rest_spent, 1), view(&open, 1)]);
         work.run_lookups(&gh, lookups.map(|lookup| (Relation::Edited, lookup)))
     });
-    let waiting = deadline.unwrap().saturating_duration_since(Instant::now());
-    assert!((Duration::from_secs(598)..=Duration::from_secs(600)).contains(&waiting));
+    assert_eq!(next.reset, Some(reset + 1));
+    assert_eq!(next.wait_for(), Some(crate::host::work::PAUSED_WAKE));
 
     let commands = forge.0.lock().unwrap();
     assert_eq!(commands.len(), 2);
@@ -576,6 +576,63 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
             .unwrap()
             .contains("Retrying at")
     );
+}
+
+#[test]
+fn a_new_rate_limit_ends_an_outage_but_a_near_reset_backs_off() {
+    use crate::repository::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
+    };
+
+    struct Rejected(u64);
+    impl ProcessExecutor for Rejected {
+        fn execute(
+            &self,
+            _: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            Ok(ProcessOutput {
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: format!(
+                    "GraphQL: API rate limit already exceeded\nX-RateLimit-Remaining: 0\nX-RateLimit-Resource: graphql\nX-RateLimit-Reset: {}\n",
+                    self.0,
+                ).into_bytes(),
+            })
+        }
+    }
+
+    for (authority, seconds) in [("normal-reset.invalid", 600), ("near-reset.invalid", 1)] {
+        let reset = polling::now() + seconds;
+        let gh = GitHubService::new("gh", Arc::new(Rejected(reset)));
+        let repository = GitHubRepoKey::new(authority, None, "owner", "repo").unwrap();
+        let key = PullRequestKeyOrd {
+            repository: (&repository).into(),
+            number: 1,
+        };
+        let work = Handle::idle(Weak::new());
+        let outage = GitHubError::NoActiveAccount(authority.into());
+        work.conversations().failed(&outage);
+        work.conversations().failed(&outage);
+
+        let next = polling::with_scope("conversation-rate-limit-reply-test", || {
+            work.run_lookups(&gh, [(Relation::Edited, Lookup::PullRequest(key.clone()))])
+        });
+        let state = work.conversations();
+        if seconds == 1 {
+            assert_eq!(state.failures, 3);
+            assert_eq!(state.observed[&key].failures, 1);
+            assert_eq!(next.deadline, state.lookup_retry());
+            assert_eq!(next.reset, None);
+        } else {
+            assert_eq!(state.failures, 0);
+            assert!(!state.observed.contains_key(&key));
+            assert_eq!(next.deadline, None);
+            assert_eq!(next.reset, Some(reset + 1));
+        }
+    }
 }
 
 /// A transcript file in a directory owned by its test.
@@ -1272,7 +1329,10 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     let mut files = files::Watches::new(|_| {});
     // Nothing to read: the loop would wait for input.
     let observed = signal.observe().unwrap();
-    assert_eq!(work.conversation_pass(&host, &mut files), None);
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
 
     let id = host_recorded_chat(
         &host,
@@ -1298,7 +1358,10 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     assert_ne!(signal.observe(), Some(observed));
 
     // Followed with no watcher, and read from its start.
-    assert_eq!(work.conversation_pass(&host, &mut files), None);
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
     {
         let mut state = work.conversations();
         let watched = state.watched.get_mut(&id).unwrap();
@@ -1319,7 +1382,10 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
         })
         .unwrap();
     assert_ne!(signal.observe(), Some(observed));
-    assert_eq!(work.conversation_pass(&host, &mut files), None);
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
     assert_eq!(numbers(&work.conversations().watched[&id]), [1, 2]);
 
     let record = host.lock().unwrap().chats.remove(&id).unwrap();
