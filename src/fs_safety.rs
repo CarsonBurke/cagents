@@ -1419,11 +1419,6 @@ mod xattr {
         // SAFETY: forwarded under the caller's obligations.
         unsafe { libc::fsetxattr(fd, name, value, size, 0, 0) }
     }
-
-    pub(super) unsafe fn remove(fd: libc::c_int, name: *const libc::c_char) -> libc::c_int {
-        // SAFETY: forwarded under the caller's obligations.
-        unsafe { libc::fremovexattr(fd, name, 0) }
-    }
 }
 
 /// Every extended-attribute name an open file carries.
