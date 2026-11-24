@@ -3631,14 +3631,17 @@ mod tests {
     /// killed the provider and prevented the session from reopening.
     #[test]
     fn inline_image_far_past_the_identity_budget_round_trips() {
+        use crate::chat::OpeningTitle;
+
         let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store.apply(Event::OpeningHistoryComplete).unwrap();
         let payload = format!("data:image/png;base64,{}", "QUJD".repeat(512 * 1024));
-        let warnings = store
+        let events = store
             .apply(Event::Item(Item {
                 id: "shot".into(),
                 role: Role::User,
                 content: ItemContent::Image {
-                    path: payload.clone(),
+                    path: payload,
                     description: "screenshot".into(),
                     reference: None,
                 },
@@ -3646,7 +3649,7 @@ mod tests {
                 at: None,
             }))
             .unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(events, [Event::OpeningTitle(OpeningTitle::Image)]);
         let window = store.window().unwrap();
         assert_eq!(window.items.len(), 1);
         match &window.items[0].content {
