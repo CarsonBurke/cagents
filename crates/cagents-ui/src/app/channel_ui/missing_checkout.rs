@@ -79,9 +79,10 @@ impl Cagents {
             .find(|channel| channel.id == id)?;
         let path = channel.checkout.as_deref()?;
         let project = self.sidebar_model.project(channel.project_id)?;
+        // A reload keeps the last listing until the new one lands, and that
+        // listing still answers: the notice must not lapse for a refresh.
         if project.kind != ProjectKind::Git
             || project.worktrees.is_empty()
-            || project.reloading
             || project.unreachable.is_some()
             || listed_worktree(project, &self.known_worktree_roots, path).is_some()
         {
@@ -97,6 +98,27 @@ impl Cagents {
             label: label(branch.as_deref(), path),
             branch,
         })
+    }
+
+    /// What the source-control panel binds while worktree channel `id` is
+    /// shown: its listed checkout, or nothing while that checkout is missing
+    /// or not yet confirmed. `None` for a channel that names no worktree.
+    pub(in crate::app) fn channel_checkout_focus(&self, id: ChannelId) -> Option<SidebarFocus> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        let checkout = channel.checkout.as_deref()?;
+        let listed = self
+            .sidebar_model
+            .project(channel.project_id)
+            .and_then(|project| listed_worktree(project, &self.known_worktree_roots, checkout));
+        Some(
+            listed.map_or(SidebarFocus::Removed, |worktree| SidebarFocus::Repository {
+                worktree: worktree.to_path_buf(),
+            }),
+        )
     }
 
     /// [`Self::missing_checkout`] for the channel holding `card`.

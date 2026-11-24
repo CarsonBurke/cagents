@@ -13441,14 +13441,17 @@ impl Cagents {
     /// page - is [`SidebarFocus::None`], which leaves the panel where it is
     /// rather than tearing it down.
     fn sidebar_focus(&self) -> SidebarFocus {
-        // A channel whose worktree was removed shows its panes in the main
-        // checkout, whose changes are not the channel's to commit.
-        if self
+        // A worktree channel binds its own checkout, read from the latest
+        // listing rather than from the strip it installed: the worktree may
+        // have been removed or listed again since. Until the listing confirms
+        // it, the panel binds nothing; the main checkout the panes fall back
+        // to is not the channel's to commit.
+        if let Some(focus) = self
             .durable
             .active_channel
-            .is_some_and(|channel| self.missing_checkout(channel).is_some())
+            .and_then(|channel| self.channel_checkout_focus(channel))
         {
-            return SidebarFocus::Removed;
+            return focus;
         }
         if let Some(worktree) = &self.active_workspace {
             return SidebarFocus::Repository {

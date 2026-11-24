@@ -863,6 +863,38 @@ mod tests {
                 if removed.channel == missing && removed.path == gone
         ));
         assert_eq!(fixture.app.inspector_panel_pin(), None);
+
+        // A refresh keeps the last listing, which still says it is missing.
+        let project = fixture.project;
+        fn row(app: &mut Cagents, project: ProjectId) -> &mut crate::sidebar::SidebarProject {
+            app.sidebar_model
+                .projects
+                .iter_mut()
+                .find(|row| row.id == project)
+                .unwrap()
+        }
+        row(&mut fixture.app, project).reloading = true;
+        assert!(fixture.app.missing_checkout(missing).is_some());
+        assert_eq!(
+            fixture.app.sidebar_focus(),
+            crate::sidebar::SidebarFocus::Removed
+        );
+        row(&mut fixture.app, project).reloading = false;
+
+        // Listed again, as when it is recreated outside the app, it binds the
+        // channel's worktree, not the main checkout the strip still shows.
+        row(&mut fixture.app, project)
+            .worktrees
+            .push(SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                gone.clone(),
+                Some("feature-two".into()),
+            ));
+        assert!(fixture.app.missing_checkout(missing).is_none());
+        assert_eq!(
+            fixture.app.sidebar_focus(),
+            crate::sidebar::SidebarFocus::Repository { worktree: gone }
+        );
     }
 
     /// A listing records each worktree's branch, so it outlives the worktree.
