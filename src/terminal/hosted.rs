@@ -1534,13 +1534,16 @@ fn ensure_daemon_ready_at(
             // A listening socket can belong to an older development build.
             // Verify the wire protocol before opening a window whose actions
             // would otherwise all fail against that daemon.
-            // A concurrent launcher may still be restoring behind this bound
-            // listener. Authenticate with the same startup allowance as our
-            // own launch. Budget estimation is not readiness authority: a
-            // stale damaged checkpoint must not reject a serving daemon.
-            let timeout = crate::upgrade::handoff::startup_timeout()
-                .unwrap_or(crate::upgrade::handoff::STARTUP_BASE);
-            return verify_startup_stream(socket, stream, Instant::now() + timeout);
+            return verify_startup_stream(socket, stream, |stream| {
+                let started = Instant::now();
+                crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
+                    // A concurrent launcher may still be restoring. Keep the
+                    // allowance anchored to when this handshake began.
+                    started
+                        + crate::upgrade::handoff::startup_timeout()
+                            .unwrap_or(crate::upgrade::handoff::STARTUP_BASE)
+                })
+            });
         }
         Err(error)
             if !matches!(
@@ -1602,7 +1605,9 @@ fn start_and_verify_daemon_at(
             path: socket.to_owned(),
             source,
         })?;
-    verify_startup_stream(socket, stream, deadline)
+    verify_startup_stream(socket, stream, |stream| {
+        crate::control::ControlClient::from_stream_until(stream, deadline)
+    })
 }
 
 fn launch_is_updating(socket: &Path) -> Result<bool, HostedTerminalStartError> {
@@ -1622,7 +1627,9 @@ fn refuse_update_launch(socket: &Path) -> Result<(), HostedTerminalStartError> {
 fn verify_startup_stream(
     socket: &Path,
     stream: UnixStream,
-    deadline: Instant,
+    connect: impl FnOnce(
+        UnixStream,
+    ) -> Result<crate::control::ControlClient, crate::control::ControlError>,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     // A serving daemon remains usable during review. An ordinary reader of
     // an update's bound-but-unready listener gets the normal handshake budget;
@@ -1636,7 +1643,7 @@ fn verify_startup_stream(
     } else {
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
-        let client = crate::control::ControlClient::from_stream_until(stream, deadline);
+        let client = connect(stream);
         // A serving daemon that took the connection and never answered is
         // as unresponsive as one that ignores a request, so the window says
         // so and offers its restart. An update's listener is left out: it
@@ -3616,7 +3623,9 @@ mod tests {
                     let result = verify_startup_stream(
                         &socket,
                         UnixStream::connect(&socket).unwrap(),
-                        Instant::now(),
+                        |stream| {
+                            crate::control::ControlClient::from_stream_until(stream, Instant::now())
+                        },
                     );
                     assert_eq!(result.is_ok(), answer, "{result:?}");
                     server.join()
@@ -3816,20 +3825,20 @@ mod tests {
                 .write_all(b"damaged checkpoint")
                 .unwrap();
         }
-        // Restoration outlasts the ordinary handshake budget, lowered here
-        // so that waiting it out is cheap.
+        // The reply is split across the ordinary handshake budget, lowered
+        // here so the start of the reply has to survive the extension.
         let _budget = crate::control::ordinary_budget::quick();
         let restore = crate::control::ordinary_budget::QUICK + Duration::from_millis(600);
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            thread::sleep(restore);
             let mut stream = accept_connection(&listener);
             let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             let proof = proof("restored-existing");
-            let _ = write_frame(
-                &mut stream,
+            let mut reply = Vec::new();
+            write_frame(
+                &mut reply,
                 &ServerEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: Some(request.request_id),
@@ -3841,7 +3850,11 @@ mod tests {
                         },
                     },
                 },
-            );
+            )
+            .unwrap();
+            stream.write_all(&reply[..6]).unwrap();
+            thread::sleep(restore);
+            let _ = stream.write_all(&reply[6..]);
         });
         let result = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
         server.join().unwrap();
