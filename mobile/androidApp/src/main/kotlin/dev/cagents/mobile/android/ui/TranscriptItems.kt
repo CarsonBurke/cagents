@@ -313,7 +313,7 @@ private fun Delivery(id: String, body: ItemBody.Delivery) {
                 Icon(Icons.Outlined.Inbox, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.secondary)
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    body.summary.ifBlank { body.from.ifBlank { "Delivered" } },
+                    body.heading,
                     style = MaterialTheme.typography.labelLarge,
                     maxLines = if (open) Int.MAX_VALUE else 1,
                     overflow = TextOverflow.Ellipsis,
