@@ -329,6 +329,9 @@ impl Handle {
 
     pub fn presence(&self, client: ClientId, presence: Option<Presence>) {
         let mut current = self.0.presence.lock().unwrap_or_else(|p| p.into_inner());
+        if current.get(&client) == presence.as_ref() {
+            return;
+        }
         if let Some(presence) = presence {
             current.insert(client, presence);
         } else {
@@ -453,17 +456,17 @@ fn supervise(
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         snapshot.diagnostic = Some(format!("Notifications unavailable: {error}"));
-        publish(shared, host, snapshot);
+        publish(shared, host, &snapshot);
     }
 }
 
-fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
+fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: &Snapshot) {
     if let Some(shared) = shared.upgrade() {
         let mut current = shared.snapshot.lock().unwrap_or_else(|p| p.into_inner());
-        if *current == snapshot {
+        if *current == *snapshot {
             return;
         }
-        *current = snapshot;
+        current.clone_from(snapshot);
         drop(current);
         if let Some(host) = host.upgrade() {
             host.lock()
@@ -938,7 +941,7 @@ fn restore(
     policy: &Preferences,
     snapshot: &mut Snapshot,
     withdrawals: &mut Withdrawals,
-) {
+) -> bool {
     if !policy.message_previews {
         match journal.clear_content() {
             Ok(notices) => {
@@ -949,19 +952,33 @@ fn restore(
             Err(error) => snapshot.diagnostic = Some(error),
         }
     }
-    match journal.list() {
-        Ok(notices) => snapshot.notices = notices,
-        Err(error) => snapshot.diagnostic = Some(error),
-    }
+    let loaded = refresh_notices(journal, snapshot, withdrawals);
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
-    withdrawals.protect(
-        snapshot
-            .notices
-            .iter()
-            .map(|notice| batching::desktop_id(&notice.event.target)),
-    );
+    loaded
+}
+
+fn refresh_notices(
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+) -> bool {
+    match journal.list() {
+        Ok(notices) => {
+            withdrawals.protect(
+                notices
+                    .iter()
+                    .map(|notice| batching::desktop_id(&notice.event.target)),
+            );
+            snapshot.notices = notices;
+            true
+        }
+        Err(error) => {
+            snapshot.diagnostic = Some(error);
+            false
+        }
+    }
 }
 
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
@@ -1169,11 +1186,14 @@ async fn run(
         diagnostic: settings_error.clone(),
         ..Default::default()
     };
-    match store.journal() {
-        Ok(journal) => restore(journal, &policy, &mut snapshot, &mut withdrawals),
-        Err(error) => snapshot.diagnostic = Some(error.clone()),
-    }
-    publish(&shared, &host, snapshot.clone());
+    let mut notices_dirty = match store.journal() {
+        Ok(journal) => !restore(journal, &policy, &mut snapshot, &mut withdrawals),
+        Err(error) => {
+            snapshot.diagnostic = Some(error.clone());
+            true
+        }
+    };
+    publish(&shared, &host, &snapshot);
     while wait_for_work(
         &mut receiver,
         if proxy.is_none() {
@@ -1224,7 +1244,7 @@ async fn run(
             if snapshot.diagnostic.as_ref() == Some(&recovered) {
                 snapshot.diagnostic.clone_from(&settings_error);
             }
-            restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            notices_dirty = !restore(journal, &policy, &mut snapshot, &mut withdrawals);
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -1257,6 +1277,28 @@ async fn run(
                 continue;
             }
         };
+        if notices_dirty && pending.inboxes.is_some() {
+            notices_dirty = !refresh_notices(journal, &mut snapshot, &mut withdrawals);
+            if !policy.message_previews {
+                for notice in &mut snapshot.notices {
+                    notice.event.content = None;
+                }
+            }
+        }
+        if let Some(inboxes) = pending.inboxes.take() {
+            // This broker alone writes the journal, so its current projection
+            // also tells it which pending inboxes have gone away.
+            if !notices_dirty {
+                for notice in &snapshot.notices {
+                    if let Target::SessionInbox(lineage) = notice.event.target
+                        && !inboxes.pending.contains(&lineage)
+                    {
+                        pending.retired.insert(Target::SessionInbox(lineage));
+                    }
+                }
+            }
+            pending.events.extend(inboxes.events);
+        }
         if let Some(current) = current_presence {
             for (client, update) in &current {
                 if stopped(&shared) {
@@ -1270,12 +1312,15 @@ async fn run(
                     old.sessions != update.sessions || old.destination() != update.destination()
                 });
                 let sessions = if changed {
-                    update.sessions.clone()
+                    update.sessions.as_slice()
                 } else {
-                    update.focused.into_iter().collect()
+                    update.focused.as_slice()
                 };
-                if let Err(error) = journal.remember_window(sessions, &update.window) {
-                    snapshot.diagnostic = Some(error);
+                if !sessions.is_empty() {
+                    match journal.remember_window(sessions.iter().copied(), &update.window) {
+                        Ok(()) => notices_dirty = true,
+                        Err(error) => snapshot.diagnostic = Some(error),
+                    }
                 }
             }
             presence = current;
@@ -1292,6 +1337,7 @@ async fn run(
                 revoke_previews(&mut snapshot, &mut withdrawals);
                 match journal.clear_content() {
                     Ok(notices) => {
+                        notices_dirty |= !notices.is_empty();
                         for (id, target) in notices {
                             withdraw_target(&mut withdrawals, id, &target);
                         }
@@ -1320,23 +1366,6 @@ async fn run(
             next_attempt = Instant::now();
             retry_delay = RETRY_DELAY;
         }
-        if let Some(inboxes) = pending.inboxes.take() {
-            // A complete durable pending snapshot retires inbox attention only
-            // when mail is gone; offline recipients keep existing attention.
-            match journal.list() {
-                Ok(notices) => {
-                    for notice in notices {
-                        if let Target::SessionInbox(lineage) = notice.event.target
-                            && !inboxes.pending.contains(&lineage)
-                        {
-                            pending.retired.insert(Target::SessionInbox(lineage));
-                        }
-                    }
-                }
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
-            pending.events.extend(inboxes.events);
-        }
         for session in pending.retired {
             if stopped(&shared) {
                 return;
@@ -1349,8 +1378,9 @@ async fn run(
             {
                 withdraw_notice(&mut withdrawals, old);
             }
-            if let Err(error) = journal.retire(session) {
-                snapshot.diagnostic = Some(error);
+            match journal.retire(session) {
+                Ok(()) => notices_dirty = true,
+                Err(error) => snapshot.diagnostic = Some(error),
             }
         }
         for id in pending.acknowledged {
@@ -1358,8 +1388,10 @@ async fn run(
                 return;
             }
             delivery.retain(|_, notice| notice.id != id);
-            if let Err(error) = journal.acknowledge(id) {
-                snapshot.diagnostic = Some(error);
+            match journal.acknowledge(id) {
+                Ok(Some(_)) => notices_dirty = true,
+                Ok(None) => {}
+                Err(error) => snapshot.diagnostic = Some(error),
             }
             if let Some(notice) = snapshot.notices.iter().find(|notice| notice.id == id) {
                 withdraw_notice(&mut withdrawals, notice);
@@ -1386,8 +1418,10 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
+            let inbox = matches!(event.target, Target::SessionInbox(_));
             match record_attention_committed_policy(journal, event, suppressed, receipt, &policy) {
                 Ok(Some(notice)) => {
+                    notices_dirty = true;
                     delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot.notices.iter().find(|old| {
                         old.event.target.storage_key() == notice.event.target.storage_key()
@@ -1407,25 +1441,19 @@ async fn run(
                         delivery.insert(notice.event.target(), notice);
                     }
                 }
-                Ok(None) => {}
+                // A duplicate inbox event can still change its routing.
+                Ok(None) => notices_dirty |= inbox,
                 Err(error) => snapshot.diagnostic = Some(error),
             }
         }
-        match journal.list() {
-            Ok(notices) => snapshot.notices = notices,
-            Err(error) => snapshot.diagnostic = Some(error),
-        }
-        if !policy.message_previews {
-            for notice in &mut snapshot.notices {
-                notice.event.content = None;
+        if notices_dirty {
+            notices_dirty = !refresh_notices(journal, &mut snapshot, &mut withdrawals);
+            if !policy.message_previews {
+                for notice in &mut snapshot.notices {
+                    notice.event.content = None;
+                }
             }
         }
-        withdrawals.protect(
-            snapshot
-                .notices
-                .iter()
-                .map(|notice| batching::desktop_id(&notice.event.target)),
-        );
         for notice in delivery.values_mut() {
             if let Some(current) = snapshot
                 .notices
@@ -1437,12 +1465,14 @@ async fn run(
         }
         // Journal eviction also bounds retries across multiple disconnected
         // batches. Never announce an event whose durable identity was evicted.
-        let retained = snapshot
-            .notices
-            .iter()
-            .map(|notice| notice.id)
-            .collect::<BTreeSet<_>>();
-        delivery.retain(|_, notice| retained.contains(&notice.id));
+        if !delivery.is_empty() {
+            let retained = snapshot
+                .notices
+                .iter()
+                .map(|notice| notice.id)
+                .collect::<BTreeSet<_>>();
+            delivery.retain(|_, notice| retained.contains(&notice.id));
+        }
         // A delayed completion stops being a desktop alert once the user has
         // returned to that pane or disabled its category.
         delivery.retain(|_, notice| {
@@ -1505,8 +1535,17 @@ async fn run(
                 match send(backend, &notice, activation.receives_actions()).await {
                     Ok(()) => {
                         delivery.remove(&notice.event.target());
-                        if let Err(error) = journal.delivered(notice.id) {
-                            snapshot.diagnostic = Some(error);
+                        match journal.delivered(notice.id) {
+                            Ok(()) => {
+                                if let Some(current) = snapshot
+                                    .notices
+                                    .iter_mut()
+                                    .find(|current| current.id == notice.id)
+                                {
+                                    current.delivered = true;
+                                }
+                            }
+                            Err(error) => snapshot.diagnostic = Some(error),
                         }
                     }
                     Err(error) => {
@@ -1546,15 +1585,6 @@ async fn run(
                 && let Some(shared) = shared.upgrade()
             {
                 let _ = shared.wake.try_send(());
-            }
-        }
-        match journal.list() {
-            Ok(notices) => snapshot.notices = notices,
-            Err(error) => snapshot.diagnostic = Some(error),
-        }
-        if !policy.message_previews {
-            for notice in &mut snapshot.notices {
-                notice.event.content = None;
             }
         }
         for (action, token) in pending.actions {
@@ -1598,7 +1628,7 @@ async fn run(
             .map(batching::desktop_id)
             .collect::<BTreeSet<_>>();
         delivery_schedule.retain(|group| delivery_groups.contains(group));
-        publish(&shared, &host, snapshot.clone());
+        publish(&shared, &host, &snapshot);
     }
 }
 
@@ -1619,6 +1649,38 @@ mod tests {
     }
 
     #[test]
+    fn presence_wakes_the_broker_only_when_the_client_presence_changes() {
+        let (shared, mut receiver) = shared();
+        let handle = Handle(shared.clone());
+        let session = TerminalId::new();
+        let mut presence = Presence {
+            window: "primary".into(),
+            sessions: vec![session],
+            ..Presence::default()
+        };
+
+        handle.presence(1, None);
+        assert!(receiver.try_recv().is_err());
+
+        handle.presence(1, Some(presence.clone()));
+        assert!(receiver.try_recv().is_ok());
+        assert!(take_pending(&shared).presence_changed);
+        handle.presence(1, Some(presence.clone()));
+        assert!(receiver.try_recv().is_err());
+
+        presence.focused = Some(session);
+        handle.presence(1, Some(presence));
+        assert!(receiver.try_recv().is_ok());
+        assert!(take_pending(&shared).presence_changed);
+
+        handle.presence(1, None);
+        assert!(receiver.try_recv().is_ok());
+        assert!(take_pending(&shared).presence_changed);
+        handle.presence(1, None);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn work_deferred_for_an_unavailable_journal_keeps_its_order_with_later_work() {
         let (shared, _receiver) = shared();
         let handle = Handle(shared.clone());
@@ -1628,7 +1690,7 @@ mod tests {
         handle.record(attention_event(replaced, "older"));
         handle.record(attention_event(kept, "kept"));
         handle.acknowledge(acknowledged);
-        handle.presence(1, None);
+        handle.presence(1, Some(Presence::default()));
         let receipt = handle
             .record_committed(attention_event(kept, "receipt"))
             .unwrap();
