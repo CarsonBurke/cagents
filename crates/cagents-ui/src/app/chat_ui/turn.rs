@@ -169,12 +169,18 @@ impl Turn {
         if self.partly_failed() {
             return Some(Status::PartlyFailed);
         }
+        // A refusal is not hidden behind later success either.
+        if self.denied > 0 && self.outcome == Some(ToolStatus::Succeeded) {
+            return Some(ToolStatus::Denied.into());
+        }
         self.outcome.map(Status::from)
     }
 
-    /// Whether some of the group's steps failed and others did not.
+    /// Whether some of the group's steps failed and others went through.
+    /// Refused steps did not, so failures and refusals that cover every
+    /// step keep the full error mark.
     fn partly_failed(&self) -> bool {
-        self.failed > 0 && self.failed < self.steps.len()
+        self.failed > 0 && self.failed + self.denied < self.steps.len()
     }
 
     /// How long this stretch of work has taken, in milliseconds.
@@ -1667,7 +1673,7 @@ mod tests {
 
     #[test]
     fn a_collapsed_group_counts_refusals_and_keeps_one_before_later_success() {
-        let summary = |statuses: &[ToolStatus]| {
+        let summary_and_glyph = |statuses: &[ToolStatus]| {
             let mut items = vec![text("u1", Role::User, Phase::Final, false)];
             items.extend(
                 statuses
@@ -1675,18 +1681,33 @@ mod tests {
                     .enumerate()
                     .map(|(index, status)| command(&format!("c{index}"), *status)),
             );
-            group(&items, &unasked(), plain)[0].summary.clone()
+            let turns = group(&items, &unasked(), plain);
+            (turns[0].summary.clone(), turns[0].glyph())
         };
+        let summary = |statuses: &[ToolStatus]| summary_and_glyph(statuses).0;
         use ToolStatus::{Denied, Failed, Succeeded};
-        assert_eq!(
-            summary(&[Denied, Succeeded]),
-            "Ran 2 commands · 1 denied",
-            "later success must not hide a refused step either"
-        );
+        for statuses in [[Denied, Succeeded], [Succeeded, Denied]] {
+            assert_eq!(
+                summary_and_glyph(&statuses),
+                ("Ran 2 commands · 1 denied".to_owned(), Some(Denied.into())),
+                "later success must not hide a refused step, in words or in its mark"
+            );
+        }
         assert_eq!(summary(&[Denied, Denied]), "Ran 2 commands · all denied");
         assert_eq!(
-            summary(&[Failed, Denied, Succeeded]),
-            "Ran 3 commands · 1 failed, 1 denied"
+            summary_and_glyph(&[Failed, Denied, Succeeded]),
+            (
+                "Ran 3 commands · 1 failed, 1 denied".to_owned(),
+                Some(Status::PartlyFailed)
+            )
+        );
+        assert_eq!(
+            summary_and_glyph(&[Failed, Denied]),
+            (
+                "Ran 2 commands · 1 failed, 1 denied".to_owned(),
+                Some(Failed.into())
+            ),
+            "where nothing went through, the group keeps the full error mark"
         );
         assert_eq!(summary(&[Denied]), "Tried to run cargo check · denied");
     }
