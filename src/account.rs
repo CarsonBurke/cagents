@@ -41,6 +41,7 @@ pub mod resets;
 pub use resets::{ResetKind, ResetScope, UsageReset};
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
+pub mod provider_install;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
 pub mod remote;

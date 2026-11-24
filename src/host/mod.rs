@@ -25,6 +25,7 @@ mod model;
 mod notifications;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
+mod provider_status;
 mod recovery_admission;
 mod service;
 #[cfg(all(test, target_os = "linux"))]

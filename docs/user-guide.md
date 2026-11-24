@@ -966,6 +966,10 @@ and Stop cancels navigation. Search input uses the configured search URL.
 
 ## Native agent chat
 
+Run `cagents provider status` to see which provider CLIs the daemon finds,
+their versions, and how they were installed. With `--device NAME`, the
+command reports the provider CLIs on that device.
+
 ### Resume a saved conversation
 
 Choose **New tab → Resume conversation**, **Resume conversation** on an empty

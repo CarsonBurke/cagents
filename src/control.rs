@@ -56,6 +56,8 @@ mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
+mod providers;
+pub use providers::ProviderCommand;
 mod work;
 pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
@@ -317,6 +319,11 @@ pub enum TopCommand {
     Account {
         #[command(subcommand)]
         command: AccountCommand,
+    },
+    /// Inspect the provider CLIs this daemon uses.
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
     },
     /// List live agent sessions in this project, or your channel's with --channel.
     #[command(
@@ -2382,6 +2389,19 @@ impl ControlClient {
         }
     }
 
+    /// The provider CLIs visible to the selected daemon.
+    pub fn provider_status(
+        &mut self,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ProviderStatus,
+            Instant::now() + Duration::from_secs(20),
+        )? {
+            ServerResponse::ProviderStatus(providers) => Ok(providers),
+            response => Err(unexpected_response("provider status", &response)),
+        }
+    }
+
     /// Answered during startup recovery, when other requests are refused.
     pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
         self.startup_state_with_deadline(Instant::now() + io_timeout())
@@ -3387,6 +3407,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::PeerChallenge { .. } => "peer_challenge",
         ServerResponse::PeerAuthenticated { .. } => "peer_authenticated",
         ServerResponse::DeviceProof { .. } => "device_proof",
+        ServerResponse::ProviderStatus(_) => "provider_status",
     }
 }
 
@@ -4079,6 +4100,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Automation { .. }
         | TopCommand::Work { .. }
         | TopCommand::Account { .. }
+        | TopCommand::Provider { .. }
         | TopCommand::Chat { .. }
         | TopCommand::Whoami(_)
         | TopCommand::Sessions(_)
@@ -4189,6 +4211,7 @@ fn execute_with_model_context(
         },
         TopCommand::Whoami(arguments) => sessions::whoami(arguments),
         TopCommand::Account { command } => accounts::execute(command),
+        TopCommand::Provider { command } => providers::execute(command),
         TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
         TopCommand::Transcript(arguments) => transcript::read(arguments),

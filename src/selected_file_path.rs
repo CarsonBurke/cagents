@@ -28,8 +28,6 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
 }
 
 /// Required paths retain the same byte-preserving framing without an option.
-/// Compiled with its one user, the launch account scope.
-#[cfg(feature = "host")]
 pub(crate) mod required {
     use super::*;
     pub(crate) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {

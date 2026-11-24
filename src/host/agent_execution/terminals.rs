@@ -43,6 +43,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::Authenticate { .. }
         | R::BuildInfo
         | R::StartupState
+        | R::ProviderStatus
         | R::List
         | R::ListPage { .. }
         | R::ListResidentTerminals

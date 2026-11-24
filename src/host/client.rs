@@ -195,6 +195,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadTerminalRemovalBasis { .. }
             | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
+            | ClientRequest::ProviderStatus
     )
 }
 
@@ -1588,6 +1589,11 @@ fn process_admitted_request(
             crate::terminal_ipc::RETIRED_CHANNEL_WORK,
             false,
         )),
+        ClientRequest::ProviderStatus => {
+            drop(_shared);
+            let providers = super::provider_status::snapshot()?;
+            Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
+        }
         ClientRequest::Work(request) => {
             // Admission was checked above. A board may wait on scans and
             // GitHub for its bound, which must not hold the fence that
