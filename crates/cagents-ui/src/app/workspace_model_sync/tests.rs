@@ -5730,6 +5730,8 @@ fn a_receipt_confirming_a_held_project_neither_reconciles_nor_projects() {
         edit: edit.clone(),
         views: ViewChanges::default(),
     };
+    // Discovery is not primed, so a save would build a topology.
+    app.shared_views.topology_build_count.set(0);
     app.shared_views.structural_pass_count.set(0);
 
     let (_, projection) =
@@ -5744,6 +5746,7 @@ fn a_receipt_confirming_a_held_project_neither_reconciles_nor_projects() {
         )))),
     );
     assert_eq!(app.shared_views.structural_pass_count.get(), 0);
+    assert_eq!(app.shared_views.topology_build_count.get(), 0);
     assert_eq!(app.workspace_model, held);
     assert_eq!(
         app.shared_views.metadata_revisions[&MetadataKey::Project(repository.clone())],
@@ -5834,6 +5837,7 @@ fn a_confirming_receipt_ahead_of_the_model_advances_only_its_clocks() {
     app.workspace_model.sequence = 7;
     app.workspace_model.projects.push(held_project(&repository));
     let held = app.workspace_model.clone();
+    app.shared_views.topology_build_count.set(0);
     app.shared_views.structural_pass_count.set(0);
 
     drop(
@@ -5855,7 +5859,9 @@ fn a_confirming_receipt_ahead_of_the_model_advances_only_its_clocks() {
         })),
     );
 
+    // Discovery is not primed, so a save would have built a topology.
     assert_eq!(app.shared_views.structural_pass_count.get(), 0);
+    assert_eq!(app.shared_views.topology_build_count.get(), 0);
     assert_eq!(app.workspace_model.sequence, 12);
     assert_eq!(
         app.shared_views.metadata_revisions[&MetadataKey::Project(repository.clone())],

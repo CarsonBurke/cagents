@@ -349,10 +349,6 @@ impl Cagents {
         settlement: Settlement,
     ) -> LocalViews {
         let mut phase = WorkspaceProjectionTiming::new(true);
-        let kept_topology = discovery
-            .topology
-            .as_ref()
-            .map(|topology| topology.revision);
         let revision = self.refresh_view_topology(discovery);
         let channel_cards = self
             .durable
@@ -370,7 +366,6 @@ impl Cagents {
             None => Err("none kept"),
         };
         tracing::debug!(target: "cagents::workspace_pipeline", stage = "kept_discovery",
-            topology_kept = kept_topology == Some(revision),
             rediscovered = followed.err(),
             initialized_changes = settlement.initialized.changed.as_ref().map(Vec::len),
             baseline_changes = settlement.baseline.changed.as_ref().map(Vec::len),
@@ -487,6 +482,14 @@ impl Cagents {
         }
         #[cfg(test)]
         self.record_topology_build();
+        // Logged where the decision is made: the structural pass and the save
+        // after it share this topology, so only the first of them rebuilds it.
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "view_topology",
+            known_roots_changed = discovery
+                .topology
+                .as_ref()
+                .is_none_or(|topology| topology.roots_generation != roots_generation),
+            "Rebuilt the worktree topology");
         let topology = Topology {
             revision: next_revision(),
             roots_generation,

@@ -6764,11 +6764,12 @@ fn repository_refresh_adopts_cross_repository_alias_without_losing_its_draft() {
     let mut view = View::empty(destination);
     view.panes.push(canonical.clone());
     app.workspace_model.views = vec![View::empty(source), view];
+    app.prime_view_discovery();
     app.shared_views.topology_build_count.set(0);
     app.shared_views.structural_pass_count.set(0);
     drop(app.reconcile_shared_views_for_repository(&destination_repository, &HashSet::new()));
     assert_eq!(app.shared_views.structural_pass_count.get(), 1);
-    assert!(app.shared_views.topology_build_count.get() <= 1);
+    assert_eq!(app.shared_views.topology_build_count.get(), 0);
     assert!(!app.card_state(alias).unwrap().existence.is_open());
     assert!(app.card_state(canonical.id).unwrap().existence.is_open());
     assert!(
@@ -6870,11 +6871,12 @@ fn blocked_view_does_not_partially_retire_terminal_aliases() {
     let mut view = View::empty(a);
     view.panes = panes;
     app.workspace_model.views = vec![view];
+    app.prime_view_discovery();
     app.shared_views.topology_build_count.set(0);
     app.shared_views.structural_pass_count.set(0);
     drop(app.reconcile_shared_views());
     assert_eq!(app.shared_views.structural_pass_count.get(), 1);
-    assert!(app.shared_views.topology_build_count.get() <= 1);
+    assert_eq!(app.shared_views.topology_build_count.get(), 0);
     assert!(app.shared_views.blocked.contains(&Scope::Channel(a)));
     assert!(app.shared_views.adoptions.is_empty());
     for alias in &aliases {
