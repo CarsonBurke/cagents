@@ -489,8 +489,19 @@ mod tests {
         let mut downloaded = Vec::new();
         archive.read_to_end(&mut downloaded).unwrap();
         assert_eq!(downloaded, b"archive bytes");
+        assert_eq!(
+            archive.write_all(b"unverified bytes").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
 
-        // Same size, different bytes: the signed digest refuses it.
+        // Same size, different bytes: the signed digests refuse them.
+        fs::write(release_dir.join(&latest.archive.name), b"archive bytez").unwrap();
+        assert_eq!(
+            feed.download(&latest, &latest.archive, &cancellation)
+                .unwrap_err()
+                .to_string(),
+            "release SHA-256 verification failed; installation was not changed"
+        );
         fs::write(release_dir.join("install.sh"), b"installer bytez").unwrap();
         assert!(
             feed.download(&latest, &latest.installer, &cancellation)
