@@ -293,9 +293,7 @@ def update_completed(root, version):
 SHOWN_UPDATE_FAILURES = ('Update failed', 'Update not installed')
 
 
-# An older worker's verdict on a successor whose protocol it does not know:
-# the update installed and NEW serves, yet OLD records Failed (#3877).
-OLD_PROTOCOL_VERDICT = re.compile(r'uses protocol \d+; live updates support only')
+OLD_PROTOCOL_VERDICT = records.OLD_PROTOCOL_VERDICT
 
 # What hovering a header control can say that the person would read as the
 # update going wrong: the update control's failure or retry labels, and the
@@ -1127,7 +1125,31 @@ class Rehearsal:
         observation = json.loads(text)
         return observation if observation['window']['id'] == window['id'] else None
 
-    def inspect_header(self, slot, window, *, row=21, step=24, span=420, right=120):
+    HEADER = {'row': 21, 'step': 24, 'span': 420, 'right': 120}
+
+    def header_offers_update(self, version):
+        """Before an in-app update, finds the main window's update control by
+        the same hover scan inspect_header uses afterwards, so that finding
+        no failure there means something. Returns the tooltip it read."""
+        window = self.mapped()['main']
+        observation = self.observe_window(window)
+        if observation is not None:
+            width = observation['window']['size'][0]
+            first = width-self.HEADER['right']
+            for x in range(first, max(first-self.HEADER['span'], 0), -self.HEADER['step']):
+                self.call('drive', 'hover', f'{x},{self.HEADER["row"]}', timeout=30)
+                observation = self.observe_window(window)
+                words = ' '.join(run.get('text','') for run in (observation or {}).get('runs',[]))
+                if visible_phrase(words, 'Update to') and version in words:
+                    self.call('drive', 'hover', '850,750', timeout=30, check=False)
+                    return words
+        self.call('drive', 'hover', '850,750', timeout=30, check=False)
+        self.errors.append(f'the header scan found no control offering {version} before the update, '
+                           'so finding no failure there afterwards would prove nothing')
+        return None
+
+    def inspect_header(self, slot, window, *, row=HEADER['row'], step=HEADER['step'], span=HEADER['span'],
+                       right=HEADER['right']):
         """Hovers each place a control can sit in WINDOW's header, right to
         left from just before the window controls, and reads what it says.
 
@@ -2093,6 +2115,8 @@ class Rehearsal:
                 update_args.append('--require-idle')
             (self.root/'rehearsal-target.json').write_text(json.dumps({
                 'version':args.new_version,'working':args.working,'started':time.time()})+'\n')
+            if args.feed:
+                self.header_offers_update(args.new_version)
             self.watch_checkpoint()
             self.stall_window_after_flush = args.stall_window_after_flush
             self.stall_suppress_flush = args.stall_suppress_flush

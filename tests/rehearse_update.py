@@ -445,7 +445,15 @@ class Comparison(unittest.TestCase):
         rollback_after = copy.deepcopy(after)
         rollback_after['agents']['agent']['agent']['console']['launch']['environment'] = {'TOKEN':'value'}
         self.assertTrue(records.console_relaunch(rollback_before,rollback_after,'terminal'))
+        # In the app an older worker records Failed when it does not know NEW's
+        # protocol (#3877); NEW's usable recovery still decides.
+        old_worker = copy.deepcopy(after)
+        old_worker['update_status'].update(phase='Failed',message='could not configure the daemon connection: '
+                                           'The running cagents service uses protocol 203; live updates support only 198.')
+        self.assertTrue(records.console_relaunch(before,old_worker,'terminal'))
         mutations = {
+            'refused-old-worker':lambda a:a['update_status'].update(
+                phase='Failed',message='uses protocol 203; live updates support only 198',refusal={'kind':'busy'}),
             'wrong-target':lambda a:a['target'].update(version='other'),
             'failed-update':lambda a:a['update_status'].update(phase='Failed'),
             'new-run':lambda a:a['agents']['agent'].update(run='new-run'),
@@ -1295,6 +1303,17 @@ class ShownUpdateOutcome(unittest.TestCase):
                 failed, updated = rehearsal.watch_shown_update("2.0.0", settle=0)
             self.assertEqual((failed, updated, rehearsal.errors), ({}, ["main"], []))
             self.assertIn(("drive", "key", "Escape"), rehearsal.actions)
+
+    def test_the_header_scan_must_find_the_offered_update_before_it_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Starting", "version": "2.0.0"},
+                                       {1112: "Update to 2.0.0 (saves and restarts application windows)"})
+            self.assertIn("Update to 2.0.0", rehearsal.header_offers_update("2.0.0"))
+            self.assertEqual(rehearsal.errors, [])
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Starting", "version": "2.0.0"}, {})
+            self.assertIsNone(rehearsal.header_offers_update("2.0.0"))
+            self.assertIn("would prove nothing", rehearsal.errors[0])
 
     def test_a_window_never_observed_is_an_unknown_outcome(self):
         import rehearse_update_run as run

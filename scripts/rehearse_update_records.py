@@ -1123,6 +1123,20 @@ def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
     return set(chats), set(terminals)
 
 
+# An older worker's verdict on a successor whose protocol it does not know:
+# the update installed and NEW serves, yet that worker records Failed (#3877).
+OLD_PROTOCOL_VERDICT = re.compile(r"uses protocol \d+; live updates support only")
+
+
+def update_finished(status: dict) -> bool:
+    """Whether the worker's record shows the update through: Complete, or the
+    Failed an older in-app worker records when it does not know NEW's protocol.
+    Callers still require the shared verifier's usable recovery for NEW."""
+    return status.get("phase") == "Complete" or (
+        status.get("phase") == "Failed" and not status.get("refusal")
+        and bool(OLD_PROTOCOL_VERDICT.search(str(status.get("message", "")))))
+
+
 def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
     if verified_recovery(before, after) is None:
         return False
@@ -1130,7 +1144,7 @@ def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
     status = after.get("update_status", {})
     if (not isinstance(target.get("version"), str)
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", target["version"])
-            or status.get("phase") != "Complete" or status.get("version") != target["version"]
+            or not update_finished(status) or status.get("version") != target["version"]
             or status.get("id") != after["recovery"]["census"]["transaction"]):
         return False
     program = str(Path(after["root"])/"home/.local/share/cagents-install/versions"/target["version"]/"bin/cagents")
