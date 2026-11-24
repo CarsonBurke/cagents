@@ -4,6 +4,7 @@
 {"name":"conversation.send","direction":"client","message":{"id":10,"op":"conversation.send","params":{"mode":"steer","session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10","text":"Run the tests"},"type":"request"}}
 {"name":"conversation.unwatch","direction":"client","message":{"id":8,"op":"conversation.unwatch","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"type":"request"}}
 {"name":"conversation.watch","direction":"client","message":{"id":7,"op":"conversation.watch","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"type":"request"}}
+{"name":"conversation.acknowledge","direction":"client","message":{"id":13,"op":"conversation.acknowledge","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10","watch_id":11},"type":"request"}}
 {"name":"error","direction":"server","message":{"error":{"code":"not_watching","message":"Open the conversation before acting on it."},"id":8,"type":"error"}}
 {"name":"error without id","direction":"server","message":{"error":{"code":"unsupported_api","message":"Update the app."},"type":"error"}}
 {"name":"event closing","direction":"server","message":{"data":{"message":"The computer's cagents daemon is stopping."},"event":"closing","type":"event"}}
@@ -21,4 +22,3 @@
 {"name":"sessions.unwatch","direction":"client","message":{"id":3,"op":"sessions.unwatch","type":"request"}}
 {"name":"sessions.watch","direction":"client","message":{"id":2,"op":"sessions.watch","type":"request"}}
 {"name":"welcome","direction":"server","message":{"api":1,"host":"desktop","server_version":"0.1.3","type":"welcome"}}
-{"name":"conversation.acknowledge","direction":"client","message":{"id":13,"op":"conversation.acknowledge","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10","watch_id":11},"type":"request"}}
