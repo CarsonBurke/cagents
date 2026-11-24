@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fs, io, os::unix::fs::MetadataExt, path::Path};
 
 /// How many times the kernel index is read before believing that no
 /// candidate it names holds the lock.
-pub(crate) const INDEX_READS: usize = 3;
+pub const INDEX_READS: usize = 3;
 
 pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
     let fields: Vec<_> = line.split_whitespace().collect();

@@ -18,7 +18,8 @@ pub fn version() -> &'static str {
 pub mod build_version;
 #[doc(hidden)]
 pub mod names;
-pub(crate) mod native_chat_capacity;
+#[doc(hidden)]
+pub mod native_chat_capacity;
 pub mod search_match;
 // The repository fixtures the UI crate's tests share allocate through this;
 // that build uses only part of it.
@@ -65,7 +66,8 @@ pub mod filesystem_recovery_context;
 pub mod fixture_startup;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod fixture_workspace;
-mod flock;
+#[doc(hidden)]
+pub mod flock;
 pub mod fs_safety;
 pub mod git_marker;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -75,15 +77,15 @@ pub mod github;
 pub mod github_identity;
 pub(crate) mod github_rate_limit;
 pub mod github_status;
-#[cfg(feature = "host")]
-pub mod host;
 #[cfg(feature = "ui")]
 pub mod input_trace;
-mod install_guard;
+#[doc(hidden)]
+pub mod install_guard;
 pub mod instance;
 pub mod layout_metrics;
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) mod lineage_birth;
+#[doc(hidden)]
+pub mod lineage_birth;
 pub mod linear;
 pub mod location;
 pub mod mobile;
@@ -120,7 +122,8 @@ pub mod test_timing;
 ))]
 #[doc(hidden)]
 pub mod test_tracing;
-pub(crate) mod transcript_cache;
+#[doc(hidden)]
+pub mod transcript_cache;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod transcript_location;
 #[cfg(feature = "host")]

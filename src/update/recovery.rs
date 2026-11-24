@@ -28,7 +28,7 @@ pub(crate) const OUTCOME_ENV: &str = "CAGENTS_INSTALL_OUTCOME_PATH";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Census {
+pub struct Census {
     version: u8,
     pub transaction: String,
     pub source: Option<HostSessionProof>,
@@ -40,7 +40,7 @@ pub(crate) struct Census {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     Usable {
         serving: HostSessionProof,
         terminals: usize,
@@ -72,7 +72,7 @@ pub(crate) enum Outcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Receipt {
+pub struct Receipt {
     version: u8,
     pub transaction: String,
     pub census_digest: String,
@@ -149,7 +149,7 @@ impl Census {
         Ok(census)
     }
 
-    pub(crate) fn capture(transaction: String, busy: BusyPatience) -> Result<Self, UpdateError> {
+    pub fn capture(transaction: String, busy: BusyPatience) -> Result<Self, UpdateError> {
         Self::capture_with_candidate(transaction, None, busy)
     }
 
@@ -269,12 +269,12 @@ impl Census {
     pub(crate) fn digest(&self) -> Result<String, UpdateError> {
         Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
     }
-    pub(crate) fn load(path: &Path) -> Result<Self, UpdateError> {
+    pub fn load(path: &Path) -> Result<Self, UpdateError> {
         let census: Self = serde_json::from_slice(&read_private(path, JOB_STATE_LIMIT)?)?;
         census.validate()?;
         Ok(census)
     }
-    pub(crate) fn save(&self, path: &Path) -> Result<(), UpdateError> {
+    pub fn save(&self, path: &Path) -> Result<(), UpdateError> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
         if bytes.len() as u64 > JOB_STATE_LIMIT {
@@ -332,7 +332,7 @@ impl Census {
         })
     }
     /// Reads the serving inventory, asking a busy daemon again within `busy`.
-    pub(crate) fn verify(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
+    pub fn verify(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
         match observe_with(busy, |proof, terminals, chats, target| {
             // Evidence failure must not discard the independently observed
             // serving owner or skip the closing readiness/inventory fences.
@@ -546,7 +546,7 @@ impl Receipt {
             _ => None,
         }
     }
-    pub(crate) fn usable(&self) -> bool {
+    pub fn usable(&self) -> bool {
         matches!(self.outcome, Outcome::Usable { .. })
     }
     pub(crate) fn has_listener(&self) -> bool {
@@ -1224,7 +1224,7 @@ fn require_captured_owner(
 /// verifier proves a fresh Ready socket and its complete live/paused inventory.
 /// This never starts, stops, attaches or replays any owner. A daemon busy
 /// finishing another operation is asked again within `busy`.
-pub(crate) fn retire_current_service(busy: BusyPatience) -> Result<RetirementStatus, UpdateError> {
+pub fn retire_current_service(busy: BusyPatience) -> Result<RetirementStatus, UpdateError> {
     retire_service(RetirementTrigger::CurrentJob, busy)
 }
 
@@ -1233,13 +1233,13 @@ pub(crate) fn retire_current_service(busy: BusyPatience) -> Result<RetirementSta
 /// would only hold those clients back, and this optional completion is
 /// attempted again by the next update, so it is asked once.
 #[cfg(feature = "host")]
-pub(crate) fn refresh_completed_service() -> Result<RetirementStatus, UpdateError> {
+pub fn refresh_completed_service() -> Result<RetirementStatus, UpdateError> {
     retire_service(RetirementTrigger::ColdStart, BusyPatience::ONCE)
 }
 
 /// Mechanical evidence status, not another daemon usability outcome.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RetirementStatus {
+pub enum RetirementStatus {
     /// Another helper owns the evidence transaction; no completion is claimed.
     Busy,
     NotRequired,

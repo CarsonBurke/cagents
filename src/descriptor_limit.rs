@@ -123,7 +123,7 @@ pub(crate) mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "host::descriptor_limit::tests::children_start_with_the_limit_the_daemon_was_given",
+                    "descriptor_limit::tests::children_start_with_the_limit_the_daemon_was_given",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")

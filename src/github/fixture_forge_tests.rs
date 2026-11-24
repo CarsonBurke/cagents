@@ -5,7 +5,7 @@
 //!
 //! The calls mirror the app's GitHub entry points: `load_repository_github` and
 //! `attached_worktree_pull_requests` in crates/cagents-ui/src/app.rs, `read` in
-//! src/host/work/forge.rs, and the `GitHubReviewApi` pages. When one of them
+//! crates/cagents-host/src/host/work/forge.rs, and the `GitHubReviewApi` pages. When one of them
 //! starts a new gh read, add it here and teach the forge to answer it.
 use super::*;
 use std::process::Command;

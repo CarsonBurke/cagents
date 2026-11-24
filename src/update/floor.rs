@@ -1062,11 +1062,13 @@ fn quiesce_inner(
 
 /// How long the update pauses between checks that the confirmed
 /// interruptions have ended; tests settle at once, so they check sooner.
-const INTERRUPT_POLL: Duration = if cfg!(test) {
-    Duration::from_millis(10)
-} else {
-    Duration::from_millis(100)
-};
+fn interrupt_poll() -> Duration {
+    if crate::test_binary::is_test_binary() {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(100)
+    }
+}
 
 /// A preparation still refused as busy after the reviewed conversations ended.
 /// The terminal service and its terminals kept running.
@@ -1177,7 +1179,7 @@ fn settle_interrupts(
             }
             return Ok(current);
         }
-        thread::sleep(INTERRUPT_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        thread::sleep(interrupt_poll().min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 

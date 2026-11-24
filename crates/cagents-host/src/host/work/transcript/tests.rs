@@ -242,7 +242,7 @@ fn unanswered_calls_are_bounded() {
 /// replays these frames; what they point at is what its Work list shows.
 #[test]
 fn the_conversation_work_fixture_reads_as_its_documented_work() {
-    let template = include_str!("../../../../tests/fixtures/conversation-work/frames.jsonl");
+    let template = include_str!("../../../../../../tests/fixtures/conversation-work/frames.jsonl");
     let lines = template
         .lines()
         .map(|line| {

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "host", target_os = "linux"))]
+#![cfg(target_os = "linux")]
 //! Actual matched source inspection and daemon handoff in one private profile.
 //! The upgrade is driven by an explicit synthetic fixture User protocol client,
 //! not a CLI User execution. Inherited delegation is separately proved refused

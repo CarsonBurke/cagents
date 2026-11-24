@@ -767,8 +767,8 @@ impl Holder {
         self.adoption_pending = false;
     }
 
-    #[cfg(test)]
-    pub(super) fn fail_after_actual_commit_for_test(&mut self) -> Result<(), String> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_after_actual_commit_for_test(&mut self) -> Result<(), String> {
         self.commit_adoption()?; // real original holder acknowledged and cleared replay
         // Inject the caller's uncertain outcome at precisely that irreversible
         // boundary, retaining the conservative phase of a lost acknowledgement.
@@ -776,8 +776,8 @@ impl Holder {
         Err("injected local failure AFTER actual holder commit acknowledgement".into())
     }
 
-    #[cfg(test)]
-    pub(super) fn startup_cleanup_state_for_test(&self) -> (bool, bool) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn startup_cleanup_state_for_test(&self) -> (bool, bool) {
         (self.adoption_pending, self.cleanup_proved)
     }
     pub(super) fn registered(&self) -> bool {
@@ -1890,7 +1890,7 @@ fn hand_over(
 }
 
 /// Reads only the memory of a proven orphan holder; does not adopt or release it.
-pub(crate) fn inspect(
+pub fn inspect(
     socket: &Path,
     expected: &Record,
     proof: &crate::model::HostSessionProof,

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! CAGENTS_STORE_COPY=/path/to/workspace-model.sqlite3 \
-//!     cargo test --release --no-default-features --features host --lib \
+//!     cargo test --release --no-default-features -p cagents-host --lib \
 //!     view_cost_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!

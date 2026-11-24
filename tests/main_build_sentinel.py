@@ -111,9 +111,10 @@ if sys.argv[1] == 'test':
         sys.exit(101)
     sys.exit(0)
 assert sys.argv[-1] == '--message-format=json', sys.argv
-selection = sys.argv[sys.argv.index('--all-targets') + 1:-1]
+arguments = sys.argv[sys.argv.index('--no-default-features') + 1:-1]
+targets = json.loads(os.environ['SENTINEL_LANE_TARGETS'])
 lane = next(name for name, value in json.loads(os.environ['SENTINEL_LANES']).items()
-            if value == selection)
+            if arguments == [*targets.get(name, ['--all-targets']), *value])
 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 with open(os.environ['SENTINEL_CALLS'], 'a') as out:
     out.write(json.dumps([sha, lane, sys.argv[1:], os.environ.get('CAGENTS_BUILD_REMOTE')]) + '\\n')
@@ -146,6 +147,9 @@ if Path('broken-' + lane).exists():
         kit = self.origin / "crates/cagents-ui-kit/Cargo.toml"
         kit.parent.mkdir(parents=True)
         kit.write_text('[package]\nname = "cagents-ui-kit"\n')
+        daemon = self.origin / "crates/cagents-host/Cargo.toml"
+        daemon.parent.mkdir(parents=True)
+        daemon.write_text('[package]\nname = "cagents-host"\n')
         dictation = self.origin / "crates/cagents-dictate/Cargo.toml"
         dictation.parent.mkdir(parents=True)
         dictation.write_text('[package]\nname = "cagents-dictate"\n')
@@ -186,6 +190,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
                                       SENTINEL_SYSTEMCTL=str(self.root / "systemctl"),
                                       SENTINEL_CALLS=str(self.calls),
                                       SENTINEL_LANES=json.dumps(sentinel.LANES),
+                                      SENTINEL_LANE_TARGETS=json.dumps(sentinel.LANE_TARGETS),
                                       SENTINEL_TESTS=str(self.root / "tests"),
                                       SENTINEL_TEST_LANES=json.dumps(sentinel.TEST_LANES))
         self.environment.start()
@@ -224,7 +229,9 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertEqual([(entry[0], entry[1]) for entry in records],
                          [(sha, lane) for sha in (self.first, third) for lane in sentinel.LANES])
         for entry in records:
-            self.assertEqual(entry[2][:4], ['clippy', '--locked', '--no-default-features', '--all-targets'])
+            targets = sentinel.LANE_TARGETS.get(entry[1], ['--all-targets'])
+            self.assertEqual(entry[2][:3 + len(targets)],
+                             ['clippy', '--locked', '--no-default-features', *targets])
             self.assertEqual(entry[2][-1], '--message-format=json')
             self.assertEqual(entry[3], 'fw16')
 
@@ -235,7 +242,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.now += 120
         self.tick()
         self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
-                         ["cli", "host", "ui", "dictate", "editor"])
+                         ["cli", "host", "daemon", "ui", "dictate", "editor"])
 
     def test_commit_before_the_dictation_helper_skips_only_its_lane(self):
         self.tick()
@@ -244,7 +251,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.now += 120
         self.tick()
         self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
-                         ["cli", "host", "ui", "app", "browser", "editor"])
+                         ["cli", "host", "daemon", "ui", "app", "browser", "editor"])
 
     def test_failure_is_reported_and_closed_issue_reopened_then_recovery_reported(self):
         self.tick()
@@ -1078,6 +1085,15 @@ class LaneSelectionTests(unittest.TestCase):
         self.assertEqual(command[command.index("--no-fail-fast") + 1:],
                          ["--no-default-features", "-p", "cagents", "-p", "cagents-ui", "--features", "cagents/ui"])
         self.assertIn("cagents-ui-kit", sentinel.test_command("ui", {"cagents", "cagents-ui", "cagents-ui-kit"}))
+
+    def test_a_commit_from_before_the_daemon_was_split_out_builds_it_from_the_library(self):
+        # The host feature alone, as that commit's own lane selected it.
+        self.assertEqual(sentinel.present(sentinel.LANES["host"], {"cagents", "cagents-ui"}),
+                         ["-p", "cagents", "--features", "cagents/host"])
+        command = sentinel.test_command("host", {"cagents", "cagents-ui"})
+        self.assertEqual(command[command.index("--no-fail-fast") + 1:],
+                         ["--no-default-features", "-p", "cagents", "--features", "cagents/host"])
+        self.assertIn("cagents-host", sentinel.test_command("host", {"cagents", "cagents-host"}))
 
 
 if __name__ == "__main__":

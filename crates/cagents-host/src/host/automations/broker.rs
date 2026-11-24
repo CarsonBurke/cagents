@@ -1704,7 +1704,7 @@ mod tests {
             before.wrapping_add(1),
             "a newly committed decision must still wake scheduling"
         );
-        assert_eq!(told(&watching), [repository.clone()]);
+        assert_eq!(told(&watching), std::slice::from_ref(&repository));
         assert!(told(&unwatched).is_empty());
         assert_eq!(
             registry

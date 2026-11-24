@@ -56,7 +56,7 @@ pub struct BranchDeleteFailure {
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn git_command(repository: &std::path::Path) -> crate::repository::CommandSpec {
+pub fn git_command(repository: &std::path::Path) -> crate::repository::CommandSpec {
     crate::repository::RepositoryService::system("git")
         .git_base(repository, false)
         .timeout(std::time::Duration::from_secs(30))

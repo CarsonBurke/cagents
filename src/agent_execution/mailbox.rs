@@ -401,7 +401,7 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
 /// still holds the registry-wide symmetric MAC material: matched helper code is
 /// inside the daemon's trusted realm, and this is not compromise containment.
 #[cfg(feature = "host")]
-pub(crate) struct Seal([u8; 32]);
+pub struct Seal([u8; 32]);
 
 #[cfg(feature = "host")]
 impl std::fmt::Debug for Seal {
@@ -412,11 +412,11 @@ impl std::fmt::Debug for Seal {
 
 #[cfg(feature = "host")]
 impl Seal {
-    pub(crate) fn new(key: [u8; 32]) -> Self {
+    pub fn new(key: [u8; 32]) -> Self {
         Self(key)
     }
 
-    pub(crate) fn recognizer(&self) -> Recognizer {
+    pub fn recognizer(&self) -> Recognizer {
         Recognizer(self.0)
     }
 
@@ -434,13 +434,13 @@ impl Seal {
     }
 
     /// The prompt that delivers `message` at `now`.
-    pub(crate) fn seal(&self, message: &Message, now: u64) -> String {
+    pub fn seal(&self, message: &Message, now: u64) -> String {
         self.sealed(frame(message, now))
     }
 
     /// The prompt of the agent run that delivers `message`. A run can start
     /// long after it is accepted, so it never says the sender is waiting.
-    pub(crate) fn seal_run(&self, message: &Message) -> String {
+    pub fn seal_run(&self, message: &Message) -> String {
         self.sealed(framed(message, false))
     }
 
@@ -455,7 +455,7 @@ impl Seal {
 /// could recover the shared signing material. Providers never receive it.
 #[cfg(feature = "host")]
 #[derive(Clone)]
-pub(crate) struct Recognizer([u8; 32]);
+pub struct Recognizer([u8; 32]);
 
 #[cfg(feature = "host")]
 impl std::fmt::Debug for Recognizer {
@@ -507,7 +507,7 @@ impl Recognizer {
 
     /// A user prompt the daemon sealed, as the delivery a window shows.
     /// Whether it was one.
-    pub(crate) fn recognize(&self, item: &mut crate::chat::Item) -> bool {
+    pub fn recognize(&self, item: &mut crate::chat::Item) -> bool {
         if !may_be_frame(item) {
             return false;
         }

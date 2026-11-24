@@ -1,5 +1,3 @@
-#![cfg(feature = "host")]
-
 //! Qualifies one real Codex CLI for durable native continuity.
 //!
 //! `VERIFIED_CODEX_VERSIONS` in `chat/native_holder.rs` is a claim that a
@@ -21,7 +19,7 @@
 //!
 //! ```sh
 //! CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
-//!     --no-default-features --features host \
+//!     --no-default-features -p cagents-host \
 //!     --test codex_continuity_qualification -- --ignored --test-threads=1
 //! ```
 //!
@@ -30,6 +28,8 @@
 //! to its standard utility paths. Codex may still reach the network for its own
 //! housekeeping; the model endpoint never leaves this process.
 
+#[path = "support/cli.rs"]
+mod cli;
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
@@ -535,7 +535,7 @@ unified_exec = true
     }
 
     fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
-        let mut command = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")));
+        let mut command = Self::command(self.root.path(), crate::cli::cagents());
         command.arg("--json").args(arguments);
         let output = run_until(command, deadline);
         self.agents.observe(&output);

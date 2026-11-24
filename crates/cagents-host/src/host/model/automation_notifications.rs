@@ -461,21 +461,27 @@ mod tests {
             None,
             200,
         );
-        assert_eq!(pending(&registry.db, 100).unwrap(), [entry.clone()]);
         assert_eq!(
             pending(&registry.db, 100).unwrap(),
-            [entry.clone()],
+            std::slice::from_ref(&entry)
+        );
+        assert_eq!(
+            pending(&registry.db, 100).unwrap(),
+            std::slice::from_ref(&entry),
             "full/stopped/error delivery has no ACK and cannot consume the slot"
         );
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-        assert_eq!(pending(&registry.db, 100).unwrap(), [entry.clone()]);
+        assert_eq!(
+            pending(&registry.db, 100).unwrap(),
+            std::slice::from_ref(&entry)
+        );
         let tx = registry.db.transaction().unwrap();
         acknowledge(&tx, std::slice::from_ref(&entry)).unwrap();
         drop(tx);
         assert_eq!(
             pending(&registry.db, 100).unwrap(),
-            [entry.clone()],
+            std::slice::from_ref(&entry),
             "an uncommitted ACK is not durable"
         );
         let tx = registry.db.transaction().unwrap();
@@ -537,7 +543,10 @@ mod tests {
         queue(&tx, &automation, LifecycleCause::ProjectClosed, None).unwrap();
         assert!(queue(&tx, &automation, LifecycleCause::StartPaused, None).is_err());
         tx.commit().unwrap();
-        assert_eq!(pending(&registry.db, 100).unwrap(), [original.clone()]);
+        assert_eq!(
+            pending(&registry.db, 100).unwrap(),
+            std::slice::from_ref(&original)
+        );
         let old = automation.clone();
         let latest = emit(
             &mut registry,
@@ -749,7 +758,7 @@ mod tests {
         );
         assert_eq!(
             registry.pending_automation_notifications(1).unwrap(),
-            [middle.clone()]
+            std::slice::from_ref(&middle)
         );
         assert_eq!(
             registry

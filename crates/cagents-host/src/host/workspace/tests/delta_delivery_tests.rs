@@ -313,7 +313,7 @@ fn a_delivery_gap_recovers_only_its_scope_and_retains_unrelated_views() {
     let edge = observer.next_edge();
     assert_eq!(edge.sequence, second.sequence);
     let missing = mirror.apply(&edge.edit, &edge.effects);
-    assert_eq!(missing.unresolved, [scope.clone()]);
+    assert_eq!(missing.unresolved, std::slice::from_ref(&scope));
     let (view, sequence) = observer.client.read_workspace_view(scope.clone()).unwrap();
     assert!(sequence >= edge.sequence);
     mirror.install(scope, view);

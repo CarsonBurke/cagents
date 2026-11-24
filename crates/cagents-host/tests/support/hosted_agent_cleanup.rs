@@ -235,7 +235,7 @@ pub fn cli(root: &Path, arguments: &[&str], deadline: Instant) -> Result<Value, 
     if remaining.is_zero() {
         return Err("Private cleanup command deadline expired".into());
     }
-    let program = Path::new(env!("CARGO_BIN_EXE_cagents"));
+    let program = crate::cli::cagents();
     let mut spec = CommandSpec::new(program)
         .args(["--device", "local", "--no-start", "--json"])
         .args(arguments.iter().copied())

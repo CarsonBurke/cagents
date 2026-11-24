@@ -1,4 +1,4 @@
-#![cfg(all(feature = "host", target_os = "linux"))]
+#![cfg(target_os = "linux")]
 
 //! A real private daemon establishes and reuses an offline fixture provider.
 //! A genuinely nondelegated User environment is required before any guardian
@@ -12,7 +12,7 @@
 //! this manual contract. From a nondelegated User environment, explicitly run:
 //!
 //! ```sh
-//! cargo test --locked --no-default-features --features host \
+//! cargo test --locked --no-default-features -p cagents-host \
 //!     --test automation_establishment_contract -- --ignored --exact \
 //!     failed_first_reuse_start_releases_and_new_firings_establish_then_reuse_one_provider \
 //!     --nocapture --test-threads=1
@@ -471,7 +471,7 @@ impl Fixture {
 
         fs::write(
             self.root.path().join("bin/claude"),
-            include_str!("fixtures/automation-establishment-claude.sh"),
+            include_str!("../../../tests/fixtures/automation-establishment-claude.sh"),
         )
         .map_err(|error| error.to_string())?;
         fs::set_permissions(

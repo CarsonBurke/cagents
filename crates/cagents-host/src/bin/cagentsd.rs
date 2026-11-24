@@ -40,7 +40,7 @@ fn command() -> clap::Command {
 cagents::stamp_version!();
 
 fn main() -> std::process::ExitCode {
-    if let Some(result) = cagents::host::run_retained_actor_helper() {
+    if let Some(result) = cagents_host::host::run_retained_actor_helper() {
         return match result {
             // The startup owner treats this private status as proved teardown.
             Ok(()) => std::process::ExitCode::from(73),
@@ -56,7 +56,7 @@ fn main() -> std::process::ExitCode {
         cagents::account::detach_inherited_selections();
         cagents::agent::detach_session_environment();
     }
-    if let Some(result) = cagents::host::run_upgrade_inspection_helper() {
+    if let Some(result) = cagents_host::host::run_upgrade_inspection_helper() {
         return match result {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(error) => {
@@ -65,7 +65,7 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    if let Some(result) = cagents::host::run_automation_helper() {
+    if let Some(result) = cagents_host::host::run_automation_helper() {
         return match result {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(error) => {
@@ -81,7 +81,7 @@ fn main() -> std::process::ExitCode {
     let matches = command().get_matches();
     // A fixture seed writes the stores and exits; it never serves.
     if let Some(plan) = matches.get_one::<std::path::PathBuf>("development-seed-workspace") {
-        return match cagents::host::seed_fixture_workspace(plan) {
+        return match cagents_host::host::seed_fixture_workspace(plan) {
             Ok(summary) => {
                 println!("{summary}");
                 std::process::ExitCode::SUCCESS
@@ -93,7 +93,7 @@ fn main() -> std::process::ExitCode {
         };
     }
     if matches.get_flag("stored-schema") {
-        return match cagents::host::stored_schema() {
+        return match cagents_host::host::stored_schema() {
             Ok(schema) => {
                 if let Some(schema) = schema {
                     println!("{schema}");
@@ -107,7 +107,7 @@ fn main() -> std::process::ExitCode {
         };
     }
     if let Some(&target) = matches.get_one::<u32>("downgrade-store") {
-        return match cagents::host::downgrade_store(target) {
+        return match cagents_host::host::downgrade_store(target) {
             Ok(Some(from)) => {
                 println!("converted the shared-model store from schema {from} to {target}");
                 std::process::ExitCode::SUCCESS
@@ -124,7 +124,7 @@ fn main() -> std::process::ExitCode {
     // admission, so a refused start is in the development log too.
     unsafe { cagents::instance::redirect_development_daemon_log() };
     // SAFETY: entry is still single-threaded; helper-only mode returned above.
-    let admission = match unsafe { cagents::host::prepare_daemon_admission() } {
+    let admission = match unsafe { cagents_host::host::prepare_daemon_admission() } {
         Ok(admission) => admission,
         Err(error) => {
             eprintln!("cagentsd: {error}");
@@ -137,7 +137,7 @@ fn main() -> std::process::ExitCode {
     cagents::instance::install_panic_hook("cagentsd");
     cagents::instance::install_tracing("cagentsd", "cagentsd=info,cagents=info,warn");
     tracing::info!(version = cagents::version(), "starting cagentsd");
-    match cagents::host::run(admission) {
+    match cagents_host::host::run(admission) {
         Ok(()) => {
             cagents::diagnostics::record(cagents::diagnostics::Event::Exit { success: true });
             std::process::ExitCode::SUCCESS

@@ -15,7 +15,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
 mod images;
-pub(crate) mod rollout;
+pub mod rollout;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
@@ -201,7 +201,7 @@ fn account_home(spec: &ProcessSpec) -> Result<PathBuf, &'static str> {
 /// A bare `unix://` remote, without a socket named after it, selects the
 /// shared daemon of the account home the launch runs under. Any named
 /// endpoint is a request for that exact server, so none is reported.
-pub(crate) fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
+pub fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
     let mut shared = false;
     let mut named = false;
     let mut args = launch.recipe.arguments.iter();
@@ -235,7 +235,7 @@ pub(crate) fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
 
 /// The lock file whose holder Codex makes the one writer of `thread` in the
 /// account home `launch` runs under. Codex holds it while the thread is loaded.
-pub(crate) fn thread_writer_lock(launch: &Launch, thread: &str) -> Option<PathBuf> {
+pub fn thread_writer_lock(launch: &Launch, thread: &str) -> Option<PathBuf> {
     let home = account_home(&ProcessSpec::from(&launch.recipe)).ok()?;
     Some(
         home.join("thread-writer-locks")
@@ -247,7 +247,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     create_for_start(launch).map_err(|error| error.to_string())
 }
 
-pub(crate) fn create_for_start(
+pub fn create_for_start(
     launch: &Launch,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, None)
@@ -261,7 +261,7 @@ pub(crate) fn create_with_listener(
     create_with_listener_for_start(launch, socket).map_err(|error| error.to_string())
 }
 
-pub(crate) fn create_with_listener_for_start(
+pub fn create_with_listener_for_start(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
@@ -285,7 +285,7 @@ pub(crate) fn create_with_listener_for_start(
 
 /// Only authenticated holder recovery supplies this identity. The runtime
 /// additionally verifies the exact retained app-server peer before initialize.
-pub(crate) fn create_restored_for_start(
+pub fn create_restored_for_start(
     recovery: &crate::chat::native_holder::Recovery,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     let confirmed = recovery

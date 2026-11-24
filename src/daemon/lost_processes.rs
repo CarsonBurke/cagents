@@ -39,7 +39,7 @@ use std::{
 
 /// A process left in a lost helper's session or its provider's group.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Survivor {
+pub struct Survivor {
     pub pid: i32,
     pub start: u64,
     pub group: i32,
@@ -114,7 +114,7 @@ fn id_kept(proc: &Path, original: &Process) -> Result<bool, String> {
 }
 
 /// Every process in `helper`'s session or `provider`'s group, proved or not.
-pub(crate) fn census(helper: &Process, provider: &Process) -> Result<Vec<Survivor>, String> {
+pub fn census(helper: &Process, provider: &Process) -> Result<Vec<Survivor>, String> {
     census_in(Path::new("/proc"), helper, provider)
 }
 
@@ -143,7 +143,7 @@ pub(crate) fn census_in(
 /// Every process proved to be `pane`'s Codex provider because its arguments
 /// name the conversation's own listener directory, and the members of each
 /// one's process group when it leads it. `named` lists those providers.
-pub(crate) fn listener_census(named: &[Process]) -> Result<Vec<Survivor>, String> {
+pub fn listener_census(named: &[Process]) -> Result<Vec<Survivor>, String> {
     let proc = Path::new("/proc");
     let uid = crate::daemon::current_uid();
     scan(proc, |process, pid, stat| {
@@ -258,7 +258,7 @@ const ENDING_LIMIT: Duration = Duration::from_secs(10);
 /// after a short grace. The scan is repeated until none of them is left or
 /// the limit passes. Unproved survivors, and any not chosen, are never
 /// signalled; they stay in what is returned, for the person to see.
-pub(crate) fn end(
+pub fn end(
     mut scan: impl FnMut() -> Result<Vec<Survivor>, String>,
     chosen: &[(i32, u64)],
 ) -> Result<Vec<Survivor>, String> {

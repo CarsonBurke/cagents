@@ -10,7 +10,7 @@ use std::{
 pub(super) const GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[cfg(feature = "host")]
-pub(crate) fn collect_superseded(serving: &HostSessionProof) -> Result<usize, String> {
+pub fn collect_superseded(serving: &HostSessionProof) -> Result<usize, String> {
     let Some(store) = super::super::handoff::Store::existing()? else {
         return Ok(0);
     };

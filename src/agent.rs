@@ -16,7 +16,7 @@ pub(crate) use claude::{
 };
 mod codex;
 #[cfg(feature = "host")]
-pub(crate) use codex::archived_rollout as codex_archived_rollout;
+pub use codex::archived_rollout as codex_archived_rollout;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub use codex::rollout as codex_rollout;
 mod antigravity;
@@ -28,7 +28,7 @@ pub(crate) use muse::offers_model as muse_offers_model;
 mod omp;
 
 #[cfg(feature = "host")]
-pub(crate) mod observe;
+pub mod observe;
 
 /// Where Omp keeps its data - its sessions and its agent database - for
 /// `launch`, resolved as Omp resolves it: its profile, its configuration
@@ -568,7 +568,7 @@ impl Provider {
         Some(launch)
     }
 
-    pub(crate) fn is_interpreter(program: &str) -> bool {
+    pub fn is_interpreter(program: &str) -> bool {
         matches!(
             Path::new(program)
                 .file_name()
@@ -586,15 +586,15 @@ impl Provider {
         self.adapter().resume_flag
     }
 
-    pub(crate) fn is_identity_option(self, flag: &str) -> bool {
+    pub fn is_identity_option(self, flag: &str) -> bool {
         self.adapter().identity_options.contains(&flag)
     }
 
-    pub(crate) fn is_cwd_option(self, flag: &str) -> bool {
+    pub fn is_cwd_option(self, flag: &str) -> bool {
         self.adapter().cwd_options.contains(&flag)
     }
 
-    pub(crate) fn is_value_option(self, flag: &str) -> bool {
+    pub fn is_value_option(self, flag: &str) -> bool {
         self.adapter().value_options.contains(&flag)
     }
 
@@ -621,7 +621,7 @@ impl Provider {
 
     /// Whether `flag` continues the most recent conversation rather than
     /// naming one.
-    pub(crate) fn is_latest_selector(self, flag: &str) -> bool {
+    pub fn is_latest_selector(self, flag: &str) -> bool {
         self.adapter().latest_selectors.contains(&flag)
     }
 

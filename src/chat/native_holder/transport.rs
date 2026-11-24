@@ -189,7 +189,7 @@ enum Report {
 
 /// Dropping an intentionally closed actor releases its server. An unexpected
 /// daemon exit instead closes the socket without sending Release.
-pub(crate) struct Holder {
+pub struct Holder {
     control: Option<UnixStream>,
     release_on_drop: bool,
     durable: bool,
@@ -320,8 +320,8 @@ impl Holder {
     /// never confirmed ends with its channel, so a test that cannot confirm a
     /// provider keeps it here to stand in for the durable holder a Close
     /// adopts.
-    #[cfg(test)]
-    pub(crate) fn owner(&self) -> super::Detached {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn owner(&self) -> super::Detached {
         self.identity.clone()
     }
 
@@ -423,7 +423,7 @@ impl Drop for Holder {
     }
 }
 
-pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
+pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
     std::hint::black_box(&SERVE);
     spec.withhold_environment();
     if source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly {
@@ -675,10 +675,7 @@ fn connect(record: &Record) -> Result<UnixStream, String> {
     Ok(control)
 }
 
-pub(crate) fn inspect(
-    record: &Record,
-    proof: &HostSessionProof,
-) -> Result<(Recovery, bool), String> {
+pub fn inspect(record: &Record, proof: &HostSessionProof) -> Result<(Recovery, bool), String> {
     inspect_with_capabilities(record, proof).map(|(recovery, exited, _)| (recovery, exited))
 }
 
@@ -725,7 +722,7 @@ fn inspect_with_capabilities(
     }
 }
 
-pub(crate) fn adopt(
+pub fn adopt(
     record: &Record,
     source: &Session,
     proof: &HostSessionProof,
@@ -2255,10 +2252,7 @@ exec /bin/sleep 60
         assert_eq!(std::fs::metadata(temp).unwrap().mode() & 0o777, 0o700);
         std::fs::create_dir(temp.join(".git")).unwrap();
         crate::descriptor_limit::tests::assert_process_limit(record.root.pid as u32, &limit);
-        crate::descriptor_limit::tests::assert_process_limit(
-            record.holder.pid as u32,
-            &limit,
-        );
+        crate::descriptor_limit::tests::assert_process_limit(record.holder.pid as u32, &limit);
         crate::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         crate::daemon::process_scope::tests::assert_separate(
             record.holder.pid as u32,

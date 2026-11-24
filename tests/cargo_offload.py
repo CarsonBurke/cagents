@@ -811,6 +811,57 @@ class StandInHost(unittest.TestCase):
         self.assertFalse((slot / "src/scripts").exists())
         self.assertFalse((self.root / "local-build").exists())
 
+    def test_host_helper_builds_the_daemons_package_and_the_command_line_beside_it(self):
+        # The daemon is its own package; its tests find the shared library's
+        # `cagents` beside cagentsd, so the helper builds both in one command.
+        for name in ("cargo-host-test-helper.py", "cargo_artifacts.py"):
+            shutil.copy2(ROOT / "scripts" / name, self.gate.parent / name)
+        (self.crate / "src/main.rs").rename(self.crate / "src/cli.rs")
+        (self.crate / "Cargo.toml").write_text(textwrap.dedent("""
+            [package]
+            name = "cagents"
+            version = "0.1.0"
+            edition = "2021"
+            [workspace]
+            members = ["crates/cagents-host"]
+            [features]
+            host = []
+            [[bin]]
+            name = "cagents"
+            path = "src/cli.rs"
+        """))
+        daemon = self.crate / "crates/cagents-host"
+        (daemon / "src").mkdir(parents=True)
+        (daemon / "Cargo.toml").write_text(textwrap.dedent("""
+            [package]
+            name = "cagents-host"
+            version = "0.1.0"
+            edition = "2021"
+            [dependencies]
+            cagents = { path = "../..", features = ["host"] }
+            [[bin]]
+            name = "cagentsd"
+            path = "src/main.rs"
+        """))
+        (daemon / "src/main.rs").write_text('fn main() { println!("probe"); }\n')
+        (daemon / "src/lib.rs").write_text(textwrap.dedent('''
+            #[test]
+            fn matched_helper_and_command_line_were_prepared() {
+                let helper = std::env::var("CAGENTS_TEST_RETAINED_ACTOR_HELPER").unwrap();
+                let helper = std::path::Path::new(&helper);
+                assert!(helper.is_absolute());
+                assert_eq!(helper.file_name().unwrap(), "cagentsd");
+                let output = std::process::Command::new(helper).output().unwrap();
+                assert_eq!(output.stdout, b"probe\\n");
+                let cli = std::process::Command::new(helper.with_file_name("cagents")).output().unwrap();
+                assert_eq!(cli.stdout, b"probe\\n");
+            }
+        '''))
+        result = self.gate_run("test", "-p", "cagents-host", "--lib", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("building the matched cagentsd and its cagents helper", result.stderr)
+        self.assertIn("matched_helper_and_command_line_were_prepared ... ok", result.stdout)
+
     def assert_test_memory_cap(self, env):
         # Prove a real scope is available, without compiling or allocating.
         cap = ROOT / "scripts/memory-capped"

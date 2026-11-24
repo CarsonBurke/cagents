@@ -1,4 +1,4 @@
-#![cfg(all(feature = "host", target_os = "linux"))]
+#![cfg(target_os = "linux")]
 
 //! A private daemon serves a client of an older protocol it lists, the way a
 //! chat carried across an update keeps running the CLI it launched with.

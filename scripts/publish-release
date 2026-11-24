@@ -89,7 +89,8 @@ manifest_version() {
 
 if [[ -z $VERSION ]]; then
     VERSION=$(manifest_version < "$ROOT_DIR/Cargo.toml")
-    for manifest in crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml; do
+    for manifest in crates/cagents-host/Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml \
+        crates/cagents-dictate/Cargo.toml; do
         [[ -f $ROOT_DIR/$manifest ]] || continue
         [[ $(manifest_version < "$ROOT_DIR/$manifest") == "$VERSION" ]] \
             || fail "checkout cagents and $manifest versions differ"
@@ -108,6 +109,10 @@ DICTATE=0
 if checkout_git cat-file -e "$SOURCE_COMMIT:crates/cagents-dictate/Cargo.toml" 2>/dev/null; then
     DICTATE=1
     manifests+=(crates/cagents-dictate/Cargo.toml)
+fi
+# The daemon carries the product version once it is its own package.
+if checkout_git cat-file -e "$SOURCE_COMMIT:crates/cagents-host/Cargo.toml" 2>/dev/null; then
+    manifests+=(crates/cagents-host/Cargo.toml)
 fi
 for manifest in "${manifests[@]}"; do
     tagged_version=$(checkout_git show "$SOURCE_COMMIT:$manifest" | manifest_version)

@@ -236,7 +236,7 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
     let provider = root.join("bin/claude");
     fs::write(
         &provider,
-        include_str!("../../../tests/fixtures/claude-upgrade-continuity.py"),
+        include_str!("../../../../../tests/fixtures/claude-upgrade-continuity.py"),
     )
     .unwrap();
     fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();

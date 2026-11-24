@@ -9,31 +9,13 @@
 //! `/proc/PID/environ`. Removing a variable from a running process does not
 //! change its own `/proc` entry, so a child is the only honest witness.
 
-#[path = "support/startup_environment.rs"]
+#[allow(dead_code, reason = "each contract uses part of the shared support")]
+#[path = "../../../tests/support/startup_environment.rs"]
 mod startup_environment;
 
-use startup_environment::{Home, Installation, assert_detached};
+use startup_environment::{Home, assert_detached};
 use std::fs;
 
-#[test]
-fn the_command_line_never_hands_a_parent_session_to_the_daemon() {
-    let home = Home::new();
-    // `daemon store-schema` runs its matched daemon directly and synchronously.
-    let installation = Installation::new(env!("CARGO_BIN_EXE_cagents"), "cagentsd", "exit 0");
-    let output = home
-        .command(installation.executable())
-        .args(["daemon", "store-schema"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_detached(&fs::read(installation.recorded("cagentsd")).unwrap());
-}
-
-#[cfg(feature = "host")]
 #[test]
 fn the_daemon_never_hands_a_parent_session_to_an_automation_precheck() {
     use std::{

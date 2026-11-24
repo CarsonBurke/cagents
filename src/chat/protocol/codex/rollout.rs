@@ -47,7 +47,7 @@ const HARNESS_CONTEXT: &[&str] = &[
 ];
 
 /// Every item in the rollout at `path`, oldest first.
-pub(crate) fn read(path: &Path) -> Result<Vec<Item>, String> {
+pub fn read(path: &Path) -> Result<Vec<Item>, String> {
     let (file, len) = open(path)?;
     if len > MAX_ROLLOUT {
         return Err("The Codex rollout must be a regular file smaller than 256 MiB".into());

@@ -16,7 +16,7 @@ pub struct ProjectLocation {
 
 /// Preserve an already-open folder identity before interpreting new Git
 /// metadata. Otherwise checkouts and linked worktrees resolve to one Git key.
-pub(crate) fn resolve(
+pub fn resolve(
     path: &Path,
     model: Option<&crate::workspace_model::WorkspaceModel>,
 ) -> Result<ProjectLocation, String> {
@@ -122,22 +122,19 @@ fn has_git_metadata(directory: &Path) -> Result<bool, String> {
 /// belongs to. Read from the filesystem as Git discovers a repository, without
 /// running Git, so listing many sessions stays cheap.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Placement {
+pub struct Placement {
     pub worktree: Option<PathBuf>,
     pub project: Option<PathBuf>,
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+pub fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
     place_among(path, &model.projects)
 }
 
 /// [`place`] among `projects`, for a client that read the open projects
 /// rather than the whole workspace model.
-pub(crate) fn place_among(
-    path: &Path,
-    projects: &[crate::workspace_model::ModelProject],
-) -> Placement {
+pub fn place_among(path: &Path, projects: &[crate::workspace_model::ModelProject]) -> Placement {
     let Ok(directory) = fs::canonicalize(path) else {
         return Placement::default();
     };
@@ -198,7 +195,7 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
 /// its index and `HEAD`, and the common directory it shares objects and refs
 /// with every other worktree of the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GitDirectories {
+pub struct GitDirectories {
     pub private: PathBuf,
     pub common: PathBuf,
 }
@@ -208,7 +205,7 @@ pub(crate) struct GitDirectories {
 /// directory, and that directory names the shared one it borrows objects and
 /// refs from. `None` when the checkout has no marker, or one that names
 /// nothing readable; such a marker is skipped, not trusted.
-pub(crate) fn git_directories(checkout: &Path) -> Option<GitDirectories> {
+pub fn git_directories(checkout: &Path) -> Option<GitDirectories> {
     let marker = checkout.join(".git");
     if !crate::git_marker::present(&marker).ok()? {
         return None;

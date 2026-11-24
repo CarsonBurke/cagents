@@ -1,11 +1,11 @@
-#![cfg(feature = "host")]
-
+#[path = "support/cli.rs"]
+mod cli;
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
-#[path = "support/retained_fixture.rs"]
+#[path = "../../../tests/support/retained_fixture.rs"]
 mod retained_fixture;
 
 use serde_json::{Value, json};
@@ -224,7 +224,11 @@ fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it
     let project = fixture.root.path().join("project");
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
     let provider = fixture.root.path().join("bin/claude");
-    fs::write(&provider, include_str!("fixtures/automation-claude.sh")).unwrap();
+    fs::write(
+        &provider,
+        include_str!("../../../tests/fixtures/automation-claude.sh"),
+    )
+    .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
     let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC);
@@ -551,7 +555,11 @@ fn run_attention_rejected_by_the_journal_survives_a_killed_daemon() {
     let project = fixture.root.path().join("project");
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
     let provider = fixture.root.path().join("bin/claude");
-    fs::write(&provider, include_str!("fixtures/automation-claude.sh")).unwrap();
+    fs::write(
+        &provider,
+        include_str!("../../../tests/fixtures/automation-claude.sh"),
+    )
+    .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
     let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC);

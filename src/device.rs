@@ -205,7 +205,7 @@ fn list_from_path(path: &Path) -> io::Result<Vec<Device>> {
     }
 }
 /// Whether `name` can name a saved device.
-pub(crate) fn validate_name(name: &str) -> io::Result<()> {
+pub fn validate_name(name: &str) -> io::Result<()> {
     if name == "local"
         || name.is_empty()
         || name.len() > 16

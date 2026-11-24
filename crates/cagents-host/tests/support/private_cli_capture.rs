@@ -13,7 +13,7 @@ use std::{
 const STREAM_LIMIT: usize = 4 * 1024 * 1024;
 
 pub fn private_cli(root: &Path) -> CommandSpec {
-    let mut spec = CommandSpec::new(env!("CARGO_BIN_EXE_cagents"))
+    let mut spec = CommandSpec::new(crate::cli::cagents())
         .arg("--json")
         .cwd(root);
     // Match the fixture's env_clear Command without inheriting the invoking

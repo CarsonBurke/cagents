@@ -196,7 +196,7 @@ mod wire_json {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
+pub fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
@@ -1871,7 +1871,7 @@ fn accounts() -> Result<Reply, String> {
 /// Chooses the default account for `provider`, as
 /// [`Operation::AccountDefault`] asks, under the daemon's shared admission.
 #[cfg(feature = "host")]
-pub(crate) fn account_default(
+pub fn account_default(
     expected_revision: u64,
     provider: crate::agent::Provider,
     selection: &crate::account::preferences::DefaultSelection,
@@ -1898,7 +1898,7 @@ pub(crate) fn account_default(
 /// [`Operation::AccountsUpdate`] asks, under the daemon's shared admission:
 /// a held account list refuses at once rather than wait, retryably.
 #[cfg(feature = "host")]
-pub(crate) fn update_accounts(
+pub fn update_accounts(
     expected_revision: u64,
     proposal: serde_json::Value,
 ) -> Result<Reply, crate::account::remote::LifecycleError> {

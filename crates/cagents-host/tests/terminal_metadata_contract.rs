@@ -1,5 +1,5 @@
-#![cfg(feature = "host")]
-
+#[path = "support/cli.rs"]
+mod cli;
 use std::{
     collections::BTreeMap,
     fs,
@@ -173,7 +173,7 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
     use cagents::process::{
         CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
     };
-    use std::{os::unix::fs::DirBuilderExt, path::Path};
+    use std::os::unix::fs::DirBuilderExt;
 
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -274,7 +274,7 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
             if remaining.is_zero() {
                 return Err("inventory CLI deadline expired".into());
             }
-            let executable = Path::new(env!("CARGO_BIN_EXE_cagents"));
+            let executable = crate::cli::cagents();
             let mut command = CommandSpec::new(executable)
                 .args(["--device", "local"])
                 .args(args.iter().copied())

@@ -1,5 +1,7 @@
 mod account_lifecycle;
 #[cfg(test)]
+mod account_remote_tests;
+#[cfg(test)]
 mod account_restore_tests;
 #[cfg(test)]
 pub(crate) use account_lifecycle::Reservation as AccountReservation;

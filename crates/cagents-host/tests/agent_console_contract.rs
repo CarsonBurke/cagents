@@ -1,11 +1,11 @@
-#![cfg(feature = "host")]
-
+#[path = "support/cli.rs"]
+mod cli;
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
-#[path = "support/retained_fixture.rs"]
+#[path = "../../../tests/support/retained_fixture.rs"]
 mod retained_fixture;
 
 use cagents::{
@@ -56,7 +56,9 @@ impl Fixture {
     }
 
     fn new() -> Self {
-        Self::with_provider(include_str!("fixtures/execution-console-claude.sh"))
+        Self::with_provider(include_str!(
+            "../../../tests/fixtures/execution-console-claude.sh"
+        ))
     }
 
     fn with_provider(script: &str) -> Self {
@@ -488,7 +490,8 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
     if retained_fixture::run_isolated() {
         return;
     }
-    let fixture = Fixture::with_provider(include_str!("fixtures/automation-claude.sh"));
+    let fixture =
+        Fixture::with_provider(include_str!("../../../tests/fixtures/automation-claude.sh"));
     let project_path = fixture.root.path().join("project");
     let project = project_path.to_str().unwrap();
     fixture.cli(&["project", "open", project]);
@@ -702,7 +705,9 @@ fn terminal_console_prints_each_line_once_without_tool_payloads() {
     if retained_fixture::run_isolated() {
         return;
     }
-    let fixture = Fixture::with_provider(include_str!("fixtures/console-transcript-claude.sh"));
+    let fixture = Fixture::with_provider(include_str!(
+        "../../../tests/fixtures/console-transcript-claude.sh"
+    ));
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
     fixture.cli(&["project", "open", project]);
@@ -768,7 +773,9 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         chat::{ItemContent, NativeContinuity},
         control::ControlClient,
     };
-    let fixture = Fixture::with_provider(include_str!("fixtures/chat-composer-claude.sh"));
+    let fixture = Fixture::with_provider(include_str!(
+        "../../../tests/fixtures/chat-composer-claude.sh"
+    ));
     let config = fixture.root.path().join("home/.claude");
     let reply = "Offline background update for responsiveness comparison.\n".repeat(40000);
     assert_eq!(reply.len(), 2_280_000);
@@ -1070,7 +1077,9 @@ fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
     if retained_fixture::run_isolated() {
         return;
     }
-    let fixture = Fixture::with_provider(include_str!("fixtures/wait-outcomes-claude.sh"));
+    let fixture = Fixture::with_provider(include_str!(
+        "../../../tests/fixtures/wait-outcomes-claude.sh"
+    ));
     let project_path = fixture.root.path().join("project");
     let project = project_path.to_str().unwrap();
     fixture.cli(&["project", "open", project]);

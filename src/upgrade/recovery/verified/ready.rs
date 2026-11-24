@@ -54,14 +54,14 @@ pub(crate) struct ReadyView(Publication);
 
 /// Captured before normal restoration consumes the exact Ready checkpoint.
 #[cfg(feature = "host")]
-pub(crate) struct ReadyCapture {
+pub struct ReadyCapture {
     checkpoint_hash: String,
     capture_hash: String,
     capture: CapturedCensus,
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn capture() -> Result<Option<ReadyCapture>, String> {
+pub fn capture() -> Result<Option<ReadyCapture>, String> {
     let Some(store) = super::super::super::handoff::Store::existing()? else {
         return Ok(None);
     };
@@ -341,7 +341,7 @@ impl ReadyView {
 /// Runs under the startup daemon's lease, after restoration/presentation and
 /// before Ready. It records no guessed replacement or provider launch intent.
 #[cfg(feature = "host")]
-pub(crate) fn publish(
+pub fn publish(
     ready: Option<ReadyCapture>,
     serving: &HostSessionProof,
     target: &Path,

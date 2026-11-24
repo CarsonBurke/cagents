@@ -50,11 +50,7 @@ const LEGACY_BUNDLED: &[&str] = &[
 /// without being read in full.
 const READ_LIMIT: u64 = 1 << 20;
 
-pub(crate) fn install(
-    provider: Option<Provider>,
-    environment: &BTreeMap<String, String>,
-    cwd: &Path,
-) {
+pub fn install(provider: Option<Provider>, environment: &BTreeMap<String, String>, cwd: &Path) {
     let Some(home) = environment
         .get("HOME")
         .map(|home| cwd.join(home))
@@ -437,7 +433,7 @@ fn paired_directory() -> Option<std::path::PathBuf> {
 /// paired CLI. Only the daemon holding the runtime lease calls this, before it
 /// launches anything. Without a paired CLI the entry is removed, so a carried
 /// session finds its CLI on the rest of its `PATH` rather than an older one.
-pub(crate) fn publish_serving_cli(runtime: &Path) -> io::Result<()> {
+pub fn publish_serving_cli(runtime: &Path) -> io::Result<()> {
     publish_serving_cli_at(runtime, paired_directory().as_deref())
 }
 
@@ -466,7 +462,7 @@ fn publish_serving_cli_at(runtime: &Path, paired: Option<&Path>) -> io::Result<(
 /// Use the CLI paired with the serving daemon, without persisting the
 /// installation path into user-authored recipes or replacing the rest of
 /// their PATH.
-pub(crate) fn matched_path(current: Option<&str>) -> Option<String> {
+pub fn matched_path(current: Option<&str>) -> Option<String> {
     let paired = paired_directory()?;
     let serving = crate::daemon::RuntimePaths::discover()
         .ok()

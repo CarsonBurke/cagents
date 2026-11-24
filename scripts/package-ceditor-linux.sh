@@ -96,7 +96,7 @@ elif [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
             --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --bin cagents)
         HOST_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
             --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
-            --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --features host --bin cagentsd)
+            --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features -p cagents-host --bin cagentsd)
     fi
     EDITOR_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" ceditor \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \

@@ -1,6 +1,6 @@
 //! Authenticated retained Claude helper and bounded attachment transport.
 use super::super::{LocalHandle, QueueRefusal, Rejection, Update};
-pub(crate) use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
+pub use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
 use super::journal::Journal;
 use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState, OutboxEntry};
 use super::{MAX_FRAME, deadline_io, final_snapshot, journal};
@@ -126,13 +126,13 @@ enum InputPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ActorIdentity {
+pub struct ActorIdentity {
     pub instance: uuid::Uuid,
     pub record: Record,
 }
 /// Immutable retirement evidence, never current account read/delete authority.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct RetirementReceipt {
+pub struct RetirementReceipt {
     /// Legacy private receipts always projected installed capability.
     #[serde(default = "legacy_installed", skip_serializing_if = "is_installed")]
     pub installed: bool,
@@ -152,7 +152,7 @@ pub(super) fn is_installed(value: &bool) -> bool {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CloseObservation {
+pub struct CloseObservation {
     pub actor_id: uuid::Uuid,
     pub turn_generation: u64,
     pub activity: crate::agent::ActivityState,
@@ -163,7 +163,7 @@ pub(crate) struct CloseObservation {
     pub owns_work: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Resident {
+pub struct Resident {
     pub provider_process: Option<Process>,
     pub generation: u64,
     pub session_id: Option<String>,
@@ -251,7 +251,7 @@ impl Resident {
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct ActorInspection {
+pub struct ActorInspection {
     pub identity: ActorIdentity,
     pub source: chat::Session,
     pub previous_sources: Vec<chat::Session>,
@@ -455,8 +455,8 @@ fn fixture_preserve_and_join(actor: &RemoteActor) {
         worker.join().expect("preserved fixture observer panicked");
     }
 }
-#[cfg(test)]
-pub(super) fn fixture_source() -> chat::Session {
+#[cfg(any(test, feature = "test-support"))]
+pub fn fixture_source() -> chat::Session {
     let id = crate::model::TerminalId::new();
     chat::Session {
         id,
@@ -483,15 +483,15 @@ pub(super) fn fixture_source() -> chat::Session {
     }
 }
 impl RemoteActor {
-    #[cfg(test)]
-    pub(in crate::chat::runtime) fn fixture() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture() -> Self {
         Self::fixture_at(PathBuf::from("/nonexistent/cagents-actor-fixture"))
     }
     /// A fixture proxy for `source`'s retained actor, held under `scope`, whose
     /// helper socket is `socket`. Its holder record names `source`'s terminal
     /// and boot, so the daemon can register and settle its exact ownership.
-    #[cfg(test)]
-    fn scripted_fixture(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scripted_fixture(
         socket: PathBuf,
         source: chat::Session,
         scope: Result<crate::account::scope::LaunchAccountScope, String>,
@@ -511,8 +511,8 @@ impl RemoteActor {
     }
     /// A fixture proxy whose helper socket is `socket`. The in-process peer
     /// authenticates, because the fixture names this process as its holder.
-    #[cfg(test)]
-    fn fixture_at(socket: PathBuf) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_at(socket: PathBuf) -> Self {
         use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalId};
         let process = Process::read(std::process::id() as i32).unwrap();
         let boot = BootId::new("fixture-boot");
@@ -625,11 +625,8 @@ impl RemoteActor {
     /// Complete the actual proxy's pending envelope without any external
     /// helper. Tests still use production enqueue, receipt and disconnection
     /// handling; only the authenticated peer's observed outcome is supplied.
-    #[cfg(test)]
-    pub(in crate::chat::runtime) fn settle_input_fixture(
-        &self,
-        outcome: super::super::handle::RetainedInputOutcome,
-    ) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn settle_input_fixture(&self, outcome: super::super::handle::RetainedInputOutcome) -> u64 {
         use super::super::handle::RetainedInputOutcome;
         let deadline = Instant::now() + Duration::from_secs(3);
         let identity = loop {
@@ -671,8 +668,8 @@ impl RemoteActor {
         identity.sequence
     }
 
-    #[cfg(test)]
-    pub(in crate::chat::runtime) fn distinct_attachment_fixture(&self) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn distinct_attachment_fixture(&self) -> Self {
         let mut other = Self::fixture();
         let remote = Arc::get_mut(&mut other.0).unwrap();
         remote.identity = self.identity();
@@ -680,18 +677,18 @@ impl RemoteActor {
         remote.source = self.0.source.clone();
         other
     }
-    #[cfg(test)]
-    pub(in crate::chat::runtime) fn publish_session_fixture(&self, session: String) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publish_session_fixture(&self, session: String) {
         let mut state = self.0.state.lock().unwrap();
         Arc::make_mut(&mut state).session_id = Some(session);
     }
-    #[cfg(test)]
-    pub(in crate::chat::runtime) fn confirm_session_fixture(&self, session: String) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn confirm_session_fixture(&self, session: String) {
         let mut state = self.0.state.lock().unwrap();
         Arc::make_mut(&mut state).confirmed_session = Some(session);
     }
-    #[cfg(test)]
-    pub(in crate::chat::runtime) fn completed_failure_fixture() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completed_failure_fixture() -> Self {
         let actor = Self::fixture();
         {
             let mut state = actor.0.state.lock().unwrap();
@@ -740,7 +737,7 @@ impl RemoteActor {
         validate_evidence_record(record, proof)?;
         final_snapshot::compact_retired(record, proof)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn retired_actor_receipt(
         record: &Record,
         proof: &HostSessionProof,
@@ -948,7 +945,7 @@ impl RemoteActor {
         self.0.wake.notify();
         self.state().generation
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn attachment_snapshot(&self) -> Snapshot {
         let state = self.state();
         Snapshot {
@@ -980,7 +977,7 @@ impl RemoteActor {
             .map(|(_, content)| content.clone())
             .unwrap_or_default()
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), super::super::TitleUnavailable> {
@@ -1014,7 +1011,7 @@ impl RemoteActor {
     pub fn recovery_environment_matches(&self, value: &BTreeMap<String, String>) -> bool {
         &self.0.recovery_environment == value
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resource_lifetime(&self) -> Box<dyn Fn() -> bool> {
         let weak = Arc::downgrade(&self.0);
         Box::new(move || weak.upgrade().is_some())
@@ -1843,7 +1840,7 @@ impl RemoteActor {
             Duration::ZERO,
         )
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn pending_inputs(&self) -> Vec<InputIdentity> {
         self.0
             .pending
@@ -2717,9 +2714,9 @@ struct Server {
     journal: Arc<Mutex<Journal>>,
     changed: Arc<std::sync::atomic::AtomicU64>,
     watcher: Arc<push::Watcher>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     state_reads: Arc<std::sync::atomic::AtomicU64>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fail_state_reads: Arc<std::sync::atomic::AtomicU64>,
     prompt_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: Vec<(
@@ -2902,9 +2899,9 @@ impl Server {
             journal,
             changed,
             watcher,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prompt_revision,
             pending: Vec::new(),
@@ -3453,7 +3450,7 @@ impl Server {
             }
             "execution_environment" => value!(self.environment.clone()),
             "state" => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 {
                     self.state_reads.fetch_add(1, Ordering::Release);
                     if self
@@ -4504,12 +4501,16 @@ fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {
     }
     Ok(())
 }
+/// The executable a retained helper runs: this daemon itself, except in tests.
+/// A test binary is no daemon, so it needs the same-head `cagentsd` the gate
+/// builds and names. A daemon built with `test-support` takes that name too
+/// when it is given, and is itself otherwise, as when an integration test runs
+/// it with a cleared environment.
 fn helper_executable() -> Result<PathBuf, String> {
-    #[cfg(test)]
-    {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(path) = std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER") {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
-            .map(PathBuf::from).ok_or("Actual retained-helper tests require CAGENTS_TEST_RETAINED_ACTOR_HELPER pointing to the same-head cagentsd binary")?;
+        let path = PathBuf::from(path);
         if !path.is_absolute() {
             return Err("Retained-helper test executable must be absolute".into());
         }
@@ -4517,12 +4518,12 @@ fn helper_executable() -> Result<PathBuf, String> {
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             return Err("Retained-helper test executable is not an executable file".into());
         }
-        Ok(path)
+        return Ok(path);
     }
-    #[cfg(not(test))]
-    {
-        std::env::current_exe().map_err(|error| error.to_string())
+    if crate::test_binary::is_test_binary() {
+        return Err("Actual retained-helper tests require CAGENTS_TEST_RETAINED_ACTOR_HELPER pointing to the same-head cagentsd binary".into());
     }
+    std::env::current_exe().map_err(|error| error.to_string())
 }
 
 fn confirm_installed_snapshot(state: &mut Snapshot) {
@@ -4567,9 +4568,9 @@ mod connection_tests;
 #[path = "transport_push_tests.rs"]
 mod push_tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "transport_scripted_helper.rs"]
-pub(crate) mod scripted_helper;
+pub mod scripted_helper;
 
 #[path = "transport_push.rs"]
 mod push;

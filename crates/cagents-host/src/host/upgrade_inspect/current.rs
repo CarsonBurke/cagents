@@ -798,7 +798,7 @@ mod tests {
         ipc::encoding_for(100, || ipc::write_frame(&mut bytes, &connect)).unwrap();
         assert_eq!(
             bytes.as_slice(),
-            include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connect.bin")
+            include_bytes!("../../../../../tests/fixtures/upgrade-inspection-v100/connect.bin")
         );
         for protocol in source_protocols() {
             let mut request = connect.clone();
@@ -842,16 +842,22 @@ mod tests {
             ipc::encoding_for(100, || ipc::write_frame(&mut bytes, &envelope)).unwrap();
             let frozen: &[u8] = match name {
                 "CONNECTED" => {
-                    include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connected.bin")
+                    include_bytes!(
+                        "../../../../../tests/fixtures/upgrade-inspection-v100/connected.bin"
+                    )
                 }
                 "LISTED" => {
-                    include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/listed.bin")
+                    include_bytes!(
+                        "../../../../../tests/fixtures/upgrade-inspection-v100/listed.bin"
+                    )
                 }
                 "CHAT_LISTED" => include_bytes!(
-                    "../../../tests/fixtures/upgrade-inspection-v100/chat_listed.bin"
+                    "../../../../../tests/fixtures/upgrade-inspection-v100/chat_listed.bin"
                 ),
                 "RESOLVED" => {
-                    include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/resolved.bin")
+                    include_bytes!(
+                        "../../../../../tests/fixtures/upgrade-inspection-v100/resolved.bin"
+                    )
                 }
                 _ => unreachable!(),
             };

@@ -14,7 +14,7 @@ SCRIPT = ROOT / "scripts/check-lane-isolation"
 MARKERS = ("libcosmic", "libghostty-vt", "servo", "rusqlite")
 VARS = {
     "cli": "--no-default-features",
-    "host": "--no-default-features --features host",
+    "host": "--no-default-features --package cagents --package cagents-host --features cagents/host",
     "ui": "--no-default-features --package cagents --package cagents-ui --features cagents/ui",
     "browser": "--no-default-features --package cagents-ui --features browser",
     "editor": "--package editor",
@@ -54,6 +54,9 @@ class LaneIsolationTests(unittest.TestCase):
             "cagents": '{ path = "../..", default-features = false, features = ["ui"] }',
             "servo": '{ path = "../../markers/servo", optional = true }',
         })
+        self.package("crates/cagents-host", "cagents-host", dependencies={
+            "cagents": '{ path = "../..", default-features = false, features = ["host"] }',
+        })
         self.package("crates/editor", "editor", dependencies={
             "cagents": '{ path = "../..", default-features = false, features = ["ui"] }',
         })
@@ -66,7 +69,7 @@ class LaneIsolationTests(unittest.TestCase):
         (path / "src/lib.rs").write_text("")
         manifest = ""
         if workspace:
-            manifest += ('[workspace]\nmembers = [".", "crates/cagents-ui", "crates/editor", "crates/dictate"]\n'
+            manifest += ('[workspace]\nmembers = [".", "crates/cagents-host", "crates/cagents-ui", "crates/editor", "crates/dictate"]\n'
                          'resolver = "3"\n\n')
         manifest += f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\n'
         if features is not None:
@@ -105,8 +108,15 @@ class LaneIsolationTests(unittest.TestCase):
         self.assertIn("libghostty-vt v0.1.0", result.stderr)
         self.assertNotIn("the host lane", result.stderr)
 
+    def test_a_lane_that_builds_the_daemon_fails(self):
+        self.write_vars(dict(VARS, ui=VARS["ui"] + " --package cagents-host"))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the ui lane resolves the daemon (cagents-host), through:", result.stderr)
+        self.assertNotIn("the host lane", result.stderr)
+
     def test_a_host_lane_that_resolves_the_ui_toolkit_fails(self):
-        self.write_vars(dict(VARS, host="--no-default-features --features host,ui"))
+        self.write_vars(dict(VARS, host=VARS["host"] + ",cagents/ui"))
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
         self.assertIn("the host lane resolves libcosmic (libcosmic)", result.stderr)

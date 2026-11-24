@@ -1,5 +1,3 @@
-#![cfg(feature = "host")]
-
 #[path = "support/precheck_receipt_guardian.rs"]
 mod guardian;
 

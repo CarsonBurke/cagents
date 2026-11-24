@@ -54,12 +54,12 @@ use uuid::Uuid;
 use crate::agent::Provider;
 
 mod creation;
-pub(crate) use creation::NewHomeCreationReceipt;
+pub use creation::NewHomeCreationReceipt;
 
 // Legacy destructive fixtures only. Product discovery preserves old parked
 // homes; their names grant no authority to finish a deletion.
-#[cfg(test)]
-const REMOVING_PREFIX: &str = ".removing-";
+#[cfg(any(test, feature = "test-support"))]
+pub const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// The daemon declined to enroll a new home before anything was written
@@ -67,7 +67,7 @@ const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 /// this error as it is, so the request leaves nothing behind.
 #[cfg(any(test, feature = "host"))]
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EnrollmentRefused {
+pub enum EnrollmentRefused {
     /// The control gate was busy, or another account operation changed the
     /// reservations meanwhile. The same request can be sent again.
     #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
@@ -79,7 +79,7 @@ pub(crate) enum EnrollmentRefused {
 
 #[cfg(any(test, feature = "host"))]
 impl EnrollmentRefused {
-    pub(crate) fn into_error(self) -> io::Error {
+    pub fn into_error(self) -> io::Error {
         let kind = match self {
             Self::Busy => io::ErrorKind::WouldBlock,
             Self::Closed(_) => io::ErrorKind::Other,
@@ -88,7 +88,7 @@ impl EnrollmentRefused {
     }
 
     /// This refusal, if `error` is one, unwrapped.
-    pub(crate) fn of(error: &io::Error) -> Option<&Self> {
+    pub fn of(error: &io::Error) -> Option<&Self> {
         error.get_ref()?.downcast_ref()
     }
 }
@@ -148,7 +148,7 @@ impl Homes {
 
     /// Host short admission must never wait behind another process's flock:
     /// a held lock refuses with [`ListHeld::Lifecycle`](super::remote::ListHeld).
-    pub(crate) fn try_lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
+    pub fn try_lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.root)?;
         crate::instance::owned_lock(
             &self.root.join(".lifecycle.lock"),
@@ -179,7 +179,7 @@ impl Homes {
     /// than in the account list, so it survives that list's loss. The marker
     /// is never removed while the home exists.
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn mark_released(&self, provider: Provider, key: Uuid) -> io::Result<()> {
+    pub fn mark_released(&self, provider: Provider, key: Uuid) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
 
         crate::secure_file::prepare_private_directory(&self.provider_directory(provider))?;
@@ -197,7 +197,7 @@ impl Homes {
     /// Whether a regular marker beside the home records that its sign-in
     /// was given up, even if the account list was lost.
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn is_released(&self, provider: Provider, key: Uuid) -> bool {
+    pub fn is_released(&self, provider: Provider, key: Uuid) -> bool {
         fs::symlink_metadata(self.released_marker(provider, key))
             .is_ok_and(|metadata| metadata.is_file())
     }
@@ -213,7 +213,7 @@ impl Homes {
 
     /// Whether `key` names a kept home of `provider` that `registry` does not
     /// name. Only such a home can be restored to the registry.
-    pub(crate) fn is_unregistered(
+    pub fn is_unregistered(
         &self,
         registry: &super::registry::Registry,
         provider: Provider,
@@ -231,7 +231,7 @@ impl Homes {
     /// and anything else in the directory is not a home cagents made. A home
     /// with a released-sign-in marker (`.released-<key>`) is not offered.
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn unregistered(
+    pub fn unregistered(
         &self,
         registry: &super::registry::Registry,
     ) -> Vec<(Provider, Uuid, Option<std::time::SystemTime>)> {
@@ -321,7 +321,7 @@ impl Homes {
     /// Host admission chooses the fresh UUID before mkdir so its exact future
     /// home can be reserved. This argument grants no creation/read authority;
     /// the nonrecursive mkdir must still succeed and mint the actual receipt.
-    pub(crate) fn create_planned_with_config_initialized(
+    pub fn create_planned_with_config_initialized(
         &self,
         provider: Provider,
         key: Uuid,
@@ -380,8 +380,8 @@ impl Homes {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -402,7 +402,7 @@ impl Homes {
 
     // Legacy destructive fixture support only. Never sweep parked evidence
     // from discovery, sign-in cleanup, or any product lifecycle request.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn finish_removals(&self) {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -542,8 +542,8 @@ fn seed_claude_mcp(source: &Path, home: &Path) -> io::Result<()> {
 
 /// Deletes a home that has been renamed aside, after checking it is still a
 /// real directory of this user's.
-#[cfg(test)]
-fn remove_parked(parked: &Path) -> io::Result<()> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn remove_parked(parked: &Path) -> io::Result<()> {
     crate::secure_file::reject_symlink_components(parked)?;
     crate::secure_file::validate_owned_directory(parked)?;
     fs::remove_dir_all(parked)

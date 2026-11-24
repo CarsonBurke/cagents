@@ -227,7 +227,8 @@ class ReleaseCut(unittest.TestCase):
         self.tool(self.repo / "scripts/release-actions", ADMIT)
         (self.repo / ".gitignore").write_text(".worktrees/\n")
         lock = ["version = 4\n"]
-        for name, manifest in (("cagents", "Cargo.toml"), ("cagents-ui", "crates/cagents-ui/Cargo.toml"),
+        for name, manifest in (("cagents", "Cargo.toml"), ("cagents-host", "crates/cagents-host/Cargo.toml"),
+                               ("cagents-ui", "crates/cagents-ui/Cargo.toml"),
                                ("ceditor", "crates/ceditor/Cargo.toml"),
                                ("cagents-dictate", "crates/cagents-dictate/Cargo.toml")):
             path = self.repo / manifest
@@ -800,7 +801,8 @@ class ReleaseCut(unittest.TestCase):
         branch = self.git("show", "release/bump-0.2.5:crates/ceditor/Cargo.toml", cwd=self.origin)
         self.assertIn('version = "0.2.5"', branch)
         lock = self.git("show", "release/bump-0.2.5:Cargo.lock", cwd=self.origin)
-        self.assertEqual(lock.count('version = "0.2.5"'), 4)
+        # One per product package: the library, daemon, UI, editor and dictation helper.
+        self.assertEqual(lock.count('version = "0.2.5"'), 5)
         self.assertEqual(self.git("log", "-1", "--format=%s", "release/bump-0.2.5", cwd=self.origin),
                          "chore(release): start 0.2.5 after v0.2.4")
         self.assertFalse((self.repo / ".worktrees/release-bump-0.2.5").exists())

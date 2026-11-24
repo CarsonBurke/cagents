@@ -1,4 +1,4 @@
-#![cfg(all(feature = "host", target_os = "linux"))]
+#![cfg(target_os = "linux")]
 
 //! Private-daemon preference persistence and real CLI authority behavior, no providers.
 //!
@@ -6,6 +6,8 @@
 //! A distinct explicit fixture User protocol client then tests persistence. Real
 //! CLI User success/output is exercised only with a genuinely nondelegated caller;
 //! the delegated lane never claims those CLI writes ran or substitutes authority.
+#[path = "support/cli.rs"]
+mod cli;
 use cagents::{
     account::{
         preferences::DefaultSelection,
@@ -141,7 +143,7 @@ fn private_default_preferences_persist_and_cli_respects_inherited_authority() {
             if remaining.is_zero() {
                 return Err("private CLI deadline expired".into());
             }
-            let executable = Path::new(env!("CARGO_BIN_EXE_cagents"));
+            let executable = crate::cli::cagents();
             let mut spec = CommandSpec::new(executable)
                 .args([
                     "--device",
@@ -241,7 +243,7 @@ fn private_default_preferences_persist_and_cli_respects_inherited_authority() {
                 Some(serde_json::from_value::<Registry>(value).map_err(|error| error.to_string())?)
             } else {
                 let output = cli(choice)?
-                    .require_success(Path::new(env!("CARGO_BIN_EXE_cagents")))
+                    .require_success(crate::cli::cagents())
                     .map_err(|error| error.to_string())?;
                 cli_replies.push(
                     serde_json::from_slice::<serde_json::Value>(&output.stdout)

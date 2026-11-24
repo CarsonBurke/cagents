@@ -215,6 +215,16 @@ class ReleaseActions(unittest.TestCase):
         self.assertIn("not newer than the published 0.3.0", result.stderr)
         self.assertEqual(self.outputs(), {})
 
+    def test_the_daemon_package_must_declare_the_tag_version_too(self):
+        daemon = self.repo / "crates/cagents-host/Cargo.toml"
+        daemon.parent.mkdir(parents=True)
+        daemon.write_text('[package]\nname = "cagents-host"\nversion = "0.2.3"\n')
+        self.release_commit("0.2.4", "security", "actions")
+        self.git("tag", "-a", "v0.2.4", "-m", "v0.2.4")
+        self.git("push", "-q", "origin", "main")
+        result = self.run_actions("admit", "v0.2.4")
+        self.assertIn("crates/cagents-host/Cargo.toml at v0.2.4 declares 0.2.3, not 0.2.4", result.stderr)
+
     def test_a_tag_must_be_a_commit_on_main_that_declares_its_version(self):
         self.git("checkout", "-q", "-b", "side")
         self.release_commit("0.2.4", "security", "actions")

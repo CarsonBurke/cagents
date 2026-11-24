@@ -5,9 +5,9 @@
 //! fences remain held. Its only startup action is adopting existing owners.
 #[cfg(any(feature = "host", test))]
 mod retention;
-pub(crate) mod verified;
+pub mod verified;
 #[cfg(feature = "host")]
-pub(crate) use retention::collect_superseded;
+pub use retention::collect_superseded;
 
 use crate::{
     chat::Session,
@@ -49,7 +49,7 @@ const SEALS: i32 = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK 
 static INHERITED: OnceLock<io::Result<Mutex<Option<Inherited>>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Census {
+pub struct Census {
     pub terminals: Vec<TerminalSession>,
     pub chats: Vec<Session>,
     pub snapshots: Vec<super::floor::StoppedSnapshot>,
@@ -67,7 +67,7 @@ pub(crate) struct Census {
 /// Transcript pages captured before preparation. [`Census::fit_pages`] fits
 /// their total to the evidence; a long conversation is never refused.
 #[derive(Default)]
-pub(crate) struct SnapshotCapture {
+pub struct SnapshotCapture {
     snapshots: Vec<super::floor::StoppedSnapshot>,
     pages: Vec<super::floor::Page>,
 }
@@ -77,7 +77,7 @@ pub(crate) struct SnapshotCapture {
 const CAPTURE_COMPACTION: usize = 2 * SNAPSHOT_LIMIT;
 
 impl SnapshotCapture {
-    pub(crate) fn push(
+    pub fn push(
         &mut self,
         source: Session,
         mut snapshot: crate::chat::Snapshot,
@@ -124,7 +124,7 @@ impl SnapshotCapture {
         }
         Ok(())
     }
-    pub(crate) fn finish(self) -> Vec<super::floor::StoppedSnapshot> {
+    pub fn finish(self) -> Vec<super::floor::StoppedSnapshot> {
         self.snapshots
     }
 }
@@ -185,7 +185,7 @@ fn same_captured_terminal(
 }
 
 impl Census {
-    pub(crate) fn terminal_ids(&self) -> BTreeSet<TerminalId> {
+    pub fn terminal_ids(&self) -> BTreeSet<TerminalId> {
         self.terminals
             .iter()
             .map(|source| source.id)
@@ -685,7 +685,7 @@ impl Bound {
 /// Retain only the immutable allocation/lineage and serving ownership fields
 /// used by the proof reader. Output and attachment metadata can keep changing.
 #[cfg(feature = "host")]
-pub(crate) fn proof_terminal_descriptor(
+pub fn proof_terminal_descriptor(
     mut descriptor: crate::terminal_ipc::TerminalDescriptor,
 ) -> crate::terminal_ipc::TerminalDescriptor {
     descriptor.generation = 0;
@@ -1961,7 +1961,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
 /// The reviewed owners the source's checkpoint must name. A conversation
 /// whose provider already ended is reviewed, so the user sees it reopen, but
 /// the source has nothing of it to checkpoint and leaves it out.
-pub(crate) fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, TerminalId)> {
+pub fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, TerminalId)> {
     reviewed
         .sessions
         .iter()
@@ -2308,7 +2308,7 @@ pub(crate) fn initialize_inherited() -> io::Result<()> {
     inherited().map(|_| ())
 }
 
-pub(crate) fn has_inherited_receipt() -> io::Result<bool> {
+pub fn has_inherited_receipt() -> io::Result<bool> {
     Ok(inherited()?
         .lock()
         .map_err(|_| io::Error::other("Update recovery descriptors are unavailable"))?
@@ -2368,7 +2368,7 @@ fn validate_forward_target(command: &Command, receipt: &File) -> io::Result<()> 
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct RecoveryRecord {
+pub struct RecoveryRecord {
     version: u16,
     #[serde(default)]
     origin: Origin,
@@ -2409,7 +2409,7 @@ fn recovery_name(hash: &str) -> String {
 /// Immutable identity of the originally settled outcome, never renewed
 /// receipt authority. A later incarnation must authenticate its own holders.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SettledWitness {
+pub struct SettledWitness {
     pub checkpoint_hash: String,
     pub record_hash: String,
     pub target: PathBuf,
@@ -2422,14 +2422,14 @@ pub(crate) struct SettledWitness {
 /// Durable evidence that these exact Prepared bytes have already been handled.
 /// This value carries no locks, receipt, or authority to replay or adopt owners.
 #[derive(Clone, Debug)]
-pub(crate) struct AlreadyRecovered {
+pub struct AlreadyRecovered {
     pub source: HostSessionProof,
     pub census: Census,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
     pub witness: SettledWitness,
     pub adopted_chat_descriptors: Vec<Session>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub adopted_terminals: Vec<TerminalId>,
     checkpoint_path: PathBuf,
     daemon_binary: PathBuf,
@@ -2562,7 +2562,7 @@ fn validate_settled_identity(
 
 /// Classify exact settled history only. Orphan adoption still authenticates
 /// every current holder and cannot execute a recipe based on this record.
-pub(crate) fn classify_retained_prepared(
+pub fn classify_retained_prepared(
     checkpoint_path: &Path,
     daemon_binary: &Path,
 ) -> Result<Option<AlreadyRecovered>, String> {
@@ -2647,7 +2647,7 @@ struct Retirement {
 /// Read-only evidence for an independent verifier. Neither the retirement nor
 /// the archived checkpoint grants replay, lease transfer, or adoption authority.
 #[derive(Clone, Debug)]
-pub(crate) struct ArchiveProof {
+pub struct ArchiveProof {
     pub archive_path: PathBuf,
     pub checkpoint_sha256: String,
     pub outcome_path: PathBuf,
@@ -2847,7 +2847,7 @@ fn archived_discovery_strict(
 /// This never directs restoration, adoption, paused panes or provider starts.
 /// Broken, unsupported or unrelated history must never prevent normal startup.
 #[cfg(any(feature = "host", test))]
-pub(crate) fn archived_discovery(
+pub fn archived_discovery(
     checkpoint: &Path,
     daemon: &Path,
 ) -> Result<Option<AlreadyRecovered>, String> {
@@ -2902,10 +2902,7 @@ pub(crate) fn pending_retirement_for_source(
 
 /// Strict actual archive evidence. A durable routing pointer may precede the
 /// move, so its presence alone never establishes completed archival.
-pub(crate) fn archived_proof(
-    checkpoint: &Path,
-    daemon: &Path,
-) -> Result<Option<ArchiveProof>, String> {
+pub fn archived_proof(checkpoint: &Path, daemon: &Path) -> Result<Option<ArchiveProof>, String> {
     let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
     let Some((_, proof, record)) = scoped_retirement(checkpoint, &target, None, None)? else {
         return Ok(None);
@@ -2947,7 +2944,7 @@ fn recovered_data(
         paused_terminals: record.paused_terminals,
         paused_chats: record.paused_chats,
         adopted_chat_descriptors: descriptors,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         adopted_terminals: record.adopted_terminals,
         checkpoint_path: checkpoint.to_owned(),
         daemon_binary: target,
@@ -3091,8 +3088,8 @@ impl AlreadyRecovered {
     /// restoration, and Ready. The live/paused counts below are mechanical
     /// safety checks; they do not establish that the user's recovery succeeded.
     /// Unrelated owners created since the original recovery are left alone.
-    #[cfg(test)]
-    pub(crate) fn archive_completed(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn archive_completed(
         &self,
         serving: &HostSessionProof,
         live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
@@ -3463,10 +3460,10 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! { static ARCHIVE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) }; }
-#[cfg(test)]
-fn archive_test_hook(stage: &str) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn archive_test_hook(stage: &str) {
     ARCHIVE_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook(stage);
@@ -3486,7 +3483,7 @@ fn archive_claimed_checkpoint(
         digest(expected),
         uuid::Uuid::new_v4()
     ));
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     archive_test_hook("before-claim");
     match rename_noreplace(checkpoint, &custody) {
         Ok(()) => {}
@@ -3506,7 +3503,7 @@ fn archive_claimed_checkpoint(
     // canonical name. It is intentionally never swept or replayed.
     let result = (|| {
         sync_directory(directory)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         archive_test_hook("after-claim");
         let bytes = read_checkpoint(&custody)?.ok_or("Claimed checkpoint disappeared")?;
         if bytes != expected {
@@ -3889,7 +3886,7 @@ impl RecoveryRecord {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
+pub fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
     let Some(mut inherited) = inherited()
         .map_err(|e| e.to_string())?
         .lock()
@@ -4066,7 +4063,7 @@ impl RecoveryRecord {
     fn name(&self) -> String {
         recovery_name(&self.checkpoint_hash)
     }
-    pub(crate) fn validate_continuity(&self) -> Result<(), String> {
+    pub fn validate_continuity(&self) -> Result<(), String> {
         let held = self
             .authority
             .as_ref()
@@ -4111,7 +4108,7 @@ impl RecoveryRecord {
         .and_then(|directory| directory.sync_all())
         .map_err(|e| e.to_string())
     }
-    pub(crate) fn finish(mut self, successor: &HostSessionProof) -> Result<(), String> {
+    pub fn finish(mut self, successor: &HostSessionProof) -> Result<(), String> {
         self.validate_continuity()?;
         self.validate_census()?;
         self.adopted_terminal_descriptors = std::mem::take(&mut self.adopted_terminal_descriptors)
@@ -4129,8 +4126,8 @@ impl RecoveryRecord {
 
 /// Tests join real holder authentication to the ordinary read-only proof
 /// consumer without fabricating a live receipt or automatic source ACK.
-#[cfg(all(test, feature = "host"))]
-pub(crate) fn fixture_settled_outcome(
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub fn fixture_settled_outcome(
     checkpoint: &Path,
     target: &Path,
     source: &HostSessionProof,

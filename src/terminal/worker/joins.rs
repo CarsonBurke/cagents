@@ -74,8 +74,8 @@ impl JoinOwner {
     pub(super) fn new(published: Arc<PublishedState>, reservation: Reservation) -> Arc<Self> {
         Self::make(published, Some(reservation))
     }
-    #[cfg(test)]
-    pub(super) fn empty(published: Arc<PublishedState>) -> Arc<Self> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn empty(published: Arc<PublishedState>) -> Arc<Self> {
         Self::make(published, None)
     }
     fn make(published: Arc<PublishedState>, reservation: Option<Reservation>) -> Arc<Self> {
@@ -110,8 +110,8 @@ impl JoinOwner {
         // Body completion can precede parent-side handle installation.
         dispatch(self);
     }
-    #[cfg(test)]
-    pub(super) fn joined(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn joined(&self) -> bool {
         let p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
         p.joined && !p.panicked
     }
@@ -354,7 +354,7 @@ pub(super) fn wait_until(owner: &JoinOwner, deadline: Option<Instant>, release: 
         };
     }
 }
-#[cfg(test)]
-pub(super) fn reserved() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reserved() -> usize {
     RESERVED.load(Ordering::Acquire)
 }

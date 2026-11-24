@@ -299,7 +299,7 @@ impl LaunchRecipe {
     /// Remove what this launch must not pass on: its explicit removals, the
     /// equivalent policy for legacy managed homes, and any provider session's
     /// identity, which a recipe saved before it was withheld may still hold.
-    pub(crate) fn withhold_environment(&self, environment: &mut BTreeMap<String, String>) {
+    pub fn withhold_environment(&self, environment: &mut BTreeMap<String, String>) {
         let names = crate::account::launch_credential_overrides(self);
         environment
             .retain(|name, _| !names.contains(name) && !crate::agent::is_session_variable(name));

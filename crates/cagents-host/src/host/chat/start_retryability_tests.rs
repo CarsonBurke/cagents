@@ -636,7 +636,7 @@ fn managed_account_registry_io_is_retryable_but_malformed_data_is_blocked() {
     let provider = root.join("bin/codex");
     fs::write(
         &provider,
-        include_str!("../../../tests/fixtures/terminal-escape-codex.py"),
+        include_str!("../../../../../tests/fixtures/terminal-escape-codex.py"),
     )
     .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -899,7 +899,7 @@ fn codex_endpoint_repair_retries_the_same_socket_and_thread() {
     let provider = root.join("bin/codex");
     fs::write(
         &provider,
-        include_str!("../../../tests/fixtures/terminal-escape-codex.py"),
+        include_str!("../../../../../tests/fixtures/terminal-escape-codex.py"),
     )
     .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();

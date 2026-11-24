@@ -81,7 +81,7 @@ mod persistence {
     }
 
     #[derive(Debug)]
-    pub(crate) struct SaveOutcome {
+    pub struct SaveOutcome {
         /// The rename committed; only crash durability is uncertain.
         pub durability_warning: Option<String>,
     }
@@ -174,4 +174,4 @@ mod persistence {
     }
 }
 #[cfg(feature = "host")]
-pub(crate) use persistence::{load, save};
+pub use persistence::{load, save};

@@ -39,7 +39,7 @@ pub(super) fn identity_absent(expected: &Process) -> Result<bool, String> {
 /// that happens to reuse it); both refuse. Descendants that left the group on
 /// purpose are tool work, not writers of the provider's conversation, which
 /// only the provider process itself records.
-pub(crate) fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+pub fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
     abandoned_in(std::path::Path::new("/proc"), holder, root)
 }
 
@@ -50,7 +50,7 @@ fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Res
 /// Codex execution needs a positive survivor tied to the pane. A reused PID
 /// proves its original group/session also ended: Linux cannot reuse the PID
 /// while that numeric group/session still has members.
-pub(crate) fn codex_abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+pub fn codex_abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
     abandoned_with_policy(std::path::Path::new("/proc"), holder, root, true)
 }
 

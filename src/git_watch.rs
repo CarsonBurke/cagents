@@ -1217,8 +1217,8 @@ impl Monitor {
         })
     }
 
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn start_for_test<W: Watcher + Send + 'static>(
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn start_for_test<W: Watcher + Send + 'static>(
         wake: impl Fn() + Send + Sync + 'static,
         create: impl FnMut(Box<dyn FnMut(notify::Result<Event>) + Send>) -> notify::Result<W>
         + Send
@@ -1227,8 +1227,8 @@ impl Monitor {
         Self::with_watcher(wake, create)
     }
 
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn pending_coverage_for_test(&self, id: ProjectId) -> Option<bool> {
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn pending_coverage_for_test(&self, id: ProjectId) -> Option<bool> {
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())

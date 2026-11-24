@@ -1083,7 +1083,7 @@ mod tests {
         };
         assert_eq!(
             told(&watching),
-            [proposal.definition.agent.target.repository.clone()]
+            std::slice::from_ref(&proposal.definition.agent.target.repository)
         );
         assert!(told(&unwatched).is_empty());
         assert!(matches!(
