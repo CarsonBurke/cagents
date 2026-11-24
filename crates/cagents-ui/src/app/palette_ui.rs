@@ -460,8 +460,12 @@ impl Cagents {
                     .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
             }
             Action::Query(query) => {
-                self.palette.query = Some(query);
-                self.filter_palette();
+                // A query opens a closed palette, which holds no entries yet.
+                if self.palette.query.replace(query).is_none() {
+                    self.refresh_palette();
+                } else {
+                    self.filter_palette();
+                }
                 self.capture_first_palette_entry();
                 self.reveal_palette_selection()
             }
@@ -2454,6 +2458,25 @@ mod tests {
         let _ = app.update_chrome(chrome_ui::Action::RenameSubmit);
         assert!(!app.apply_reported_title(id, "fish /some/path".into()));
         assert_eq!(app.card_state(id).unwrap().title, "Migration agent");
+    }
+
+    #[test]
+    fn an_open_palette_shows_a_pane_renamed_through_an_update() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let id = app.workspace.focused().unwrap();
+        drop(app.update(Message::Palette(Action::Open)));
+        drop(app.update(Message::Palette(Action::Query("@".into()))));
+        let renamed = |app: &Cagents| app.palette.projection_view().contains("Migration agent");
+        assert!(!renamed(&app));
+        for action in [
+            chrome_ui::Action::Rename(id),
+            chrome_ui::Action::RenameChanged("Migration agent".into()),
+            chrome_ui::Action::RenameSubmit,
+        ] {
+            drop(app.update(Message::ChromeUi(action)));
+        }
+        assert_eq!(app.card_state(id).unwrap().title, "Migration agent");
+        assert!(renamed(&app), "{}", app.palette.projection_view());
     }
     #[test]
     fn card_index_tolerates_insertions_before_the_cached_position() {
