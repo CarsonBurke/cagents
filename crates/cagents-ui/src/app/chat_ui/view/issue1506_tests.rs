@@ -1165,6 +1165,8 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                 .iter()
                 .map(|child| runtime.child_choice_name(child, &runtime.child_label(child, 80)))
                 .collect();
+            // Without the child's ID, each name is still its own.
+            assert_eq!(choice_names.len(), runtime.snapshot.subagents.len());
             for height in [180.0, 600.0] {
                 // The navbar contains only the trigger. Exercise the actual
                 // in-pane chooser, including its bounded window of choices.

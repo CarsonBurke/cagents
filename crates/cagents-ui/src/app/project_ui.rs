@@ -2493,11 +2493,16 @@ pub struct ProjectSessionClosure {
 }
 
 /// Why the daemon did not close a terminal, in words rather than its reply.
+/// An unconfirmed close's reason describes the daemon's own bookkeeping, so
+/// it goes to the log, not the person.
 pub(super) fn terminal_close_refusal(result: crate::terminal::ipc::TerminalCloseResult) -> String {
     match result {
-        crate::terminal::ipc::TerminalCloseResult::Closed => "it closed".into(),
         crate::terminal::ipc::TerminalCloseResult::Active => "it is still running".into(),
-        crate::terminal::ipc::TerminalCloseResult::Unknown(reason) => reason,
+        crate::terminal::ipc::TerminalCloseResult::Closed
+        | crate::terminal::ipc::TerminalCloseResult::Unknown(_) => {
+            tracing::warn!(?result, "a terminal close was not confirmed");
+            "the app could not confirm that it stopped".into()
+        }
     }
 }
 

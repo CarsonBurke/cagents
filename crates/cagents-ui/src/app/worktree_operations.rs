@@ -561,7 +561,14 @@ fn unowned_operation_notice(report: &WorktreeOperationReport) -> String {
     let what = match report.state {
         WorktreeOperationState::Created => "was created",
         WorktreeOperationState::NotCreated => "was not created",
-        _ => "did not finish being created",
+        WorktreeOperationState::Prepared | WorktreeOperationState::Running => {
+            "is still being created"
+        }
+        WorktreeOperationState::ReconcileRequired
+        | WorktreeOperationState::OutcomeUnknown
+        | WorktreeOperationState::MalformedPayload
+        | WorktreeOperationState::JournalWriteFailed
+        | WorktreeOperationState::LeaseConflict => "could not be confirmed",
     };
     if report.detail.trim().is_empty() {
         format!("{subject} {what}")
@@ -590,7 +597,7 @@ mod tests {
         let notice = unowned_operation_notice(&report);
         assert_eq!(
             notice,
-            "A worktree for a project no longer in the sidebar did not finish being created: \
+            "A worktree for a project no longer in the sidebar could not be confirmed: \
              git exited before confirming"
         );
         assert!(!notice.contains(&report.operation_id.to_string()));

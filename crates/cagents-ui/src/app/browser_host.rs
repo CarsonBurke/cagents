@@ -472,11 +472,14 @@ mod tests {
     fn replacing_a_browser_card_in_a_retained_slot_changes_host_identity() {
         let first = CardId::new();
         let second = CardId::new();
-        let location = SanitizedLocation::from(&Url::parse("https://example.test/").unwrap());
+        let locations = [
+            SanitizedLocation::from(&Url::parse("https://first.example.test/").unwrap()),
+            SanitizedLocation::from(&Url::parse("https://second.example.test/").unwrap()),
+        ];
         let make = |card| {
             surface::<()>(
                 card,
-                &location,
+                &locations[usize::from(card == second)],
                 BrowserCapability::Integrated,
                 LoadState::Loading,
                 false,
@@ -503,7 +506,9 @@ mod tests {
             accessible.root()[0].id().clone().into();
         assert_ne!(old_id, new_id);
         let description = accessible.root()[0].node().description().unwrap();
-        // The new host's identity is its node, not words in its description.
+        // The new host describes its own page, and names no card by its ID.
+        assert!(description.contains("second.example.test"));
+        assert!(!description.contains("first.example.test"));
         assert!(!description.contains(&second.to_string()));
         assert!(!description.contains(&first.to_string()));
     }
