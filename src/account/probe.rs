@@ -1561,22 +1561,47 @@ async fn probe_codex_with_path(
     finish_codex_probe(after_close(result, session.close()).await)
 }
 
-fn codex_catalog(answer: &Observed<RpcResult>) -> Option<Catalog> {
+/// The models Codex lists, with the one a conversation that names none runs.
+///
+/// `model/list` flags Codex's built-in default and ignores `config.toml`,
+/// which Codex itself honours, so the resolved configuration decides: its
+/// `model` when set, the flagged model when it sets none, and nothing when it
+/// could not be read, so the picker leaves an unknown default unnamed.
+fn codex_catalog(
+    answer: &Observed<RpcResult>,
+    config: Option<&Observed<RpcResult>>,
+) -> Option<Catalog> {
     let result = answer.value.as_ref().ok()?;
     let entries = result["data"].as_array();
     let mut catalog =
         observed_catalog(self::models(entries, Model::from_codex), answer.observed_at)?;
+    let mut flagged = None;
     for entry in entries.into_iter().flatten() {
         let Some(id) = entry["model"].as_str() else {
             continue;
         };
         if entry["isDefault"].as_bool() == Some(true) {
-            catalog.default_model = Some(id.to_owned());
+            flagged = Some(id);
         }
         if let Some(effort) = entry["defaultReasoningEffort"].as_str() {
             catalog
                 .reasoning_defaults
                 .insert(id.to_owned(), effort.to_owned());
+        }
+    }
+    let Some(config) = config.and_then(|read| read.value.as_ref().ok()?.get("config")) else {
+        return Some(catalog);
+    };
+    let configured = |key: &str| config[key].as_str();
+    catalog.default_model = configured("model").or(flagged).map(str::to_owned);
+    // A configured effort applies to every model that offers it.
+    if let Some(effort) = configured("model_reasoning_effort") {
+        for model in &catalog.models {
+            if model.reasoning.iter().any(|level| level == effort) {
+                catalog
+                    .reasoning_defaults
+                    .insert(model.id.clone(), effort.to_owned());
+            }
         }
     }
     Some(catalog)
@@ -1587,8 +1612,11 @@ fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, St
         account: account_read,
         limits: limits_read,
         models,
+        config,
     } = result?;
-    let catalog = models.as_ref().and_then(codex_catalog);
+    let catalog = models
+        .as_ref()
+        .and_then(|models| codex_catalog(models, config.as_ref()));
     let identity = match account_read.value {
         Ok(result) => match super::codex::parse_account(&result) {
             Ok(identity) => Some(identity),
@@ -1642,6 +1670,10 @@ struct CodexSession {
     /// in one page of this size. A version without it answers an error, and
     /// one that did not answer within [`MODELS_GRACE`] reads as one.
     models: Option<Observed<RpcResult>>,
+    /// `config/read`: the configuration Codex resolved for this home, which
+    /// names the model a conversation runs when it asks for none. Waited for
+    /// like the listing.
+    config: Option<Observed<RpcResult>>,
 }
 
 async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
@@ -1663,14 +1695,18 @@ async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
     session
         .send(&json!({"id": 4, "method": "model/list", "params": {"limit": 100}}))
         .await?;
+    session
+        .send(&json!({"id": 5, "method": "config/read", "params": {}}))
+        .await?;
     let mut answers = CodexAnswers::default();
     while answers.account.is_none() || answers.limits.is_none() {
         answers.take(session.next().await?, now_ms);
     }
-    // The usage is what the probe is for, so the listing is only waited for
-    // a little longer, and a probe that has its answer never fails for it.
+    // The usage is what the probe is for, so the listing and configuration are
+    // only waited for a little longer, and a probe that has its answer never
+    // fails for them.
     let _ = tokio::time::timeout(MODELS_GRACE, async {
-        while answers.models.is_none() {
+        while answers.models.is_none() || answers.config.is_none() {
             answers.take(session.next().await?, now_ms);
         }
         Ok::<(), String>(())
@@ -1684,6 +1720,7 @@ struct CodexAnswers {
     account: Option<Observed<RpcResult>>,
     limits: Option<Observed<RpcResult>>,
     models: Option<Observed<RpcResult>>,
+    config: Option<Observed<RpcResult>>,
 }
 
 impl CodexAnswers {
@@ -1696,6 +1733,7 @@ impl CodexAnswers {
             Some(2) => &mut self.account,
             Some(3) => &mut self.limits,
             Some(4) => &mut self.models,
+            Some(5) => &mut self.config,
             _ => return,
         };
         *slot = Some(Observed {
@@ -1709,6 +1747,7 @@ impl CodexAnswers {
             account: self.account.unwrap(),
             limits: self.limits.unwrap(),
             models: self.models,
+            config: self.config,
         }
     }
 }
@@ -2015,22 +2054,58 @@ mod tests {
         assert!(models(None, Model::from_codex).is_empty());
     }
 
-    #[test]
-    fn codex_catalog_keeps_advertised_default_efforts_for_drafts() {
-        let answer = Observed {
+    fn codex_models() -> Observed<RpcResult> {
+        Observed {
             observed_at: 7,
             value: Ok(json!({"data": [
                 {"model":"mini", "displayName":"Mini", "isDefault":true,
                  "defaultReasoningEffort":"medium", "supportedReasoningEfforts":[
                      {"reasoningEffort":"medium"}, {"reasoningEffort":"high"}]},
-                {"model":"other", "defaultReasoningEffort":"high"}
+                {"model":"other", "defaultReasoningEffort":"high",
+                 "supportedReasoningEfforts":[{"reasoningEffort":"high"}]}
             ]})),
-        };
-        let catalog = codex_catalog(&answer).unwrap();
+        }
+    }
+
+    fn codex_config(value: RpcResult) -> Observed<RpcResult> {
+        Observed {
+            observed_at: 8,
+            value,
+        }
+    }
+
+    #[test]
+    fn codex_catalog_keeps_advertised_default_efforts_for_drafts() {
+        let config = codex_config(Ok(json!({"config": {"model": null}})));
+        let catalog = codex_catalog(&codex_models(), Some(&config)).unwrap();
+        assert_eq!(catalog.default_model.as_deref(), Some("mini"));
         assert_eq!(catalog.default_effort(None), Some("medium"));
         assert_eq!(catalog.default_effort(Some("mini")), Some("medium"));
         assert_eq!(catalog.default_effort(Some("other")), Some("high"));
         assert_eq!(catalog.observed_at, 7);
+    }
+
+    /// Codex flags its built-in default in `model/list` even when
+    /// `config.toml` names another model, and runs the configured one.
+    #[test]
+    fn codex_default_is_the_configured_model_not_the_flagged_one() {
+        let config = codex_config(Ok(json!({"config": {
+            "model": "other", "model_reasoning_effort": "high"}})));
+        let catalog = codex_catalog(&codex_models(), Some(&config)).unwrap();
+        assert_eq!(catalog.default_model.as_deref(), Some("other"));
+        assert_eq!(catalog.default_effort(None), Some("high"));
+        // The configured effort applies to every model that offers it.
+        assert_eq!(catalog.default_effort(Some("mini")), Some("high"));
+    }
+
+    #[test]
+    fn codex_default_is_unnamed_when_its_configuration_is_unknown() {
+        let refused = codex_config(Err(json!({"code": -32601})));
+        for config in [None, Some(&refused)] {
+            let catalog = codex_catalog(&codex_models(), config).unwrap();
+            assert_eq!(catalog.default_model, None);
+            assert_eq!(catalog.default_effort(Some("mini")), Some("medium"));
+        }
     }
 
     #[test]

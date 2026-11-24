@@ -11951,7 +11951,7 @@ fn every_providers_default_names_the_model_it_resolves_to() {
     );
     assert_eq!(
         after("Other models"),
-        ["Default model", "The model Oh My Pi is set to use"],
+        ["Default model", "Whichever its settings choose"],
         "{texts:?}"
     );
     assert_eq!(
@@ -11960,14 +11960,32 @@ fn every_providers_default_names_the_model_it_resolves_to() {
         "{texts:?}"
     );
     assert!(
-        !texts.iter().any(|text| text.contains("Whichever")),
+        !texts
+            .iter()
+            .any(|text| text.contains("would choose itself")),
         "{texts:?}"
     );
     // The default is found by the model it resolves to, as Claude's
-    // `default` alias is found by its label.
+    // `default` alias is found by its label, but after the model the search
+    // names, so Enter takes that model rather than whatever the provider's
+    // setting next makes its default.
     assert_eq!(
         listed(&model_rows(&offers[..1], "5.5", true)),
-        [(Provider::Codex, vec!["default", "gpt-5.5"])]
+        [(Provider::Codex, vec!["gpt-5.5", "default"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[1..2], "opus", true)),
+        [(Provider::Claude, vec!["opus", "default"])]
+    );
+    // A search for the default itself, or for the provider, still heads
+    // with it.
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "def", true)),
+        [(Provider::Codex, vec!["default"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "chatgpt", true)),
+        [(Provider::Codex, vec!["default", "gpt-5.4", "gpt-5.5"])]
     );
     assert_eq!(
         listed(&model_rows(&offers[..1], "5.4", true)),

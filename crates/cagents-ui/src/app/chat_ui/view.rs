@@ -8533,12 +8533,10 @@ fn reasoning_rows<'a>(
     model: &'a chat::Model,
     default: Option<&str>,
 ) -> Vec<(Option<&'a str>, Cow<'a, str>)> {
-    let title = match default.map(effort_label) {
-        Some(effort) => default_choice_label(Some(&effort), "Default")
-            .into_owned()
-            .into(),
-        None => Cow::Borrowed("Default"),
-    };
+    let title = default.map_or_else(
+        || Cow::Borrowed("Default"),
+        |effort| Cow::Owned(format!("Default ({})", effort_label(effort))),
+    );
     std::iter::once((None, title))
         .chain(
             model
@@ -8685,7 +8683,8 @@ fn model_rows<'a>(
         .filter_map(|offer| {
             // A letter alone begins too many names to mean one provider.
             let named = needle.chars().count() > 1 && names_provider(offer.provider, &needle);
-            // The default is found by the model it resolves to, as a
+            let by_name = needle.is_empty() || named || "default".starts_with(&needle);
+            // The default is also found by the model it resolves to, as a
             // listed `default` alias is by its label.
             let resolves = || {
                 advertised_default(offer.models, offer.catalog)
@@ -8693,8 +8692,8 @@ fn model_rows<'a>(
             };
             let default = ((draft && !offer.models.iter().any(|model| model.id == "default"))
                 || offer.models.is_empty())
-                && (needle.is_empty() || named || "default".starts_with(&needle) || resolves());
-            let rows: Vec<ModelRow<'a>> = default
+                && (by_name || resolves());
+            let (mut rows, defaults): (Vec<ModelRow<'a>>, Vec<ModelRow<'a>>) = default
                 .then_some(ModelRow {
                     provider: offer.provider,
                     model: None,
@@ -8708,7 +8707,11 @@ fn model_rows<'a>(
                             model: Some(model),
                         }),
                 )
-                .collect();
+                // A search that names a model rather than the default puts
+                // that model first, so Enter takes the model it named: the
+                // default follows the provider's setting wherever it goes.
+                .partition(|row| by_name || row.model.is_some_and(|model| model.id != "default"));
+            rows.extend(defaults);
             (!rows.is_empty()).then_some((offer.provider, rows))
         })
         .collect()
@@ -8881,12 +8884,8 @@ fn model_list<'a>(
                 Some(id) if id != title.as_ref() => Some(Cow::Borrowed(id)),
                 Some(_) => None,
                 None if advertised.is_some() => None,
-                // The agent's own setting decides, so it is named rather
-                // than the family its models are listed under.
-                None if listed => Some(Cow::Owned(format!(
-                    "The model {} is set to use",
-                    provider.label()
-                ))),
+                // The agent's own settings decide, and haven't said.
+                None if listed => Some(Cow::Borrowed("Whichever its settings choose")),
                 None => Some(Cow::Borrowed("Its models are listed once it has run")),
             };
             rows.push(picker_choice_row(
