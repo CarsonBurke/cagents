@@ -2015,9 +2015,17 @@ impl State {
         self.popup = None;
     }
 
-    /// Whether a pane is being renamed, which a click elsewhere does not end.
-    pub(super) fn renaming(&self) -> bool {
-        self.rename.is_some()
+    /// Whether something other than pane `card` is being renamed: another
+    /// pane or a channel. A click elsewhere does not end a rename.
+    pub(super) fn renaming_other_than(&self, card: CardId) -> bool {
+        self.rename
+            .as_ref()
+            .is_some_and(|(target, _)| *target != RenameTarget::Pane(card))
+    }
+
+    /// Drops a rename without applying it.
+    pub(super) fn cancel_rename(&mut self) {
+        self.rename = None;
     }
 }
 
@@ -2091,7 +2099,7 @@ pub enum Action {
     Launch(NewTab),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenameTarget {
     Pane(CardId),
     Channel(crate::model::ChannelId),

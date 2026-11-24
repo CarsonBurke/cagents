@@ -216,6 +216,15 @@ impl Cagents {
         }
         self.closed_terminal_cards.remove(&card);
         self.proven_gone_cards.remove(&card);
+        // Asked for again while it was closing, the pane is still here: once
+        // given up, the request is answered, and must not bring the pane
+        // straight back after the next close that does go through.
+        if self
+            .card_state(card)
+            .is_some_and(|state| self.reopen_utility.as_ref() == Some(&state.kind))
+        {
+            self.reopen_utility = None;
+        }
     }
 
     /// Brings the rest of the window up to date with panes that came back:
@@ -385,27 +394,22 @@ impl Cagents {
     /// waits for, so a Close that can't start yet is never silent.
     fn queue_card_close_behind(&mut self, card: CardId, blocker: CardId, unasked: bool) {
         self.queue_card_close(card, unasked);
-        let name = self
-            .card_state(blocker)
-            .map(|state| self.card_display_title(state).to_owned())
-            .filter(|name| !name.is_empty())
-            .map_or_else(|| "another pane".to_owned(), |name| format!("“{name}”"));
+        let name = self.pane_name(blocker);
+        let me = self.pane_name(card);
         let message = if self
             .dirty_repository_close
             .as_ref()
             .is_some_and(|close| close.card == blocker || close.remaining.contains(&blocker))
         {
-            format!(
-                "This pane closes once you decide what to do with the unsaved changes in {name}."
-            )
+            format!("{me} closes once you decide what to do with the unsaved changes in {name}.")
         } else if self.chrome_ui.closing_group.contains(&blocker) {
-            "This pane closes once the panes already closing have gone.".to_owned()
+            format!("{me} closes once the panes already closing have gone.")
         } else if self
             .terminal_close
             .as_ref()
             .is_some_and(|intent| intent.card == blocker && !intent.pending)
         {
-            format!("This pane closes once you answer the question about {name}.")
+            format!("{me} closes once you answer the question about {name}.")
         } else if self
             .terminal_close
             .as_ref()
@@ -413,17 +417,26 @@ impl Cagents {
             || self.completed_release == Some(blocker)
         {
             format!(
-                "This pane closes once {name} has finished closing. Cagents is waiting for its terminal to stop."
+                "{me} closes once {name} has finished closing. Cagents is waiting for its terminal to stop."
             )
-        } else if self.removal_stranded(blocker) {
+        } else if self.removal_stranded(blocker) && self.close_waiting_its_turn(card) {
             format!(
-                "This pane is waiting for {name} to finish closing. Close this pane again to stop waiting."
+                "{name} didn't finish closing, so {me} is waiting for it. Close {me} again to close it now; {name} stays open."
             )
         } else {
-            format!("This pane closes once {name} has finished closing.")
+            format!("{me} closes once {name} has finished closing.")
         };
         self.status =
             Some(TransientNotice::warning(message).with_key(NoticeKey::CloseWaiting(card)));
+    }
+
+    /// A pane's title in quotes for a notice, which is read away from the
+    /// pane, or "another pane" when it has none.
+    pub(super) fn pane_name(&self, card: CardId) -> String {
+        self.card_state(card)
+            .map(|state| self.card_display_title(state).to_owned())
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| "another pane".to_owned(), |name| format!("“{name}”"))
     }
 
     /// Whether `card`'s close only waits its turn behind another pane's, with
@@ -681,10 +694,11 @@ impl Cagents {
         }
         if self.chat_close_dialog_visible() {
             self.queue_card_close(card, unasked);
+            let me = self.pane_name(card);
             self.status = Some(
-                TransientNotice::warning(
-                    "This pane closes once you answer the question about the chat that is closing.",
-                )
+                TransientNotice::warning(format!(
+                    "{me} closes once you answer the question about the chat that is closing."
+                ))
                 .with_key(NoticeKey::CloseWaiting(card)),
             );
             return Task::none();
@@ -3822,7 +3836,7 @@ pub(in crate::app) mod tests {
         drop(app.update(Message::CloseCard(settings)));
         assert!(app.card_state(settings).unwrap().existence.is_open());
         let notice = waiting_notice(&app, settings).expect("the wait is reported");
-        assert!(notice.contains("Close this pane again"), "{notice}");
+        assert!(notice.contains("again to close it now"), "{notice}");
         // The tab's Close stays pressable, so the advice can be followed.
         assert!(app.close_waiting_its_turn(settings));
         assert!(!app.close_waiting_its_turn(first));
@@ -3835,12 +3849,18 @@ pub(in crate::app) mod tests {
             Some(settings)
         );
         assert!(app.queued_card_closes.is_empty());
+        // The given-up pane's late commit starts nothing of its own: no
+        // terminal close, and no place in the queue.
         drop(app.update(Message::CommitClose(first)));
         assert!(app.card_state(first).unwrap().existence.is_open());
+        assert!(app.terminal_close.is_none());
+        assert!(app.queued_card_closes.is_empty());
         drop(app.update(Message::CommitClose(settings)));
         assert!(!app.card_state(settings).unwrap().existence.is_open());
         assert!(app.card_state(first).unwrap().existence.is_open());
         assert!(app.workspace.order().any(|card| card == first));
+        assert!(app.terminal_close.is_none());
+        assert!(app.queued_card_closes.is_empty());
         assert_eq!(waiting_notice(&app, settings), None);
     }
 
@@ -3861,7 +3881,7 @@ pub(in crate::app) mod tests {
                 Some(first)
             );
             let notice = waiting_notice(&app, settings).expect("the wait is reported");
-            assert!(!notice.contains("Close this pane again"), "{notice}");
+            assert!(!notice.contains("again to close it now"), "{notice}");
             assert!(app.close_waiting_its_turn(settings));
         }
         assert_eq!(app.queued_card_closes.len(), 1);
@@ -3914,5 +3934,49 @@ pub(in crate::app) mod tests {
         );
         drop(app.update(Message::CommitClose(settings)));
         assert!(!app.card_state(settings).unwrap().existence.is_open());
+    }
+    /// Closing the pane being renamed drops the rename and closes it.
+    #[test]
+    fn closing_the_pane_being_renamed_closes_it() {
+        let (mut app, _) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::Rename(settings))));
+        assert!(app.chrome_ui.is_open());
+        drop(app.update(Message::CloseCard(settings)));
+        assert!(!app.chrome_ui.is_open());
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|pending| pending.unmounting),
+            Some(settings)
+        );
+    }
+
+    /// Closing a pane while another is being renamed keeps that rename and
+    /// says, naming the pane, why it stays.
+    #[test]
+    fn a_close_during_another_rename_says_to_finish_it() {
+        let (mut app, first) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::Rename(first))));
+        drop(app.update(Message::CloseCard(settings)));
+        assert!(app.chrome_ui.is_open());
+        assert!(app.workspace.pending_close().is_none());
+        let notice = app.status.as_ref().expect("the refusal is reported");
+        assert!(notice.message.contains("rename first"), "{notice:?}");
+        assert!(notice.message.contains("“Settings”"), "{notice:?}");
+    }
+
+    /// Given up while Settings was asked for again, the close's pending
+    /// reopen goes too: the next close that lands does not bring it back.
+    #[test]
+    fn a_given_up_close_forgets_its_reopen_request() {
+        let (mut app, _) = retry_close_fixture();
+        let settings = settings_beside(&mut app);
+        app.workspace.request_close(settings).unwrap();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        assert_eq!(app.reopen_utility, Some(CardKind::Settings));
+        app.abandon_removal(settings);
+        assert_eq!(app.reopen_utility, None);
     }
 }

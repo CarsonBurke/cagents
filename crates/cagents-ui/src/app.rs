@@ -15504,6 +15504,17 @@ impl Cagents {
         {
             return Task::none();
         }
+        // Only a reservation sends this. A commit for one given up meanwhile,
+        // as a stranded one is when a pane waiting behind it is closed again,
+        // has nothing left to commit, and starts nothing: the pane stays open.
+        if !self
+            .workspace
+            .pending_close()
+            .is_some_and(|pending| pending.unmounting == id)
+        {
+            self.abandon_removal(id);
+            return self.next_queued_card_close();
+        }
         if self.pending_terminal_spawn(id) {
             return self.begin_card_close(id);
         }
@@ -15513,16 +15524,6 @@ impl Cagents {
             && !self.closed_terminal_cards.contains(&id)
         {
             return self.begin_card_close(id);
-        }
-        // A commit for a removal given up meanwhile, as a stranded one is when
-        // a pane waiting behind it is closed again, has nothing left to commit.
-        if !self
-            .workspace
-            .pending_close()
-            .is_some_and(|pending| pending.unmounting == id)
-        {
-            self.abandon_removal(id);
-            return self.next_queued_card_close();
         }
         match self.commit_card_removal(id, None) {
             Some(task) => task,
@@ -18031,10 +18032,10 @@ impl Cagents {
         }
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
-        let closes = matches!(
-            message,
-            Message::CloseCard(_) | Message::CloseCardUnasked(_)
-        );
+        let closing = match message {
+            Message::CloseCard(card) => Some(card),
+            _ => None,
+        };
         if self.update_prepared && user_message_blocked_during_update(&message) {
             // Nothing else would ever deliver this removal.
             if let Message::CommitClose(card) = message {
@@ -18045,10 +18046,11 @@ impl Cagents {
                 return ControlFlow::Break(self.return_kept_panes());
             }
             // A Close turned away says why, rather than doing nothing.
-            if closes {
-                self.status = Some(TransientNotice::warning(
-                    "Panes can't close while an update is being prepared. Close it again once the update finishes or is cancelled.",
-                ));
+            if let Some(card) = closing {
+                let me = self.pane_name(card);
+                self.status = Some(TransientNotice::warning(format!(
+                    "{me} can't close while an update is being prepared. Close it again if the update is cancelled."
+                )));
             }
             return ControlFlow::Break(Task::none());
         }
@@ -18059,23 +18061,30 @@ impl Cagents {
             && user_workspace_message_blocked_while_modal(&message)
         {
             // A menu only dismisses itself under a click elsewhere, but a pane's
-            // Close is aimed at the pane: the menu goes and the close goes on.
-            if closes && !self.chrome_ui.renaming() {
-                self.chrome_ui.close();
-            } else {
-                if closes {
-                    self.status = Some(TransientNotice::warning(
-                        "Finish renaming the pane first, then close it.",
-                    ));
+            // Close is aimed at the pane: the menu goes and the close goes on,
+            // as does a rename of the pane being closed. Another rename keeps
+            // what was typed, and says why the pane stays.
+            match closing {
+                Some(card) if !self.chrome_ui.renaming_other_than(card) => {
+                    self.chrome_ui.close();
+                    self.chrome_ui.cancel_rename();
                 }
-                return ControlFlow::Break(Task::none());
+                Some(card) => {
+                    let me = self.pane_name(card);
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Finish or cancel the rename first, then close {me}."
+                    )));
+                    return ControlFlow::Break(Task::none());
+                }
+                None => return ControlFlow::Break(Task::none()),
             }
         }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
-            if closes {
-                self.status = Some(TransientNotice::warning(
-                    "Close or answer the open dialog first, then close the pane.",
-                ));
+            if let Some(card) = closing {
+                let me = self.pane_name(card);
+                self.status = Some(TransientNotice::warning(format!(
+                    "Close or answer the open dialog first, then close {me}."
+                )));
             }
             return ControlFlow::Break(Task::none());
         }
