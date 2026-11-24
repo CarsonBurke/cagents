@@ -5,9 +5,12 @@ import dev.cagents.mobile.client.SessionOverview
 import dev.cagents.mobile.protocol.Activity
 import dev.cagents.mobile.protocol.Agent
 import dev.cagents.mobile.protocol.AgentOwner
+import dev.cagents.mobile.protocol.Event
 import dev.cagents.mobile.protocol.Notice
 import dev.cagents.mobile.protocol.NoticeKind
+import dev.cagents.mobile.protocol.ServerLine
 import dev.cagents.mobile.protocol.Session
+import dev.cagents.mobile.protocol.decodeServerLine
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -94,12 +97,28 @@ class SessionOverviewTest {
     }
 
     @Test
-    fun takesTheAskingClassificationFromTheBridge() {
-        val notices = listOf(
-            Notice(id = "new-kind", asks = true),
-            Notice(id = "quiet", kind = NoticeKind.AutomationPaused, asks = false),
+    fun classifiesLegacyNoticesAndHonorsExplicitAsks() {
+        val line = decodeServerLine(
+            """{"type":"event","event":"notifications","data":{"notices":[
+                {"id":"waiting","kind":"waiting"},
+                {"id":"review","kind":"review_requested"},
+                {"id":"message","kind":"message_received"},
+                {"id":"paused","kind":"automation_paused"},
+                {"id":"blocked","kind":"automation_blocked"},
+                {"id":"failed","kind":"failed","session":"done"},
+                {"id":"unknown","kind":"new_kind"},
+                {"id":"new-kind","kind":"new_kind","asks":true},
+                {"id":"quiet","kind":"automation_paused","asks":false}
+            ]}}""",
         )
-        val overview = SessionOverview.of(emptyList(), notices)
-        assertEquals(listOf("notice/new-kind"), overview.attention.map { it.key })
+        val notices = assertIs<Event.Notifications>(assertIs<ServerLine.EventLine>(line).event).notices
+        val overview = SessionOverview.of(listOf(session("done", Activity.Idle, 1)), notices)
+
+        assertEquals(
+            listOf("notice/waiting", "notice/message", "notice/paused", "notice/blocked", "notice/new-kind", "reviews"),
+            overview.attention.map { it.key },
+        )
+        assertEquals("review", assertIs<AttentionItem.Reviews>(overview.attention.last()).notices.single().id)
+        assertEquals("failed", overview.outcomes["done"]?.id)
     }
 }
