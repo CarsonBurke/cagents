@@ -69,7 +69,7 @@ mod views;
 mod workspace_snapshot_tests;
 mod worktree_repair;
 
-const SCHEMA_VERSION: u32 = 30;
+const SCHEMA_VERSION: u32 = 31;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -1210,6 +1210,10 @@ fn migrate_through(
         tx.execute_batch("ALTER TABLE channels ADD COLUMN checkout TEXT;")
             .map_err(|error| error.to_string())?;
         schema::migration_checkpoint(30)?;
+    }
+    if version < 31 && target >= 31 {
+        execution::migrate_courier_runs(tx)?;
+        schema::migration_checkpoint(31)?;
     }
     Ok(())
 }

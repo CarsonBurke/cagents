@@ -30,7 +30,7 @@ fn store_error(error: rusqlite::Error) -> AcceptanceError {
 pub(crate) use crate::agent_execution::MESSAGE_RUN_KEY;
 const _: () = assert!(
     const_str_eq(MESSAGE_RUN_KEY, "cagents-message:"),
-    "RETURNED and IN_LINE spell out the message run key"
+    "the returned-message lookup and its index spell out the message run key"
 );
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
@@ -69,18 +69,17 @@ pub(super) fn return_run_message_in(
 
 /// Whether message `m` already became an agent run once, which ended unsent
 /// and gave it back: it then arrives as a message, out of the order runs keep.
+/// The prefix condition lets SQLite seek by the computed key in the partial index.
 const RETURNED: &str = "EXISTS(SELECT 1 FROM agent_runs given
-    WHERE given.idempotency_key = 'cagents-message:' || m.id)";
+    WHERE given.idempotency_key GLOB 'cagents-message:*'
+      AND given.idempotency_key = 'cagents-message:' || m.id)";
 
-/// Pending messages that take their place in a recipient agent's order of
-/// runs, as `deliverable_messages` offers them: a reply held for its
-/// question's asker waits out of line, and so does a returned message.
+/// Pending messages a recipient may now receive, including returned messages.
+/// Callers ordering new runs also exclude `RETURNED`.
 /// Expects the message alias `m` and the parameter `:now`.
-const IN_LINE: &str = "m.state = 'pending'
+const ELIGIBLE_PENDING: &str = "m.state = 'pending'
     AND NOT EXISTS(SELECT 1 FROM messages asked WHERE asked.id = m.reply_to
-        AND asked.wait_until_ms > :now)
-    AND NOT EXISTS(SELECT 1 FROM agent_runs given
-        WHERE given.idempotency_key = 'cagents-message:' || m.id)";
+        AND asked.wait_until_ms > :now)";
 
 /// Whether a message to `agent`'s conversation waits to be delivered. A
 /// follow-up given to that agent then goes behind it, so messages and
@@ -96,7 +95,7 @@ pub(super) fn messages_wait_for_agent(
                  ON m.recipient_lineage = coalesce(
                      (SELECT lineage FROM session_lineages WHERE session_id = a.session_id),
                      a.session_id)
-             WHERE a.id = :agent AND {IN_LINE})"
+             WHERE a.id = :agent AND {ELIGIBLE_PENDING} AND NOT {RETURNED})"
         ),
         rusqlite::named_params! {":agent": agent.to_string(), ":now": now as i64},
         |row| row.get(0),
@@ -112,7 +111,7 @@ fn earlier_message_waits(db: &Connection, id: MessageId, now: u64) -> Result<boo
             "SELECT EXISTS(SELECT 1 FROM messages later JOIN messages m
                  ON m.recipient_lineage = later.recipient_lineage
                  AND (m.created_ms, m.rowid) < (later.created_ms, later.rowid)
-             WHERE later.id = :id AND {IN_LINE})"
+             WHERE later.id = :id AND {ELIGIBLE_PENDING} AND NOT {RETURNED})"
         ),
         rusqlite::named_params! {":id": id.to_string(), ":now": now as i64},
         |row| row.get(0),
@@ -597,7 +596,7 @@ impl Registry {
                              ON m.recipient_lineage = coalesce(
                                  (SELECT lineage FROM session_lineages WHERE session_id = a.session_id),
                                  a.session_id)
-                         WHERE a.id = :agent AND {IN_LINE}
+                         WHERE a.id = :agent AND {ELIGIBLE_PENDING} AND NOT {RETURNED}
                          ORDER BY m.created_ms, m.rowid LIMIT 1)"
                 ),
                 rusqlite::named_params! {":agent": agent.to_string(), ":now": now as i64},
@@ -837,6 +836,70 @@ mod tests {
             state: State::Pending,
             created_ms,
         }
+    }
+
+    #[test]
+    fn returned_message_receipt_survives_schema_round_trip_and_uses_its_index() {
+        let (mut registry, _directory) = registry();
+        let path = registry.path.clone();
+        let recipient = Lineage(TerminalId::new());
+        let returned = message(Party::user(), party(recipient), 1);
+        let ordinary = message(Party::user(), party(recipient), 2);
+        registry.post_message(&returned).unwrap();
+        registry.post_message(&ordinary).unwrap();
+        let agent = crate::model::AgentId::new();
+        registry
+            .db
+            .execute(
+                "INSERT INTO agents(id,origin,record,session_id,closed) VALUES(?1,'new','{}',?2,0)",
+                params![agent.to_string(), recipient.0.to_string()],
+            )
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "INSERT INTO agent_runs(id,agent,origin,idempotency_key,request,state,revision,record)
+                 VALUES(?1,?2,'old',?3,'{}','cancelled',1,'{}')",
+                params![
+                    crate::model::RunId::new().to_string(),
+                    agent.to_string(),
+                    format!("{MESSAGE_RUN_KEY}{}", returned.id),
+                ],
+            )
+            .unwrap();
+        drop(registry);
+        assert_eq!(
+            super::super::schema::downgrade(&path, 30).unwrap(),
+            Some(31)
+        );
+
+        let registry = Registry::at(&path).unwrap();
+        let plan: Vec<String> = registry
+            .db
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT {RETURNED} FROM messages m WHERE m.id = ?1"
+            ))
+            .unwrap()
+            .query_map([returned.id.to_string()], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("agent_runs_by_message (idempotency_key=?)")),
+            "{plan:?}"
+        );
+        let (deliverable, next_release) = registry.deliverable_messages(3).unwrap();
+        let ids: Vec<_> = deliverable.iter().map(|message| message.id).collect();
+        assert_eq!(ids, [returned.id, ordinary.id]);
+        assert_eq!(next_release, None);
+        assert_eq!(
+            registry
+                .next_message_in_line(agent, 3)
+                .unwrap()
+                .map(|message| message.id),
+            Some(ordinary.id)
+        );
     }
 
     fn assert_inbox_fits_wire(messages: &[Message]) {
