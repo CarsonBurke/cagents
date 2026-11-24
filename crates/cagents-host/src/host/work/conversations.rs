@@ -104,25 +104,51 @@ struct State {
     /// cannot be reached, lookups back off rather than retry every pass.
     failures: u32,
     failed: Option<Instant>,
+    /// The Unix second GitHub's rate limit admits lookups again. They resume
+    /// then rather than after a doubling backoff.
+    paused_until: Option<u64>,
 }
 
 impl State {
     fn lookups_due(&self) -> bool {
-        self.failed
-            .is_none_or(|failed| failed.elapsed() >= backoff(self.failures))
+        match self.paused_until {
+            Some(until) => super::pause_over(until),
+            None => self
+                .failed
+                .is_none_or(|failed| failed.elapsed() >= backoff(self.failures)),
+        }
     }
 
     fn succeeded(&mut self) {
         self.forge_error = None;
         self.failures = 0;
         self.failed = None;
+        self.paused_until = None;
     }
 
     fn failed(&mut self, error: &GitHubError) {
         self.forge_error = Some(error.to_string());
-        self.failures = self.failures.saturating_add(1);
         self.failed = Some(Instant::now());
+        match pause(error) {
+            // GitHub answered, so earlier outages are over.
+            Some(until) => {
+                self.paused_until = Some(until);
+                self.failures = 0;
+            }
+            None => {
+                self.failures = self.failures.saturating_add(1);
+                self.paused_until = None;
+            }
+        }
     }
+}
+
+/// Until when a rate limit that refused a lookup pauses the rest, as the
+/// board's polls pause.
+fn pause(error: &GitHubError) -> Option<u64> {
+    error
+        .rate_limit()
+        .and_then(|limit| super::rate_limit_pause(limit.retry_at))
 }
 
 /// As the board backs off: 30 s doubling, at most 30 min.
@@ -144,6 +170,15 @@ struct Observed {
 }
 
 impl Observed {
+    /// Counts a failed lookup of this pull request toward its backoff. A
+    /// rate limit is no fault of the pull request: lookups resume together
+    /// when it resets.
+    fn lookup_failed(&mut self, error: &GitHubError) {
+        if pause(error).is_none() {
+            self.failures = self.failures.saturating_add(1);
+        }
+    }
+
     fn due(&self, worked_on: bool) -> bool {
         let Some(checked) = self.checked else {
             return true;
@@ -1017,7 +1052,7 @@ impl Handle {
                             entry.failures = 0;
                         }
                         Err(error) => {
-                            entry.failures = entry.failures.saturating_add(1);
+                            entry.lookup_failed(&error);
                             state.failed(&error);
                             return;
                         }
