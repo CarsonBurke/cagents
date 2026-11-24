@@ -1495,7 +1495,9 @@ Every field is optional. `tailscale` set to `null` reports Tailscale as
 installed but not connected, and leaving it out reports it as not installed.
 `listening` set to `false` reports no SSH server, `blocked` lists network
 addresses the firewall blocks SSH on while it allows SSH over Tailscale, and
-`connections` lists the addresses of connected phones. The file is read each time the popover checks
+`connections` lists the addresses of connected phones. Leave `connections`
+out to show the phones really connected, as when a real phone pairs with the
+fixture over an SSH server that reads the fixture HOME's `authorized_keys`. The file is read each time the popover checks
 again, every two seconds while it is open, so it can be changed while the
 session runs. Debug builds whose `HOME` is in a native-evidence task read it;
 other builds and homes ignore it.

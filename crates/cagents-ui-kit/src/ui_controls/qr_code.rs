@@ -156,7 +156,11 @@ mod tests {
         let matrix = QrMatrix::encode("cagents-mobile://pair?v=1").unwrap();
         let mut drawn = vec![false; matrix.dark.len()];
         for (row, column, length) in matrix.runs() {
-            for module in drawn.iter_mut().skip(row * matrix.width + column).take(length) {
+            for module in drawn
+                .iter_mut()
+                .skip(row * matrix.width + column)
+                .take(length)
+            {
                 assert!(!*module, "runs never overlap");
                 *module = true;
             }

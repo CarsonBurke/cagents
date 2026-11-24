@@ -122,10 +122,10 @@ pub(crate) fn probe(network: bool) -> Status {
         Some(fixture) => fixture.network(),
         None => read_network(),
     });
-    let connections = match &fixture {
-        Some(fixture) => fixture.connections(network.as_ref()),
-        None => connections(Path::new("/proc"), network.as_ref()),
-    };
+    let connections = fixture
+        .as_ref()
+        .and_then(|fixture| fixture.connections(network.as_ref()))
+        .unwrap_or_else(|| connections(Path::new("/proc"), network.as_ref()));
     Status {
         phones,
         unwritable,
@@ -564,8 +564,9 @@ mod fixture {
         /// Network addresses the firewall blocks SSH on, while it allows SSH
         /// over Tailscale.
         blocked: Vec<String>,
-        /// The phones' addresses.
-        connections: Vec<String>,
+        /// The phones' addresses; absent to find the phones really connected,
+        /// as a fixture that a real phone pairs with does.
+        connections: Option<Vec<String>>,
     }
 
     #[derive(Deserialize)]
@@ -597,14 +598,17 @@ mod fixture {
             }
         }
 
-        pub(super) fn connections(&self, network: Option<&Network>) -> Vec<Connection> {
-            self.connections
-                .iter()
-                .map(|from| Connection {
-                    route: route("", from, network),
-                    from: from.clone(),
-                })
-                .collect()
+        pub(super) fn connections(&self, network: Option<&Network>) -> Option<Vec<Connection>> {
+            let connections = self.connections.as_ref()?;
+            Some(
+                connections
+                    .iter()
+                    .map(|from| Connection {
+                        route: route("", from, network),
+                        from: from.clone(),
+                    })
+                    .collect(),
+            )
         }
     }
 

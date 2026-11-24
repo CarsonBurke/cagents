@@ -448,7 +448,9 @@ impl Cagents {
         if let Some(tone) = tone {
             control = control.tone(design::Tone::Themed(tone));
         }
-        let max_height = (self.window_height - super::account_ui::STATUS_BAR_HEIGHT - 2.0 * space::XL).max(160.0);
+        let max_height =
+            (self.window_height - super::account_ui::STATUS_BAR_HEIGHT - 2.0 * space::XL)
+                .max(160.0);
         crate::ui_controls::scrolling_popover(
             control,
             open.then(|| {
