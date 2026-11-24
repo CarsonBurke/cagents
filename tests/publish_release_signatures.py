@@ -77,7 +77,8 @@ def editor_archive(path: Path, version: str):
 # GitHub for publication: releases are directories under $FAKE_GITHUB, tags
 # are the checkout's own, and every request is logged.
 GH = r"""#!/usr/bin/python3 -I
-import json, os, shutil, subprocess, sys
+import json, os, shutil, subprocess, sys, zlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 state = Path(os.environ["FAKE_GITHUB"])
@@ -91,9 +92,14 @@ def option(name):
 
 def releases():
     found = [json.loads((path / "release.json").read_text()) for path in sorted(state.glob("releases/*"))]
+    # An asset uploaded again gets a new id; ids.json holds those.
+    ids = json.loads((state / "ids.json").read_text()) if (state / "ids.json").exists() else {}
     for release in found:
-        release["assets"] = [{"name": asset.name, "size": asset.stat().st_size}
-                             for asset in sorted((state / "releases" / release["tag_name"] / "assets").iterdir())]
+        release["assets"] = [{
+            "name": asset.name, "size": asset.stat().st_size,
+            "id": ids.get(f"{release['tag_name']}/{asset.name}", zlib.crc32(f"{release['tag_name']}/{asset.name}".encode())),
+            "updated_at": datetime.fromtimestamp(asset.stat().st_mtime, timezone.utc).isoformat(),
+        } for asset in sorted((state / "releases" / release["tag_name"] / "assets").iterdir())]
     return found
 
 def release(tag):
@@ -125,6 +131,14 @@ if arguments[:2] == ["release", "download"]:
         raise SystemExit("no assets match")
     for asset in matched:
         shutil.copyfile(asset, directory / asset.name)
+    # Once downloaded, an asset named in swap-after-download/TAG is uploaded
+    # again with the same bytes.
+    swap = state / "swap-after-download" / arguments[2]
+    if swap.exists():
+        ids = json.loads((state / "ids.json").read_text()) if (state / "ids.json").exists() else {}
+        ids[f"{arguments[2]}/{swap.read_text().strip()}"] = 999
+        (state / "ids.json").write_text(json.dumps(ids))
+        swap.unlink()
 elif arguments[:2] == ["release", "upload"]:
     files = [value for value in arguments[3:] if value.startswith("/")]
     for path in files:
@@ -229,8 +243,9 @@ class PublisherSignatures(unittest.TestCase):
         self.git("commit", "-q", "-m", f"release {version}")
         self.git("tag", "-a", f"v{version}", "-m", f"v{version}")
 
-    def bundle(self, version: str, signers: list[str]) -> Path:
-        """A complete bundle of VERSION, its metadata signed by SIGNERS in order."""
+    def bundle(self, version: str, signers: list[str], variant: str = "") -> Path:
+        """A complete bundle of VERSION, its metadata signed by SIGNERS in
+        order; another VARIANT is another build of it."""
         dist = Path(tempfile.mkdtemp(prefix=f"dist-{version}-", dir=self.directory))
         cagents_archive(dist / f"cagents-{version}-{TARGET}.tar.gz", "cagents", version, "dev.cagents.Cagents")
         cagents_archive(dist / f"cagents-browserless-{version}-{TARGET}.tar.gz", "cagents-browserless", version,
@@ -239,7 +254,7 @@ class PublisherSignatures(unittest.TestCase):
         for name in (f"cagents_{version}_amd64.deb", f"cagents-browserless_{version}_amd64.deb",
                      f"cagents-{version}-sizes.txt", f"cagents-{version}-artifact-comparison.txt",
                      f"cagents-browserless-{version}-sizes.txt"):
-            (dist / name).write_text(name)
+            (dist / name).write_text(name + variant)
         (dist / "install.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n")
 
         def sums(manifest: str, names: list[str]):
@@ -453,6 +468,26 @@ class PublisherSignatures(unittest.TestCase):
         shutil.copyfile(release / "release-metadata.json", assets / "release-metadata.json")
         self.assertRefused(self.promote("0.2.5", digest), "GitHub served different bytes for release-metadata.json")
         self.assertIn('"draft": true', (self.directory / "github/releases/v0.2.5/release.json").read_text())
+
+    def test_a_rehearsal_of_another_build_does_not_publish_the_draft(self):
+        self.drafted()
+        # A pass for a local cut of the same version is a pass for other bytes.
+        local = self.bundle("0.2.5", ["new"], variant=" built locally")
+        digest = hashlib.sha256((local / "release-metadata.json").read_bytes()).hexdigest()
+        self.assertRefused(self.promote("0.2.5", digest), "is not what was rehearsed")
+        self.assertIn('"draft": true', (self.directory / "github/releases/v0.2.5/release.json").read_text())
+
+    def test_an_asset_uploaded_again_while_promoting_stops_it(self):
+        release = self.drafted()
+        digest = hashlib.sha256((release / "release-metadata.json").read_bytes()).hexdigest()
+        swap = self.directory / "github/swap-after-download/v0.2.5"
+        swap.parent.mkdir(parents=True)
+        swap.write_text("install.sh\n")
+        # The same bytes under a new asset are still not the draft verified.
+        self.assertRefused(self.promote("0.2.5", digest), "the draft of v0.2.5 changed while it was verified")
+        self.assertIn('"draft": true', (self.directory / "github/releases/v0.2.5/release.json").read_text())
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_publication_never_puts_a_release_above_a_newer_one(self):
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})

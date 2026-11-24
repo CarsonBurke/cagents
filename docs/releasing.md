@@ -206,8 +206,10 @@ draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
    a sandbox masking `.git` leaves behind, it goes in `/dev/shm/cr` instead.
    It takes about 700 MB and is removed once the rehearsal passes; the
    report is kept in `~/.cache/cagents-release-rehearsal/passed-VERSION.txt`,
-   headed by the SHA-256 of the metadata the update read; a later rehearsal
-   of the version removes it first, so only the latest outcome stands. If a
+   headed, for the in-app update, by the SHA-256 of the metadata the update
+   read and the release it updated from; a staged pass has no such header.
+   A later rehearsal of the version removes it as soon as it starts on the
+   host, so only the latest outcome stands. If a
    `.git` appears above the root while the rehearsal runs, a failure says
    so instead of reporting it as a regression, and you rehearse again. A
    rehearsal that fails in `/var/tmp` keeps its report, records and
@@ -352,17 +354,21 @@ recovery key, and signs locally whatever Actions may not:
    to run next. It exits non-zero until the release is published.
 3. Once the workflow has left the draft, `mise run release -- rehearse
    VERSION --from-draft` rehearses the in-app update to it, as
-   [Publishing](#publishing) describes. The build host downloads the draft itself and serves it in a file
-   feed under its published names, so the published build reads the same
-   metadata names, signatures and bridges it will read from GitHub. A pass
-   records the SHA-256 of the draft's own metadata, which names every file's
-   digest.
+   [Publishing](#publishing) describes. It refuses while the tag's workflow
+   run is still going, or if it did not succeed. The build host downloads the
+   draft itself, so `gh` there must be logged in with access to the
+   repository's drafts (push access). It serves the draft in a file feed under
+   its published names, so the published build reads the same metadata names,
+   signatures and bridges it will read from GitHub. A pass records the
+   SHA-256 of the draft's own metadata, which names every file's digest, and
+   the release it updated from.
 4. `mise run release -- publish VERSION --actions` again reads that record
    from the build host and, after you type the version (or with `--yes`),
-   runs `scripts/publish-release --promote SHA256`. It downloads the draft,
-   repeats every check on it except the smoke install, which the workflow
-   ran, and compares what it serves under the older generations' names with
-   what the bridge release publishes. It refuses unless the draft's metadata
+   runs `scripts/publish-release --promote SHA256`. It refuses if the newest
+   published release is no longer the one the rehearsal updated from. It
+   downloads the draft, repeats every check on it except the smoke install,
+   which the workflow ran, and compares what it serves under the older
+   generations' names with what the bridge release publishes. It refuses unless the draft's metadata
    has the rehearsed digest and its assets are unchanged since it read
    them, then publishes the draft and lands the next version's bump as
    `publish` does. With no passing rehearsal of that draft it refuses and

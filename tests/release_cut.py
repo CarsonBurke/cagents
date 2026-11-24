@@ -68,7 +68,10 @@ case "$1 $2" in
     "pr list") cat "$FIXTURE/open-pr" 2>/dev/null ;;
     "release view")
         if [[ " $* " == *" tagName "* ]]; then cat "$FIXTURE/published" 2>/dev/null || echo v0.2.3
+        elif [[ -e $FIXTURE/view-fails ]]; then echo "HTTP 502: Bad Gateway" >&2; exit 1
         else cat "$FIXTURE/release-draft" 2>/dev/null; fi ;;
+    "run list") cat "$FIXTURE/runs" 2>/dev/null \
+        || echo '[{"status": "completed", "conclusion": "success", "url": "https://github.com/CarsonBurke/cagents/actions/runs/1"}]' ;;
     "release download")
         version=${3#v} patterns=()
         while (($#)); do [[ $1 == -D ]] && directory=$2; [[ $1 == -p ]] && patterns+=("$2"); shift; done
@@ -776,7 +779,8 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), self.fix)
         self.assertIn("Something people asked for", result.stdout)
-        self.assertIn("scripts/release publish 0.2.4 --actions", result.stdout)
+        self.assertIn("scripts/release publish 0.2.4 --actions\n  scripts/release rehearse 0.2.4 --from-draft\n"
+                      "  scripts/release publish 0.2.4 --actions", result.stdout)
         self.assertFalse((self.root / "bundles/0.2.4").exists())
         self.assertFalse(any(line.startswith("ssh-keygen") for line in self.log("calls.log")))
         # Actions signs; a local key has no place in it.
@@ -851,8 +855,50 @@ class ReleaseCut(unittest.TestCase):
         # The pass names the metadata it updated to, as the draft serves it.
         digest = hashlib.sha256((draft / "release-metadata-2.json").read_bytes()).hexdigest()
         passed = (self.host / ".cache/cagents-release-rehearsal/passed-0.2.4.txt").read_text().splitlines()
-        self.assertEqual(passed[0], f"Rehearsed metadata: sha256 {digest}")
+        self.assertEqual(passed[:2], [f"Rehearsed metadata: sha256 {digest}", "Rehearsed from: 0.2.3"])
         self.assertIn("Outcome: PASS", passed)
+        self.assertIn(f"run list -R CarsonBurke/cagents --workflow release.yml --branch v0.2.4 --event push --limit 1 "
+                      f"--json status,conclusion,url", self.log("gh.log"))
+
+    def test_a_draft_is_rehearsed_only_once_the_workflow_has_finished_it(self):
+        self.drafted()
+        runs = self.root / "runs"
+        url = "https://github.com/CarsonBurke/cagents/actions/runs/7"
+        for run, said in ((f'[{{"status": "in_progress", "conclusion": "", "url": "{url}"}}]',
+                           f"the release workflow run of v0.2.4 is still in_progress: its draft is not finished yet ({url})"),
+                          (f'[{{"status": "completed", "conclusion": "failure", "url": "{url}"}}]',
+                           f"the release workflow run of v0.2.4 ended failure, so its draft may be incomplete or "
+                           f"unverified; rerun its failed jobs ({url})"),
+                          ("[]", "no release workflow run of v0.2.4 is found")):
+            runs.write_text(run)
+            for command in (("rehearse", "0.2.4", "--from-draft"), ("publish", "0.2.4", "--actions", "--yes")):
+                result = self.release(*command)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(said, result.stderr)
+        self.assertEqual(self.log("rehearse.log"), [])
+        self.assertFalse(any(line.startswith("publish-release") for line in self.log("calls.log")))
+
+    def test_draft_metadata_of_another_version_or_commit_is_not_rehearsed(self):
+        draft = self.drafted()
+        metadata = draft / "release-metadata-2.json"
+        original = json.loads(metadata.read_text())
+        for changed in ({"version": "0.2.5"}, {"source_commit": self.fix}):
+            metadata.write_text(json.dumps(original | changed))
+            result = self.release("rehearse", "0.2.4", "--from-draft")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"release-metadata-2.json is not 0.2.4's from {self.git('rev-parse', 'v0.2.4^{commit}')}",
+                          result.stderr)
+        self.assertEqual(self.log("rehearse.log"), [])
+
+    def test_the_state_of_the_release_is_read_not_guessed(self):
+        self.drafted()
+        (self.root / "view-fails").touch()
+        for command in (("rehearse", "0.2.4", "--from-draft"), ("publish", "0.2.4", "--actions", "--yes")):
+            self.assertIn("cannot read the release v0.2.4 on GitHub: HTTP 502: Bad Gateway", self.release(*command).stderr)
+        (self.root / "view-fails").unlink()
+        (self.root / "release-draft").write_text("false\n")
+        self.assertIn("v0.2.4 is published already; there is no draft to rehearse",
+                      self.release("rehearse", "0.2.4", "--from-draft").stderr)
 
     def test_publish_in_actions_publishes_the_draft_only_once_its_rehearsal_passed(self):
         draft = self.drafted()
@@ -863,6 +909,11 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(self.release("rehearse", "0.2.4", "--from-draft").returncode, 0)
         self.assertIn("not published", self.release("publish", "0.2.4", "--actions", stdin="0.2.3\n").stderr)
         self.assertFalse(any(line.startswith(("publish-release", "land-pr")) for line in self.log("calls.log")))
+        # A release published since makes it an update from something else.
+        (self.root / "published").write_text("v0.2.2\n")
+        self.assertIn("was rehearsed updating from 0.2.3, but the newest published release is now 0.2.2; "
+                      "rehearse it again", self.release("publish", "0.2.4", "--actions", "--yes").stderr)
+        (self.root / "published").unlink()
         result = self.release("publish", "0.2.4", "--actions", "--yes")
         self.assertEqual(result.returncode, 0, result.stderr)
         digest = hashlib.sha256((draft / "release-metadata-2.json").read_bytes()).hexdigest()

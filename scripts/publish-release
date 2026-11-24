@@ -29,11 +29,12 @@ usage() {
         '       scripts/publish-release --version VERSION --promote SHA256 [--bridge DIR]' \
         'Validate an existing local bundle and publish it through authenticated gh.' \
         '--draft uploads and verifies it as a draft release, and publishes nothing.' \
-        '--promote publishes that draft: it downloads it, verifies it as a bundle again, and requires' \
-        "its own trust generation's metadata to have SHA256, the digest of the metadata a passing rehearsal updated to." \
+        "--promote SHA256 publishes VERSION's existing draft, uploading nothing: it downloads the draft, verifies it" \
+        "again as a bundle, and requires its own trust generation's metadata to have the SHA-256 digest SHA256," \
+        'which a passing rehearsal of the draft records.' \
         'Defaults: version from Cargo manifests; dist from CAGENTS_DIST_DIR or checkout/dist.' \
         '--verify-only validates local files and the local tag without network access.' \
-        'Except --promote, whose draft was, they install/run/remove artifacts in private offline rootfs copies first.' \
+        'Every mode but --promote, whose draft was smoke-tested before it was left, installs/runs/removes artifacts in private offline rootfs copies first.' \
         '--smoke-rootfs overrides the runtime image prepared by the local release builder.' \
         "Older trust generations' metadata names carry the metadata of the release that began the next generation:" \
         '--verify-only reads those files, as published, from --bridge DIR; publication downloads them and compares any --bridge.' \
