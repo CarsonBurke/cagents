@@ -1212,6 +1212,28 @@ fn stopped_provider_keeps_its_semantic_journal_until_outcome_and_loss_ack() {
 }
 #[test]
 fn legacy_daemon_drains_outcomes_and_retires_with_pending_attention_clears() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    const CHILD: &str = "CAGENTS_LEGACY_ATTENTION_RETIREMENT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let test = thread::current().name().unwrap().to_owned();
+        let output = ChildCommand::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, "1")
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     #[derive(Deserialize)]
     struct LegacyEntry {
         sequence: u64,
