@@ -195,7 +195,7 @@ pub fn transcript(config: &Path, cwd: &Path, id: &str) -> Result<PathBuf, String
 /// changing the selected conversation.
 #[cfg(any(feature = "ui", feature = "host"))]
 #[derive(Debug)]
-pub(crate) enum TranscriptError {
+pub enum TranscriptError {
     Invalid(String),
     Unavailable(String),
 }
@@ -210,7 +210,7 @@ impl std::fmt::Display for TranscriptError {
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn transcript_for_start(
+pub fn transcript_for_start(
     config: &Path,
     cwd: &Path,
     id: &str,

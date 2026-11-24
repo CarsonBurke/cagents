@@ -1690,7 +1690,7 @@ mod magic {
 
 /// Whether native notifications can cover external writes to this directory.
 #[cfg(feature = "host")]
-pub(crate) fn reliable_filesystem_events(path: &Path) -> bool {
+pub fn reliable_filesystem_events(path: &Path) -> bool {
     !Filesystem::of(path).is_ok_and(Filesystem::omits_events)
 }
 

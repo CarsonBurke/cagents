@@ -10,9 +10,10 @@ mod claude;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub use claude::transcript as claude_transcript;
 #[cfg(feature = "host")]
-pub(crate) use claude::{
-    TranscriptError as ClaudeTranscriptError, transcript_exists as claude_transcript_exists,
-    transcript_for_start as claude_transcript_for_start,
+pub(crate) use claude::transcript_exists as claude_transcript_exists;
+#[cfg(feature = "host")]
+pub use claude::{
+    TranscriptError as ClaudeTranscriptError, transcript_for_start as claude_transcript_for_start,
 };
 mod codex;
 #[cfg(feature = "host")]

@@ -1212,7 +1212,7 @@ impl Handle {
             // published budget here without reading the credentials for a
             // request that cannot run.
             if checked_hosts.insert(authority.clone())
-                && let Some(limit) = polling::rate_limit_for(&authority, "graphql")
+                && let Some(limit) = polling::rate_limit(&authority)
             {
                 limited.insert(authority.clone(), limit);
             }
