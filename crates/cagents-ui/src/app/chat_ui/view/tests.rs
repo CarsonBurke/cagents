@@ -12003,7 +12003,9 @@ fn file_change_review_fits_narrow_and_wide_panes_and_names_delegated_proposals()
         for expected in [
             "Files changed",
             "Proposed edit",
-            "Subagent: child",
+            // An agent the conversation does not list is named only as a
+            // subagent: its ID is not a name to show.
+            "Subagent",
             "pending",
             "from src/old.rs",
             "Close",
@@ -12013,6 +12015,10 @@ fn file_change_review_fits_narrow_and_wide_panes_and_names_delegated_proposals()
                 "{width}: missing {expected}: {labels:?}"
             );
         }
+        assert!(
+            !labels.iter().any(|label| label.contains("child")),
+            "{width}: {labels:?}"
+        );
         assert!(
             !labels.iter().any(|label| label == "Open file"),
             "unresolved child-relative paths must not route to the parent"

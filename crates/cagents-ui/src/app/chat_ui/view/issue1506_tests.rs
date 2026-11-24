@@ -1653,6 +1653,83 @@ fn report_surface(runtime: &Runtime, id: &str) -> ReportSurface {
     result
 }
 
+/// The action of the message's own Copy, the one every message in the
+/// timeline offers among the actions beneath it, as a click on it sends.
+fn message_copy_action(runtime: &Runtime, id: &str) -> Action {
+    let item = runtime.active_item(id).expect("current delivery source");
+    let mut footer = runtime.message_copy(item);
+    let renderer = crate::app::tests::headless_renderer();
+    let mut tree = Tree::new(footer.as_widget());
+    let size = iced::Size::new(520.0, 100.0);
+    let node = footer.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, size),
+    );
+    let accessible =
+        footer
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    let bounds = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .find(|node| node.node().label() == Some("Copy this message"))
+        .expect("the message's actions include Copy")
+        .node()
+        .bounds()
+        .unwrap();
+    let cursor = iced::mouse::Cursor::Available(iced::Point::new(
+        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+    ));
+    let mut messages = Vec::new();
+    for event in [
+        iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+        iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+    ] {
+        footer.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Mouse(event),
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut iced::advanced::Shell::new(&mut messages),
+            &iced::Rectangle::with_size(size),
+        );
+    }
+    assert_eq!(messages.len(), 1);
+    let Message::ChatUi(action) = messages.pop().unwrap() else {
+        panic!("Copy must dispatch a chat action");
+    };
+    action
+}
+
+/// No bespoke copy button sits in a delivery's body: copying is the
+/// message's own Copy, among its actions.
+fn assert_no_body_copy_button(surface: &ReportSurface) {
+    assert!(
+        !surface.text.iter().any(|text| text.starts_with("Copy ")),
+        "{:?}",
+        surface.text
+    );
+}
+
+/// The provider's address for a delivery's sender is never drawn.
+fn assert_no_sender_address(surface: &ReportSurface, address: &str) {
+    assert!(
+        !surface
+            .text
+            .iter()
+            .chain(&surface.accessible)
+            .any(|text| text.contains(address) || text.starts_with("Sender")),
+        "{:?} / {:?}",
+        surface.text,
+        surface.accessible
+    );
+}
+
 #[test]
 fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy() {
     use iced::futures::StreamExt;
@@ -1703,7 +1780,7 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .contains(&format!("Show delivery details: {heading}"))
         );
         // A closed report is a line of the timeline, like a closed step: its
-        // message actions come with its detail, and Copy still publishes the
+        // message actions come with its detail, and their Copy publishes the
         // original bytes below.
         assert!(
             !surface.accessible.contains(&"Copy this message".to_owned()),
@@ -1730,10 +1807,8 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
             "a name too long for the pane keeps the room its outcome would take, \
              and the outcome is still read in the row's accessible name"
         );
-        assert!(
-            !surface.text.iter().any(|text| text == "Copy report"),
-            "closed reports use the message footer Copy action"
-        );
+        assert_no_body_copy_button(&surface);
+        assert_no_sender_address(&surface, "task-report-sender");
         let marker = body.lines().next().unwrap();
         assert!(
             !surface
@@ -1743,10 +1818,11 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .any(|text| text.contains(marker)),
             "even short report bodies stay behind the disclosure"
         );
+        let copy = message_copy_action(&runtime, "task-report");
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-        let copy = app.handle_chat_ui(Action::Copy(target, "task-report".into(), CopyPart::Text));
+        let copy = app.handle_chat_ui(copy);
         let copied = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -1763,7 +1839,7 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                             return contents;
                         }
                     }
-                    panic!("Copy report must publish original bytes");
+                    panic!("the message's Copy must publish the original bytes");
                 })
                 .await
                 .expect("bounded clipboard effect")
@@ -1924,8 +2000,12 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
                     .count(),
                 1
             );
-            assert!(surface.text.iter().any(|text| text == "Copy report"));
+            // Open, the report carries the message's actions, whose Copy is
+            // the only one: no button of its own repeats it in the body, and
+            // the sender's address is not shown.
             assert!(surface.accessible.contains(&"Copy this message".to_owned()));
+            assert_no_body_copy_button(&surface);
+            assert_no_sender_address(&surface, "task-report-sender");
             assert!(
                 surface.text.iter().any(|text| text.contains(needle)),
                 "the late body match must actually be rendered"
@@ -1975,8 +2055,8 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
                 Some(format!("{heading}\n\n{body}"))
             );
         }
-        // The full opaque sender is indexed even when its suffix is absent
-        // from the compact/full heading and the report body.
+        // The sender's opaque address is not shown, so Find neither matches
+        // it nor opens the report to reveal it.
         let sender_suffix = "report-sender";
         assert!(!heading.contains(sender_suffix) && !body.contains(sender_suffix));
         drop(find_navigation::find_for_test(
@@ -1986,37 +2066,14 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
         ));
         let live = app.chat_runtime_mut(target).unwrap();
         preparation::drain_fixture(live);
-        assert!(!live.find_matches.is_empty());
-        assert!(
-            live.item_expanded("disclosed-report"),
-            "metadata Find must reveal the matching report"
-        );
-        let metadata = report_surface(live, "disclosed-report");
-        assert!(
-            metadata
-                .text
-                .iter()
-                .any(|text| text == "Sender: task-report-sender"),
-            "the indexed opaque sender suffix must actually be visible"
-        );
-        assert_eq!(
-            copy_text(CopyPart::Text, &original.content),
-            Some(format!("{heading}\n\n{body}"))
-        );
-        drop(app.handle_chat_ui(Action::CloseFind(target)));
-        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(live.find_matches.is_empty());
         assert!(!live.item_expanded("disclosed-report"));
+        assert_no_sender_address(&report_surface(live, "disclosed-report"), sender_suffix);
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(
-            live.presentation_cache()["disclosed-report"]
-                .markdown
-                .items()
-                .is_empty()
-        );
-        assert!(
-            !report_surface(live, "disclosed-report")
-                .text
-                .iter()
-                .any(|text| text.contains(sender_suffix))
+            !app.chat_runtime_mut(target)
+                .unwrap()
+                .item_expanded("disclosed-report")
         );
 
         // Search restores its own temporary disclosure, never a reader's
@@ -2107,58 +2164,15 @@ fn a_find_keystroke_searches_once_and_revisits_only_the_reports_it_revealed() {
     );
 }
 
+/// An open report or message shows what was delivered, not the provider's
+/// address for whoever sent it, and Find does not match that address.
 #[test]
-fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable() {
-    use iced::advanced::{
-        Layout, layout,
-        widget::{Operation, Tree},
-    };
+fn open_deliveries_show_no_sender_address() {
     const BODY: &str = "Readable delivered body with the original contents preserved.";
-    const SENDER: &str = "opaque-transcript-sender-7f31";
-    #[derive(Default)]
-    struct Paragraphs {
-        sender: Option<iced::Rectangle>,
-        body: Option<iced::Rectangle>,
-    }
-    impl Operation for Paragraphs {
-        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-            visit(self);
-        }
-        fn custom(
-            &mut self,
-            _: Option<&widget::Id>,
-            bounds: iced::Rectangle,
-            state: &mut dyn std::any::Any,
-        ) {
-            let Some(text) = state.downcast_ref::<selectable_prose::State>() else {
-                return;
-            };
-            if text.plain.as_ref() == format!("Sender: {SENDER}") {
-                assert_eq!(
-                    text.mounted_typography(),
-                    Some((iced::Font::default(), design::TEXT_CAPTION.into())),
-                    "sender metadata uses the regular caption face"
-                );
-                let spans = text.spans.as_ref().expect("mounted sender spans");
-                assert!(spans.iter().all(|span| {
-                    span.font.unwrap_or_default() == iced::Font::default()
-                        && span.size.unwrap_or(design::TEXT_CAPTION.into())
-                            == design::TEXT_CAPTION.into()
-                        && span.color == Some(design::muted_color(&cosmic::theme::active()))
-                }));
-                assert_eq!(text.copied(0..text.plain.len()), text.plain.as_ref());
-                assert!(text.target.is_some(), "metadata stays selectable");
-                self.sender = Some(bounds);
-            } else if text.plain.as_ref() == BODY {
-                self.body = Some(bounds);
-            }
-        }
-    }
-
-    let renderer = crate::app::tests::headless_renderer();
+    const SENDER: &str = "a404930e4df62e728";
     for kind in [chat::DeliveryKind::Report, chat::DeliveryKind::Message] {
         let delivered = chat::Item {
-            id: "sender-metadata".into(),
+            id: "sender-address".into(),
             role: Role::User,
             at: None,
             started_at: None,
@@ -2180,53 +2194,25 @@ fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable(
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
         drop(app.handle_chat_ui(Action::Toggle(target, delivered.id.clone())));
-        for searching in [false, true] {
-            if searching {
-                drop(find_navigation::find_for_test(
-                    &mut app,
-                    target,
-                    SENDER.into(),
-                ));
-            }
-            let live = app.chat_runtime_mut(target).unwrap();
-            preparation::drain_fixture(live);
-            assert!(live.item_expanded(&delivered.id));
-            if searching {
-                assert!(
-                    !live.find_matches.is_empty(),
-                    "Find retains the opaque sender"
-                );
-            }
-            for width in [275.0, 960.0] {
-                let mut element = live.delivery_view(
-                    &delivered,
-                    &live.presentation_cache()[&delivered.id],
-                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
-                );
-                let mut tree = Tree::new(element.as_widget());
-                let node = element.as_widget_mut().layout(
-                    &mut tree,
-                    &renderer,
-                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 4_000.0)),
-                );
-                let mut paragraphs = Paragraphs::default();
-                element.as_widget_mut().operate(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &mut paragraphs,
-                );
-                let sender = paragraphs.sender.expect("expanded selectable sender");
-                let body = paragraphs.body.expect("expanded delivered body");
-                assert!(
-                    (sender.x - body.x).abs() < 0.1,
-                    "kind={kind:?}, width={width}"
-                );
-                assert!((sender.x - step::GAP_M).abs() < 0.1);
-                assert!(sender.y + sender.height <= body.y);
-                assert!(sender.x + sender.width <= node.size().width + 0.1);
-            }
-        }
+        let live = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(live);
+        assert!(live.item_expanded(&delivered.id));
+        let surface = report_surface(live, &delivered.id);
+        assert!(
+            surface.text.iter().any(|text| text == BODY),
+            "kind={kind:?}: {:?}",
+            surface.text
+        );
+        assert_no_sender_address(&surface, SENDER);
+        assert_no_body_copy_button(&surface);
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            SENDER.into(),
+        ));
+        let live = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(live);
+        assert!(live.find_matches.is_empty(), "kind={kind:?}");
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(
             app.chat_runtime_mut(target)
@@ -2235,6 +2221,51 @@ fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable(
             "closing Find preserves the reader's explicit disclosure"
         );
     }
+}
+
+/// A report whose provider named its sender only by an ID, with no summary,
+/// is headed by the agent's name where this conversation lists the agent,
+/// and otherwise as another agent's; the ID is never the heading.
+#[test]
+fn a_report_without_a_summary_names_its_agent_not_its_id() {
+    const SENDER: &str = "a17925ac2cee519e2";
+    let mut report = task_report("unsummarized", String::new(), "Done.".into());
+    if let ItemContent::Delivery { sender, .. } = &mut report.content {
+        *sender = SENDER.into();
+    }
+    let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&report));
+    let surface = report_surface(&runtime, "unsummarized");
+    assert!(
+        surface
+            .text
+            .iter()
+            .any(|text| text == "Report from another agent"),
+        "{:?}",
+        surface.text
+    );
+    assert_no_sender_address(&surface, &SENDER[..8]);
+
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.generation += 1;
+    let mut agent = child(SENDER, ToolStatus::Succeeded, false);
+    agent.description = "Build and install the app".into();
+    snapshot.subagents = vec![agent];
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    let named = runtime
+        .listed_agent_name(SENDER)
+        .expect("the agent is listed");
+    assert!(!named.contains(&SENDER[..8]), "{named}");
+    let surface = report_surface(&runtime, "unsummarized");
+    assert!(
+        surface
+            .text
+            .iter()
+            .any(|text| *text == format!("Report from {named}")),
+        "{:?}",
+        surface.text
+    );
+    assert_no_sender_address(&surface, &SENDER[..8]);
 }
 
 #[test]

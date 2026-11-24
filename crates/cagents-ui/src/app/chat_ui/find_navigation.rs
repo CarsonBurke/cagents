@@ -1406,18 +1406,13 @@ fn contains_checked(
         ItemContent::Image {
             path, description, ..
         } => texts.extend([path.as_str(), description.as_str()]),
+        // Its sender's address is not shown, so it is not a match either.
         ItemContent::Delivery {
             from,
-            sender,
             summary,
             body,
             ..
-        } => texts.extend([
-            from.as_str(),
-            sender.as_str(),
-            summary.as_str(),
-            body.as_str(),
-        ]),
+        } => texts.extend([from.as_str(), summary.as_str(), body.as_str()]),
     }
     for text in texts {
         if matches_checked(text, pattern, current)? {
@@ -1939,13 +1934,11 @@ fn small_raw_work(runtime: &Runtime) -> bool {
             }
             ItemContent::Delivery {
                 from,
-                sender,
                 summary,
                 body,
                 ..
             } => {
                 add(from);
-                add(sender);
                 add(summary);
                 add(body);
             }
