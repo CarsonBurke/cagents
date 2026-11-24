@@ -2,6 +2,7 @@
 """Exercise Zig discovery before any Cargo build, and the decision to skip an
 up-to-date build, without building the app."""
 
+import fcntl
 import importlib.util
 import os
 from pathlib import Path
@@ -124,6 +125,8 @@ exit 83
         self.env.update(
             PATH=f"{fake_bin}:{shim.parent}:/usr/bin:/bin",
             HOME=str(self.home), XDG_DATA_HOME=str(self.xdg),
+            XDG_STATE_HOME=str(self.home / ".local/state"),
+            XDG_CACHE_HOME=str(self.home / ".cache"),
             SHIM_CALLS=str(self.shim_calls), CARGO_CALLS=str(self.cargo_calls),
             # The runner builds through the gate; keep it off the host's locks.
             CAGENTS_BUILD_LOCK=str(self.root / "cargo.lock"),
@@ -1284,6 +1287,10 @@ while [ "$#" -gt 0 ]; do
         stop) rm -f "$sessions/$session"; exit 0 ;;
         start)
             # Started as the runner names it, with a fresh runtime.
+            if [ "${{CHECK_STORAGE_LOCK:-}}" = yes ] && flock -n "$XDG_STATE_HOME" true; then
+                echo 'runner did not hold a shared storage lock during launch' >&2
+                exit 1
+            fi
             while [ "$1" != --name ]; do shift; done
             mkdir -p "$sessions/$2.runtime"
             printf 'live %s\n' "$sessions/$2.runtime" >"$sessions/$2"
@@ -1598,6 +1605,95 @@ exit 1
                 self.assertTrue((root / f"cagents-development-{kept}").exists(), kept)
             self.assertTrue((root / "cagents-development").exists())
             self.assertTrue((root / "cagents-other").exists())
+
+    def storage_file(self, root, path, age_days=31):
+        file = root / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("fixture")
+        timestamp = time.time() - age_days * 86400
+        os.utime(file, (timestamp, timestamp))
+        return file
+
+    def test_default_gc_sweeps_old_generated_storage_and_preserves_sessions(self):
+        state = self.root / "state/cagents-development-unused"
+        cache = self.root / "cache/cagents-development-unused"
+        data = self.xdg / "cagents-development-unused"
+        config = self.root / "config/cagents-development-unused"
+        discarded = [self.storage_file(root, name) for root, name in (
+            (state, "run-development.log"), (state, "diagnostics/cagentsd.0.jsonl"),
+            (cache, "resume-catalog"), (cache, "chat-pasted-images/paste-image.png"),
+            (cache, "github-avatars/github.com-owner.image"), (cache, "account-usage.json"),
+        )]
+        kept = [self.storage_file(root, name, age) for root, name, age in (
+            (data, "session.sqlite", 31), (data, "accounts/provider/projects/transcript.jsonl", 31),
+            (config, "settings.toml", 31), (state, "notes.txt", 31),
+            (state, "diagnostics/export.json", 31), (state, "diagnostics/cagentsd.lock", 31),
+            (cache, "resume-catalog.user-copy", 31), (cache, "account-usage.lock", 31),
+            (cache, "chat-pasted-images/my-picture.png", 31),
+            (cache, "github-avatars/github.com-recent.image", 29),
+            (self.root / "cache/cagents-development", "resume-catalog", 31),
+            (self.root / "cache/cagents-development-cached", "resume-catalog", 31),
+            (self.root / "cache/cagents-development-running", "resume-catalog", 31),
+            (self.root / "cache/cagents-development-starting", "resume-catalog", 31),
+        )]
+        self.storage_file(self.root / "state/cagents-development-cached", "run-development.log", 1)
+        self.session("starting", state="dead")
+        process = subprocess.Popen(["sleep", "infinity"], env={"CAGENTS_DEVELOPMENT_INSTANCE": "running"})
+        self.addCleanup(lambda: (process.kill(), process.wait()))
+        linked = self.root / "cache/cagents-development-linked"
+        linked.symlink_to(data, target_is_directory=True)
+        link = cache / "chat-pasted-images/paste-link.png"
+        link.symlink_to(kept[0])
+        empty = self.root / "cache/cagents-development-empty"
+        empty.mkdir()
+
+        result = self.run_runner("--gc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for file in discarded:
+            self.assertFalse(file.exists(), file)
+        for file in kept:
+            self.assertTrue(file.exists(), file)
+        self.assertFalse(empty.exists())
+        self.assertTrue(linked.is_symlink())
+        self.assertTrue(link.is_symlink())
+
+    def test_named_launch_sweeps_old_cache_even_before_any_runner_logs_exist(self):
+        file = self.storage_file(self.root / "cache/cagents-development-old", "prompt-cache.json")
+        result = self.run_runner("--browserless", "--instance", "new", "--keep", CHECK_STORAGE_LOCK="yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(file.parent.exists())
+
+    def test_storage_gc_preserves_a_mounted_instance_directory(self):
+        file = self.storage_file(self.root / "cache/cagents-development-mounted", "prompt-cache.json")
+        timestamp = time.time() - 31 * 86400
+        os.utime(file.parent, (timestamp, timestamp))
+        mountpoint = self.root / "bin/mountpoint"
+        mountpoint.write_text('''#!/bin/sh
+if [ "$3" = "$FAKE_MOUNTPOINT" ]; then exit 0; fi
+exec /usr/bin/mountpoint "$@"
+''')
+        mountpoint.chmod(0o755)
+        for arguments in (["--gc"], ["--gc", "--storage", "7"]):
+            with self.subTest(arguments=arguments):
+                result = self.run_runner(*arguments, FAKE_MOUNTPOINT=str(file.parent))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(file.exists())
+
+    def test_gc_checks_for_a_launch_in_progress_before_discarding_storage(self):
+        file = self.storage_file(self.root / "cache/cagents-development-old", "prompt-cache.json")
+        state = self.root / "state"
+        state.mkdir()
+        fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            result = self.run_runner("--gc")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(file.exists())
+        finally:
+            os.close(fd)
+        result = self.run_runner("--gc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(file.parent.exists())
 
     def test_lifetime_options_are_checked_before_anything_runs(self):
         for arguments, message in (
