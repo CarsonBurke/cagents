@@ -107,8 +107,14 @@ for _ in 1 2 3 4 5 6 7 8; do
     composer=$(printf '%s\n' "$observed" | grep -E 'Message' | tail -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
+    # Where the hint cannot be read, the composer's input sits at a fixed place
+    # in the window, whose size observe reports on its "window" line (an
+    # older driver reported it as "output="). The point left of centre and
+    # above the footer is inside the input, clear of the Stop control.
     [ -n "$composer" ] || composer=$(printf '%s\n' "$observed" |
-        sed -nE 's/.*output=([0-9]+)x([0-9]+).*/\1 \2/p' | awk '{printf "%d,%d", $1 * 0.65, $2 - 67}')
+        sed -nE -e 's/.*output=([0-9]+)x([0-9]+).*/\1 \2/p' \
+            -e "s/^ *window .* ([0-9]+)x([0-9]+)$/\1 \2/p" | head -1 |
+        awk '{printf "%d,%d", $1 * 0.45, $2 - 86}')
     break
 done
 if [ -z "$composer" ]; then

@@ -154,10 +154,10 @@ fn a_group_counts_on_while_the_agent_thinks_and_stops_when_it_is_done() {
     assert!(runtime.turns[0].running, "thinking is work still going on");
     let shown = texts(&runtime, &mut None);
     assert!(
-        shown.iter().any(|text| text == "Ran 2 commands · working"),
+        shown.iter().any(|text| text == "Ran 2 commands"),
         "{shown:?}"
     );
-    assert_eq!(runtime.turns[0].summary, "Ran 2 commands · working");
+    assert_eq!(runtime.turns[0].summary, "Ran 2 commands");
     // The same items once the agent has stopped: only the busy state moved.
     publish(&mut runtime, false);
     assert!(!runtime.turns[0].running);
@@ -180,9 +180,7 @@ fn a_lone_command_followed_by_thinking_counts_on_as_its_group() {
     preparation::drain_fixture(&mut runtime);
     let shown = texts(&runtime, &mut None);
     assert!(
-        shown
-            .iter()
-            .any(|text| text == "Ran cargo test c1 · working"),
+        shown.iter().any(|text| text == "Ran cargo test c1"),
         "the strip says the group is still working: {shown:?}"
     );
 }
@@ -261,7 +259,7 @@ fn a_lone_step_becomes_its_strip_and_back_without_moving_the_transcript() {
     assert!(
         thinking
             .iter()
-            .any(|(text, ..)| text == "Ran cargo test c1 · working"),
+            .any(|(text, ..)| text == "Ran cargo test c1"),
         "{thinking:?}"
     );
     let (lone_y, lone_height, lone_below) = rows(&lone);
