@@ -180,14 +180,21 @@ steps, each through `mise run release` (`scripts/release --help`):
      serve, the windows to reopen on NEW, and no reopened window to show
      "Update failed" or "Update not installed".
 
-   In the app the published build's worker writes the update's status, and a
-   worker older than the cut can record Failed for an update the cut's
-   windows accept, so the status is printed but the windows decide. With
-   `--staged` it instead runs the cut's own staged `cagents daemon upgrade`,
-   which needs no signature, and the update must end `Complete` with no
-   refusal. A rehearsal that does not pass leaves its report, records and
-   screenshots in `/var/tmp/cr/release-VERSION` on the host, until the next
-   rehearsal of that version replaces them.
+   Either way the update must end `Complete` with no refusal. A reopened
+   window reports anything else as "Update failed" or "Update not installed",
+   even when the work survived. In the app it is the published build's worker
+   that writes that status, so a worker that refuses the cut's protocol after
+   a good install fails the rehearsal (#3877). With `--staged` it instead runs
+   the cut's own staged `cagents daemon upgrade`, which needs no signature.
+
+   The rehearsal's private user goes in `/var/tmp/cr/release-VERSION` on the
+   host. If `/var/tmp` has a `.git` above it, such as the empty mountpoints
+   a sandbox masking `.git` leaves behind, it goes in `/dev/shm/cr` instead.
+   It takes about 700 MB and is removed once the rehearsal passes. A
+   rehearsal that fails in `/var/tmp` keeps its report, records and
+   screenshots there until the next rehearsal of that version replaces them.
+   One that fails in `/dev/shm`, which is memory, keeps only its report and
+   screenshots, in `~/.cache/cagents-release-rehearsal/failed-VERSION`.
 3. `mise run release -- publish VERSION` asks you to type the version, then
    runs `scripts/publish-release --push-tag`. It checks the signature against
    the keys the tag lists, the metadata against every asset, the checksums,

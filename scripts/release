@@ -9,8 +9,14 @@ BUILD_HOST=${CAGENTS_RELEASE_BUILD_HOST:-fw16}
 BUNDLES=${CAGENTS_RELEASE_BUNDLES:-"${XDG_STATE_HOME:-$HOME/.local/state}/cagents-release"}
 GITHUB_REPOSITORY=${CAGENTS_RELEASE_GITHUB_REPOSITORY:-CarsonBurke/cagents}
 # The rehearsal's private user on the build host; by default
-# /var/tmp/cr/release-VERSION, short as its sockets need.
+# PARENT/release-VERSION, short as its sockets need, in the first of these
+# parents with no .git above it. A sandbox that masks .git in its writable
+# roots leaves empty .git mountpoints in /var/tmp, under which the harness
+# refuses to run; /dev/shm is memory, so a failed rehearsal there keeps only
+# its report and screenshots.
 REHEARSAL_ROOT=${CAGENTS_RELEASE_REHEARSAL_ROOT:-}
+# Separated by colons, as ssh splits its arguments at spaces.
+REHEARSAL_PARENTS=${CAGENTS_RELEASE_REHEARSAL_PARENTS:-/var/tmp/cr:/dev/shm/cr}
 VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 # Workspace members that carry the product version.
 MANIFESTS=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
@@ -550,7 +556,8 @@ rehearse() {
     [[ $previous =~ $VERSION_PATTERN && $previous != "$VERSION" \
         && $(printf '%s\n%s\n' "$previous" "$VERSION" | sort -V | tail -n1) == "$VERSION" ]] \
         || fail "the newest published release is $previous, not older than $VERSION; there is nothing to rehearse"
-    root=${REHEARSAL_ROOT:-/var/tmp/cr/release-$VERSION}
+    # ssh would drop an empty argument.
+    root=${REHEARSAL_ROOT:--}
     printf 'Rehearsing the %s update from %s to %s on %s; it takes a few minutes.\n' \
         "$mode" "$previous" "$VERSION" "$BUILD_HOST"
     started=$SECONDS
@@ -559,7 +566,7 @@ rm -rf -- ~/.cache/cagents-release-rehearsal/cut-"$2" && mkdir -p -- ~/.cache/ca
 HOST
     scp -q -- "${files[@]}" "$BUILD_HOST:.cache/cagents-release-rehearsal/cut-$VERSION/" \
         || fail "cannot copy the cut to $BUILD_HOST"
-    on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" <<'HOST' \
+    on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" "$REHEARSAL_PARENTS" <<'HOST' \
         || fail "the rehearsal of $VERSION did not pass"
 # Parsed whole before it runs, so nothing it starts reads the rest of it.
 main() {
@@ -567,7 +574,17 @@ set -euo pipefail
 cd ~/"$1"
 local repository=$PWD sha=$2 version=$3 previous=$4 github=$5 root=$6 mode=$7 cache=~/.cache/cagents-release-rehearsal
 local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release status=0 update
-local feed=$cache/feed-$3 path=()
+local feed=$cache/feed-$3 path=() parents parent ancestor kept=
+if [[ $root == - ]]; then
+    root=
+    IFS=: read -ra parents <<<"$8"
+    for parent in "${parents[@]}"; do
+        ancestor=$parent
+        while [[ ! -e $ancestor/.git && ! -L $ancestor/.git && $ancestor != / ]]; do ancestor=$(dirname -- "$ancestor"); done
+        [[ -e $ancestor/.git || -L $ancestor/.git ]] || { root=$parent/release-$version; break; }
+    done
+    [[ -n $root ]] || { echo "release: each of ${parents[*]} has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT" >&2; exit 1; }
+fi
 exec 9>>"$cache/lock"
 flock -n 9 || { echo "release: another rehearsal is running on $HOSTNAME" >&2; exit 1; }
 (cd "$new" && sha256sum --check --strict --ignore-missing --quiet SHA256SUMS)
@@ -607,10 +624,9 @@ fi
     --ended-provider "${path[@]}" >/dev/null 9>&- || status=$?
 local report=$root/report.txt
 [[ ! -f $report ]] || sed -n '/^Total duration:/p;/^Outcome:/p;/^Regressions/,/^Steps/{/^Steps/d;p;}' "$report"
-# The update worker's own record. On the staged path that worker is the
-# cut's, and a failed or refused job is what reopened windows report as
-# "Update failed" or "Update not installed". In the app the published
-# build's worker writes it, and the harness judges the windows instead.
+# The update worker's own record: the cut's on the staged path, the
+# published build's in the app. A failed or refused job is what reopened
+# windows report as "Update failed" or "Update not installed".
 update=$(/usr/bin/python3 -I -c '
 import json, sys
 try:
@@ -619,11 +635,22 @@ try:
 except (OSError, ValueError):
     print("absent")' "$root/home/.local/share/cagents-install/.update/status.json")
 echo "Update status: $update"
-if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $mode == in-app || $update == Complete ]]; then
+# Either way a reopened window reports anything but Complete as a failed
+# or refused update, which is what the rehearsal must catch (#3877).
+if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == Complete ]]; then
     "$rehearse" --root "$root" cleanup >/dev/null \
         || echo "release: the rehearsal passed, but $root could not be removed" >&2
     git -C "$repository" worktree remove --force "$harness" || :
     rm -rf -- "$feed"
+elif [[ $root == /dev/shm/* ]]; then
+    # Memory: keep the report and screenshots, and free the rest.
+    kept=$cache/failed-$version
+    rm -rf -- "$kept" && mkdir -p -- "$kept"
+    cp -a -- "$report" "$kept/" 2>/dev/null || :
+    [[ ! -d $root/shots ]] || cp -a -- "$root/shots" "$kept/"
+    "$rehearse" --root "$root" cleanup >/dev/null || :
+    echo "release: its report and screenshots are in $kept on $HOSTNAME" >&2
+    exit 1
 else
     echo "release: its report, records and screenshots are in $root on $HOSTNAME" >&2
     exit 1

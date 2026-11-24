@@ -97,6 +97,7 @@ exit 0
 REHEARSE = r"""#!/bin/bash
 root=$2 command=$3
 echo "$0 $command ${*:4}" >> "$FIXTURE/rehearse.log"
+echo "$root" >> "$FIXTURE/rehearse-roots.log"
 case $command in
     cleanup) rm -rf "$root" ;;
     run)
@@ -440,26 +441,51 @@ class ReleaseCut(unittest.TestCase):
         commands = [line.split()[1] for line in self.log("rehearse.log")]
         self.assertEqual(commands, ["run", "cleanup", "run", "cleanup"])
 
-    def test_a_staged_rehearsal_whose_update_failed_or_was_refused_does_not_pass(self):
+    def test_a_rehearsal_whose_update_failed_or_was_refused_does_not_pass_either_way(self):
+        # Reopened windows would show "Update failed" or "Update not
+        # installed", whoever's worker wrote it: in the app, the published
+        # build's (#3877).
         self.cut_signed()
-        for status, shown in (('{"phase": "Failed"}', "Failed"),
-                              ('{"phase": "Failed", "refusal": {"kind": "busy"}}', "Failed refused"),
-                              ("", "absent")):
-            (self.root / "rehearse-status").write_text(status)
-            result = self.release("rehearse", "0.2.4", "--staged")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(f"Update status: {shown}\n", result.stdout)
-            self.assertIn(f"in {self.root / 'cr'}", result.stderr)
-            self.assertTrue((self.root / "cr/report.txt").exists())
+        for mode in ((), ("--staged",)):
+            for status, shown in (('{"phase": "Failed"}', "Failed"),
+                                  ('{"phase": "Failed", "refusal": {"kind": "busy"}}', "Failed refused"),
+                                  ("", "absent")):
+                (self.root / "rehearse-status").write_text(status)
+                result = self.release("rehearse", "0.2.4", *mode)
+                self.assertNotEqual(result.returncode, 0, mode)
+                self.assertIn(f"Update status: {shown}\n", result.stdout)
+                self.assertIn(f"in {self.root / 'cr'}", result.stderr)
+                self.assertTrue((self.root / "cr/report.txt").exists())
 
-    def test_in_the_app_the_harness_judges_the_windows_not_the_published_workers_record(self):
-        # The published build's worker may record Failed for an update the
-        # cut's windows accept (#3877); the harness's verdict covers them.
+    def test_the_root_avoids_a_parent_under_a_stray_git_and_a_failure_in_memory_keeps_only_its_evidence(self):
         self.cut_signed()
-        (self.root / "rehearse-status").write_text('{"phase": "Failed"}')
+        self.env.pop("CAGENTS_RELEASE_REHEARSAL_ROOT")
+        marked, clean = self.root / "marked", self.root / "clean"
+        (marked / ".git").mkdir(parents=True)
+        self.env["CAGENTS_RELEASE_REHEARSAL_PARENTS"] = f"{marked}/cr:{clean}/cr"
         result = self.release("rehearse", "0.2.4")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Update status: Failed\n", result.stdout)
+        self.assertEqual(self.log("rehearse-roots.log")[0], f"{clean}/cr/release-0.2.4")
+        self.assertFalse((marked / "cr").exists())
+        self.assertFalse((clean / "cr/release-0.2.4").exists())
+        # A failure in memory keeps its report and screenshots on disk, and
+        # frees the rest.
+        memory = Path(tempfile.mkdtemp(prefix="cr-test-", dir="/dev/shm"))
+        self.addCleanup(shutil.rmtree, memory, True)
+        self.env["CAGENTS_RELEASE_REHEARSAL_PARENTS"] = f"{marked}/cr:{memory}/cr"
+        (self.root / "rehearse-outcome").write_text("FAIL\n")
+        result = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        kept = self.host / ".cache/cagents-release-rehearsal/failed-0.2.4"
+        self.assertIn(f"report and screenshots are in {kept}", result.stderr)
+        self.assertIn("Outcome: FAIL", (kept / "report.txt").read_text())
+        self.assertFalse((memory / "cr/release-0.2.4").exists())
+        (self.root / "rehearse-outcome").unlink()
+        # Every parent marked: it says so rather than guess.
+        self.env["CAGENTS_RELEASE_REHEARSAL_PARENTS"] = f"{marked}/cr"
+        result = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT", result.stderr)
 
     def test_a_staged_rehearsal_needs_no_signature_and_runs_the_cuts_upgrade(self):
         self.bundle(self.fix)
