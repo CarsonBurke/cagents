@@ -38,7 +38,10 @@ pub fn reject_symlink_components(path: &Path) -> io::Result<()> {
     ancestors.reverse();
     for component in ancestors {
         match fs::symlink_metadata(component) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && !is_sealed_system_link(component, &metadata) =>
+            {
                 return Err(storage_error(component, "symbolic links are not allowed"));
             }
             Ok(_) => {}
@@ -47,6 +50,29 @@ pub fn reject_symlink_components(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Darwin reaches `/var`, `/tmp` and `/etc` through root-owned links in the
+/// sealed system volume, which even root cannot rewrite while it is mounted
+/// read-only. Such a link cannot be substituted, so it is no hazard, and every
+/// component after it is still checked. Linux has no equivalent.
+#[cfg(target_os = "macos")]
+fn is_sealed_system_link(component: &Path, metadata: &fs::Metadata) -> bool {
+    if component.parent() != Some(Path::new("/")) || metadata.uid() != 0 {
+        return false;
+    }
+    let mut root = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: the path literal is static and statvfs fills the buffer.
+    if unsafe { libc::statvfs(c"/".as_ptr(), root.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: statvfs succeeded, so the buffer is initialized.
+    unsafe { root.assume_init() }.f_flag & libc::ST_RDONLY != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_sealed_system_link(_component: &Path, _metadata: &fs::Metadata) -> bool {
+    false
 }
 
 pub fn validate_owned_directory(path: &Path) -> io::Result<()> {
