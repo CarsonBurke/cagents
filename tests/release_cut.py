@@ -75,7 +75,8 @@ case "$1 $2" in
         echo "archive of $version" > "cagents-$version-x86_64-unknown-linux-gnu.tar.gz"
         echo "#!/bin/sh" > install.sh
         sha256sum "cagents-$version-x86_64-unknown-linux-gnu.tar.gz" install.sh > SHA256SUMS ;;
-    "variable get") [[ $3 != RELEASE_SIGNING_PUBLIC_KEY ]] || echo "ssh-ed25519 FIXTURE" ;;
+    "variable list") [[ ! -e $FIXTURE/variables-fail ]] || exit 1
+        echo '[{"name":"RELEASE_SIGNING_PUBLIC_KEY","value":"ssh-ed25519 FIXTURE"}]' ;;
 esac
 exit 0
 """
@@ -803,6 +804,9 @@ class ReleaseCut(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(f"would not sign v0.2.4, so nothing is pushed; cut and sign it here: "
                       f"scripts/release cut --commit {self.fix} --key KEY", result.stderr)
+        (self.root / "variables-fail").touch()
+        self.assertIn("cannot read the repository variables", self.release("publish", "0.2.4", "--actions", "--yes").stderr)
+        (self.root / "variables-fail").unlink()
         (self.root / "admit-refuses").touch()
         result = self.release("publish", "0.2.4", "--actions", "--yes")
         self.assertIn("refused by the fixture", result.stderr)

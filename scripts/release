@@ -374,7 +374,8 @@ cut_cleanup() {
     unpin_bundle
 }
 
-cut() {
+# Named apart from the cut command, which it would otherwise shadow.
+cut_release() {
     local status released selected sha behind tip answer version bundle protocol previous key building
     trap cut_cleanup EXIT
     repository_git fetch --quiet origin main
@@ -762,7 +763,7 @@ HOST
 # then builds, signs and publishes it. Succeeds once the release is published;
 # until then it says so, and running it again resumes.
 publish_in_actions() {
-    local sha answer state admitted
+    local sha answer state admitted variables
     sha=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
         || fail "tag $TAG does not exist here; make it with scripts/release cut --actions"
     state=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null) || state=
@@ -777,10 +778,13 @@ publish_in_actions() {
     fi
     # A pushed tag cannot be moved or deleted, so ask first what the
     # workflow's admission will: a refused tag would leave its version used.
+    # Unset variables read as empty; a failure to read them stops here.
+    variables=$(gh variable list -R "$GITHUB_REPOSITORY" --json name,value) \
+        || fail "cannot read the repository variables of $GITHUB_REPOSITORY"
     admitted=$(mktemp "${TMPDIR:-/tmp}/cagents-admit.XXXXXX")
     if ! GITHUB_OUTPUT=$admitted CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
-        RELEASE_SIGNING_PUBLIC_KEY=$(gh variable get RELEASE_SIGNING_PUBLIC_KEY -R "$GITHUB_REPOSITORY" 2>/dev/null) \
-        RELEASE_TRUSTED_KEYS=$(gh variable get RELEASE_TRUSTED_KEYS -R "$GITHUB_REPOSITORY" 2>/dev/null) \
+        RELEASE_SIGNING_PUBLIC_KEY=$(jq -r '.[] | select(.name == "RELEASE_SIGNING_PUBLIC_KEY") | .value' <<< "$variables") \
+        RELEASE_TRUSTED_KEYS=$(jq -r '.[] | select(.name == "RELEASE_TRUSTED_KEYS") | .value' <<< "$variables") \
         "$ROOT_DIR/scripts/release-actions" admit "$TAG"; then
         rm -f -- "$admitted"
         fail "GitHub Actions would refuse $TAG; nothing is pushed"
@@ -812,7 +816,7 @@ signed_bundle() {
 case $COMMAND in
     bump) bump ;;
     build) build ;;
-    cut) cut ;;
+    cut) cut_release ;;
     rehearse) rehearse ;;
     feed)
         [[ -n $FEED ]] || fail 'feed needs --feed DIR'

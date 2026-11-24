@@ -354,8 +354,9 @@ The workflow's jobs:
 - **admit** proceeds only for a tag on a commit on main whose manifests declare
   the tag's version, which is newer than every published release and not
   published itself. It signs in Actions only when all of these hold:
-  - the previous release trusts the Actions key;
-  - the tag is of the previous release's trust generation;
+  - the tag does not begin a trust generation;
+  - every published release of its generation trusts the Actions key, as
+    `publish-release` requires;
   - the tagged `release-keys.pub` lists exactly the repository variable
     `RELEASE_TRUSTED_KEYS`.
 
@@ -382,7 +383,7 @@ access token at <https://github.com/settings/personal-access-tokens/new>:
 
 - Repository access: only `CarsonBurke/cagents`.
 - Expiration: one day.
-- Repository permissions: Environments, Secrets and Variables, read and write.
+- Repository permissions: Environments and Variables, read and write.
 
 Then run:
 

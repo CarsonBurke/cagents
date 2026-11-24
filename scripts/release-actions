@@ -91,7 +91,8 @@ version_after() {
 }
 
 admit() {
-    local tag=$1 version sha manifest declared published newest previous actions trusted at_commit
+    local tag=$1 version sha manifest declared published newest actions trusted at_commit generation earlier
+    local -a readers
     [[ $tag =~ ^v(.*)$ && ${BASH_REMATCH[1]} =~ $VERSION_PATTERN ]] || fail "$tag is not a release tag"
     version=${tag#v}
     sha=$(repository_git rev-parse --verify --quiet "refs/tags/$tag^{commit}") || fail "this checkout has no tag $tag"
@@ -123,18 +124,32 @@ admit() {
         return
     fi
     [[ $(wc -l <<< "$actions") == 1 ]] || fail 'RELEASE_SIGNING_PUBLIC_KEY must be one key'
-    previous=$(repository_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) || previous=
-    # Builds of the previous release verify this one with that release's keys.
-    if [[ -z $previous ]] || ! grep -qxF -- "$actions" <(keys_at "$previous"); then
-        notice "${previous:-No earlier release} does not trust the Actions key, so its builds could not verify $tag: it is signed locally with a key they trust."
+    # As publish-release requires: every published release of this one's
+    # trust generation is read by builds that must verify it, so each must
+    # trust the Actions key. A release that begins a generation is signed
+    # with a key the previous generation's builds trust, locally.
+    generation=$(generation_at "$sha")
+    readers=()
+    while IFS= read -r earlier; do
+        [[ $earlier =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+        version_after "$version" "${earlier#v}" || continue
+        repository_git merge-base --is-ancestor "refs/tags/$earlier" "$sha" 2>/dev/null \
+            || fail "the published $earlier is not in $tag's history here; fetch the release tags"
+        repository_git cat-file -e "$earlier:src/update/release-keys.pub" 2>/dev/null || continue
+        [[ $(generation_at "$earlier") == "$generation" ]] && readers+=("$earlier")
+    done <<< "$published"
+    if ((${#readers[@]} == 0)); then
+        notice "$tag begins trust generation $generation, so it is signed locally with a key every build of the generation before trusts."
         output sign=false
         return
     fi
-    if [[ $(generation_at "$sha") != "$(generation_at "$previous")" ]]; then
-        notice "$tag begins a new trust generation, so it is signed locally with a key every build of $previous's generation trusts."
-        output sign=false
-        return
-    fi
+    for earlier in "${readers[@]}"; do
+        if ! grep -qxF -- "$actions" <(keys_at "$earlier"); then
+            notice "$earlier does not trust the Actions key, so its builds could not verify $tag: it is signed locally with a key they trust."
+            output sign=false
+            return
+        fi
+    done
     at_commit=$(keys_at "$sha")
     if ! grep -qxF -- "$actions" <<< "$at_commit"; then
         notice "$tag no longer trusts the Actions key, so it is signed locally."

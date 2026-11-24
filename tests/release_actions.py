@@ -116,7 +116,7 @@ class ReleaseActions(unittest.TestCase):
         result = self.run_actions("admit", "v0.2.4", env={"GITHUB_SHA": sha})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs(), {"version": "0.2.4", "commit": sha, "sign": "false"})
-        self.assertIn("v0.2.3 does not trust the Actions key", result.stdout)
+        self.assertIn("v0.2.4 begins trust generation 2", result.stdout)
 
     def test_a_release_whose_predecessor_trusts_the_actions_key_is_signed_in_actions(self):
         self.tag("0.2.4", "security", "actions")
@@ -125,6 +125,30 @@ class ReleaseActions(unittest.TestCase):
         result = self.run_actions("admit", "v0.2.5", env={"GITHUB_SHA": sha})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs(), {"version": "0.2.5", "commit": sha, "sign": "true"})
+
+    def test_every_published_release_of_the_generation_must_trust_the_actions_key(self):
+        # 0.2.5 adds the Actions key partway through generation 2; builds of
+        # 0.2.4 still cannot verify a release signed by it alone.
+        self.tag("0.2.4", "security")
+        self.tag("0.2.5", "security", "actions")
+        self.published("v0.2.3", "v0.2.4", "v0.2.5")
+        self.tag("0.2.6", "security", "actions")
+        result = self.run_actions("admit", "v0.2.6")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["sign"], "false")
+        self.assertIn("v0.2.4 does not trust the Actions key", result.stdout)
+
+    def test_a_tag_never_published_is_no_ones_build(self):
+        self.tag("0.2.4", "security")
+        self.tag("0.2.5", "security", "actions")
+        self.published("v0.2.3", "v0.2.5")
+        self.tag("0.2.6", "security", "actions")
+        result = self.run_actions("admit", "v0.2.6")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["sign"], "true")
+        # A published release missing here cannot be checked.
+        self.git("tag", "-d", "v0.2.5")
+        self.assertIn("the published v0.2.5 is not in v0.2.6's history here", self.run_actions("admit", "v0.2.6").stderr)
 
     def test_without_an_actions_key_every_release_is_signed_locally(self):
         self.tag("0.2.4", "security")
@@ -154,7 +178,7 @@ class ReleaseActions(unittest.TestCase):
         result = self.run_actions("admit", "v0.2.5")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["sign"], "false")
-        self.assertIn("begins a new trust generation", result.stdout)
+        self.assertIn("v0.2.5 begins trust generation 3", result.stdout)
 
     def test_a_version_is_signed_once_and_only_after_every_published_one(self):
         self.tag("0.2.4", "security", "actions")
