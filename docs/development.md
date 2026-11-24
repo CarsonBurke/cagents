@@ -381,8 +381,8 @@ directly.
 | `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them, when they stop and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
 | `--keep` | With `--instance`: keep the instance after the session that started it ends; see [How long an instance runs](#how-long-an-instance-runs) |
 | `--ttl SECONDS` | With `--instance`: stop the instance that long after it starts |
-| `--gc` | Stop instances whose starter ended longer ago than their grace period, other than kept ones, and clear what dead harness sessions left. Fails without stopping anything or removing storage when `niri-harness list` fails |
-| `--storage DAYS` | With `--gc`: also delete the storage of instances that are not running and that nothing touched for `DAYS` days |
+| `--gc` | Stop instances whose starter ended longer ago than their grace period, other than kept ones, and clear old logs and caches. Fails without stopping anything or removing storage when `niri-harness list` fails |
+| `--storage DAYS` | With `--gc`: explicitly discard the entire storage of inactive instances that nothing touched for `DAYS` days, including their saved sessions |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -504,10 +504,9 @@ To fill an instance with a realistic workspace before its first launch, see
 
 Stopping a harness session deletes its runtime directory, so stop an instance
 with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
-leaves that daemon running without a socket. An instance's storage remains
-for its next launch; `--gc --storage DAYS` deletes what has gone unused, or
-delete `~/.local/share/cagents-development-NAME` and its config, state and
-cache siblings to discard one.
+leaves that daemon running without a socket. The next launch can still open
+the instance's saved workspace. To deliberately discard all inactive instance
+storage, including that workspace, use `--gc --storage DAYS`.
 
 #### Stopping instances from a cagents session
 
@@ -619,9 +618,13 @@ The next `--instance` launch and `--gc` repair what a watcher could not:
 
 None of them stops an instance whose daemon hosts the caller, or one that a
 session it descends from runs in; a hosted caller whose hosts can't be told
-stops nothing. `--gc --storage 14` also deletes the storage of instances that
-aren't running and that nothing touched for 14 days. An instance counts as
-running while its harness session is live or any process was started for it.
+stops nothing. A named launch and `--gc` also sweep cagents' generated state
+logs and cache files once they are 30 days old in an inactive named instance.
+This leaves a month of logs for debugging and gives the cache time to be reused
+between launches. The sweep preserves saved sessions, configuration, provider
+transcripts, lock files, and other files. An instance counts as active while
+its harness session is listed or a process for the instance is still alive.
+A sweep skips storage cleanup while a launch is starting a new session.
 
 Instances started from one checkout run that checkout's executables, so start
 them all in the same lane: all `--browserless` or all integrated. The two lanes

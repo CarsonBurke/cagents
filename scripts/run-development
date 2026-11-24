@@ -19,6 +19,7 @@ keep_instance=false
 instance_ttl=
 collect_garbage=false
 storage_days=
+cache_retention_days=30
 watch_instance=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -128,9 +129,10 @@ Options:
                    checkout, age, instance, who started them, when they stop
                    and how to stop them
   --gc             Stop instances whose starter has ended, other than kept ones,
-                   and clear what dead sessions left behind
-  --storage DAYS   With --gc: also delete the storage of instances not used for
-                   DAYS days and not running
+                   clear what dead sessions left, and sweep inactive instance
+                   caches and logs after 30 days
+  --storage DAYS   With --gc: explicitly discard all storage, including any
+                   saved sessions, of instances unused for DAYS days
   --help           Show this help
 
 A session hosted by cagents may stop or replace an instance it started, or any
@@ -387,8 +389,10 @@ session_runtime() {
 
 # Where an instance's own notes go: its state directory, which outlives its
 # runtime directory, so the next launch or listing can say what happened.
+state_root=${XDG_STATE_HOME:-$HOME/.local/state}
 instance_log() {
-    directory=${XDG_STATE_HOME:-$HOME/.local/state}/cagents-development-$1
+    directory=$state_root/cagents-development-$1
+    [ ! -L "$directory" ] && [ ! -L "$directory/run-development.log" ] || return 0
     mkdir -p -- "$directory" 2>/dev/null || return 0
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$2" >>"$directory/run-development.log" 2>/dev/null || :
 }
@@ -677,30 +681,60 @@ $sessions
 SESSIONS
 }
 
-# Storage of named instances that are not running and that nothing touched
-# for the given days: their cagents-development-NAME data, configuration,
-# state and cache directories, never the unnamed development storage or
-# anything else. An instance runs if its harness session does, or if any
-# process was started for it, such as a daemon outliving its session.
-collect_storage() {
-    days=$1 removed=false
-    live=
+old_instance_path() {
+    [ ! -L "$1" ] && { [ -d "$1" ] || [ -f "$1" ]; } || return 1
+    changed=$(find "$1" -xdev -newermt "-$days days" -printf . -quit 2>/dev/null) || return 1
+    [ -z "$changed" ]
+}
+
+# The instance or one of its cache directories could have been redirected to
+# storage the runner does not own. Never walk a symlink or mount point.
+instance_storage_directory() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    mountpoint -q -- "$1" && return 1
+    [ "$?" -eq 32 ]
+}
+
+prune_instance_files() {
+    instance_storage_directory "$1" || return 0
+    directory=$1
+    shift
+    find "$directory" -maxdepth 1 -type f -uid "$storage_uid" ! -newermt "-$days days" \( "$@" \) -delete || return 0
+    rmdir -- "$directory" 2>/dev/null || :
+}
+
+# Automatic retention covers generated caches and logs. A stopped instance
+# can still have a saved workspace, provider accounts and transcripts.
+collect_storage() (
+    days=$1 scope=$2 removed=false
+    mkdir -p -- "$state_root" || return 1
+    exec 9<"$state_root"
+    if ! flock --nonblock 9; then
+        [ "$scope" != all ] || printf '%s\n' 'an instance is starting or another sweep is running; no storage was discarded' >&2
+        return 0
+    fi
+    hosts_unknown "$(caller_host_runtimes)" && return 0
+    listing=
     if command -v niri-harness >/dev/null 2>&1; then
         listing=$(niri-harness list 2>/dev/null) || {
             printf '%s\n' "niri-harness list failed, so no storage was removed, since which instances run can't be told" >&2
             return 1
         }
-        live=$(printf '%s\n' "$listing" | awk '$1 ~ /^cagents-/ && $2 != "dead" { print substr($1, 9) }')
     fi
-    live=$live$(printf '\n'; cat /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' |
-        sed -n 's/^CAGENTS_DEVELOPMENT_INSTANCE=//p' | sort -u)
+    # A session still listed as dead might be starting. A daemon can also
+    # outlive its harness session.
+    live=$(printf '%s\n' "$listing" | awk '$1 ~ /^cagents-/ { print substr($1, 9) }'
+        cat /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' |
+            sed -n 's/^CAGENTS_DEVELOPMENT_INSTANCE=//p' | sort -u)
     data_root=${XDG_DATA_HOME:-$HOME/.local/share}
     config_root=${XDG_CONFIG_HOME:-$HOME/.config}
-    state_root=${XDG_STATE_HOME:-$HOME/.local/state}
     cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
-    names=$(for directory in "$data_root" "$config_root" "$state_root" "$cache_root"; do
+    storage_uid=$(id -u)
+    set -- "$state_root" "$cache_root"
+    [ "$scope" != all ] || set -- "$@" "$data_root" "$config_root"
+    names=$(for directory do
         for path in "$directory"/cagents-development-*; do
-            [ -d "$path" ] && printf '%s\n' "${path##*/cagents-development-}"
+            [ -d "$path" ] && [ ! -L "$path" ] && printf '%s\n' "${path##*/cagents-development-}"
         done
     done | sort -u)
     while IFS= read -r name; do
@@ -709,22 +743,54 @@ collect_storage() {
             [!A-Za-z0-9]* | *[!A-Za-z0-9-]*) continue ;;
         esac
         ! printf '%s\n' "$live" | grep -qxF "$name" || continue
+        instance_state=$state_root/cagents-development-$name
+        instance_cache=$cache_root/cagents-development-$name
+        if [ "$scope" = generated ]; then
+            [ "${#name}" -le 24 ] || continue
+            log=$instance_state/run-development.log
+            if [ -e "$log" ] && ! old_instance_path "$log"; then
+                continue
+            fi
+            if instance_storage_directory "$instance_state"; then
+                prune_instance_files "$instance_state/diagnostics" \
+                    -name 'cagents-ui.[0-4].jsonl' -o -name 'cagentsd.[0-4].jsonl' \
+                    -o -name 'ceditor.[0-4].jsonl'
+                prune_instance_files "$instance_state" -name run-development.log
+            fi
+            if instance_storage_directory "$instance_cache"; then
+                prune_instance_files "$instance_cache/github-avatars" \
+                    -name 'github.com-*.image' -o -name '.avatar-??????'
+                prune_instance_files "$instance_cache/chat-pasted-images" -name 'paste-*'
+                # Only named cache files, even when two XDG roots are the same.
+                prune_instance_files "$instance_cache" \
+                    -name account-usage.json -o -name '.account-usage.*' \
+                    -o -name prompt-cache.json -o -name '.prompt-cache.*' \
+                    -o -name resume-catalog -o -name '.resume-catalog.*'
+            fi
+            continue
+        fi
         set -- "$data_root/cagents-development-$name" "$config_root/cagents-development-$name" \
-            "$state_root/cagents-development-$name" "$cache_root/cagents-development-$name"
+            "$instance_state" "$instance_cache"
         recent=
         for directory in "$@"; do
-            [ ! -d "$directory" ] || recent=$recent$(find "$directory" -newermt "-$days days" -print -quit 2>/dev/null)
+            if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+                continue
+            fi
+            if ! instance_storage_directory "$directory" || ! old_instance_path "$directory"; then
+                recent=true
+                break
+            fi
         done
         [ -z "$recent" ] || continue
-        size=$(du -csh -- "$@" 2>/dev/null | tail -n 1 | cut -f 1)
-        rm -rf -- "$@"
+        size=$(du -cxsh -- "$@" 2>/dev/null | tail -n 1 | cut -f 1)
+        rm -rf --one-file-system -- "$@" || return 1
         printf 'removed the storage of instance %s (%s), unused for %s days\n' "$name" "${size:-?}" "$days"
         removed=true
     done <<NAMES
 $names
 NAMES
-    [ "$removed" = true ] || printf 'no instance storage has gone unused for %s days\n' "$days"
-}
+    [ "$scope" != all ] || [ "$removed" = true ] || printf 'no instance storage has gone unused for %s days\n' "$days"
+)
 
 if [ "$collect_garbage" = true ]; then
     if ! collect_instances true; then
@@ -732,7 +798,11 @@ if [ "$collect_garbage" = true ]; then
             printf '%s\n' "no storage was removed either, since which instances run can't be told" >&2
         exit 1
     fi
-    [ -z "$storage_days" ] || collect_storage "$storage_days" || exit 1
+    if [ -n "$storage_days" ]; then
+        collect_storage "$storage_days" all || exit 1
+    else
+        collect_storage "$cache_retention_days" generated || exit 1
+    fi
     exit 0
 fi
 
@@ -755,7 +825,9 @@ if [ -n "$instance" ] && [ "$in_session" = false ]; then
     if [ "$stop_instance" = false ]; then
         # What earlier sessions left: this name's dead session, which would
         # otherwise block the launch, and expired instances nothing watches.
-        collect_instances false || :
+        if collect_instances false; then
+            collect_storage "$cache_retention_days" generated || :
+        fi
     fi
     if [ "$stop_instance" = false ] && [ "$fresh_daemon" = false ] &&
         session_live "$harness_session"; then
@@ -1338,19 +1410,30 @@ fi
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
 if [ -n "$instance" ] && [ "$in_session" = false ]; then
-    if [ "$fresh_daemon" = true ]; then
-        printf '%s\n' "Replacing instance $instance stops its terminal/chat jobs and all their background subagents." >&2
-        stop_instance_session
-    fi
     capped=
     [ ! -x "$root/scripts/memory-capped" ] || capped=$root/scripts/memory-capped
-    # Its own bus and runtime directory keep the instance's application ID,
-    # activation sockets and daemon apart from every other session.
-    # Without the caller's display variables, nothing in the session can fall
-    # back to the caller's desktop.
-    env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
-        niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
-        ${capped:+"$capped" --name cagents-ui} "$products/cagents-ui" "$@"
+    (
+        # A sweep must see either the previous session or the new one. With
+        # shared locks, different instances can still launch simultaneously.
+        if mkdir -p -- "$state_root"; then
+            exec 9<"$state_root"
+            flock --shared 9
+        fi
+        if [ "$fresh_daemon" = true ]; then
+            printf '%s\n' "Replacing instance $instance stops its terminal/chat jobs and all their background subagents." >&2
+            stop_instance_session
+        fi
+        # Its own bus and runtime directory keep the instance's application ID,
+        # activation sockets and daemon apart from every other session.
+        # Without the caller's display variables, the session cannot fall back
+        # to the caller's desktop. The session must not inherit the lock.
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
+            niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
+            ${capped:+"$capped" --name cagents-ui} "$products/cagents-ui" "$@" 9<&-
+        # Keep this shell holding the lock until start returns. Otherwise a
+        # shell may exec its final command and close the lock before launch.
+        exec 9<&-
+    )
     instance_runtime=$(session_runtime "$harness_session") || instance_runtime=
     if [ -n "$instance_runtime" ] && record_owner "$instance_runtime" &&
         { [ "$keep_instance" = false ] || [ -n "$instance_ttl" ]; }; then
@@ -1401,4 +1484,16 @@ else
     set -- "$products/cagents-ui" "$@"
 fi
 [ ! -x "$root/scripts/memory-capped" ] || set -- "$root/scripts/memory-capped" --name cagents-ui "$@"
+if [ "$in_session" = true ] && mkdir -p -- "$state_root"; then
+    # /proc sees the environment at exec, so the new shell is visible to
+    # later sweeps by instance name while it waits for any ongoing sweep.
+    # shellcheck disable=SC2016 # the new shell expands its own arguments
+    exec sh -ec '
+        exec 9<"$1"
+        shift
+        flock --shared 9
+        exec 9<&-
+        exec "$@"
+    ' run-development "$state_root" "$@"
+fi
 exec "$@"
