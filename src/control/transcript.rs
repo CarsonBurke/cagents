@@ -85,12 +85,13 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
             ));
         }
     };
-    let human = human(&page, &query, &format::program(), sessions::now_ms());
-    Ok(CommandOutput {
-        command: "transcript",
-        data: page_json(&page, &selected),
-        human,
-    })
+    Ok(format::listing_output(
+        "transcript",
+        &page,
+        super::human_output(),
+        |page| human(page, &query, &format::program(), sessions::now_ms()),
+        |page| page_json(page, &selected),
+    ))
 }
 
 /// The page as `--json` reports it: the session as a listing's row, with

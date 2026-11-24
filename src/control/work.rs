@@ -718,14 +718,16 @@ fn list(
         placed: placed.is_some(),
         current: current.as_deref(),
     };
-    let human = board_human(&board, &listing, crate::chat::now_ms().unwrap_or_default());
-    let omitted = listing.omit(&mut board.items, listing.limit);
-    let data = board_json(&board, &scope, &omitted, &arguments.fields);
-    Ok(CommandOutput {
-        command: "work.list",
-        data,
-        human,
-    })
+    Ok(super::format::listing_output(
+        "work.list",
+        board,
+        super::human_output(),
+        |board| board_human(&board, &listing, crate::chat::now_ms().unwrap_or_default()),
+        |mut board| {
+            let omitted = listing.omit(&mut board.items, listing.limit);
+            board_json(&board, &scope, &omitted, &arguments.fields)
+        },
+    ))
 }
 
 fn pin(
