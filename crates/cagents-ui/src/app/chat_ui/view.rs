@@ -5333,9 +5333,10 @@ impl Runtime {
         }
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
-            let default_effort = offers
+            let own = offers
                 .iter()
-                .find(|offer| offer.provider == self.session.launch.provider)
+                .find(|offer| offer.provider == self.session.launch.provider);
+            let default_effort = own
                 .and_then(|offer| offer.catalog)
                 .and_then(|catalog| catalog.default_effort(self.chosen_model().id));
             let label = footer_model_label(
@@ -5344,6 +5345,7 @@ impl Runtime {
                 draft,
                 self.session.launch.provider,
                 fit,
+                own.and_then(|offer| advertised_default(offer.models, offer.catalog)),
                 default_effort,
             );
             if transitioning {
@@ -8478,11 +8480,41 @@ pub(super) fn answer_control_id(
 
 /// Keep the provider's alias as a choice while naming the model it resolves to.
 fn model_choice_label(model: &chat::Model) -> Cow<'_, str> {
-    if model.id == "default" && !model.label.to_lowercase().starts_with("default") {
-        format!("Default ({})", model.label).into()
+    if model.id == "default" {
+        default_choice_label(Some(&model.label), "Default model")
     } else {
         model.label.as_str().into()
     }
+}
+
+/// How a provider's default reads wherever it can be chosen or is shown:
+/// "Default" with what it resolves to, `resolved`, where the provider has
+/// said, and `unknown` where it has not. Every provider's default reads
+/// this one way, whether it lists the default as an alias of its own, as
+/// Claude's `default` is, or only marks one of its models as the default.
+fn default_choice_label<'a>(resolved: Option<&'a str>, unknown: &'a str) -> Cow<'a, str> {
+    match resolved {
+        // A provider's own name for its default already says so.
+        Some(label) if label.to_lowercase().starts_with("default") => label.into(),
+        Some(label) => format!("Default ({label})").into(),
+        None => unknown.into(),
+    }
+}
+
+/// The model a provider advertises as its default, where it has, by the
+/// name it lists it under: Codex marks one model of its list, and an ACP
+/// agent reports the model it is configured with. `models` is what the
+/// conversation itself lists; the catalog's own list stands in for it.
+fn advertised_default<'a>(
+    models: &'a [chat::Model],
+    catalog: Option<&'a crate::account::cache::Catalog>,
+) -> Option<&'a chat::Model> {
+    let catalog = catalog?;
+    let id = catalog.default_model.as_deref()?;
+    models
+        .iter()
+        .chain(&catalog.models)
+        .find(|model| model.id == id)
 }
 
 /// Provider identifiers stay in the protocol; people see these names everywhere.
@@ -8501,10 +8533,12 @@ fn reasoning_rows<'a>(
     model: &'a chat::Model,
     default: Option<&str>,
 ) -> Vec<(Option<&'a str>, Cow<'a, str>)> {
-    let title = default.map_or_else(
-        || Cow::Borrowed("Default"),
-        |effort| Cow::Owned(format!("Default ({})", effort_label(effort))),
-    );
+    let title = match default.map(effort_label) {
+        Some(effort) => default_choice_label(Some(&effort), "Default")
+            .into_owned()
+            .into(),
+        None => Cow::Borrowed("Default"),
+    };
     std::iter::once((None, title))
         .chain(
             model
@@ -8563,6 +8597,7 @@ fn footer_model_label<'a>(
     draft: bool,
     provider: Provider,
     fit: FooterFit,
+    advertised: Option<&'a chat::Model>,
     draft_default_effort: Option<&str>,
 ) -> Cow<'a, str> {
     let selected = chosen.model(snapshot);
@@ -8573,10 +8608,12 @@ fn footer_model_label<'a>(
         match selected {
             Some(model) if provider == Provider::Omp && !draft => model.label.as_str().into(),
             Some(model) => model_choice_label(model),
-            None => match chosen.id {
-                Some(id) => id.into(),
-                None if fit != FooterFit::Wide => "Default model".into(),
-                None => format!("{} · Default model", family_label(provider)).into(),
+            None => match (chosen.id, advertised) {
+                (Some(id), _) => id.into(),
+                // Named, it says which provider it is, as Claude's does.
+                (None, Some(model)) => default_choice_label(Some(&model.label), "Default model"),
+                (None, None) if fit != FooterFit::Wide => "Default model".into(),
+                (None, None) => format!("{} · Default model", family_label(provider)).into(),
             },
         }
     };
@@ -8648,9 +8685,15 @@ fn model_rows<'a>(
         .filter_map(|offer| {
             // A letter alone begins too many names to mean one provider.
             let named = needle.chars().count() > 1 && names_provider(offer.provider, &needle);
+            // The default is found by the model it resolves to, as a
+            // listed `default` alias is by its label.
+            let resolves = || {
+                advertised_default(offer.models, offer.catalog)
+                    .is_some_and(|model| !model_hits(std::slice::from_ref(model), query).is_empty())
+            };
             let default = ((draft && !offer.models.iter().any(|model| model.id == "default"))
                 || offer.models.is_empty())
-                && (needle.is_empty() || named || "default".starts_with(&needle));
+                && (needle.is_empty() || named || "default".starts_with(&needle) || resolves());
             let rows: Vec<ModelRow<'a>> = default
                 .then_some(ModelRow {
                     provider: offer.provider,
@@ -8695,7 +8738,7 @@ fn picker_section_header<'a>(content: Element<'a, Message>, top: f32) -> Element
 
 fn picker_choice_row<'a>(
     title: Cow<'a, str>,
-    detail: Option<&'a str>,
+    detail: Option<Cow<'a, str>>,
     name: Cow<'a, str>,
     id: widget::Id,
     selected: bool,
@@ -8804,32 +8847,47 @@ fn model_list<'a>(
                 },
             ));
         }
+        let offer = offers.iter().find(|offer| offer.provider == provider);
+        let advertised = offer.and_then(|offer| advertised_default(offer.models, offer.catalog));
+        let listed = offer.is_some_and(|offer| !offer.models.is_empty());
         for row in models {
             let selected =
                 provider == current.0 && row.model.map(|model| model.id.as_str()) == current.1;
-            let (title, id, name) = match row.model {
-                Some(model) => (
-                    model_choice_label(model),
-                    Some(model.id.as_str()),
-                    model_choice_label(model),
-                ),
+            let (title, id) = match row.model {
+                Some(model) => (model_choice_label(model), Some(model.id.as_str())),
                 None => (
-                    Cow::Borrowed("Default model"),
+                    default_choice_label(
+                        advertised.map(|model| model.label.as_str()),
+                        "Default model",
+                    ),
                     None,
-                    Cow::Owned(format!("{} default model", family_label(provider))),
                 ),
+            };
+            // Under a heading for each provider the default's own name
+            // doesn't say whose it is; a model's name does.
+            let name = match id {
+                None | Some("default") if headed => {
+                    Cow::Owned(format!("{} {title}", family_label(provider)))
+                }
+                _ => title.clone(),
             };
             // The identifier is shown only where it is not already the
             // label, because most providers use one string for both and a
-            // row that prints it twice is half a list of duplicates.
-            let listed = offers
-                .iter()
-                .any(|offer| offer.provider == provider && !offer.models.is_empty());
+            // row that prints it twice is half a list of duplicates. A
+            // default named for what it resolves to needs no second line
+            // either: "default" is already its title.
             let detail = match id {
-                Some(id) if id != title.as_ref() => Some(id),
+                Some("default") => None,
+                Some(id) if id != title.as_ref() => Some(Cow::Borrowed(id)),
                 Some(_) => None,
-                None if listed => Some("Whichever it would choose itself"),
-                None => Some("Its models are listed once it has run"),
+                None if advertised.is_some() => None,
+                // The agent's own setting decides, so it is named rather
+                // than the family its models are listed under.
+                None if listed => Some(Cow::Owned(format!(
+                    "The model {} is set to use",
+                    provider.label()
+                ))),
+                None => Some(Cow::Borrowed("Its models are listed once it has run")),
             };
             rows.push(picker_choice_row(
                 title,
