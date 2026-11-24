@@ -39,16 +39,20 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
+mod files;
+
 #[cfg(test)]
 mod tests;
 
-/// How often a watched conversation's transcript is read again.
+/// Coalesce bursts of active output and continue bounded reads.
 const TICK: Duration = Duration::from_secs(2);
+/// Retry file coverage while the directory or watch backend is unavailable.
+const UNWATCHED_TRANSCRIPT: Duration = Duration::from_secs(10);
 /// How long what was read of an unwatched conversation is kept, so coming
 /// back to it, or showing the inspector again, does not read it all again.
 const KEPT_UNWATCHED: Duration = Duration::from_secs(10 * 60);
@@ -88,9 +92,10 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 pub(super) struct Conversations {
     state: Mutex<State>,
-    /// Runtime callbacks queue the specific record after its data was stored.
-    records_changed: Mutex<BTreeSet<TerminalId>>,
+    /// Only conversations with input queued need their transcript read.
+    inputs_changed: Mutex<BTreeSet<TerminalId>>,
     watching: AtomicBool,
+    projection: AtomicU64,
     pub(super) signal: Signal,
 }
 
@@ -215,6 +220,7 @@ struct BranchLookup {
 struct Watched {
     watchers: BTreeMap<ClientId, Weak<DeliveryQueue>>,
     source: Source,
+    facts: Option<(u64, Option<Arc<Facts>>)>,
     files: BTreeMap<PathBuf, Cursor>,
     /// How far cagents' own record of the conversation has been read, for a
     /// conversation whose transcript files are not.
@@ -237,6 +243,7 @@ struct Watched {
     searches_missed: u32,
     record_read_at: Option<Instant>,
     record_retry: Option<Instant>,
+    file_retry: Option<Instant>,
 }
 
 /// Where a pass found the conversation's transcript.
@@ -298,6 +305,7 @@ impl Watched {
         Self {
             watchers: BTreeMap::new(),
             source: Source::Pending,
+            facts: None,
             files: BTreeMap::new(),
             items: Items::default(),
             references: BTreeMap::new(),
@@ -312,6 +320,7 @@ impl Watched {
             searches_missed: 0,
             record_read_at: None,
             record_retry: None,
+            file_retry: None,
         }
     }
 
@@ -571,15 +580,27 @@ impl Handle {
     /// whose record is read is followed from the next pass rather than after
     /// the loop's idle wait.
     pub(in crate::host) fn chat_added(&self, conversation: TerminalId, provider: Provider) {
+        self.0
+            .conversations
+            .projection
+            .fetch_add(1, Ordering::Release);
         if recorded_provider(provider) {
-            self.record_changed(conversation);
+            self.input_changed(conversation);
+        } else {
+            self.conversation_identity_changed(conversation);
         }
     }
 
-    pub(in crate::host) fn record_changed(&self, conversation: TerminalId) {
+    pub(in crate::host) fn conversation_identity_changed(&self, conversation: TerminalId) {
+        if self.0.conversations.watching.load(Ordering::Acquire) {
+            self.input_changed(conversation);
+        }
+    }
+
+    pub(in crate::host) fn input_changed(&self, conversation: TerminalId) {
         let conversations = &self.0.conversations;
         if conversations
-            .records_changed
+            .inputs_changed
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(conversation)
@@ -589,6 +610,10 @@ impl Handle {
     }
 
     pub(super) fn projection_changed(&self) {
+        self.0
+            .conversations
+            .projection
+            .fetch_add(1, Ordering::Release);
         if self.0.conversations.watching.load(Ordering::Acquire) {
             self.0.conversations.signal.notify();
         }
@@ -611,14 +636,16 @@ impl Handle {
         conversation: TerminalId,
         delivery: Weak<DeliveryQueue>,
     ) -> Result<(u64, ConversationPullRequests), String> {
-        let provider = host
+        if !host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .chats
-            .get(&conversation)
-            .map(|record| record.session.launch.provider)
-            .ok_or("No such conversation")?;
-        let facts = self.facts(host, conversation, true);
+            .contains_key(&conversation)
+        {
+            return Err("No such conversation".into());
+        }
+        let projection = self.0.conversations.projection.load(Ordering::Acquire);
+        let facts = self.facts(host, conversation, true).map(Arc::new);
         let mut state = self.conversations();
         // A connection watches one conversation at a time.
         for watched in state.watched.values_mut() {
@@ -635,10 +662,10 @@ impl Handle {
         let watched = watched.entry(conversation).or_insert_with(Watched::new);
         watched.watchers.insert(client, delivery);
         watched.unwatched_since = None;
-        watched.pin_edits(facts.as_ref(), observed, branches);
+        watched.pin_edits(facts.as_deref(), observed, branches);
         let mut list = assemble(
             watched,
-            facts.as_ref(),
+            facts.as_deref(),
             observed,
             branches,
             forge_error.clone(),
@@ -651,13 +678,10 @@ impl Handle {
             watched.revision += 1;
         }
         let revision = watched.revision;
+        watched.facts = Some((projection, facts));
         self.0.conversations.watching.store(true, Ordering::Release);
         drop(state);
-        if recorded_provider(provider) {
-            self.record_changed(conversation);
-        } else {
-            self.0.conversations.signal.notify();
-        }
+        self.input_changed(conversation);
         Ok((revision, list))
     }
 
@@ -672,12 +696,18 @@ impl Handle {
     }
 
     pub(super) fn conversation_loop(&self) {
+        let owner = Arc::downgrade(&self.0);
+        let mut files = files::Watches::new(move |id| {
+            if let Some(inner) = owner.upgrade() {
+                Handle(inner).input_changed(id);
+            }
+        });
         while let Some(observed) = self.0.conversations.signal.observe() {
             let Some(host) = self.0.host.upgrade() else {
                 break;
             };
             let delay = super::super::service::attempt("Conversation pull requests", || {
-                Ok(self.conversation_pass(&host))
+                Ok(self.conversation_pass(&host, &mut files))
             })
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, "conversation pull requests are temporarily unavailable");
@@ -691,12 +721,12 @@ impl Handle {
     /// Reads changed records and watched transcripts, then publishes any
     /// changed lists. Only watches, retention and incomplete record reads
     /// can need another pass without input.
-    fn conversation_pass(&self, host: &SharedHost) -> Option<Duration> {
+    fn conversation_pass(&self, host: &SharedHost, files: &mut files::Watches) -> Option<Duration> {
         let dirty = std::mem::take(
             &mut *self
                 .0
                 .conversations
-                .records_changed
+                .inputs_changed
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()),
         );
@@ -757,15 +787,20 @@ impl Handle {
                             || watched.record_retry.is_some_and(|due| due <= now))
                         .then_some(*id)
                     } else {
-                        (!watched.watchers.is_empty()).then_some(*id)
+                        (!watched.watchers.is_empty()
+                            && (dirty.contains(id)
+                                || watched.search_after.is_some_and(|due| due <= now)
+                                || watched.file_retry.is_some_and(|due| due <= now)))
+                        .then_some(*id)
                     }
                 })
                 .collect::<Vec<_>>();
             (conversations, read)
         };
+        files.retain(|id| conversations.contains(&id) && !followed.contains(&id));
         let mut facts = conversations
             .iter()
-            .map(|id| (*id, self.facts(host, *id, true)))
+            .map(|id| (*id, self.watched_facts(host, *id)))
             .collect::<BTreeMap<_, _>>();
         for conversation in &read {
             let watched = conversations.contains(conversation);
@@ -788,6 +823,9 @@ impl Handle {
                 let Some(watched) = state.watched.get_mut(conversation) else {
                     continue;
                 };
+                if search_due {
+                    watched.search_after = None;
+                }
                 if matches!(located, Location::Missed) {
                     watched.searches_missed = watched.searches_missed.saturating_add(1);
                     watched.search_after =
@@ -816,9 +854,22 @@ impl Handle {
             // Watching and unwatching take the same lock, so the files and
             // the record are read without it. Only this thread moves the
             // cursors.
-            let (scanned, retry) = match &source {
-                Source::Recorded => recorded(host, *conversation, &mut items),
-                _ => (scan(&source, &mut cursors), false),
+            let (scanned, record_retry, file_retry) = match &source {
+                Source::Recorded => {
+                    let (scanned, retry) = recorded(host, *conversation, &mut items);
+                    (scanned, retry, None)
+                }
+                Source::Located(located) => {
+                    let covered = files.cover(*conversation, located);
+                    let scanned = scan(&source, &mut cursors);
+                    let retry = match &scanned.coverage {
+                        TranscriptCoverage::Pending => Some(TICK),
+                        _ if !covered => Some(UNWATCHED_TRANSCRIPT),
+                        _ => None,
+                    };
+                    (scanned, false, retry)
+                }
+                Source::Pending => (scan(&source, &mut cursors), false, None),
             };
             // Work on "the current branch" is pinned to the branch checked
             // out as it is read.
@@ -828,7 +879,10 @@ impl Handle {
                     .iter()
                     .any(|found| matches!(found.signal.reference, Reference::CurrentBranch { .. }))
             {
-                facts.insert(*conversation, self.facts(host, *conversation, false));
+                facts.insert(
+                    *conversation,
+                    self.facts(host, *conversation, false).map(Arc::new),
+                );
             }
             let mut state = self.conversations();
             if let Some(watched) = state.watched.get_mut(conversation)
@@ -836,12 +890,13 @@ impl Handle {
             {
                 watched.files = cursors;
                 watched.items = items;
+                let now = Instant::now();
                 if source == Source::Recorded {
-                    let now = Instant::now();
                     watched.record_read_at = Some(now);
-                    watched.record_retry = retry.then(|| now + TICK);
+                    watched.record_retry = record_retry.then(|| now + TICK);
                 }
-                watched.apply(scanned, facts.get(conversation).and_then(Option::as_ref));
+                watched.file_retry = file_retry.map(|delay| now + delay);
+                watched.apply(scanned, facts.get(conversation).and_then(Option::as_deref));
             }
         }
         let delay = self.conversation_delay(&followed, !conversations.is_empty());
@@ -869,7 +924,7 @@ impl Handle {
             let Some(watched) = watched.get_mut(&conversation) else {
                 continue;
             };
-            let facts = facts.get(&conversation).and_then(Option::as_ref);
+            let facts = facts.get(&conversation).and_then(Option::as_deref);
             watched.pin_edits(facts, observed, branches);
             let mut list = assemble(watched, facts, observed, branches, forge_error.clone());
             with_measured(&mut list, measured);
@@ -912,8 +967,14 @@ impl Handle {
             .filter_map(|(id, watched)| {
                 if followed.contains(id) {
                     watched.record_retry
-                } else {
+                } else if watched.watchers.is_empty() {
                     watched.unwatched_since.map(|since| since + KEPT_UNWATCHED)
+                } else {
+                    watched
+                        .search_after
+                        .into_iter()
+                        .chain(watched.file_retry)
+                        .min()
                 }
             })
             .min();
@@ -922,6 +983,26 @@ impl Handle {
             .into_iter()
             .chain(watching.then_some(TICK))
             .min()
+    }
+
+    /// Project placement reads the workspace registry and Git metadata.
+    /// A transcript tick can reuse that answer until Work publishes facts.
+    fn watched_facts(&self, host: &SharedHost, conversation: TerminalId) -> Option<Arc<Facts>> {
+        let projection = self.0.conversations.projection.load(Ordering::Acquire);
+        if let Some((seen, facts)) = self
+            .conversations()
+            .watched
+            .get(&conversation)
+            .and_then(|watched| watched.facts.as_ref())
+            && *seen == projection
+        {
+            return facts.clone();
+        }
+        let facts = self.facts(host, conversation, true).map(Arc::new);
+        if let Some(watched) = self.conversations().watched.get_mut(&conversation) {
+            watched.facts = Some((projection, facts.clone()));
+        }
+        facts
     }
 
     /// The board's facts for a conversation's directory. Watching a
@@ -970,7 +1051,11 @@ impl Handle {
     /// conversation edited whose status changed since it was last measured.
     /// The board's scan, which its file watcher drives, says when one did, so
     /// an unchanged worktree is never diffed again.
-    fn measure(&self, conversations: &[TerminalId], facts: &BTreeMap<TerminalId, Option<Facts>>) {
+    fn measure(
+        &self,
+        conversations: &[TerminalId],
+        facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
+    ) {
         let due = {
             let mut state = self.conversations();
             let mut wanted = BTreeMap::new();
@@ -1019,7 +1104,11 @@ impl Handle {
     }
 
     /// Asks GitHub about the few pull requests and branches most worth it.
-    fn look_up(&self, conversations: &[TerminalId], facts: &BTreeMap<TerminalId, Option<Facts>>) {
+    fn look_up(
+        &self,
+        conversations: &[TerminalId],
+        facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
+    ) {
         // In rank order across conversations, so the budget goes to what
         // they worked on before what they mentioned.
         let lookups = {
@@ -1680,6 +1769,9 @@ fn locate(
     let Some(id) = session_id.filter(|id| known != Some(id.as_str())) else {
         return Location::Unchanged;
     };
+    if !search_due {
+        return Location::Unchanged;
+    }
     let Some(root) = provider.session_root(&recipe) else {
         return Location::Unchanged;
     };
@@ -1687,8 +1779,13 @@ fn locate(
         .unwrap_or_else(|_| recipe.working_directory.clone());
     match provider {
         Provider::Claude => {
-            let Ok(transcript) = crate::agent::claude_transcript(&root, &directory, &id) else {
-                return Location::Unchanged;
+            let transcript = match crate::agent::claude_transcript_for_start(&root, &directory, &id)
+            {
+                Ok(transcript) => transcript,
+                Err(crate::agent::ClaudeTranscriptError::Unavailable(_)) => {
+                    return Location::Missed;
+                }
+                Err(crate::agent::ClaudeTranscriptError::Invalid(_)) => return Location::Unchanged,
             };
             Location::Found(
                 id,
@@ -1700,7 +1797,6 @@ fn locate(
                 }),
             )
         }
-        Provider::Codex if !search_due => Location::Unchanged,
         Provider::Codex => match codex_rollout(&root.join("sessions"), &id) {
             Some(transcript) => Location::Found(
                 id,

@@ -600,7 +600,7 @@ fn changed_for_instance(
     }
     if matches!(update, Update::RecordChanged) {
         if let Some(work) = &state.work {
-            work.record_changed(id);
+            work.input_changed(id);
         }
         return;
     }
@@ -630,6 +630,9 @@ fn changed_for_instance(
         return;
     }
     if matches!(update, Update::ConversationNameChanged) {
+        if let Some(work) = &state.work {
+            work.conversation_identity_changed(id);
+        }
         if let Some(titles) = &state.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
         }

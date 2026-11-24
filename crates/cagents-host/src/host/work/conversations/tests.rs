@@ -1219,9 +1219,10 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     host.lock().unwrap().work = Some(work.clone());
     let signal = &work.0.conversations.signal;
 
+    let mut files = files::Watches::new(|_| {});
     // Nothing to read: the loop would wait for input.
     let observed = signal.observe().unwrap();
-    assert_eq!(work.conversation_pass(&host), None);
+    assert_eq!(work.conversation_pass(&host, &mut files), None);
 
     let id = host_recorded_chat(
         &host,
@@ -1247,7 +1248,7 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     assert_ne!(signal.observe(), Some(observed));
 
     // Followed with no watcher, and read from its start.
-    assert_eq!(work.conversation_pass(&host), None);
+    assert_eq!(work.conversation_pass(&host, &mut files), None);
     {
         let mut state = work.conversations();
         let watched = state.watched.get_mut(&id).unwrap();
@@ -1268,7 +1269,7 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
         })
         .unwrap();
     assert_ne!(signal.observe(), Some(observed));
-    assert_eq!(work.conversation_pass(&host), None);
+    assert_eq!(work.conversation_pass(&host, &mut files), None);
     assert_eq!(numbers(&work.conversations().watched[&id]), [1, 2]);
 
     let record = host.lock().unwrap().chats.remove(&id).unwrap();
