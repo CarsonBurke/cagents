@@ -7,7 +7,7 @@ fn closed_here_notice(app: &Cagents, card: CardId) -> String {
         .pane_notice_title(card)
         .expect("a closed pane keeps the title it is named by");
     let notice = pane_closed_here_kept_elsewhere(Some(&title));
-    assert!(notice.starts_with(&format!("\u{201c}{title}\u{201d} closed here")));
+    assert!(notice.starts_with(&format!("The pane \u{201c}{title}\u{201d} closed here")));
     notice
 }
 

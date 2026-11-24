@@ -12274,9 +12274,10 @@ impl Cagents {
             // offers storage the same move from the same identity. A new chat
             // starts from no identity at all, so nothing is moved. The
             // remedy comes first: the notice shows its first lines only.
-            PaneSaveRefusal::Identity { category, .. } => format!(
-                "{LEAD} Copy it into a new conversation and send it there: storage won't record a new conversation for this pane ({}), so sending here fails again.",
-                category.label()
+            // The storage rule and category stay in the log: "saved state is
+            // invalid" would suggest the reader's data is damaged.
+            PaneSaveRefusal::Identity { .. } => format!(
+                "{LEAD} Copy it into a new conversation and send it there. Storage won't let this pane start one, so sending here fails again."
             ),
             PaneSaveRefusal::Refused { pane, category, .. } => {
                 let label = category.label();

@@ -282,7 +282,7 @@ pub(super) const PANE_KEPT_ELSEWHERE: &str =
 pub(super) fn pane_closed_here_kept_elsewhere(title: Option<&str>) -> String {
     match title {
         Some(title) => format!(
-            "\u{201c}{title}\u{201d} closed here, but other windows may still show it. Close it there if they do."
+            "The pane \u{201c}{title}\u{201d} closed here, but other windows may still show it. Close it there if they do."
         ),
         None => {
             "This pane closed here, but other windows may still show it. Close it there if they do."
