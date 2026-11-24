@@ -2717,8 +2717,12 @@ fn a_recorded_base_turns_a_redraw_edge_into_a_pushed_repaint() {
     crate::test_timing::eventually("the terminal's repaint", || {
         // The worker withholds the next capture until the presented
         // generation is acknowledged; the UI does this after drawing.
-        handle.acknowledge_redraw(handle.generation());
-        handle.generation() > base.generation
+        let generation = handle.generation();
+        if generation > base.generation {
+            return true;
+        }
+        handle.acknowledge_redraw(generation);
+        false
     });
 
     broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation(), &handle);

@@ -687,8 +687,8 @@ impl PublishedState {
             shutdown_census_delay: Mutex::new(None),
             #[cfg(test)]
             // Tests reach most terminals through code that creates and shuts
-            // them down itself, so every test terminal starts patient. Only a
-            // test of the deadline itself, or of the grace, chooses another.
+            // them down itself, so every test terminal starts patient. A test
+            // that needs another budget sets it before shutdown.
             shutdown_budget: Mutex::new(ShutdownBudget::PATIENT_PRODUCT_GRACE),
             #[cfg(test)]
             test_holder_reservation: Mutex::new(None),
@@ -1256,7 +1256,9 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
-    /// The product's [`Self::shutdown_join_budget`].
+    /// The product's [`Self::shutdown_join_budget`], which the fixtures built
+    /// to run out a budget keep.
+    #[cfg(test)]
     pub(crate) const SHUTDOWN_TIMEOUT: Duration = WORKER_JOIN_TIMEOUT;
     /// Captured from the authenticated original holder before worker startup;
     /// never rediscovered by a reusable terminal ID.
@@ -2409,8 +2411,8 @@ impl TerminalHandle {
         self.shutdown_until(std::time::Instant::now() + self.shutdown_join_budget())
     }
 
-    /// How long a caller waits for this worker to finish shutting down:
-    /// [`Self::SHUTDOWN_TIMEOUT`] in the product.
+    /// How long a caller waits for this worker to finish shutting down: five
+    /// seconds in the product.
     pub(crate) fn shutdown_join_budget(&self) -> Duration {
         self.inner.published.shutdown_budget().join
     }

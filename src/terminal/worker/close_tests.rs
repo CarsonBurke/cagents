@@ -360,8 +360,9 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     let child = shutdown_job(
         &shell,
-        // The shell outlives its job, so it cannot resume the job itself, and
-        // exits once the job does, so the grace ends there.
+        // The shell doesn't exit before its job, so bash's exit-time SIGCONT
+        // to stopped jobs can't be what resumes it, and it exits once the job
+        // does, which ends the grace there.
         b"trap 'while kill -0 $(cat child.pid) 2>/dev/null; do sleep 0.05; done; exit 0' HUP; bash -c 'trap \"printf hup > stopped-hup; exit 0\" HUP; echo $$ > child.pid; while :; do sleep 0.05; done' &\n",
         "bash",
     );
@@ -376,7 +377,13 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
                 .is_some_and(|(_, fields)| fields.starts_with('T'))
         })
     });
+    let started = Instant::now();
     let outcome = shell.terminal.shutdown();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < ShutdownBudget::PATIENT.hangup_grace,
+        "a family that exits on hangup must end the grace early: {elapsed:?}"
+    );
     assert!(
         shell.home.path().join("stopped-hup").exists(),
         "an already-stopped job must run its HUP handler before shutdown completes: {outcome:?}"
@@ -425,6 +432,13 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
     capture_finished
         .recv_timeout(crate::test_timing::EVENTUALLY)
         .unwrap();
+    // Capture stops at its own half second, not at the deadline less the
+    // confirmation reserve, which would leave it the grace's 15 s as well.
+    let capture = started.elapsed();
+    assert!(
+        capture < budget.hangup_grace,
+        "capture must stop where the hangup grace begins: {capture:?}"
+    );
     // Watching for a product grace's worth of time: a busy host can only
     // shorten the watch relative to shutdown, never end the grace early.
     let killed_during_grace = holder::exits_within(&root.0, CHILD_HANGUP_GRACE).unwrap();
@@ -459,11 +473,12 @@ fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
     let started = Instant::now();
     let outcome = shell.terminal.shutdown();
     // A family that exits on hangup closes the PTY at once; shutdown must not
-    // wait out the drain budget kept for jobs that linger.
+    // wait out the hangup grace, let alone the drain budget kept for jobs
+    // that linger.
     let elapsed = started.elapsed();
     assert!(
-        elapsed < ShutdownBudget::PATIENT.deadline / 2,
-        "a family that exits on hangup must not wait for the drain deadline: {elapsed:?}"
+        elapsed < ShutdownBudget::PATIENT.hangup_grace,
+        "a family that exits on hangup must end the grace early: {elapsed:?}"
     );
     assert!(
         outcome.is_ok(),
