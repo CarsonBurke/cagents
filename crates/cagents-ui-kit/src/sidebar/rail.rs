@@ -158,16 +158,18 @@ pub(super) fn cell<'a>(
             .into(),
     );
     if let Some(news) = badges.news {
-        layers.push(
-            widget::container(news_badge(news))
-                .id(super::news_id())
-                .class(design::transparent())
-                .align_x(Alignment::End)
-                .align_y(Alignment::Start)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-        );
+        let layer = widget::container(news_badge(news))
+            .class(design::transparent())
+            .align_x(Alignment::End)
+            .align_y(Alignment::Start)
+            .width(Length::Fill)
+            .height(Length::Fill);
+        // A count of work in progress shares the corner but is not news.
+        layers.push(if matches!(news, News::Count(_)) {
+            layer.into()
+        } else {
+            layer.id(super::news_id()).into()
+        });
     }
     if let Some(activity) = badges.activity {
         layers.push(

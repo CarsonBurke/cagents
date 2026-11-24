@@ -654,13 +654,10 @@ impl<'a> View<'a> {
             );
         }
         if working > 0 {
+            // Work is its spinner alone, as in the sidebar: what is working
+            // needs nothing from the user, so how many is the tooltip's.
             title.push(crate::interaction::tooltip(
-                widget::row::with_children(vec![
-                    crate::ui_controls::activity_spinner(12.0, design::activity_color),
-                    design::caption(working.to_string()).into(),
-                ])
-                .spacing(space::XXS)
-                .align_y(Alignment::Center),
+                crate::ui_controls::activity_spinner(12.0, design::activity_color),
                 format!("{working} working in this project's checkouts"),
             ));
         }

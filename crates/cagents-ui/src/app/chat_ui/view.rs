@@ -805,7 +805,7 @@ fn queue_row<'a>(
         details.push(crate::interaction::tooltip(
             crate::ui_controls::badged(
                 Icon::Attachment,
-                design::ROW_ICON_SIZE,
+                design::LEADING_ICON_SIZE,
                 design::Tone::Themed(design::muted_icon_color),
                 attachments.len(),
                 crate::ui_controls::BadgeFill::NEUTRAL,

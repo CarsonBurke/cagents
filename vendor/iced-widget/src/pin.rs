@@ -110,7 +110,9 @@ where
         self
     }
 
-    /// Sets whether the [`Pin`] can overflow its boundaries.
+    /// Sets whether the [`Pin`] can overflow its boundaries. Overflowing
+    /// content is laid out at its own size, unbounded by the [`Pin`]'s, so
+    /// it must size itself: a fixed or shrinking width and height.
     pub fn overflow(mut self, overflow: bool) -> Self {
         self.overflow = overflow;
         self
@@ -155,7 +157,7 @@ where
 
         let available = 
             if self.overflow {
-                limits.max()
+                Size::INFINITE
             } else {
                 limits.max() - Size::new(self.position.x, self.position.y)
             };

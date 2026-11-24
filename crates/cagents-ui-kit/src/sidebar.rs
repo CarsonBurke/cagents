@@ -107,6 +107,10 @@ const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
 /// other row's.
 const ROW_DELETE_STATUS_WIDTH: f32 = ICON_CONTROL_SIZE - 2.0 * ROW_GUTTER;
 const _: () = assert!(ROW_DELETE_STATUS_WIDTH >= ROW_STATUS_WIDTH);
+const _: () = assert!(
+    ROW_ICON_SIZE as f32 + ATTENTION_OVERHANG <= ROW_STATUS_WIDTH + ROW_GUTTER,
+    "a count badge on a row's indicator stays inside the row"
+);
 /// The project header's hover-revealed commands: disclose, new channel, new
 /// worktree. Reserved inside the header row so a long project name ellipsizes
 /// instead of running under them, and read by `row_interaction::header_at` so
@@ -6922,8 +6926,10 @@ impl RowGrid {
             content = content.push(label);
         }
         if matches!(self.kind, RowKind::Child) {
+            // At the slot's start, so a count badge, which overhangs its
+            // glyph to the right, ends at the row's edge rather than past it.
             let status = widget::container(slot(status))
-                .center_x(Length::Fixed(ROW_STATUS_WIDTH))
+                .align_left(Length::Fixed(ROW_STATUS_WIDTH))
                 .center_y(Length::Fill);
             content = content.push(if self.deletable {
                 widget::container(status)
@@ -7680,6 +7686,7 @@ fn project_view<'a>(
         chrome.new_channel_id.clone(),
     );
     let mut identity = widget::row::with_children(vec![project_identity])
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .width(Length::Fill);
     // A folded project's row count follows its name, and its live state
@@ -7694,7 +7701,11 @@ fn project_view<'a>(
         identity = identity.push(design::caption((entity.channels.len() + rows).to_string()));
     }
     if let Some(indicator) = attention_indicator(header_attention) {
-        identity = identity.push(indicator);
+        // Room for a count badge before the disclosure.
+        identity = identity.push(widget::container(indicator).padding(Padding {
+            right: ATTENTION_OVERHANG,
+            ..Padding::ZERO
+        }));
     }
     let header = project_header_row(
         identity.into(),
@@ -8459,50 +8470,65 @@ fn agent_wait_name(state: crate::agent::ActivityState) -> &'static str {
 }
 
 /// A summary's one indicator: its most urgent state's mark at a row glyph's
-/// size, with how many agents are in that state on the mark's corner when
-/// there is more than one. Unread news, whose mark is a dot, grows the dot
-/// into the count. Work in progress is its spinner alone: what is working
-/// needs nothing from the user, so how many is the tooltip's to say.
+/// size, with how many agents are in that state on the mark's lower right
+/// corner when there is more than one. Unread news, whose mark is a dot,
+/// grows the dot into the count; beside work in progress it is a dot on the
+/// spinner's upper right corner, as on the rail. Work is its spinner without
+/// a count: what is working needs nothing from the user, so how many is the
+/// tooltip's to say.
+///
+/// A badge overhangs the mark's square to the right by
+/// [`ATTENTION_OVERHANG`]; where something follows the indicator closely,
+/// leave that much room after it.
 pub fn attention_indicator<Message: Clone + 'static>(
     summary: AttentionSummary,
 ) -> Option<Element<'static, Message>> {
-    let state = summary.state()?;
-    let count = attention_count(summary, state);
+    let (state, count) = attention_count(summary)?;
     let look = state.look();
+    // News under a state that outranks it shows only beside work, as on the
+    // rail: every other state already asks the user to open the row.
+    let news = state == AttentionState::Working && summary.unread != 0;
     let mark = match look.mark {
-        attention::Mark::Glyph(icon) if count > 1 => crate::ui_controls::badged(
+        attention::Mark::Glyph(icon) => crate::ui_controls::badged(
             icon,
             ROW_ICON_SIZE,
             design::Tone::Themed(look.tone.color()),
             count,
             attention_badge_fill(look.tone),
         ),
-        attention::Mark::Dot => match crate::ui_controls::count_badge::badge_label(count) {
-            Some(label) => widget::container(crate::ui_controls::count_badge::count_pill(
-                label,
-                attention_badge_fill(look.tone),
-                1.0,
-            ))
-            .center(Length::Fixed(f32::from(ROW_ICON_SIZE)))
-            .into(),
-            None => attention_mark(state, ROW_ICON_SIZE),
-        },
-        _ => attention_mark(state, ROW_ICON_SIZE),
+        attention::Mark::Dot => {
+            use crate::ui_controls::count_badge;
+            match count_badge::badge_label(count, count_badge::PILL_MAX) {
+                Some(label) => {
+                    count_badge::pill_in(label, attention_badge_fill(look.tone), ROW_ICON_SIZE)
+                }
+                None => attention_mark(state, ROW_ICON_SIZE),
+            }
+        }
+        attention::Mark::Spinner if news => crate::ui_controls::count_badge::with_news(
+            attention_mark(state, ROW_ICON_SIZE),
+            ROW_ICON_SIZE,
+        ),
+        attention::Mark::Spinner => attention_mark(state, ROW_ICON_SIZE),
     };
     // The state's own label while it is the whole story; the summary's
     // description once there is a count or news beside it.
-    let label = if count <= 1 && summary.unread == 0 {
+    let label = if count <= 1 && !news {
         Cow::Borrowed(look.label)
     } else {
         Cow::Owned(summary.description())
     };
     let indicator = crate::interaction::tooltip(mark, label);
-    Some(if state == AttentionState::Working {
+    Some(if state == AttentionState::Working && !news {
         indicator
     } else {
         widget::container(indicator).id(news_id()).into()
     })
 }
+
+/// How far an [`attention_indicator`]'s badge reaches past its square.
+pub const ATTENTION_OVERHANG: f32 =
+    crate::ui_controls::count_badge::Corner::overhang(ROW_ICON_SIZE);
 
 /// The container every attention indicator that gives news, and every rail
 /// news badge, is drawn in; work in progress is not news. Where a row shows
@@ -8513,19 +8539,30 @@ pub(crate) fn news_id() -> Id {
     NEWS.clone()
 }
 
-/// How many agents `summary` counts in `state`, its most urgent: every wait
-/// on the user for any waiting state, since each one needs the user whatever
-/// its kind.
-fn attention_count(summary: AttentionSummary, state: AttentionState) -> usize {
-    match state {
+/// The state `summary`'s indicator shows and how many agents are in it:
+/// its most urgent state, except that waits of more than one kind show the
+/// plain waiting glyph with every wait counted, since a permission glyph
+/// with a count would say that many want permission.
+fn attention_count(summary: AttentionSummary) -> Option<(AttentionState, usize)> {
+    let state = summary.state()?;
+    Some(match state {
         AttentionState::Approval | AttentionState::Question | AttentionState::Waiting => {
-            summary.waiting
+            let own = match state {
+                AttentionState::Approval => summary.approval,
+                AttentionState::Question => summary.question,
+                _ => summary.waiting,
+            };
+            if own >= summary.waiting {
+                (state, own)
+            } else {
+                (AttentionState::Waiting, summary.waiting)
+            }
         }
-        AttentionState::Failed => summary.failed,
-        AttentionState::Limited => summary.limited,
-        AttentionState::Working => summary.working,
-        AttentionState::Unread => summary.unread,
-    }
+        AttentionState::Failed => (state, summary.failed),
+        AttentionState::Limited => (state, summary.limited),
+        AttentionState::Working => (state, summary.working),
+        AttentionState::Unread => (state, summary.unread),
+    })
 }
 
 fn attention_badge_fill(tone: attention::Tone) -> crate::ui_controls::BadgeFill {

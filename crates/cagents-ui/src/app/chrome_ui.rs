@@ -3925,7 +3925,16 @@ impl Cagents {
             );
         }
         if let Some(indicator) = sidebar::attention_indicator(attention) {
-            children.push(indicator);
+            // Room for a count badge, which overhangs the indicator's
+            // square, before the next control.
+            children.push(
+                widget::container(indicator)
+                    .padding(iced::Padding {
+                        right: sidebar::ATTENTION_OVERHANG - space::XXS,
+                        ..iced::Padding::ZERO
+                    })
+                    .into(),
+            );
         }
         if focused && self.chat_switch_available(id) {
             let blocker = self.chat_switch_blocker(id);

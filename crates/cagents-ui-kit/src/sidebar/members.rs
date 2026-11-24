@@ -282,9 +282,12 @@ impl Ground {
     /// lower right corner.
     const fn badge(self) -> Corner {
         match self {
-            Self::Row => Corner::of(LEAD),
+            Self::Row => Corner {
+                right: 11.0,
+                centre_y: 7.0,
+            },
             Self::Rail => Corner {
-                right: 13.0,
+                right: 7.5 + BADGE_WIDTHS[0] / 2.0,
                 centre_y: 6.0,
             },
         }
@@ -314,7 +317,7 @@ pub fn view<Message: 'static>(
 ) -> Option<Element<'static, Message>> {
     let lead = members.lead()?;
     let count = members.len();
-    let badge = count_badge::badge_label(count);
+    let badge = count_badge::badge_label(count, count_badge::GLYPH_MAX);
     let width = badge.as_deref().map(count_badge::badge_width);
     let opacity = if ink == RowInk::Muted { 0.55 } else { 1.0 };
     // Only the rail has room beside its lead for a second provider.
@@ -434,7 +437,7 @@ fn peek_handle(provider: Provider) -> Handle {
 fn cut_handle(provider: Provider, size: f32, hole: Hole) -> Handle {
     let (svg, symbolic) = provider_artwork(provider);
     let svg = std::str::from_utf8(svg).expect("provider artwork is UTF-8");
-    let cut = cut_svg(svg, size, hole).expect("provider artwork has a root svg with a viewBox");
+    let cut = cut_svg(svg, size, &[hole]).expect("provider artwork has a root svg with a viewBox");
     cosmic::widget::icon::from_svg_bytes(cut.into_bytes()).symbolic(symbolic)
 }
 
@@ -680,7 +683,7 @@ mod tests {
                     height: 13.0,
                 },
             ] {
-                let masked = cut_svg(svg, LEAD, hole).unwrap_or_else(|| panic!("{provider:?}"));
+                let masked = cut_svg(svg, LEAD, &[hole]).unwrap_or_else(|| panic!("{provider:?}"));
                 assert!(masked.contains(r#"<g mask="url(#cagents-cut)">"#));
                 assert!(masked.ends_with("</g></svg>"), "{provider:?}");
             }

@@ -10847,14 +10847,13 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
         rows.iter()
             .any(|(name, _)| name.starts_with("Open channel Child work"))
     );
-    // The root is working, so its one indicator is its spinner, which is
-    // not news: work outranks its unread update, which its name and tooltip
-    // still give. The channel shows its own wait, uncounted, and the
-    // project's aggregate is not repeated above its expanded children.
+    // The root's spinner carries its one unread update as a dot, and the
+    // channel shows its own wait, uncounted; the project's aggregate is not
+    // repeated above its expanded children.
     assert_eq!(
         sidebar.news_counts(),
-        vec![1],
-        "expanded Folder root and channel each render only their own state"
+        vec![1, 1],
+        "expanded Folder root and channel each render only their own news"
     );
     // A Folder has no checkouts to hide: hiding them still draws its
     // channels, so its header keeps the same root-only news.
@@ -10869,7 +10868,7 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
     );
     assert_eq!(
         sidebar.news_counts(),
-        vec![1],
+        vec![1, 1],
         "with checkouts hidden, the root and channel still render only their own news"
     );
     sidebar.state.sidebar_worktrees = display;
@@ -13388,4 +13387,89 @@ fn untracked_starts_expanded_and_history_reloads_when_head_moves() {
         "failure requires explicit retry, not an automatic loop"
     );
     assert!(previous.can_load_history());
+}
+
+/// A row's indicator counts the agents in the state its mark names: waits
+/// of one kind keep their own glyph and count, while mixed waits fall back
+/// to the plain waiting glyph counting all of them, so a permission glyph
+/// never claims a question's agent. Work and news count their own.
+#[test]
+fn an_indicator_counts_only_what_its_mark_names() {
+    let summary = |approval, question, waiting| AttentionSummary {
+        approval,
+        question,
+        waiting,
+        unread: 4,
+        working: 2,
+        ..AttentionSummary::default()
+    };
+    assert_eq!(
+        attention_count(summary(2, 0, 2)),
+        Some((AttentionState::Approval, 2))
+    );
+    assert_eq!(
+        attention_count(summary(0, 3, 3)),
+        Some((AttentionState::Question, 3))
+    );
+    assert_eq!(
+        attention_count(summary(1, 1, 2)),
+        Some((AttentionState::Waiting, 2))
+    );
+    assert_eq!(
+        attention_count(summary(1, 0, 3)),
+        Some((AttentionState::Waiting, 3))
+    );
+    assert_eq!(
+        attention_count(summary(0, 0, 0)),
+        Some((AttentionState::Working, 2))
+    );
+    assert_eq!(
+        attention_count(AttentionSummary {
+            unread: 5,
+            ..AttentionSummary::default()
+        }),
+        Some((AttentionState::Unread, 5))
+    );
+    assert_eq!(attention_count(AttentionSummary::default()), None);
+}
+
+/// Work is not news, but unread news beside it is: the spinner alone is
+/// not marked as news, and gains the news mark once there is an unread
+/// update. A count of unread news is the mark itself, spelled out to 99.
+#[test]
+fn news_beside_work_is_marked_and_unread_counts_read_to_ninety_nine() {
+    let marks = |summary: AttentionSummary| {
+        news_counts(
+            || attention_indicator::<SidebarAction>(summary).expect("an indicator"),
+            200.0,
+        )
+    };
+    let working = AttentionSummary {
+        working: 1,
+        ..AttentionSummary::default()
+    };
+    assert!(marks(working).is_empty(), "work alone is not news");
+    assert_eq!(
+        marks(AttentionSummary {
+            unread: 3,
+            ..working
+        }),
+        vec![1],
+        "unread news beside work is a dot on the spinner"
+    );
+    assert_eq!(
+        marks(AttentionSummary {
+            unread: 42,
+            ..AttentionSummary::default()
+        }),
+        vec![42]
+    );
+    assert_eq!(
+        marks(AttentionSummary {
+            unread: 1,
+            ..AttentionSummary::default()
+        }),
+        vec![1],
+        "one unread update is the dot"
+    );
 }
