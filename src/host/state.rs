@@ -6,13 +6,14 @@ mod retention;
 pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -5216,11 +5217,11 @@ fn start_terminal_view_owned_reserved(
     } else {
         Default::default()
     };
-    let redraw = Arc::new(TerminalRedraw {
-        host: Arc::downgrade(shared),
+    let redraw = Arc::new(TerminalRedraw::new(
+        Arc::downgrade(shared),
         terminal_id,
-        worker: OnceLock::new(),
-    });
+        redraw_notifier().cloned(),
+    ));
     let config = TerminalConfig {
         agent_authority,
         console_startup_owner: (paired
@@ -5281,9 +5282,8 @@ fn start_terminal_view_owned_reserved(
                 .options = install_options;
             state.startup_custody.insert(terminal_id);
             let _ = install_redraw.worker.set(handle.downgrade());
-            let event_host = Arc::downgrade(shared);
             handle.set_event_observer(move |source, event| {
-                record_event_from(&event_host, terminal_id, event, Some(source));
+                install_redraw.record_event(source, event);
             });
             #[cfg(test)]
             if state.test_fail_startup_commit == Some(terminal_id) {
@@ -5391,15 +5391,8 @@ fn start_terminal_view_owned_reserved(
             .agent_activity_wake,
     );
     redraw_handle.set_agent_process_observer(move || activity_wake.notify());
-    let event_host = Arc::downgrade(shared);
     redraw_handle.set_event_observer(move |handle, event| {
-        let completed = matches!(event, TerminalEvent::Completed { .. });
-        record_event_from(&event_host, terminal_id, event, Some(handle));
-        if completed {
-            // Completed is emitted only after the final grid and parser
-            // teardown. Notify visible subscribers from that exact worker.
-            broadcast_redraw(&event_host, terminal_id, handle.generation(), handle);
-        }
+        redraw.record_event(handle, event);
     });
 
     let descriptor = match publish_installed_terminal(
@@ -5631,17 +5624,111 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
     }
 }
 
+type RedrawSender = crossbeam_channel::Sender<Weak<TerminalRedraw>>;
+
+/// One sleeping dispatcher for steady-state redraws, separate from terminal events.
+fn redraw_notifier() -> Option<&'static RedrawSender> {
+    static NOTIFIER: OnceLock<Option<RedrawSender>> = OnceLock::new();
+    NOTIFIER
+        .get_or_init(|| {
+            // Live workers need at most one slot each. Cap retired tickets
+            // too, in case terminals churn while delivery is delayed.
+            let (send, pending) = crossbeam_channel::bounded::<Weak<TerminalRedraw>>(MAX_TERMINALS);
+            match thread::Builder::new()
+                .name("terminal-redraw".into())
+                .spawn(move || {
+                    for redraw in pending {
+                        if let Some(redraw) = redraw.upgrade() {
+                            redraw.deliver_pending();
+                        }
+                    }
+                }) {
+                Ok(_) => Some(send),
+                Err(error) => {
+                    tracing::warn!(%error, "terminal redraws will run synchronously");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 /// Binds redraw wakes before Host publication without a strong callback cycle.
 struct TerminalRedraw {
     host: Weak<HostLock>,
     terminal_id: TerminalId,
     worker: OnceLock<crate::terminal::WeakTerminalHandle>,
+    pending_generation: AtomicU64,
+    notifier: Option<RedrawSender>,
 }
 
 impl TerminalRedraw {
-    fn publish(&self, generation: u64) {
-        if let Some(worker) = self.worker.get().and_then(|worker| worker.upgrade()) {
-            broadcast_redraw(&self.host, self.terminal_id, generation, &worker);
+    fn new(host: Weak<HostLock>, terminal_id: TerminalId, notifier: Option<RedrawSender>) -> Self {
+        Self {
+            host,
+            terminal_id,
+            worker: OnceLock::new(),
+            pending_generation: AtomicU64::new(0),
+            notifier,
+        }
+    }
+
+    fn publish(self: &Arc<Self>, generation: u64) {
+        if generation == 0 || self.worker.get().is_none() {
+            return;
+        }
+        // Queue one weak ticket for this worker. A newer wake can replace a
+        // queued generation, or enqueue another ticket while it is delivered.
+        if self
+            .pending_generation
+            .fetch_max(generation, Ordering::AcqRel)
+            == 0
+            && self
+                .notifier
+                .as_ref()
+                .is_none_or(|send| send.try_send(Arc::downgrade(self)).is_err())
+        {
+            // A full or unavailable dispatcher falls back to synchronous
+            // delivery. This wake is needed to return the worker's credit.
+            self.deliver_pending();
+        }
+    }
+
+    fn deliver_pending(&self) {
+        let generation = self.pending_generation.swap(0, Ordering::AcqRel);
+        if generation != 0
+            && let Some(worker) = self.worker.get().and_then(|worker| worker.upgrade())
+        {
+            self.broadcast(generation, &worker);
+        }
+    }
+
+    fn broadcast(&self, generation: u64, worker: &TerminalHandle) {
+        // A visual callback can fail without taking down the dispatcher or
+        // dropping a terminal event that still needs to be recorded.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            broadcast_redraw(&self.host, self.terminal_id, generation, worker);
+        }));
+    }
+
+    fn record_event(self: &Arc<Self>, worker: &TerminalHandle, event: TerminalEvent) {
+        let completed = matches!(event, TerminalEvent::Completed { .. });
+        let retires_surface = match &event {
+            TerminalEvent::Exited {
+                exit_code, signal, ..
+            } => *exit_code != 0 || signal.is_some(),
+            _ => completed,
+        };
+        if retires_surface {
+            // The published grid may still have a queued visual wake. Give
+            // visible readers its frame before the event can hibernate their
+            // surface. A clean root exit leaves presentation active.
+            self.broadcast(worker.generation(), worker);
+        }
+        record_event_from(&self.host, self.terminal_id, event, Some(worker));
+        if completed {
+            // Keep the follow-up wake for view changes during completion.
+            self.publish(worker.generation());
         }
     }
 }
