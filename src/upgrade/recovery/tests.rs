@@ -2715,6 +2715,171 @@ fn complete_files(files: &SettledFiles) {
 }
 
 #[test]
+fn daemon_upgrade_retention_keeps_the_active_bundle_and_expires_an_older_one() {
+    use std::time::{Duration, SystemTime};
+
+    let old = settled_files();
+    let active = settled_files();
+    complete_files(&old);
+    complete_files(&active);
+    let current = archived_proof(&active.checkpoint, &active.target)
+        .unwrap()
+        .unwrap();
+    let old_proof = archived_proof(&old.checkpoint, &old.target)
+        .unwrap()
+        .unwrap();
+    let archive = archive_path(&active.checkpoint, &old.record.checkpoint_hash);
+    let outcome = active
+        .checkpoint
+        .with_file_name(recovery_name(&old.record.checkpoint_hash));
+    let cold = active.checkpoint.with_file_name(format!(
+        "daemon-upgrade.cold-outcome.{}.json",
+        old.record.checkpoint_hash
+    ));
+    save(&archive, &old.checkpoint_bytes);
+    save(&outcome, &old.outcome_bytes);
+    save(
+        &cold,
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "witness": { "checkpoint_hash": old.record.checkpoint_hash },
+        }))
+        .unwrap(),
+    );
+    let mut retired: Retirement =
+        serde_json::from_slice(&fs::read(old_proof.retirement_path).unwrap()).unwrap();
+    retired.archive_path = archive.clone();
+    let retired = serde_json::to_vec(&retired).unwrap();
+    let retirement = retirement_path(&active.checkpoint, &digest(&retired));
+    save(&retirement, &retired);
+
+    let now = SystemTime::now();
+    let serving = active.record.successor.as_ref().unwrap();
+    assert_eq!(
+        retention::collect_at(&active.checkpoint, serving, now).unwrap(),
+        0
+    );
+    let expired = now + retention::GRACE + Duration::from_secs(1);
+    assert_eq!(
+        retention::collect_at(&active.checkpoint, serving, expired).unwrap(),
+        4
+    );
+    for path in [archive, outcome, cold, retirement] {
+        assert!(!path.exists(), "{} survived", path.display());
+    }
+    let remaining = archived_proof(&active.checkpoint, &active.target)
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining.checkpoint_sha256, current.checkpoint_sha256);
+    assert_eq!(
+        retention::collect_at(&active.checkpoint, serving, expired).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn daemon_upgrade_retention_expires_only_unreferenced_captures() {
+    use std::time::{Duration, SystemTime};
+
+    let files = settled_files();
+    let source = &files.record.source;
+    let mut capture = CapturedCensus {
+        producer: None,
+        source: source.clone(),
+        checkpoint_hash: None,
+        census: Census::default(),
+        windows: Vec::new(),
+    };
+    let proposed = capture_path(&files.checkpoint, source).unwrap();
+    save(&proposed, &serde_json::to_vec(&capture).unwrap());
+    let hash = &files.record.checkpoint_hash;
+    let bound = bound_capture_path(&files.checkpoint, hash);
+    capture.checkpoint_hash = Some(hash.clone());
+    save(&bound, &serde_json::to_vec(&capture).unwrap());
+    let expired = SystemTime::now() + retention::GRACE + Duration::from_secs(1);
+    let serving = files.record.successor.as_ref().unwrap();
+    assert_eq!(
+        retention::collect_at(&files.checkpoint, serving, expired).unwrap(),
+        0
+    );
+
+    // A deliberately interrupted archive remains the only copy of some panes.
+    let interrupted = files.checkpoint.with_file_name(format!(
+        "daemon-upgrade.interrupted-setup.{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    fs::rename(&files.checkpoint, &interrupted).unwrap();
+    assert_eq!(
+        retention::collect_at(&files.checkpoint, serving, expired).unwrap(),
+        0
+    );
+
+    // A Ready publication continues to require the exact original capture.
+    let ready = files
+        .checkpoint
+        .with_file_name("daemon-upgrade.ready-outcome.json");
+    save(
+        &ready,
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "serving": serving,
+            "target": files.target,
+            "target_hash": files.record.target_hash,
+            "partitions": [{
+                "source": source,
+                "checkpoint_hash": hash,
+                "capture_hash": digest(&fs::read(&bound).unwrap()),
+                "chats": [],
+                "aliases": [],
+                "terminals": [],
+            }],
+        }))
+        .unwrap(),
+    );
+    fs::remove_file(interrupted).unwrap();
+    assert_eq!(
+        retention::collect_at(&files.checkpoint, serving, expired).unwrap(),
+        0
+    );
+    fs::remove_file(ready).unwrap();
+    assert_eq!(
+        retention::collect_at(&files.checkpoint, source, expired).unwrap(),
+        0
+    );
+
+    let unrelated = files.checkpoint.with_file_name("my-review.json");
+    save(&unrelated, b"retain unknown data");
+    let symlink = bound_capture_path(&files.checkpoint, &"a".repeat(64));
+    std::os::unix::fs::symlink(&unrelated, &symlink).unwrap();
+    assert_eq!(
+        retention::collect_at(&files.checkpoint, serving, expired).unwrap(),
+        0
+    );
+    assert!(
+        files.outcome.exists(),
+        "an outcome without an archive is still evidence"
+    );
+    fs::remove_file(files.outcome).unwrap();
+    let quarantine = files
+        .checkpoint
+        .with_file_name(format!(".retirement-pointer.{}.json", uuid::Uuid::new_v4()));
+    save(&quarantine, b"unrecognized retirement routing evidence");
+    assert_eq!(
+        retention::collect_at(&files.checkpoint, serving, expired).unwrap(),
+        0
+    );
+    assert!(proposed.exists() && bound.exists() && quarantine.exists());
+    fs::remove_file(quarantine).unwrap();
+    assert_eq!(
+        retention::collect_at(&files.checkpoint, serving, expired).unwrap(),
+        2
+    );
+    assert!(!proposed.exists());
+    assert!(!bound.exists());
+    assert_eq!(fs::read(symlink).unwrap(), b"retain unknown data");
+}
+
+#[test]
 fn retirement_guard_contention_is_bounded_and_leaves_no_waiter() {
     const ISOLATED: &str = "CAGENTS_TEST_RETIREMENT_CONTENTION_ISOLATED";
     if std::env::var_os(ISOLATED).is_none() {

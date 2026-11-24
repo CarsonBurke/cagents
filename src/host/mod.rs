@@ -285,15 +285,30 @@ fn start_scope_collection() -> io::Result<()> {
     .map(drop)
 }
 
-/// Reclaims transcript caches whose owners have ended and the transcripts that
-/// retired actors' final receipts no longer need: now, then every interval,
-/// until the daemon is gone. The startup sweep has already run.
+/// Runs background storage collection until the daemon is gone.
 fn start_runtime_collection(
     host: std::sync::Weak<state::HostLock>,
     root: std::path::PathBuf,
     model: Option<model::Registry>,
 ) -> io::Result<()> {
+    let mut next_upgrade_collection = std::time::Instant::now();
     runtime_collector(host, RUNTIME_COLLECT_INTERVAL, move |host, first| {
+        let now = std::time::Instant::now();
+        if now >= next_upgrade_collection {
+            next_upgrade_collection = now + std::time::Duration::from_secs(24 * 60 * 60);
+            let serving = host
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .proof()
+                .clone();
+            match service::attempt("upgrade evidence collection", || {
+                crate::upgrade::recovery::collect_superseded(&serving)
+            }) {
+                Ok(0) => {}
+                Ok(files) => tracing::info!(files, "removed expired upgrade evidence"),
+                Err(error) => tracing::warn!(%error, "upgrade evidence collection did not finish"),
+            }
+        }
         collect_runtime_directory(host, &root, model.as_ref(), first)
     })
     .map(drop)

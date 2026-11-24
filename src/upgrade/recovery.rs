@@ -3,7 +3,11 @@
 //! A Prepared checkpoint is never replay permission. This receipt identifies
 //! bytes written by an acknowledged prepare while the same update and window
 //! fences remain held. Its only startup action is adopting existing owners.
+#[cfg(any(feature = "host", test))]
+mod retention;
 pub(crate) mod verified;
+#[cfg(feature = "host")]
+pub(crate) use retention::collect_superseded;
 
 use crate::{
     chat::Session,
@@ -3410,7 +3414,7 @@ fn sweep_archive_temporaries_at(directory: &Path, proc_root: &Path) {
         }
         let file = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(entry.path())
         {
             Ok(f) => f,
