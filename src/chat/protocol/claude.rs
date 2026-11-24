@@ -4135,6 +4135,13 @@ impl Adapter for Claude {
             }
         }
     }
+    fn expendable_write(&self, frame: &Value) -> bool {
+        frame["type"] == "control_request"
+            && frame["request_id"]
+                .as_str()
+                .and_then(|id| self.controls.get(id))
+                .is_some_and(|request| request["_cagents_automatic"] == true)
+    }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
         for event in &mut step.events {

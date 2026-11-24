@@ -496,6 +496,12 @@ pub trait Adapter: Send {
     fn refresh_metadata(&mut self) -> Option<Step> {
         None
     }
+    /// Whether `frame`, one of this adapter's queued writes, is a request it
+    /// made on its own for display data. A provider that exits cleanly
+    /// before reading such a request lost no input of the reader's.
+    fn expendable_write(&self, _frame: &Value) -> bool {
+        false
+    }
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.
