@@ -80,6 +80,17 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const fn asks(self) -> bool {
+        match self {
+            Self::Waiting
+            | Self::ReviewRequested
+            | Self::MessageReceived
+            | Self::AutomationPaused
+            | Self::AutomationBlocked => true,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Interrupted => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Succeeded => "Agent finished",
@@ -320,6 +331,13 @@ pub struct Notice {
     pub delivered: bool,
     pub acknowledged: bool,
     pub window: Option<String>,
+}
+
+impl Notice {
+    /// Whether this notice asks something of the person reading it.
+    pub const fn asks(&self) -> bool {
+        self.event.evidence.kind.asks()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -38,7 +38,7 @@ class SessionOverviewTest {
             session("wait", Activity.Waiting, 2),
             session("noticed", Activity.Waiting, 4),
         )
-        val notice = Notice(id = "n", kind = NoticeKind.Waiting, session = "noticed")
+        val notice = Notice(id = "n", kind = NoticeKind.Waiting, asks = true, session = "noticed")
         val overview = SessionOverview.of(sessions, listOf(notice))
 
         assertEquals(listOf("notice/n", "waiting/wait"), overview.attention.map { it.key })
@@ -69,14 +69,14 @@ class SessionOverviewTest {
             session("asks", Activity.Waiting, 1),
             session("answered", Activity.Working, 4),
         )
-        fun notice(id: String, kind: NoticeKind, session: String? = null) =
-            Notice(id = id, kind = kind, title = kind.name, session = session)
+        fun notice(id: String, kind: NoticeKind, session: String? = null, asks: Boolean = false) =
+            Notice(id = id, kind = kind, asks = asks, title = kind.name, session = session)
         // Newest first, as the bridge sends them.
-        val notices = (1..500).map { notice("r$it", NoticeKind.ReviewRequested) } +
-            notice("a2", NoticeKind.Waiting, "asks") +
-            notice("a1", NoticeKind.Waiting, "asks") +
-            notice("gone", NoticeKind.Waiting, "closed") +
-            notice("stale", NoticeKind.Waiting, "answered") +
+        val notices = (1..500).map { notice("r$it", NoticeKind.ReviewRequested, asks = true) } +
+            notice("a2", NoticeKind.Waiting, "asks", asks = true) +
+            notice("a1", NoticeKind.Waiting, "asks", asks = true) +
+            notice("gone", NoticeKind.Waiting, "closed", asks = true) +
+            notice("stale", NoticeKind.Waiting, "answered", asks = true) +
             notice("f2", NoticeKind.Failed, "done") +
             notice("f1", NoticeKind.Succeeded, "done") +
             notice("w1", NoticeKind.Succeeded, "work") +
@@ -91,5 +91,15 @@ class SessionOverviewTest {
         // "answered" is working again, so its old request is no longer a card.
         assertEquals(listOf("answered", "work"), overview.working.map { it.session.id })
         assertEquals(listOf("done"), overview.recent.map { it.session.id })
+    }
+
+    @Test
+    fun takesTheAskingClassificationFromTheBridge() {
+        val notices = listOf(
+            Notice(id = "new-kind", asks = true),
+            Notice(id = "quiet", kind = NoticeKind.AutomationPaused, asks = false),
+        )
+        val overview = SessionOverview.of(emptyList(), notices)
+        assertEquals(listOf("notice/new-kind"), overview.attention.map { it.key })
     }
 }

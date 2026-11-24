@@ -373,6 +373,7 @@ data class NoticeList(val notices: List<Notice> = emptyList())
 data class Notice(
     val id: String,
     val kind: NoticeKind = NoticeKind.Unknown,
+    val asks: Boolean = false,
     val title: String = "",
     val session: String? = null,
     val conversation: String? = null,

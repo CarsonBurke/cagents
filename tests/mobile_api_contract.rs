@@ -384,6 +384,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                 notices: vec![Notice {
                     id: "0b0e7a52-6f6b-4f7c-8a35-5c9f3f0e2d11".into(),
                     kind: NoticeKind::Waiting,
+                    asks: true,
                     title: "Agent needs your attention".into(),
                     session: Some(session()),
                     conversation: Some("Fix the build".into()),
@@ -391,6 +392,35 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                     request: Some(RequestKind::Approval),
                     provider: Some("claude".into()),
                 }],
+            })),
+        ),
+        (
+            "event notifications asks",
+            event(Event::Notifications(Notifications {
+                notices: vec![
+                    Notice {
+                        id: "review".into(),
+                        kind: NoticeKind::ReviewRequested,
+                        asks: true,
+                        title: "Your review was requested".into(),
+                        session: None,
+                        conversation: None,
+                        preview: None,
+                        request: None,
+                        provider: None,
+                    },
+                    Notice {
+                        id: "outcome".into(),
+                        kind: NoticeKind::Succeeded,
+                        asks: false,
+                        title: "Agent finished".into(),
+                        session: Some(session()),
+                        conversation: None,
+                        preview: None,
+                        request: None,
+                        provider: None,
+                    },
+                ],
             })),
         ),
         (

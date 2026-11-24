@@ -374,6 +374,7 @@ fn notice(notice: &notifications::Notice) -> api::Notice {
     let nonempty = |text: &str| (!text.is_empty()).then(|| text.to_owned());
     api::Notice {
         id: notice.id.to_string(),
+        asks: notice.asks(),
         kind: match event.evidence.kind {
             Kind::Succeeded => api::NoticeKind::Succeeded,
             Kind::Failed => api::NoticeKind::Failed,
