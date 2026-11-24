@@ -85,7 +85,6 @@ const OPEN_FOR: Duration = Duration::from_secs(60);
 const MENTIONED_OPEN_FOR: Duration = Duration::from_secs(10 * 60);
 const FINISHED_FOR: Duration = Duration::from_secs(30 * 60);
 const NOT_A_PULL_REQUEST_FOR: Duration = Duration::from_secs(24 * 60 * 60);
-const BRANCH_FOUND_FOR: Duration = Duration::from_secs(15 * 60);
 const BRANCH_MISSING_FOR: Duration = Duration::from_secs(10 * 60);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -117,9 +116,10 @@ struct State {
 }
 
 impl State {
-    fn lookups_due(&self) -> bool {
+    fn lookup_retry(&self) -> Option<Instant> {
         self.failed
-            .is_none_or(|failed| failed.elapsed() >= backoff(self.failures))
+            .map(|failed| failed + backoff(self.failures))
+            .filter(|&due| due > Instant::now())
     }
 
     fn succeeded(&mut self) {
@@ -154,10 +154,8 @@ struct Observed {
 }
 
 impl Observed {
-    fn due(&self, worked_on: bool) -> bool {
-        let Some(checked) = self.checked else {
-            return true;
-        };
+    fn refresh_at(&self, worked_on: bool) -> Option<Instant> {
+        let checked = self.checked?;
         let wait =
             if self.missing {
                 NOT_A_PULL_REQUEST_FOR
@@ -172,7 +170,7 @@ impl Observed {
             } else {
                 MENTIONED_OPEN_FOR
             };
-        checked.elapsed() >= wait
+        Some(checked + wait)
     }
 }
 
@@ -206,9 +204,29 @@ struct Watched {
     /// search that found nothing is not repeated before this.
     search_after: Option<Instant>,
     searches_missed: u32,
-    record_read_at: Option<Instant>,
-    record_retry: Option<Instant>,
-    file_retry: Option<Instant>,
+    input: InputRead,
+}
+
+#[derive(Default)]
+struct InputRead {
+    read: Option<Instant>,
+    due: Option<Instant>,
+}
+
+impl InputRead {
+    fn changed(&mut self, now: Instant) {
+        sooner(&mut self.due, self.read.map_or(now, |read| read + TICK));
+    }
+
+    fn complete(&mut self, again: Option<Duration>) {
+        let now = Instant::now();
+        self.read = Some(now);
+        self.due = again.map(|delay| now + delay);
+    }
+}
+
+fn sooner(next: &mut Option<Instant>, at: Instant) {
+    *next = Some(next.map_or(at, |pending| pending.min(at)));
 }
 
 /// Where a pass found the conversation's transcript.
@@ -283,9 +301,7 @@ impl Watched {
             located_id: None,
             search_after: None,
             searches_missed: 0,
-            record_read_at: None,
-            record_retry: None,
-            file_retry: None,
+            input: InputRead::default(),
         }
     }
 
@@ -537,6 +553,7 @@ enum Resolved {
         head: GitHubRepoKey,
         branch: String,
     },
+    Deferred(Instant),
     Nothing,
 }
 
@@ -740,24 +757,18 @@ impl Handle {
                 .watched
                 .iter_mut()
                 .filter_map(|(id, watched)| {
-                    if followed.contains(id) {
-                        if dirty.contains(id) {
-                            // Streaming frames coalesce without slowing an idle
-                            // conversation's first new record.
-                            watched.record_retry.get_or_insert_with(|| {
-                                watched.record_read_at.map_or(now, |read| read + TICK)
-                            });
-                        }
-                        (watched.source == Source::Pending
-                            || watched.record_retry.is_some_and(|due| due <= now))
-                        .then_some(*id)
-                    } else {
-                        (!watched.watchers.is_empty()
-                            && (dirty.contains(id)
-                                || watched.search_after.is_some_and(|due| due <= now)
-                                || watched.file_retry.is_some_and(|due| due <= now)))
-                        .then_some(*id)
+                    let followed = followed.contains(id);
+                    if !followed && watched.watchers.is_empty() {
+                        return None;
                     }
+                    if dirty.contains(id) {
+                        watched.input.changed(now);
+                    }
+                    let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
+                    (due(watched.input.due)
+                        || due(watched.search_after)
+                        || (followed && watched.source == Source::Pending))
+                        .then_some(*id)
                 })
                 .collect::<Vec<_>>();
             (conversations, read)
@@ -819,10 +830,10 @@ impl Handle {
             // Watching and unwatching take the same lock, so the files and
             // the record are read without it. Only this thread moves the
             // cursors.
-            let (scanned, record_retry, file_retry) = match &source {
+            let (scanned, again) = match &source {
                 Source::Recorded => {
                     let (scanned, retry) = recorded(host, *conversation, &mut items);
-                    (scanned, retry, None)
+                    (scanned, retry.then_some(TICK))
                 }
                 Source::Located(located) => {
                     let covered = files.cover(*conversation, located);
@@ -832,9 +843,9 @@ impl Handle {
                         _ if !covered => Some(UNWATCHED_TRANSCRIPT),
                         _ => None,
                     };
-                    (scanned, false, retry)
+                    (scanned, retry)
                 }
-                Source::Pending => (scan(&source, &mut cursors), false, None),
+                Source::Pending => (scan(&source, &mut cursors), None),
             };
             // Work on "the current branch" is pinned to the branch checked
             // out as it is read.
@@ -855,21 +866,16 @@ impl Handle {
             {
                 watched.files = cursors;
                 watched.items = items;
-                let now = Instant::now();
-                if source == Source::Recorded {
-                    watched.record_read_at = Some(now);
-                    watched.record_retry = record_retry.then(|| now + TICK);
-                }
-                watched.file_retry = file_retry.map(|delay| now + delay);
+                watched.input.complete(again);
                 watched.apply(scanned, facts.get(conversation).and_then(Option::as_deref));
             }
         }
-        let delay = self.conversation_delay(&followed, !conversations.is_empty());
+        let delay = self.conversation_delay(&followed);
         if conversations.is_empty() {
             return delay;
         }
-        self.look_up(&conversations, &facts);
-        self.measure(&conversations, &facts);
+        let next_lookup = self.look_up(&conversations, &facts);
+        let more_diffs = self.measure(&conversations, &facts);
         let proof = Arc::new(
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -916,38 +922,34 @@ impl Handle {
                     ))
                     .is_ok()
             });
+            if watched.watchers.is_empty() {
+                self.0.conversations.signal.notify();
+            }
         }
         delay
+            .into_iter()
+            .chain(next_lookup.map(|at| at.saturating_duration_since(Instant::now())))
+            .chain(more_diffs.then_some(TICK))
+            .min()
     }
 
-    fn conversation_delay(
-        &self,
-        followed: &BTreeSet<TerminalId>,
-        watching: bool,
-    ) -> Option<Duration> {
-        let state = self.conversations();
-        let next = state
+    fn conversation_delay(&self, followed: &BTreeSet<TerminalId>) -> Option<Duration> {
+        self.conversations()
             .watched
             .iter()
             .filter_map(|(id, watched)| {
-                if followed.contains(id) {
-                    watched.record_retry
-                } else if watched.watchers.is_empty() {
+                if !followed.contains(id) && watched.watchers.is_empty() {
                     watched.unwatched_since.map(|since| since + KEPT_UNWATCHED)
                 } else {
                     watched
                         .search_after
                         .into_iter()
-                        .chain(watched.file_retry)
+                        .chain(watched.input.due)
                         .min()
                 }
             })
-            .min();
-        // Watched conversations also refresh unresolved forge references.
-        next.map(|due| due.saturating_duration_since(Instant::now()))
-            .into_iter()
-            .chain(watching.then_some(TICK))
             .min()
+            .map(|due| due.saturating_duration_since(Instant::now()))
     }
 
     /// Project placement reads the workspace registry and Git metadata.
@@ -1020,7 +1022,7 @@ impl Handle {
         &self,
         conversations: &[TerminalId],
         facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
-    ) {
+    ) -> bool {
         let due = {
             let mut state = self.conversations();
             let mut wanted = BTreeMap::new();
@@ -1048,6 +1050,7 @@ impl Handle {
                 })
                 .collect::<Vec<_>>()
         };
+        let more = due.len() > MEASURES_PER_PASS;
         let git = crate::repository::RepositoryService::system("git");
         for (path, fingerprint) in due.into_iter().take(MEASURES_PER_PASS) {
             let diff = match &fingerprint.dirty {
@@ -1066,6 +1069,7 @@ impl Handle {
                 .measured
                 .insert(path, Measured { fingerprint, diff });
         }
+        more
     }
 
     /// Asks GitHub about the few pull requests and branches most worth it.
@@ -1073,14 +1077,16 @@ impl Handle {
         &self,
         conversations: &[TerminalId],
         facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
-    ) {
+    ) -> Option<Instant> {
+        let mut next = None;
         // In rank order across conversations, so the budget goes to what
         // they worked on before what they mentioned.
         let lookups = {
             let state = self.conversations();
-            if !state.lookups_due() {
-                return;
+            if let Some(due) = state.lookup_retry() {
+                return Some(due);
             }
+            let now = Instant::now();
             let mut lookups: Vec<(Relation, Lookup)> = Vec::new();
             for conversation in conversations {
                 let (Some(watched), Some(Some(facts))) =
@@ -1103,12 +1109,16 @@ impl Handle {
                                 .project
                                 .as_ref()
                                 .is_some_and(|project| project.listed(&key).is_some());
-                            if listed
-                                || !state
-                                    .observed
-                                    .get(&key)
-                                    .is_none_or(|observed| observed.due(worked_on))
+                            if listed {
+                                continue;
+                            }
+                            if let Some(due) = state
+                                .observed
+                                .get(&key)
+                                .and_then(|read| read.refresh_at(worked_on))
+                                .filter(|&due| due > now)
                             {
+                                sooner(&mut next, due);
                                 continue;
                             }
                             Lookup::PullRequest(key)
@@ -1131,6 +1141,10 @@ impl Handle {
                             head: RepoKeyOrd::from(&head),
                             branch,
                         },
+                        Resolved::Deferred(due) => {
+                            sooner(&mut next, due);
+                            continue;
+                        }
                         Resolved::Nothing => continue,
                     };
                     match lookups.iter_mut().find(|(_, known)| *known == lookup) {
@@ -1142,25 +1156,23 @@ impl Handle {
             lookups.sort_by_key(|(relation, _)| *relation);
             lookups
         };
-        if lookups.is_empty() {
-            return;
+        if let Some(due) = self.run_lookups(&GitHubService::system("gh"), lookups) {
+            sooner(&mut next, due);
         }
-        self.run_lookups(
-            &GitHubService::system("gh"),
-            lookups.into_iter().map(|(_, lookup)| lookup),
-        );
+        next
     }
 
     fn run_lookups<E: crate::repository::ProcessExecutor>(
         &self,
         gh: &GitHubService<E>,
-        lookups: impl IntoIterator<Item = Lookup>,
-    ) {
+        lookups: impl IntoIterator<Item = (Relation, Lookup)>,
+    ) -> Option<Instant> {
         let cancellation = &self.0.cancellation;
         let mut checked_hosts = BTreeSet::new();
         let mut limited = BTreeMap::new();
         let mut reads = 0;
-        for lookup in lookups {
+        let mut next = None;
+        for (relation, lookup) in lookups {
             let repository = lookup.repository();
             let authority = repository.authority();
             // A transport worker binds the credential context. Use its
@@ -1172,6 +1184,10 @@ impl Handle {
                 limited.insert(authority.clone(), limit);
             }
             if limited.contains_key(&authority) {
+                continue;
+            }
+            if reads == LOOKUPS_PER_PASS {
+                sooner(&mut next, Instant::now() + TICK);
                 continue;
             }
 
@@ -1205,7 +1221,7 @@ impl Handle {
                             entry.failures = entry.failures.saturating_add(1);
                         }
                         state.failed(&error);
-                        return;
+                        return state.lookup_retry();
                     }
                 };
                 match lookup {
@@ -1213,13 +1229,21 @@ impl Handle {
                         if let Some(found) = &found
                             && let Ok(key) = PullRequestKey::new(repository, found.number)
                         {
-                            state.observed.insert((&key).into(), observed_now(found));
+                            let read = observed_now(found);
+                            if let Some(due) = read.refresh_at(relation.worked_on()) {
+                                sooner(&mut next, due);
+                            }
+                            state.observed.insert((&key).into(), read);
+                        }
+                        let checked = Instant::now();
+                        if found.is_none() {
+                            sooner(&mut next, checked + BRANCH_MISSING_FOR);
                         }
                         state.branches.insert(
                             (base, branch),
                             BranchLookup {
                                 number: found.map(|found| found.number),
-                                checked: Instant::now(),
+                                checked,
                             },
                         );
                     }
@@ -1232,17 +1256,24 @@ impl Handle {
                             entry.missing = true;
                             entry.failures = 0;
                         }
+                        if let Some(due) = entry.refresh_at(relation.worked_on()) {
+                            sooner(&mut next, due);
+                        }
                     }
                 }
             }
-            if reads == LOOKUPS_PER_PASS {
-                break;
-            }
         }
-        self.conversations().forge_error = limited
-            .values()
-            .min_by_key(|limit| limit.retry_at)
-            .map(ToString::to_string);
+        let limit = limited.values().min_by_key(|limit| limit.retry_at);
+        if let Some(limit) = limit {
+            let reset_in = limit
+                .retry_at
+                .saturating_mul(1000)
+                .saturating_sub(now_unix_ms());
+            let delay = Duration::from_millis(reset_in).max(Duration::from_secs(1));
+            sooner(&mut next, Instant::now() + delay);
+        }
+        self.conversations().forge_error = limit.map(ToString::to_string);
+        next
     }
 }
 
@@ -1377,27 +1408,17 @@ fn resolve(
             });
         }
         match branches.get(&(base.into(), name.to_owned())) {
-            Some(lookup) => {
-                let fresh = lookup.checked.elapsed()
-                    < if lookup.number.is_some() {
-                        BRANCH_FOUND_FOR
-                    } else {
-                        BRANCH_MISSING_FOR
-                    };
-                match lookup.number {
-                    Some(number) => Resolved::Key(PullRequestKeyOrd {
-                        repository: base.into(),
-                        number,
-                    }),
-                    None if fresh => Resolved::Nothing,
-                    None => Resolved::Branch {
-                        base: base.clone(),
-                        head: head.unwrap_or(base).clone(),
-                        branch: name.to_owned(),
-                    },
-                }
+            Some(BranchLookup {
+                number: Some(number),
+                ..
+            }) => Resolved::Key(PullRequestKeyOrd {
+                repository: base.into(),
+                number: *number,
+            }),
+            Some(BranchLookup { checked, .. }) if checked.elapsed() < BRANCH_MISSING_FOR => {
+                Resolved::Deferred(*checked + BRANCH_MISSING_FOR)
             }
-            None => Resolved::Branch {
+            _ => Resolved::Branch {
                 base: base.clone(),
                 head: head.unwrap_or(base).clone(),
                 branch: name.to_owned(),

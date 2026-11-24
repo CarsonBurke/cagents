@@ -472,15 +472,15 @@ fn many_mentions_drop_the_oldest_mention_before_any_work() {
 #[test]
 fn failed_lookups_back_off() {
     let mut state = State::default();
-    assert!(state.lookups_due());
+    assert!(state.lookup_retry().is_none());
     let error = GitHubError::NoActiveAccount("github.com".into());
     state.failed(&error);
-    assert!(!state.lookups_due());
+    assert!(state.lookup_retry().is_some());
     assert_eq!(backoff(1), Duration::from_secs(30));
     assert_eq!(backoff(2), Duration::from_secs(60));
     assert_eq!(backoff(40), FINISHED_FOR);
     state.succeeded();
-    assert!(state.lookups_due());
+    assert!(state.lookup_retry().is_none());
     assert!(state.forge_error.is_none());
 }
 
@@ -530,7 +530,7 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
         })
     };
 
-    polling::with_scope(scope, || {
+    let deadline = polling::with_scope(scope, || {
         let reset = polling::now() + 600;
         for (repository, resource) in [(&spent, "graphql"), (&rest_spent, "core")] {
             polling::failed(
@@ -547,8 +547,10 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
         })
         .chain((1..10).map(|number| view(&spent, number)))
         .chain([view(&rest_spent, 1), view(&open, 1)]);
-        work.run_lookups(&gh, lookups);
+        work.run_lookups(&gh, lookups.map(|lookup| (Relation::Edited, lookup)))
     });
+    let waiting = deadline.unwrap().saturating_duration_since(Instant::now());
+    assert!((Duration::from_secs(598)..=Duration::from_secs(600)).contains(&waiting));
 
     let commands = forge.0.lock().unwrap();
     assert_eq!(commands.len(), 2);
@@ -562,7 +564,7 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
     );
     assert!(state.branches.is_empty());
     assert!(
-        state.lookups_due(),
+        state.lookup_retry().is_none(),
         "rate limits do not start an outage backoff"
     );
     assert!(
@@ -1304,7 +1306,7 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
         assert!(watched.watchers.is_empty());
         assert_eq!(numbers(watched), [1]);
         assert_eq!(watched.coverage, TranscriptCoverage::Complete);
-        watched.record_read_at = Some(Instant::now() - TICK);
+        watched.input.read = Some(Instant::now() - TICK);
     }
 
     // A daemon-origin command writes a record without provider output or
