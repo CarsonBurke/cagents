@@ -6666,12 +6666,21 @@ fn composer_offers_send_only_for_a_draft_and_keeps_stop_last() {
         mode: PromptMode::Send,
         slot: 0,
     };
-    assert_eq!(composer_trailing(&[PromptMode::Send], false, false), []);
-    assert_eq!(composer_trailing(&[PromptMode::Send], false, true), [send]);
-    let working = [PromptMode::Steer, PromptMode::Queue];
-    assert_eq!(composer_trailing(&working, true, false), [Trailing::Stop]);
     assert_eq!(
-        composer_trailing(&working, true, true),
+        composer_trailing(&[PromptMode::Send], false, false, false),
+        []
+    );
+    assert_eq!(
+        composer_trailing(&[PromptMode::Send], false, true, false),
+        [send]
+    );
+    let working = [PromptMode::Steer, PromptMode::Queue];
+    assert_eq!(
+        composer_trailing(&working, true, false, false),
+        [Trailing::Stop]
+    );
+    assert_eq!(
+        composer_trailing(&working, true, true, false),
         [
             Trailing::Submit {
                 mode: PromptMode::Steer,
@@ -6684,6 +6693,35 @@ fn composer_offers_send_only_for_a_draft_and_keeps_stop_last() {
             Trailing::Stop,
         ]
     );
+}
+
+/// Dictation writes into the draft while it listens, so Send can appear
+/// mid-session. The microphone stays at the trailing edge, and Stop just
+/// before it, whatever the draft and the turn, so neither moves under a
+/// pointer about to press it.
+#[test]
+fn composer_keeps_the_microphone_at_the_trailing_edge() {
+    for modes in [
+        &[PromptMode::Send][..],
+        &[PromptMode::Steer, PromptMode::Queue][..],
+    ] {
+        for busy in [false, true] {
+            for has_draft in [false, true] {
+                let controls = composer_trailing(modes, busy, has_draft, true);
+                assert_eq!(controls.last(), Some(&Trailing::Dictate));
+                let stop = controls
+                    .iter()
+                    .rposition(|control| *control == Trailing::Stop);
+                assert_eq!(
+                    stop,
+                    busy.then(|| controls.len() - 2),
+                    "Stop keeps its place beside the microphone: {controls:?}"
+                );
+                let without = composer_trailing(modes, busy, has_draft, false);
+                assert_eq!(controls[..controls.len() - 1], without[..]);
+            }
+        }
+    }
 }
 
 /// A cancel that also stops background subagents waits for a second

@@ -668,23 +668,36 @@ enum Trailing {
     Submit { mode: PromptMode, slot: usize },
     /// Cancels the active turn.
     Stop,
+    /// Starts or stops dictating into the draft.
+    Dictate,
 }
 
 /// The composer's trailing controls, leading edge first.
 ///
 /// The submit controls appear only while there is something to send, and
-/// lead the group: whatever follows them - Stop while the agent works - keeps
-/// its place at the trailing edge as a draft is typed or cleared, so a
-/// pointer resting on Stop is never moved onto Send. A disabled Send beside
-/// an empty draft said nothing a reader could act on, and while the agent
-/// works it sat where Stop belonged.
-fn composer_trailing(modes: &[PromptMode], busy: bool, has_draft: bool) -> Vec<Trailing> {
+/// lead the group: whatever follows them - Stop while the agent works, then
+/// the microphone where this copy can dictate - keeps its place as a draft
+/// is typed or cleared, so a pointer resting on Stop is never moved onto
+/// Send. A disabled Send beside an empty draft said nothing a reader could
+/// act on, and while the agent works it sat where Stop belonged.
+///
+/// The microphone holds the very edge because dictation writes into the
+/// draft while it listens: Send appears mid-session, and a microphone ahead
+/// of it would slide away from a pointer about to stop dictating, leaving
+/// Send under it. At the edge it stays put whatever comes and goes beside it.
+fn composer_trailing(
+    modes: &[PromptMode],
+    busy: bool,
+    has_draft: bool,
+    dictation: bool,
+) -> Vec<Trailing> {
     let offered = if has_draft { modes } else { &[] };
     offered
         .iter()
         .enumerate()
         .map(|(slot, &mode)| Trailing::Submit { mode, slot })
         .chain(busy.then_some(Trailing::Stop))
+        .chain(dictation.then_some(Trailing::Dictate))
         .collect()
 }
 
@@ -4551,38 +4564,46 @@ impl Runtime {
         // permanently present for something used occasionally.
         // Stop is there whenever the conversation works, turn or not: it is
         // the way out of a turn that is slow to begin.
-        let submissions: Vec<Element<'_, Message>> =
-            composer_trailing(modes, snapshot.busy, has_draft)
-                .into_iter()
-                .map(|control| match control {
-                    Trailing::Submit { mode, slot } => {
-                        let shown = match mode {
-                            PromptMode::Steer if !self.turn_running() => PromptMode::Send,
-                            mode => mode,
-                        };
-                        let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
-                        crate::ui_controls::icon_button(name, tooltip)
-                            .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
-                            .selected(slot == 0)
-                            .tone(crate::design::Tone::Themed(if slot == 0 {
-                                design::accent_color
-                            } else {
-                                design::muted_icon_color
-                            }))
-                            .on_press_maybe(
-                                (available
-                                    && !self.start_blocked.is_some()
-                                    && !self.provider_coming_up())
-                                .then(|| action(Action::SubmitControl(target, mode))),
-                            )
-                            .into()
-                    }
-                    Trailing::Stop => self.stop_control(available),
-                })
-                .collect();
-        // One row: `+`, the draft, then what sends or stops it. The controls
-        // hold the row's foot, so a draft that grows keeps them beside its
-        // last line, and the inset centers them on a single line of text.
+        let trailing_controls: Vec<Element<'_, Message>> = composer_trailing(
+            modes,
+            snapshot.busy,
+            has_draft,
+            crate::dictation::available(),
+        )
+        .into_iter()
+        .filter_map(|control| {
+            Some(match control {
+                Trailing::Submit { mode, slot } => {
+                    let shown = match mode {
+                        PromptMode::Steer if !self.turn_running() => PromptMode::Send,
+                        mode => mode,
+                    };
+                    let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
+                    crate::ui_controls::icon_button(name, tooltip)
+                        .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
+                        .selected(slot == 0)
+                        .tone(crate::design::Tone::Themed(if slot == 0 {
+                            design::accent_color
+                        } else {
+                            design::muted_icon_color
+                        }))
+                        .on_press_maybe(
+                            (available
+                                && !self.start_blocked.is_some()
+                                && !self.provider_coming_up())
+                            .then(|| action(Action::SubmitControl(target, mode))),
+                        )
+                        .into()
+                }
+                Trailing::Stop => self.stop_control(available),
+                Trailing::Dictate => self.dictation_control(shortcuts, !read_only)?,
+            })
+        })
+        .collect();
+        // One row: `+`, the draft, then what sends or stops it and the
+        // microphone. The controls hold the row's foot, so a draft that grows
+        // keeps them beside its last line, and the inset centers them on a
+        // single line of text.
         let control = |control: Element<'a, Message>| -> Element<'a, Message> {
             widget::container(control)
                 .padding(iced::Padding::ZERO.bottom(COMPOSER_CONTROL_INSET))
@@ -4594,9 +4615,8 @@ impl Runtime {
         };
         let mut row: Vec<Element<'_, Message>> = Vec::new();
         row.extend(plus.map(control));
-        row.extend(self.dictation_control(shortcuts, !read_only).map(control));
         row.push(editor);
-        row.extend(submissions.into_iter().map(control));
+        row.extend(trailing_controls.into_iter().map(control));
         // The editor and its controls are one object: a single raised
         // surface, so the composer reads as one place to type rather than a
         // field with a toolbar bolted under it. The `+` menu opens above it,
