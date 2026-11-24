@@ -239,9 +239,10 @@ struct Tracked {
     last_fresh_poll: Option<Instant>,
     next_poll: Instant,
     failures: u32,
-    /// Until when GitHub's rate limit refuses this project's account. Not a
-    /// failure: no poll is due before it resets, and none waits past it.
-    paused_until: Option<Instant>,
+    /// The Unix second GitHub's rate limit admits this project's account
+    /// again. Not a failure: no poll is due before it, and none waits past
+    /// it. Wall-clock, as GitHub's reset is, so a suspend doesn't stretch it.
+    paused_until: Option<u64>,
     memory: forge::Memory,
     /// When a CLI board or a watched conversation last read this project.
     /// Only the projects someone reads poll at the watched cadence.
@@ -306,8 +307,12 @@ impl Tracked {
     /// outage would leave the board stale for up to half an hour after it
     /// resets.
     fn poll_failed(&mut self, failure: forge::Failure) {
-        match failure.retry_at {
-            Some(retry_at) => self.paused_until = Some(rate_limit_reset(retry_at)),
+        match failure.retry_at.and_then(rate_limit_pause) {
+            // GitHub answered, so earlier outages are over.
+            Some(until) => {
+                self.paused_until = Some(until);
+                self.failures = 0;
+            }
             None => self.failures = self.failures.saturating_add(1),
         }
         let error = failure.message;
@@ -322,16 +327,50 @@ impl Tracked {
 
     /// Whether GitHub's rate limit still refuses this project's account.
     fn paused(&self) -> bool {
-        self.paused_until
-            .is_some_and(|until| until > Instant::now())
+        self.paused_until.is_some_and(|until| !pause_over(until))
     }
 
-    /// When the poll after one at `last` is due: never before a rate limit
-    /// resets.
+    /// When the poll after one at `last` is due: when a rate limit resets,
+    /// while one refuses the account.
     fn forge_deadline(&self, last: Instant, watching: bool) -> Instant {
-        let deadline = last + self.forge_interval(watching);
         self.paused_until
-            .map_or(deadline, |until| deadline.max(until))
+            .map_or_else(|| last + self.forge_interval(watching), pause_ends)
+    }
+
+    /// Whether the forge poller should read this project now. A pause is
+    /// over by the wall clock, which kept counting through a suspend that
+    /// `next_poll` slept through.
+    fn forge_due(&self, now: Instant) -> bool {
+        self.poll_requested || self.next_poll <= now || self.paused_until.is_some_and(pause_over)
+    }
+
+    /// Records what a forge poll read, and when the next is due.
+    fn polled(&mut self, outcome: forge::Outcome, synced_at: u64, watching: bool) {
+        self.paused_until = None;
+        match outcome {
+            forge::Outcome::Synced(snapshot) => {
+                self.failures = 0;
+                let hints = snapshot.hints();
+                self.forge = Forge::Synced {
+                    at_unix_ms: synced_at,
+                    error: None,
+                };
+                self.snapshot = Some(Arc::new(snapshot));
+                // New branches or merges need measuring before the cards
+                // they belong to are right.
+                if *self.hints != hints {
+                    self.hints = Arc::new(hints);
+                    self.pending.get_or_insert_with(Default::default);
+                }
+            }
+            forge::Outcome::NotGitHub => {
+                self.failures = 0;
+                self.forge = Forge::NotGitHub;
+                self.snapshot = None;
+            }
+            forge::Outcome::Failed(failure) => self.poll_failed(failure),
+        }
+        self.next_poll = self.forge_deadline(Instant::now(), watching);
     }
 
     /// Records a read of this project. The first in a while brings its forge
@@ -351,7 +390,7 @@ impl Tracked {
             .next_poll
             .min(last + forge::interval(true, self.failures));
         if let Some(until) = self.paused_until {
-            self.next_poll = self.next_poll.max(until);
+            self.next_poll = self.next_poll.max(pause_ends(until));
         }
         if self.failures == 0 && !self.paused() && last.elapsed() >= forge::WATCHED_INTERVAL {
             self.poll_requested = true;
@@ -971,11 +1010,34 @@ fn now_unix_ms() -> u64 {
 /// again by then rather than trusted.
 const RATE_LIMIT_PAUSE_MAX: Duration = Duration::from_secs(61 * 60);
 
-/// The instant a rate limit resetting at Unix second `retry_at` admits
-/// requests again: the second after it, as the shared budget counts.
-fn rate_limit_reset(retry_at: u64) -> Instant {
-    let wait = retry_at.saturating_sub(crate::github::polling::now()) + 1;
-    Instant::now() + Duration::from_secs(wait).min(RATE_LIMIT_PAUSE_MAX)
+/// The nearest reset, in seconds, that pauses polls rather than counting as
+/// a failure. GitHub refusing a request the shared budget had admitted
+/// again, with a reset about now, means this clock runs ahead of GitHub's:
+/// waiting for that reset would ask again every poll until GitHub's.
+const RATE_LIMIT_PAUSE_MIN: u64 = 2;
+
+/// How often the forge poller looks at the wall clock while a rate limit
+/// pauses a project.
+const PAUSED_WAKE: Duration = Duration::from_secs(60);
+
+/// The Unix second until which a rate limit resetting at `retry_at` pauses
+/// polls: the second after it, as the shared budget counts. `None` when it
+/// resets too soon to trust, which backs off as an outage does.
+fn rate_limit_pause(retry_at: u64) -> Option<u64> {
+    let now = crate::github::polling::now();
+    (retry_at > now + RATE_LIMIT_PAUSE_MIN)
+        .then(|| (retry_at + 1).min(now + RATE_LIMIT_PAUSE_MAX.as_secs()))
+}
+
+/// Whether a pause until Unix second `until` is over.
+fn pause_over(until: u64) -> bool {
+    until <= crate::github::polling::now()
+}
+
+/// The instant a pause until Unix second `until` ends, by this process's
+/// monotonic clock.
+fn pause_ends(until: u64) -> Instant {
+    Instant::now() + Duration::from_secs(until.saturating_sub(crate::github::polling::now()))
 }
 
 fn open_projects(host: &SharedHost) -> Result<Vec<ModelProject>, String> {
@@ -1119,6 +1181,10 @@ impl Handle {
                 });
                 // A poll that only probed can miss what the probe can't see,
                 // such as a rerun check, so only a read listing answers.
+                // It runs during a rate-limit pause too: the shared budget
+                // refuses the listing without asking GitHub, so a refresh
+                // costs at most the conditional REST probe and answers with
+                // the limit.
                 let poll = (fresh
                     && tracked.forge != Forge::NotGitHub
                     && !recent(tracked.last_fresh_poll))
@@ -1582,7 +1648,7 @@ impl Handle {
             shared
                 .projects
                 .iter_mut()
-                .filter(|(_, tracked)| tracked.poll_requested || tracked.next_poll <= now)
+                .filter(|(_, tracked)| tracked.forge_due(now))
                 .filter_map(|(repository, tracked)| {
                     // The checkout `gh` resolves from comes from a scan.
                     let local = tracked.local.as_ref()?;
@@ -1646,7 +1712,7 @@ impl Handle {
                 // The last reader can leave while an earlier repository in
                 // this wave is being read. Its new idle deadline applies to
                 // queued polls too; explicit freshness requests still run.
-                if !requested && !tracked.poll_requested && tracked.next_poll > Instant::now() {
+                if !requested && !tracked.forge_due(Instant::now()) {
                     tracked.memory = memory;
                     continue;
                 }
@@ -1686,32 +1752,11 @@ impl Handle {
             if freshness == forge::Freshness::Fresh {
                 tracked.last_fresh_poll = tracked.last_poll;
             }
-            tracked.paused_until = None;
-            match outcome {
-                forge::Outcome::Synced(snapshot) => {
-                    tracked.failures = 0;
-                    let hints = snapshot.hints();
-                    tracked.forge = Forge::Synced {
-                        at_unix_ms: synced_at,
-                        error: None,
-                    };
-                    tracked.snapshot = Some(Arc::new(snapshot));
-                    // New branches or merges need measuring before the cards
-                    // they belong to are right.
-                    if *tracked.hints != hints {
-                        tracked.hints = Arc::new(hints);
-                        tracked.pending.get_or_insert_with(Default::default);
-                        self.0.scanner.notify();
-                    }
-                }
-                forge::Outcome::NotGitHub => {
-                    tracked.failures = 0;
-                    tracked.forge = Forge::NotGitHub;
-                    tracked.snapshot = None;
-                }
-                forge::Outcome::Failed(failure) => tracked.poll_failed(failure),
+            let hints = Arc::clone(&tracked.hints);
+            tracked.polled(outcome, synced_at, watching);
+            if !Arc::ptr_eq(&hints, &tracked.hints) {
+                self.0.scanner.notify();
             }
-            tracked.next_poll = tracked.forge_deadline(Instant::now(), watching);
             drop(shared);
             self.changed();
         }
@@ -1766,7 +1811,15 @@ impl Handle {
                     // Waits for the scan, which wakes this thread.
                     Duration::from_secs(60)
                 } else {
-                    tracked.next_poll.saturating_duration_since(Instant::now())
+                    let wait = tracked.next_poll.saturating_duration_since(Instant::now());
+                    // This sleep stops counting while the machine is
+                    // suspended, and the reset doesn't, so look again each
+                    // minute while a rate limit pauses the project.
+                    if tracked.paused_until.is_some() {
+                        wait.min(PAUSED_WAKE)
+                    } else {
+                        wait
+                    }
                 }
             })
             .min()
@@ -2661,53 +2714,99 @@ mod tests {
         assert!(!tracked.poll_requested);
     }
 
+    fn rate_limited(reset_in: Duration) -> forge::Outcome {
+        forge::Outcome::Failed(forge::Failure {
+            message: "GitHub rate limit reached. Retrying at 18:42 UTC".into(),
+            retry_at: Some(crate::github::polling::now() + reset_in.as_secs()),
+        })
+    }
+
     /// A rate limit pauses a project until it resets, however it is read or
     /// watched meanwhile, and then polls at its usual cadence, not after an
-    /// outage's doubling backoff.
+    /// outage's doubling backoff, earlier outages included.
     #[test]
     fn a_rate_limited_project_polls_again_when_the_limit_resets() {
         let handle = polling_handle();
         let mut shared = handle.shared();
         let tracked = shared.track(Path::new("/fixture/repo"), "repo");
+        tracked.failures = 3;
         let polled = Instant::now();
         tracked.last_poll = Some(polled);
         let reset_in = Duration::from_secs(20 * 60);
-        tracked.poll_failed(forge::Failure {
-            message: "GitHub rate limit reached. Retrying at 18:42 UTC".into(),
-            retry_at: Some(crate::github::polling::now() + reset_in.as_secs()),
-        });
+        tracked.polled(rate_limited(reset_in), 1_000, true);
         assert_eq!(tracked.failures, 0, "a rate limit is not an outage");
         assert!(tracked.paused());
-        tracked.next_poll = tracked.forge_deadline(polled, true);
-        let reset = tracked.paused_until.unwrap();
-        assert_eq!(tracked.next_poll, reset);
+        let reset = tracked.next_poll;
         let early = Duration::from_secs(5);
         assert!(reset >= polled + reset_in && reset <= Instant::now() + reset_in + early);
+        assert!(!tracked.forge_due(Instant::now()));
 
-        // Reading it neither brings the poll forward nor asks for one.
+        // Reading it neither brings the poll forward nor asks for one, nor
+        // does a window arriving or leaving, beyond the second the wall
+        // clock may tick meanwhile.
+        let near = |at: Instant| at.max(reset) - at.min(reset) <= Duration::from_secs(1);
         tracked.read_at = Some(polled - READ_WINDOW);
         tracked.last_poll = Some(polled - forge::WATCHED_INTERVAL);
         tracked.read(false);
-        assert_eq!(tracked.next_poll, reset);
+        assert!(near(tracked.next_poll));
         assert!(!tracked.poll_requested);
-        // Nor does a window arriving or leaving.
         shared.set_watching(true);
-        assert_eq!(shared.projects[Path::new("/fixture/repo")].next_poll, reset);
+        assert!(near(shared.projects[Path::new("/fixture/repo")].next_poll));
         shared.set_watching(false);
-        assert_eq!(shared.projects[Path::new("/fixture/repo")].next_poll, reset);
+        assert!(near(shared.projects[Path::new("/fixture/repo")].next_poll));
 
-        // An outage still backs off.
+        // A reset passed by the wall clock is due, though a suspend kept
+        // the monotonic deadline from arriving.
         let tracked = shared.projects.get_mut(Path::new("/fixture/repo")).unwrap();
-        tracked.paused_until = None;
-        tracked.poll_failed(forge::Failure::from("network unreachable".to_owned()));
+        tracked.paused_until = Some(crate::github::polling::now());
+        assert!(tracked.forge_due(Instant::now()));
+
+        // An outage still backs off, and clears the pause.
+        tracked.polled(
+            forge::Outcome::Failed(forge::Failure::from("network unreachable".to_owned())),
+            1_000,
+            true,
+        );
         assert_eq!(tracked.failures, 1);
-        assert!(!tracked.paused());
+        assert!(tracked.paused_until.is_none());
         assert_eq!(
             tracked.forge,
             Forge::Unavailable {
                 reason: "network unreachable".into()
             }
         );
+        // So does a reset about now, which means the clocks disagree.
+        tracked.polled(rate_limited(Duration::from_secs(1)), 1_000, true);
+        assert_eq!(tracked.failures, 2);
+        assert!(!tracked.paused());
+    }
+
+    /// A board read during a pause doesn't ask for a poll the limit would
+    /// refuse; once the limit resets, one does.
+    #[test]
+    fn a_board_read_during_a_rate_limit_waits_for_the_reset() {
+        let handle = polling_handle();
+        let selected: Vec<(PathBuf, String)> =
+            vec![(PathBuf::from("/fixture/repo"), "repo".into())];
+        {
+            let mut shared = handle.shared();
+            let tracked = shared.track(&selected[0].0, &selected[0].1);
+            tracked.local = Some(Arc::new(scan::Local::default()));
+            tracked.pending = None;
+            tracked.polled(rate_limited(Duration::from_secs(600)), 1_000, false);
+            tracked.last_poll = Some(Instant::now() - forge::WATCHED_INTERVAL);
+        }
+        handle.settle(&selected, false);
+        assert!(!handle.shared().projects[&selected[0].0].poll_requested);
+
+        handle
+            .shared()
+            .projects
+            .get_mut(&selected[0].0)
+            .unwrap()
+            .paused_until = Some(crate::github::polling::now());
+        handle.settle(&selected, false);
+        assert!(handle.shared().projects[&selected[0].0].poll_requested);
     }
 
     #[test]

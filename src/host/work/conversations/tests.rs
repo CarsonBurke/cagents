@@ -485,28 +485,44 @@ fn failed_lookups_back_off() {
 }
 
 /// A rate limit pauses lookups until it resets, without growing the backoff
-/// an outage would, so they resume as soon as GitHub admits them.
+/// an outage would, its own or a pull request's, so they resume as soon as
+/// GitHub admits them.
 #[test]
 fn rate_limited_lookups_wait_for_the_reset_not_a_backoff() {
-    let mut state = State::default();
     let limited = |seconds| GitHubError::RateLimited {
         limit: crate::github::polling::RateLimit::primary(
             "graphql",
             crate::github::polling::now() + seconds,
         ),
     };
+    let outage = GitHubError::NoActiveAccount("github.com".into());
+    let mut state = State::default();
+    // Outages before it are over once GitHub answers with its limit.
+    state.failed(&outage);
+    state.failed(&outage);
     state.failed(&limited(3600));
     assert!(!state.lookups_due());
     assert_eq!(state.failures, 0);
     assert!(state.forge_error.is_some());
+    let mut pull_request = Observed::default();
+    pull_request.lookup_failed(&limited(3600));
+    assert_eq!(pull_request.failures, 0);
     // Once it resets: due, though a doubling backoff would wait on.
-    state.paused_until = Some(Instant::now());
+    state.paused_until = Some(crate::github::polling::now());
     assert!(state.lookups_due());
     // An outage after it backs off as before.
-    state.failed(&GitHubError::NoActiveAccount("github.com".into()));
+    state.failed(&outage);
+    pull_request.lookup_failed(&outage);
     assert!(state.paused_until.is_none());
     assert!(!state.lookups_due());
     assert_eq!(state.failures, 1);
+    assert_eq!(pull_request.failures, 1);
+    // A reset about now means the clocks disagree: that backs off too.
+    state.failed(&limited(1));
+    pull_request.lookup_failed(&limited(1));
+    assert!(state.paused_until.is_none());
+    assert_eq!(state.failures, 2);
+    assert_eq!(pull_request.failures, 2);
 }
 
 /// A transcript file under `/var/tmp`, removed when dropped.
