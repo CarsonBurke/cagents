@@ -5273,6 +5273,40 @@ fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
 }
 
 #[test]
+fn json_line_batches_preserve_order_across_blank_lines_and_the_poll_budget() {
+    let mut output = String::from("\n");
+    let mut expected = String::new();
+    for index in 0..=FRAMES_PER_POLL {
+        if index == FRAMES_PER_POLL {
+            output.push('\n');
+        }
+        let digit = format!("{:x}", index % 16);
+        output.push_str(&format!("{}\n", json!({"text": digit})));
+        expected.push_str(&digit);
+    }
+    output.push('\n');
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/usr/bin/printf".into(),
+        arguments: vec!["%s".into(), output],
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let mut initial = Step::default();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+    let snapshot = until(&handle, |snapshot| snapshot.exited);
+    assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+    assert_eq!(unstamped(&snapshot.items), vec![text("echo", &expected)]);
+    handle.close().unwrap();
+}
+
+#[test]
 fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
     let mut output = String::new();
     for text in ["hello", " world"] {

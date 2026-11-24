@@ -2897,12 +2897,14 @@ impl Actor {
             // framing; a stalled write has its own `write_started` deadline below.
             let mut frames_ready = false;
             let mut parsed = 0usize;
+            let mut consumed = 0;
             loop {
-                let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
+                let unread = &self.output[consumed..];
+                let Some(newline) = next_newline(unread, &mut self.scanned) else {
                     break;
                 };
                 if newline == 0 {
-                    self.output.drain(..1);
+                    consumed += 1;
                     self.scanned = 0;
                     continue;
                 }
@@ -2910,7 +2912,8 @@ impl Actor {
                     frames_ready = true;
                     break;
                 }
-                let frame = match serde_json::from_slice(&self.output[..newline]) {
+                let line = &unread[..newline];
+                let frame = match serde_json::from_slice(line) {
                     Ok(frame) => {
                         garbage_lines = 0;
                         Some(frame)
@@ -2921,9 +2924,8 @@ impl Actor {
                                 "Unsupported provider stdout (expected JSON-lines): {error}"
                             ));
                         };
-                        let preview =
-                            super::protocol::diagnostic_preview(&self.output[..newline], 200);
-                        if hides_frame(&self.output[..newline]) {
+                        let preview = super::protocol::diagnostic_preview(line, 200);
+                        if hides_frame(line) {
                             return Err(format!(
                                 "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
                             ));
@@ -2946,8 +2948,14 @@ impl Actor {
                         None
                     }
                 };
-                self.output.drain(..=newline);
+                consumed += newline + 1;
                 self.scanned = 0;
+                // Let a prompt-ready step release the allocation immediately
+                // when it consumes the last frame. Clearing moves no bytes.
+                if consumed == self.output.len() {
+                    self.output.clear();
+                    consumed = 0;
+                }
                 partial_started = None;
                 parsed += 1;
                 let Some(frame) = frame else {
@@ -2957,6 +2965,11 @@ impl Actor {
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
                 startup_progress = Instant::now();
+            }
+            // Move any unread suffix once per poll. `scanned` is already
+            // relative to this suffix, including when it holds a partial line.
+            if consumed != 0 {
+                self.output.drain(..consumed);
             }
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
@@ -3720,14 +3733,19 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
-        let frame_context = {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            super::notification::FrameContext::capture(&state)
-        };
-        let mut frame_contents = if suppress_current_notification {
-            Default::default()
-        } else {
+        let mut frame_contents = if !suppress_current_notification
+            && step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        {
+            let frame_context = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                super::notification::FrameContext::capture(&state)
+            };
             frame_context.project(&step.events)
+        } else {
+            Default::default()
         };
         // Preserve decoded outcomes even when the transcript cache fails.
         // Stop further Store writes, then report the original error after
