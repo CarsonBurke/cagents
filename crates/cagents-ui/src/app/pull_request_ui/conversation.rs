@@ -813,7 +813,7 @@ fn pull_request_detail(
         let lines =
             crate::repository::line_change_counts(Some(diff.additions), Some(diff.deletions));
         if !lines.is_empty() {
-            detail.push(format!("{lines} lines"));
+            detail.push(format!("{lines} in the pull request"));
         }
     }
     if let Some(list) = list
@@ -872,8 +872,12 @@ struct RowParts<'a> {
     /// A pull request's number on the second line, after its repository
     /// when that is not the conversation's. A row without one is one line.
     number: Option<String>,
-    /// What the number says on hover.
+    /// What the row's name says of the pull request beyond its marks: its
+    /// size, and how old its state is.
     number_detail: Vec<String>,
+    /// What the number says on hover: the worktree's folder, then the
+    /// details.
+    number_tip: Option<String>,
     /// What the label says on hover: the worktree's folder.
     label_tip: Option<String>,
     /// Glyphs that give way to opening the pull request on hover.
@@ -952,13 +956,29 @@ fn row_parts<'a>(
                 Some(state) => format!("{name}, {}, {number}", state.label().to_lowercase()),
                 None => format!("{name}, state unknown"),
             };
+            // The folder is said on hover of the number, beneath the title,
+            // so the tooltip doesn't open over that number; a row without
+            // one says it on its name.
+            let folder = worktree.map(|worktree| folder(&worktree.path));
+            let number_detail = pull_request_detail(list, row);
+            let (label_tip, number_tip) = match second {
+                Some(_) => {
+                    let tip = folder
+                        .into_iter()
+                        .chain(number_detail.iter().cloned())
+                        .collect::<Vec<_>>();
+                    (None, (!tip.is_empty()).then(|| tip.join("\n")))
+                }
+                None => (folder, None),
+            };
             RowParts {
                 glyph: crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
                 name,
                 spoken,
                 number: second,
-                number_detail: pull_request_detail(list, row),
-                label_tip: worktree.map(|worktree| folder(&worktree.path)),
+                number_detail,
+                number_tip,
+                label_tip,
                 marks: pull_request_marks(row),
                 uncommitted: worktree.and_then(uncommitted),
             }
@@ -974,6 +994,7 @@ fn row_parts<'a>(
                 name,
                 number: None,
                 number_detail: Vec::new(),
+                number_tip: None,
                 label_tip: Some(folder(&worktree.path)),
                 marks: Vec::new(),
                 uncommitted: uncommitted(worktree),
@@ -990,6 +1011,7 @@ fn row_parts<'a>(
                 name,
                 number: None,
                 number_detail: Vec::new(),
+                number_tip: None,
                 label_tip: Some(format!(
                     "{}\nWhere this conversation runs",
                     crate::ui_controls::display_path(path)
@@ -1015,7 +1037,7 @@ fn work_row<'a>(
         glyph,
         name,
         number,
-        number_detail,
+        number_tip,
         label_tip,
         marks,
         uncommitted,
@@ -1042,17 +1064,10 @@ fn work_row<'a>(
                 list::CAPTION_LINE.into(),
             ))
             .into();
-        row = row.caption_element(if number_detail.is_empty() {
-            line
-        } else {
-            crate::interaction::tooltip(line, number_detail.join("\n"))
+        row = row.caption_element(match number_tip {
+            Some(tip) => crate::interaction::tooltip(line, tip),
+            None => line,
         });
-    }
-    if let Some(said) = uncommitted {
-        row = row.trailing(crate::ui_controls::uncommitted_glyph(
-            said,
-            design::COMPACT_ICON_SIZE,
-        ));
     }
     let idle = (!marks.is_empty()).then(|| -> Element<'a, Action> {
         widget::row::with_children(marks.into_iter().map(|(mark, _)| mark).collect::<Vec<_>>())
@@ -1080,6 +1095,15 @@ fn work_row<'a>(
         }
         (None, Some(idle)) => row = row.trailing(idle),
         (None, None) => {}
+    }
+    // The changes mark comes last on every row, so it lines up down the
+    // list, and stays while the pointer is on the row so its tooltip can be
+    // read.
+    if let Some(said) = uncommitted {
+        row = row.trailing(crate::ui_controls::uncommitted_glyph(
+            said,
+            design::COMPACT_ICON_SIZE,
+        ));
     }
     let row: Element<'a, Action> = row.into();
     if work.pull_request().is_some() {
@@ -2051,20 +2075,27 @@ mod tests {
         };
         let parts = row_parts(list, work, &|_| true);
         assert_eq!(parts.number.as_deref(), Some("#9"), "under the title");
+        // The folder is on the number's hover, not the title's, whose
+        // tooltip would open over the number.
+        assert_eq!(parts.label_tip, None);
+        assert_eq!(
+            parts.number_tip.as_deref(),
+            Some("/repo/fix-cache\n+120 −30 in the pull request")
+        );
         assert_eq!(
             parts.described(work, false, false),
             "Show Change 9, draft, #9, Checks: 1 running, Review required, \
-             2 uncommitted changes, +8 −17, +120 −30 lines"
+             2 uncommitted changes, +8 −17, +120 −30 in the pull request"
         );
         assert_eq!(
             parts.described(work, true, false),
             "Change 9, draft, #9, shown below, press to list its checks, \
-             Checks: 1 running, Review required, 2 uncommitted changes, +8 −17, +120 −30 lines"
+             Checks: 1 running, Review required, 2 uncommitted changes, +8 −17, +120 −30 in the pull request"
         );
         assert_eq!(
             parts.described(work, true, true),
             "Change 9, draft, #9, shown below, press to hide its checks, \
-             Checks: 1 running, Review required, 2 uncommitted changes, +8 −17, +120 −30 lines"
+             Checks: 1 running, Review required, 2 uncommitted changes, +8 −17, +120 −30 in the pull request"
         );
 
         // A merged one lists no checks, so pressing it shows only its link.

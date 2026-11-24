@@ -836,7 +836,11 @@ impl State {
         let content = widget::column::with_children(lines).spacing(space::XS);
         let selected = self.menu.as_ref() == Some(&card);
         let button = widget::button::custom(content)
-            .name(format!("Open {}", item.label()))
+            .name(format!(
+                "Open {}, {}",
+                item.label(),
+                status_words(item).replace(" · ", ", ")
+            ))
             .class(card_style(selected))
             .padding(space::S)
             .width(Length::Fill)
@@ -909,7 +913,11 @@ impl State {
         let selected = self.menu.as_ref() == Some(&card);
         let button =
             widget::button::custom(widget::column::with_children(lines).spacing(space::XXS))
-                .name(format!("Open {}", item.label()))
+                .name(format!(
+                    "Open {}, {}",
+                    item.label(),
+                    status_words(item).replace(" · ", ", ")
+                ))
                 .class(card_style(selected))
                 .padding([space::XS + space::XXS, space::S])
                 .width(Length::Fill)
@@ -1316,6 +1324,29 @@ impl<'a> Leading<'a> {
 }
 
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
+    crate::interaction::tooltip(leading_glyph(item), status_words(item))
+}
+
+/// What a card's leading glyph says, and the column it is in: `Draft pull
+/// request · In review`. Its tooltip, and part of its accessible name.
+fn status_words(item: &Item) -> String {
+    use crate::sidebar::AttentionState;
+    let glyph = match Leading::of(item) {
+        Leading::Working => "An agent is working".to_owned(),
+        Leading::Waiting(AttentionState::Approval) => "An agent needs your permission".to_owned(),
+        Leading::Waiting(AttentionState::Question) => "An agent asked you a question".to_owned(),
+        Leading::Waiting(_) => "An agent is waiting for you".to_owned(),
+        Leading::PullRequest(pull_request) => format!(
+            "{} pull request",
+            crate::sidebar::WorktreePullRequestState::from_work(pull_request).label()
+        ),
+        Leading::Branch if item.worktree.is_some() => "Worktree".to_owned(),
+        Leading::Branch => "Branch".to_owned(),
+    };
+    format!("{glyph} · {}", item.column.label())
+}
+
+fn leading_glyph<'a>(item: &Item) -> Element<'a, Action> {
     match Leading::of(item) {
         Leading::Working => widget::container(crate::sidebar::attention_mark(
             crate::sidebar::AttentionState::Working,
@@ -1344,10 +1375,10 @@ fn pinned_mark<'a>(item: &Item) -> Element<'a, Action> {
     )
 }
 
-/// The column a list row names, for the columns nothing else on it implies:
-/// an agent's glyph says Active, a pull request's says In review, and the
-/// rest is In progress. Landed asks to be cleaned up and Stale to be looked
-/// at again, so they are said, quietly.
+/// The column a list row names in words. Landed asks to be cleaned up and
+/// Stale to be looked at again, so they are said, quietly; the others are
+/// the usual states of work under way, which the leading glyph's tooltip
+/// and the row's accessible name say.
 fn quiet_column(column: Column) -> Option<&'static str> {
     matches!(column, Column::Landed | Column::Stale).then(|| column.label())
 }
@@ -2013,6 +2044,13 @@ mod tests {
             names
                 .iter()
                 .any(|name| name == crate::ui_controls::UNPUSHED_LABEL),
+            "{names:?}"
+        );
+        // Its state and column, which no word on it draws, are in its name.
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "Open feat/android, Open pull request, In review"),
             "{names:?}"
         );
         // A branch without a pull request is named by the branch, and a
