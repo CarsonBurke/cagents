@@ -1922,7 +1922,9 @@ fn child_user_quotations_are_not_provider_errors_and_followup_failures_keep_thei
 }
 
 #[test]
-fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries() {
+fn confirmed_claude_session_observes_saved_names_and_idle_updates() {
+    use std::os::fd::AsRawFd as _;
+
     let root = tempfile::tempdir().unwrap();
     let cwd = root.path().canonicalize().unwrap();
     let config = cwd.join("claude-config");
@@ -1994,9 +1996,17 @@ fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries()
         json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption review"})
     )
     .unwrap();
-    let generated = adapter
-        .receive(json!({"type":"result","session_id":id}))
-        .unwrap();
+    let Some(super::super::MetadataWake::Changed(watch)) = adapter.metadata_wake() else {
+        panic!("confirmed transcript is watched while idle");
+    };
+    let mut poll = libc::pollfd {
+        fd: watch.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll borrows the live watch for this call.
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 500) }, 1);
+    let generated = adapter.refresh_metadata().unwrap();
     assert!(generated.events.iter().any(|event| matches!(event,
         Event::Session { title: Some(title), .. } if title == "Generated encryption review")));
 
@@ -2022,6 +2032,57 @@ fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries()
         .unwrap();
     assert!(result.events.iter().any(|event| matches!(event,
         Event::Session { title: Some(title), .. } if title == "Encrypted bundle audit")));
+}
+
+#[test]
+fn confirmed_claude_resume_names_the_opening_before_the_loaded_page() {
+    let mut file = tempfile::tempfile().unwrap();
+    let id = "00000000-0000-4000-8000-000000000001";
+    for (index, content) in [
+        json!("[Image 236]"),
+        json!([{"type":"image","source":{"type":"base64","data":"AGg="}}]),
+        json!("<system-reminder>Ignore this context</system-reminder>"),
+        json!([{"type":"tool_result","content":"Ignore this tool result"}]),
+        json!([
+            {"type":"image","source":{"type":"base64","data":"AGg="}},
+            {"type":"text","text":"[Image 206] Review the sidebar contrast"}
+        ]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        writeln!(file, "{}", json!({"type":"user","sessionId":id,"uuid":index.to_string(),"message":{"content":content}})).unwrap();
+    }
+    for index in 5..120 {
+        writeln!(file, "{}",json!({"type":"assistant","sessionId":id,"uuid":index.to_string(),"message":{"content":"A later reply"}})).unwrap();
+    }
+    file.rewind().unwrap();
+    let mut adapter = Claude {
+        session_id: Some(id.into()),
+        resumed: true,
+        history: Some(History::index(file, id).unwrap()),
+        ..Default::default()
+    };
+    let start = adapter.initialize().unwrap();
+    assert!(start.events.iter().any(|event| matches!(
+        event,
+        Event::History {
+            has_earlier: true,
+            ..
+        }
+    )));
+    assert!(
+        !start
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::OpeningTitle(_)))
+    );
+    let request_id = start.writes[0]["request_id"].as_str().unwrap();
+    let confirmed = adapter.receive(
+        json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{}}}),
+    ).unwrap();
+    assert!(confirmed.events.iter().any(|event| matches!(event,
+        Event::OpeningTitle(title) if title.text() == "Review the sidebar contrast")));
 }
 
 #[test]

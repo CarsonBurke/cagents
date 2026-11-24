@@ -168,6 +168,8 @@ pub(crate) struct Resident {
     pub generation: u64,
     pub session_id: Option<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub opening_title: Option<chat::OpeningTitle>,
     pub ready: bool,
     pub busy: bool,
     pub waiting: bool,
@@ -508,6 +510,7 @@ impl RemoteActor {
             generation: 1,
             session_id: None,
             title: None,
+            opening_title: None,
             ready: true,
             busy: false,
             waiting: false,
@@ -961,14 +964,25 @@ impl RemoteActor {
             .map(|(_, content)| content.clone())
             .unwrap_or_default()
     }
+    #[cfg(test)]
     pub fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), super::super::TitleUnavailable> {
+        self.conversation_naming()
+            .map(|naming| (naming.session, naming.provider))
+    }
+    pub fn conversation_naming(
+        &self,
+    ) -> Result<super::super::ConversationNaming, super::super::TitleUnavailable> {
         let state = self.0.state.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => super::super::TitleUnavailable::Busy,
             std::sync::TryLockError::Poisoned(_) => super::super::TitleUnavailable::Poisoned,
         })?;
-        Ok((state.session_id.clone(), state.title.clone()))
+        Ok(super::super::ConversationNaming {
+            session: state.session_id.clone(),
+            provider: state.title.clone(),
+            opening: state.opening_title.clone(),
+        })
     }
     pub fn launch_account_scope(&self) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
         self.0.launch_account_scope.as_ref().map_err(String::as_str)
@@ -1522,6 +1536,12 @@ impl RemoteActor {
             let mut updates = Vec::new();
             let generation = resident.generation;
             let identity_changed = resident.confirmed_session != state.confirmed_session;
+            if resident.session_id != state.session_id
+                || resident.title != state.title
+                || resident.opening_title != state.opening_title
+            {
+                updates.push(Update::ConversationNameChanged);
+            }
             if resident.changed != state.changed
                 || resident.generation != state.generation
                 || identity_changed
@@ -2934,6 +2954,7 @@ impl Server {
         let exited = state.exited;
         let session_id = state.session_id.clone();
         let title = state.title.clone();
+        let opening_title = state.opening_title.clone();
         let ready = state.ready;
         let busy = state.busy;
         let waiting = state.waiting;
@@ -3009,6 +3030,7 @@ impl Server {
             generation,
             session_id,
             title,
+            opening_title,
             ready,
             busy,
             waiting,

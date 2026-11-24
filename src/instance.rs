@@ -3597,7 +3597,12 @@ mod tests {
         }
         let _lease = owned_lock(Path::new(&lease), libc::LOCK_EX).unwrap();
         if let Some(socket) = env::var_os(LINGERING_SOCKET) {
-            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            // The path appears at bind, before listen, so a parent that saw
+            // it could be refused: bind apart and move it into place.
+            let mut binding = socket.clone();
+            binding.push(".binding");
+            let listener = std::os::unix::net::UnixListener::bind(&binding).unwrap();
+            fs::rename(&binding, &socket).unwrap();
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let stream = stream.unwrap();

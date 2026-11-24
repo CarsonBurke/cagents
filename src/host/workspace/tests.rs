@@ -110,7 +110,7 @@ fn open_project(root: &std::path::Path) -> ModelEdit {
 /// A title suggestion has to authenticate against a resident conversation,
 /// rather than trusting a pane's stale serialized launch recipe.
 fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session {
-    use crate::chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+    use crate::chat::protocol::{Adapter, Step};
 
     struct Quiet;
     impl Adapter for Quiet {
@@ -127,6 +127,16 @@ fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session
         }
     }
 
+    install_title_chat(host, root, Quiet).0
+}
+
+fn install_title_chat(
+    host: &SharedHost,
+    root: &std::path::Path,
+    mut adapter: impl crate::chat::protocol::Adapter + 'static,
+) -> (crate::chat::Session, crate::chat::runtime::Handle) {
+    use crate::chat::protocol::{ProcessSpec, TransportSpec};
+
     let recipe = LaunchRecipe {
         program: "claude".into(),
         arguments: Vec::new(),
@@ -136,11 +146,8 @@ fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session
     };
     let mut spec = ProcessSpec::from(&recipe);
     spec.transport = TransportSpec::History;
-    let mut initial = Step::default();
+    let mut initial = adapter.initialize().unwrap();
     let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
-    let handle =
-        crate::chat::runtime::Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {})
-            .unwrap();
     let session = crate::chat::Session {
         id: TerminalId::new(),
         proof: Some(host.lock().unwrap().proof().clone()),
@@ -154,14 +161,29 @@ fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session
             draft_model: None,
         },
     };
-    host.lock().unwrap().chats.insert(
-        session.id,
+    let id = session.id;
+    let instance = uuid::Uuid::new_v4();
+    let weak = Arc::downgrade(host);
+    let handle = crate::chat::runtime::Handle::start(
+        spec,
+        Box::new(adapter),
+        initial,
+        store,
+        None,
+        move |update| {
+            crate::host::chat::changed_owned(&weak, id, instance, update);
+        },
+    )
+    .unwrap();
+    let mut state = host.lock().unwrap();
+    state.chats.insert(
+        id,
         crate::host::chat::Record {
-            execution_instance: uuid::Uuid::new_v4(),
+            execution_instance: instance,
             console_recipe: None,
             paired_terminal: None,
             session: session.clone(),
-            handle,
+            handle: handle.clone(),
             source_process: None,
             subscribers: Default::default(),
             observations: Default::default(),
@@ -169,7 +191,146 @@ fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session
             returning_terminal: false,
         },
     );
-    session
+    state.chat_added(id);
+    (session, handle)
+}
+
+#[test]
+fn hidden_primary_chat_names_its_channel_and_follows_provider_renames() {
+    use crate::{
+        chat::{
+            self, Command, Event, Item, ItemContent, Role,
+            protocol::{Adapter, Step},
+        },
+        model::ChannelTitleSource::{Manual, Prompt, Provider},
+    };
+
+    fn user(id: &str, text: &str) -> Event {
+        Event::Item(Item {
+            id: id.into(),
+            role: Role::User,
+            content: ItemContent::Text {
+                text: text.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        })
+    }
+
+    struct Conversation(u8);
+    impl Adapter for Conversation {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![user("image", "[Image 236]"), Event::Ready(true)],
+                ..Default::default()
+            })
+        }
+
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            self.0 += 1;
+            let name = |title: Option<&str>| Event::Session {
+                id: "exact-conversation".into(),
+                title: title.map(str::to_owned),
+            };
+            let events = match self.0 {
+                1 => vec![
+                    name(None),
+                    user("first-text", "[Image 206] Fix the sidebar channel names"),
+                ],
+                2 => vec![user("another-text", "Review unrelated code")],
+                3 => vec![name(Some("Channel naming review"))],
+                4 => vec![name(Some("Sidebar naming follow-up"))],
+                _ => vec![name(Some("Provider's last title"))],
+            };
+            Ok(Step {
+                events,
+                ..Default::default()
+            })
+        }
+
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+
+    let (directory, host, _) = fixture();
+    titles::install(&host);
+    let (session, handle) = install_title_chat(&host, directory.path(), Conversation(0));
+    let id = crate::model::ChannelId::new();
+    let commit = |change| edit_delta(&host, 1, change).unwrap();
+    commit(open_project(directory.path()));
+    commit(ModelEdit::CreateChannel {
+        id,
+        repository: directory.path().into(),
+        title: String::new(),
+        title_source: Manual,
+        checkout: None,
+    });
+    let name = || {
+        let model = snapshot(&host, None).unwrap();
+        let channel = model.channel(id).unwrap();
+        (channel.title.clone(), channel.title_source)
+    };
+    let wait_for = |expected: &str, source| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (title, current_source) = name();
+            if title == expected && current_source == source {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {expected:?}, got {title:?} ({current_source:?})"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    assert_eq!(name(), (String::new(), Manual));
+    commit(ModelEdit::SeedView {
+        scope: Scope::Channel(id),
+        panes: vec![Pane {
+            id: CardId::new(),
+            title: "Chat".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.,
+            scope: Some(directory.path().into()),
+            kind: CardKind::Chat(session.clone()),
+        }],
+        closed: Vec::new(),
+    });
+    wait_for("Image conversation", Prompt);
+    handle.command(Command::Compact).unwrap();
+    wait_for("Fix the sidebar channel names", Prompt);
+    handle.command(Command::Compact).unwrap();
+    assert_eq!(
+        handle
+            .conversation_naming()
+            .unwrap()
+            .opening
+            .as_ref()
+            .map(chat::OpeningTitle::text),
+        Some("Fix the sidebar channel names")
+    );
+    handle.command(Command::Compact).unwrap();
+    wait_for("Channel naming review", Provider);
+    handle.command(Command::Compact).unwrap();
+    wait_for("Sidebar naming follow-up", Provider);
+    commit(ModelEdit::RetitleChannel {
+        id,
+        title: "Release checklist".into(),
+    });
+    handle.command(Command::Compact).unwrap();
+    super::titles::refresh(&host, super::titles::Target::Chat(session.id)).unwrap();
+    assert_eq!(name(), ("Release checklist".into(), Manual));
+    commit(ModelEdit::RetitleChannel {
+        id,
+        title: String::new(),
+    });
+    wait_for("Provider's last title", Provider);
+    handle.close().unwrap();
 }
 
 #[test]
@@ -288,14 +449,8 @@ fn title_suggestion_sqlite_contention_keeps_the_host_lock_available() {
         result.unwrap().0,
         ServerResponse::WorkspaceEdit(_)
     ));
-    host.lock()
-        .unwrap()
-        .chats
-        .remove(&session.id)
-        .unwrap()
-        .handle
-        .close()
-        .unwrap();
+    let record = host.lock().unwrap().chats.remove(&session.id).unwrap();
+    record.handle.close().unwrap();
 }
 
 #[test]

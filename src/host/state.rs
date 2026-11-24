@@ -335,6 +335,7 @@ pub(crate) struct HostState {
     model: Option<super::model::Registry>,
     /// Layout persistence and hydration never borrow the global terminal lock.
     pub(super) workspace_registry: Option<Arc<Mutex<super::model::Registry>>>,
+    pub(super) channel_titles: Option<super::workspace::titles::Updates>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
@@ -493,10 +494,13 @@ impl Drop for PreparedTerminalInput {
 }
 
 impl HostState {
-    /// Tells the Work tracker about the chat `id`, just put in `chats`.
+    /// Publishes metadata from the chat `id`, just put in `chats`.
     pub(super) fn chat_added(&self, id: TerminalId) {
         if let (Some(work), Some(record)) = (&self.work, self.chats.get(&id)) {
             work.chat_added(record.session.launch.provider);
+        }
+        if let Some(titles) = &self.channel_titles {
+            titles.offer(super::workspace::titles::Target::Chat(id));
         }
         if let Some(notifications) = &self.notifications {
             notifications.refresh_session_routes();
@@ -534,6 +538,7 @@ impl HostState {
             watchers: BTreeSet::new(),
             model: None,
             workspace_registry: None,
+            channel_titles: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             agent_client_authorities: BTreeMap::new(),
@@ -973,25 +978,50 @@ impl HostState {
         title: &str,
         source: crate::model::ChannelTitleSource,
     ) -> Result<(), ProtocolError> {
-        let invalid = || {
-            ProtocolError::new(
-                ProtocolErrorCode::InvalidRequest,
-                "The conversation's current name or source changed; refresh before suggesting a title",
-                false,
-            )
-        };
-        let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
+        let naming = self.title_conversation(&expected)?;
+        match naming.title() {
+            Some((current, kind)) if current == title && kind == source => Ok(()),
+            // Older retained helpers and window transcript readers may know an
+            // opening the resident hasn't read. A real opening supersedes the
+            // provisional title of a conversation without a meaningful prompt yet.
+            Some((_, crate::model::ChannelTitleSource::Prompt))
+                if source == crate::model::ChannelTitleSource::Prompt
+                    && naming
+                        .opening
+                        .as_ref()
+                        .is_some_and(crate::chat::OpeningTitle::provisional) =>
+            {
+                Ok(())
+            }
+            None if source == crate::model::ChannelTitleSource::Prompt => Ok(()),
+            _ => Err(Self::stale_title()),
+        }
+    }
+
+    fn stale_title() -> ProtocolError {
+        ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "The conversation's current name or source changed; refresh before suggesting a title",
+            false,
+        )
+    }
+
+    pub(super) fn title_conversation(
+        &self,
+        expected: &crate::chat::Session,
+    ) -> Result<crate::chat::runtime::ConversationNaming, ProtocolError> {
+        let actual = self.chats.get(&expected.id).ok_or_else(Self::stale_title)?;
         if expected.proof.as_ref() != Some(self.proof())
             || actual.session.launch.provider != expected.launch.provider
             || actual.session.launch.recipe != expected.launch.recipe
         {
-            return Err(invalid());
+            return Err(Self::stale_title());
         }
         // The request holds workspace writer admission and keeps this
         // resident identity guard through its SQLite commit. Read only current
         // metadata, not Store, history or files; no later workspace edit can
         // overtake the validated commit.
-        let (session, current_title) = actual.handle.conversation_title().map_err(|reason| {
+        let naming = actual.handle.conversation_naming().map_err(|reason| {
             let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
             ProtocolError::new(
                 if busy {
@@ -1014,20 +1044,11 @@ impl HostState {
         // no snapshot, so its pane learns the conversation only when someone
         // opens it. A pane that recorded one names only that conversation.
         if let Some(recorded) = &expected.launch.session_id
-            && session.as_ref() != Some(recorded)
+            && naming.session.as_ref() != Some(recorded)
         {
-            return Err(invalid());
+            return Err(Self::stale_title());
         }
-        let current_title = current_title
-            .as_deref()
-            .and_then(crate::workspace_model::channel_title);
-        match source {
-            crate::model::ChannelTitleSource::Provider
-                if current_title.as_deref() == Some(title) => {}
-            crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
-            _ => return Err(invalid()),
-        }
-        Ok(())
+        Ok(naming)
     }
 
     #[cfg(test)]
@@ -1062,6 +1083,20 @@ impl HostState {
                         effects: effects.clone(),
                     },
                 ));
+            }
+        }
+        if let Some(titles) = &self.channel_titles {
+            for view in &effects.views {
+                if let crate::workspace_model::views::Scope::Channel(id) = view.scope
+                    && view.after.is_some()
+                {
+                    titles.offer(super::workspace::titles::Target::Channel(id));
+                }
+            }
+            if let ModelEdit::RetitleChannel { id, title } = edit.as_ref()
+                && title.is_empty()
+            {
+                titles.offer(super::workspace::titles::Target::Channel(*id));
             }
         }
     }

@@ -597,6 +597,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                                     not be shared between windows")
         }
     }
+    workspace::titles::install(&host);
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(

@@ -514,7 +514,12 @@ fn attached_mut(
 }
 /// Helper callbacks enqueue durable work; they never refresh or close their
 /// own proxy while its ordered publication fence is held.
-fn changed_owned(host: &Weak<HostLock>, id: TerminalId, instance: uuid::Uuid, update: Update) {
+pub(super) fn changed_owned(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: uuid::Uuid,
+    update: Update,
+) {
     let Some(owner) = host.upgrade() else {
         return;
     };
@@ -630,6 +635,12 @@ fn changed_for_instance(
                 event.content = content.clone();
             }
             notifications.record(event);
+        }
+        return;
+    }
+    if matches!(update, Update::ConversationNameChanged) {
+        if let Some(titles) = &state.channel_titles {
+            titles.offer(super::workspace::titles::Target::Chat(id));
         }
         return;
     }
