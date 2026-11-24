@@ -18471,14 +18471,30 @@ impl Cagents {
                 self.open_document_link(Some(card), &uri)
             }
             Message::Repository(RepositoryAction::Language { card, action }) => {
+                use repository_widget::EditorLspAction as Action;
                 // A hover request, and the end of one, is the editor's and
-                // the language server's alone.
-                if matches!(action, repository_widget::EditorLspAction::Hover(_))
+                // the language server's alone. Completion requests, sent as
+                // trigger characters are typed, and moving through or
+                // dismissing the popup stay in the pane too, unless they
+                // change what the projection reads of it.
+                let pane = matches!(
+                    action,
+                    Action::CompleteAt { .. } | Action::Complete | Action::Next(_) | Action::Dismiss
+                )
+                .then(|| repository_ui::EditorProjectionInputs::capture(self, card))
+                .flatten();
+                let hover = matches!(action, Action::Hover(_));
+                let task = self.update_editor_lsp(card, action);
+                if (hover
+                    || pane.is_some_and(|before| {
+                        repository_ui::EditorProjectionInputs::capture(self, card)
+                            .is_some_and(|after| after == before)
+                    }))
                     && !self.update_tail_may_close_or_commit()
                 {
                     projection = Projection::Unchanged;
                 }
-                self.update_editor_lsp(card, action)
+                task
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let target = match self.cards.get(&card) {

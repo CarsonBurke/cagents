@@ -430,7 +430,11 @@ impl Cagents {
                             | RepositoryAction::DiffViewport { .. }
                             | RepositoryAction::PreviewViewport { .. }
                             | RepositoryAction::Language {
-                                action: repository_widget::EditorLspAction::Hover(_),
+                                action: repository_widget::EditorLspAction::Hover(_)
+                                    | repository_widget::EditorLspAction::CompleteAt { .. }
+                                    | repository_widget::EditorLspAction::Complete
+                                    | repository_widget::EditorLspAction::Next(_)
+                                    | repository_widget::EditorLspAction::Dismiss,
                                 ..
                             }
                     )
