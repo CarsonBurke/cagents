@@ -14,6 +14,7 @@ pub mod in_flight;
 mod installed;
 mod pending_recovery;
 pub(crate) mod recovery;
+mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
 mod review_fixture;
 pub use recovery::TargetRecoveryRequired;
@@ -1200,6 +1201,7 @@ fn start_job(
     recovery::inspect_pending_current()?;
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
+    retention::before_start(&state);
     let id = uuid::Uuid::new_v4().to_string();
     let job = UpdateJob {
         id: id.clone(),
@@ -1635,6 +1637,8 @@ fn finish_worker(
         // Preserve a typed recovery request even when its human-readable job
         // status cannot be recorded. The caller still owns handoff custody.
         eprintln!("Could not record update result: {error}");
+    } else {
+        retention::remember_success(state, &job.id, &job.phase);
     }
     result.map(|_| ())
 }

@@ -41,6 +41,7 @@ pub(crate) fn run(
     // Global ordering matches ordinary updates: worker, UI, then daemon lease.
     // Convert to File so dropping a coordinator never LOCK_UNs shared custody.
     let worker = acquire_lock(&state)?.into_file();
+    retention::before_start(&state);
     let _reserved_worker = reserve_worker_descriptor(&worker)?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     // Arm Drop before any fallible close: reopening a saved recovery pane is
@@ -170,6 +171,7 @@ pub(crate) fn run(
             job.phase = UpdatePhase::Complete;
             job.message = report(&outcome);
             write_job(&state, &job)?;
+            retention::remember_success(&state, &job.id, &job.phase);
             Ok(job.message)
         }
         Err(error) => {
