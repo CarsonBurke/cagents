@@ -623,34 +623,32 @@ fn a_second_search_window_cannot_cancel_the_first_windows_query() {
     assert_eq!(local.load(Ordering::Acquire), 1);
 }
 
+/// Filling a history is what these cost, so the default budget's history
+/// serves both of its contracts: it holds over ten thousand rows, and a
+/// smaller budget holds less than half as many.
 #[test]
-fn default_scrollback_byte_budget_retains_over_ten_thousand_rows() {
+fn default_scrollback_byte_budget_retains_over_ten_thousand_rows_and_a_smaller_budget_fewer() {
     let config = TerminalConfig::default();
-    let mut terminal = Terminal::new(TerminalOptions {
-        cols: config.columns,
-        rows: config.rows,
-        max_scrollback: config.max_scrollback_bytes,
-    })
-    .unwrap();
-    terminal.vt_write(&b"output\r\n".repeat(20_000));
-    assert!(terminal.scrollbar().unwrap().total > 10_000);
-}
-
-#[test]
-fn scrollback_byte_budget_changes_retained_history() {
-    let retained = |budget| {
+    let retained = |max_scrollback| {
         let mut terminal = Terminal::new(TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: budget,
+            cols: config.columns,
+            rows: config.rows,
+            max_scrollback,
         })
         .unwrap();
         terminal.vt_write(&b"output\r\n".repeat(20_000));
         terminal.scrollbar().unwrap().total
     };
+    let default = retained(config.max_scrollback_bytes);
+    assert!(
+        default > 10_000,
+        "the default budget retained only {default} rows"
+    );
     let low = retained(2 * 1024 * 1024);
-    let high = retained(TerminalConfig::default().max_scrollback_bytes);
-    assert!(high > low * 2, "low={low}, high={high}");
+    assert!(
+        default > low * 2,
+        "a smaller budget must retain less history: low={low}, default={default}"
+    );
 }
 
 #[test]
