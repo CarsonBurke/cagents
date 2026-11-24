@@ -2328,6 +2328,8 @@ pub enum FrameError {
 /// perform for cold paths and tests. The buffer also lets a write emit its
 /// length prefix and payload in one `write_all`.
 pub struct FrameCodec {
+    // Already initialized through the largest recent frame. Only the current
+    // frame's declared length is read or decoded.
     read_buffer: Vec<u8>,
     write_buffer: Vec<u8>,
     prefix: [u8; LENGTH_PREFIX_BYTES],
@@ -2354,12 +2356,16 @@ fn next_memory_codec_id() -> u64 {
 // hot capacity. Hidden chat transports explicitly release their spare buffers.
 const FRAME_REUSE_FLOOR: usize = 256 * 1024;
 
+fn shrink_frame_buffer(buffer: &mut Vec<u8>) {
+    buffer.truncate(FRAME_REUSE_FLOOR);
+    buffer.shrink_to(FRAME_REUSE_FLOOR);
+}
+
 fn recycle_frame_buffer(buffer: &mut Vec<u8>, completed_bytes: usize, small_frames: &mut u8) {
-    buffer.clear();
     if buffer.capacity() > FRAME_REUSE_FLOOR.max(completed_bytes.saturating_mul(4)) {
         *small_frames = small_frames.saturating_add(1);
         if *small_frames >= 8 {
-            buffer.shrink_to(FRAME_REUSE_FLOOR);
+            shrink_frame_buffer(buffer);
             *small_frames = 0;
         }
     } else {
@@ -2392,8 +2398,7 @@ impl FrameCodec {
     /// A timed-out partial frame remains intact until it is decoded.
     pub fn release_spare(&mut self) {
         if self.payload_length.is_none() && self.prefix_read == 0 {
-            self.read_buffer.clear();
-            self.read_buffer.shrink_to(FRAME_REUSE_FLOOR);
+            shrink_frame_buffer(&mut self.read_buffer);
             self.small_reads = 0;
         }
         self.write_buffer.clear();
@@ -2431,13 +2436,13 @@ impl FrameCodec {
                 self.read_buffer
                     .try_reserve(length - self.read_buffer.len())
                     .map_err(|_| FrameError::Allocation { requested: length })?;
+                self.read_buffer.resize(length, 0);
             }
-            self.read_buffer.resize(length, 0);
             self.payload_length = Some(length);
             length
         };
         while self.payload_read < length {
-            match reader.read(&mut self.read_buffer[self.payload_read..]) {
+            match reader.read(&mut self.read_buffer[self.payload_read..length]) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -2497,6 +2502,7 @@ impl FrameCodec {
         self.write_buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&(length as u32).to_be_bytes());
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        self.write_buffer.clear();
         recycle_frame_buffer(&mut self.write_buffer, length, &mut self.small_writes);
         Ok(())
     }
@@ -2517,6 +2523,7 @@ impl FrameCodec {
         }
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        self.write_buffer.clear();
         recycle_frame_buffer(
             &mut self.write_buffer,
             payload_length,
@@ -2879,6 +2886,28 @@ mod tests {
             );
         }
         assert!(codec.read_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
+    fn frame_codec_keeps_initialized_read_bytes_for_smaller_frames() {
+        let mut frames = Vec::new();
+        write_frame(&mut frames, &"first frame").unwrap();
+        let initialized = frames.len() - LENGTH_PREFIX_BYTES;
+        write_frame(&mut frames, &"short").unwrap();
+        write_frame(&mut frames, &"third frame").unwrap();
+
+        let mut reader = Cursor::new(frames);
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for expected in ["first frame", "short", "third frame"] {
+            assert_eq!(
+                codec.read::<String>(&mut reader).unwrap().as_deref(),
+                Some(expected)
+            );
+            assert_eq!(codec.read_buffer.len(), initialized);
+            codec.release_spare();
+            assert_eq!(codec.read_buffer.len(), initialized);
+        }
+        assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
     }
 
     #[test]
