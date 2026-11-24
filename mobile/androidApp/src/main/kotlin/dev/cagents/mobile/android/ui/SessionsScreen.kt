@@ -143,16 +143,16 @@ fun SessionsScreen(
                 if (overview.attention.isNotEmpty()) {
                     section("Needs you", overview.attention.size)
                     items(overview.attention, key = { it.key }) { item ->
-                        AttentionCard(item, now, onOpen = onOpen, onDismiss = vm::acknowledge)
+                        AttentionCard(item, now, onOpen = onOpen, onDismiss = { ids -> ids.forEach(vm::acknowledge) })
                     }
                 }
                 if (overview.working.isNotEmpty()) {
                     section("Working", overview.working.size)
-                    sessionEntries(overview.working, now, onOpen)
+                    sessionEntries(overview.working, overview.outcomes, now, onOpen)
                 }
                 if (overview.recent.isNotEmpty()) {
                     section("Recent", null)
-                    sessionEntries(overview.recent, now, onOpen)
+                    sessionEntries(overview.recent, overview.outcomes, now, onOpen)
                 }
             }
         }
@@ -174,19 +174,30 @@ private fun LazyListScope.section(title: String, count: Int?) {
     }
 }
 
-private fun LazyListScope.sessionEntries(entries: List<SessionEntry>, now: Long, onOpen: (String) -> Unit) {
+private fun LazyListScope.sessionEntries(
+    entries: List<SessionEntry>,
+    outcomes: Map<String, Notice>,
+    now: Long,
+    onOpen: (String) -> Unit,
+) {
     entries.forEach { entry ->
         item(key = "session/${entry.session.id}", contentType = "session") {
-            SessionRow(entry.session, now, onOpen)
+            SessionRow(entry.session, outcomes[entry.session.id], now, onOpen)
         }
         items(entry.agents, key = { "agent/${entry.session.id}/${it.id}" }, contentType = { "agent" }) { agent ->
-            SessionRow(agent, now, onOpen, nested = true)
+            SessionRow(agent, outcomes[agent.id], now, onOpen, nested = true)
         }
     }
 }
 
 @Composable
-private fun SessionRow(session: Session, now: Long, onOpen: (String) -> Unit, nested: Boolean = false) {
+private fun SessionRow(
+    session: Session,
+    outcome: Notice?,
+    now: Long,
+    onOpen: (String) -> Unit,
+    nested: Boolean = false,
+) {
     val terminal = session.surface == Surface.Terminal
     val openable = session.watchable
     val details = buildList {
@@ -222,6 +233,16 @@ private fun SessionRow(session: Session, now: Long, onOpen: (String) -> Unit, ne
         supportingContent = {
             Column {
                 Text(details, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                outcome?.title?.takeIf { it.isNotBlank() }?.let {
+                    val failed = outcome.kind == NoticeKind.Failed
+                    Text(
+                        it,
+                        color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 session.failure?.let {
                     Text(it, color = MaterialTheme.colorScheme.error, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }
@@ -236,7 +257,7 @@ private fun SessionRow(session: Session, now: Long, onOpen: (String) -> Unit, ne
 }
 
 @Composable
-private fun AttentionCard(item: AttentionItem, now: Long, onOpen: (String) -> Unit, onDismiss: (String) -> Unit) {
+private fun AttentionCard(item: AttentionItem, now: Long, onOpen: (String) -> Unit, onDismiss: (List<String>) -> Unit) {
     val status = LocalStatusColors.current
     val (icon, title, subtitle, body, target) = when (item) {
         is AttentionItem.FromNotice -> {
@@ -260,14 +281,15 @@ private fun AttentionCard(item: AttentionItem, now: Long, onOpen: (String) -> Un
             body = item.entry.session.failure,
             target = item.entry.session.takeIf { it.watchable }?.id,
         )
+        is AttentionItem.Reviews -> AttentionContent(
+            icon = Icons.Outlined.RateReview,
+            title = if (item.notices.size == 1) "1 review request" else "${item.notices.size} review requests",
+            subtitle = "Your review was requested",
+            body = "Open them in cagents on the computer.",
+            target = null,
+        )
     }
-    ElevatedCard(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp),
-        onClick = { target?.let(onOpen) },
-        enabled = target != null || item is AttentionItem.FromNotice,
-    ) {
+    val content: @Composable () -> Unit = {
         Row(Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp)) {
             Icon(icon, null, tint = status.attention, modifier = Modifier.padding(top = 2.dp).size(22.dp))
             Spacer(Modifier.width(14.dp))
@@ -280,11 +302,20 @@ private fun AttentionCard(item: AttentionItem, now: Long, onOpen: (String) -> Un
                 }
             }
             if (item is AttentionItem.FromNotice) {
-                IconButton(onClick = { onDismiss(item.notice.id) }) {
+                IconButton(onClick = { onDismiss(item.covers) }) {
                     Icon(Icons.Outlined.Close, "Dismiss notification", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
+    }
+    val modifier = Modifier
+        .fillMaxWidth()
+        .padding(horizontal = 12.dp, vertical = 4.dp)
+    // A card with nothing to open on the phone isn't a button.
+    if (target != null) {
+        ElevatedCard(onClick = { onOpen(target) }, modifier = modifier) { content() }
+    } else {
+        ElevatedCard(modifier = modifier) { content() }
     }
 }
 
