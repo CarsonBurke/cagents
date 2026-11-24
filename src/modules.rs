@@ -57,6 +57,7 @@ pub mod filesystem_recovery_context;
 pub mod fixture_workspace;
 mod flock;
 pub mod fs_safety;
+pub mod git_marker;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]

@@ -58,7 +58,7 @@ class Job:
 
 # What the update rehearsal's suites load from scripts/, and the fixtures its
 # private user runs in place of providers and GitHub.
-REHEARSAL_SCRIPTS = ("scripts/rehearse-update", "scripts/native_slots.py",
+REHEARSAL_SCRIPTS = ("scripts/rehearse-update", "scripts/git-ancestry.sh", "scripts/native_slots.py",
                      *(f"scripts/rehearse_update_{module}.py" for module in ("records", "run", "restart", "fault", "pty")))
 REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
     "chat-composer-claude.sh", "fixture-gh.sh", "rehearsal-codex.sh", "rehearsal-codex.py",
@@ -69,13 +69,14 @@ REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
 JOBS = (
     Job("native evidence", shards=3, suites=(
         Suite("native evidence", "tests/native_evidence.py",
-              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py",
+              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/git-ancestry.sh", "scripts/native_slots.py",
                        "scripts/run-development", "scripts/cargo-lane", "scripts/cargo_warnings.py"),
-              syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
+              syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"),
+                      ("bash", "scripts/git-ancestry.sh"))),
     )),
     Job("build offload", shards=2, suites=(
         Suite("build offload", "tests/cargo_offload.py",
-              sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py", "scripts/build-host",
+              sources=("scripts/cargo-offload", "scripts/git_ancestry.py", "scripts/cargo_artifacts.py", "scripts/build-host",
                        "scripts/cargo-gate-rustc-guard", "scripts/cargo-incremental-retry.py")),
     )),
     Job("cargo gate", suites=(
@@ -147,7 +148,7 @@ JOBS = (
         Suite("retired ownership fixture", "tests/native_retired_ownership.py",
               sources=("tests/fixtures/native-retired-ownership.py",)),
         Suite("private account registry fixture", "tests/native_account_registry.py",
-              sources=("tests/fixtures/native-account-registry.py",)),
+              sources=("tests/fixtures/native-account-registry.py", "scripts/git_ancestry.py")),
         Suite("usage reset fixture", "tests/usage_reset_fixture.py",
               sources=("tests/fixtures/usage-reset-fixture.py", "tests/fixtures/codex-usage-resets.py",
                        "tests/fixtures/codex-tool-rows.py", "tests/fixtures/usage-reset-scene.sh"),

@@ -242,10 +242,60 @@ def live_lock_held(path: Path) -> bool:
     return False
 
 
+class GitAncestry(unittest.TestCase):
+    def test_git_ancestry_skips_placeholders_and_keeps_markers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="git-ancestry-") as temporary:
+            root = Path(temporary).resolve()
+            inner = root / "inner" / ".git"
+            outer = root / ".git"
+            inner.mkdir(parents=True)
+            outer.mkdir()
+
+            def detect() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["/bin/bash", "-c",
+                     'source "$1"; find_git_marker_in_ancestry "$2"',
+                     "git-ancestry", str(REPOSITORY / "scripts/git-ancestry.sh"),
+                     str(inner.parent / "absent")],
+                    capture_output=True, text=True, timeout=HANG_GUARD,
+                )
+
+            def assert_marker(marker: Path) -> None:
+                result = detect()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), str(marker))
+
+            self.assertEqual(detect().returncode, 1)
+            (inner / "objects").mkdir()
+            head = outer / "HEAD"
+            head.write_text("ref: refs/heads/main\n")
+            assert_marker(outer)
+
+            head.unlink()
+            head.symlink_to("refs/heads/main")
+            assert_marker(outer)
+
+            head.unlink()
+            outer.rmdir()
+            outer.write_text("gitdir: /elsewhere/worktrees/outer\n")
+            assert_marker(outer)
+
+            outer.unlink()
+            outer.symlink_to(root / "absent-target")
+            assert_marker(outer)
+
+            outer.unlink()
+            inner.chmod(0o600)
+            try:
+                if not os.access(inner, os.X_OK):
+                    assert_marker(inner)
+            finally:
+                inner.chmod(0o700)
+
+
 class Evidence(unittest.TestCase):
     def setUp(self) -> None:
-        # Not /tmp, /var/tmp or ~/.cache: sandboxes leave empty .git stubs there,
-        # which the script rightly refuses, and this suite does not test that.
+        # Use the native evidence task's usual base, short enough for sockets.
         state = Path.home() / ".local" / "state"
         state.mkdir(parents=True, exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix="ne-", dir=state))

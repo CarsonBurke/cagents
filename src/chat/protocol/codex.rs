@@ -904,7 +904,7 @@ impl Codex {
             .get_or_insert_with(|| {
                 self.cwd
                     .ancestors()
-                    .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+                    .find(|dir| crate::git_marker::present(&dir.join(".git")).unwrap_or(false))
                     .map(std::path::Path::to_path_buf)
             })
             .clone()

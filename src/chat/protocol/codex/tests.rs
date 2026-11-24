@@ -5523,6 +5523,25 @@ fn a_tool_result_keeps_structured_content_its_text_does_not_carry() {
     assert_eq!(images::readable(&same), "{\"issues\":[\"ENG-1\"]}");
 }
 
+#[test]
+fn a_turn_diff_passes_an_empty_git_directory_in_the_working_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path();
+    let cwd = repository.join("src");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    std::fs::create_dir(repository.join(".git")).unwrap();
+    std::fs::write(repository.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let mut adapter = adapter();
+    adapter.cwd = cwd;
+    adapter
+        .receive(json!({
+            "method": "turn/diff/updated",
+            "params": {"threadId": "thread-exact", "turnId": "turn", "diff": ""}
+        }))
+        .unwrap();
+    assert_eq!(adapter.repo_root, Some(Some(repository.to_path_buf())));
+}
+
 /// A turn's diff is its own change row only for the files none of its
 /// file-change items edited, such as one a shell command rewrote, and
 /// that row goes once items account for every file.

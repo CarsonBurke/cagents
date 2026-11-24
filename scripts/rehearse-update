@@ -9,6 +9,7 @@ set -euo pipefail
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
+source "$tool_root/scripts/git-ancestry.sh"
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
 real_home=$HOME
 
@@ -191,16 +192,10 @@ cmd_init() {
         require_init
     fi
     # Recovery storage refuses to live inside a Git checkout.
-    local ancestor=$root
-    while [ "$ancestor" != / ]; do
-        if [ -e "$ancestor/.git" ] || [ -L "$ancestor/.git" ]; then
-            # Sandboxes that mask .git in writable roots leave empty mountpoints behind.
-            [ -n "$(ls -A -- "$ancestor/.git" 2>/dev/null)" ] || [ ! -d "$ancestor/.git" ] ||
-                die "root must be outside Git ancestry; found $ancestor/.git (empty: likely a sandbox's .git mountpoint; choose another root)" 2
-            die "root must be outside Git ancestry; found $ancestor/.git" 2
-        fi
-        ancestor=$(dirname -- "$ancestor")
-    done
+    local marker
+    if marker=$(find_git_marker_in_ancestry "$root"); then
+        die "root must be outside Git ancestry; found $marker" 2
+    fi
     mkdir -p -- "$root"
     chmod 700 "$root"
     printf '%s\n' "$root" >"$root/.rehearse-update"

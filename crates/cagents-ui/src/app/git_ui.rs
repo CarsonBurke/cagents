@@ -1404,12 +1404,10 @@ fn recount_from_refs(
 /// which takes `.git` before the files and the listing that names them. A
 /// permission or transient I/O failure is not evidence of either.
 fn checkout_removed(root: &Path) -> bool {
-    std::fs::symlink_metadata(root.join(".git")).is_err_and(|error| {
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        )
-    })
+    match cagents::git_marker::present(&root.join(".git")) {
+        Ok(present) => !present,
+        Err(error) => error.kind() == std::io::ErrorKind::NotADirectory,
+    }
 }
 
 /// The records to close for worktrees Git listed in `previous` and no longer
@@ -2678,6 +2676,7 @@ mod tests {
             &["worktree", "add", "-b", "third", third.to_str().unwrap()],
         );
         fs::remove_file(third.join(".git")).unwrap();
+        fs::create_dir(third.join(".git")).unwrap();
         let (updated, _) = read_local(
             project,
             updated,
