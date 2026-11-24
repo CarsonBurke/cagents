@@ -1,7 +1,7 @@
 //! Terminal palette presets from the MIT-licensed iTerm2 Color Schemes collection.
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

@@ -173,6 +173,9 @@ JOBS = (
         # Reads the whole checkout's source text; compiles nothing.
         Suite("provider credential guard", "tests/check_credential_guard.py",
               sources=("scripts/check-credential-guard", "src/account.rs")),
+        # Reads the library's module tree; compiles nothing.
+        Suite("cli-only library tests", "tests/check_cli_only_tests.py",
+              sources=("scripts/check-cli-only-tests",)),
     )),
     # The rehearsal's pure contracts: records, comparison, staging and retry.
     # The desktop, installed archives and a real update run only on fw16 (see

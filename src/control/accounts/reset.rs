@@ -436,7 +436,7 @@ fn output(request: &ConsumeRequest, outcome: &ConsumeOutcome) -> CommandOutput {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use crate::account::resets::ResetKind;

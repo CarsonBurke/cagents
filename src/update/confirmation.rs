@@ -653,7 +653,7 @@ pub(super) fn wait_stop(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;

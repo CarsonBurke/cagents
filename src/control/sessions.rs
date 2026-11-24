@@ -1023,7 +1023,7 @@ fn request<T>(
     expected(reply).ok_or_else(|| AppError::new("sessions", "Unexpected reply from the daemon"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 pub(super) mod tests {
     use super::*;
     use crate::agent::ActivityState;

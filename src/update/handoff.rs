@@ -266,7 +266,7 @@ fn stop_empty_service(cli: &Path, timeout: Duration) -> Result<(), UpdateError> 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use crate::daemon::{RuntimePaths, lease_handoff::HandoffSource};

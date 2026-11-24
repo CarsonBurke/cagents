@@ -1668,6 +1668,17 @@ arguments narrow targets, not packages; for the application's tests alone, run
 `scripts/cargo-gate test --locked -p cagents-ui --all-targets`, and for the kit's,
 `-p cagents-ui-kit`.
 
+Each lane builds the shared library's tests with its own features. A test module
+whose module never branches on a feature would run the same tests in every lane,
+so it is declared with `#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]`
+and runs only in `test:cli`. `scripts/check-cli-only-tests` refuses that gate
+when the module, its submodules, its tests or any file they include mention a
+feature, or when the cli lane does not build the module; `--eligible` lists
+the `#[cfg(test)]` modules that could take it. It cannot see a feature branch
+in code outside the module that the tests reach through a call, so keep
+`#[cfg(test)]` for tests that depend on one. Test helpers that only such
+modules use take the same gate, or the other lanes report them as dead code.
+
 An SSH login has a soft limit of 1024 open files, and whatever it starts, with
 `nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
 with `Too many open files`, so run `ulimit -n 65536` first.

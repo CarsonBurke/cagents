@@ -234,7 +234,7 @@ fn bounded_words(text: &str, limit: usize) -> String {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

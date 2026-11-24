@@ -555,7 +555,7 @@ fn group(output: &mut String, name: &str, count: usize, description: &str, membe
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use crate::{

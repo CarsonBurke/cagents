@@ -96,7 +96,7 @@ fn inventory_needs_service_stop(
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use crate::{

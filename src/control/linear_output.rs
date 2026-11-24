@@ -144,7 +144,7 @@ pub(super) fn render(list: List, data: &Value) -> String {
     human
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use serde_json::json;

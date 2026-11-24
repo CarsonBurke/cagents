@@ -965,7 +965,7 @@ pub fn stale_after_days(path: &std::path::Path) -> Result<u16, String> {
     Ok(days.clamp(1, MAX_STALE_AFTER_DAYS))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

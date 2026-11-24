@@ -766,6 +766,6 @@ fn end_closed(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 #[path = "mobile_tests.rs"]
 mod tests;

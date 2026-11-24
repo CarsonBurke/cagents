@@ -1320,7 +1320,7 @@ fn sessions(sessions: &[crate::work::Session]) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use crate::work::{

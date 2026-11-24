@@ -87,7 +87,7 @@ fn starts_at_boundary(candidate: &str, position: usize) -> bool {
         .is_none_or(|ch| !ch.is_alphanumeric())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

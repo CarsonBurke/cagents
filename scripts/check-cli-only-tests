@@ -1,0 +1,286 @@
+#!/usr/bin/python3
+"""Check that tests run only in the cli lane cannot depend on a feature.
+
+The cli, host, ui and browser lanes each build the root library's tests with
+different features. A test module whose code never branches on a feature
+would run the same tests four times, so it is declared with
+
+    #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
+
+and runs only in the cli lane (`--no-default-features`). The browser lane
+enables `ui` through `cagents-ui`, so it skips these modules too.
+
+That is sound only while nothing the module owns branches on a feature. This
+check walks the library's module tree from src/lib.rs and refuses a gated test
+module unless:
+
+- every file of the module that declares it, including that module's
+  submodules, its tests and every file pulled in by `#[path]` or `include!`,
+  is free of `feature = "..."` in any form (`cfg`, `cfg!`, `cfg_attr`); and
+- no module on the path from the crate root is itself declared under a
+  feature, so the cli lane compiles it at all.
+
+What it cannot see: a feature branch in a module outside that subtree, which
+the tested code calls (for example `instance` calling into `diagnostics`). A
+test that depends on such a branch must stay `#[cfg(test)]`. It reads source
+text only, so CI runs it without compiling Rust.
+
+`--eligible` lists the `#[cfg(test)]` modules that would pass if gated.
+"""
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+GATE = 'all(test, not(any(feature = "host", feature = "ui")))'
+FEATURE = re.compile(r'\bfeature\s*=\s*"')
+# A module declaration, or the start of an `include!`.
+ITEM = re.compile(r"\bmod\s+(r#)?([A-Za-z_][A-Za-z0-9_]*)\s*([;{])|\binclude!\s*\(")
+STRING = re.compile(r'"((?:\\.|[^"\\])*)"')
+
+
+# The starts of the lexical forms whose contents are not structure.
+LEXICAL = re.compile(r"""//|/\*|(?<![A-Za-z0-9_])b?r#*"|"|'""")
+LINE_COMMENT = re.compile(r"[^\n]*")
+BLOCK_COMMENT = re.compile(r"/\*|\*/")
+QUOTED = re.compile(r'"(?:\\.|[^"\\])*"', re.DOTALL)
+CHARACTER = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
+NOT_NEWLINE = re.compile(r"[^\n]")
+
+
+def blank(text: str) -> str:
+    """Replace the contents of comments, strings and character literals with
+    spaces, keeping every offset, so structure can be read from what is left.
+    A quote that starts no character literal is a lifetime and stays."""
+    pieces, i, n = [], 0, len(text)
+    while (start := LEXICAL.search(text, i)):
+        token = start.group()
+        if token == "//":
+            end = LINE_COMMENT.match(text, start.end()).end()
+            keep, close, resume = start.start(), end, end
+        elif token == "/*":
+            depth, j = 1, start.end()
+            while depth and (mark := BLOCK_COMMENT.search(text, j)):
+                depth += 1 if mark.group() == "/*" else -1
+                j = mark.end()
+            keep = start.start()
+            close = resume = j if not depth else n
+        elif token == "'":
+            literal = CHARACTER.match(text, start.start())
+            if not literal:
+                pieces.append(text[i:start.end()])
+                i = start.end()
+                continue
+            keep, close, resume = start.end(), literal.end() - 1, literal.end()
+        elif token == '"':
+            literal = QUOTED.match(text, start.start())
+            keep = start.end()
+            close, resume = (literal.end() - 1, literal.end()) if literal else (n, n)
+        else:
+            terminator = '"' + token[token.index("r") + 1:-1]
+            end = text.find(terminator, start.end())
+            keep = start.end()
+            close, resume = (n, n) if end < 0 else (end, end + len(terminator))
+        pieces.append(text[i:keep])
+        pieces.append(NOT_NEWLINE.sub(" ", text[keep:close]))
+        pieces.append(text[close:resume])
+        i = resume
+    pieces.append(text[i:])
+    return "".join(pieces)
+
+
+def matching(structure: str, open_at: int, opening: str, closing: str) -> int:
+    depth = 0
+    for k in range(open_at, len(structure)):
+        if structure[k] == opening:
+            depth += 1
+        elif structure[k] == closing:
+            depth -= 1
+            if depth == 0:
+                return k
+    raise ValueError("unbalanced")
+
+
+def attributes_before(text: str, structure: str, at: int) -> list[str]:
+    """The outer attributes directly preceding the item that starts at `at`."""
+    found = []
+    end = at
+    while True:
+        k = end - 1
+        while k >= 0 and structure[k].isspace():
+            k -= 1
+        # Visibility: `pub`, `pub(crate)`, `pub(super)`, `pub(in path)`.
+        if k >= 0 and structure[k] == ")":
+            opening = structure.rfind("(", 0, k)
+            if structure[:opening].rstrip().endswith("pub"):
+                end = structure[:opening].rstrip().rfind("pub")
+                continue
+        if structure[:k + 1].endswith("pub"):
+            end = k - 2
+            continue
+        if k < 0 or structure[k] != "]":
+            return found
+        depth, j = 0, k
+        while j >= 0:
+            if structure[j] == "]":
+                depth += 1
+            elif structure[j] == "[":
+                depth -= 1
+                if depth == 0:
+                    break
+            j -= 1
+        h = j - 1
+        while h >= 0 and structure[h].isspace():
+            h -= 1
+        if h < 0 or structure[h] != "#":
+            return found
+        found.insert(0, text[j + 1:k])
+        end = h
+
+
+@dataclass
+class Module:
+    path: str
+    declaration: list[str]
+    files: list[Path] = field(default_factory=list)
+    children: list["Module"] = field(default_factory=list)
+    parent: "Module | None" = None
+    # Where the attribute sits, for gated and gateable test modules.
+    site: tuple[Path, int] | None = None
+
+
+class Tree:
+    def __init__(self, root: Path):
+        self.root = root
+        self.problems: list[str] = []
+        self.crate = Module("crate", [])
+        self.read(self.crate, root / "src/lib.rs", root / "src")
+
+    def read(self, module: Module, file: Path, directory: Path) -> None:
+        """Read `file` as the source of `module`, whose submodule files live
+        in `directory`."""
+        try:
+            text = file.read_text(encoding="utf-8")
+        except OSError as error:
+            self.problems.append(f"{module.path}: cannot read {file}: {error}")
+            return
+        module.files.append(file)
+        self.scan(module, file, text, blank(text), 0, len(text), directory)
+
+    def scan(self, module, file, text, structure, start, end, directory) -> None:
+        position = start
+        while True:
+            declaration = ITEM.search(structure, position, end)
+            if not declaration:
+                return
+            if not declaration.group(2):
+                quoted = STRING.search(text, declaration.end())
+                position = declaration.end()
+                if quoted:
+                    self.read(module, (file.parent / quoted.group(1)).resolve(), directory)
+                    position = quoted.end()
+                continue
+            name, form = declaration.group(2), declaration.group(3)
+            attributes = attributes_before(text, structure, declaration.start())
+            child = Module(f"{module.path}::{name}", attributes, parent=module)
+            module.children.append(child)
+            if any(a.strip() in ("cfg(test)", f"cfg({GATE})") for a in attributes):
+                child.site = (file, text.rfind("#", 0, declaration.start()))
+            explicit = next((STRING.search(a).group(1) for a in attributes
+                             if re.match(r"\s*path\s*=", a) and STRING.search(a)), None)
+            if form == "{":
+                close = matching(structure, declaration.end() - 1, "{", "}")
+                child.files.append(file)
+                self.scan(child, file, text, structure, declaration.end(), close, directory / name)
+                position = close + 1
+            else:
+                if explicit:
+                    target = (file.parent / explicit) if directory == self.child_directory(file) else (directory / explicit)
+                    sub = (target.parent / target.stem) if target.name != "mod.rs" else target.parent
+                elif (directory / f"{name}.rs").exists():
+                    target, sub = directory / f"{name}.rs", directory / name
+                else:
+                    target, sub = directory / name / "mod.rs", directory / name
+                self.read(child, target.resolve(), sub.resolve())
+                position = declaration.end()
+
+    @staticmethod
+    def child_directory(file: Path) -> Path:
+        if file.name in ("lib.rs", "main.rs", "mod.rs"):
+            return file.parent
+        return file.parent / file.stem
+
+    def modules(self, module: Module | None = None):
+        module = module or self.crate
+        yield module
+        for child in module.children:
+            yield from self.modules(child)
+
+
+def subtree_files(module: Module) -> set[Path]:
+    files = set(module.files)
+    for child in module.children:
+        files |= subtree_files(child)
+    return files
+
+
+def reasons(tree: Tree, test: Module, cache: dict[Path, bool]) -> list[str]:
+    found = []
+    ancestor = test.parent
+    while ancestor and ancestor.parent:
+        if any(FEATURE.search(a) for a in ancestor.declaration):
+            found.append(f"{ancestor.path} is declared under a feature, so the cli lane may not build it")
+        ancestor = ancestor.parent
+    owner = test.parent
+    for file in sorted(subtree_files(owner)):
+        if file not in cache:
+            # The gate names features too; it is the one form allowed.
+            cache[file] = bool(FEATURE.search(file.read_text(encoding="utf-8").replace(GATE, "")))
+        if cache[file]:
+            found.append(f"{file.relative_to(tree.root)} branches on a feature")
+    return found
+
+
+def check(root: Path) -> tuple[list[str], list[str]]:
+    """Problems with the gated modules, and the ungated test modules that
+    could be gated, as `file:line: module`."""
+    tree = Tree(root.resolve())
+    if tree.problems:
+        return tree.problems, []
+    cache: dict[Path, bool] = {}
+    failures, eligible = [], []
+    for module in tree.modules():
+        if not module.site:
+            continue
+        gated = any(a.strip() == f"cfg({GATE})" for a in module.declaration)
+        found = reasons(tree, module, cache)
+        if gated and found:
+            failures.append(f"{module.path} runs only in the cli lane, but:\n  " + "\n  ".join(found))
+        elif not gated and not found:
+            file, offset = module.site
+            line = file.read_text(encoding="utf-8").count("\n", 0, offset) + 1
+            eligible.append(f"{file.relative_to(tree.root)}:{line}: {module.path}")
+    return failures, eligible
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--eligible", action="store_true",
+                        help="list #[cfg(test)] modules that could run only in the cli lane")
+    args = parser.parse_args()
+    failures, eligible = check(args.root)
+    if args.eligible:
+        print("\n".join(eligible))
+    if failures:
+        print("\n".join(failures), file=sys.stderr)
+        print("\nDeclare these with #[cfg(test)] so every lane runs them, or remove the feature branch.",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

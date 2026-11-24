@@ -207,7 +207,7 @@ fn reference(text: &str) -> bool {
             && (text.starts_with('/') || text.starts_with("./") || text.starts_with("../")))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

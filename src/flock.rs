@@ -122,7 +122,7 @@ pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Resul
     Ok(owners.ok().and_then(|owners| owners.into_iter().next()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;

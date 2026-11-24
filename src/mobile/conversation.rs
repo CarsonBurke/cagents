@@ -614,6 +614,6 @@ fn api_error(code: api::ErrorCode, message: &str) -> api::Error {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 #[path = "conversation_tests.rs"]
 mod tests;

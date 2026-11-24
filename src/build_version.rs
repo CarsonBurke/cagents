@@ -34,7 +34,7 @@ pub(crate) fn current() -> &'static str {
 
 include!("../build/stated_version.rs");
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 
