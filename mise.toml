@@ -214,6 +214,26 @@ description = "Run the checks GitHub CI runs: formatting, protocol contracts and
 usage = 'arg "[unexpected]..." var=#true hide=#true'
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["fmt:check", "check:protocol", "test:scripts"] }]
 
+# Mobile ---------------------------------------------------------------------
+# The Android app in mobile/ builds with Gradle on this host: it compiles no
+# Rust, and gradle.properties caps its daemon's memory and workers. ANDROID_HOME
+# defaults to ~/Android/Sdk. See mobile/README.md.
+
+[tasks."mobile:test"]
+description = "Test the Android app: the protocol against the recorded API, the client against a fake bridge"
+dir = "mobile"
+run = 'ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain :shared:jvmTest :androidApp:testDebugUnitTest'
+
+[tasks."mobile:build"]
+description = "Build the Android app's debug APK (mobile/androidApp/build/outputs/apk/debug)"
+dir = "mobile"
+run = 'ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain :androidApp:assembleDebug'
+
+[tasks."mobile:install"]
+description = "Build the debug APK and install it on the connected phone (set ANDROID_SERIAL to choose one)"
+dir = "mobile"
+run = 'ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}" exec ./gradlew --console=plain :androidApp:installDebug'
+
 # Packaging and release ------------------------------------------------------
 
 [tasks.install]
