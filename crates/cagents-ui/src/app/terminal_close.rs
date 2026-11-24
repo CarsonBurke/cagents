@@ -426,6 +426,22 @@ impl Cagents {
             Some(TransientNotice::warning(message).with_key(NoticeKey::CloseWaiting(card)));
     }
 
+    /// Whether `card`'s close only waits its turn behind another pane's, with
+    /// nothing of its own started. Its Close stays available: pressed again,
+    /// it says what it waits for, or stops waiting on a stranded removal. A
+    /// chat's close has its own question and queue, so it is left out.
+    pub(super) fn close_waiting_its_turn(&self, card: CardId) -> bool {
+        self.queued_card_closes
+            .iter()
+            .any(|queued| queued.card == card)
+            && !self.closes_under_way().any(|running| running == card)
+            && !self.chat_close_owned(card)
+            && !self.chat_has_parked_runtime(card)
+            && !self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+    }
+
     /// Whether the next queued pane has to wait: for a close under way, or for
     /// whatever would drop the message that starts it. The update tail tries
     /// again once none of them hold.
@@ -704,9 +720,11 @@ impl Cagents {
                 self.queue_card_close_behind(card, blocker, unasked);
                 return Task::none();
             }
-            self.queued_card_closes.retain(|queued| queued.card != card);
-            self.resolve_notice(NoticeKey::CloseWaiting(card));
         }
+        // Starting now, it no longer waits its turn: the queue must not start
+        // it a second time.
+        self.queued_card_closes.retain(|queued| queued.card != card);
+        self.resolve_notice(NoticeKey::CloseWaiting(card));
         // This pane's own close is already running or asking, or the daemon has
         // answered and only its removal is left.
         if self
@@ -3776,6 +3794,8 @@ pub(in crate::app) mod tests {
 
         app.completed_release = None;
         drop(app.next_queued_card_close());
+        assert!(app.queued_card_closes.is_empty());
+        assert!(!app.close_waiting_its_turn(settings));
         assert_eq!(
             app.workspace
                 .pending_close()
@@ -3803,6 +3823,9 @@ pub(in crate::app) mod tests {
         assert!(app.card_state(settings).unwrap().existence.is_open());
         let notice = waiting_notice(&app, settings).expect("the wait is reported");
         assert!(notice.contains("Close this pane again"), "{notice}");
+        // The tab's Close stays pressable, so the advice can be followed.
+        assert!(app.close_waiting_its_turn(settings));
+        assert!(!app.close_waiting_its_turn(first));
 
         drop(app.update(Message::CloseCard(settings)));
         assert_eq!(
@@ -3839,6 +3862,7 @@ pub(in crate::app) mod tests {
             );
             let notice = waiting_notice(&app, settings).expect("the wait is reported");
             assert!(!notice.contains("Close this pane again"), "{notice}");
+            assert!(app.close_waiting_its_turn(settings));
         }
         assert_eq!(app.queued_card_closes.len(), 1);
     }

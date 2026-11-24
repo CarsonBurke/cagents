@@ -3880,6 +3880,7 @@ impl Cagents {
         };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.close_waiting_its_turn(id) => Some(("Waiting to close", true)),
             _ if self.terminal_close_in_progress(id) => Some(("Checking before closing", true)),
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.reopen_preparing(id) => Some(("Reopening conversation", true)),
@@ -3968,7 +3969,8 @@ impl Cagents {
                     || card_control_id(id, "close"),
                     |chrome| chrome.close_id.clone(),
                 ),
-                (!self.terminal_close_in_progress(id)).then_some(Message::CloseCard(id)),
+                (!self.terminal_close_in_progress(id) || self.close_waiting_its_turn(id))
+                    .then_some(Message::CloseCard(id)),
             ));
         }
         let tab = crate::tab_strip::middle_click_close(
