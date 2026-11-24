@@ -222,6 +222,7 @@ fn poll_with(
     repository.validate().map_err(|error| error.to_string())?;
     pr_status::private_directory(root).map_err(|error| error.to_string())?;
     let name = name(credentials, repository);
+    pr_status::prune_cache(root, &name);
     let flight = pr_status::lock(&root.join(format!("{name}.lock")), cancellation)?;
     validate_context()?;
     let path = root.join(format!("{name}.json"));

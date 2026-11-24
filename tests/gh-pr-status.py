@@ -182,6 +182,52 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
                 child.communicate()
             self.finish_builder()
 
+    def test_fallback_expires_old_idle_cache_records_without_breaking_cooldowns(self):
+        root = status.private(self.root / "state/cagents/github-status")
+        now = int(time.time())
+        old = now - status.CACHE_RETENTION - 1
+        future = now + 60
+        expired = {"1": ("json", {"next_attempt": 0}),
+                   "2": ("json", {"due": 0}),
+                   "3": ("rest-retry", {"retry_at": 0}),
+                   "4": ("cooldown", {"primary": {"core": 1}, "secondary": 0}),
+                   "5": ("cooldown", 1)}
+        retained = {"6": ("json", {"next_attempt": future}),
+                    "7": ("json", {"due": future}),
+                    "8": ("rest-retry", {"retry_at": future}),
+                    "9": ("cooldown", {"primary": {"graphql": future}, "secondary": 1}),
+                    "a": ("cooldown", {"primary": {}, "secondary": future}),
+                    "b": ("cooldown", future),
+                    "c": ("json", {"next_attempt": 0}),
+                    "d": ("json", {"unknown": 0})}
+
+        def record(digit, suffix):
+            return root / f"{digit * 64}.{suffix}"
+
+        for digit, (suffix, data) in (expired | retained).items():
+            path = record(digit, suffix)
+            status.store(path, data)
+            os.utime(path, (old, old))
+        recent = record("0", "json")
+        status.store(recent, {"next_attempt": 0})
+        symlink = record("f", "json")
+        symlink.symlink_to(recent)
+        os.utime(symlink, (old, old), follow_symlinks=False)
+        lock = record("1", "lock")
+        with status.locked(lock):
+            inode = lock.stat().st_ino
+        with status.locked(record("c", "lock")):
+            key = status.target("o/r", "github.com", 7)
+            self.assertIsNone(status.rest(key)["error"])
+        self.assertEqual(len(self.lines("requests")), 1)
+        for digit, (suffix, _) in expired.items():
+            self.assertFalse(record(digit, suffix).exists(), digit)
+        for digit, (suffix, _) in retained.items():
+            self.assertTrue(record(digit, suffix).exists(), digit)
+        self.assertTrue(symlink.is_symlink())
+        self.assertTrue(recent.exists())
+        self.assertEqual(lock.stat().st_ino, inode)
+
     def test_main_snapshot_ignores_dirty_branch_and_unrelated_commits(self):
         self.git("checkout", "-qb", "agent")
         (self.repo / "src/github_status.rs").write_text("dirty agent source")

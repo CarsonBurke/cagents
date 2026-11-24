@@ -17,6 +17,9 @@ use std::{
 };
 use url::Url;
 
+mod retention;
+pub(crate) use retention::prune_cache;
+
 /// A successful result and a failed attempt both suppress repeated reads for
 /// two minutes. An explicit server cooldown can extend that interval.
 pub const MAX_AGE: u64 = 120;
@@ -779,6 +782,7 @@ fn read_with<E: ProcessExecutor>(
     i32::try_from(key.number).map_err(|_| "The pull request number exceeds GitHub's Int range")?;
     private_directory(root).map_err(|error| error.to_string())?;
     let name = target_name(credentials, key);
+    prune_cache(root, &name);
     let _flight = lock(&root.join(format!("{name}.lock")), cancellation)?;
     let path = root.join(format!("{name}.json"));
     let mut cached = load::<Cached>(&path)

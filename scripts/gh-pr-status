@@ -24,6 +24,10 @@ from cargo_artifacts import CargoArtifactError, CargoArtifacts
 
 MAX_BYTES = 4 * 1024 * 1024
 REFRESH = 120
+# Shared with src/github_status/retention.rs.
+CACHE_SWEEP_INTERVAL = 24 * 60 * 60
+CACHE_RETENTION = 30 * CACHE_SWEEP_INTERVAL
+CACHE_RECORD_NAME = re.compile(r"([0-9a-f]{64})\.(json|rest-retry|cooldown)")
 BUILD_RETRY = 600
 HEAD_NOT_SHOWN = 5  # A readable snapshot that does not yet show --expect-head.
 # Launch errors that mean the cached binary itself is unusable, rather than
@@ -70,7 +74,7 @@ def locked(path):
         os.close(fd)
 
 
-def load(path, with_time=False):
+def load(path, with_time=False, *, allow_timestamp=False):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -84,8 +88,9 @@ def load(path, with_time=False):
         raise OSError("Oversized cache entry")
     try:
         result = json.loads(data)
-        result = result if isinstance(result, dict) else {}
-    except ValueError:
+        if not (isinstance(result, dict) or allow_timestamp and type(result) is int):
+            result = {}
+    except (ValueError, RecursionError):
         result = {}
     return (result, int(info.st_mtime)) if with_time else result
 
@@ -99,6 +104,64 @@ def store(path, value):
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def cache_deadline(record, kind):
+    if kind == "cooldown" and type(record) is int:
+        deadlines = [record]
+    elif not isinstance(record, dict):
+        return None
+    elif kind == "cooldown" and isinstance(record.get("primary"), dict):
+        deadlines = [record.get("secondary"), *record["primary"].values()]
+    elif kind == "json":
+        deadlines = [record[key] for key in ("next_attempt", "due") if key in record]
+    elif kind == "rest-retry":
+        deadlines = [record.get("retry_at")]
+    else:
+        return None
+    # Reject numbers that the Rust reader cannot recognize as timestamps.
+    if deadlines and all(type(due) is int and 0 <= due < 2**64 for due in deadlines):
+        return max(deadlines)
+    return None
+
+
+def prune_cache(root, requested, now):
+    """Sweep expired records without waiting or retiring coordination locks."""
+    marker = root / ".retention.lock"
+
+    def recent(info):
+        return stat.S_ISREG(info.st_mode) and info.st_size and 0 <= now - info.st_mtime < CACHE_SWEEP_INTERVAL
+
+    def expired(info):
+        return (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                and info.st_nlink == 1 and now - info.st_mtime >= CACHE_RETENTION)
+
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            if recent(marker.lstat()):
+                return
+        with locked(marker) as sweep:
+            info = os.fstat(sweep)
+            if info.st_nlink != 1 or recent(info):
+                return
+            os.write(sweep, b"1")
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    match = CACHE_RECORD_NAME.fullmatch(entry.name)
+                    if match is None or match[1] == requested:
+                        continue
+                    with contextlib.suppress(OSError):
+                        if not expired(entry.stat(follow_symlinks=False)):
+                            continue
+                        path = root / entry.name
+                        with locked(root / (match[1] + ".lock")):
+                            # Recheck because publication could have replaced the entry.
+                            if expired(path.lstat()):
+                                due = cache_deadline(load(path, allow_timestamp=True), match[2])
+                                if due is not None and due <= now:
+                                    path.unlink()
+    except OSError:
+        pass
 
 
 def git(root, *args):
@@ -368,6 +431,7 @@ def rest(key):
                   repo["name"].lower(), str(key["number"]))
     path = root / (name + ".json")
     retry_path = root / (name + ".rest-retry")
+    prune_cache(root, name, time.time())
     at = int(time.time())
     saved = load(path)
     rest_due = load(retry_path).get("retry_at", 0)
