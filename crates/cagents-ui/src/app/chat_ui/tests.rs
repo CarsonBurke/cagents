@@ -381,6 +381,9 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
     runtime.attach([path.clone()]);
     assert_eq!(runtime.attachments.len(), 1);
     let queued = runtime.take_attachments();
+    // The preview leaves with the message, until nothing shows it.
+    assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+    runtime.sync_thumbnails();
     assert!(runtime.thumbnails.subscriptions(runtime.target).is_empty());
     runtime.take_back("queued", queued, PromptMode::Queue);
     assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
@@ -417,6 +420,28 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
     assert!(runtime.thumbnails.subscriptions(target).is_empty());
     runtime.attach([path]);
     assert_eq!(runtime.thumbnails.subscriptions(target).len(), 1);
+}
+
+/// A message waiting to be sent shows its images' previews, which outlast
+/// the draft they left and any later edit of the next draft.
+#[test]
+fn a_queued_message_keeps_its_image_previews() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let path = PathBuf::from("/fixture/image.png");
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().attach([path.clone()]);
+    write(&mut app, card, "Here is the layout");
+    submit(&mut app, card);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let queued = runtime.queued.as_ref().unwrap();
+    assert_eq!(queued.prompt.attachments[0].path, path);
+    assert!(runtime.attachments.is_empty());
+    runtime.sync_thumbnails();
+    assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+    runtime.queued = None;
+    runtime.sync_thumbnails();
+    assert!(runtime.thumbnails.subscriptions(runtime.target).is_empty());
 }
 
 #[test]

@@ -4954,7 +4954,7 @@ impl Runtime {
     }
 
     /// The draft's attachments as one compact strip above the message: a
-    /// square thumbnail per image and a chip per file, wrapping onto more
+    /// chip per image, with its thumbnail, and per file, wrapping onto more
     /// rows in a narrow pane rather than hiding any off its edge.
     fn attachment_tray(&self, target: Target, transitioning: bool) -> Option<Element<'_, Message>> {
         if self.attachments.is_empty() {
@@ -5029,8 +5029,12 @@ impl Runtime {
         let close = widget::container(attachment_close(removal(Removal::Pointer)))
             .center_y(Length::Fixed(ATTACHMENT_CHIP - 6.0));
         let id = attachment_tile_id(target.card, index);
-        // Room at the trailing end for the × it reveals.
-        let trailing = ATTACHMENT_CLOSE + 6.0;
+        // Room at the trailing end for the × it reveals, where it has one.
+        let trailing = if fixed {
+            step::GAP_S
+        } else {
+            ATTACHMENT_CLOSE + 6.0
+        };
         if !is_image_attachment(attachment) {
             let face = widget::container(
                 widget::row::with_children(vec![
@@ -5051,10 +5055,9 @@ impl Runtime {
                 true,
             ));
             // The chip names the file; where it is, the path, waits for the
-            // pointer.
-            return crate::interaction::tooltip(
-                attachment_tile::tile(id, face, widget::Space::new(), close, label, remove)
-                    .on_history(undo, redo),
+            // pointer, above the chip rather than over the draft below it.
+            return crate::interaction::tooltip_above(
+                attachment_tile::tile(id, face, close, label, remove).on_history(undo, redo),
                 attachment.path.display().to_string(),
             );
         }
@@ -5081,7 +5084,6 @@ impl Runtime {
                 source,
                 trailing,
             ),
-            widget::Space::new(),
             close,
             name,
             remove,
@@ -5090,7 +5092,7 @@ impl Runtime {
         .on_history(undo, redo)
         .marked(marked);
         match full {
-            Some(full) => crate::interaction::tooltip(tile, full),
+            Some(full) => crate::interaction::tooltip_above(tile, full),
             None => tile.into(),
         }
     }

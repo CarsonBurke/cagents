@@ -4019,7 +4019,7 @@ impl Runtime {
             }
         }
         draft_images::forget(&mut self.detached_attachments, &self.attachments);
-        self.thumbnails.sync(&self.attachments);
+        self.sync_thumbnails();
         if self.attachments.len() != before {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -4250,7 +4250,7 @@ impl Runtime {
             self.composer_note = Some(note);
         }
         if reconciled.changed {
-            self.thumbnails.sync(&self.attachments);
+            self.sync_thumbnails();
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -4299,7 +4299,7 @@ impl Runtime {
             self.composer_note = Some(note);
         }
         if changed {
-            self.thumbnails.sync(&self.attachments);
+            self.sync_thumbnails();
         }
         self.cancel_invalid_attachment_jobs();
         self.reconcile_references(inline);
@@ -4559,7 +4559,7 @@ impl Runtime {
             // Like any edit, it makes the message shown the draft.
             self.end_history_walk();
         }
-        self.thumbnails.sync(&self.attachments);
+        self.sync_thumbnails();
         self.revision = self.revision.wrapping_add(1);
         self.settle_restored_notice();
         self.follow_caret_reference();
@@ -4568,18 +4568,39 @@ impl Runtime {
 
     /// The draft's attachments leave with the draft, when it is sent or held,
     /// and so does what the restored-messages notice said about it.
+    /// Their previews stay: the message they leave with shows them until
+    /// the conversation has it, and the next sync lets them go.
     fn take_attachments(&mut self) -> Vec<Attachment> {
         self.composer_note = None;
         self.restored_waiting = None;
-        self.thumbnails.clear();
         std::mem::take(&mut self.attachments)
     }
 
     fn replace_attachments(&mut self, attachments: Vec<Attachment>) -> Vec<Attachment> {
-        self.thumbnails.clear();
         let old = std::mem::replace(&mut self.attachments, attachments);
-        self.thumbnails.sync(&self.attachments);
+        self.sync_thumbnails();
         old
+    }
+
+    /// Previews for the draft's images and for those of the reader's
+    /// messages shown ahead of the conversation, the draft's first.
+    fn sync_thumbnails(&mut self) {
+        let shown = self
+            .queued
+            .iter()
+            .map(|queued| &queued.prompt)
+            .chain(
+                self.commands
+                    .unconfirmed()
+                    .iter()
+                    .map(|unconfirmed| &unconfirmed.outgoing)
+                    .chain(self.commands.outgoing())
+                    .filter(|outgoing| outgoing.in_transcript())
+                    .map(|outgoing| &outgoing.prompt),
+            )
+            .flat_map(|prompt| &prompt.attachments);
+        let attachments: Vec<&Attachment> = shown.chain(&self.attachments).collect();
+        self.thumbnails.sync(attachments);
     }
 
     /// Puts a message that was waiting back in the composer, ahead of

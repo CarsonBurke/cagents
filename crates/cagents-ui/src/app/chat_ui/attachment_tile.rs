@@ -23,8 +23,8 @@ const RING: f32 = 2.0;
 
 pub(super) struct Tile<'a, Message> {
     id: widget::Id,
-    /// The face, then the label shown over it, then the × button.
-    children: [Element<'a, Message>; 3],
+    /// The face, then the × button drawn over it.
+    children: [Element<'a, Message>; 2],
     name: String,
     marked: bool,
     on_open: Option<Message>,
@@ -38,14 +38,13 @@ pub(super) struct Tile<'a, Message> {
 pub(super) fn tile<'a, Message: Clone + 'a>(
     id: widget::Id,
     face: impl Into<Element<'a, Message>>,
-    label: impl Into<Element<'a, Message>>,
     close: impl Into<Element<'a, Message>>,
     name: String,
     on_remove: Option<Message>,
 ) -> Tile<'a, Message> {
     Tile {
         id,
-        children: [face.into(), label.into(), close.into()],
+        children: [face.into(), close.into()],
         name,
         marked: false,
         on_open: None,
@@ -70,7 +69,7 @@ impl<'a, Message> Tile<'a, Message> {
         self
     }
 
-    /// Shows the label and × as hover does: the composer's caret is on this
+    /// Shows the × as hover does: the composer's caret is on this
     /// attachment's reference.
     pub(super) fn marked(mut self, marked: bool) -> Self {
         self.marked = marked;
@@ -96,8 +95,7 @@ impl operation::Focusable for State {
 }
 
 const FACE: usize = 0;
-const LABEL: usize = 1;
-const CLOSE: usize = 2;
+const CLOSE: usize = 1;
 
 impl<Message> Tile<'_, Message> {
     fn revealed(&self, state: &State) -> bool {
@@ -141,19 +139,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let [face, label, close] = &mut self.children;
-        let [face_tree, label_tree, close_tree] = &mut tree.children[..] else {
-            unreachable!("a tile has three parts");
+        let [face, close] = &mut self.children;
+        let [face_tree, close_tree] = &mut tree.children[..] else {
+            unreachable!("a tile has two parts");
         };
         let face = face
             .as_widget_mut()
             .layout(face_tree, renderer, &limits.loose());
         let size = face.size();
-        let label = label.as_widget_mut().layout(
-            label_tree,
-            renderer,
-            &layout::Limits::new(Size::ZERO, size),
-        );
         let close = close.as_widget_mut().layout(
             close_tree,
             renderer,
@@ -164,7 +157,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
             (size.width - close_size.width - CLOSE_INSET).max(0.0),
             CLOSE_INSET,
         ));
-        layout::Node::with_children(size, vec![face, label, close])
+        layout::Node::with_children(size, vec![face, close])
     }
 
     fn operate(
@@ -342,10 +335,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
         let bounds = layout.bounds();
         let mut parts = layout.children();
         let face = parts.next().expect("a tile's face");
-        let label = parts.next().expect("a tile's label");
         let close = parts.next().expect("a tile's ×");
         // The face is clipped to the tile's rounded square by its own
-        // container; the label, × and ring draw over it.
+        // container; the × and ring draw over it.
         self.children[FACE].as_widget().draw(
             &tree.children[FACE],
             renderer,
@@ -380,21 +372,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
             return;
         };
         // A layer of its own: within one layer the renderer puts images
-        // above quads, so the thumbnail would hide the label's scrim, the ×
-        // and the ring, leaving only the label's text.
+        // above quads, so the thumbnail would hide the × and the ring.
         renderer.with_layer(clip, |renderer| {
             if revealed {
-                for (index, part) in [(LABEL, label), (CLOSE, close)] {
-                    self.children[index].as_widget().draw(
-                        &tree.children[index],
-                        renderer,
-                        theme,
-                        style,
-                        part,
-                        cursor,
-                        viewport,
-                    );
-                }
+                self.children[CLOSE].as_widget().draw(
+                    &tree.children[CLOSE],
+                    renderer,
+                    theme,
+                    style,
+                    close,
+                    cursor,
+                    viewport,
+                );
             }
             if let Some(color) = ring {
                 renderer.fill_quad(
@@ -478,7 +467,6 @@ mod tests {
                 tile(
                     id.clone(),
                     cosmic::widget::Space::new().width(56).height(56),
-                    cosmic::widget::Space::new(),
                     cosmic::widget::button::custom(
                         cosmic::widget::Space::new().width(18).height(18),
                     )
