@@ -276,7 +276,9 @@ runs the installer's full-upgrade handoff, and reopens the same named windows
 from the newly installed executable. Failure status and the private installer
 log stay under the installation's `.update/` directory. After you resolve a
 veto or failure, the warning offers **Retry update** while the selected release
-is still available; the diagnostic files are kept.
+is still available. Starting a new update keeps the current job and keeps
+verified successful jobs for at least 30 days. Failed or unresolved jobs
+retain the inputs needed for recovery.
 
 ### From the command line
 
