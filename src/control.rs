@@ -146,13 +146,13 @@ fn io_timeout() -> Duration {
 }
 
 #[cfg(test)]
-mod ordinary_budget {
+pub(crate) mod ordinary_budget {
     use std::cell::Cell;
     use std::time::Duration;
 
     /// Short enough that waiting one out costs little, and still long beside
     /// an in-process exchange.
-    pub(super) const QUICK: Duration = Duration::from_secs(1);
+    pub(crate) const QUICK: Duration = Duration::from_secs(1);
 
     thread_local! {
         static BUDGET: Cell<Duration> = const { Cell::new(super::IO_TIMEOUT) };
@@ -165,7 +165,7 @@ mod ordinary_budget {
     /// Lower the ordinary budget on this thread to [`QUICK`] until the guard
     /// drops. A client must be created and used on a thread holding it.
     #[must_use = "the budget is restored when the guard drops"]
-    pub(super) fn quick() -> impl Drop {
+    pub(crate) fn quick() -> impl Drop {
         struct Restore(Duration);
         impl Drop for Restore {
             fn drop(&mut self) {

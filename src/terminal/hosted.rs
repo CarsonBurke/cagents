@@ -3816,11 +3816,15 @@ mod tests {
                 .write_all(b"damaged checkpoint")
                 .unwrap();
         }
+        // Restoration outlasts the ordinary handshake budget, lowered here
+        // so that waiting it out is cheap.
+        let _budget = crate::control::ordinary_budget::quick();
+        let restore = crate::control::ordinary_budget::QUICK + Duration::from_millis(600);
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5_600));
+            thread::sleep(restore);
             let mut stream = accept_connection(&listener);
             let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             let proof = proof("restored-existing");
@@ -3901,6 +3905,9 @@ mod tests {
         let socket = directory.path().join("daemon.sock");
         // The #2400 rehearsal restored 34 sessions in 5.48 s; the CLI's ordinary
         // handshake gave up at 5 s while the startup allowance was far larger.
+        // This one test keeps the production budget, so it also fails a
+        // handshake bounded by any fixed five seconds, not only by the
+        // ordinary budget that the existing-listener test lowers.
         let started = Instant::now();
         start_and_verify_daemon_at(
             &socket,
