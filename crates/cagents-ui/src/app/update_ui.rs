@@ -1344,6 +1344,7 @@ pub(in crate::app) mod tests {
                 confirmation: None,
                 refusal: None,
                 in_flight: Vec::new(),
+                recorded_by: None,
             };
             app.update_ui.job = Some(job.clone());
             app.status = None;
@@ -1367,6 +1368,7 @@ pub(in crate::app) mod tests {
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         app.update_ui.job = Some(job.clone());
         job.phase = UpdatePhase::Complete;
@@ -1387,6 +1389,66 @@ pub(in crate::app) mod tests {
 
     /// A refusal names what held the update back, once, and the header keeps
     /// reading as a refusal rather than a failure or a cancelled download.
+    /// A window reopened by an older worker can first read that worker's
+    /// failure while it still verifies this build. The update reports it as
+    /// finishing, so the window keeps asking until the verdict is in.
+    #[test]
+    fn a_reopened_window_waits_out_an_older_workers_verification() {
+        let finishing = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "0.2.4".into(),
+            phase: UpdatePhase::Installing,
+            message: "Finishing the update".into(),
+            log_path: "/nonexistent/update.log".into(),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: None,
+        };
+        let open = || {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.update_update_ui(Action::Polled(None, Ok(Some(finishing.clone())))));
+            assert!(app.update_ui.updating(), "the window keeps polling");
+            assert!(app.update_ui.error.is_none());
+            assert!(app.status.is_none(), "no failure is said while it finishes");
+            for _ in 0..3 {
+                drop(app.update_update_ui(Action::Polled(
+                    Some(finishing.id.clone()),
+                    Ok(Some(finishing.clone())),
+                )));
+            }
+            assert!(app.update_ui.updating());
+            app
+        };
+
+        // The target's verifier proved the service: the window says so.
+        let mut app = open();
+        let mut completed = finishing.clone();
+        completed.phase = UpdatePhase::Complete;
+        completed.message = "Update installed; saved windows reopened".into();
+        drop(app.update_update_ui(Action::Polled(
+            Some(finishing.id.clone()),
+            Ok(Some(completed)),
+        )));
+        assert!(!app.update_ui.updating());
+        assert!(app.update_ui.error.is_none());
+        let [entry] = app.notices.entries.make_contiguous() else {
+            panic!("expected one completion notice");
+        };
+        assert_eq!(entry.notice.message, "Updated to cagents 0.2.4");
+
+        // The verification never settled: the recorded failure is shown.
+        let mut app = open();
+        let mut failed = finishing.clone();
+        failed.phase = UpdatePhase::Failed;
+        failed.message = "Fresh readiness verification is pending".into();
+        drop(app.update_update_ui(Action::Polled(Some(finishing.id.clone()), Ok(Some(failed)))));
+        assert!(!app.update_ui.updating());
+        assert!(app.update_ui.error.is_some());
+        assert!(app.status.is_some());
+        assert!(app.notices.entries.is_empty());
+    }
+
     #[test]
     fn a_refused_update_shows_its_reasons_not_a_cancellation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -1407,6 +1469,7 @@ pub(in crate::app) mod tests {
             confirmation: None,
             refusal: Some(refusal.clone()),
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let reason = "Claude: Its provider stopped but may still hold unfinished work. \
                       Close this conversation to release it.";
@@ -1503,6 +1566,7 @@ pub(in crate::app) mod tests {
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         });
         app.update_ui.error = Some("installed daemon startup failed".into());
         drop(app.update_update_ui(Action::Polled(Some("historical-failure".into()), Ok(None))));
@@ -1628,6 +1692,7 @@ pub(in crate::app) mod tests {
             }),
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         }
     }
 
@@ -1826,6 +1891,7 @@ pub(in crate::app) mod tests {
                 confirmation,
                 refusal: None,
                 in_flight: Vec::new(),
+                recorded_by: None,
             })),
         )));
         assert!(app.update_ui.confirmation.is_none());
@@ -1943,6 +2009,7 @@ pub(in crate::app) mod tests {
             confirmation: Some(confirmation.clone()),
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         }
     }
 

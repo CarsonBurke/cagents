@@ -297,7 +297,7 @@ pub(super) fn perform(
         installation,
         state,
         job,
-        &result,
+        &mut result,
         handoff,
         &recovery,
         survivors,
@@ -1288,6 +1288,7 @@ exit 1"#,
                 confirmation: None,
                 refusal: None,
                 in_flight: Vec::new(),
+                recorded_by: None,
             };
             write_job(&state, &job).unwrap();
             if mode == "write-error" {

@@ -343,6 +343,7 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
                 confirmation: None,
                 refusal: None,
                 in_flight: Vec::new(),
+                recorded_by: None,
             },
         )
     }

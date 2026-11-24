@@ -237,6 +237,13 @@ pub struct UpdateJob {
     /// what became of it. Empty until the update has changed a provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_flight: Vec<in_flight::Outcome>,
+    /// The release whose worker owns this job. Releases up to 0.2.3 do not
+    /// record it; their workers checked the successor daemon through their
+    /// own wire protocol, so a newer target could fail that check while
+    /// serving correctly. A worker that records its release confirms the
+    /// successor without the protocol, so its failure is its own verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_by: Option<String>,
 }
 
 impl UpdateError {
@@ -1217,6 +1224,7 @@ fn start_job(
         confirmation: None,
         refusal: None,
         in_flight: Vec::new(),
+        recorded_by: Some(crate::version().into()),
     };
     let log = private_create(&job.log_path)?;
     confirmation::initialize(&state, &id)?;
@@ -1321,8 +1329,14 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
     Ok(Some(job))
 }
 
-/// Keep historical diagnostics available to the CLI without showing a resolved
-/// installation failure as a warning in every subsequently installed window.
+/// The update job as a window should present it.
+///
+/// A failure recorded by an older worker after this window's own build, its
+/// target, took over is settled here: while that worker is still finishing it
+/// reads as still updating, and once the target's own verifier has proven the
+/// service it reads, and is recorded, as complete. A failure that a later
+/// switch of `current` resolved is not shown at all. Anything unproven keeps
+/// the failure visible.
 #[cfg(feature = "ui")]
 pub fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
     #[cfg(feature = "development")]
@@ -1334,64 +1348,384 @@ pub fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
     let Some(job) = status()? else {
         return Ok(None);
     };
+    Ok(present_for_ui(job, reconcile_failure))
+}
+
+/// `job` as a window shows it, settling a failure through `reconcile`.
+#[cfg(feature = "ui")]
+fn present_for_ui(
+    job: UpdateJob,
+    reconcile: impl FnOnce(&UpdateJob) -> Result<Reconciled, UpdateError>,
+) -> Option<UpdateJob> {
+    if job.phase != UpdatePhase::Failed {
+        return Some(job);
+    }
+    // Missing evidence or an incompatible/starting daemon keeps the failure
+    // visible. Reconciliation must never conceal an unresolved replacement.
+    match reconcile(&job).unwrap_or(Reconciled::Shown) {
+        Reconciled::Shown => Some(job),
+        Reconciled::Superseded => None,
+        Reconciled::Finishing => Some(finishing_presentation(job)),
+        Reconciled::Completed { proof, state } => {
+            if let Err(error) = settle_as_completed(&state, &job, &proof) {
+                tracing::warn!(%error, "could not record the verified update as complete");
+            }
+            Some(completed_presentation(job))
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+enum Reconciled {
+    Shown,
+    /// A later switch of `current` resolved it; there is nothing to show.
+    Superseded,
+    /// The worker that recorded it has not finished; ask again.
+    Finishing,
+    /// The target's verifier proved `proof` serving, and it still serves.
+    Completed {
+        proof: crate::model::HostSessionProof,
+        state: PathBuf,
+    },
+}
+
+#[cfg(feature = "ui")]
+fn reconcile_failure(job: &UpdateJob) -> Result<Reconciled, UpdateError> {
+    let window = locate(&std::env::current_exe()?)?;
+    let served = served_version_root(&window)?;
+    let daemon = installed_daemon_owner(&window)?;
+    if job.version == window.version {
+        // The job's own recovery receipt, written by the target's verifier,
+        // decides it.
+        if !failed_job_reached_its_target(job, &window, &served, daemon.as_ref())
+            || !protocol_check_could_have_failed_it(job)
+        {
+            return Ok(Reconciled::Shown);
+        }
+        let state = window.prefix.join(".update");
+        let proof = match judge_target_failure(
+            &target_evidence(&state, &job.id)?,
+            std::time::SystemTime::now(),
+        ) {
+            TargetFailure::Finishing => return Ok(Reconciled::Finishing),
+            TargetFailure::Unproven => return Ok(Reconciled::Shown),
+            TargetFailure::Reached(proof) => proof,
+        };
+        // The receipt must describe the daemon serving now, not one that
+        // has since restarted.
+        let socket = crate::terminal_ipc::local_daemon_socket_path()?;
+        source::Peer::confirm_serving(&socket, &served.join("bin/cagentsd"), &proof)?;
+        return Ok(if daemon_speaks_version(&window.version)? {
+            Reconciled::Completed { proof, state }
+        } else {
+            Reconciled::Shown
+        });
+    }
     // Failed local builds cannot be ordered by their metadata. A later switch
     // of `current`, followed by a healthy matched application set, demonstrates
     // supersession; a rollback before the failure was recorded does not.
-    let superseded = (|| -> Result<bool, UpdateError> {
-        if job.phase != UpdatePhase::Failed {
-            return Ok(false);
-        }
-        let window = locate(&std::env::current_exe()?)?;
-        let served = served_version_root(&window)?;
-        let daemon = installed_daemon_owner(&window)?;
-        let resolved = if job.version == window.version {
-            // An older worker can record a failure after its target already
-            // took over: e8bbb84f2 re-checks the successor with its own client,
-            // which cannot speak a newer protocol. The job's own recovery
-            // receipt, written by the target's verifier, decides it.
-            // The receipt must describe the daemon serving now, not one that
-            // has since restarted.
-            failed_job_reached_its_target(&job, &window, &served, daemon.as_ref())
-                && recovery::verified_serving(&window.prefix.join(".update"), &job.id)?.is_some_and(
-                    |proof| {
-                        crate::terminal_ipc::local_daemon_socket_path().is_ok_and(|socket| {
-                            source::Peer::confirm_serving(
-                                &socket,
-                                &served.join("bin/cagentsd"),
-                                &proof,
-                            )
-                            .is_ok()
-                        })
-                    },
-                )
+    let failed = fs::symlink_metadata(window.prefix.join(".update/status.json"))?;
+    let current = fs::symlink_metadata(window.prefix.join("current"))?;
+    let switched_after_failure = current.file_type().is_symlink()
+        && (current.ctime(), current.ctime_nsec()) > (failed.ctime(), failed.ctime_nsec());
+    Ok(
+        if failed_job_is_superseded(
+            job,
+            &window,
+            &served,
+            daemon.as_ref(),
+            switched_after_failure,
+        ) && daemon_speaks_version(&window.version)?
+        {
+            Reconciled::Superseded
         } else {
-            let failed = fs::symlink_metadata(window.prefix.join(".update/status.json"))?;
-            let current = fs::symlink_metadata(window.prefix.join("current"))?;
-            let switched_after_failure = current.file_type().is_symlink()
-                && (current.ctime(), current.ctime_nsec()) > (failed.ctime(), failed.ctime_nsec());
-            failed_job_is_superseded(
-                &job,
-                &window,
-                &served,
-                daemon.as_ref(),
-                switched_after_failure,
-            )
-        };
-        if !resolved {
-            return Ok(false);
+            Reconciled::Shown
+        },
+    )
+}
+
+/// Whether `job` is a failure that an older worker can record after its target
+/// already took over: e8bbb84f2 and 0.2.3 re-check the successor with their
+/// own client, which cannot speak a newer protocol, and record no release.
+/// Windows that did not reopen stay reported: that part of such a failure is
+/// true whatever the protocol did.
+#[cfg(any(feature = "ui", feature = "host", test))]
+fn protocol_check_could_have_failed_it(job: &UpdateJob) -> bool {
+    job.recorded_by.is_none() && !job.message.contains("did not reopen")
+}
+
+#[cfg(feature = "ui")]
+fn daemon_speaks_version(version: &str) -> Result<bool, UpdateError> {
+    let socket = crate::terminal_ipc::local_daemon_socket_path()?;
+    let mut client = crate::control::ControlClient::connect(&socket)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(client
+        .daemon_version()
+        .map_err(|error| invalid(error.to_string()))?
+        == version)
+}
+
+/// Whether the worker that owns the update state is still running.
+#[cfg(any(feature = "ui", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Worker {
+    Running,
+    Finished,
+    Unknown,
+}
+
+/// What a window can read of a failure recorded against its own build.
+#[cfg(any(feature = "ui", test))]
+#[derive(Debug)]
+struct TargetEvidence {
+    /// Read first, so a receipt read after a finished worker is its last.
+    worker: Worker,
+    receipt: recovery::Reading,
+    /// When the failure was recorded.
+    recorded: std::time::SystemTime,
+}
+
+#[cfg(any(feature = "ui", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum TargetFailure {
+    /// The worker is still verifying the target; its verdict is not in.
+    Finishing,
+    /// The target's verifier found the service usable, served by this proof.
+    Reached(crate::model::HostSessionProof),
+    Unproven,
+}
+
+/// How long a pending placeholder can stand for a verifier still running: the
+/// coordinator stops the verifier at its limit, then saves what it left.
+#[cfg(any(feature = "ui", test))]
+const PENDING_RECEIPT_PATIENCE: Duration =
+    Duration::from_secs(recovery::VERIFIER_LIMIT.as_secs() + 10);
+
+/// How long after recording a failure the worker may still be reopening
+/// windows and verifying them before a window stops waiting for it. Past
+/// this, the receipt already saved decides.
+#[cfg(any(feature = "ui", test))]
+const FINISHING_WORKER_PATIENCE: Duration = Duration::from_secs(3 * 60);
+
+/// Whether a failed job whose target this window runs is settled, and how.
+///
+/// An older worker records the failure before it reopens windows, then saves
+/// a pending placeholder and runs the target's verifier once more, so a
+/// window opened in between can read either the earlier receipt or the
+/// placeholder. Only the receipt left by a finished worker, or one that
+/// outlived the bounds above, decides.
+#[cfg(any(feature = "ui", test))]
+fn judge_target_failure(evidence: &TargetEvidence, now: std::time::SystemTime) -> TargetFailure {
+    // A timestamp in the future means the clock moved; stop waiting.
+    let within = |since: std::time::SystemTime, patience: Duration| {
+        now.duration_since(since)
+            .is_ok_and(|waited| waited < patience)
+    };
+    let worker_finishing =
+        evidence.worker == Worker::Running && within(evidence.recorded, FINISHING_WORKER_PATIENCE);
+    match &evidence.receipt {
+        recovery::Reading::Pending { since }
+            if evidence.worker != Worker::Finished && within(*since, PENDING_RECEIPT_PATIENCE) =>
+        {
+            TargetFailure::Finishing
         }
-        let socket = crate::terminal_ipc::local_daemon_socket_path()?;
-        let mut client = crate::control::ControlClient::connect(&socket)
-            .map_err(|error| invalid(error.to_string()))?;
-        Ok(client
-            .daemon_version()
-            .map_err(|error| invalid(error.to_string()))?
-            == window.version)
-    })()
-    // Missing evidence or an incompatible/starting daemon keeps the failure
-    // visible. Reconciliation must never conceal an unresolved replacement.
-    .unwrap_or(false);
-    Ok((!superseded).then_some(job))
+        recovery::Reading::Pending { .. } => TargetFailure::Unproven,
+        _ if worker_finishing => TargetFailure::Finishing,
+        recovery::Reading::Usable(proof) => TargetFailure::Reached(proof.clone()),
+        recovery::Reading::Unusable => TargetFailure::Unproven,
+    }
+}
+
+#[cfg(feature = "ui")]
+fn target_evidence(state: &Path, job: &str) -> Result<TargetEvidence, UpdateError> {
+    let worker = match crate::instance::private_lock_is_held(&state.join("lock")) {
+        Ok(true) => Worker::Running,
+        Ok(false) => Worker::Finished,
+        Err(_) => Worker::Unknown,
+    };
+    Ok(TargetEvidence {
+        worker,
+        receipt: recovery::read_receipt(state, job)?,
+        recorded: fs::symlink_metadata(state.join("status.json"))?.modified()?,
+    })
+}
+
+/// A failure an older worker recorded, while it is still verifying the target.
+#[cfg(feature = "ui")]
+fn finishing_presentation(mut job: UpdateJob) -> UpdateJob {
+    job.phase = UpdatePhase::Installing;
+    job.message = "Finishing the update".into();
+    job.confirmation = None;
+    job.refusal = None;
+    job
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+fn completed_presentation(mut job: UpdateJob) -> UpdateJob {
+    job.phase = UpdatePhase::Complete;
+    job.message = format!(
+        "Update installed; cagents {} verified its terminal service",
+        job.version
+    );
+    job.confirmation = None;
+    job.refusal = None;
+    job
+}
+
+/// Settle a failure that the target's own verifier proved wrong: record the
+/// job complete through the ordinary job writer, so the CLI, later windows
+/// and later daemons agree, even once the daemon that proved it restarts. The
+/// failure as recorded is kept beside it, in `<job>.settled.json`.
+///
+/// Only with the updater lease held, which no worker then holds, and only
+/// while the job and its receipt are still those that were judged: a failure
+/// `protocol_check_could_have_failed_it`, for the build serving now, whose
+/// receipt shows `proof` serving. Whether `proof` is the daemon serving now
+/// is the caller's to establish. Returns whether the job is now complete.
+#[cfg(any(feature = "ui", feature = "host"))]
+fn settle_as_completed(
+    state: &Path,
+    judged: &UpdateJob,
+    proof: &crate::model::HostSessionProof,
+) -> Result<bool, UpdateError> {
+    // A worker still holding the lease records its own verdict.
+    let _lock = match acquire_lock(state) {
+        Err(UpdateError::Busy) => return Ok(false),
+        lock => lock?,
+    };
+    let current: UpdateJob =
+        serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
+    if current.id != judged.id
+        || current.phase != UpdatePhase::Failed
+        || current.version != judged.version
+        || current.message != judged.message
+        || !protocol_check_could_have_failed_it(&current)
+        || recovery::read_receipt(state, &judged.id)? != recovery::Reading::Usable(proof.clone())
+    {
+        return Ok(false);
+    }
+    let history = state.join(format!("{}.settled.json", current.id));
+    match private_create(&history) {
+        Ok(mut file) => {
+            serde_json::to_writer(
+                &mut file,
+                &serde_json::json!({
+                    "settled_by": crate::version(),
+                    "settled_at_unix": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_secs()),
+                    "serving": proof,
+                    "recorded": current,
+                }),
+            )?;
+            file.sync_all()?;
+        }
+        // An earlier settle that stopped before the job was rewritten.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let completed = completed_presentation(current);
+    write_job(state, &completed)?;
+    retention::remember_success(state, &completed.id, &completed.phase);
+    Ok(true)
+}
+
+/// How long a daemon of an update's target waits for the worker that
+/// installed it to finish, before leaving its failure to a window.
+#[cfg(feature = "host")]
+const SUCCESSOR_SETTLE_PATIENCE: Duration = Duration::from_secs(30 * 60);
+
+/// Run once by a daemon that has finished starting, serving as `serving`.
+///
+/// A 0.2.3 worker records its update failed after this build already took
+/// over, because it checks the successor through its own older protocol
+/// (#3877). The daemon of the target is the one process that can prove that
+/// record wrong without a window: it waits for that worker to finish, and if
+/// the worker's own verifier receipt names this daemon serving, it settles the
+/// job complete. Anything else leaves the record as it is.
+#[cfg(feature = "host")]
+pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let Ok(layout) = locate(&executable) else {
+        // Not an installed build; there is no update record to settle.
+        return;
+    };
+    let state = layout.prefix.join(".update");
+    if !state.is_dir() {
+        return;
+    }
+    let spawned = thread::Builder::new()
+        .name("update-settle".into())
+        .spawn(move || {
+            let deadline = Instant::now() + SUCCESSOR_SETTLE_PATIENCE;
+            loop {
+                match successor_settle_step(&layout, &state, &serving) {
+                    Ok(SettleStep::Wait) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                    Ok(SettleStep::Settled(job)) => {
+                        tracing::info!(job, "settled an older worker's update failure as complete");
+                        return;
+                    }
+                    Ok(_) => return,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not settle the last update's record");
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not watch the last update's record");
+    }
+}
+
+#[cfg(feature = "host")]
+#[derive(Debug, PartialEq, Eq)]
+enum SettleStep {
+    /// The worker is still running; look again.
+    Wait,
+    /// Nothing here for this daemon to settle.
+    Done,
+    Settled(String),
+}
+
+#[cfg(feature = "host")]
+fn successor_settle_step(
+    layout: &InstallLayout,
+    state: &Path,
+    serving: &crate::model::HostSessionProof,
+) -> Result<SettleStep, UpdateError> {
+    // The lease first: a receipt read once its worker has gone is its last.
+    let worker_running = match acquire_lock(state) {
+        Ok(_lease) => false,
+        Err(UpdateError::Busy) => true,
+        Err(error) => return Err(error),
+    };
+    if worker_running {
+        return Ok(SettleStep::Wait);
+    }
+    let job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SettleStep::Done);
+        }
+        Err(error) => return Err(error),
+    };
+    if job.phase != UpdatePhase::Failed
+        || job.version != layout.version
+        || !protocol_check_could_have_failed_it(&job)
+        || served_version_root(layout)? != layout.version_root
+    {
+        return Ok(SettleStep::Done);
+    }
+    Ok(if settle_as_completed(state, &job, serving)? {
+        SettleStep::Settled(job.id)
+    } else {
+        SettleStep::Done
+    })
 }
 
 #[cfg(any(feature = "ui", test))]
@@ -1820,7 +2154,7 @@ fn perform_update(
             ));
         }
     }
-    let install_result = (|| {
+    let mut install_result = (|| {
         if confirmed.replaces_daemon {
             // A failed prepare can strand an immutable Prepared checkpoint.
             // Retain the complete verified recovery owner before asking the
@@ -1899,7 +2233,7 @@ fn perform_update(
         installation,
         state,
         job,
-        &install_result,
+        &mut install_result,
         handoff,
         &recovery,
         survivors,
@@ -2438,7 +2772,7 @@ fn finish_handoff(
     installation: &Installation,
     state: &Path,
     job: &mut UpdateJob,
-    result: &Result<(), UpdateError>,
+    result: &mut Result<(), UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     recovery: &recovery::Context,
     survivors: &mut floor::Survivors,
@@ -2515,13 +2849,11 @@ fn finish_handoff(
         );
         drop(handoff.take());
         survivors.release_recovery_reservation();
-        if result.is_ok()
-            && let Err(error) = survivors.verify_successor(&verified)
-        {
-            return report_recovery_failure(state, job, error);
-        }
         recording_errors.extend(saved.err().map(|e| e.to_string()));
         recording_errors.extend(recorded.err().map(|e| e.to_string()));
+        if require_successor(job, result, survivors, &verified) {
+            recording_errors.extend(write_job(state, job).err().map(|e| e.to_string()));
+        }
         return finish_recording_recovery(state, job, recording_errors).map(|()| Handoff::Served);
     }
     if needed {
@@ -2657,11 +2989,7 @@ fn finish_handoff(
                 )),
             );
         }
-        if result.is_ok()
-            && let Err(error) = survivors.verify_successor(&verified)
-        {
-            return report_recovery_failure(state, job, error);
-        }
+        require_successor(job, result, survivors, &verified);
         job.message.push_str(
             " The terminal service is ready and its original terminal inventory was verified.",
         );
@@ -2673,6 +3001,36 @@ fn finish_handoff(
         }
         report_recovery_failure(state, job, verified.failure())
     }
+}
+
+/// Whether the daemon serving after a successful install failed to prove it
+/// is the successor this update selected. That is an install failure, as it
+/// was when the installer checked it: `result` becomes that failure and the
+/// job records it, and the caller still reopens windows from `current`, the
+/// build matched to the serving daemon. Returning early instead would leave
+/// them to the update guard, which reopens this worker's own, older build.
+fn require_successor(
+    job: &mut UpdateJob,
+    result: &mut Result<(), UpdateError>,
+    survivors: &mut floor::Survivors,
+    verified: &recovery::Receipt,
+) -> bool {
+    if result.is_err() {
+        return false;
+    }
+    let Err(error) = survivors.verify_successor(verified) else {
+        return false;
+    };
+    // Lead the log with the cause, as for any other install failure.
+    eprintln!("{error}");
+    record_primary_failure(
+        job,
+        &error,
+        &survivors.recovery_report(),
+        &survivors.prepared_report(),
+    );
+    *result = Err(error);
+    true
 }
 
 fn probe_recovery(
@@ -3455,6 +3813,7 @@ mod tests {
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let file = private_create(&directory.path().join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(file, &UpdateRequest::Release(release)).unwrap();
@@ -4784,6 +5143,7 @@ finally:
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let superseded = |job: &UpdateJob, switched| {
             failed_job_is_superseded(job, &window, &served, Some(&owner), switched)
@@ -4864,6 +5224,7 @@ finally:
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         assert!(failed_job_reached_its_target(
             &job,
@@ -4999,6 +5360,7 @@ finally:
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         assert_eq!(
             completion_message(
@@ -5054,6 +5416,7 @@ finally:
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let result = Err(invalid("the original startup failure"));
         // A failed status write must leave the reservation intact.
@@ -5098,6 +5461,7 @@ finally:
                 "first-start-failed-without-source",
                 "reopened-window-starts-daemon",
                 "absent-source-with-prepared-checkpoint",
+                "successor-mismatch",
             ] {
                 // A retained Prepared checkpoint belongs to this one case;
                 // later cases must not consume or remove another case's state.
@@ -5262,7 +5626,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-exit-zero-without-service
 assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
 assert not pathlib.Path('/proc/self/fd/199').exists()
 if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']!='recovery-recording-failure':
-    expected = 'Installing' if os.environ['CAGENTS_TEST_RECOVERY_FAILURE'] in ('installer-success-daemon-exited', 'reopened-window-starts-daemon') else 'Failed'
+    expected = 'Installing' if os.environ['CAGENTS_TEST_RECOVERY_FAILURE'] in ('installer-success-daemon-exited', 'reopened-window-starts-daemon', 'successor-mismatch') else 'Failed'
     assert json.loads((root/'status.json').read_text())['phase'] == expected
 os.environ['CAGENTS_TEST_HEADLESS_RECOVERY']='daemon'
 os.environ['CAGENTS_TEST_HEADLESS_ROOT']=str(root)
@@ -5294,6 +5658,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let census: recovery::Census=serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[],"chats":[]})).unwrap();
         let census = if matches!(
@@ -5436,11 +5801,12 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             fs::create_dir(root.path().join("status.json")).unwrap();
             fs::create_dir(recovery::outcome_path(root.path(), &job.id)).unwrap();
         }
-        let installer_result = if matches!(
+        let mut installer_result = if matches!(
             failure.as_str(),
             "installer-success-daemon-exited"
                 | "first-start-failed-without-source"
                 | "reopened-window-starts-daemon"
+                | "successor-mismatch"
         ) {
             write_job(root.path(), &job).unwrap();
             Ok(())
@@ -5448,11 +5814,18 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             Err(invalid(failure.clone()))
         };
         let mut survivors = floor::Survivors::default();
+        if failure == "successor-mismatch" {
+            // The fixture daemon is this test executable, never the
+            // selected successor's.
+            survivors
+                .authorize_successor(&root.path().join("versions/new/bin/cagentsd"), None, None)
+                .unwrap();
+        }
         let settled = finish_handoff(
             &installation,
             root.path(),
             &mut job,
-            &installer_result,
+            &mut installer_result,
             &mut lease,
             &context,
             &mut survivors,
@@ -5674,6 +6047,42 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
         if !expected_failure {
             assert!(matches!(settled, Ok(Handoff::Served)), "{settled:?}");
         }
+        if failure == "successor-mismatch" {
+            // The serving daemon failed the successor check after a clean
+            // install. That fails the install, not the handoff: the worker
+            // goes on to reopen windows from `current`, then reports it.
+            let error = installer_result.as_ref().unwrap_err().to_string();
+            assert!(
+                error.contains("does not belong to the confirmed installation"),
+                "{error}"
+            );
+            let persisted: UpdateJob =
+                serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(persisted.phase, UpdatePhase::Failed);
+            assert!(
+                persisted.message.starts_with(&error),
+                "{}",
+                persisted.message
+            );
+            let final_result = finish_reopening_windows(
+                root.path(),
+                &mut job,
+                installer_result,
+                Handoff::Served,
+                Ok(None),
+            );
+            finish_worker(root.path(), &mut job, final_result, &mut survivors).unwrap_err();
+            let persisted: UpdateJob =
+                serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(persisted.phase, UpdatePhase::Failed);
+            assert!(
+                persisted.message.starts_with(&error),
+                "{}",
+                persisted.message
+            );
+        }
         assert_eq!(
             fs::read_to_string(root.path().join("start-attempts")).unwrap(),
             "attempt\n"
@@ -5790,6 +6199,7 @@ sys.stdin.buffer.read(1)
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let (send, recv) = std::sync::mpsc::sync_channel(1);
         let monitor = thread::spawn(move || {
@@ -5817,6 +6227,7 @@ sys.stdin.buffer.read(1)
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let report = concat!(
             "\nThe terminal service accepted the stop.\n",
@@ -5862,6 +6273,7 @@ sys.stdin.buffer.read(1)
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         record_primary_failure(
             &mut job,
@@ -5953,6 +6365,7 @@ sys.stdin.buffer.read(1)
             }),
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let mut terminal = Terminal {
             job: job.clone(),
@@ -6048,6 +6461,7 @@ sys.stdin.buffer.read(1)
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let mut terminal = Terminal {
             job: job.clone(),
@@ -6073,5 +6487,434 @@ sys.stdin.buffer.read(1)
             terminal.output.is_empty(),
             "settled recovery needs no new prompts"
         );
+    }
+}
+
+/// A failure an older worker recorded against the build a window runs.
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn proof() -> crate::model::HostSessionProof {
+        crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("target"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("target"),
+        }
+    }
+
+    fn evidence(
+        worker: Worker,
+        receipt: recovery::Reading,
+        recorded: SystemTime,
+    ) -> TargetEvidence {
+        TargetEvidence {
+            worker,
+            receipt,
+            recorded,
+        }
+    }
+
+    /// A window opened while the older worker's verifier runs reads its
+    /// placeholder. It waits, then settles on the receipt the worker leaves.
+    #[test]
+    fn a_pending_placeholder_settles_on_the_verifiers_receipt() {
+        let start = SystemTime::now();
+        let pending = recovery::Reading::Pending { since: start };
+        let at = |seconds| start + Duration::from_secs(seconds);
+        for worker in [Worker::Running, Worker::Unknown] {
+            assert_eq!(
+                judge_target_failure(&evidence(worker, pending.clone(), start), at(5)),
+                TargetFailure::Finishing,
+                "{worker:?}"
+            );
+        }
+        // The worker finished and replaced the placeholder with its verdict.
+        assert_eq!(
+            judge_target_failure(
+                &evidence(Worker::Finished, recovery::Reading::Usable(proof()), start),
+                at(6)
+            ),
+            TargetFailure::Reached(proof())
+        );
+        assert_eq!(
+            judge_target_failure(
+                &evidence(Worker::Finished, recovery::Reading::Unusable, start),
+                at(6)
+            ),
+            TargetFailure::Unproven
+        );
+        // A finished worker that left the placeholder ran no verifier to
+        // its end; nothing proved the service.
+        assert_eq!(
+            judge_target_failure(&evidence(Worker::Finished, pending.clone(), start), at(1)),
+            TargetFailure::Unproven
+        );
+    }
+
+    #[test]
+    fn a_pending_placeholder_times_out_into_the_failure() {
+        let start = SystemTime::now();
+        let pending = recovery::Reading::Pending { since: start };
+        for worker in [Worker::Running, Worker::Unknown] {
+            assert_eq!(
+                judge_target_failure(
+                    &evidence(worker, pending.clone(), start),
+                    start + PENDING_RECEIPT_PATIENCE
+                ),
+                TargetFailure::Unproven,
+                "{worker:?}"
+            );
+        }
+        // A clock that went back cannot keep a window waiting.
+        assert_eq!(
+            judge_target_failure(
+                &evidence(
+                    Worker::Running,
+                    recovery::Reading::Pending {
+                        since: start + Duration::from_secs(3600)
+                    },
+                    start
+                ),
+                start
+            ),
+            TargetFailure::Unproven
+        );
+    }
+
+    /// Between recording the failure and its last verification the worker
+    /// reopens windows; the earlier receipt is not its final word.
+    #[test]
+    fn a_running_worker_is_waited_for_within_its_bound() {
+        let recorded = SystemTime::now();
+        for receipt in [
+            recovery::Reading::Usable(proof()),
+            recovery::Reading::Unusable,
+        ] {
+            assert_eq!(
+                judge_target_failure(
+                    &evidence(Worker::Running, receipt.clone(), recorded),
+                    recorded + Duration::from_secs(60)
+                ),
+                TargetFailure::Finishing
+            );
+            assert_ne!(
+                judge_target_failure(
+                    &evidence(Worker::Running, receipt, recorded),
+                    recorded + FINISHING_WORKER_PATIENCE
+                ),
+                TargetFailure::Finishing
+            );
+        }
+        assert_eq!(
+            judge_target_failure(
+                &evidence(
+                    Worker::Unknown,
+                    recovery::Reading::Usable(proof()),
+                    recorded
+                ),
+                recorded
+            ),
+            TargetFailure::Reached(proof()),
+            "only a held lease or a placeholder says the worker is still busy"
+        );
+    }
+
+    #[test]
+    fn only_a_protocol_checking_workers_failure_is_reconciled() {
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "0.2.4".into(),
+            phase: UpdatePhase::Failed,
+            message: "The confirmed successor does not serve this update's matched protocol".into(),
+            log_path: "/nonexistent/update.log".into(),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: None,
+        };
+        assert!(protocol_check_could_have_failed_it(&job));
+        job.recorded_by = Some("0.2.4".into());
+        assert!(!protocol_check_could_have_failed_it(&job));
+        job.recorded_by = None;
+        job.message = "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: no display. Run `cagents ui` to reopen the saved workspace.".into();
+        assert!(!protocol_check_could_have_failed_it(&job));
+        // What 0.2.3 workers record is read without the field.
+        let recorded: UpdateJob = serde_json::from_value(serde_json::json!({
+            "id": job.id, "version": "0.2.4", "phase": "Failed", "message": "",
+            "log_path": "/nonexistent/update.log",
+        }))
+        .unwrap();
+        assert_eq!(recorded.recorded_by, None);
+    }
+
+    #[cfg(feature = "ui")]
+    mod settled {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        const JOB: &str = "467204f6-b633-4600-b92d-afd4a95547f8";
+
+        struct State {
+            _directory: tempfile::TempDir,
+            path: PathBuf,
+            fixture: PathBuf,
+        }
+
+        impl State {
+            fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(".update");
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                let state = Self {
+                    _directory: directory,
+                    path,
+                    fixture: Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/update-e8bbb84f2-reached-target"),
+                };
+                state.write(
+                    recovery::census_path(&state.path, JOB),
+                    &fs::read(state.fixture.join("census.json")).unwrap(),
+                );
+                state
+            }
+            fn write(&self, path: PathBuf, bytes: &[u8]) {
+                fs::write(&path, bytes).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            fn receipt(&self, name: &str) {
+                self.write(
+                    recovery::outcome_path(&self.path, JOB),
+                    &fs::read(self.fixture.join(name)).unwrap(),
+                );
+            }
+            fn recorded(&self) -> UpdateJob {
+                serde_json::from_slice(&fs::read(self.path.join("status.json")).unwrap()).unwrap()
+            }
+            fn serving(&self) -> crate::model::HostSessionProof {
+                let recovery::Reading::Usable(proof) =
+                    recovery::read_receipt(&self.path, JOB).unwrap()
+                else {
+                    panic!("the fixture receipt is usable");
+                };
+                proof
+            }
+        }
+
+        fn failed() -> UpdateJob {
+            UpdateJob {
+                id: JOB.into(),
+                version: "0.2.4".into(),
+                phase: UpdatePhase::Failed,
+                message: "The confirmed successor does not serve this update's matched protocol"
+                    .into(),
+                log_path: "/nonexistent/update.log".into(),
+                confirmation: None,
+                refusal: None,
+                in_flight: Vec::new(),
+                recorded_by: None,
+            }
+        }
+
+        /// The old worker's lease and placeholder, then its usable receipt.
+        #[test]
+        fn the_placeholder_then_the_usable_receipt_settle_the_job_complete() {
+            let state = State::new();
+            let job = failed();
+            write_job(&state.path, &job).unwrap();
+            let worker = acquire_lock(&state.path).unwrap();
+            state.receipt("pending.json");
+            let read = target_evidence(&state.path, JOB).unwrap();
+            assert_eq!(read.worker, Worker::Running);
+            assert!(matches!(read.receipt, recovery::Reading::Pending { .. }));
+            assert_eq!(
+                judge_target_failure(&read, SystemTime::now()),
+                TargetFailure::Finishing
+            );
+            let shown = present_for_ui(job.clone(), |_| Ok(Reconciled::Finishing)).unwrap();
+            assert!(!shown.phase.is_terminal(), "the window keeps polling");
+
+            state.receipt("recovery.json");
+            drop(worker);
+            let read = target_evidence(&state.path, JOB).unwrap();
+            assert_eq!(read.worker, Worker::Finished);
+            let TargetFailure::Reached(proof) = judge_target_failure(&read, SystemTime::now())
+            else {
+                panic!("the usable receipt of a finished worker decides");
+            };
+            let settled = present_for_ui(job.clone(), |_| {
+                Ok(Reconciled::Completed {
+                    proof: proof.clone(),
+                    state: state.path.clone(),
+                })
+            })
+            .unwrap();
+            assert_eq!(settled.phase, UpdatePhase::Complete);
+            let recorded = state.recorded();
+            assert_eq!(recorded.phase, UpdatePhase::Complete);
+            assert_eq!(recorded.message, settled.message);
+            assert!(recorded.refusal.is_none());
+            assert!(state.path.join(format!("{JOB}.complete")).is_file());
+            let history: serde_json::Value = serde_json::from_slice(
+                &fs::read(state.path.join(format!("{JOB}.settled.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(history["recorded"]["phase"], "Failed");
+            assert_eq!(history["recorded"]["message"], job.message.as_str());
+
+            // Settled: the daemon that proved it may restart, the receipt
+            // may no longer match; the record no longer depends on either.
+            state.receipt("pending.json");
+            let shown =
+                present_for_ui(recorded, |_| panic!("a completed job is not re-judged")).unwrap();
+            assert_eq!(shown.phase, UpdatePhase::Complete);
+        }
+
+        #[test]
+        fn an_unproven_failure_stays_recorded_and_shown() {
+            let state = State::new();
+            let job = failed();
+            write_job(&state.path, &job).unwrap();
+            state.receipt("recovery.json");
+            let proof = state.serving();
+            // The proof did not hold: the daemon could not be confirmed.
+            let shown = present_for_ui(job.clone(), |_| Err(invalid("no daemon"))).unwrap();
+            assert_eq!(shown.phase, UpdatePhase::Failed);
+            assert_eq!(shown.message, job.message);
+            assert_eq!(state.recorded().phase, UpdatePhase::Failed);
+
+            // A worker still holding the lease records its own verdict.
+            let worker = acquire_lock(&state.path).unwrap();
+            assert!(!settle_as_completed(&state.path, &job, &proof).unwrap());
+            assert_eq!(state.recorded().phase, UpdatePhase::Failed);
+            drop(worker);
+
+            // A receipt that changed since the judgement proves nothing.
+            state.receipt("pending.json");
+            assert!(!settle_as_completed(&state.path, &job, &proof).unwrap());
+            assert_eq!(state.recorded().phase, UpdatePhase::Failed);
+
+            // Nor does a job rewritten since.
+            state.receipt("recovery.json");
+            let mut later = job.clone();
+            later.message.push_str(" Retried.");
+            write_job(&state.path, &later).unwrap();
+            assert!(!settle_as_completed(&state.path, &job, &proof).unwrap());
+            assert_eq!(state.recorded().message, later.message);
+            assert!(!state.path.join(format!("{JOB}.complete")).exists());
+        }
+    }
+
+    /// The target's daemon settles an older worker's false failure once that
+    /// worker finishes, from its own receipt, without a window.
+    #[cfg(feature = "host")]
+    #[test]
+    fn the_targets_daemon_settles_an_older_workers_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        const JOB: &str = "467204f6-b633-4600-b92d-afd4a95547f8";
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().canonicalize().unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            b"cagents install root\n",
+        )
+        .unwrap();
+        let bin = prefix.join("versions/0.2.4/bin");
+        fs::create_dir_all(&bin).unwrap();
+        for executable in ["cagents", "cagents-ui", "cagentsd"] {
+            fs::write(bin.join(executable), b"fixture").unwrap();
+        }
+        std::os::unix::fs::symlink("versions/0.2.4", prefix.join("current")).unwrap();
+        let layout = locate(&bin.join("cagentsd")).unwrap();
+        let state = prefix.join(".update");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/update-e8bbb84f2-reached-target");
+        let write = |path: PathBuf, name: &str| {
+            fs::write(&path, fs::read(fixture.join(name)).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(recovery::census_path(&state, JOB), "census.json");
+        write(recovery::outcome_path(&state, JOB), "pending.json");
+        let mut job = UpdateJob {
+            id: JOB.into(),
+            version: "0.2.4".into(),
+            phase: UpdatePhase::Installing,
+            message: "Checkpointing sessions and switching the installation".into(),
+            log_path: state.join(format!("{JOB}.log")),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: None,
+        };
+        write_job(&state, &job).unwrap();
+        let recorded = || -> UpdateJob {
+            serde_json::from_slice(&fs::read(state.join("status.json")).unwrap()).unwrap()
+        };
+        write(recovery::outcome_path(&state, JOB), "recovery.json");
+        let serving = match recovery::read_receipt(&state, JOB).unwrap() {
+            recovery::Reading::Usable(serving) => serving,
+            other => panic!("{other:?}"),
+        };
+        write(recovery::outcome_path(&state, JOB), "pending.json");
+
+        // The old worker installed this daemon and is still running.
+        let worker = acquire_lock(&state).unwrap();
+        let step = || successor_settle_step(&layout, &state, &serving).unwrap();
+        assert_eq!(step(), SettleStep::Wait);
+        job.phase = UpdatePhase::Failed;
+        job.message =
+            "The confirmed successor does not serve this update's matched protocol".into();
+        write_job(&state, &job).unwrap();
+        assert_eq!(step(), SettleStep::Wait);
+        drop(worker);
+
+        // It left its placeholder: nothing proved the service.
+        assert_eq!(step(), SettleStep::Done);
+        assert_eq!(recorded().phase, UpdatePhase::Failed);
+        // Its receipt names a daemon that has since restarted.
+        write(recovery::outcome_path(&state, JOB), "recovery.json");
+        let mut restarted = serving.clone();
+        restarted.host_incarnation = crate::model::HostIncarnation::new("restarted");
+        assert_eq!(
+            successor_settle_step(&layout, &state, &restarted).unwrap(),
+            SettleStep::Done
+        );
+        assert_eq!(recorded().phase, UpdatePhase::Failed);
+        // A worker that records its release reports its own verdict.
+        job.recorded_by = Some("0.2.4".into());
+        write_job(&state, &job).unwrap();
+        assert_eq!(step(), SettleStep::Done);
+        assert_eq!(recorded().phase, UpdatePhase::Failed);
+        job.recorded_by = None;
+        write_job(&state, &job).unwrap();
+
+        // Its receipt names this daemon: the update completed.
+        assert_eq!(step(), SettleStep::Settled(JOB.into()));
+        let settled = recorded();
+        assert_eq!(settled.phase, UpdatePhase::Complete);
+        assert_eq!(settled.version, "0.2.4");
+        assert!(settled.refusal.is_none());
+        assert!(
+            !serde_json::to_value(&settled)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("refusal")
+        );
+        let history: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.join(format!("{JOB}.settled.json"))).unwrap())
+                .unwrap();
+        assert_eq!(history["recorded"]["message"], job.message.as_str());
+        assert!(state.join(format!("{JOB}.complete")).is_file());
+        // Settled for good: a later daemon finds nothing to do.
+        assert_eq!(
+            successor_settle_step(&layout, &state, &restarted).unwrap(),
+            SettleStep::Done
+        );
+        assert_eq!(recorded().phase, UpdatePhase::Complete);
     }
 }

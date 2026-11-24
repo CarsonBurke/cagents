@@ -668,6 +668,7 @@ mod tests {
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let request = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(
@@ -915,6 +916,7 @@ mod tests {
                 }),
                 refusal: None,
                 in_flight: Vec::new(),
+                recorded_by: None,
             };
             let mut terminal = Terminal {
                 job: job.clone(),
@@ -1019,6 +1021,7 @@ mod tests {
             }),
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let mut terminal = Terminal {
             job: job.clone(),

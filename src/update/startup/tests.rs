@@ -28,6 +28,7 @@ fn job(phase: UpdatePhase) -> UpdateJob {
         confirmation: None,
         refusal: None,
         in_flight: Vec::new(),
+        recorded_by: None,
     }
 }
 fn write(state: &Path, job: &UpdateJob) {

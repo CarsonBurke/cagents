@@ -79,7 +79,13 @@ fn job_artifact(name: &str) -> Option<&str> {
     let (job, suffix) = name.split_once('.')?;
     if matches!(
         suffix,
-        "log" | "request" | "census.json" | "recovery.json" | "cancel-nonce" | "decisions.lock"
+        "log"
+            | "request"
+            | "census.json"
+            | "recovery.json"
+            | "settled.json"
+            | "cancel-nonce"
+            | "decisions.lock"
     ) || suffix
         .split_once('.')
         .is_some_and(|(nonce, kind)| matches!(kind, "decision" | "cancel") && canonical_id(nonce))
