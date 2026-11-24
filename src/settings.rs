@@ -15,6 +15,7 @@ use crate::{
     layout_metrics::{
         NAVIGATION_MAX_WIDTH as EXPANDED_WIDTH_MAX, NAVIGATION_MIN_WIDTH as EXPANDED_WIDTH_MIN,
     },
+    secure_file::reject_symlink_components,
 };
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
@@ -3525,28 +3526,6 @@ fn open_private_directory(path: &Path) -> io::Result<File> {
     }
     validate_owner(path, &metadata)?;
     Ok(directory)
-}
-
-fn reject_symlink_components(path: &Path) -> io::Result<()> {
-    let mut ancestors = path
-        .ancestors()
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .collect::<Vec<_>>();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(unsafe_path_error(
-                    ancestor,
-                    "symbolic links are not allowed",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 fn reject_unsafe_destination(path: &Path) -> io::Result<()> {

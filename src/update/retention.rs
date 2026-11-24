@@ -97,9 +97,8 @@ fn job_artifact(name: &str) -> Option<&str> {
 }
 
 fn collect(root: &Root, current: Option<&str>, now: SystemTime) -> Result<(), UpdateError> {
-    let names = fs::read_dir(root.process_path())?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<io::Result<Vec<_>>>()?;
+    let names = fs_safety::directory_entries_beneath(root, Path::new(""), usize::MAX)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let names: Vec<_> = names.iter().filter_map(|name| name.to_str()).collect();
     let mut expired = BTreeSet::new();
     for name in &names {

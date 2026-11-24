@@ -555,7 +555,7 @@ fn prepare_directory_using<T: Send + 'static>(
                 // No automatic deletion/chmod or later ownership conversion.
                 let _ = &owner;
                 if matches!(policy, PreparationPolicy::SaveLiveCustody)
-                    && directory.metadata().map_err(|e| e.to_string())?.nlink() == 0
+                    && directory_unlinked(&directory).map_err(|e| e.to_string())?
                 {
                     // Observed unverified custody is already unlinked. No
                     // factory-owned artifact or user-file state needs a live
@@ -563,7 +563,7 @@ fn prepare_directory_using<T: Send + 'static>(
                     return confirm_removed_preparation_parent(policy, context.placement().directory());
                 }
                 context.placement().validate().map_err(|e| e.to_string())?;
-                if directory.metadata().map_err(|e| e.to_string())?.nlink() == 0 {
+                if directory_unlinked(&directory).map_err(|e| e.to_string())? {
                     return confirm_removed_preparation_parent(policy, context.placement().directory());
                 }
                 Err("Unverified holding remains linked and requires external resolution; no ownership cleanup was attempted".into())
@@ -648,7 +648,7 @@ fn prepare_directory_using<T: Send + 'static>(
 /// Same factory preflight/error ownership path, with the real producer's
 /// deterministic protected-INTERNAL acquisition failure. Test-only: no forged
 /// receipt, second slot, alternate cleanup, or production authority bypass.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 pub(crate) fn fixture_recovery_directory_preparation_failure<T: Send + 'static>(
     admission: FilesystemRecoveryReservation,
     owner: T,
@@ -663,7 +663,7 @@ pub(crate) fn fixture_recovery_directory_preparation_failure<T: Send + 'static>(
     .unwrap_err()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::filesystem_recovery_context::fixtures::fixture_context;

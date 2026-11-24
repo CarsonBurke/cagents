@@ -72,12 +72,24 @@ fn sticky_parent_effective_access(directory: &Root) -> io::Result<()> {
     }
     Err(error)
 }
-#[cfg(not(target_os = "linux"))]
-fn sticky_parent_effective_access(_directory: &Root) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Retained sticky-parent effective permission observation is unavailable on this platform",
-    ))
+/// Darwin has no `AT_EMPTY_PATH`, but `.` relative to the retained descriptor
+/// names that same directory and can never be substituted, and its
+/// `faccessat` honors `AT_EACCESS`, ACLs and supplementary groups alike.
+#[cfg(target_os = "macos")]
+fn sticky_parent_effective_access(directory: &Root) -> io::Result<()> {
+    // SAFETY: the Root retains its descriptor and the literal is static.
+    let status = unsafe {
+        libc::faccessat(
+            directory.descriptor(),
+            c".".as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    Err(io::Error::last_os_error())
 }
 impl StickyParent {
     pub fn acquire(directory: Arc<Root>) -> io::Result<Arc<Self>> {
@@ -293,7 +305,7 @@ impl OwnedPrivateSibling {
         if self.directory.is_none() {
             // A pending first acquisition is permitted only by the ORIGINAL
             // fresh mkdir + sticky namespace custody, never pathname existence.
-            let directory = resolve_directory(&self.parent.directory, Path::new(&self.name))
+            let directory = resolve_fresh_directory(&self.parent.directory, Path::new(&self.name))
                 .map_err(io::Error::other)?;
             self.directory = Some(Arc::new(directory));
         }
@@ -607,11 +619,7 @@ impl DirectoryPreparation {
             Ok(outer) => outer,
             Err(error) if error.is_not_found() => {
                 if let Some(held) = &self.outer
-                    && held
-                        .metadata()
-                        .map_err(|e| ResolveError::io(&held.path, &e))?
-                        .nlink()
-                        != 0
+                    && !directory_unlinked(held).map_err(|e| ResolveError::io(&held.path, &e))?
                 {
                     return Err(ResolveError::message(
                         &held.path,
@@ -680,11 +688,8 @@ impl DirectoryPreparation {
                 }
                 Err(error) if error.is_not_found() => {
                     if let Some(held) = &self.payload
-                        && held
-                            .metadata()
+                        && !directory_unlinked(held)
                             .map_err(|e| ResolveError::io(&held.path, &e))?
-                            .nlink()
-                            != 0
                     {
                         return Err(ResolveError::message(
                             &held.path,
@@ -885,19 +890,18 @@ impl DirectoryPublication {
         )?;
         self.quarantined = Some(quarantine.clone());
         after_acquire();
-        let acquired = resolve_directory(&self.namespace.directory, Path::new(&quarantine));
-        let checked = acquired.and_then(|acquired| {
-            let current = acquired
-                .metadata()
-                .map_err(|e| ResolveError::io(&acquired.path, &e))?;
-            if self.identity() != (current.dev(), current.ino()) {
-                return Err(ResolveError::message(
-                    &acquired.path,
-                    "directory cleanup acquired a replacement; it was preserved",
-                ));
-            }
-            remove_directory_within(&self.namespace.directory, &quarantine)
-        });
+        // Identity alone decides removal, so the entry is observed rather than
+        // opened: Darwin cannot open a directory its mode denies the owner.
+        let checked =
+            directory_entry_identity(&self.namespace.directory, &quarantine).and_then(|current| {
+                if current != Some(self.identity()) {
+                    return Err(ResolveError::message(
+                        &self.namespace.directory.path.join(&quarantine),
+                        "directory cleanup acquired a replacement; it was preserved",
+                    ));
+                }
+                remove_directory_within(&self.namespace.directory, &quarantine)
+            });
         match checked {
             Ok(()) => {
                 self.quarantined = None;
@@ -946,6 +950,114 @@ pub fn create_directory_beneath(
         Err(reason) => create_unverified(&parent, &name, mode, reason.to_string()),
     }
 }
+/// Resolves a directory this process has just created. Linux holds it with
+/// `O_PATH`, which needs no permission. Darwin needs search permission to hold
+/// any directory, which a restrictive umask or creation mode can withhold even
+/// from the owner. There the owner grants itself search through the same fresh
+/// name the resolution already relies on, opens it, and restores the observed
+/// mode through the descriptor, so creation keeps exactly the requested mode.
+/// A failure after the grant withdraws it by name, and only while that name
+/// still holds the observed directory.
+#[cfg(target_os = "linux")]
+fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveError> {
+    resolve_directory(parent, name)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveError> {
+    let reported = parent.path.join(name);
+    let leaf = c_component(name.as_os_str(), &parent.path)?;
+    let mut observed = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the parent descriptor and C string outlive the call, which fills
+    // the buffer and never follows a final symbolic link.
+    let status = unsafe {
+        libc::fstatat(
+            parent.descriptor(),
+            leaf.as_ptr(),
+            observed.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return resolve_directory(parent, name);
+    }
+    // SAFETY: fstatat succeeded, so the buffer is initialized.
+    let observed = unsafe { observed.assume_init() };
+    let unsearchable = observed.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && observed.st_uid == unsafe { libc::geteuid() }
+        && observed.st_mode & libc::S_IXUSR == 0;
+    if !unsearchable {
+        return resolve_directory(parent, name);
+    }
+    let permissions = observed.st_mode & 0o7777;
+    // SAFETY: as above; AT_SYMLINK_NOFOLLOW never changes a link's target.
+    let granted = unsafe {
+        libc::fchmodat(
+            parent.descriptor(),
+            leaf.as_ptr(),
+            permissions | libc::S_IXUSR,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if granted != 0 {
+        return Err(ResolveError::io(&reported, &io::Error::last_os_error()));
+    }
+    // Withdraws the grant by name, only from the entry that was observed: a
+    // replacement swapped in since keeps whatever mode it has.
+    let withdraw = || {
+        let mut current = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: as above.
+        let still_observed = unsafe {
+            libc::fstatat(
+                parent.descriptor(),
+                leaf.as_ptr(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+            && {
+                // SAFETY: fstatat succeeded, so the buffer is initialized.
+                let current = unsafe { current.assume_init() };
+                (current.st_dev, current.st_ino) == (observed.st_dev, observed.st_ino)
+            };
+        if still_observed {
+            // Best effort: the caller reports the failure that led here.
+            // SAFETY: as above.
+            unsafe {
+                libc::fchmodat(
+                    parent.descriptor(),
+                    leaf.as_ptr(),
+                    permissions,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+        }
+    };
+    let directory = resolve_directory(parent, name).inspect_err(|_| withdraw())?;
+    let metadata = match directory.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            withdraw();
+            return Err(ResolveError::io(&reported, &error));
+        }
+    };
+    // The standard library widens Darwin's signed `dev_t` the same way.
+    if metadata.dev() != observed.st_dev as u64 || metadata.ino() != observed.st_ino {
+        withdraw();
+        return Err(ResolveError::message(
+            &reported,
+            "the fresh directory was replaced while it was being opened",
+        ));
+    }
+    // The descriptor holds the observed directory, so restoring through it
+    // cannot reach a replacement.
+    set_directory_permissions(&directory, u32::from(permissions)).map_err(|error| {
+        withdraw();
+        ResolveError::io(&reported, &error)
+    })?;
+    Ok(directory)
+}
+
 fn create_unverified(
     parent: &Root,
     name: &OsStr,
@@ -953,6 +1065,8 @@ fn create_unverified(
     reason: String,
 ) -> Result<DirectoryCreation, DirectoryCreateError> {
     let leaf = c_component(name, &parent.path)?;
+    let mode =
+        kernel_mode(mode).map_err(|error| ResolveError::io(&parent.path.join(name), &error))?;
     // No creation authority is inferred from mkdir followed by name resolution.
     let status = unsafe { libc::mkdirat(parent.descriptor(), leaf.as_ptr(), mode) };
     if status < 0 {
@@ -964,7 +1078,7 @@ fn create_unverified(
             .map(DirectoryCreation::Existing)
             .map_err(Into::into);
     }
-    let directory = resolve_directory(parent, Path::new(name))?;
+    let directory = resolve_fresh_directory(parent, Path::new(name))?;
     Ok(DirectoryCreation::Unverified { directory, reason })
 }
 
@@ -1080,7 +1194,7 @@ fn prepare_private_stage(
     after_stage(&namespace.directory, &preparation.name);
     let mut identity = None;
     let prepare = (|| -> Result<bool, ResolveError> {
-        let outer = resolve_directory(&namespace.directory, Path::new(&preparation.name))?;
+        let outer = resolve_fresh_directory(&namespace.directory, Path::new(&preparation.name))?;
         preparation.outer = Some(outer);
         let outer = preparation.outer.as_ref().unwrap();
         let inherited = outer
@@ -1097,6 +1211,7 @@ fn prepare_private_stage(
         {
             return Ok(false);
         }
+        let mode = kernel_mode(mode).map_err(|e| ResolveError::io(&outer.path, &e))?;
         if unsafe { libc::mkdirat(outer.descriptor(), c"directory".as_ptr(), mode) } != 0 {
             return Err(ResolveError::io(
                 &outer.path.join("directory"),
@@ -1104,7 +1219,7 @@ fn prepare_private_stage(
             ));
         }
         preparation.payload_created = true;
-        let payload = resolve_directory(outer, Path::new("directory"))?;
+        let payload = resolve_fresh_directory(outer, Path::new("directory"))?;
         preparation.payload = Some(payload);
         let payload = preparation.payload.as_ref().unwrap();
         identity = Some(
@@ -1497,7 +1612,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_parent_effective_access_checks_the_retained_original_before_creation() {
         // A root process may bypass DAC checks. This fixture needs no chown or
         // privileged child, so exercise denial under an ordinary effective UID.
@@ -1520,7 +1634,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sibling_directory_confirmation_is_strict_generally_and_typed_for_save() {
         for failure_on in [1, 2] {
             for policy in [
@@ -1581,7 +1694,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn save_sibling_incomplete_acquisition_and_foreign_entry_failures_remain_retained() {
         let (_fixture, parent) = sticky_fixture();
         let error = parent
@@ -1628,7 +1740,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn save_sibling_cleanup_softens_only_sync_after_positive_removal() {
         let (_fixture, parent) = sticky_fixture();
         let mut sibling = parent.create_private_sibling().unwrap();
@@ -1659,7 +1770,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn save_sibling_cleanup_never_softens_nonempty_or_replacement_errors() {
         let (fixture, parent) = sticky_fixture();
         let mut sibling = parent.create_private_sibling().unwrap();
@@ -1699,7 +1809,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_is_owned_without_broadening_namespace_or_publication() {
         let (fixture, parent) = sticky_fixture();
         assert!(DirectoryNamespace::acquire(&parent.directory).is_err());
@@ -1722,7 +1831,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_never_adopts_an_existing_entry() {
         let (fixture, parent) = sticky_fixture();
         let name = OsString::from("occupied");
@@ -1742,7 +1850,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_partial_acquisition_retains_cleanup_custody() {
         let (fixture, parent) = sticky_fixture();
         let error = parent
@@ -1760,7 +1867,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_partial_custody_refuses_a_symlink_replacement() {
         let (fixture, parent) = sticky_fixture();
         let error = parent
@@ -1784,7 +1890,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_repairs_restrictive_creation_mode_on_original_only() {
         let (_fixture, parent) = sticky_fixture();
         let mut sibling = parent
@@ -1802,7 +1907,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_refuses_changed_parent_proof() {
         let (fixture, parent) = sticky_fixture();
         std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -1814,7 +1918,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_retains_nonempty_original_until_explicit_retry() {
         let (_fixture, parent) = sticky_fixture();
         let mut sibling = parent.create_private_sibling().unwrap();
@@ -1829,7 +1932,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_preserves_replacement_and_retains_original_fd() {
         let (fixture, parent) = sticky_fixture();
         let mut sibling = parent.create_private_sibling().unwrap();
@@ -1847,7 +1949,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_quarantine_collision_is_retained_and_retryable() {
         let (fixture, parent) = sticky_fixture();
         let mut sibling = parent.create_private_sibling().unwrap();
@@ -1870,7 +1971,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sticky_private_sibling_parent_sync_failure_retries_without_reopening_removed_name() {
         let (_fixture, parent) = sticky_fixture();
         let mut sibling = parent.create_private_sibling().unwrap();
