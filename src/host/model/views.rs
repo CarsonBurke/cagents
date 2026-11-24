@@ -931,7 +931,7 @@ impl Registry {
     }
 
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
-        Ok(read(&self.db, scope)?.revision)
+        store::revision(&self.db, scope)
     }
     pub(crate) fn view_operation_seen(&self, operation: Uuid) -> Result<bool, String> {
         operation_seen(&self.db, operation)

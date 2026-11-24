@@ -167,6 +167,27 @@ pub(in crate::host::model) fn scope_id(
     .map_err(sql)
 }
 
+/// Reads the scope revision without loading pane descriptors or tombstones.
+pub(in crate::host::model) fn revision(db: &Connection, scope: &Scope) -> Result<u64, String> {
+    let (channel, repository, worktree) = columns(scope)?;
+    let revision: Option<i64> = match channel {
+        Some(channel) => db
+            .prepare_cached("SELECT revision FROM view_scopes WHERE channel = ?1")
+            .and_then(|mut statement| statement.query_row([channel], |row| row.get(0)).optional()),
+        None => db
+            .prepare_cached(
+                "SELECT revision FROM view_scopes WHERE repository = ?1 AND worktree = ?2",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_row(params![repository, worktree], |row| row.get(0))
+                    .optional()
+            }),
+    }
+    .map_err(sql)?;
+    Ok(revision.unwrap_or(0) as u64)
+}
+
 /// The scope's row, created at revision 0 when absent. A view that has never
 /// been written is still empty at revision 0, as it was before it existed.
 pub(in crate::host::model) fn register(db: &Connection, scope: &Scope) -> Result<i64, String> {
