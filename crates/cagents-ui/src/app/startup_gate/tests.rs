@@ -189,7 +189,7 @@ fn retained_reason_fits_one_launcher_handshake_line() {
 }
 
 #[test]
-fn panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready() {
+fn panes_without_progress_are_reported_before_the_budget_once_the_daemon_is_ready() {
     // Three panes give a 120 second inventory budget.
     let (mut app, cards) = waiting(3);
     drop(deliver(&mut app, Ok(StartupState::Ready)));
@@ -203,14 +203,12 @@ fn panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_re
     assert_readable(reason);
     assert!(reason.starts_with("3 saved panes"), "{reason}");
     assert!(reason.contains("made no progress"), "{reason}");
-    let answer = app.stalled_reason(&Pending {
+    let answer = app.stalled_report(&Pending {
         admission: false,
         panes: cards.clone(),
     });
-    assert!(
-        answer.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX),
-        "{answer}"
-    );
+    assert!(matches!(answer, StartupReport::PaneNotes(_)));
+    assert!(!reason.contains("The update has not been verified."));
     // Panes are named as their tabs are, not by internal identifiers.
     assert!(reason.contains("\u{201c}Terminal\u{201d}"), "{reason}");
     assert!(!reason.contains(&cards[0].to_string()), "{reason}");
@@ -1182,15 +1180,15 @@ fn pane_notices_fit_one_launcher_handshake_line_at_their_longest() {
         admission: false,
         panes: cards.clone(),
     };
-    let stalled = app.stalled_reason(&pending);
+    let stalled = app.stalled_report(&pending);
     let reconnecting = app.reconnecting_reason(&pending);
     for card in &cards {
         app.cards
             .insert(*card, CardRuntime::Failed("Fixture attach failed".into()));
     }
     let failed = app.startup_pending().unwrap_err();
-    for reason in [stalled, reconnecting, failed] {
-        let line = format!("{}{reason}", instance::UI_LAUNCH_ERROR_PREFIX);
+    for reason in [stalled.message(), &reconnecting, &failed] {
+        let line = format!("ready-with-pane-notes: {reason}");
         assert!(line.len() < 4096, "{}", line.len());
         assert!(!line.contains('\n'));
         assert!(line.contains("and 3 more"), "{line}");
@@ -1255,10 +1253,11 @@ fn a_single_waiting_pane_is_named_in_the_singular() {
         admission: false,
         panes: cards,
     };
-    for reason in [
-        app.stalled_reason(&pending),
-        app.reconnecting_reason(&pending),
+    for report in [
+        app.stalled_report(&pending),
+        app.reconnecting_report(&pending),
     ] {
+        let reason = report.message();
         assert!(reason.contains("1 saved pane "), "{reason}");
         assert!(
             reason.contains(
@@ -1433,7 +1432,7 @@ fn a_budget_report_gives_held_panes_their_next_step() {
         "{report}"
     );
     assert!(
-        report.contains("The update has not been verified."),
+        !report.contains("The update has not been verified."),
         "{report}"
     );
 }
@@ -1474,7 +1473,7 @@ fn the_longest_report_fits_what_the_launcher_accepts() {
     assert!(report.len() > 4096, "not its longest: {}", report.len());
     let bounded = bounded_report(report);
     assert!(bounded.len() <= MAX_REPORT_BYTES, "{}", bounded.len());
-    assert!(bounded.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX));
+    assert!(bounded.starts_with("8 saved panes could not reconnect"));
 }
 
 /// A pane that has already failed stays named when another is still waiting
@@ -1489,7 +1488,9 @@ fn a_budget_report_also_names_panes_that_failed() {
         .startup_pending()
         .unwrap()
         .expect("one is still waiting");
-    let report = app.reconnecting_reason(&pending);
+    let outcome = app.reconnecting_report(&pending);
+    assert!(matches!(outcome, StartupReport::PaneNotes(_)));
+    let report = outcome.message();
     assert!(report.contains("\u{201c}Waiting\u{201d}"), "{report}");
     assert!(report.contains("\u{201c}Failed\u{201d}"), "{report}");
     assert!(

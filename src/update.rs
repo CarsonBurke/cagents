@@ -67,6 +67,11 @@ enum Handoff {
     NoDaemon,
 }
 
+struct Completion {
+    handoff: Handoff,
+    pane_notes: Option<String>,
+}
+
 /// SIGINT or SIGTERM to this process while installed, without SA_RESTART.
 pub(crate) struct WorkerInterrupt {
     _installed: cancellation::Interrupt,
@@ -1347,11 +1352,18 @@ pub fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
             // The receipt must describe the daemon serving now, not one that
             // has since restarted.
             failed_job_reached_its_target(&job, &window, &served, daemon.as_ref())
-                && recovery::verified_complete(&window.prefix.join(".update"), &job.id)?
-                    .is_some_and(|proof| {
-                        source::inspect_identity(Some(&proof))
-                            .is_ok_and(|(_, serving)| serving.as_ref() == Some(&proof))
-                    })
+                && recovery::verified_serving(&window.prefix.join(".update"), &job.id)?.is_some_and(
+                    |proof| {
+                        crate::terminal_ipc::local_daemon_socket_path().is_ok_and(|socket| {
+                            source::Peer::confirm_serving(
+                                &socket,
+                                &served.join("bin/cagentsd"),
+                                &proof,
+                            )
+                            .is_ok()
+                        })
+                    },
+                )
         } else {
             let failed = fs::symlink_metadata(window.prefix.join(".update/status.json"))?;
             let current = fs::symlink_metadata(window.prefix.join("current"))?;
@@ -1368,7 +1380,7 @@ pub fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
         if !resolved {
             return Ok(false);
         }
-        let socket = crate::terminal_ipc::daemon_socket_path()?;
+        let socket = crate::terminal_ipc::local_daemon_socket_path()?;
         let mut client = crate::control::ControlClient::connect(&socket)
             .map_err(|error| invalid(error.to_string()))?;
         Ok(client
@@ -1413,7 +1425,7 @@ fn failed_job_is_superseded(
 }
 
 /// A failed job whose target is the build this window runs, served by its own
-/// daemon. Its recovery receipt must still show every session usable.
+/// daemon. Its recovery receipt must still show the service was usable.
 #[cfg(any(feature = "ui", test))]
 fn failed_job_reached_its_target(
     job: &UpdateJob,
@@ -1598,7 +1610,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
 fn finish_worker(
     state: &Path,
     job: &mut UpdateJob,
-    result: Result<Handoff, UpdateError>,
+    result: Result<Completion, UpdateError>,
     survivors: &mut floor::Survivors,
 ) -> Result<(), UpdateError> {
     let settled_failure = job.phase == UpdatePhase::Failed && result.is_err();
@@ -1644,13 +1656,24 @@ fn finish_worker(
 }
 
 fn completion_message(
-    result: &Result<Handoff, UpdateError>,
+    result: &Result<Completion, UpdateError>,
     job: &UpdateJob,
     settled_failure: bool,
 ) -> String {
     match result {
-        Ok(Handoff::NoDaemon) => NO_DAEMON_INSTALLED.into(),
-        Ok(Handoff::Served) => "Update installed; saved windows reopened".into(),
+        Ok(Completion {
+            handoff,
+            pane_notes,
+        }) => {
+            let message = match handoff {
+                Handoff::NoDaemon => NO_DAEMON_INSTALLED,
+                Handoff::Served => "Update installed; saved windows reopened",
+            };
+            match pane_notes {
+                Some(notes) => format!("{message}\n\n{notes}"),
+                None => message.into(),
+            }
+        }
         Err(_) if settled_failure => job.message.clone(),
         Err(error) => error.record_message(),
     }
@@ -1679,7 +1702,7 @@ fn perform_update(
     job: &mut UpdateJob,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
-) -> Result<Handoff, UpdateError> {
+) -> Result<Completion, UpdateError> {
     let request: UpdateRequest = serde_json::from_slice(&read_private(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
@@ -1840,7 +1863,13 @@ fn perform_update(
             .join("versions")
             .join(&release.version)
             .join("bin/cagentsd");
-        survivors.authorize_successor(&target_daemon, Some(&daemon_digest), handoff.as_ref())?;
+        if confirmed.replaces_daemon {
+            survivors.authorize_successor(
+                &target_daemon,
+                Some(&daemon_digest),
+                handoff.as_ref(),
+            )?;
+        }
         confirmation::prepared(state, job)?;
         guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         Installation::detect()?;
@@ -1863,9 +1892,6 @@ fn perform_update(
             survivors,
             false,
         )?;
-        if confirmed.replaces_daemon {
-            survivors.verify_successor(&target_daemon)?;
-        }
         Ok(())
     })();
     announce_primary_failure(&install_result);
@@ -1916,7 +1942,12 @@ fn perform_update(
         }
         _ => None,
     };
-    let handoff_kind = verify_reopened_service(&recovery, state, job)?;
+    let handoff_kind = verify_reopened_service(
+        &recovery,
+        state,
+        job,
+        install_result.is_ok().then_some(&*survivors),
+    )?;
     let (new, old) = (&release.version, &installation.version);
     match restored {
         Some(Ok(Ok(()))) => {
@@ -1944,17 +1975,35 @@ fn perform_update(
         Some(Err(error)) => eprintln!("Could not put back cagents {old}: {error}"),
         None => (),
     }
-    if let Err(error) = reopen_result {
-        job.message.clear();
-        return report_recovery_failure(
-            state,
-            job,
-            invalid(format!(
-                "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: {error}. Run `cagents ui` to reopen the saved workspace."
-            )),
-        );
-    }
-    install_result.map(|()| handoff_kind)
+    finish_reopening_windows(state, job, install_result, handoff_kind, reopen_result)
+}
+
+fn finish_reopening_windows(
+    state: &Path,
+    job: &mut UpdateJob,
+    install_result: Result<(), UpdateError>,
+    handoff: Handoff,
+    reopened: Result<Option<String>, UpdateError>,
+) -> Result<Completion, UpdateError> {
+    let pane_notes = match reopened {
+        Ok(notes) => notes,
+        Err(error) => {
+            if install_result.is_ok() {
+                job.message.clear();
+            }
+            return report_recovery_failure(
+                state,
+                job,
+                invalid(format!(
+                    "Some saved windows did not reopen: {error}. Run `cagents ui` to reopen the saved workspace."
+                )),
+            );
+        }
+    };
+    install_result.map(|()| Completion {
+        handoff,
+        pane_notes,
+    })
 }
 
 /// Whether an installed update whose windows did not reopen goes back to the
@@ -2009,17 +2058,14 @@ fn verify_reopened_service(
     recovery: &recovery::Context,
     state: &Path,
     job: &mut UpdateJob,
+    successor: Option<&floor::Survivors>,
 ) -> Result<Handoff, UpdateError> {
     let census = recovery
         .census
         .as_ref()
         .ok_or_else(|| invalid("No pre-update census exists; recovery readiness is unverified"))?;
     let absence = (!recovery.shutdown_requested && census.source.is_none())
-        .then(|| {
-            census
-                .verify_absence(source::BusyPatience::for_one_run())
-                .ok()
-        })
+        .then(|| census.verify_absence().ok())
         .flatten();
     let receipt = if let Some(absence) = absence {
         absence
@@ -2038,6 +2084,11 @@ fn verify_reopened_service(
     if matches!(receipt.outcome, recovery::Outcome::NoSource) {
         Ok(Handoff::NoDaemon)
     } else if receipt.usable() {
+        if let Some(successor) = successor
+            && let Err(error) = successor.confirm_successor(&receipt)
+        {
+            return report_recovery_failure(state, job, error);
+        }
         Ok(Handoff::Served)
     } else {
         report_recovery_failure(state, job, receipt.failure())
@@ -2432,7 +2483,7 @@ fn finish_handoff(
     let mut verified = probe_recovery(census, &target, state, &job.id, &mut recording_errors)?;
     if !needed
         && census.source.is_none()
-        && let Ok(absence) = census.verify_absence(source::BusyPatience::for_one_run())
+        && let Ok(absence) = census.verify_absence()
     {
         // A file-only installation did not remove a daemon. Verified absence
         // is a separate outcome, never readiness or preservation of a service.
@@ -2464,6 +2515,11 @@ fn finish_handoff(
         );
         drop(handoff.take());
         survivors.release_recovery_reservation();
+        if result.is_ok()
+            && let Err(error) = survivors.verify_successor(&verified)
+        {
+            return report_recovery_failure(state, job, error);
+        }
         recording_errors.extend(saved.err().map(|e| e.to_string()));
         recording_errors.extend(recorded.err().map(|e| e.to_string()));
         return finish_recording_recovery(state, job, recording_errors).map(|()| Handoff::Served);
@@ -2601,6 +2657,11 @@ fn finish_handoff(
                 )),
             );
         }
+        if result.is_ok()
+            && let Err(error) = survivors.verify_successor(&verified)
+        {
+            return report_recovery_failure(state, job, error);
+        }
         job.message.push_str(
             " The terminal service is ready and its original terminal inventory was verified.",
         );
@@ -2625,7 +2686,7 @@ fn probe_recovery(
         Ok(receipt) => Ok(receipt),
         Err(error) => {
             errors.push(error.to_string());
-            census.verify(source::BusyPatience::for_one_run())
+            census.unobserved(&error)
         }
     }
 }
@@ -4940,11 +5001,25 @@ finally:
             in_flight: Vec::new(),
         };
         assert_eq!(
-            completion_message(&Ok(Handoff::NoDaemon), &job, false),
+            completion_message(
+                &Ok(Completion {
+                    handoff: Handoff::NoDaemon,
+                    pane_notes: None
+                }),
+                &job,
+                false,
+            ),
             NO_DAEMON_INSTALLED
         );
         assert_eq!(
-            completion_message(&Ok(Handoff::Served), &job, false),
+            completion_message(
+                &Ok(Completion {
+                    handoff: Handoff::Served,
+                    pane_notes: None
+                }),
+                &job,
+                false,
+            ),
             "Update installed; saved windows reopened"
         );
     }
@@ -5408,8 +5483,16 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 assert!(HostLease::is_held(&paths).unwrap());
             }
             let final_result = settled
-                .and_then(|_| verify_reopened_service(&context, root.path(), &mut job))
-                .and_then(|outcome| installer_result.map(|()| outcome));
+                .and_then(|_| verify_reopened_service(&context, root.path(), &mut job, None))
+                .and_then(|handoff| {
+                    finish_reopening_windows(
+                        root.path(),
+                        &mut job,
+                        installer_result,
+                        handoff,
+                        Ok(None),
+                    )
+                });
             finish_worker(root.path(), &mut job, final_result, &mut survivors).unwrap();
             let persisted: UpdateJob =
                 serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap())

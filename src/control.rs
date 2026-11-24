@@ -72,8 +72,9 @@ pub(crate) fn standard_input(word: impl AsRef<std::ffi::OsStr>) -> bool {
 use crate::{
     agent_execution::Authority,
     instance::{
-        self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY,
-        UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX, UI_LAUNCH_RECOVERY_PROGRESS_PREFIX,
+        self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_PANE_NOTES_ENV,
+        UI_LAUNCH_PANE_NOTES_PREFIX, UI_LAUNCH_READY, UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX,
+        UI_LAUNCH_RECOVERY_PROGRESS_PREFIX,
     },
     model::{
         ChannelId, HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession,
@@ -4390,7 +4391,7 @@ fn launch_ui(
     })
 }
 
-pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
+pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
@@ -4405,6 +4406,7 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
+        .env(UI_LAUNCH_PANE_NOTES_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -4424,9 +4426,9 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
 
 fn finish_ui_launch(
     mut child: std::process::Child,
-    result: io::Result<()>,
+    result: io::Result<Option<String>>,
     stdout: Option<ChildStdout>,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     if let Err(error) = result {
         if error
             .to_string()
@@ -4464,7 +4466,7 @@ fn finish_ui_launch(
     thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
+    result
 }
 
 fn already_running_ui_output() -> CommandOutput {
@@ -4479,7 +4481,10 @@ fn handshake_reports_already_running(error: &io::Error) -> bool {
     error.to_string() == instance::ApplicationLeaseError::AlreadyRunning.to_string()
 }
 
-fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::Result<()> {
+fn read_ui_launch_handshake(
+    stdout: &mut ChildStdout,
+    timeout: Duration,
+) -> io::Result<Option<String>> {
     let descriptor = stdout.as_raw_fd();
     // SAFETY: fcntl receives a live descriptor and integer flags only.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
@@ -4576,11 +4581,14 @@ fn parse_ui_recovery_progress(response: &[u8]) -> io::Result<Option<u64>> {
     Ok(Some(count))
 }
 
-fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
+fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<Option<String>> {
     let response = std::str::from_utf8(response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if response == UI_LAUNCH_READY {
-        return Ok(());
+        return Ok(None);
+    }
+    if let Some(notes) = response.strip_prefix(UI_LAUNCH_PANE_NOTES_PREFIX) {
+        return Ok(Some(notes.to_owned()));
     }
     if let Some(message) = response.strip_prefix(UI_LAUNCH_ERROR_PREFIX) {
         return Err(io::Error::other(message.to_owned()));
@@ -11754,6 +11762,19 @@ mod tests {
             ])
             .env_remove("CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS");
         spawn_ui_process(&mut command).unwrap();
+    }
+
+    #[test]
+    fn ui_launcher_accepts_pane_notes_as_a_successful_launch() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "test \"$CAGENTS_UI_LAUNCH_PANE_NOTES\" = 1 || exit 94; printf 'recovering: 2\\nready-with-pane-notes: One pane could not reconnect. Another is still reconnecting.\\n'",
+        ]);
+        assert_eq!(
+            spawn_ui_process(&mut command).unwrap().as_deref(),
+            Some("One pane could not reconnect. Another is still reconnecting.")
+        );
     }
 
     #[test]

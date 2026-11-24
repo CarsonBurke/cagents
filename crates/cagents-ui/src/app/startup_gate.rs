@@ -1,5 +1,5 @@
-//! A launched window is ready only after its saved conversations and workspace
-//! have actually recovered. Opening a native surface alone cannot finish an update.
+//! A launched window checks its saved workspace and reports any panes that
+//! still need attention.
 use super::*;
 use crate::terminal::ipc::StartupState;
 
@@ -134,6 +134,19 @@ pub(super) struct Pending {
     panes: Vec<CardId>,
 }
 
+enum StartupReport {
+    PaneNotes(String),
+    Incomplete(String),
+}
+
+impl StartupReport {
+    fn message(&self) -> &str {
+        match self {
+            Self::PaneNotes(message) | Self::Incomplete(message) => message,
+        }
+    }
+}
+
 impl State {
     fn retire_inspections(&mut self) {
         self.inspecting = None;
@@ -232,13 +245,20 @@ impl Cagents {
             && self.chat_awaiting_admission(card)
     }
 
+    #[cfg(test)]
     pub(super) fn startup_pane_check(&self) -> Result<bool, String> {
         self.startup_pending().map(|pending| pending.is_none())
     }
 
+    #[cfg(test)]
+    pub(super) fn startup_pending(&self) -> Result<Option<Pending>, String> {
+        self.inspect_startup_panes()
+            .map_err(|report| report.message().to_owned())
+    }
+
     /// What still keeps the gate waiting, or `None` once every saved pane has
     /// recovered.
-    pub(super) fn startup_pending(&self) -> Result<Option<Pending>, String> {
+    fn inspect_startup_panes(&self) -> Result<Option<Pending>, StartupReport> {
         let scan = self.startup_scan();
         if scan.admission || !scan.panes.is_empty() {
             return Ok(Some(Pending {
@@ -247,21 +267,31 @@ impl Cagents {
             }));
         }
         if !scan.out_of_step.is_empty() || !scan.failures.is_empty() || !scan.fenced.is_empty() {
-            return Err(self.startup_incomplete(
+            let report = self.startup_incomplete(
                 &scan.failures,
                 &scan.out_of_step,
                 &scan.fenced,
                 scan.reasons.first(),
-            ));
+            );
+            return Err(
+                if scan.views_stalled.is_some() || scan.registry_unavailable {
+                    StartupReport::Incomplete(format!(
+                        "{}{report}",
+                        instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX
+                    ))
+                } else {
+                    StartupReport::PaneNotes(report)
+                },
+            );
         }
         if let Some(hold) = scan.views_stalled {
-            return Err(views_incomplete(hold));
+            return Err(StartupReport::Incomplete(views_incomplete(hold)));
         }
         if scan.registry_unavailable {
-            return Err(format!(
+            return Err(StartupReport::Incomplete(format!(
                 "recovery-incomplete: saved panes reconnected, but the shared workspace could not be restored because {}. This window remains available with its own saved layout.",
                 crate::workspace_model::REGISTRY_UNAVAILABLE
-            ));
+            )));
         }
         Ok(None)
     }
@@ -420,7 +450,7 @@ impl Cagents {
         let sentences = self.startup_unsettled_sentences(failures, out_of_step, fenced);
         let detail = startup_details(reason);
         format!(
-            "recovery-incomplete: {sentences} Nothing was closed or restarted, and this window remains available.{detail}"
+            "{sentences} Nothing was closed or restarted, and this window remains available.{detail}"
         )
     }
 
@@ -751,7 +781,7 @@ impl Cagents {
             // Nothing launched this window to verify a restore; the sweep's
             // own checks still keep every channel holding a card or session.
             self.allow_empty_channel_sweep();
-            return report(Ok(()));
+            return report(Ok(None));
         }
         self.startup_gate.retire_inspections();
         self.startup_gate.warned = false;
@@ -779,8 +809,8 @@ impl Cagents {
             return Task::none();
         }
         self.observe_unsettled_terminals();
-        match self.startup_pending() {
-            Err(reason) => self.fail_startup_gate(reason),
+        match self.inspect_startup_panes() {
+            Err(reason) => self.finish_startup_with_notice(reason),
             Ok(Some(pending)) => {
                 let now = Instant::now();
                 self.retire_stale_observation(Some(&pending));
@@ -797,8 +827,8 @@ impl Cagents {
                 // daemon reports that it is still restoring.
                 if self.startup_budget_spent(now) {
                     let reason =
-                        self.reconnecting_reason(self.startup_gate.pending.as_ref().unwrap());
-                    return self.fail_startup_gate(reason);
+                        self.reconnecting_report(self.startup_gate.pending.as_ref().unwrap());
+                    return self.finish_startup_with_notice(reason);
                 }
                 let gate = &self.startup_gate;
                 if gate
@@ -809,8 +839,8 @@ impl Cagents {
                         .progressed
                         .is_some_and(|progressed| now.duration_since(progressed) >= NO_PROGRESS)
                 {
-                    let reason = self.stalled_reason(gate.pending.as_ref().unwrap());
-                    return self.fail_startup_gate(reason);
+                    let reason = self.stalled_report(gate.pending.as_ref().unwrap());
+                    return self.finish_startup_with_notice(reason);
                 }
                 let attach = self.qualify_startup_terminals();
                 Task::batch([attach, poll(), self.inspect_daemon_startup()])
@@ -820,7 +850,9 @@ impl Cagents {
                 match self.settled_verdict(now) {
                     Settled::Save => {}
                     Settled::Wait => return Task::batch([poll(), self.inspect_daemon_startup()]),
-                    Settled::Report(reason) => return self.fail_startup_gate(reason),
+                    Settled::Report(reason) => {
+                        return self.finish_startup_with_notice(StartupReport::Incomplete(reason));
+                    }
                 }
                 self.startup_gate.retire_inspections();
                 self.startup_gate.saving = true;
@@ -924,27 +956,32 @@ impl Cagents {
         names
     }
 
+    #[cfg(test)]
     pub(super) fn reconnecting_reason(&self, pending: &Pending) -> String {
+        self.reconnecting_report(pending).message().to_owned()
+    }
+
+    fn reconnecting_report(&self, pending: &Pending) -> StartupReport {
         let detail = self.startup_waiting_details(pending);
         let settled = self.startup_settled_alongside();
         if pending.panes.is_empty() {
-            return format!(
+            return StartupReport::Incomplete(format!(
                 "recovery-incomplete: this window's shared workspace did not finish loading in time. The window and its saved panes remain available.{settled} The update has not been verified.{detail}"
-            );
+            ));
         }
         let waiting =
             self.startup_waiting_sentences(&pending.panes, "did not reconnect in time".into());
-        format!("recovery-incomplete: {waiting}{settled} The update has not been verified.{detail}")
+        self.pane_timeout_report(format!("{waiting}{settled}{detail}"))
     }
 
-    fn stalled_reason(&self, pending: &Pending) -> String {
+    fn stalled_report(&self, pending: &Pending) -> StartupReport {
         let detail = self.startup_waiting_details(pending);
         let settled = self.startup_settled_alongside();
         if pending.panes.is_empty() {
-            return format!(
+            return StartupReport::Incomplete(format!(
                 "recovery-incomplete: this window's shared workspace made no progress loading for {} seconds. The window and its saved panes remain available.{settled} The update has not been verified.{detail}",
                 NO_PROGRESS.as_secs()
-            );
+            ));
         }
         let waiting = self.startup_waiting_sentences(
             &pending.panes,
@@ -953,7 +990,26 @@ impl Cagents {
                 NO_PROGRESS.as_secs()
             ),
         );
-        format!("recovery-incomplete: {waiting}{settled} The update has not been verified.{detail}")
+        self.pane_timeout_report(format!("{waiting}{settled}{detail}"))
+    }
+
+    fn pane_timeout_report(&self, notes: String) -> StartupReport {
+        if let Some(hold) = self.shared_views_startup_hold() {
+            if self.shared_views.registry_unavailable {
+                return StartupReport::Incomplete(format!(
+                    "recovery-incomplete: the shared workspace could not be restored because {}. {notes}",
+                    crate::workspace_model::REGISTRY_UNAVAILABLE
+                ));
+            }
+            if self
+                .startup_gate
+                .views_unready
+                .is_some_and(|since| since.elapsed() >= retries::RETRY_WINDOW)
+            {
+                return StartupReport::Incomplete(format!("{} {notes}", views_incomplete(hold)));
+            }
+        }
+        StartupReport::PaneNotes(notes)
     }
 
     fn retire_stale_observation(&mut self, pending: Option<&Pending>) {
@@ -1049,8 +1105,8 @@ impl Cagents {
             self.startup_gate.retries.restart_windows();
             self.startup_gate.views_unready = None;
         }
-        match self.startup_pending() {
-            Err(reason) => return self.fail_startup_gate(reason),
+        match self.inspect_startup_panes() {
+            Err(reason) => return self.finish_startup_with_notice(reason),
             Ok(pending) if pending == inspection.context.pending => {}
             // Every inspection is issued beside the gate's own rescheduled
             // check, which records this move, settled panes included; starting
@@ -1111,7 +1167,7 @@ impl Cagents {
         let reason = retained_reason(detail);
         let notice = TransientNotice::warning(RETAINED_NOTICE).with_details(bounded_detail(detail));
         self.startup_gate.retained = true;
-        self.report_startup_failure(reason, notice)
+        self.report_startup_notice(Err(reason), notice)
     }
 
     fn startup_observation_current(&self, observed: &Observed, pending: Option<&Pending>) -> bool {
@@ -1170,19 +1226,27 @@ impl Cagents {
         crate::terminal::ipc::daemon_socket_path().ok()
     }
 
-    fn fail_startup_gate(&mut self, reason: String) -> Task<Message> {
-        let notice = incomplete_notice(&reason);
-        self.report_startup_failure(reason, notice)
+    fn finish_startup_with_notice(&mut self, outcome: StartupReport) -> Task<Message> {
+        let notice = incomplete_notice(outcome.message());
+        let result = match outcome {
+            StartupReport::PaneNotes(notes) => Ok(Some(notes)),
+            StartupReport::Incomplete(reason) => Err(reason),
+        };
+        self.report_startup_notice(result, notice)
     }
 
-    /// `reason` answers the launcher; `notice` is what this window shows.
-    fn report_startup_failure(&mut self, reason: String, notice: TransientNotice) -> Task<Message> {
+    /// `result` answers the launcher; `notice` is what this window shows.
+    fn report_startup_notice(
+        &mut self,
+        result: Result<Option<String>, String>,
+        notice: TransientNotice,
+    ) -> Task<Message> {
         self.startup_gate.retire_inspections();
         self.startup_gate.reported = true;
         instance::finish_window_restore();
         self.startup_gate.reported_notice = Some(notice.message.clone());
         self.status = Some(notice);
-        report(Err(reason))
+        report(result)
     }
 
     pub(super) fn startup_report_failed(&mut self) {
@@ -1198,21 +1262,20 @@ impl Cagents {
     ) -> Task<Message> {
         self.startup_gate.saving = false;
         let settings = settings.map(|settings| self.acknowledge_settings_save(settings));
-        let mut result = settings.and(saved).map_err(|error| format!("recovery-incomplete: saved panes reconnected, but the recovered workspace could not be saved: {error}. This window remains available; retry saving before updating again."));
-        if result.is_ok() {
-            match self.startup_pane_check() {
-                Ok(true) => {}
-                Ok(false) => return self.verify_startup_gate(),
-                Err(reason) => result = Err(reason),
-            }
+        if let Err(error) = settings.and(saved) {
+            return self.finish_startup_with_notice(StartupReport::Incomplete(format!(
+                "recovery-incomplete: saved panes reconnected, but the recovered workspace could not be saved: {error}. This window remains available; retry saving before updating again."
+            )));
+        }
+        match self.inspect_startup_panes() {
+            Ok(None) => {}
+            Ok(Some(_)) => return self.verify_startup_gate(),
+            Err(reason) => return self.finish_startup_with_notice(reason),
         }
         self.startup_gate.reported = true;
         instance::finish_window_restore();
-        match &result {
-            Ok(()) => self.allow_empty_channel_sweep(),
-            Err(reason) => self.status = Some(incomplete_notice(reason)),
-        }
-        report(result)
+        self.allow_empty_channel_sweep();
+        report(Ok(None))
     }
 }
 
@@ -1572,13 +1635,16 @@ fn bounded_report(mut reason: String) -> String {
     reason
 }
 
-fn report(result: Result<(), String>) -> Task<Message> {
-    let result = result.map_err(bounded_report);
+fn report(result: Result<Option<String>, String>) -> Task<Message> {
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || instance::report_ui_startup(&result))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
+        let result = tokio::task::spawn_blocking(move || match result {
+            Ok(Some(notes)) => instance::report_ui_startup_with_pane_notes(&bounded_report(notes)),
+            Ok(None) => instance::report_ui_startup(&Ok(())),
+            Err(reason) => instance::report_ui_startup(&Err(bounded_report(reason))),
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
         Message::StartupReported(result)
     })
 }

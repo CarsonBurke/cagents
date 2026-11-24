@@ -398,9 +398,7 @@ fn reopened_shared_window_reports_a_refused_offscreen_attach() {
     assert!(!app.startup_terminal_gave_up(window.projected()));
     let report = app.startup_pane_check().unwrap_err();
     assert!(
-        report.starts_with(
-            "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}Terminal\u{201d}."
-        ),
+        report.starts_with("1 saved pane could not reconnect: \u{201c}Terminal\u{201d}."),
         "named as its tab is: {report}"
     );
     assert!(!report.contains(&window.cached.id.to_string()), "{report}");
@@ -1502,9 +1500,7 @@ fn the_budget_report_names_each_waiting_pane_and_why() {
     };
     let report = budget_report(&window.app);
     assert!(
-        report.starts_with(
-            "recovery-incomplete: 1 saved pane did not reconnect in time: \u{201c}Terminal\u{201d}."
-        ),
+        report.starts_with("1 saved pane did not reconnect in time: \u{201c}Terminal\u{201d}."),
         "{report}"
     );
     assert!(

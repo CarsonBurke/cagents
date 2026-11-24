@@ -15,10 +15,11 @@ pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
         && job
             .active_confirmation()
             .is_some_and(|confirmation| confirmation.preview.daemon.is_some());
-    let ended = job.phase.is_terminal() && job.confirmation.is_none();
-    if job.id != "fixture-update-review" || !(review || ended) {
+    let status = (job.phase == UpdatePhase::Installing || job.phase.is_terminal())
+        && job.confirmation.is_none();
+    if job.id != "fixture-update-review" || !(review || status) {
         return Err(invalid(
-            "update review fixture must review the terminal service or have ended, and be read-only",
+            "update fixture must show terminal service review, installation or completion, and be read-only",
         ));
     }
     Ok(Some(job))
@@ -122,6 +123,12 @@ mod tests {
         assert_eq!(
             read(root.path()).unwrap().unwrap().phase,
             UpdatePhase::Failed
+        );
+        job.phase = UpdatePhase::Installing;
+        publish(&job);
+        assert_eq!(
+            read(root.path()).unwrap().unwrap().phase,
+            UpdatePhase::Installing
         );
     }
 

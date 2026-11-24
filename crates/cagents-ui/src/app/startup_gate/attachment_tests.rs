@@ -301,8 +301,8 @@ fn oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery
     }
     let reason = app
         .startup_pane_check()
-        .expect_err("exhausted attachment must fail recovery");
-    assert!(reason.starts_with("recovery-incomplete: "));
+        .expect_err("exhausted attachment must be reported");
+    assert!(reason.starts_with("1 saved pane could not reconnect"));
     assert!(reason.contains("exact terminal refused"));
     assert!(
         reason.contains("Open it to see why and what to do next"),

@@ -1246,6 +1246,7 @@ pub(super) struct Survivors {
     recovery_capture_error: Option<String>,
     receipt: Option<crate::upgrade::recovery::Receipt>,
     recovery_outcome: Option<crate::upgrade::recovery::RecoveryOutcome>,
+    successor_target: Option<PathBuf>,
     interrupted: BTreeMap<(impact::SessionKind, TerminalId), InterruptedTurn>,
     unconfirmed_interrupts: BTreeMap<(impact::SessionKind, TerminalId), String>,
     late_turns: BTreeSet<TerminalId>,
@@ -1291,6 +1292,7 @@ impl Survivors {
         verified_digest: Option<&str>,
         handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
     ) -> Result<(), UpdateError> {
+        self.successor_target = Some(target_daemon.to_owned());
         if !self.source_prepared {
             return Ok(());
         }
@@ -1329,45 +1331,33 @@ impl Survivors {
         Ok(())
     }
 
-    pub(super) fn verify_successor(&mut self, target_daemon: &Path) -> Result<(), UpdateError> {
-        if crate::daemon::running_executable()
-            .map_err(|error| invalid(error.to_string()))?
-            .as_deref()
-            != Some(target_daemon)
-        {
-            return Err(invalid(
-                "The terminal service does not belong to the confirmed installation; its saved panes and recovery state were retained. Check cagents daemon status before retrying",
-            ));
-        }
+    /// Bind the target CLI's proof to the exact daemon selected for this update.
+    /// The worker may speak only the previous wire.
+    pub(super) fn confirm_successor<'a>(
+        &self,
+        verified: &'a recovery::Receipt,
+    ) -> Result<Option<&'a crate::model::HostSessionProof>, UpdateError> {
+        let Some(target) = &self.successor_target else {
+            return Ok(None);
+        };
+        let recovery::Outcome::Usable { serving, .. } = &verified.outcome else {
+            return Err(verified.failure());
+        };
         let socket = crate::terminal_ipc::daemon_socket_path()?;
-        let source::Client {
-            mut client, peer, ..
-        } = source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-        if client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION {
-            return Err(invalid(
-                "The confirmed successor does not serve this update's matched protocol",
-            ));
-        }
-        peer.verify(client.proof())?;
-        if client
-            .startup_state()
-            .map_err(|error| invalid(error.to_string()))?
-            != crate::terminal_ipc::StartupState::Ready
-        {
-            return Err(invalid(
-                "The confirmed terminal service has not finished recovering its saved panes",
-            ));
-        }
+        source::Peer::confirm_serving(&socket, target, serving)?;
+        Ok(Some(serving))
+    }
+
+    pub(super) fn verify_successor(
+        &mut self,
+        verified: &recovery::Receipt,
+    ) -> Result<(), UpdateError> {
+        let Some(serving) = self.confirm_successor(verified)? else {
+            return Ok(());
+        };
         if let Some(receipt) = &self.receipt {
-            let terminals = client.list().map_err(|error| invalid(error.to_string()))?;
-            let chats = client
-                .list_chats()
-                .map_err(|error| invalid(error.to_string()))?;
-            peer.verify(client.proof())?;
-            let outcome = receipt.verify(client.proof(), &terminals, &chats);
-            self.recovery_outcome = Some(outcome.map_err(invalid)?);
+            self.recovery_outcome = Some(receipt.verify_successor(serving).map_err(invalid)?);
         }
-        peer.verify(client.proof())?;
         self.successor_serving = true;
         Ok(())
     }
@@ -2071,8 +2061,12 @@ impl Survivors {
         }
         let attached = (|| -> Result<BTreeSet<TerminalId>, UpdateError> {
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client =
-                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+            let mut client = if self.successor_serving {
+                source::Client::connect_matched(&socket)
+            } else {
+                source::Client::connect_inventory(&socket)
+            }
+            .map_err(|error| invalid(error.to_string()))?;
             let proof = client.proof().clone();
             let mut ids: BTreeSet<_> = client
                 .list_chats()?
