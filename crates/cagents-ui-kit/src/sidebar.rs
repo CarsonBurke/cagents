@@ -7682,9 +7682,9 @@ fn project_view<'a>(
     let mut identity = widget::row::with_children(vec![project_identity])
         .align_y(Alignment::Center)
         .width(Length::Fill);
-    if let Some(indicator) = attention_indicator(header_attention) {
-        identity = identity.push(indicator);
-    }
+    // A folded project's row count follows its name, and its live state
+    // comes last, where every row's indicator is: the count beside the
+    // state's mark would read as how many agents are in that state.
     if !expanded {
         let rows = if project.state.lists_panes(entity) {
             entity.panes.len()
@@ -7692,6 +7692,9 @@ fn project_view<'a>(
             entity.worktrees.len()
         };
         identity = identity.push(design::caption((entity.channels.len() + rows).to_string()));
+    }
+    if let Some(indicator) = attention_indicator(header_attention) {
+        identity = identity.push(indicator);
     }
     let header = project_header_row(
         identity.into(),
@@ -8455,22 +8458,83 @@ fn agent_wait_name(state: crate::agent::ActivityState) -> &'static str {
     }
 }
 
+/// A summary's one indicator: its most urgent state's mark at a row glyph's
+/// size, with how many agents are in that state on the mark's corner when
+/// there is more than one. Unread news, whose mark is a dot, grows the dot
+/// into the count. Work in progress is its spinner alone: what is working
+/// needs nothing from the user, so how many is the tooltip's to say.
 pub fn attention_indicator<Message: Clone + 'static>(
     summary: AttentionSummary,
 ) -> Option<Element<'static, Message>> {
     let state = summary.state()?;
-    let indicator =
-        crate::interaction::tooltip(attention_mark(state, ROW_ICON_SIZE), state.look().label);
-    if summary.unread == 0 {
-        return Some(indicator);
+    let count = attention_count(summary, state);
+    let look = state.look();
+    let mark = match look.mark {
+        attention::Mark::Glyph(icon) if count > 1 => crate::ui_controls::badged(
+            icon,
+            ROW_ICON_SIZE,
+            design::Tone::Themed(look.tone.color()),
+            count,
+            attention_badge_fill(look.tone),
+        ),
+        attention::Mark::Dot => match crate::ui_controls::count_badge::badge_label(count) {
+            Some(label) => widget::container(crate::ui_controls::count_badge::count_pill(
+                label,
+                attention_badge_fill(look.tone),
+                1.0,
+            ))
+            .center(Length::Fixed(f32::from(ROW_ICON_SIZE)))
+            .into(),
+            None => attention_mark(state, ROW_ICON_SIZE),
+        },
+        _ => attention_mark(state, ROW_ICON_SIZE),
+    };
+    // The state's own label while it is the whole story; the summary's
+    // description once there is a count or news beside it.
+    let label = if count <= 1 && summary.unread == 0 {
+        Cow::Borrowed(look.label)
+    } else {
+        Cow::Owned(summary.description())
+    };
+    let indicator = crate::interaction::tooltip(mark, label);
+    Some(if state == AttentionState::Working {
+        indicator
+    } else {
+        widget::container(indicator).id(news_id()).into()
+    })
+}
+
+/// The container every attention indicator that gives news, and every rail
+/// news badge, is drawn in; work in progress is not news. Where a row shows
+/// its news can be found by this id, now that one unread update draws a dot
+/// with no count to read.
+pub(crate) fn news_id() -> Id {
+    static NEWS: std::sync::LazyLock<Id> = std::sync::LazyLock::new(|| stable_id("news"));
+    NEWS.clone()
+}
+
+/// How many agents `summary` counts in `state`, its most urgent: every wait
+/// on the user for any waiting state, since each one needs the user whatever
+/// its kind.
+fn attention_count(summary: AttentionSummary, state: AttentionState) -> usize {
+    match state {
+        AttentionState::Approval | AttentionState::Question | AttentionState::Waiting => {
+            summary.waiting
+        }
+        AttentionState::Failed => summary.failed,
+        AttentionState::Limited => summary.limited,
+        AttentionState::Working => summary.working,
+        AttentionState::Unread => summary.unread,
     }
-    let count: Element<'static, Message> = widget::text(rail::count_label(summary.unread))
-        .size(9)
-        .into();
-    let counted: Element<'static, Message> = widget::column::with_children(vec![indicator, count])
-        .align_x(Alignment::Center)
-        .into();
-    Some(crate::interaction::tooltip(counted, summary.description()))
+}
+
+fn attention_badge_fill(tone: attention::Tone) -> crate::ui_controls::BadgeFill {
+    use crate::ui_controls::BadgeFill;
+    match tone {
+        attention::Tone::Attention => BadgeFill::WARNING,
+        attention::Tone::Failure => BadgeFill::DANGER,
+        attention::Tone::News | attention::Tone::Activity => BadgeFill::ACCENT,
+    }
 }
 
 /// A deletion under way takes the reserved slot: it is the one live thing
@@ -8916,28 +8980,21 @@ fn in_progress_section(
     let content = if compact {
         grid.rail(glyph, rail::Badges::in_progress(agents, collapsed))
     } else {
-        // The count sits in the indicator slot, where every row's badge is.
-        // Folded, the spinner above it says the hidden rows are still at work,
-        // as a counted badge does on any other row.
-        let count = design::caption(agents.to_string());
-        let indicator: Element<'static, SidebarAction> = if collapsed {
-            widget::column::with_children(vec![
-                crate::ui_controls::activity_spinner(
-                    f32::from(ROW_ICON_SIZE),
-                    design::activity_color,
-                ),
-                count.size(9).into(),
-            ])
-            .align_x(Alignment::Center)
-            .into()
-        } else {
-            count.into()
-        };
-        grid.content(
-            glyph,
-            Some(design::body("In progress").width(Length::Fill).into()),
-            Some(indicator),
-        )
+        // How many agents are at work follows the label, as a section
+        // header's count does. Folded, the spinner in the indicator slot says
+        // the hidden rows are still at work; it is a state's mark like any
+        // row's, never a count's.
+        let label = widget::row::with_children(vec![
+            design::body("In progress").width(Length::Fill).into(),
+            design::caption(agents.to_string()).into(),
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        let indicator = collapsed.then(|| {
+            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::activity_color)
+        });
+        grid.content(glyph, Some(label.into()), indicator)
     };
     let header = grid
         .control(content, false)

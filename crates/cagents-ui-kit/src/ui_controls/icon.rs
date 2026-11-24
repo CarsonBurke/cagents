@@ -32,7 +32,7 @@ macro_rules! icons {
             /// Every glyph, in declaration order: the order of [`HANDLES`].
             const ALL: &'static [Self] = &[$(Self::$icon,)*];
 
-            const fn svg(self) -> &'static [u8] {
+            pub(crate) const fn svg(self) -> &'static [u8] {
                 match self {
                     $(Self::$icon => include_bytes!(concat!("../icons/", $file, ".svg")),)*
                 }

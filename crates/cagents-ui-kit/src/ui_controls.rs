@@ -5,6 +5,8 @@
 pub mod accessibility_probe;
 pub mod accessible_bounds;
 pub mod button;
+pub mod count_badge;
+pub use count_badge::{BadgeFill, badged};
 mod culled_column;
 pub use culled_column::{CulledColumn, culled_column, keep_in_place};
 mod display;

@@ -76,16 +76,17 @@ impl Cagents {
                 .into(),
         ];
         if let Some(work) = summary.work {
+            // The pull request glyph with how many rows Work lists on its
+            // corner, as every glyph that carries a count shows it.
             marks.push(
-                widget::column::with_children(vec![
-                    crate::ui_controls::passive_icon(Icon::PullRequest, design::COMPACT_ICON_SIZE),
-                    design::caption(work.to_string())
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .into(),
-                ])
-                .spacing(space::XXS)
-                .align_x(Alignment::Center)
-                .width(Length::Fill)
+                widget::container(crate::ui_controls::badged(
+                    Icon::PullRequest,
+                    design::ROW_ICON_SIZE,
+                    design::Tone::Themed(design::muted_icon_color),
+                    work,
+                    crate::ui_controls::BadgeFill::NEUTRAL,
+                ))
+                .center_x(Length::Fill)
                 .into(),
             );
         }

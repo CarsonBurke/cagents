@@ -2109,12 +2109,11 @@ fn hidden_checkouts_leave_pull_requests_folders_and_unowned_news_alone() {
     state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
 
     // The unread news shows once: on its pane's row, or on the header
-    // while a search leaves that row out. An unread badge carries its
-    // count as text; the working badge beside Build has none.
+    // while a search leaves that row out. Build's spinner is work, not news.
     let renderer = headless_renderer();
     let unread_badges = |state: &SidebarState| {
         let names = accessible_names(&renderer, project_list(&model, state, false, false));
-        let badges = names.iter().filter(|name| *name == "1").count();
+        let badges = news_marks(project_list(&model, state, false, false), 1280.0).len();
         (badges, names)
     };
     let (badges, names) = unread_badges(&state);
@@ -2154,13 +2153,10 @@ fn hidden_checkouts_leave_pull_requests_folders_and_unowned_news_alone() {
 fn hidden_checkouts_keep_news_no_drawn_row_carries_on_the_rail_chip() {
     let (model, mut state, _) = hidden_checkouts_scene();
     let renderer = headless_renderer();
-    // A rail badge draws an unread count, which its row's name carries
-    // instead, so count the drawn text.
+    // A rail cell pins its news to its top right corner; its working
+    // spinner sits apart, on the bottom right, so count the news badges.
     let unread_badges = |state: &SidebarState| {
-        let badges = drawn_texts(project_list(&model, state, true, false), COMPACT_WIDTH)
-            .into_iter()
-            .filter(|(text, _)| text == "1")
-            .count();
+        let badges = news_marks(project_list(&model, state, true, false), COMPACT_WIDTH).len();
         let names = accessible_names(&renderer, project_list(&model, state, true, false));
         (badges, names)
     };
@@ -5284,6 +5280,26 @@ impl Sidebar {
         }
     }
 
+    /// How much news each of the sidebar's news marks gives; see
+    /// [`news_counts`].
+    fn news_counts(&self) -> Vec<usize> {
+        news_counts(
+            || {
+                view_cached(
+                    &self.model,
+                    &self.state,
+                    SidebarMode::Expanded,
+                    design::NAVIGATION_DEFAULT_WIDTH,
+                    false,
+                    &self.navigation,
+                    &crate::settings::KeyboardShortcuts::default(),
+                    false,
+                )
+            },
+            self.bounds.width,
+        )
+    }
+
     fn attention_frame(&mut self) -> (Vec<(String, [f64; 4])>, Vec<u8>) {
         use cosmic::iced::{
             Color,
@@ -8047,6 +8063,54 @@ fn attention_lists_working_rows_last_under_in_progress() {
 }
 
 /// Every text the element draws, with where it draws it.
+/// Where `element` draws news: every attention indicator and rail news
+/// badge, by the container [`news_id`] names. One unread update is a dot
+/// with no count to read, so this finds what [`drawn_texts`] cannot.
+fn news_marks(mut element: Element<'_, SidebarAction>, width: f32) -> Vec<Rectangle> {
+    use cosmic::iced::advanced::widget::Operation;
+    struct Marks(Id, Vec<Rectangle>);
+    impl Operation for Marks {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if id == Some(&self.0) {
+                self.1.push(bounds);
+            }
+        }
+    }
+    let renderer = headless_renderer();
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(width, 2_000.0)),
+    );
+    let mut marks = Marks(news_id(), Vec::new());
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut marks);
+    marks.1
+}
+
+/// How much news each of `element`'s news marks gives: the count it draws,
+/// or one for a mark with no count, which is how one unread update shows.
+fn news_counts<'a>(element: impl Fn() -> Element<'a, SidebarAction>, width: f32) -> Vec<usize> {
+    let texts = drawn_texts(element(), width);
+    news_marks(element(), width)
+        .into_iter()
+        .map(|mark| {
+            // A rail badge's layer spans its cell, whose glyph may be a
+            // project's initials: the count is the number inside it.
+            texts
+                .iter()
+                .filter(|(_, bounds)| mark.contains(bounds.center()))
+                .find_map(|(text, _)| text.parse().ok())
+                .unwrap_or(1)
+        })
+        .collect()
+}
+
 fn drawn_texts(mut element: Element<'_, SidebarAction>, width: f32) -> Vec<(String, Rectangle)> {
     use cosmic::iced::advanced::widget::Operation;
     #[derive(Default)]
@@ -8142,9 +8206,9 @@ fn attention_rows_show_why_they_are_listed_never_the_work_spinner() {
         project_section(&model, &state, project, false),
     );
     assert_eq!(
-        names.iter().filter(|name| *name == "1").count(),
+        news_marks(project_section(&model, &state, project, false), 1280.0).len(),
         2,
-        "each row shows its unread count instead: {names:?}"
+        "each row shows its unread news instead: {names:?}"
     );
     // Folded, the header gives the same reason.
     state.apply(&SidebarAction::ToggleProject(project));
@@ -8221,15 +8285,17 @@ fn in_progress_rows_say_where_they_are() {
     let mut grid = Vec::new();
     navigation_rows(Layout::new(&node), &mut grid);
     assert_eq!(grid.len(), 3, "the header and two rows");
-    let status = grid[0].1[2];
+    let (label, status) = (grid[0].1[1], grid[0].1[2]);
     let count = drawn_texts(section(), 260.0)
         .into_iter()
         .find(|(text, _)| text == "2")
         .expect("the header's count")
         .1;
+    // The count follows the label, as a section header's does; the
+    // indicator slot holds a state's mark, never a count.
     assert!(
-        status.contains(count.center()),
-        "the count sits in the indicator slot: {count:?} in {status:?}"
+        label.contains(count.center()) && !status.contains(count.center()),
+        "the count follows the label: {count:?} in {label:?}, not {status:?}"
     );
     for (_, slots) in &grid[1..] {
         assert_eq!(slots[2].x, status.x, "one indicator column");
@@ -10430,9 +10496,9 @@ fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
     let (unread_rows, unread_image) = sidebar.attention_frame();
     assert!(unread_rows.iter().any(|(name, _)| name == &plain));
     assert_eq!(
-        unread_rows.iter().filter(|(name, _)| name == "1").count(),
-        1,
-        "the rendered Folder root has exactly one unread count"
+        sidebar.news_counts(),
+        vec![1],
+        "the rendered Folder root has exactly one unread mark"
     );
     assert_ne!(
         quiet_image, unread_image,
@@ -10626,10 +10692,7 @@ fn compact_folder_root_badge_survives_a_visible_channel() {
         "the selected channel is drawn, and the Folder root has no pane row"
     );
     let unread_counts = |model: &SidebarModel, state: &SidebarState| {
-        drawn_texts(project_list(model, state, true, false), COMPACT_WIDTH)
-            .into_iter()
-            .filter_map(|(text, _)| text.parse::<usize>().ok())
-            .collect::<Vec<_>>()
+        news_counts(|| project_list(model, state, true, false), COMPACT_WIDTH)
     };
     assert_eq!(
         unread_counts(&model, &state),
@@ -10784,14 +10847,14 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
         rows.iter()
             .any(|(name, _)| name.starts_with("Open channel Child work"))
     );
+    // The root is working, so its one indicator is its spinner, which is
+    // not news: work outranks its unread update, which its name and tooltip
+    // still give. The channel shows its own wait, uncounted, and the
+    // project's aggregate is not repeated above its expanded children.
     assert_eq!(
-        rows.iter().filter(|(name, _)| name == "1").count(),
-        2,
-        "expanded Folder root and channel each render only their own unread count"
-    );
-    assert!(
-        !rows.iter().any(|(name, _)| name == "2"),
-        "the project aggregate is not repeated above its expanded children"
+        sidebar.news_counts(),
+        vec![1],
+        "expanded Folder root and channel each render only their own state"
     );
     // A Folder has no checkouts to hide: hiding them still draws its
     // channels, so its header keeps the same root-only news.
@@ -10805,11 +10868,10 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
             .any(|(name, _)| name == &format!("{plain}, agent working"))
     );
     assert_eq!(
-        rows.iter().filter(|(name, _)| name == "1").count(),
-        2,
-        "with checkouts hidden, the root and channel still render only their own unread count"
+        sidebar.news_counts(),
+        vec![1],
+        "with checkouts hidden, the root and channel still render only their own news"
     );
-    assert!(!rows.iter().any(|(name, _)| name == "2"));
     sidebar.state.sidebar_worktrees = display;
     sidebar
         .state

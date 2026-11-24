@@ -800,13 +800,16 @@ fn queue_row<'a>(
     let preview: Cow<'a, str> = if has_text { text } else { names().into() };
     let mut details: Vec<Element<'a, Message>> = Vec::new();
     if !attachments.is_empty() && has_text {
+        // How many files ride along, on the attachment glyph's corner; the
+        // tooltip names them.
         details.push(crate::interaction::tooltip(
-            widget::row::with_children(vec![
-                crate::ui_controls::passive_icon(Icon::Attachment, design::COMPACT_ICON_SIZE),
-                design::caption(attachments.len().to_string()).into(),
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center),
+            crate::ui_controls::badged(
+                Icon::Attachment,
+                design::ROW_ICON_SIZE,
+                design::Tone::Themed(design::muted_icon_color),
+                attachments.len(),
+                crate::ui_controls::BadgeFill::NEUTRAL,
+            ),
             names(),
         ));
     }

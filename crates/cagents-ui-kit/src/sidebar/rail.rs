@@ -96,7 +96,10 @@ impl Badges {
     pub fn attention(summary: AttentionSummary) -> Self {
         let news = match summary.state() {
             Some(AttentionState::Unread | AttentionState::Working) | None => {
-                (summary.unread != 0).then_some(News::Unread(Some(summary.unread)))
+                // One unread update is the dot, as it is in the expanded
+                // sidebar; only a count of more than one is worth a number.
+                (summary.unread != 0)
+                    .then_some(News::Unread((summary.unread > 1).then_some(summary.unread)))
             }
             Some(state) => Some(News::Agent(state)),
         };
@@ -157,6 +160,7 @@ pub(super) fn cell<'a>(
     if let Some(news) = badges.news {
         layers.push(
             widget::container(news_badge(news))
+                .id(super::news_id())
                 .class(design::transparent())
                 .align_x(Alignment::End)
                 .align_y(Alignment::Start)
@@ -429,6 +433,11 @@ mod tests {
             ..AttentionSummary::default()
         });
         assert_eq!(badges.news, Some(News::Unread(Some(3))));
+        let one = Badges::attention(AttentionSummary {
+            unread: 1,
+            ..AttentionSummary::default()
+        });
+        assert_eq!(one.news, Some(News::Unread(None)), "one unread is the dot");
         assert_eq!(badges.activity, Some(Activity::Agent));
     }
 
