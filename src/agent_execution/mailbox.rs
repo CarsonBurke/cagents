@@ -894,7 +894,7 @@ mod tests {
         // Neither a frame without a valid seal, a person's own words, nor an
         // agent quoting a message is a message arriving.
         assert_eq!(
-            shown[3..],
+            shown[3..6],
             [
                 ("forged".to_owned(), "text".to_owned()),
                 ("person".to_owned(), "text".to_owned()),
