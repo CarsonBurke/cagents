@@ -2070,8 +2070,18 @@ class RemoteRun(unittest.TestCase):
                     owner.write_text(previous + "\n")
                     (slot / "incremental-epoch").write_text(f"{owner.stat().st_mtime_ns} epoch\n")
                     crate = build / "local/incremental/probe-1"
-                    (crate / "s-a-0-finished").mkdir(parents=True)
-                    (crate / "s-b-0-working").mkdir()
+                    finalized = crate / "s-a-0-finished"
+                    finalized.mkdir(parents=True)
+                    index = finalized / "work-products.bin"
+                    index.touch()
+                    os.utime(index, (1, 1))
+                    working = crate / "s-b-0-working"
+                    working.mkdir()
+                    bitcode = finalized / "probe.pre-lto.bc"
+                    bitcode.write_bytes(b"previous build")
+                    linked = working / bitcode.name
+                    os.link(bitcode, linked)
+                    linked.write_bytes(b"interrupted build")
                     healthy = build / "local/incremental/healthy-1/s-a-0-finished"
                     healthy.mkdir(parents=True, exist_ok=True)
                     host = ("import os\n"
