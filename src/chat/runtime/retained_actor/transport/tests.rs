@@ -450,6 +450,13 @@ fn resident_fixture_with_body(body: Option<String>) -> Fixture {
 /// A resident fixture's parts, for a test that moves the server into
 /// [`Server::serve`], which closes its actor on the way out.
 pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDir) {
+    resident_server_at(body, tempfile::tempdir_in("/var/tmp").unwrap())
+}
+
+fn resident_server_at(
+    body: Option<String>,
+    root: tempfile::TempDir,
+) -> (Server, tempfile::TempDir) {
     use crate::chat::protocol::{Adapter, Step};
     struct Idle;
     impl Adapter for Idle {
@@ -466,7 +473,6 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
             Ok(Step::default())
         }
     }
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let remote = RemoteActor::fixture();
     let mut identity = remote.identity();
     let proof = remote.0.proof.clone();
@@ -1246,8 +1252,8 @@ fn legacy_daemon_drains_outcomes_and_retires_with_pending_attention_clears() {
             update: crate::agent_execution::Update,
         },
     }
-    let mut fixture = resident_fixture();
-    let server = &mut fixture.server;
+    let (mut server, _root) = resident_server_at(None, tempfile::tempdir().unwrap());
+    let server = &mut server;
     server.installed = false;
     let run = crate::model::RunId::new();
     let started = crate::agent_execution::Update::Started {
