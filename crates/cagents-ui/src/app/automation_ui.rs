@@ -130,15 +130,34 @@ impl Cagents {
                     .map(cosmic::Action::App)
             }
             None => Task::none(),
-            Some(Effect::ReadRun(run)) => {
+            Some(Effect::ReadRun {
+                run,
+                revision,
+                terminal,
+            }) => {
+                let target = crate::notifications::Target::AgentRun(run);
+                let terminal_key = run.to_string();
+                let waiting_prefix = format!("{run}:waiting:");
                 let ids = self
                     .notification_ui
                     .snapshot
                     .notices
                     .iter()
                     .filter(|notice| {
-                        notice.event.target() == crate::notifications::Target::AgentRun(run)
-                            && !notice.acknowledged
+                        if notice.acknowledged || notice.event.target != target {
+                            return false;
+                        }
+                        // The notification stream can advance while the detail
+                        // reply is in flight. Only mark evidence the open covered.
+                        let evidence = &notice.event.evidence;
+                        match evidence.kind {
+                            crate::notifications::Kind::Waiting => evidence
+                                .key
+                                .strip_prefix(&waiting_prefix)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .is_some_and(|waiting| waiting <= revision),
+                            _ => terminal && evidence.key == terminal_key,
+                        }
                     })
                     .map(|notice| notice.id)
                     .collect::<Vec<_>>();

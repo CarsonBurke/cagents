@@ -1,44 +1,19 @@
-//! Reconcile automation attention against committed lifecycle changes and views.
+//! Reconcile automation attention against committed lifecycle changes.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     sync::Weak,
     time::{Duration, Instant},
 };
 
-use crate::{
-    agent_execution::Run,
-    model::RunId,
-    notifications::{Evidence, Kind, Notice, Snapshot, Target},
-};
+use crate::notifications::{Notice, Snapshot, Target};
 
 use super::{HostLock, Journal, MAX_PENDING, Withdrawals, withdraw_notice};
 use uuid::Uuid;
-
-#[derive(Clone, Copy)]
-struct View {
-    revision: u64,
-    terminal: bool,
-}
-
-impl View {
-    fn covers(self, run: RunId, evidence: &Evidence) -> bool {
-        if evidence.kind == Kind::Waiting {
-            evidence
-                .key
-                .strip_prefix(&format!("{run}:waiting:"))
-                .and_then(|revision| revision.parse::<u64>().ok())
-                .is_some_and(|revision| revision <= self.revision)
-        } else {
-            self.terminal && evidence.key == run.to_string()
-        }
-    }
-}
 
 #[derive(Default)]
 pub(super) struct Pending {
     scan_all: bool,
     changed: BTreeSet<Uuid>,
-    viewed_runs: BTreeMap<RunId, View>,
 }
 
 impl Pending {
@@ -49,9 +24,6 @@ impl Pending {
             for id in newer.changed {
                 self.lifecycle_changed(id);
             }
-        }
-        for (run, view) in newer.viewed_runs {
-            self.insert_view(run, view);
         }
     }
 
@@ -69,28 +41,8 @@ impl Pending {
         }
     }
 
-    pub(super) fn viewed(&mut self, run: &Run) {
-        self.insert_view(
-            run.id,
-            View {
-                revision: run.revision,
-                terminal: run.state.is_terminal(),
-            },
-        );
-    }
-
-    fn insert_view(&mut self, run: RunId, view: View) {
-        if self.viewed_runs.len() < MAX_PENDING || self.viewed_runs.contains_key(&run) {
-            let latest = self.viewed_runs.entry(run).or_insert(view);
-            if latest.revision < view.revision {
-                *latest = view;
-            }
-        }
-    }
-
     pub(super) fn retry_at(&self) -> Option<Instant> {
-        (self.scan_all || !self.changed.is_empty() || !self.viewed_runs.is_empty())
-            .then(|| Instant::now() + Duration::from_secs(5))
+        (self.scan_all || !self.changed.is_empty()).then(|| Instant::now() + Duration::from_secs(5))
     }
 
     /// Runs before publication and desktop delivery. It also checks events
@@ -113,38 +65,7 @@ impl Pending {
                 }
             }
         }
-        if !self.viewed_runs.is_empty() {
-            match self.acknowledge_views(journal, &mut snapshot.notices, withdrawals) {
-                Ok(()) => self.viewed_runs.clear(),
-                Err(error) => {
-                    tracing::warn!(%error, "could not acknowledge viewed automation runs")
-                }
-            }
-        }
         self.retry_at()
-    }
-
-    fn acknowledge_views(
-        &self,
-        journal: &mut Journal,
-        notices: &mut [Notice],
-        withdrawals: &mut Withdrawals,
-    ) -> Result<(), String> {
-        for notice in notices {
-            if let Target::AgentRun(run) = notice.event.target
-                && !notice.acknowledged
-                && self
-                    .viewed_runs
-                    .get(&run)
-                    .is_some_and(|view| view.covers(run, &notice.event.evidence))
-            {
-                journal.acknowledge(notice.id)?;
-                notice.acknowledged = true;
-                notice.delivered = true;
-                withdraw_notice(withdrawals, notice);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -210,7 +131,7 @@ mod tests {
     use super::*;
     use crate::{
         agent::Provider,
-        agent_execution::{Authority, Spec, State, Surface, Target as AgentTarget, Update},
+        agent_execution::{Authority, Spec, Surface, Target as AgentTarget, Update},
         automations::{
             Automation, Definition, DirectoryIdentity, Occurrence, Precheck, Request, Response,
             Schedule, SchedulePattern, SessionMode, Trigger,
@@ -221,8 +142,8 @@ mod tests {
             model::Registry,
             state::{HostState, SharedHost},
         },
-        model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, ProjectKind},
-        notifications::Event,
+        model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, ProjectKind, RunId},
+        notifications::{Event, Evidence, Kind},
         workspace_model::ModelEdit,
     };
     use std::sync::Arc;
@@ -471,12 +392,9 @@ mod tests {
     }
 
     #[test]
-    fn viewing_run_acknowledges_the_receipt_and_preserves_later_attention() {
-        let (directory, host, registry, automation) = fixture(false);
-        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
-        let (notifications, _) = super::super::Handle::inert_for_test();
-        host.lock().unwrap().notifications = Some(notifications.clone());
-        let (firing, waiting, event) = {
+    fn reading_run_detail_leaves_attention_pending() {
+        let (_directory, host, registry, automation) = fixture(false);
+        let (firing, waiting) = {
             let mut registry = registry.lock().unwrap();
             let claim = claim(&mut registry, &automation);
             let run = claim.accepted.unwrap().run;
@@ -493,73 +411,26 @@ mod tests {
             let waiting = registry
                 .update_agent_run(run.id, started.revision, Update::Waiting, 4)
                 .unwrap();
-            let event = registry
-                .pending_automation_attention(1)
-                .unwrap()
-                .pop()
-                .unwrap()
-                .event;
-            (claim.firing.id, waiting, event)
+            (claim.firing.id, waiting)
         };
-        let view_firing = service::process_under_control(
-            &host,
-            Authority::default(),
+        for request in [
             Request::ShowFiring { id: firing },
-        )
-        .unwrap();
-        assert!(
-            matches!(view_firing, Response::Detail(detail) if detail.run == Some(waiting.clone()))
-        );
-        assert!(
-            registry
-                .lock()
-                .unwrap()
-                .pending_automation_attention(1)
-                .unwrap()
-                .is_empty()
-        );
-        journal.record(event, false).unwrap();
-        let mut pending = std::mem::take(&mut notifications.0.pending.lock().unwrap().automations);
-        assert!(apply(&mut pending, &host, &mut journal).notices[0].acknowledged);
-
-        let event = {
-            let mut registry = registry.lock().unwrap();
-            registry
-                .update_agent_run(
-                    waiting.id,
-                    waiting.revision,
-                    Update::Finished {
-                        state: State::Succeeded,
-                        result: Default::default(),
-                    },
-                    5,
-                )
-                .unwrap();
-            registry
-                .pending_automation_attention(1)
-                .unwrap()
-                .pop()
-                .unwrap()
-                .event
-        };
-        journal.record(event, false).unwrap();
-        pending.viewed(&waiting);
-        assert!(!apply(&mut pending, &host, &mut journal).notices[0].acknowledged);
-        service::process_under_control(
-            &host,
-            Authority::default(),
+            Request::ShowFiring { id: firing },
             Request::ShowRun { run: waiting.id },
-        )
-        .unwrap();
-        let mut pending = std::mem::take(&mut notifications.0.pending.lock().unwrap().automations);
-        assert!(apply(&mut pending, &host, &mut journal).notices[0].acknowledged);
-        assert!(
-            registry
+        ] {
+            let response =
+                service::process_under_control(&host, Authority::default(), request).unwrap();
+            assert!(
+                matches!(response, Response::Detail(detail) if detail.run == Some(waiting.clone()))
+            );
+            let pending = registry
                 .lock()
                 .unwrap()
                 .pending_automation_attention(1)
-                .unwrap()
-                .is_empty()
-        );
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].receipt.run, waiting.id);
+            assert_eq!(pending[0].receipt.revision, waiting.revision);
+        }
     }
 }

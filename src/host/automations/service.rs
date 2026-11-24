@@ -177,14 +177,18 @@ fn process_user(
                 .map(Response::Audit);
         }
         Request::ShowFiring { id } => {
-            return view_run(host, &registry, |registry| {
-                registry.automation_run_detail(id)
-            });
+            return registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_run_detail(id)
+                .map(|detail| Response::Detail(Box::new(detail)));
         }
         Request::ShowRun { run } => {
-            return view_run(host, &registry, |registry| {
-                registry.automation_detail_for_run(run)
-            });
+            return registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_detail_for_run(run)
+                .map(|detail| Response::Detail(Box::new(detail)));
         }
         Request::Create { definition } => Response::Automation(Box::new(create(host, definition)?)),
         Request::Edit {
@@ -235,37 +239,6 @@ fn attention_changed(host: &SharedHost, id: Uuid) {
     if let Some(notifications) = &host.lock().unwrap_or_else(|p| p.into_inner()).notifications {
         notifications.automation_attention_changed(id);
     }
-}
-
-fn view_run(
-    host: &SharedHost,
-    registry: &agent_execution::SharedRegistry,
-    detail: impl FnOnce(&crate::host::model::Registry) -> Result<crate::automations::RunDetail, String>,
-) -> Result<crate::automations::Response, String> {
-    let detail = {
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let detail = detail(&registry)?;
-        if let Some(run) = &detail.run
-            && let Err(error) =
-                registry.ack_automation_attention(crate::host::model::AutomationAttentionReceipt {
-                    run: run.id,
-                    revision: run.revision,
-                })
-        {
-            tracing::warn!(%error, "could not acknowledge the pending automation run receipt");
-        }
-        detail
-    };
-    if let Some(run) = &detail.run
-        && let Some(notifications) = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .notifications
-            .as_ref()
-    {
-        notifications.viewed_automation_run(run);
-    }
-    Ok(crate::automations::Response::Detail(Box::new(detail)))
 }
 
 /// Inspection and proposal ownership follow authenticated session lineage.

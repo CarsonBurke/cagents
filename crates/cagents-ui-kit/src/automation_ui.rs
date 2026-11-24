@@ -147,9 +147,16 @@ impl Action {
 // Returned by `update` and consumed at once, so boxing would only add allocations.
 #[allow(clippy::large_enum_variant)]
 pub enum Effect {
-    Request { sequence: u64, request: Request },
+    Request {
+        sequence: u64,
+        request: Request,
+    },
     OpenRun(RunDetail),
-    ReadRun(crate::model::RunId),
+    ReadRun {
+        run: crate::model::RunId,
+        revision: u64,
+        terminal: bool,
+    },
 }
 
 /// A request in flight. `Reload` rereads the open automation for Refresh,
@@ -182,6 +189,7 @@ enum Pending {
         before: Option<HistoryKey>,
     },
     Run,
+    ReloadRun,
     OpenRun,
 }
 
@@ -1528,9 +1536,17 @@ impl State {
                         self.run = Some(detail.clone());
                         return Some(Effect::OpenRun(detail));
                     }
-                    let run = detail.run.as_ref().map(|run| run.id);
+                    let read = if matches!(pending, Pending::Run) {
+                        detail.run.as_ref().map(|run| Effect::ReadRun {
+                            run: run.id,
+                            revision: run.revision,
+                            terminal: run.state.is_terminal(),
+                        })
+                    } else {
+                        None
+                    };
                     self.run = Some(detail);
-                    return run.map(Effect::ReadRun);
+                    return read;
                 }
                 Ok(Response::Firing(firing)) => {
                     self.refresh_last_outcome(&firing, true);
@@ -1709,7 +1725,10 @@ impl State {
             }
             Action::Refresh => {
                 if let Some(run) = &self.run {
-                    return self.request(Pending::Run, Request::ShowFiring { id: run.firing.id });
+                    return self.request(
+                        Pending::ReloadRun,
+                        Request::ShowFiring { id: run.firing.id },
+                    );
                 }
                 if self.all_history {
                     return self.request(
@@ -3461,7 +3480,7 @@ fn progress_label(pending: Pending) -> &'static str {
         Pending::Mutate => "Updating automation…",
         Pending::History { .. } => "Loading run history…",
         Pending::Lifecycle { .. } => "Loading lifecycle…",
-        Pending::Run => "Loading run…",
+        Pending::Run | Pending::ReloadRun => "Loading run…",
         Pending::OpenRun => "Opening agent…",
         // Background reads draw no progress, but name themselves should one
         // ever be shown.
@@ -3927,6 +3946,40 @@ mod tests {
             result: std::sync::Arc::new(Ok(Response::Listed(Vec::new()))),
         });
         assert!(matches!(state.pending, Some((current, Pending::Run)) if current == sequence));
+    }
+
+    #[test]
+    fn only_an_explicit_run_open_reads_the_displayed_run_revision() {
+        let detail = diagnostic_run(None, None);
+        let run = detail.run.as_ref().unwrap();
+        let mut state = State::default();
+        for action in [Action::Run(detail.firing.id), Action::InspectRun(run.id)] {
+            let Some(Effect::Request { sequence, .. }) = state.update(action) else {
+                panic!("an explicit open must read the run");
+            };
+            let effect = state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(Box::new(detail.clone())))),
+            });
+            assert!(matches!(
+                effect,
+                Some(Effect::ReadRun { run: id, revision, terminal: true })
+                    if id == run.id && revision == run.revision
+            ));
+        }
+        for action in [Action::Tick, Action::Refresh] {
+            let Some(Effect::Request { sequence, .. }) = state.update(action) else {
+                panic!("refresh must still read the run");
+            };
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(Response::Detail(Box::new(detail.clone())))),
+                    })
+                    .is_none()
+            );
+        }
     }
 
     #[test]

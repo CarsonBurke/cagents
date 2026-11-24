@@ -356,10 +356,6 @@ impl Handle {
         self.change(|pending| pending.automations.lifecycle_changed(id));
     }
 
-    pub(in crate::host) fn viewed_automation_run(&self, run: &crate::agent_execution::Run) {
-        self.change(|pending| pending.automations.viewed(run));
-    }
-
     pub fn reload(&self, preferences: Option<Preferences>) {
         self.change(|pending| {
             pending.reload = true;
