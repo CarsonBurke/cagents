@@ -176,6 +176,8 @@ pub struct PaneMove {
 }
 
 mod conversation_titles;
+#[cfg(feature = "host")]
+pub(crate) use conversation_titles::image_placeholder_prompt;
 pub use conversation_titles::{channel_title, channel_title_from_prompt};
 
 /// The identity of a registry that has never been created.

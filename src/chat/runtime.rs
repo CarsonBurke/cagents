@@ -1,7 +1,7 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
     AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
-    protocol::{Adapter, HeldStop, ProcessSpec, SetupError, Step, TransportSpec},
+    protocol::{Adapter, HeldStop, MetadataWake, ProcessSpec, SetupError, Step, TransportSpec},
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
@@ -265,6 +265,28 @@ pub(crate) enum Update {
         revision: u64,
         model: Option<super::ActiveModel>,
     },
+    ConversationNameChanged,
+}
+
+pub(crate) struct ConversationNaming {
+    pub session: Option<String>,
+    pub provider: Option<String>,
+    pub opening: Option<super::OpeningTitle>,
+}
+
+impl ConversationNaming {
+    pub(crate) fn title(&self) -> Option<(String, crate::model::ChannelTitleSource)> {
+        use crate::model::ChannelTitleSource::{Prompt, Provider};
+        self.provider
+            .as_deref()
+            .and_then(crate::workspace_model::channel_title)
+            .map(|title| (title, Provider))
+            .or_else(|| {
+                self.opening
+                    .as_ref()
+                    .map(|title| (title.text().to_owned(), Prompt))
+            })
+    }
 }
 
 /// The conversation's prompt cache activity, which the actor records and
@@ -1767,14 +1789,24 @@ impl LocalHandle {
     }
     /// A coherent resident naming projection. Never opens the transcript Store,
     /// pages history or touches the filesystem; safe at host admission points.
+    #[cfg(test)]
     pub(crate) fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
+        self.conversation_naming()
+            .map(|naming| (naming.session, naming.provider))
+    }
+
+    pub(crate) fn conversation_naming(&self) -> Result<ConversationNaming, TitleUnavailable> {
         let state = self.0.state.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => TitleUnavailable::Busy,
             std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
         })?;
-        Ok((state.session_id.clone(), state.title.clone()))
+        Ok(ConversationNaming {
+            session: state.session_id.clone(),
+            provider: state.title.clone(),
+            opening: state.opening_title.clone(),
+        })
     }
 
     /// The provider-reported title, read without loading the transcript.
@@ -2753,6 +2785,42 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 }
 
 impl Actor {
+    fn metadata_poll(&self, timeout: i32) -> (libc::pollfd, i32) {
+        let mut watch = libc::pollfd {
+            fd: -1,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match self.adapter.metadata_wake() {
+            Some(MetadataWake::Changed(fd)) => watch.fd = fd.as_raw_fd(),
+            Some(MetadataWake::RetryAt(at)) => {
+                let delay = at.saturating_duration_since(Instant::now());
+                let millis = delay.as_nanos().div_ceil(1_000_000);
+                let retry = i32::try_from(millis).unwrap_or(i32::MAX);
+                return (
+                    watch,
+                    if timeout < 0 {
+                        retry
+                    } else {
+                        timeout.min(retry)
+                    },
+                );
+            }
+            None => {}
+        }
+        (watch, timeout)
+    }
+
+    fn refresh_metadata(&mut self, changed: bool) -> Result<(), String> {
+        if (changed
+            || matches!(self.adapter.metadata_wake(), Some(MetadataWake::RetryAt(at)) if at <= Instant::now()))
+            && let Some(step) = self.adapter.refresh_metadata()
+        {
+            self.step(step)?;
+        }
+        Ok(())
+    }
+
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -2773,14 +2841,17 @@ impl Actor {
             if !self.incoming.is_empty() {
                 continue;
             }
-            let mut fd = libc::pollfd {
-                fd: self.wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: poll receives one initialized entry whose descriptor is
-            // held by this actor for the entire call.
-            if unsafe { libc::poll(&mut fd, 1, -1) } < 0 {
+            let (watch, timeout) = self.metadata_poll(-1);
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                watch,
+            ];
+            // SAFETY: poll receives initialized entries held by this actor.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
                     return Err(error.to_string());
@@ -2788,6 +2859,7 @@ impl Actor {
             }
             let mut buffer = [0; 64];
             while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
+            self.refresh_metadata(fds[1].revents != 0)?;
         }
         Ok(())
     }
@@ -3042,6 +3114,23 @@ impl Actor {
                 (self.notify)(Update::Presentation);
             }
             self.publish_resident_metadata();
+            let timeout = if frames_ready
+                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+            {
+                0
+            } else if self.dirty && self.visible.load(Ordering::Acquire) {
+                50
+            } else if !self.first_frame
+                || self.adapter.initialization_pending()
+                || !self.output.is_empty()
+                || self.write_started.is_some()
+                || closing.is_some()
+            {
+                250
+            } else {
+                -1
+            };
+            let (watch, poll_timeout) = self.metadata_poll(timeout);
             let mut fds = [
                 libc::pollfd {
                     fd: self.wake.as_raw_fd(),
@@ -3071,30 +3160,15 @@ impl Actor {
                     events: libc::POLLOUT,
                     revents: 0,
                 },
+                watch,
             ];
-            let timeout = if frames_ready
-                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
-            {
-                0
-            } else if self.dirty && self.visible.load(Ordering::Acquire) {
-                50
-            } else if !self.first_frame
-                || self.adapter.initialization_pending()
-                || !self.output.is_empty()
-                || self.write_started.is_some()
-                || closing.is_some()
-            {
-                250
-            } else {
-                -1
-            };
             // The -1 branch proves the parser drained every complete frame
             // and no partial line remains. It also covers a conversation
             // parked on a permission request, which cannot become prompt-ready.
             if timeout == -1 {
                 self.reclaim_idle_frame_buffer();
             }
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, poll_timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
                     return Err(error.to_string());
@@ -3166,6 +3240,7 @@ impl Actor {
                     Err(e) => return Err(format!("Provider stderr: {e}")),
                 }
             }
+            self.refresh_metadata(fds[4].revents != 0)?;
         }
     }
     /// The provider read input or wrote output, so it may be about to start
@@ -3996,6 +4071,17 @@ impl Actor {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
+        let name_changed = match &event {
+            Event::OpeningTitle(title) => state.opening_title.as_ref() != Some(title),
+            Event::Session { id, title } => {
+                state.session_id.as_ref() != Some(id)
+                    || title
+                        .as_ref()
+                        .is_some_and(|title| state.title.as_ref() != Some(title))
+            }
+            Event::Reset { .. } => state.session_id.is_some() || state.opening_title.is_some(),
+            _ => false,
+        };
         apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
         if let Some(store) = &mut diagnostic_store {
             let owners = store.diagnostics.owners(&state);
@@ -4027,6 +4113,10 @@ impl Actor {
         self.retained = counter.0;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
+        drop(state);
+        if name_changed {
+            (self.notify)(Update::ConversationNameChanged);
+        }
     }
     fn publish_activity(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -4349,6 +4439,7 @@ fn apply_projected_event(
             };
             state.session_id = None;
             state.title = None;
+            state.opening_title = None;
             state.has_earlier = false;
             state.has_later = false;
             state.history_loading = false;
@@ -4365,6 +4456,9 @@ fn apply_projected_event(
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
                 state.prompt_suggestion = None;
+                if state.session_id.is_some() {
+                    state.opening_title = None;
+                }
                 state.title = title;
             } else if title.is_some() {
                 // Identity-only frames carry no new naming information.
@@ -4372,6 +4466,7 @@ fn apply_projected_event(
             }
             state.session_id = Some(id);
         }
+        Event::OpeningTitle(title) => state.opening_title = Some(title),
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.

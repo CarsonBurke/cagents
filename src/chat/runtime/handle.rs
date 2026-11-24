@@ -840,12 +840,21 @@ impl Handle {
             Owner::Remote(remote) => remote.decline_answer(command),
         }
     }
+    #[cfg(test)]
     pub(crate) fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
         match &self.0 {
             Owner::Local(local) => local.conversation_title(),
             Owner::Remote(remote) => remote.conversation_title(),
+        }
+    }
+    pub(crate) fn conversation_naming(
+        &self,
+    ) -> Result<super::ConversationNaming, TitleUnavailable> {
+        match &self.0 {
+            Owner::Local(local) => local.conversation_naming(),
+            Owner::Remote(remote) => remote.conversation_naming(),
         }
     }
     #[cfg(test)]

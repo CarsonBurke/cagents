@@ -434,6 +434,13 @@ pub enum HeldStop {
     Dropped,
 }
 
+/// When an adapter's local metadata can be read again, independently of
+/// provider messages on the transport.
+pub enum MetadataWake<'a> {
+    Changed(std::os::fd::BorrowedFd<'a>),
+    RetryAt(std::time::Instant),
+}
+
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
@@ -478,6 +485,12 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    fn metadata_wake(&self) -> Option<MetadataWake<'_>> {
+        None
+    }
+    fn refresh_metadata(&mut self) -> Option<Step> {
+        None
+    }
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.

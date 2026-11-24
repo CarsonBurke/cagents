@@ -13,6 +13,7 @@
 
 use std::{
     collections::HashMap,
+    fs::File,
     io::{BufRead, BufReader, Read},
     path::Path,
 };
@@ -26,6 +27,10 @@ use crate::chat::{
 /// Rollouts are append-only JSON lines; a conversation this large is refused
 /// rather than read into memory.
 const MAX_ROLLOUT: u64 = 256 * 1024 * 1024;
+/// Keep an opening lookup cheap even when a conversation begins with images,
+/// tool output or lengthy instructions.
+const OPENING_BYTES: u64 = 16 * 1024 * 1024;
+const OPENING_RECORD_BYTES: u64 = 256 * 1024;
 /// Tool output kept per call. A transcript clips it far shorter unless asked
 /// for whole output, and this bounds what a long session holds in memory.
 const TOOL_OUTPUT: usize = 64 * 1024;
@@ -43,6 +48,14 @@ const HARNESS_CONTEXT: &[&str] = &[
 
 /// Every item in the rollout at `path`, oldest first.
 pub(crate) fn read(path: &Path) -> Result<Vec<Item>, String> {
+    let (file, len) = open(path)?;
+    if len > MAX_ROLLOUT {
+        return Err("The Codex rollout must be a regular file smaller than 256 MiB".into());
+    }
+    Ok(parse(file.take(MAX_ROLLOUT)))
+}
+
+fn open(path: &Path) -> Result<(File, u64), String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     crate::secure_file::reject_symlink_components(path).map_err(|error| error.to_string())?;
     let file = std::fs::OpenOptions::new()
@@ -51,10 +64,83 @@ pub(crate) fn read(path: &Path) -> Result<Vec<Item>, String> {
         .open(path)
         .map_err(|error| format!("Cannot open the Codex rollout: {error}"))?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.len() > MAX_ROLLOUT {
+    if !metadata.is_file() {
         return Err("The Codex rollout must be a regular file smaller than 256 MiB".into());
     }
-    Ok(parse(file.take(MAX_ROLLOUT)))
+    Ok((file, metadata.len()))
+}
+
+/// An opening prompt for a resumed thread whose newest history page doesn't
+/// reach its start. Read only the account's exact rollout and stop at the first
+/// user text that names the conversation.
+pub(super) fn opening_title(home: &Path, id: &str) -> Option<crate::chat::OpeningTitle> {
+    let path = crate::agent::codex_rollout(home, id).ok()?;
+    let (file, len) = open(&path).ok()?;
+    let mut reader = BufReader::new(file.take(len.min(OPENING_BYTES)));
+    let mut line = Vec::new();
+    let mut exact = false;
+    let mut fallback = None;
+    loop {
+        line.clear();
+        if (&mut reader)
+            .take(OPENING_RECORD_BYTES)
+            .read_until(b'\n', &mut line)
+            .ok()?
+            == 0
+        {
+            return fallback;
+        }
+        if !line.ends_with(b"\n") {
+            reader.skip_until(b'\n').ok()?;
+            continue;
+        }
+        if ![
+            b"\"session_meta\"".as_slice(),
+            b"\"user\"",
+            b"\"UserMessage\"",
+            b"\"user_message\"",
+        ]
+        .iter()
+        .any(|kind| line.windows(kind.len()).any(|window| window == *kind))
+        {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let payload = &record["payload"];
+        if record["type"] == "session_meta" {
+            if payload["id"].as_str() != Some(id) {
+                return None;
+            }
+            exact = true;
+            continue;
+        }
+        if !exact {
+            continue;
+        }
+        let text = match (record["type"].as_str(), payload["type"].as_str()) {
+            (Some("response_item"), Some("message")) => match message(payload) {
+                Some((Role::User, ItemContent::Text { text, .. })) => text,
+                _ => continue,
+            },
+            (Some("event_msg"), Some("user_message")) => {
+                payload["message"].as_str().unwrap_or_default().to_owned()
+            }
+            (Some("event_msg"), Some("item_completed"))
+                if payload["item"]["type"] == "UserMessage" =>
+            {
+                content_text(&payload["item"]["content"])
+            }
+            _ => continue,
+        };
+        if let Some(title) = crate::chat::OpeningTitle::from_text(&text) {
+            if !title.provisional() {
+                return Some(title);
+            }
+            fallback.get_or_insert(title);
+        }
+    }
 }
 
 /// Parses rollout lines in one pass. A line Codex is still writing, or one
