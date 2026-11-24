@@ -2070,8 +2070,18 @@ class RemoteRun(unittest.TestCase):
                     owner.write_text(previous + "\n")
                     (slot / "incremental-epoch").write_text(f"{owner.stat().st_mtime_ns} epoch\n")
                     crate = build / "local/incremental/probe-1"
-                    (crate / "s-a-0-finished").mkdir(parents=True)
-                    (crate / "s-b-0-working").mkdir()
+                    finalized = crate / "s-a-0-finished"
+                    finalized.mkdir(parents=True)
+                    index = finalized / "work-products.bin"
+                    index.touch()
+                    os.utime(index, (1, 1))
+                    working = crate / "s-b-0-working"
+                    working.mkdir()
+                    bitcode = finalized / "probe.pre-lto.bc"
+                    bitcode.write_bytes(b"previous build")
+                    linked = working / bitcode.name
+                    os.link(bitcode, linked)
+                    linked.write_bytes(b"interrupted build")
                     healthy = build / "local/incremental/healthy-1/s-a-0-finished"
                     healthy.mkdir(parents=True, exist_ok=True)
                     host = ("import os\n"
@@ -2513,6 +2523,28 @@ class Trim(unittest.TestCase):
         self.assertTrue(self.repair_incremental(build, "new epoch"))
         self.assertFalse(fresh.exists())
         self.assertEqual(output.read_bytes(), b"compiled")
+
+    def test_incremental_repair_keeps_the_cache_after_a_compile_error(self):
+        build = self.slot / "src/target"
+        self.assertTrue(self.repair_incremental(build))
+        crate = build / "debug/incremental/checked-1"
+        finalized = crate / "s-a-0-finished"
+        finalized.mkdir(parents=True)
+        keys = finalized / "thin-lto-past-keys.bin"
+        keys.write_bytes(b"previous build")
+        os.utime(keys, (1, 1))
+        index = finalized / "work-products.bin"
+        index.touch()
+        # rustc links the previous cache before compiling, and an error can
+        # leave the working session behind without overwriting these files.
+        working = crate / "s-b-0-working"
+        working.mkdir()
+        os.link(keys, working / keys.name)
+        os.link(index, working / index.name)
+
+        self.assertTrue(self.repair_incremental(build))
+        self.assertEqual(keys.read_bytes(), b"previous build")
+        self.assertTrue(working.is_dir())
 
     def test_incremental_repair_evicts_the_crate_with_an_overwritten_finalized_session(self):
         build = self.slot / "src/target"

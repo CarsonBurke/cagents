@@ -1258,15 +1258,16 @@ Before each Cargo command under the slot's running lock, the gate checks the
 incremental state in its configured build directory. Rust 1.93 can overwrite
 hard-linked pre-LTO bitcode and ThinLTO keys in the last finalized session
 while it compiles the next one. If interrupted, the old work-product index
-can then describe inputs from two builds. A newer unfinished session or an
-input newer than the last work-product index causes the gate to move out the
-whole crate cache before Cargo runs. A slot discards its old incremental
-state when adopting this check or after a lease from an older gate, and
-keeps its compiled outputs. For a directory outside the slot's lock, the
+can then describe inputs from two builds. A finalized ThinLTO key file or
+pre-LTO bitcode file newer than that index causes the gate to move out the
+whole crate cache before Cargo runs. Rustc handles unfinished sessions left
+by ordinary compile errors at the next compile. A slot discards its old
+incremental state when adopting this check or after a lease from an older gate,
+and keeps its compiled outputs. For a directory outside the slot's lock, the
 gate disables incremental compilation for the command. When Cargo uses
 the gate's default compiler wrapper, an undefined-symbol link error in a
 workspace crate moves out that crate's incremental cache and retries the
-compiler once. The compiler fix is tracked in
+compiler once, suppressing repeated diagnostics. The compiler fix is tracked in
 [rust-lang/rust#159287](https://github.com/rust-lang/rust/pull/159287).
 
 A checkout's gate defers to the installed one, `/var/tmp/cagents-cargo-gate`
