@@ -104,24 +104,38 @@ struct State {
     /// cannot be reached, lookups back off rather than retry every pass.
     failures: u32,
     failed: Option<Instant>,
+    /// Until when GitHub's rate limit refuses lookups. They resume once it
+    /// resets rather than after a doubling backoff.
+    paused_until: Option<Instant>,
 }
 
 impl State {
     fn lookups_due(&self) -> bool {
-        self.failed
-            .is_none_or(|failed| failed.elapsed() >= backoff(self.failures))
+        match self.paused_until {
+            Some(until) => until <= Instant::now(),
+            None => self
+                .failed
+                .is_none_or(|failed| failed.elapsed() >= backoff(self.failures)),
+        }
     }
 
     fn succeeded(&mut self) {
         self.forge_error = None;
         self.failures = 0;
         self.failed = None;
+        self.paused_until = None;
     }
 
     fn failed(&mut self, error: &GitHubError) {
         self.forge_error = Some(error.to_string());
-        self.failures = self.failures.saturating_add(1);
         self.failed = Some(Instant::now());
+        match error.rate_limit() {
+            Some(limit) => self.paused_until = Some(super::rate_limit_reset(limit.retry_at)),
+            None => {
+                self.failures = self.failures.saturating_add(1);
+                self.paused_until = None;
+            }
+        }
     }
 }
 
@@ -1017,7 +1031,10 @@ impl Handle {
                             entry.failures = 0;
                         }
                         Err(error) => {
-                            entry.failures = entry.failures.saturating_add(1);
+                            // A rate limit is no fault of this pull request.
+                            if error.rate_limit().is_none() {
+                                entry.failures = entry.failures.saturating_add(1);
+                            }
                             state.failed(&error);
                             return;
                         }

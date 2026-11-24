@@ -239,6 +239,9 @@ struct Tracked {
     last_fresh_poll: Option<Instant>,
     next_poll: Instant,
     failures: u32,
+    /// Until when GitHub's rate limit refuses this project's account. Not a
+    /// failure: no poll is due before it resets, and none waits past it.
+    paused_until: Option<Instant>,
     memory: forge::Memory,
     /// When a CLI board or a watched conversation last read this project.
     /// Only the projects someone reads poll at the watched cadence.
@@ -274,6 +277,7 @@ impl Tracked {
             last_fresh_poll: None,
             next_poll: Instant::now(),
             failures: 0,
+            paused_until: None,
             memory: forge::Memory::with_listings(listings),
             read_at: None,
         }
@@ -297,6 +301,39 @@ impl Tracked {
         }
     }
 
+    /// Keeps what the last poll read, says why this one could not, and backs
+    /// off. A rate limit says when to ask again; doubling the wait as for an
+    /// outage would leave the board stale for up to half an hour after it
+    /// resets.
+    fn poll_failed(&mut self, failure: forge::Failure) {
+        match failure.retry_at {
+            Some(retry_at) => self.paused_until = Some(rate_limit_reset(retry_at)),
+            None => self.failures = self.failures.saturating_add(1),
+        }
+        let error = failure.message;
+        self.forge = match (&self.forge, &self.snapshot) {
+            (Forge::Synced { at_unix_ms, .. }, Some(_)) => Forge::Synced {
+                at_unix_ms: *at_unix_ms,
+                error: Some(error),
+            },
+            _ => Forge::Unavailable { reason: error },
+        };
+    }
+
+    /// Whether GitHub's rate limit still refuses this project's account.
+    fn paused(&self) -> bool {
+        self.paused_until
+            .is_some_and(|until| until > Instant::now())
+    }
+
+    /// When the poll after one at `last` is due: never before a rate limit
+    /// resets.
+    fn forge_deadline(&self, last: Instant, watching: bool) -> Instant {
+        let deadline = last + self.forge_interval(watching);
+        self.paused_until
+            .map_or(deadline, |until| deadline.max(until))
+    }
+
     /// Records a read of this project. The first in a while brings its forge
     /// poll forward to the watched cadence, and refreshes a healthy listing
     /// that went stale while nobody read it, as a board request does. Returns
@@ -313,7 +350,10 @@ impl Tracked {
         self.next_poll = self
             .next_poll
             .min(last + forge::interval(true, self.failures));
-        if self.failures == 0 && last.elapsed() >= forge::WATCHED_INTERVAL {
+        if let Some(until) = self.paused_until {
+            self.next_poll = self.next_poll.max(until);
+        }
+        if self.failures == 0 && !self.paused() && last.elapsed() >= forge::WATCHED_INTERVAL {
             self.poll_requested = true;
         }
         true
@@ -477,7 +517,7 @@ impl Shared {
             if tracked.forge != Forge::NotGitHub
                 && let Some(last) = tracked.last_poll
             {
-                let deadline = last + tracked.forge_interval(watching);
+                let deadline = tracked.forge_deadline(last, watching);
                 tracked.next_poll = if tracked.failures > 0 {
                     tracked.next_poll.max(deadline)
                 } else {
@@ -926,6 +966,18 @@ fn now_unix_ms() -> u64 {
     crate::chat::now_ms().unwrap_or_default()
 }
 
+/// The longest a rate limit may pause a project's polls. GitHub's primary
+/// window is an hour; a later reset, as from a skewed clock, is asked about
+/// again by then rather than trusted.
+const RATE_LIMIT_PAUSE_MAX: Duration = Duration::from_secs(61 * 60);
+
+/// The instant a rate limit resetting at Unix second `retry_at` admits
+/// requests again: the second after it, as the shared budget counts.
+fn rate_limit_reset(retry_at: u64) -> Instant {
+    let wait = retry_at.saturating_sub(crate::github::polling::now()) + 1;
+    Instant::now() + Duration::from_secs(wait).min(RATE_LIMIT_PAUSE_MAX)
+}
+
 fn open_projects(host: &SharedHost) -> Result<Vec<ModelProject>, String> {
     agent_execution::registry(host)?
         .lock()
@@ -1078,6 +1130,7 @@ impl Handle {
                 // Unread, listings go stale for minutes; the first read in a
                 // while refreshes them without waiting for the answer.
                 if tracked.failures == 0
+                    && !tracked.paused()
                     && tracked.forge != Forge::NotGitHub
                     && tracked
                         .last_poll
@@ -1633,6 +1686,7 @@ impl Handle {
             if freshness == forge::Freshness::Fresh {
                 tracked.last_fresh_poll = tracked.last_poll;
             }
+            tracked.paused_until = None;
             match outcome {
                 forge::Outcome::Synced(snapshot) => {
                     tracked.failures = 0;
@@ -1655,18 +1709,9 @@ impl Handle {
                     tracked.forge = Forge::NotGitHub;
                     tracked.snapshot = None;
                 }
-                forge::Outcome::Failed(error) => {
-                    tracked.failures = tracked.failures.saturating_add(1);
-                    tracked.forge = match (&tracked.forge, &tracked.snapshot) {
-                        (Forge::Synced { at_unix_ms, .. }, Some(_)) => Forge::Synced {
-                            at_unix_ms: *at_unix_ms,
-                            error: Some(error),
-                        },
-                        _ => Forge::Unavailable { reason: error },
-                    };
-                }
+                forge::Outcome::Failed(failure) => tracked.poll_failed(failure),
             }
-            tracked.next_poll = Instant::now() + tracked.forge_interval(watching);
+            tracked.next_poll = tracked.forge_deadline(Instant::now(), watching);
             drop(shared);
             self.changed();
         }
@@ -2614,6 +2659,55 @@ mod tests {
         assert!(tracked.read(false));
         assert_eq!(tracked.next_poll, last + forge::interval(true, 2));
         assert!(!tracked.poll_requested);
+    }
+
+    /// A rate limit pauses a project until it resets, however it is read or
+    /// watched meanwhile, and then polls at its usual cadence, not after an
+    /// outage's doubling backoff.
+    #[test]
+    fn a_rate_limited_project_polls_again_when_the_limit_resets() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let tracked = shared.track(Path::new("/fixture/repo"), "repo");
+        let polled = Instant::now();
+        tracked.last_poll = Some(polled);
+        let reset_in = Duration::from_secs(20 * 60);
+        tracked.poll_failed(forge::Failure {
+            message: "GitHub rate limit reached. Retrying at 18:42 UTC".into(),
+            retry_at: Some(crate::github::polling::now() + reset_in.as_secs()),
+        });
+        assert_eq!(tracked.failures, 0, "a rate limit is not an outage");
+        assert!(tracked.paused());
+        tracked.next_poll = tracked.forge_deadline(polled, true);
+        let reset = tracked.paused_until.unwrap();
+        assert_eq!(tracked.next_poll, reset);
+        let early = Duration::from_secs(5);
+        assert!(reset >= polled + reset_in && reset <= Instant::now() + reset_in + early);
+
+        // Reading it neither brings the poll forward nor asks for one.
+        tracked.read_at = Some(polled - READ_WINDOW);
+        tracked.last_poll = Some(polled - forge::WATCHED_INTERVAL);
+        tracked.read(false);
+        assert_eq!(tracked.next_poll, reset);
+        assert!(!tracked.poll_requested);
+        // Nor does a window arriving or leaving.
+        shared.set_watching(true);
+        assert_eq!(shared.projects[Path::new("/fixture/repo")].next_poll, reset);
+        shared.set_watching(false);
+        assert_eq!(shared.projects[Path::new("/fixture/repo")].next_poll, reset);
+
+        // An outage still backs off.
+        let tracked = shared.projects.get_mut(Path::new("/fixture/repo")).unwrap();
+        tracked.paused_until = None;
+        tracked.poll_failed(forge::Failure::from("network unreachable".to_owned()));
+        assert_eq!(tracked.failures, 1);
+        assert!(!tracked.paused());
+        assert_eq!(
+            tracked.forge,
+            Forge::Unavailable {
+                reason: "network unreachable".into()
+            }
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::scan::ForgeHints;
 use crate::{
     github::{
-        GitHubRepoKey, GitHubService, PullRequest, Revalidation, checks_settling,
+        GitHubError, GitHubRepoKey, GitHubService, PullRequest, Revalidation, checks_settling,
         remote_repository_key,
     },
     repository::{CancellationToken, RemoteRecord, RepositoryService},
@@ -240,7 +240,7 @@ struct Listing {
     probed_at: Instant,
     /// Why that revalidation failed, which a project sharing the listing in
     /// the same cadence reports too rather than showing it as current.
-    failed: Option<String>,
+    failed: Option<Failure>,
 }
 
 impl Listing {
@@ -350,7 +350,35 @@ enum Probe {
 pub(super) enum Outcome {
     NotGitHub,
     Synced(Snapshot),
-    Failed(String),
+    Failed(Failure),
+}
+
+/// Why a poll could not read GitHub, and, when a rate limit refused it, when
+/// GitHub said to ask again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Failure {
+    pub message: String,
+    /// The Unix second the refusing limit resets. Every project read with
+    /// the same account shares it, so none asks before then.
+    pub retry_at: Option<u64>,
+}
+
+impl From<GitHubError> for Failure {
+    fn from(error: GitHubError) -> Self {
+        Self {
+            retry_at: error.rate_limit().map(|limit| limit.retry_at),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retry_at: None,
+        }
+    }
 }
 
 pub(super) fn poll(
@@ -371,16 +399,13 @@ fn read(
     memory: &mut Memory,
     freshness: Freshness,
     cancellation: &CancellationToken,
-) -> Result<Option<Snapshot>, String> {
+) -> Result<Option<Snapshot>, Failure> {
     let git = RepositoryService::system("git");
     let gh = GitHubService::system("gh");
     let remotes = git
         .remotes(&target.repository, cancellation)
-        .map_err(|error| error.to_string())?;
-    if !gh
-        .has_associated_remote(&remotes, cancellation)
-        .map_err(|error| error.to_string())?
-    {
+        .map_err(|error| Failure::from(error.to_string()))?;
+    if !gh.has_associated_remote(&remotes, cancellation)? {
         return Ok(None);
     }
     let mut keys = Vec::<GitHubRepoKey>::new();
@@ -398,9 +423,7 @@ fn read(
         Some(repository) => repository.clone(),
         None => {
             let from = target.root.as_deref().unwrap_or(&target.repository);
-            let repository = gh
-                .resolve_repository(from, &remotes, cancellation)
-                .map_err(|error| error.to_string())?;
+            let repository = gh.resolve_repository(from, &remotes, cancellation)?;
             memory.remember_repository(repository.clone(), remotes.clone());
             repository
         }
@@ -478,7 +501,7 @@ fn listing<E: crate::repository::ProcessExecutor>(
     memory: &mut Memory,
     freshness: Freshness,
     cancellation: &CancellationToken,
-) -> Result<Vec<PullRequest>, String> {
+) -> Result<Vec<PullRequest>, Failure> {
     let credential = crate::github_status::credential_fingerprint().ok();
     let key = ListingKey {
         repository: repository.clone(),
@@ -605,11 +628,9 @@ fn read_listing<E: crate::repository::ProcessExecutor>(
     credential: Option<String>,
     probe: Probe,
     cancellation: &CancellationToken,
-) -> Result<Listing, String> {
+) -> Result<Listing, Failure> {
     let read_at = jiff::Timestamp::now();
-    let read = gh
-        .authored_pull_requests(repository, OPEN, AUTHORED, cancellation)
-        .map_err(|error| error.to_string())?;
+    let read = gh.authored_pull_requests(repository, OPEN, AUTHORED, cancellation)?;
     Ok(Listing {
         repository: repository.clone(),
         credential,
@@ -794,6 +815,8 @@ mod tests {
         /// How the probe fails, if it does: a status line.
         probe_fails: std::sync::Mutex<Option<&'static str>>,
         listing_fails: std::sync::atomic::AtomicBool,
+        /// When the listing's GraphQL quota resets, while it is spent.
+        graphql_exhausted_until: std::sync::Mutex<Option<u64>>,
         listed: std::sync::Mutex<String>,
         calls: std::sync::Mutex<Vec<&'static str>>,
     }
@@ -811,6 +834,7 @@ mod tests {
                 pending: false.into(),
                 probe_fails: Default::default(),
                 listing_fails: false.into(),
+                graphql_exhausted_until: Default::default(),
                 listed: std::sync::Mutex::new(FIRST.into()),
                 calls: Default::default(),
             })
@@ -852,6 +876,14 @@ mod tests {
                 self.calls.lock().unwrap().push("listing");
                 if self.listing_fails.load(Ordering::SeqCst) {
                     return output(false, "HTTP/2.0 502 Bad Gateway\r\n\r\n".into());
+                }
+                if let Some(reset) = *self.graphql_exhausted_until.lock().unwrap() {
+                    return output(
+                        false,
+                        format!(
+                            "HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Resource: graphql\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{\"errors\":[{{\"type\":\"RATE_LIMITED\",\"message\":\"API rate limit exceeded\"}}]}}"
+                        ),
+                    );
                 }
                 if !self.lagging.load(Ordering::SeqCst) {
                     *self.listed.lock().unwrap() = self.updated.lock().unwrap().clone();
@@ -1119,6 +1151,59 @@ mod tests {
         assert_eq!(forge.take(), ["probe", "listing"]);
         assert!(poll(&mut second).is_err());
         assert!(forge.take().is_empty());
+    }
+
+    /// A spent GraphQL quota tells every project on the account when it
+    /// resets: the one whose listing GitHub refused, one sharing that
+    /// listing, and one asking later, which the shared budget answers
+    /// without asking GitHub.
+    #[test]
+    fn a_spent_quota_tells_every_project_when_it_resets() {
+        crate::github::polling::with_scope("forge-graphql-spent", || {
+            let forge = Forge::new();
+            let gh = GitHubService::new("gh", forge.clone());
+            let repository = key("me");
+            let cancellation = CancellationToken::new();
+            let listings = Listings::default();
+            let mut first = Memory::with_listings(listings.clone());
+            let mut second = Memory::with_listings(listings.clone());
+            let poll = |memory: &mut Memory| {
+                listing(&gh, &repository, memory, Freshness::Watched, &cancellation)
+            };
+            // Its checks are still running, so each poll reads it again.
+            forge
+                .pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            poll(&mut first).unwrap();
+            assert_eq!(forge.take(), ["listing"]);
+
+            let reset = crate::github::polling::now() + 1800;
+            *forge.graphql_exhausted_until.lock().unwrap() = Some(reset);
+            let cache_key = ListingKey {
+                repository: repository.clone(),
+                credential: crate::github_status::credential_fingerprint().ok(),
+            };
+            let due = || {
+                listings.listing_mut(&cache_key, |listing| {
+                    listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
+                })
+            };
+            due();
+            let refused = poll(&mut first).unwrap_err();
+            assert_eq!(forge.take(), ["probe", "listing"]);
+            assert_eq!(refused.retry_at, Some(reset));
+            assert_eq!(
+                poll(&mut second).unwrap_err(),
+                refused,
+                "the project sharing it is told the same"
+            );
+            assert!(forge.take().is_empty());
+
+            due();
+            let later = poll(&mut second).unwrap_err();
+            assert_eq!(later.retry_at, Some(reset));
+            assert_eq!(forge.take(), ["probe"], "the free probe, not the listing");
+        });
     }
 
     #[test]
