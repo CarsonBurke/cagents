@@ -201,7 +201,8 @@ impl Turn {
     /// Timers use the same compact seconds/minutes notation as reasoning and
     /// individual steps. The retained cache shares the running timer cadence.
     pub(super) fn duration_label(&self, now: u64) -> Option<String> {
-        self.working_for(now).map(super::disclosure::duration)
+        self.working_for(now)
+            .and_then(super::disclosure::shown_duration)
     }
 
     /// Fills in the summary once the group's membership is final.
@@ -267,11 +268,14 @@ impl Turn {
         }
         // Several steps say how many of them failed or were refused, after
         // the line that counted them: "Ran 3 commands · 1 failed", and
-        // "all failed" where none went otherwise. A lone step's line is
-        // about that step, so the bare word says it. How the group ended,
-        // where that is more than finishing, still follows the counts:
-        // "Ran 2 commands · 1 denied · stopped".
+        // "all failed" where none went otherwise. How the group stands is
+        // its row's mark, so its words say it only where the mark tells
+        // something else: "Ran 2 commands · 1 failed · stopped", whose mark
+        // is the partial failure's. A lone step's failure or refusal is its
+        // mark's alone.
+        let marked = self.glyph() == self.outcome.map(Status::from);
         let ending = match self.outcome {
+            _ if marked => "",
             Some(ToolStatus::Stopped) => " · stopped",
             Some(ToolStatus::Ended) => " · ended",
             Some(ToolStatus::Waiting) => " · waiting on background work",
@@ -297,11 +301,7 @@ impl Turn {
                 return Cow::Owned(format!(" · {}{ending}", counts.join(", ")));
             }
         }
-        Cow::Borrowed(match self.outcome {
-            Some(ToolStatus::Failed) => " · failed",
-            Some(ToolStatus::Denied) => " · denied",
-            _ => ending,
-        })
+        Cow::Borrowed(ending)
     }
 
     /// Whether nothing has happened in this group since its prompt.
@@ -1606,8 +1606,8 @@ mod tests {
         );
         assert_eq!(
             summary_and_glyph(&[Failed]),
-            ("Ran cargo check · failed".to_owned(), Some(Failed.into())),
-            "a lone step keeps its own wording"
+            ("Ran cargo check".to_owned(), Some(Failed.into())),
+            "a lone step's failure is its mark's alone"
         );
     }
 
@@ -1783,7 +1783,7 @@ mod tests {
             ),
             "where nothing went through, the group keeps the full error mark"
         );
-        assert_eq!(summary(&[Denied]), "Tried to run cargo check · denied");
+        assert_eq!(summary(&[Denied]), "Tried to run cargo check");
     }
 
     #[test]
@@ -1802,11 +1802,8 @@ mod tests {
         use ToolStatus::{Denied, Ended, Stopped, Waiting};
         assert_eq!(
             summary_and_glyph(&[Denied, Waiting]),
-            (
-                "Ran 2 commands · 1 denied · waiting on background work".to_owned(),
-                Some(Waiting.into())
-            ),
-            "work still waiting on the background says so, in words and in its mark"
+            ("Ran 2 commands · 1 denied".to_owned(), Some(Waiting.into())),
+            "work still waiting on the background says so by its mark, once"
         );
         assert_eq!(
             summary_and_glyph(&[Denied, Stopped]),
@@ -1958,8 +1955,10 @@ mod tests {
         tool.started_at = Some(1_000);
         tool.at = Some(1_100);
         let turns = group(&[tool], &unasked(), plain);
-        assert_eq!(turns[0].duration_label(999).as_deref(), Some("0s"));
-        assert_eq!(turns[0].duration_label(1_999).as_deref(), Some("0s"));
+        // Under a second shows no time rather than "0s".
+        assert_eq!(turns[0].duration_label(999), None);
+        assert_eq!(turns[0].duration_label(1_999), None);
+        assert_eq!(turns[0].duration_label(2_000).as_deref(), Some("1s"));
         assert_eq!(turns[0].duration_label(60_999).as_deref(), Some("59s"));
         assert_eq!(turns[0].duration_label(61_000).as_deref(), Some("1m 0s"));
     }
@@ -2650,7 +2649,7 @@ mod tests {
         }];
         assert_eq!(
             group(&items, &unasked(), plain)[0].summary,
-            "Ran cargo test --lib module_295 · failed"
+            "Ran cargo test --lib module_295"
         );
     }
 

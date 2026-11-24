@@ -7716,7 +7716,8 @@ impl Runtime {
             Icon::Ended
         } else if notice && delivery_command_outcome(heading).is_some() {
             Icon::Terminal
-        } else if kind == chat::DeliveryKind::Notice {
+        } else if kind == chat::DeliveryKind::Notice && report.is_none() {
+            // An agent's notice reads as its report, under a report's glyph.
             Icon::Attention
         } else {
             Icon::Chat
@@ -7849,7 +7850,7 @@ impl Runtime {
             .then(|| self.subagent(sender))
             .flatten()
             .and_then(|agent| agent_elapsed_ms(agent, self.source_now_ms()))
-            .map(disclosure::duration);
+            .and_then(disclosure::shown_duration);
         let named = match &elapsed {
             Some(elapsed) => format!("{heading} · {elapsed}"),
             None => heading.clone(),

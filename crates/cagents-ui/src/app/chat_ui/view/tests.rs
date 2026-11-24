@@ -5615,7 +5615,7 @@ fn drawing_and_regrouping_a_tool_row_do_not_read_its_input_again() {
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
     assert_eq!(
         runtime.turns[0].summary,
-        "Tried to write docs/large-report.md · denied"
+        "Tried to write docs/large-report.md"
     );
     let reads = || crate::app::chat_ui::tool_title::READS.with(std::cell::Cell::get);
     let before = reads();
@@ -8403,7 +8403,7 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     assert_eq!(stopped.heading, "Agent \"Review restart safety\" stopped");
     // A report keeps its kind's glyph, and marks the stop beside its time,
     // where every row marks how its work stands.
-    assert_eq!(stopped.glyph, Icon::Attention);
+    assert_eq!(stopped.glyph, Icon::Chat);
     assert_eq!(stopped.mark, Some(disclosure::Mark::Stopped));
     // Resumed after it was stopped, the notice keeps its own words.
     Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Running;
@@ -10212,7 +10212,7 @@ fn a_lone_file_step_names_its_file_on_the_collapsed_strip() {
     let turn = runtime.turns[0].clone();
     assert_eq!(
         runtime.strip_summary(&turn),
-        "Tried to edit src/platform/a.rs · failed"
+        "Tried to edit src/platform/a.rs"
     );
 }
 

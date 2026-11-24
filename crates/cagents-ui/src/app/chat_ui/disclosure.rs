@@ -12,9 +12,15 @@ pub(super) fn duration(millis: u64) -> String {
     }
 }
 
+/// A row's time as it shows it: none under a second, which says nothing
+/// beside a finished mark and would read as no time at all.
+pub(super) fn shown_duration(millis: u64) -> Option<String> {
+    (millis >= 1_000).then(|| duration(millis))
+}
+
 /// A tool's own interval, never the time spent waiting for the next tool.
 pub(super) fn item_duration(item: &chat::Item, now: Option<u64>) -> Option<String> {
-    item_duration_ms(item, now).map(duration)
+    item_duration_ms(item, now).and_then(shown_duration)
 }
 
 /// Unformatted timing for retained rows, hashed at the displayed second cadence.
@@ -343,7 +349,10 @@ pub(super) fn row(
     // accessible name's to carry. A group failing in part says how many of
     // its steps failed in its own words.
     let failure = match status {
-        Some(Status::Tool(chat::ToolStatus::Failed)) => " · failed",
+        // "all failed" already says it.
+        Some(Status::Tool(chat::ToolStatus::Failed)) if !name.ends_with(" all failed") => {
+            " · failed"
+        }
         _ => "",
     };
     let name = format!("{name}{failure}{}", trailing.described());

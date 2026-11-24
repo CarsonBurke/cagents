@@ -1162,8 +1162,9 @@ struct Row {
     full: String,
     state: RowStatus,
     /// How long the work it started took, where that is not the step's own
-    /// time: an agent's, which runs on after the step that started it.
-    elapsed: Option<u64>,
+    /// time: an agent's, which runs on after the step that started it, and
+    /// is none where its transcript carries no times. `None` for the step's.
+    elapsed: Option<Option<u64>>,
     /// What opening the row does, where this conversation can open the agent.
     open: Option<Action>,
     /// Where it cannot, why: there is none, or there are several.
@@ -1829,20 +1830,15 @@ impl Runtime {
             } else {
                 listed.is_some_and(|agent| agent.items.is_empty())
             };
-        let mut glyph = Icon::Agent;
+        // The agent's glyph leads whatever its state, which the trailing
+        // mark tells, once.
+        let glyph = Icon::Agent;
         // Use the observed task state while a native launch tool is still
         // settling, but keep an explicit launch failure visible.
         let state = match background
             .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
         {
-            Some(state) => {
-                glyph = match state {
-                    BackgroundState::Waiting => Icon::AgentWaiting,
-                    BackgroundState::OnBackgroundWork(_) => Icon::AgentBackground,
-                    _ => Icon::Agent,
-                };
-                state.status()
-            }
+            Some(state) => state.status(),
             None => match status {
                 ToolStatus::Running if spawn.waits => RowStatus::live("Working").quiet(),
                 ToolStatus::Running => RowStatus::live("Starting"),
@@ -1903,10 +1899,10 @@ impl Runtime {
             term,
             full: full.join("\n\n"),
             state,
-            // A background agent's time, not its launch's.
+            // A started agent's time, not its launch's, or none at all.
             elapsed: listed
                 .filter(|_| !unstarted)
-                .and_then(|agent| view::agent_elapsed_ms(agent, self.source_now_ms())),
+                .map(|agent| view::agent_elapsed_ms(agent, self.source_now_ms())),
             several: open.is_none() && self.listed_subagents(coordinated).nth(1).is_some(),
             open,
             copy: if spawn
@@ -1933,8 +1929,8 @@ impl Runtime {
         );
         let elapsed = row
             .elapsed
-            .or_else(|| disclosure::item_duration_ms(item, self.source_now_ms()))
-            .map(disclosure::duration);
+            .unwrap_or_else(|| disclosure::item_duration_ms(item, self.source_now_ms()))
+            .and_then(disclosure::shown_duration);
         let content = row_content(row.glyph, words, &row.state, elapsed);
         let open_tool = self.item_expanded(&item.id);
         // The detail holds what was said and reported in full, then the
@@ -2049,7 +2045,7 @@ impl Runtime {
         let elapsed = self
             .source_now_ms()
             .and_then(|now| turn.working_for(now))
-            .map(disclosure::duration);
+            .and_then(disclosure::shown_duration);
         let content = row_content(Icon::Send, words, &run.state, elapsed);
         let arrow = crate::ui_controls::passive_icon(
             if open {
