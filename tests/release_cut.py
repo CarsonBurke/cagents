@@ -100,6 +100,8 @@ echo "$0 $command ${*:4}" >> "$FIXTURE/rehearse.log"
 case $command in
     cleanup) rm -rf "$root" ;;
     run)
+        feed=; while (($#)); do [[ $1 == --feed ]] && feed=$2; shift; done
+        [[ -z $feed ]] || ls "$feed/download" | sed "s|^|feed $feed offers |" >> "$FIXTURE/rehearse-feed.log"
         mkdir -p "$root/home/.local/share/cagents-install/.update"
         outcome=$(cat "$FIXTURE/rehearse-outcome" 2>/dev/null || echo PASS)
         printf 'Total duration: 61.2s\nOutcome: %s\n' "$outcome" > "$root/report.txt"
@@ -385,7 +387,7 @@ class ReleaseCut(unittest.TestCase):
         self.cut_signed()
         result = self.release("rehearse", "0.2.4")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Rehearsing the update from 0.2.3 to 0.2.4", result.stdout)
+        self.assertIn("Rehearsing the in-app update from 0.2.3 to 0.2.4", result.stdout)
         self.assertIn("Outcome: PASS", result.stdout)
         self.assertIn("Update status: Complete", result.stdout)
         self.assertRegex(result.stdout, r"Rehearsed 0\.2\.3 to 0\.2\.4 in \d+ min \d+ s")
@@ -393,9 +395,14 @@ class ReleaseCut(unittest.TestCase):
         run = next(line for line in self.log("rehearse.log") if " run " in line)
         old = self.host / ".cache/cagents-release-rehearsal/0.2.3"
         new = self.host / ".cache/cagents-release-rehearsal/cut-0.2.4"
+        feed = self.host / ".cache/cagents-release-rehearsal/feed-0.2.4"
         self.assertEqual(run, f"{harness}/scripts/rehearse-update run --old-dir {old} --old-version 0.2.3 "
                               f"--old-installer {old}/install.sh --new-dir {new} --new-version 0.2.4 "
-                              f"--new-installer {new}/install.sh --answer yes")
+                              f"--new-installer {new}/install.sh --answer yes --ended-provider "
+                              f"--feed {feed} --empty-window")
+        # The feed the published build read offered the signed cut; it goes once the rehearsal passes.
+        self.assertIn(f"feed {feed} offers v0.2.4", self.log("rehearse-feed.log"))
+        self.assertFalse(feed.exists())
         # The cut's own bytes, not the host's store.
         self.assertEqual((new / f"cagents-0.2.4-{TARGET}.tar.gz").read_bytes(),
                          (self.root / f"bundles/0.2.4/cagents-0.2.4-{TARGET}.tar.gz").read_bytes())
@@ -433,17 +440,39 @@ class ReleaseCut(unittest.TestCase):
         commands = [line.split()[1] for line in self.log("rehearse.log")]
         self.assertEqual(commands, ["run", "cleanup", "run", "cleanup"])
 
-    def test_a_passing_rehearsal_whose_update_failed_or_was_refused_does_not_pass(self):
+    def test_a_staged_rehearsal_whose_update_failed_or_was_refused_does_not_pass(self):
         self.cut_signed()
         for status, shown in (('{"phase": "Failed"}', "Failed"),
                               ('{"phase": "Failed", "refusal": {"kind": "busy"}}', "Failed refused"),
                               ("", "absent")):
             (self.root / "rehearse-status").write_text(status)
-            result = self.release("rehearse", "0.2.4")
+            result = self.release("rehearse", "0.2.4", "--staged")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(f"Update status: {shown}\n", result.stdout)
             self.assertIn(f"in {self.root / 'cr'}", result.stderr)
             self.assertTrue((self.root / "cr/report.txt").exists())
+
+    def test_in_the_app_the_harness_judges_the_windows_not_the_published_workers_record(self):
+        # The published build's worker may record Failed for an update the
+        # cut's windows accept (#3877); the harness's verdict covers them.
+        self.cut_signed()
+        (self.root / "rehearse-status").write_text('{"phase": "Failed"}')
+        result = self.release("rehearse", "0.2.4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Update status: Failed\n", result.stdout)
+
+    def test_a_staged_rehearsal_needs_no_signature_and_runs_the_cuts_upgrade(self):
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut").returncode, 0)
+        refused = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("sign", refused.stderr)
+        result = self.release("rehearse", "0.2.4", "--staged")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Rehearsing the staged update", result.stdout)
+        run = next(line for line in self.log("rehearse.log") if " run " in line)
+        self.assertTrue(run.endswith("--answer yes --ended-provider"), run)
+        self.assertIn("--staged is for rehearse", self.release("publish", "0.2.4", "--staged").stderr)
 
     def test_a_failed_rehearsal_reports_what_regressed(self):
         self.cut_signed()

@@ -164,23 +164,30 @@ steps, each through `mise run release` (`scripts/release --help`):
      security key when it asks. Without a key, it prints the signing command
      (see [Signing](#signing)).
 2. `mise run release -- rehearse VERSION` rehearses installed cagents updating
-   from the newest published release to the cut, on the build host. It uses
-   the released commit's `scripts/rehearse-update`
+   from the newest published release to the signed cut, on the build host,
+   the way a person updates in the app. It uses the released commit's
+   `scripts/rehearse-update`
    ([Rehearsing an update](development.md#rehearsing-an-update)):
    - a private user with its own headless desktop installs the published
      release;
-   - it opens two windows and seeds chats, agents, a channel and terminals
-     with a long-lived child;
-   - it updates to the cut's archive, copied from the cut bundle, through
-     `cagents daemon upgrade`;
-   - it requires every pane, chat, agent and terminal to survive and the
-     windows to reopen.
+   - it opens three windows, one holding nothing, and seeds chats, agents, a
+     channel, terminals with a long-lived child and a chat whose provider has
+     already stopped;
+   - the published build's own updater finds the cut in a file feed made
+     from the cut bundle, checks its signature against the release keys, and
+     updates;
+   - it requires every pane, chat, agent and terminal to survive, NEW to
+     serve, the windows to reopen on NEW, and no reopened window to show
+     "Update failed" or "Update not installed".
 
-   The update must end `Complete`, with no refusal, so the reopened windows
-   report no "Update failed". A rehearsal that does not pass leaves its report,
-   records and screenshots in `/var/tmp/cr/release-VERSION` on the host, until
-   the next rehearsal of that version replaces them.
-   The in-app path through a file feed (below) needs builds that read one.
+   In the app the published build's worker writes the update's status, and a
+   worker older than the cut can record Failed for an update the cut's
+   windows accept, so the status is printed but the windows decide. With
+   `--staged` it instead runs the cut's own staged `cagents daemon upgrade`,
+   which needs no signature, and the update must end `Complete` with no
+   refusal. A rehearsal that does not pass leaves its report, records and
+   screenshots in `/var/tmp/cr/release-VERSION` on the host, until the next
+   rehearsal of that version replaces them.
 3. `mise run release -- publish VERSION` asks you to type the version, then
    runs `scripts/publish-release --push-tag`. It checks the signature against
    the keys the tag lists, the metadata against every asset, the checksums,
