@@ -265,6 +265,9 @@ pub enum Update {
         model: Option<super::ActiveModel>,
     },
     ConversationNameChanged,
+    /// A local conversation's record changed for its Work reader.
+    #[serde(skip)]
+    RecordChanged,
 }
 
 pub struct ConversationNaming {
@@ -382,6 +385,7 @@ struct Inner {
     prompt_cache: PromptCache,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
+    record_observer: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
@@ -677,6 +681,7 @@ impl LocalHandle {
         }));
         let visible = Arc::new(AtomicBool::new(false));
         let observe_next = Arc::new(AtomicBool::new(true));
+        let record_observer = spec.followed.then(|| Arc::new(AtomicBool::new(false)));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
@@ -700,6 +705,7 @@ impl LocalHandle {
             prompt_cache: prompt_cache.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
+            record_observer: record_observer.clone(),
             stop: stop.clone(),
             completed: completed.clone(),
             draining: draining.clone(),
@@ -755,6 +761,7 @@ impl LocalHandle {
                     store,
                     visible,
                     observe_next,
+                    record_observer,
                     stop,
                     detached_work: detached_work.clone(),
                     incoming,
@@ -762,6 +769,7 @@ impl LocalHandle {
                     notify,
                     resident_changed,
                     resident_dirty: false,
+                    followed_generation: spec.followed.then_some(0),
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
@@ -1420,6 +1428,10 @@ impl LocalHandle {
     /// follows the conversation without presenting it; `again` names items
     /// to serve once more. See [`store::Unread`].
     pub fn unread(&self, again: &[String]) -> Result<(store::Unread, bool), String> {
+        // Arm before reading, so a write racing this read still signals.
+        if let Some(observer) = &self.0.record_observer {
+            observer.store(true, Ordering::Release);
+        }
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let unread = store.unread(again)?;
         let busy = self.0.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
@@ -2553,6 +2565,7 @@ struct Actor {
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
+    record_observer: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     /// What teardown leaves running; see [`ActorCommand::CloseIfIdle`].
     detached_work: Arc<DetachedDecision>,
@@ -2563,6 +2576,7 @@ struct Actor {
     /// presentation and the once-per-unread-epoch output observation.
     resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
     resident_dirty: bool,
+    followed_generation: Option<u64>,
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
@@ -4265,6 +4279,13 @@ impl Actor {
             // retained actor, one process per Claude conversation.
             self.reclaim_idle_frame_buffer();
             (self.notify)(Update::PromptAvailable);
+        }
+        if let Some(previous) = &mut self.followed_generation
+            && std::mem::replace(previous, generation) != generation
+            && let Some(observer) = &self.record_observer
+            && observer.swap(false, Ordering::AcqRel)
+        {
+            (self.notify)(Update::RecordChanged);
         }
         // apply_step has installed confirmed_session before reaching here.
         self.publish_resident_metadata();

@@ -82,6 +82,8 @@ pub struct Unread {
     pub newest: Option<String>,
     /// Items asked for again that the conversation no longer has.
     pub gone: Vec<String>,
+    /// More changed items are waiting after this bounded read.
+    pub more: bool,
 }
 
 impl Store {
@@ -186,6 +188,7 @@ impl Store {
             // What does not fit is served by the next read.
             self.following.changed(&id);
         }
+        unread.more = left;
         unread.newest = self
             .db
             .prepare_cached("SELECT id FROM items ORDER BY ordinal DESC LIMIT 1")?

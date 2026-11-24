@@ -37,7 +37,10 @@ use std::{
     io,
     os::unix::fs::{FileExt as _, MetadataExt as _},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -46,7 +49,6 @@ mod tests;
 
 /// How often a watched conversation's transcript is read again.
 const TICK: Duration = Duration::from_secs(2);
-const UNWATCHED: Duration = Duration::from_secs(60 * 60);
 /// How long what was read of an unwatched conversation is kept, so coming
 /// back to it, or showing the inspector again, does not read it all again.
 const KEPT_UNWATCHED: Duration = Duration::from_secs(10 * 60);
@@ -86,6 +88,9 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 pub(super) struct Conversations {
     state: Mutex<State>,
+    /// Runtime callbacks queue the specific record after its data was stored.
+    records_changed: Mutex<BTreeSet<TerminalId>>,
+    watching: AtomicBool,
     pub(super) signal: Signal,
 }
 
@@ -230,6 +235,8 @@ struct Watched {
     /// search that found nothing is not repeated before this.
     search_after: Option<Instant>,
     searches_missed: u32,
+    record_read_at: Option<Instant>,
+    record_retry: Option<Instant>,
 }
 
 /// Where a pass found the conversation's transcript.
@@ -303,6 +310,8 @@ impl Watched {
             located_id: None,
             search_after: None,
             searches_missed: 0,
+            record_read_at: None,
+            record_retry: None,
         }
     }
 
@@ -561,8 +570,26 @@ impl Handle {
     /// Tells the conversation loop about a chat the daemon now hosts. One
     /// whose record is read is followed from the next pass rather than after
     /// the loop's idle wait.
-    pub(in crate::host) fn chat_added(&self, provider: Provider) {
+    pub(in crate::host) fn chat_added(&self, conversation: TerminalId, provider: Provider) {
         if recorded_provider(provider) {
+            self.record_changed(conversation);
+        }
+    }
+
+    pub(in crate::host) fn record_changed(&self, conversation: TerminalId) {
+        let conversations = &self.0.conversations;
+        if conversations
+            .records_changed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(conversation)
+        {
+            conversations.signal.notify();
+        }
+    }
+
+    pub(super) fn projection_changed(&self) {
+        if self.0.conversations.watching.load(Ordering::Acquire) {
             self.0.conversations.signal.notify();
         }
     }
@@ -584,33 +611,39 @@ impl Handle {
         conversation: TerminalId,
         delivery: Weak<DeliveryQueue>,
     ) -> Result<(u64, ConversationPullRequests), String> {
-        if !host
+        let provider = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .chats
-            .contains_key(&conversation)
-        {
-            return Err("No such conversation".into());
-        }
+            .get(&conversation)
+            .map(|record| record.session.launch.provider)
+            .ok_or("No such conversation")?;
         let facts = self.facts(host, conversation, true);
         let mut state = self.conversations();
         // A connection watches one conversation at a time.
         for watched in state.watched.values_mut() {
             watched.watchers.remove(&client);
         }
-        let forge_error = state.forge_error.clone();
-        let observed = state.observed.clone();
-        let branches = state.branches.clone();
-        let measured = state.measured.clone();
-        let watched = state
-            .watched
-            .entry(conversation)
-            .or_insert_with(Watched::new);
+        let State {
+            watched,
+            observed,
+            branches,
+            measured,
+            forge_error,
+            ..
+        } = &mut *state;
+        let watched = watched.entry(conversation).or_insert_with(Watched::new);
         watched.watchers.insert(client, delivery);
         watched.unwatched_since = None;
-        watched.pin_edits(facts.as_ref(), &observed, &branches);
-        let mut list = assemble(watched, facts.as_ref(), &observed, &branches, forge_error);
-        with_measured(&mut list, &measured);
+        watched.pin_edits(facts.as_ref(), observed, branches);
+        let mut list = assemble(
+            watched,
+            facts.as_ref(),
+            observed,
+            branches,
+            forge_error.clone(),
+        );
+        with_measured(&mut list, measured);
         let mut comparable = list.clone();
         comparable.generated_at_unix_ms = 0;
         if watched.sent.as_ref() != Some(&comparable) {
@@ -618,15 +651,23 @@ impl Handle {
             watched.revision += 1;
         }
         let revision = watched.revision;
+        self.0.conversations.watching.store(true, Ordering::Release);
         drop(state);
-        self.0.conversations.signal.notify();
+        if recorded_provider(provider) {
+            self.record_changed(conversation);
+        } else {
+            self.0.conversations.signal.notify();
+        }
         Ok((revision, list))
     }
 
     pub(in crate::host) fn unwatch_conversation(&self, client: ClientId) {
         let mut state = self.conversations();
         for watched in state.watched.values_mut() {
-            watched.watchers.remove(&client);
+            if watched.watchers.remove(&client).is_some() {
+                self.0.conversations.signal.notify();
+                break;
+            }
         }
     }
 
@@ -635,30 +676,32 @@ impl Handle {
             let Some(host) = self.0.host.upgrade() else {
                 break;
             };
-            let read = super::super::service::attempt("Conversation pull requests", || {
+            let delay = super::super::service::attempt("Conversation pull requests", || {
                 Ok(self.conversation_pass(&host))
             })
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, "conversation pull requests are temporarily unavailable");
-                true
+                Some(TICK)
             });
             drop(host);
-            self.0
-                .conversations
-                .signal
-                .wait(observed, if read { TICK } else { UNWATCHED });
+            self.0.conversations.signal.wait_for_change(observed, delay);
         }
     }
 
-    /// Reads every watched conversation and every followed one once,
-    /// resolves and publishes the watched ones, and reports whether it read
-    /// any, so that the loop comes back after a tick rather than its idle
-    /// wait.
-    fn conversation_pass(&self, host: &SharedHost) -> bool {
-        // A conversation whose record is read is followed whether or not
-        // anything shows it: the record serves only what changed since the
-        // last read, so an idle one costs nothing, and what a busy one did
-        // early is read before it is long past.
+    /// Reads changed records and watched transcripts, then publishes any
+    /// changed lists. Only watches, retention and incomplete record reads
+    /// can need another pass without input.
+    fn conversation_pass(&self, host: &SharedHost) -> Option<Duration> {
+        let dirty = std::mem::take(
+            &mut *self
+                .0
+                .conversations
+                .records_changed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        // A recorded conversation is followed from startup even when no
+        // window shows it, but its SQLite store is read only after a change.
         let followed = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -693,14 +736,37 @@ impl Handle {
                 .filter(|(_, watched)| !watched.watchers.is_empty())
                 .map(|(conversation, _)| *conversation)
                 .collect::<Vec<_>>();
-            let mut read = conversations.iter().copied().collect::<BTreeSet<_>>();
-            read.extend(&followed);
+            self.0
+                .conversations
+                .watching
+                .store(!conversations.is_empty(), Ordering::Release);
+            let now = Instant::now();
+            let read = state
+                .watched
+                .iter_mut()
+                .filter_map(|(id, watched)| {
+                    if followed.contains(id) {
+                        if dirty.contains(id) {
+                            // Streaming frames coalesce without slowing an idle
+                            // conversation's first new record.
+                            watched.record_retry.get_or_insert_with(|| {
+                                watched.record_read_at.map_or(now, |read| read + TICK)
+                            });
+                        }
+                        (watched.source == Source::Pending
+                            || watched.record_retry.is_some_and(|due| due <= now))
+                        .then_some(*id)
+                    } else {
+                        (!watched.watchers.is_empty()).then_some(*id)
+                    }
+                })
+                .collect::<Vec<_>>();
             (conversations, read)
         };
-        if read.is_empty() {
-            return false;
-        }
-        let mut facts = BTreeMap::new();
+        let mut facts = conversations
+            .iter()
+            .map(|id| (*id, self.facts(host, *id, true)))
+            .collect::<BTreeMap<_, _>>();
         for conversation in &read {
             let watched = conversations.contains(conversation);
             let (known, search_due) = self
@@ -717,9 +783,6 @@ impl Handle {
                 })
                 .unwrap_or_default();
             let located = locate(host, *conversation, known.as_deref(), search_due);
-            if watched {
-                facts.insert(*conversation, self.facts(host, *conversation, true));
-            }
             let (source, mut cursors, mut items) = {
                 let mut state = self.conversations();
                 let Some(watched) = state.watched.get_mut(conversation) else {
@@ -753,9 +816,9 @@ impl Handle {
             // Watching and unwatching take the same lock, so the files and
             // the record are read without it. Only this thread moves the
             // cursors.
-            let scanned = match &source {
+            let (scanned, retry) = match &source {
                 Source::Recorded => recorded(host, *conversation, &mut items),
-                _ => scan(&source, &mut cursors),
+                _ => (scan(&source, &mut cursors), false),
             };
             // Work on "the current branch" is pinned to the branch checked
             // out as it is read.
@@ -773,30 +836,43 @@ impl Handle {
             {
                 watched.files = cursors;
                 watched.items = items;
+                if source == Source::Recorded {
+                    let now = Instant::now();
+                    watched.record_read_at = Some(now);
+                    watched.record_retry = retry.then(|| now + TICK);
+                }
                 watched.apply(scanned, facts.get(conversation).and_then(Option::as_ref));
             }
         }
+        let delay = self.conversation_delay(&followed, !conversations.is_empty());
+        if conversations.is_empty() {
+            return delay;
+        }
         self.look_up(&conversations, &facts);
         self.measure(&conversations, &facts);
-        let mut state = self.conversations();
-        let observed = state.observed.clone();
-        let branches = state.branches.clone();
-        let measured = state.measured.clone();
-        let forge_error = state.forge_error.clone();
         let proof = Arc::new(
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .proof()
                 .clone(),
         );
+        let mut state = self.conversations();
+        let State {
+            watched,
+            observed,
+            branches,
+            measured,
+            forge_error,
+            ..
+        } = &mut *state;
         for conversation in conversations {
-            let Some(watched) = state.watched.get_mut(&conversation) else {
+            let Some(watched) = watched.get_mut(&conversation) else {
                 continue;
             };
             let facts = facts.get(&conversation).and_then(Option::as_ref);
-            watched.pin_edits(facts, &observed, &branches);
-            let mut list = assemble(watched, facts, &observed, &branches, forge_error.clone());
-            with_measured(&mut list, &measured);
+            watched.pin_edits(facts, observed, branches);
+            let mut list = assemble(watched, facts, observed, branches, forge_error.clone());
+            with_measured(&mut list, measured);
             let mut comparable = list.clone();
             comparable.generated_at_unix_ms = 0;
             if watched.sent.as_ref() == Some(&comparable) {
@@ -821,7 +897,31 @@ impl Handle {
                     .is_ok()
             });
         }
-        true
+        delay
+    }
+
+    fn conversation_delay(
+        &self,
+        followed: &BTreeSet<TerminalId>,
+        watching: bool,
+    ) -> Option<Duration> {
+        let state = self.conversations();
+        let next = state
+            .watched
+            .iter()
+            .filter_map(|(id, watched)| {
+                if followed.contains(id) {
+                    watched.record_retry
+                } else {
+                    watched.unwatched_since.map(|since| since + KEPT_UNWATCHED)
+                }
+            })
+            .min();
+        // Watched conversations also refresh unresolved forge references.
+        next.map(|due| due.saturating_duration_since(Instant::now()))
+            .into_iter()
+            .chain(watching.then_some(TICK))
+            .min()
     }
 
     /// The board's facts for a conversation's directory. Watching a
@@ -1665,7 +1765,7 @@ fn read(watched: &mut Watched) {
 /// Reads what cagents' own record of the conversation gained since the last
 /// pass. Only the conversation's handle is taken under the host's lock; the
 /// record is read without it.
-fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> Scanned {
+fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> (Scanned, bool) {
     let handle = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1673,16 +1773,26 @@ fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> S
         .get(&conversation)
         .map(|record| record.handle.clone());
     let mut found = Vec::new();
-    match handle.map(|handle| handle.unread(&items.again())) {
-        Some(Ok((unread, busy))) => items.read(unread, busy, &mut found),
-        Some(Err(error)) => items.failed(error),
+    let retry = match handle.map(|handle| handle.unread(&items.again())) {
+        Some(Ok((unread, busy))) => {
+            let more = unread.more;
+            items.read(unread, busy, &mut found);
+            more
+        }
+        Some(Err(error)) => {
+            items.failed(error);
+            true
+        }
         // Gone: what was read stays as it was.
-        None => {}
-    }
-    Scanned {
-        found,
-        coverage: items.coverage(),
-    }
+        None => false,
+    };
+    (
+        Scanned {
+            found,
+            coverage: items.coverage(),
+        },
+        retry,
+    )
 }
 
 /// Whether cagents' own record of `provider`'s conversations is read for

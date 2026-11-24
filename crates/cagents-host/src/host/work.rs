@@ -126,13 +126,24 @@ impl Signal {
     }
 
     fn wait(&self, observed: u64, timeout: Duration) {
+        self.wait_for_change(observed, Some(timeout));
+    }
+
+    fn wait_for_change(&self, observed: u64, timeout: Option<Duration>) {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = self
-            .changed
-            .wait_timeout_while(state, timeout, |state| {
-                !state.stopped && state.generation == observed
-            })
-            .unwrap_or_else(|p| p.into_inner());
+        let unchanged = |state: &mut SignalState| !state.stopped && state.generation == observed;
+        if let Some(timeout) = timeout {
+            let _ = self
+                .changed
+                .wait_timeout_while(state, timeout, unchanged)
+                .unwrap_or_else(|p| p.into_inner());
+        } else {
+            drop(
+                self.changed
+                    .wait_while(state, unchanged)
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+        }
     }
 }
 
@@ -1321,8 +1332,10 @@ impl Handle {
 
     pub(super) fn unwatch(&self, client: ClientId) {
         let mut publication = self.publication();
-        publication.watchers.remove(&client);
-        self.shared().set_watching(!publication.watchers.is_empty());
+        if publication.watchers.remove(&client).is_none() || !publication.watchers.is_empty() {
+            return;
+        }
+        self.shared().set_watching(false);
         drop(publication);
         self.0.forge.notify();
     }
@@ -1336,6 +1349,7 @@ impl Handle {
     fn changed(&self) {
         self.0.updated.notify_all();
         self.0.publisher.notify();
+        self.projection_changed();
     }
 
     fn publish_loop(&self) {
@@ -1898,6 +1912,7 @@ impl Scanner {
         drop(shared);
         if !unchanged {
             handle.0.publisher.notify();
+            handle.projection_changed();
         }
     }
 
@@ -2546,6 +2561,14 @@ mod tests {
     #[test]
     fn non_utf8_branch_preserves_refreshed_work_cards() {
         non_utf8_branch_work_cards(true);
+    }
+
+    #[test]
+    fn disconnecting_an_unrelated_client_does_not_wake_the_forge() {
+        let handle = polling_handle();
+        let generation = handle.0.forge.observe();
+        handle.unwatch(1);
+        assert_eq!(handle.0.forge.observe(), generation);
     }
 
     #[test]

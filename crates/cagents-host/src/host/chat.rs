@@ -598,6 +598,12 @@ fn changed_for_instance(
     }) {
         return;
     }
+    if matches!(update, Update::RecordChanged) {
+        if let Some(work) = &state.work {
+            work.record_changed(id);
+        }
+        return;
+    }
     let proof = state.proof().clone();
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind.

@@ -499,7 +499,7 @@ impl HostState {
     /// Publishes metadata from the chat `id`, just put in `chats`.
     pub(super) fn chat_added(&self, id: TerminalId) {
         if let (Some(work), Some(record)) = (&self.work, self.chats.get(&id)) {
-            work.chat_added(record.session.launch.provider);
+            work.chat_added(id, record.session.launch.provider);
         }
         if let Some(titles) = &self.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));

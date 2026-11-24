@@ -1114,7 +1114,7 @@ fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_
 /// installs one, and tells the Work tracker.
 fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> TerminalId {
     use crate::chat::{
-        self, Command, Event,
+        self, Command, Event, Item, ItemContent, Phase, Role,
         protocol::{Adapter, ProcessSpec, Step, TransportSpec},
     };
     struct Idle;
@@ -1122,8 +1122,24 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step::default())
         }
-        fn command(&mut self, _: Command) -> Result<Step, String> {
-            Ok(Step::default())
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            let Command::SetModel { model: text, .. } = command else {
+                return Ok(Step::default());
+            };
+            Ok(Step {
+                events: vec![Event::Item(Item {
+                    id: "extra".into(),
+                    role: Role::Assistant,
+                    content: ItemContent::Text {
+                        text,
+                        thinking: false,
+                        phase: Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })],
+                ..Step::default()
+            })
         }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
@@ -1147,9 +1163,14 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
         ..Step::default()
     };
     let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
-    let handle =
-        chat::runtime::Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
     let id = TerminalId::new();
+    let execution_instance = uuid::Uuid::new_v4();
+    let owner = Arc::downgrade(host);
+    let handle =
+        chat::runtime::Handle::start(spec, Box::new(Idle), initial, store, None, move |update| {
+            crate::host::chat::changed_owned(&owner, id, execution_instance, update);
+        })
+        .unwrap();
     let mut state = host.lock().unwrap();
     let session = chat::Session {
         id,
@@ -1167,7 +1188,7 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
     state.chats.insert(
         id,
         crate::host::chat::Record {
-            execution_instance: uuid::Uuid::new_v4(),
+            execution_instance,
             console_recipe: None,
             paired_terminal: None,
             session,
@@ -1198,9 +1219,9 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     host.lock().unwrap().work = Some(work.clone());
     let signal = &work.0.conversations.signal;
 
-    // Nothing to read: the loop would wait for its idle interval.
+    // Nothing to read: the loop would wait for input.
     let observed = signal.observe().unwrap();
-    assert!(!work.conversation_pass(&host));
+    assert_eq!(work.conversation_pass(&host), None);
 
     let id = host_recorded_chat(
         &host,
@@ -1226,13 +1247,30 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     assert_ne!(signal.observe(), Some(observed));
 
     // Followed with no watcher, and read from its start.
-    assert!(work.conversation_pass(&host));
-    let state = work.conversations();
-    let watched = &state.watched[&id];
-    assert!(watched.watchers.is_empty());
-    assert_eq!(numbers(watched), [1]);
-    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
-    drop(state);
+    assert_eq!(work.conversation_pass(&host), None);
+    {
+        let mut state = work.conversations();
+        let watched = state.watched.get_mut(&id).unwrap();
+        assert!(watched.watchers.is_empty());
+        assert_eq!(numbers(watched), [1]);
+        assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+        watched.record_read_at = Some(Instant::now() - TICK);
+    }
+
+    // A daemon-origin command writes a record without provider output or
+    // visible presentation. The next record read is triggered by that write.
+    let observed = signal.observe().unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    handle
+        .command(crate::chat::Command::SetModel {
+            model: "https://github.com/me/repo/pull/2".into(),
+            reasoning: None,
+        })
+        .unwrap();
+    assert_ne!(signal.observe(), Some(observed));
+    assert_eq!(work.conversation_pass(&host), None);
+    assert_eq!(numbers(&work.conversations().watched[&id]), [1, 2]);
+
     let record = host.lock().unwrap().chats.remove(&id).unwrap();
     let _ = record.handle.close();
 }
