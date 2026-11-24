@@ -6403,20 +6403,25 @@ impl Runtime {
             self.figures.version().hash(hasher);
         }
         // An agent's report says how the agent stands now, so it tracks that
-        // agent, and which agent its sender names. Nothing else a delivery
-        // says depends on either.
+        // agent, and which agent its sender names. A heading that names its
+        // sender as this conversation lists it changes when the listing does.
+        // Nothing else a delivery says depends on either.
         if let ItemContent::Delivery {
             from,
             sender,
             summary,
             ..
         } = &item.content
-            && delivery_names_agent(from, sender, summary)
+            && from.is_empty()
+            && !sender.is_empty()
         {
-            if let Some(agent) = self.subagent(sender) {
-                self.hash_agent_state(agent, hasher);
+            if delivery_names_agent(from, sender, summary) {
+                if let Some(agent) = self.subagent(sender) {
+                    self.hash_agent_state(agent, hasher);
+                }
+                std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
             }
-            std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
+            self.listed_agent_name(sender).hash(hasher);
         }
         // A coordinating step names agents by what this conversation calls
         // them, links their transcripts while it lists them, tells how those
@@ -7386,17 +7391,25 @@ impl Runtime {
         .into()
     }
 
-    /// A delivery's heading as the person reads it. A sender the provider
-    /// addresses only by a task or agent ID, with no summary to describe it,
-    /// is named as this conversation lists that agent, or else as another
-    /// agent: the ID itself means nothing to the person and is never shown.
-    fn delivery_heading(
+    /// A delivery's heading as the person reads it, which its row, tooltip
+    /// and Copy all say. A summary that only repeats the body is left out.
+    /// A sender the provider addresses only by a task or agent ID, with no
+    /// summary to describe it, is named as this conversation lists that
+    /// agent, or else as another agent: the ID itself means nothing to the
+    /// person and is never shown.
+    pub(super) fn delivery_heading(
         &self,
         kind: chat::DeliveryKind,
         from: &str,
         sender: &str,
         summary: &str,
+        body: &str,
     ) -> String {
+        let summary = if !body.is_empty() && body.trim() == summary.trim() {
+            ""
+        } else {
+            summary
+        };
         if from.is_empty() && summary.is_empty() && !sender.is_empty() {
             let name = self.listed_agent_name(sender);
             return chat::delivery_heading(kind, name.as_deref().unwrap_or_default(), "", "");
@@ -7537,18 +7550,7 @@ impl Runtime {
             None
         };
         let heading = notice.map_or_else(
-            || {
-                self.delivery_heading(
-                    *kind,
-                    from,
-                    sender,
-                    if !body.is_empty() && body.trim() == summary.trim() {
-                        ""
-                    } else {
-                        summary
-                    },
-                )
-            },
+            || self.delivery_heading(*kind, from, sender, summary, body),
             |notice| notice.summary.plain().to_string(),
         );
         let (first, remainder) = heading
@@ -7694,16 +7696,7 @@ impl Runtime {
             };
             (delivery_has_body(Some(notice), body, ""), notice.body.long)
         } else {
-            let heading = self.delivery_heading(
-                *kind,
-                from,
-                sender,
-                if !body.is_empty() && body.trim() == summary.trim() {
-                    ""
-                } else {
-                    summary
-                },
-            );
+            let heading = self.delivery_heading(*kind, from, sender, summary, body);
             let remainder = heading
                 .split_once(['\r', '\n'])
                 .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));

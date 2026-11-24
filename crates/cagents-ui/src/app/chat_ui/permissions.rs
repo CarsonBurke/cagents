@@ -347,8 +347,6 @@ impl Runtime {
         permissions_surface(content, width, target.card)
     }
 
-    /// A blocked call's input as lines to read; the retry draft keeps the
-    /// exact JSON, so authorizing a retry loses nothing.
     /// The subagent a block stopped, as its tab names it. The provider
     /// addresses it by an ID, which is not a name the person knows.
     pub(super) fn denial_agent(&self, agent: &str) -> String {
@@ -358,6 +356,8 @@ impl Runtime {
         }
     }
 
+    /// A blocked call's input as lines to read; the retry draft keeps the
+    /// exact JSON, so authorizing a retry loses nothing.
     pub(super) fn denial_input(&self, id: &str, input: &str) -> Arc<str> {
         self.denial_inputs
             .borrow_mut()

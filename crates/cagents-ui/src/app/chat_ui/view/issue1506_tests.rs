@@ -353,7 +353,9 @@ fn large_diagnostic_preview_and_find_are_bounded_while_full_copy_keeps_exact_sou
         Some(raw.as_str())
     );
     assert_eq!(
-        copy_text(CopyPart::Text, &runtime.snapshot.items[0].content).unwrap(),
+        runtime
+            .item_copy_text(CopyPart::Text, &runtime.snapshot.items[0].content)
+            .unwrap(),
         format!("Provider request failed\n\n{raw}")
     );
     assert!(
@@ -1572,7 +1574,9 @@ fn expanded_diagnostic_preview_and_copy_follow_changed_sources_with_the_same_key
                 Some(raw_before.as_str())
             );
             assert_eq!(
-                copy_text(CopyPart::Text, &runtime.snapshot.items[0].content).unwrap(),
+                runtime
+                    .item_copy_text(CopyPart::Text, &runtime.snapshot.items[0].content)
+                    .unwrap(),
                 format!("Provider request failed\n\n{raw_after}")
             );
         }
@@ -1706,6 +1710,31 @@ fn message_copy_action(runtime: &Runtime, id: &str) -> Action {
     action
 }
 
+/// What a copy task writes to the clipboard.
+fn clipboard_write(copy: Task<Message>) -> String {
+    use iced::futures::StreamExt;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut effects = iced::runtime::task::into_stream(copy).expect("actual Copy action");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::Write { contents, .. },
+                    ) = effect
+                    {
+                        return contents;
+                    }
+                }
+                panic!("the message's Copy must write to the clipboard");
+            })
+            .await
+            .expect("bounded clipboard effect")
+        })
+}
+
 /// No bespoke copy button sits in a delivery's body: copying is the
 /// message's own Copy, among its actions.
 fn assert_no_body_copy_button(surface: &ReportSurface) {
@@ -1732,7 +1761,6 @@ fn assert_no_sender_address(surface: &ReportSurface, address: &str) {
 
 #[test]
 fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy() {
-    use iced::futures::StreamExt;
     let long_name =
         "Review implementation and ownership with a deliberately long task name ".repeat(8);
     for (outcome, body) in [
@@ -1822,28 +1850,7 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-        let copy = app.handle_chat_ui(copy);
-        let copied = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut effects =
-                    iced::runtime::task::into_stream(copy).expect("actual Copy action");
-                tokio::time::timeout(Duration::from_secs(1), async {
-                    while let Some(effect) = effects.next().await {
-                        if let iced::runtime::Action::Clipboard(
-                            iced::runtime::clipboard::Action::Write { contents, .. },
-                        ) = effect
-                        {
-                            return contents;
-                        }
-                    }
-                    panic!("the message's Copy must publish the original bytes");
-                })
-                .await
-                .expect("bounded clipboard effect")
-            });
+        let copied = clipboard_write(app.handle_chat_ui(copy));
         assert_eq!(copied, format!("{heading}\n\n{body}"));
         let live = app.chat_runtime_mut(target).unwrap();
         assert!(Arc::ptr_eq(&original, &live.snapshot.items[0]));
@@ -1860,14 +1867,12 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
 /// reserves the room for them in the transcript and in an agent's.
 #[test]
 fn a_delivery_that_cannot_open_keeps_its_copy_and_time() {
-    let mut quiet = task_report(
+    // Its sender's address is no detail to open: only a body is.
+    let quiet = task_report(
         "quiet-report",
         "Agent \"Quiet\" finished".into(),
         String::new(),
     );
-    if let ItemContent::Delivery { sender, .. } = &mut quiet.content {
-        sender.clear();
-    }
     let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&quiet));
     let surface = report_surface(&runtime, "quiet-report");
     assert!(
@@ -2051,7 +2056,7 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
                 live.active_item("disclosed-report").unwrap()
             ));
             assert_eq!(
-                copy_text(CopyPart::Text, &original.content),
+                live.item_copy_text(CopyPart::Text, &original.content),
                 Some(format!("{heading}\n\n{body}"))
             );
         }
@@ -2244,6 +2249,15 @@ fn a_report_without_a_summary_names_its_agent_not_its_id() {
         surface.text
     );
     assert_no_sender_address(&surface, &SENDER[..8]);
+    // The row's fingerprint, which must change once its heading does.
+    let print = |runtime: &Runtime| {
+        use std::hash::Hasher;
+        let mut hasher = crate::fingerprint::hasher();
+        let cached = runtime.cache.get("unsummarized");
+        runtime.hash_turn_item(0, cached, None, None, &mut hasher);
+        hasher.finish()
+    };
+    let unlisted = print(&runtime);
 
     let mut snapshot = runtime.snapshot.as_ref().clone();
     snapshot.generation += 1;
@@ -2256,6 +2270,11 @@ fn a_report_without_a_summary_names_its_agent_not_its_id() {
         .listed_agent_name(SENDER)
         .expect("the agent is listed");
     assert!(!named.contains(&SENDER[..8]), "{named}");
+    assert_ne!(
+        unlisted,
+        print(&runtime),
+        "a row that names its agent redraws once the agent is listed"
+    );
     let surface = report_surface(&runtime, "unsummarized");
     assert!(
         surface
@@ -2266,6 +2285,16 @@ fn a_report_without_a_summary_names_its_agent_not_its_id() {
         surface.text
     );
     assert_no_sender_address(&surface, &SENDER[..8]);
+    // Copy says it as the row does: by the agent's name, not its ID.
+    let target = runtime.target;
+    let copy = message_copy_action(&runtime, "unsummarized");
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.cards
+        .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    assert_eq!(
+        clipboard_write(app.handle_chat_ui(copy)),
+        format!("Report from {named}\n\nDone.")
+    );
 }
 
 #[test]
@@ -2331,8 +2360,8 @@ fn report_async_disclosure_closes_without_resurrection_from_queued_preparation()
     assert!(!cached.blocks.is_empty());
     assert_eq!(cached.report_expanded, Some(true));
     assert_eq!(
-        copy_text(CopyPart::Text, &report.content),
-        copy_text(
+        live.item_copy_text(CopyPart::Text, &report.content),
+        live.item_copy_text(
             CopyPart::Text,
             &live.active_item("queued-report").unwrap().content
         )
@@ -2409,8 +2438,8 @@ fn busy_report_ready_and_collapse_release_actual_worker_canonical_and_palette() 
             "actual shared syntax highlighting must be released"
         );
         assert_eq!(
-            copy_text(CopyPart::Text, &report.content),
-            copy_text(
+            live.item_copy_text(CopyPart::Text, &report.content),
+            live.item_copy_text(
                 CopyPart::Text,
                 &live.active_item("busy-report").unwrap().content
             ),
@@ -2449,11 +2478,11 @@ fn busy_report_ready_and_collapse_release_actual_worker_canonical_and_palette() 
                 .any(|text| text.contains("NEW_REPORT_SOURCE_AFTER_CLOSE"))
         );
         assert_eq!(
-            copy_text(
+            live.item_copy_text(
                 CopyPart::Text,
                 &live.active_item("busy-report").unwrap().content
             ),
-            copy_text(CopyPart::Text, &replacement.content)
+            live.item_copy_text(CopyPart::Text, &replacement.content)
         );
     }
 }
