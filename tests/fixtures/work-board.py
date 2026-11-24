@@ -183,7 +183,9 @@ def special_cards(projects):
             path = proration / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("// proration, in progress\n")
-            os.utime(path, (NOW - 20 * HOUR, NOW - 20 * HOUR))
+            # Untracked directories count as changed, by their own times.
+            for changed in (path, path.parent):
+                os.utime(changed, (NOW - 20 * HOUR, NOW - 20 * HOUR))
         git(billing, "worktree", "add", "--quiet", "--detach",
             str(billing / ".worktrees" / "invoice-bisect"), "main")
         checkout(journal, "feat/offline-mode", NOW - 6 * HOUR)
