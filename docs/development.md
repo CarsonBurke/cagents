@@ -936,6 +936,10 @@ failing test with its output and each lane's command, and comments when a later
 commit passes. A lane that stops with a status other than Cargo's 101, such as
 the disk guard's refusal or a kill, says nothing about the code: it keeps no
 verdict, opens no issue, and the commit is tested again 30 minutes later.
+The same goes for a lane whose test fixtures refused their temporary root
+because of a `.git` outside the checkout, such as a stray `/var/tmp/.git`.
+That fails every fixture test in every lane, whatever the commit. The
+sentinel's log names the marker to remove.
 
 `scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
 commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a

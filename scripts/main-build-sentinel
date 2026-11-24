@@ -83,6 +83,10 @@ TEST_THREADS = {"ui": "2", "browser": "2"}
 # status, such as the disk guard's refusal or a kill, says nothing about the
 # commit, so it leaves no verdict and the lane is tested again.
 CODE_FAILURE = 101
+# The test fixtures refuse a temporary root under a Git checkout. A `.git`
+# that another process leaves above the shared root, such as /var/tmp/.git,
+# fails every fixture test in every lane, which says nothing about the code.
+STRAY_GIT_MARKER = re.compile(r"unsafe test fixture root (/\S*): enclosing Git marker (/\S*) exists")
 # A caller's test variables would change what the lanes test.
 TEST_ENVIRONMENT_IGNORED = re.compile(r"CAGENTS_TEST_|RUST_TEST_|RUSTFLAGS$|RUSTDOCFLAGS$|CARGO_PROFILE_"
                                       r"|CARGO_BUILD_RUSTFLAGS$|CARGO_ENCODED_RUSTFLAGS$|CARGO_INCREMENTAL$")
@@ -446,6 +450,19 @@ def test_environment(lane):
     return environment
 
 
+def stray_git_marker(log, checkout):
+    """The `.git` outside the checkout that the fixtures refused to test
+    under, from a lane's log, or None."""
+    with contextlib.suppress(OSError), log.open(errors="replace") as lines:
+        for line in lines:
+            if "enclosing Git marker" not in line:
+                continue
+            found = STRAY_GIT_MARKER.search(line)
+            if found and not Path(found[2]).is_relative_to(checkout):
+                return found[2]
+    return None
+
+
 def test_commit(repository, directory, sha):
     """Runs each test lane the commit has, in the sentinel's worktree, and
     returns the verdict: passed only when every lane's tests ran and passed.
@@ -460,11 +477,17 @@ def test_commit(repository, directory, sha):
         print(f"main-build-sentinel: {sha} test {lane}", flush=True)
         started = time.monotonic()
         command = test_command(lane, packages)
-        with (directory / "logs" / f"{sha}-test-{lane}.log").open("w") as log:
+        path = directory / "logs" / f"{sha}-test-{lane}.log"
+        with path.open("w") as log:
             status = subprocess.run([str(checkout / command[0]), *command[1:]], cwd=checkout,
                                     env=test_environment(lane), stdout=log,
                                     stderr=subprocess.STDOUT).returncode
         lanes[lane] = {"status": status, "seconds": round(time.monotonic() - started)}
+        marker = stray_git_marker(path, checkout) if status == CODE_FAILURE else None
+        if marker:
+            lanes[lane]["stray_git_marker"] = marker
+            print(f"main-build-sentinel: {sha} {lane}: the test fixtures refused to run under "
+                  f"{marker}, which something outside the code left; remove it", flush=True)
     # A test that leaves files in the checkout must not stop later checks.
     changed = git(checkout, "status", "--porcelain", "--untracked-files=all")
     if changed:
@@ -473,7 +496,8 @@ def test_commit(repository, directory, sha):
         git(checkout, "clean", "--quiet", "-fd")
     verdict = {"sha": sha, "passed": all(entry["status"] == 0 for entry in lanes.values()),
                "lanes": lanes, "finished": time.time()}
-    outside = [lane for lane, entry in lanes.items() if entry["status"] not in (0, CODE_FAILURE)]
+    outside = [lane for lane, entry in lanes.items()
+               if entry["status"] not in (0, CODE_FAILURE) or entry.get("stray_git_marker")]
     if outside:
         verdict["outside_code"] = outside
         print(f"main-build-sentinel: {sha} {', '.join(outside)} stopped outside the code; "

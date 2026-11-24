@@ -54,6 +54,13 @@ if sys.argv[1] == 'test':
     if Path('refused-' + lane).exists():
         print('build-disk-guard: not enough space')
         sys.exit(2)
+    if Path('stray-git-' + lane).exists():
+        marker = Path('stray-git-' + lane).read_text().strip()
+        print('test fixture_test ... FAILED')
+        print('called `Result::unwrap()` on an `Err` value: Custom { kind: Other, error: unsafe test fixture '
+              f'root {os.path.dirname(marker)}: enclosing Git marker {marker} exists; set TMPDIR to an existing '
+              'writable directory }')
+        sys.exit(101)
     print('     Running unittests src/lib.rs')
     print('running 400 tests')
     for index in range(400):
@@ -659,6 +666,25 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         verdict = sentinel.require_tests(self.repo, self.state, refused)
         self.assertEqual(verdict["outside_code"], ["host"])
         self.assertFalse((self.state / "verdicts" / f"{refused}.json").exists())
+
+    def test_fixtures_refusing_a_stray_git_marker_keep_no_verdict_unless_it_is_in_the_checkout(self):
+        self.tick()
+        (self.origin / "stray-git-host").write_text("/var/tmp/.git\n")
+        refused = self.commit("merge while /var/tmp/.git exists")
+        self.now += 120
+        self.tick()
+        self.assertFalse((self.state / "verdicts" / f"{refused}.json").exists())
+        self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+        verdict = sentinel.require_tests(self.repo, self.state, refused)
+        self.assertEqual(verdict["outside_code"], ["host"])
+        self.assertEqual(verdict["lanes"]["host"]["stray_git_marker"], "/var/tmp/.git")
+        # A marker inside the checkout is the code's own doing: a failure.
+        checkout = self.repo / ".worktrees" / "main-build-sentinel"
+        (self.origin / "stray-git-host").write_text(f"{checkout}/target/.git\n")
+        own = self.commit("a test that makes a checkout its own temporary root")
+        verdict = sentinel.require_tests(self.repo, self.state, own)
+        self.assertNotIn("outside_code", verdict)
+        self.assertFalse(verdict["passed"])
 
     def test_a_removed_verdict_is_tested_again_by_the_watcher(self):
         self.tick()
