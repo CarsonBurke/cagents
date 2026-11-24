@@ -11,6 +11,9 @@ TARGET=x86_64-unknown-linux-gnu
 VERSION=
 VERIFY_ONLY=false
 PUSH_TAG=false
+DRAFT=false
+DIST_SET=
+PROMOTE=
 SMOKE_ROOTFS=
 BRIDGE_DIR=
 export LC_ALL=C
@@ -22,11 +25,16 @@ fail() {
 
 usage() {
     printf '%s\n' \
-        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--smoke-rootfs DIR] [--bridge DIR] [--verify-only | --push-tag]' \
+        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--smoke-rootfs DIR] [--bridge DIR] [--verify-only | --push-tag | --draft]' \
+        '       scripts/publish-release --version VERSION --promote SHA256 [--bridge DIR]' \
         'Validate an existing local bundle and publish it through authenticated gh.' \
+        '--draft uploads and verifies it as a draft release, and publishes nothing.' \
+        "--promote SHA256 publishes VERSION's existing draft, uploading nothing: it downloads the draft, verifies it" \
+        "again as a bundle, and requires its own trust generation's metadata to have the SHA-256 digest SHA256," \
+        'which a passing rehearsal of the draft records.' \
         'Defaults: version from Cargo manifests; dist from CAGENTS_DIST_DIR or checkout/dist.' \
         '--verify-only validates local files and the local tag without network access.' \
-        'Both modes install/run/remove artifacts in private offline rootfs copies before publication.' \
+        'Every mode but --promote, whose draft was smoke-tested before it was left, installs/runs/removes artifacts in private offline rootfs copies first.' \
         '--smoke-rootfs overrides the runtime image prepared by the local release builder.' \
         "Older trust generations' metadata names carry the metadata of the release that began the next generation:" \
         '--verify-only reads those files, as published, from --bridge DIR; publication downloads them and compares any --bridge.' \
@@ -38,22 +46,29 @@ usage() {
 
 while (($#)); do
     case $1 in
-        --version|--dist|--smoke-rootfs|--bridge)
+        --version|--dist|--smoke-rootfs|--bridge|--promote)
             (($# >= 2)) || fail "missing value for $1"
             [[ -n $2 ]] || fail "empty value for $1"
             case $1 in
-                --version) VERSION=$2 ;; --dist) DIST_DIR=$2 ;; --smoke-rootfs) SMOKE_ROOTFS=$2 ;;
-                --bridge) BRIDGE_DIR=$2 ;;
+                --version) VERSION=$2 ;; --dist) DIST_DIR=$2; DIST_SET=true ;; --smoke-rootfs) SMOKE_ROOTFS=$2 ;;
+                --bridge) BRIDGE_DIR=$2 ;; --promote) PROMOTE=$2 ;;
             esac
             shift 2
             ;;
         --verify-only) VERIFY_ONLY=true; shift ;;
         --push-tag) PUSH_TAG=true; shift ;;
+        --draft) DRAFT=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
 done
 ! { "$VERIFY_ONLY" && "$PUSH_TAG"; } || fail '--verify-only does not push; drop --push-tag'
+! { "$VERIFY_ONLY" && "$DRAFT"; } || fail '--verify-only uploads nothing; drop --draft'
+if [[ -n $PROMOTE ]]; then
+    [[ $PROMOTE =~ ^[0-9a-f]{64}$ ]] || fail '--promote takes the SHA-256 of the rehearsed metadata'
+    ! "$VERIFY_ONLY" && ! "$PUSH_TAG" && ! "$DRAFT" && [[ -z $SMOKE_ROOTFS && -z $DIST_SET ]] \
+        || fail '--promote publishes the draft on GitHub; it takes no --dist, --smoke-rootfs, --verify-only, --push-tag or --draft'
+fi
 
 for command in git jq sed sort sha256sum tar mktemp cp cmp ssh-keygen; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
@@ -427,11 +442,47 @@ check_bridge() {
     done
 }
 
-check_asset_set "$DIST_DIR"
+# A bundle is checked before anything is made for it; promotion makes it
+# from the draft.
+[[ -n $PROMOTE ]] || check_asset_set "$DIST_DIR"
 WORK_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/cagents-publish.XXXXXX")
 cleanup() { rm -rf -- "$WORK_DIR"; }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+
+# The draft's assets, which promotion publishes, by name, id, size and upload
+# time: promotion refuses if any changes after it downloaded them.
+draft_assets() {
+    jq -c '[.assets[] | {name, id, size, updated_at}] | sort_by(.name)' <<< "$1"
+}
+
+if [[ -n $PROMOTE ]]; then
+    # Promotion publishes the draft the release workflow left, which it reads
+    # back as the bundle it was made from and verifies again from the start.
+    command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
+    export GH_HOST=github.com GH_PROMPT_DISABLED=1
+    unset GH_DEBUG
+    draft=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
+        jq -sce --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("not one release") end') \
+        || fail "there is no one release of $TAG to publish; the release workflow leaves it as a draft"
+    jq -e '.draft == true' <<< "$draft" >/dev/null || fail "$TAG is published already"
+    DRAFT_ASSETS=$(draft_assets "$draft")
+    mkdir "$WORK_DIR/draft"
+    gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/draft" \
+        || fail "cannot download the draft of $TAG"
+    check_asset_set "$WORK_DIR/draft" --published
+    rehearsed=$(sha256sum "$WORK_DIR/draft/$OWN_METADATA")
+    rehearsed=${rehearsed%% *}
+    [[ $rehearsed == "$PROMOTE" ]] \
+        || fail "the draft of $TAG is not what was rehearsed: its $OWN_METADATA has SHA-256 $rehearsed, the rehearsal's $PROMOTE; rehearse the draft: scripts/release rehearse $VERSION --from-draft"
+    mkdir "$WORK_DIR/from-draft"
+    for asset in "${PAYLOADS[@]}" SHA256SUMS; do
+        cp -- "$WORK_DIR/draft/$asset" "$WORK_DIR/from-draft/$asset"
+    done
+    cp -- "$WORK_DIR/draft/$OWN_METADATA" "$WORK_DIR/from-draft/release-metadata.json"
+    cp -- "$WORK_DIR/draft/$OWN_METADATA.sig" "$WORK_DIR/from-draft/release-metadata.json.sig"
+    DIST_DIR=$WORK_DIR/from-draft
+fi
 
 # A private snapshot keeps uploads and comparisons bound to the bytes validated here.
 mkdir "$WORK_DIR/bundle"
@@ -445,9 +496,11 @@ check_metadata "$DIST_DIR"
 check_archive "$DIST_DIR" "$FULL_ARCHIVE" cagents dev.cagents.Cagents
 check_archive "$DIST_DIR" "$BROWSERLESS_ARCHIVE" cagents-browserless dev.cagents.Cagents.Browserless
 check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
-smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
-if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
-"$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
+if [[ -z $PROMOTE ]]; then
+    smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
+    if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
+    "$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
+fi
 
 # What builds of older generations read under their names: the first release
 # of the generation after theirs, which may be this one.
@@ -609,6 +662,7 @@ assert_owned_draft() {
 
 releases=$(release_for_tag)
 if [[ $(jq 'length' <<< "$releases") == 0 ]]; then
+    [[ -z $PROMOTE ]] || fail "the draft of $TAG is gone"
     # Use the creation response: the releases listing can lag behind this write.
     release=$(gh api --hostname github.com --method POST "repos/$REPOSITORY/releases" \
         -f "tag_name=$TAG" -f "name=cagents and ceditor $TAG" \
@@ -636,17 +690,25 @@ assert_current_draft() {
     assert_owned_draft "$current"
 }
 assert_current_draft
-upload_assets=()
-for asset in "${ASSETS[@]}"; do upload_assets+=("$WORK_DIR/upload/$asset"); done
-gh release upload "$TAG" "${upload_assets[@]}" --repo "$REPOSITORY" --clobber
+if [[ -z $PROMOTE ]]; then
+    upload_assets=()
+    for asset in "${ASSETS[@]}"; do upload_assets+=("$WORK_DIR/upload/$asset"); done
+    gh release upload "$TAG" "${upload_assets[@]}" --repo "$REPOSITORY" --clobber
 
-release=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
-assert_owned_draft "$release"
-actual_assets=$(jq -r '.assets[].name' <<< "$release" | sort)
-[[ $actual_assets == "$EXPECTED_ASSETS" ]] || fail 'refusing to publish: uploaded assets do not match the exact expected set'
-mkdir "$WORK_DIR/downloaded"
-# gh uses authentication for private repositories and draft asset downloads.
-gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/downloaded"
+    release=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
+    assert_owned_draft "$release"
+    actual_assets=$(jq -r '.assets[].name' <<< "$release" | sort)
+    [[ $actual_assets == "$EXPECTED_ASSETS" ]] || fail 'refusing to publish: uploaded assets do not match the exact expected set'
+    mkdir "$WORK_DIR/downloaded"
+    # gh uses authentication for private repositories and draft asset downloads.
+    gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/downloaded"
+else
+    # Promotion uploads nothing: what it compares with the release as it
+    # would have uploaded it is the draft it downloaded, still unchanged.
+    [[ $(draft_assets "$release") == "$DRAFT_ASSETS" ]] \
+        || fail "the draft of $TAG changed while it was verified; run this again"
+    mv -- "$WORK_DIR/draft" "$WORK_DIR/downloaded"
+fi
 check_asset_set "$WORK_DIR/downloaded" --published
 for asset in "${ASSETS[@]}"; do
     cmp -- "$WORK_DIR/upload/$asset" "$WORK_DIR/downloaded/$asset" \
@@ -672,6 +734,18 @@ newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_
         version_after "$VERSION" "$published" || printf '%s\n' "$published"
     done)
 [[ -z $newer ]] || fail "refusing to publish $TAG: $(head -n1 <<< "$newer") is published already"
+if "$DRAFT"; then
+    printf 'Verified %s as a draft; rehearse its update, then publish it.\n' "$TAG"
+    exit 0
+fi
+if [[ -n $PROMOTE ]]; then
+    [[ $(draft_assets "$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")") == "$DRAFT_ASSETS" ]] \
+        || fail "the draft of $TAG changed while it was verified; run this again"
+fi
 gh api --hostname github.com --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
     -F draft=false --jq .html_url
-printf 'Published %s from verified local assets.\n' "$TAG"
+if [[ -n $PROMOTE ]]; then
+    printf 'Published %s from its verified, rehearsed draft.\n' "$TAG"
+else
+    printf 'Published %s from verified local assets.\n' "$TAG"
+fi

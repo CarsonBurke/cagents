@@ -1,10 +1,14 @@
 name: Release
 
-# A pushed release tag on a main commit is built, signed and published here,
-# once the release before it trusts the Actions signing key. Until then (the
-# 0.2.4 release), and for any change of trusted keys, admission says so and a
-# release is signed locally. Run by hand, it only builds the chosen commit, to
-# rehearse a release build. See docs/releasing.md#signing-in-github-actions.
+# A pushed release tag on a main commit is built and signed here, once the
+# release before it trusts the Actions signing key; until then (the 0.2.4
+# release), and for any change of trusted keys, admission says so and a
+# release is signed locally. The signed release is left as a verified draft,
+# published only once its update is rehearsed:
+#   scripts/release rehearse VERSION --from-draft
+#   scripts/release publish VERSION --actions
+# Run by hand, it only builds the chosen commit, to rehearse a release build.
+# See docs/releasing.md#signing-in-github-actions.
 on:
   push:
     tags:
@@ -122,7 +126,7 @@ jobs:
           retention-days: 1
 
   publish:
-    name: Publish the release
+    name: Leave the release as a draft
     needs: [admit, build, sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -151,7 +155,7 @@ jobs:
         with:
           name: signature
           path: /mnt/cagents/dist
-      - name: Verify everything again, then publish
+      - name: Verify everything again, then upload it as a draft
         env:
           GH_TOKEN: ${{ github.token }}
           CAGENTS_RELEASE_SMOKE_CACHE: /mnt/cagents/smoke-cache
@@ -159,4 +163,4 @@ jobs:
           VERSION: ${{ needs.admit.outputs.version }}
         run: |
           scripts/prepare-release-smoke-rootfs >/dev/null
-          scripts/publish-release --version "$VERSION" --dist /mnt/cagents/dist
+          scripts/publish-release --version "$VERSION" --dist /mnt/cagents/dist --draft

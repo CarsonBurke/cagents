@@ -151,8 +151,8 @@ smoke-tested: fw16 prebuilds main's newest compiled commit in the background
 Main always declares the next version: publishing a release opens and lands the
 pull request that starts the next patch version. A release goes out in three
 steps, each through `mise run release` (`scripts/release --help`). From 0.2.5
-on, GitHub Actions builds, signs and publishes it instead; see
-[Signing in GitHub Actions](#signing-in-github-actions).
+on, GitHub Actions builds and signs it instead, and it is published once its
+draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
 
 1. `mise run release -- cut --key KEY` picks the newest bundle of main whose
    tests passed in main's sentinel. It shows how many commits that bundle is
@@ -205,7 +205,11 @@ on, GitHub Actions builds, signs and publishes it instead; see
    host. If `/var/tmp` has a `.git` above it, such as the empty mountpoints
    a sandbox masking `.git` leaves behind, it goes in `/dev/shm/cr` instead.
    It takes about 700 MB and is removed once the rehearsal passes; the
-   report is kept in `~/.cache/cagents-release-rehearsal/passed-VERSION.txt`. If a
+   report is kept in `~/.cache/cagents-release-rehearsal/passed-VERSION.txt`,
+   headed, for the in-app update, by the SHA-256 of the metadata the update
+   read and the release it updated from; a staged pass has no such header.
+   A later rehearsal of the version removes it as soon as it starts on the
+   host, so only the latest outcome stands. If a
    `.git` appears above the root while the rehearsal runs, a failure says
    so instead of reporting it as a regression, and you rehearse again. A
    rehearsal that fails in `/var/tmp` keeps its report, records and
@@ -335,19 +339,40 @@ holder can sign updates for them until they do.
 
 ### Signing in GitHub Actions
 
-From 0.2.5 on, releases are built, signed and published by the Release
-workflow (`.github/workflows/release.yml`) with a plain `ssh-ed25519` key that
-only GitHub holds, so publishing needs no touch. The security key stays listed
-in `release-keys.pub` as the recovery key, and signs locally whatever Actions
-may not:
+From 0.2.5 on, releases are built and signed by the Release workflow
+(`.github/workflows/release.yml`) with a plain `ssh-ed25519` key that only
+GitHub holds, so releasing needs no touch. The workflow leaves the signed
+release as a draft, which is published only once its update has been
+rehearsed. The security key stays listed in `release-keys.pub` as the
+recovery key, and signs locally whatever Actions may not:
 
 1. `mise run release -- cut --actions` picks the commit as above and tags it
    `vVERSION` locally. It copies and signs nothing.
 2. `mise run release -- publish VERSION --actions` checks the tag as the
    workflow's admission will, and pushes it only if Actions would sign it.
-   That starts the workflow, and the command prints the run's page. Run it
-   again once the release is published: it then lands the next version's bump
-   as `publish` does. Until then it exits non-zero.
+   That starts the workflow, and the command prints the run's page and what
+   to run next. It exits non-zero until the release is published.
+3. Once the workflow has left the draft, `mise run release -- rehearse
+   VERSION --from-draft` rehearses the in-app update to it, as
+   [Publishing](#publishing) describes. It refuses while the tag's workflow
+   run is still going, or if it did not succeed. The build host downloads the
+   draft itself, so `gh` there must be logged in with access to the
+   repository's drafts (push access). It serves the draft in a file feed under
+   its published names, so the published build reads the same metadata names,
+   signatures and bridges it will read from GitHub. A pass records the
+   SHA-256 of the draft's own metadata, which names every file's digest, and
+   the release it updated from.
+4. `mise run release -- publish VERSION --actions` again reads that record
+   from the build host and, after you type the version (or with `--yes`),
+   runs `scripts/publish-release --promote SHA256`. It refuses if the newest
+   published release is no longer the one the rehearsal updated from. It
+   downloads the draft, repeats every check on it except the smoke install,
+   which the workflow ran, and compares what it serves under the older
+   generations' names with what the bridge release publishes. It refuses unless the draft's metadata
+   has the rehearsed digest and its assets are unchanged since it read
+   them, then publishes the draft and lands the next version's bump as
+   `publish` does. With no passing rehearsal of that draft it refuses and
+   says to rehearse it.
 
 The workflow's jobs:
 
@@ -371,9 +396,10 @@ The workflow's jobs:
   `v*` tags. It checks this run's bundle against its metadata, version and
   commit, signs the metadata in memory-backed storage, and checks the signature
   against `RELEASE_SIGNING_PUBLIC_KEY`.
-- **publish** runs `scripts/publish-release` with the workflow's token. It
-  repeats every check, including the keys of every build that reads the
-  release and the bridges it carries.
+- **publish** runs `scripts/publish-release --draft` with the workflow's
+  token. It repeats every check, including the keys of every build that reads
+  the release and the bridges it carries, uploads the release as a draft,
+  compares the bytes GitHub serves, and publishes nothing.
 
 Run by hand (`gh workflow run release.yml --ref main`), the workflow only
 builds that commit, to rehearse a release build; nothing is signed.
@@ -413,6 +439,12 @@ However it ends, it deletes `RELEASE_KEYGEN_TOKEN`. It then prints the line to
 add to `release-keys.pub`. GITHUB_TOKEN cannot write secrets, hence the
 temporary token; revoke it once the run is done. Merge that line before
 cutting 0.2.4, which the security key signs. From 0.2.5 on, Actions signs.
+
+The rehearsal record lives on the build host, which agents running as the
+same user can write, and promotion uses your own `gh` login. It stops a
+release from being published before its update was rehearsed, or with other
+bytes than were rehearsed, by mistake; like the checks above, it does not stop
+someone who can already publish on GitHub.
 
 What this does not protect against: GitHub, and whoever can administer the
 repository, are trusted. A holder of an admin or write token can push a tag
