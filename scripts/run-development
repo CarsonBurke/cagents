@@ -1430,6 +1430,9 @@ if [ -n "$instance" ] && [ "$in_session" = false ]; then
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
             niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
             ${capped:+"$capped" --name cagents-ui} "$products/cagents-ui" "$@" 9<&-
+        # Keep this shell holding the lock until start returns. Otherwise a
+        # shell may exec its final command and close the lock before launch.
+        exec 9<&-
     )
     instance_runtime=$(session_runtime "$harness_session") || instance_runtime=
     if [ -n "$instance_runtime" ] && record_owner "$instance_runtime" &&
