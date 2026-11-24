@@ -608,13 +608,7 @@ fn settings_category_controls<'a>(
         }
         SettingsCategory::NativeChat => {
             let messages = settings_group(
-                // Alone, the group is the page and takes its name; beside
-                // Dictation it is about the messages themselves.
-                if context.dictation.available {
-                    "Messages"
-                } else {
-                    "Native chat"
-                },
+                "Messages",
                 "Message composition and conversation presentation.",
                 vec![
                     crate::settings_widgets::toggle(
@@ -640,6 +634,7 @@ fn settings_category_controls<'a>(
                 ],
             );
             std::iter::once(messages)
+                .chain(std::iter::once(chat_footer_group(draft)))
                 .chain(dictation_group(draft, &context.dictation))
                 .collect()
         }
@@ -1061,6 +1056,41 @@ fn category_icon(category: SettingsCategory) -> Icon {
         SettingsCategory::Accounts => Icon::Users,
         SettingsCategory::About => Icon::Info,
     }
+}
+
+/// What a chat's footer shows, one switch per item, as its context menu
+/// offers them.
+fn chat_footer_group(draft: &SettingsDraft) -> Group<'static, Message> {
+    use settings::ChatFooterItem;
+    let toggles = ChatFooterItem::ALL
+        .into_iter()
+        .map(|item| {
+            let description = match item {
+                ChatFooterItem::Branch => "The branch the conversation works on, where the pane has room.",
+                ChatFooterItem::Account => "The account the conversation runs on, with its usage. Hidden, its shortcut still opens the account picker.",
+                ChatFooterItem::Model => "The model and its reasoning effort. Hidden, its shortcut still opens the model picker.",
+                ChatFooterItem::Permissions => "What the agent may do without asking. Hidden, its shortcut still opens the permission modes.",
+                ChatFooterItem::Context => "How much room is left before the agent auto-compacts the conversation, as a ring and a figure. Without a known context window, the token counts.",
+                ChatFooterItem::Tokens => "The tokens the conversation has read and written so far.",
+                ChatFooterItem::Cost => "What the conversation has cost so far, where its provider reports it.",
+            };
+            crate::settings_widgets::toggle(
+                item.label(),
+                description,
+                draft.chat_footer.get(&item).copied().unwrap_or(item.shown_by_default()),
+                move |shown| Message::SettingsChanged {
+                    field: SettingsField::ChatFooter(item),
+                    value: shown.to_string(),
+                },
+            )
+            .keywords(format!("chat footer status line bar composer show hide chat_footer {}", item.key()))
+        })
+        .collect();
+    settings_group(
+        "Footer",
+        "Choose what the line under a chat's message box shows. Right-click that line to change it there.",
+        toggles,
+    )
 }
 
 fn settings_icon(name: Icon) -> widget::icon::Icon {
@@ -2461,6 +2491,8 @@ fn shared_preferences_stream_inner(
                         settings.account_usage_display,
                         settings.context_usage_display,
                         settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
+                        settings::ChatFooterItem::ALL
+                            .map(|item| settings.shows_in_chat_footer(item)),
                         settings.sidebar_worktrees_when_shown,
                     );
                     if previous.as_ref() != Some(&current) {

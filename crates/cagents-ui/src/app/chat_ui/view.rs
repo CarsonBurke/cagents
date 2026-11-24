@@ -1,5 +1,6 @@
 use super::coordination::Coordinated;
 use super::*;
+use crate::settings::ChatFooterItem;
 
 #[derive(Clone, Copy)]
 enum ViewTransition {
@@ -547,6 +548,62 @@ fn composer_editor_style(
     }
 }
 
+/// What the person chose for a chat's footer to show, by
+/// [`ChatFooterItem`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) struct FooterItems([bool; ChatFooterItem::ALL.len()]);
+
+impl Default for FooterItems {
+    fn default() -> Self {
+        Self(ChatFooterItem::ALL.map(ChatFooterItem::shown_by_default))
+    }
+}
+
+impl FooterItems {
+    pub(in crate::app) fn of(settings: &crate::settings::AppSettings) -> Self {
+        Self(ChatFooterItem::ALL.map(|item| settings.shows_in_chat_footer(item)))
+    }
+
+    fn shows(self, item: ChatFooterItem) -> bool {
+        self.0[item as usize]
+    }
+
+    #[cfg(test)]
+    fn with(mut self, item: ChatFooterItem, shown: bool) -> Self {
+        self.0[item as usize] = shown;
+        self
+    }
+
+    /// How much less width than the default footer these items need in the
+    /// wide or the narrow form, `fit`: what a hidden item would have drawn there,
+    /// less what an added one draws. Kept below the items' usual widths, so
+    /// the room hiding one gives the others is never more than it freed.
+    fn room(self, fit: FooterFit) -> f32 {
+        ChatFooterItem::ALL
+            .into_iter()
+            .map(|item| {
+                let drawn = match (item, fit) {
+                    (ChatFooterItem::Branch, FooterFit::Wide) => 120.0,
+                    (ChatFooterItem::Branch, _) => 0.0,
+                    (ChatFooterItem::Account, FooterFit::Wide) => 150.0,
+                    // The avatar and its chevron.
+                    (ChatFooterItem::Account, _) => 36.0,
+                    (ChatFooterItem::Model, _) => 110.0,
+                    (ChatFooterItem::Permissions, _) => 90.0,
+                    (ChatFooterItem::Context, _) => 60.0,
+                    (ChatFooterItem::Tokens, _) => 110.0,
+                    (ChatFooterItem::Cost, _) => 44.0,
+                };
+                match (item.shown_by_default(), self.shows(item)) {
+                    (true, false) => drawn,
+                    (false, true) => -drawn,
+                    _ => 0.0,
+                }
+            })
+            .sum()
+    }
+}
+
 /// How much of the footer a chat pane's width affords.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterFit {
@@ -561,10 +618,19 @@ enum FooterFit {
 }
 
 impl FooterFit {
-    fn for_width(width: f32) -> Self {
-        if width >= 600.0 {
+    /// The widest form of the footer that `width` affords `items`. The
+    /// default footer is wide from 600 pixels and narrow from 440; items
+    /// the person hid give their room to the rest, and token counts take
+    /// theirs, so a footer pared down to the branch shows it in a split pane
+    /// and one with every figure gives way sooner. Either way the items give
+    /// way in the same order: the branch, then the account's name, then the
+    /// model's name, the context figure, the token counts and the cost.
+    fn for_width(width: f32, items: FooterItems) -> Self {
+        // A footer pared down to almost nothing still waits for a pane wide
+        // enough that a long name beside it is cut, not squeezed.
+        if width >= (600.0 - items.room(Self::Wide)).max(400.0) {
             Self::Wide
-        } else if width >= 440.0 {
+        } else if width >= (440.0 - items.room(Self::Narrow)).max(280.0) {
             Self::Narrow
         } else {
             Self::Tight
@@ -1095,6 +1161,35 @@ fn completion_kind(kind: completion::Kind) -> &'static str {
     }
 }
 
+/// A choice in the footer's context menu: show the item or hide it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FooterChoice(ChatFooterItem, bool);
+
+impl widget::menu::Action for FooterChoice {
+    type Message = Message;
+
+    fn message(&self) -> Message {
+        Message::SettingsChanged {
+            field: crate::app::SettingsField::ChatFooter(self.0),
+            value: self.1.to_string(),
+        }
+    }
+}
+
+/// The footer's context menu: every item it can show, checked where shown.
+fn footer_menu(items: FooterItems) -> Vec<widget::menu::Tree<Message>> {
+    widget::menu::items(
+        &HashMap::new(),
+        ChatFooterItem::ALL
+            .into_iter()
+            .map(|item| {
+                let shown = items.shows(item);
+                widget::menu::Item::CheckBox(item.label(), None, shown, FooterChoice(item, !shown))
+            })
+            .collect(),
+    )
+}
+
 /// A footer name, said whole on hover where it was cut. Names have no
 /// bound, and a footer item does not wrap within itself.
 fn bounded<'a>(
@@ -1602,6 +1697,7 @@ impl Cagents {
                     self.chat_ui.phases.get(&card),
                     self.settings.chat_enter_sends,
                     self.settings.context_usage_display,
+                    FooterItems::of(&self.settings),
                     &self.settings.keyboard_shortcuts,
                     self.workspace
                         .presentation_geometry()
@@ -3085,6 +3181,7 @@ impl Runtime {
             transition,
             enter_sends,
             crate::settings::AccountUsageDisplay::default(),
+            FooterItems::default(),
             shortcuts,
             content_width,
             transcript_clearance,
@@ -3103,6 +3200,7 @@ impl Runtime {
         transition: impl Into<ViewTransition>,
         enter_sends: bool,
         context_display: crate::settings::AccountUsageDisplay,
+        footer_items: FooterItems,
         shortcuts: &crate::settings::KeyboardShortcuts,
         content_width: f32,
         transcript_clearance: f32,
@@ -4452,9 +4550,10 @@ impl Runtime {
         let usage = &snapshot.usage;
         // Keep the branch and account together; model and permissions share
         // the trailing group with usage at every footer width.
-        let fit = FooterFit::for_width(content_width);
+        let fit = FooterFit::for_width(content_width, footer_items);
         let mut status: Vec<Element<'_, Message>> = Vec::new();
         if fit == FooterFit::Wide
+            && footer_items.shows(ChatFooterItem::Branch)
             && let Some(branch) = &place.branch
         {
             status.push(bounded(
@@ -4474,8 +4573,14 @@ impl Runtime {
         }
         let mut engine = Vec::new();
         if !self.closed_elsewhere {
-            let (context, controls) =
-                self.session_controls(transitioning, accounts, offers, shortcuts, fit);
+            let (context, controls) = self.session_controls(
+                transitioning,
+                accounts,
+                offers,
+                shortcuts,
+                fit,
+                footer_items,
+            );
             status.extend(context);
             engine = controls;
         }
@@ -4526,11 +4631,26 @@ impl Runtime {
                 let cost = dollars(cost);
                 (cost.clone(), cost)
             })
-            .or_else(|| usage.cost_estimate.map(cost_estimate_label));
+            .or_else(|| usage.cost_estimate.map(cost_estimate_label))
+            .filter(|_| footer_items.shows(ChatFooterItem::Cost));
+        let meter = ContextMeter::of(usage, context_display)
+            .filter(|_| footer_items.shows(ChatFooterItem::Context));
+        let counted = usage.input_tokens + usage.output_tokens > 0;
+        // The counts stand on their own where the person asked for them, and
+        // in the context figure's place where there is no window to measure
+        // against: without one there is no proportion to draw, so the
+        // figures the provider does report stay legible as text. The
+        // tightest pane leaves them to the ring's tooltip, which says them.
+        let tokens = counted
+            && if footer_items.shows(ChatFooterItem::Tokens) {
+                fit != FooterFit::Tight || meter.is_none()
+            } else {
+                footer_items.shows(ChatFooterItem::Context) && meter.is_none()
+            };
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         let mut cost_shown = false;
-        if let Some(meter) = ContextMeter::of(usage, context_display) {
+        if let Some(meter) = meter {
             // A context budget is a quantity a reader acts on - compact now,
             // or lose the thread - so it is drawn as a ring with its figure
             // beside it. The linear capsule this replaces spent the width of a
@@ -4566,17 +4686,20 @@ impl Runtime {
                 .align_y(Alignment::Center),
                 detail,
             ));
-        } else if usage.input_tokens + usage.output_tokens > 0 {
-            // Without a context window there is no proportion to draw, so the
-            // figures the provider does report stay legible as text.
-            spend.push(
+        }
+        if tokens {
+            spend.push(crate::interaction::tooltip_above(
                 design::caption(format!(
                     "{} in · {} out",
-                    usage.input_tokens, usage.output_tokens
+                    token_count(usage.input_tokens),
+                    token_count(usage.output_tokens)
                 ))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            );
+                .wrapping(iced::widget::text::Wrapping::None),
+                format!(
+                    "{} input tokens · {} output tokens",
+                    usage.input_tokens, usage.output_tokens
+                ),
+            ));
         }
         if !cost_shown && let Some((label, tooltip)) = cost {
             let caption =
@@ -4587,6 +4710,7 @@ impl Runtime {
                 crate::interaction::tooltip_above(caption, tooltip)
             });
         }
+        let has_spend = !spend.is_empty();
         let spend = widget::row::with_children(spend)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
@@ -4594,6 +4718,15 @@ impl Runtime {
         let mut leading = status;
         leading.extend(notice);
         engine.push(spend);
+        // A footer with everything hidden keeps its line, so the composer
+        // stays where it was and the line is still there to right-click.
+        if leading.is_empty() && engine.len() == 1 && !has_spend {
+            leading.push(
+                widget::container(design::caption(""))
+                    .padding([CONTROL_PADDING[0], 0.0])
+                    .into(),
+            );
+        }
         let trailing: Element<'_, Message> = widget::row::with_children(engine)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
@@ -4638,6 +4771,9 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         };
+        // Right-clicking the footer chooses what it shows, as Settings does.
+        let footer_row =
+            crate::interaction::context_menu_lazy(footer_row, move || footer_menu(footer_items));
         let footer = crate::ui_controls::scrolling_popover(
             footer_row,
             self.permission_picker
@@ -5315,6 +5451,10 @@ impl Runtime {
     /// they were about to send. While a session is switching they are drawn as
     /// plain text: the values still matter, and a row of disabled controls
     /// says nothing a reader can act on.
+    ///
+    /// Each is drawn where `items` shows it, and also while its picker is
+    /// open: a hidden control's shortcut still opens its picker, which needs
+    /// the control to open from and says what is being changed.
     fn session_controls<'a>(
         &'a self,
         transitioning: bool,
@@ -5322,16 +5462,21 @@ impl Runtime {
         offers: Vec<Offer<'a>>,
         shortcuts: &crate::settings::KeyboardShortcuts,
         fit: FooterFit,
+        items: FooterItems,
     ) -> (Vec<Element<'a, Message>>, Vec<Element<'a, Message>>) {
         let target = self.target;
         let snapshot = &self.snapshot;
         let mut context: Vec<Element<'a, Message>> = Vec::new();
         let mut controls: Vec<Element<'a, Message>> = Vec::new();
-        if let Some(accounts) = accounts {
+        if let Some(accounts) = accounts
+            && (items.shows(ChatFooterItem::Account) || self.account_picker)
+        {
             context.push(self.account_picker(accounts, transitioning, shortcuts, fit));
         }
         let draft = self.is_draft();
-        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
+        if ((snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft)
+            && (items.shows(ChatFooterItem::Model) || self.model_picker.is_some())
+        {
             let default_effort = offers
                 .iter()
                 .find(|offer| offer.provider == self.session.launch.provider)
@@ -5358,7 +5503,9 @@ impl Runtime {
                 controls.push(self.model_picker(label, offers, shortcuts, fit));
             }
         }
-        if !snapshot.capabilities.permission_modes.is_empty() {
+        if !snapshot.capabilities.permission_modes.is_empty()
+            && (items.shows(ChatFooterItem::Permissions) || self.permission_picker)
+        {
             let modes = &snapshot.capabilities.permission_modes;
             let chosen = self.chosen_permission_mode();
             let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);

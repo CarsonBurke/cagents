@@ -1198,6 +1198,75 @@ impl Confirmation {
     }
 }
 
+/// Something a chat's footer, the line under its composer, can show.
+///
+/// The person chooses which appear, through the footer's context menu or
+/// Settings. A hidden picker is still reached through its shortcut, which
+/// shows it again while it is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ChatFooterItem {
+    /// The branch the conversation works on.
+    Branch,
+    /// The account it runs on, with that account's usage.
+    Account,
+    /// The model and its reasoning effort.
+    Model,
+    /// The permission mode.
+    Permissions,
+    /// How much of the context remains, or is used.
+    Context,
+    /// The tokens the conversation has read and written.
+    Tokens,
+    /// What the conversation has cost.
+    Cost,
+}
+
+impl ChatFooterItem {
+    /// In the order the footer draws them.
+    pub const ALL: [Self; 7] = [
+        Self::Branch,
+        Self::Account,
+        Self::Model,
+        Self::Permissions,
+        Self::Context,
+        Self::Tokens,
+        Self::Cost,
+    ];
+
+    /// The item's stable name: its key under `[chat_footer]`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Branch => "branch",
+            Self::Account => "account",
+            Self::Model => "model",
+            Self::Permissions => "permissions",
+            Self::Context => "context",
+            Self::Tokens => "tokens",
+            Self::Cost => "cost",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Branch => "Branch",
+            Self::Account => "Account",
+            Self::Model => "Model",
+            Self::Permissions => "Permission mode",
+            Self::Context => "Context",
+            Self::Tokens => "Token counts",
+            Self::Cost => "Cost",
+        }
+    }
+
+    /// Whether the footer shows it until the person chooses otherwise.
+    /// Token counts are off: the context figure is what a reader acts on,
+    /// and its tooltip has the counts. Where there is no context figure,
+    /// Context shows the counts in its place.
+    pub const fn shown_by_default(self) -> bool {
+        !matches!(self, Self::Tokens)
+    }
+}
+
 /// The pane opened when visiting an empty worktree or channel.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1458,6 +1527,14 @@ pub struct AppSettings {
     /// [`Provider::executable`]: crate::agent::Provider::executable
     #[serde(default)]
     pub providers: BTreeMap<String, bool>,
+    /// What a chat's footer shows, by [`ChatFooterItem::key`]; an absent
+    /// item takes [`ChatFooterItem::shown_by_default`]. Read through
+    /// [`AppSettings::shows_in_chat_footer`]. A table, like `confirmations`,
+    /// so windows that each change a different item merge by key, and a
+    /// newer build's items survive an older one. A choice is kept even when
+    /// it matches the default, so it stays the person's if a default changes.
+    #[serde(default)]
+    pub chat_footer: BTreeMap<String, bool>,
 }
 
 impl Default for AppSettings {
@@ -1466,6 +1543,7 @@ impl Default for AppSettings {
             notifications: crate::notifications::Preferences::default(),
             confirmations: BTreeMap::new(),
             providers: BTreeMap::new(),
+            chat_footer: BTreeMap::new(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             palette_recents: Vec::new(),
             max_hot_cards: 6,
@@ -2207,6 +2285,18 @@ impl AppSettings {
             self.providers
                 .insert(provider.executable().to_owned(), false);
         }
+    }
+
+    /// Whether a chat's footer shows `item`.
+    pub fn shows_in_chat_footer(&self, item: ChatFooterItem) -> bool {
+        self.chat_footer
+            .get(item.key())
+            .copied()
+            .unwrap_or(item.shown_by_default())
+    }
+
+    pub fn set_shows_in_chat_footer(&mut self, item: ChatFooterItem, shown: bool) {
+        self.chat_footer.insert(item.key().to_owned(), shown);
     }
 
     /// Sets how every project shows its checkouts. Hiding them remembers the
@@ -6536,6 +6626,51 @@ new_thread = "Alt+Shift+G"
         assert!(saved.uses_provider(Provider::Muse));
         assert!(!saved.uses_provider(Provider::Antigravity));
         assert!(!saved.providers.contains_key(Provider::Muse.executable()));
+    }
+
+    #[test]
+    fn chat_footer_items_round_trip_and_merge_per_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        // Today's footer: everything but the token counts.
+        for item in ChatFooterItem::ALL {
+            assert_eq!(
+                base.shows_in_chat_footer(item),
+                item != ChatFooterItem::Tokens,
+                "{item:?}"
+            );
+        }
+        let mut stored = base.clone();
+        stored.chat_footer.insert("future_item".into(), true);
+        save(&path, &stored).unwrap();
+        assert_eq!(load(&path).unwrap(), stored);
+
+        // Two windows each change a different item from the same base.
+        let mut tokens = stored.clone();
+        tokens.set_shows_in_chat_footer(ChatFooterItem::Tokens, true);
+        save_merged(&path, &stored, &tokens).unwrap();
+        let mut cost = stored.clone();
+        cost.set_shows_in_chat_footer(ChatFooterItem::Cost, false);
+        save_merged(&path, &stored, &cost).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(saved.shows_in_chat_footer(ChatFooterItem::Tokens));
+        assert!(!saved.shows_in_chat_footer(ChatFooterItem::Cost));
+        assert!(saved.shows_in_chat_footer(ChatFooterItem::Model));
+        assert_eq!(saved.chat_footer.get("future_item"), Some(&true));
+
+        // A choice that matches the default is still the person's.
+        let mut again = saved.clone();
+        again.set_shows_in_chat_footer(ChatFooterItem::Cost, true);
+        save_merged(&path, &saved, &again).unwrap();
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.chat_footer.get("cost"), Some(&true));
+        assert!(saved.shows_in_chat_footer(ChatFooterItem::Tokens));
+
+        // The file says it in words a person can edit.
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[chat_footer]"), "{written}");
+        assert!(written.contains("tokens = true"), "{written}");
     }
 
     #[test]

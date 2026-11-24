@@ -3611,6 +3611,9 @@ pub enum SettingsField {
     Confirm(settings::Confirmation),
     /// Whether a provider is in use, as `AppSettings::uses_provider` reads it.
     UseProvider(crate::agent::Provider),
+    /// Whether a chat's footer shows an item, as
+    /// `AppSettings::shows_in_chat_footer` reads it.
+    ChatFooter(settings::ChatFooterItem),
     FocusFollowsMouse,
     LinkOpenGesture,
     PullRequestOpenTarget,
@@ -3787,6 +3790,7 @@ impl SettingsField {
             Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",
             Self::Confirm(settings::Confirmation::CloseActiveTerminal) => "Active processes",
             Self::UseProvider(provider) => provider.label(),
+            Self::ChatFooter(item) => item.label(),
             Self::FocusFollowsMouse => "Pane focus",
             Self::LinkOpenGesture => "System browser gesture",
             Self::PullRequestOpenTarget => "Open pull requests in",
@@ -3848,7 +3852,8 @@ impl SettingsField {
             | Self::ChatExpandToolGroups
             | Self::ChatContentFraction
             | Self::DictationModel
-            | Self::DictationSends => SettingsCategory::NativeChat,
+            | Self::DictationSends
+            | Self::ChatFooter(_) => SettingsCategory::NativeChat,
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::InspectorOpenByDefault
             | Self::InspectorShowActivity
@@ -4055,6 +4060,9 @@ struct SettingsDraft {
     confirmations: BTreeMap<settings::Confirmation, bool>,
     /// Whether each provider is in use, as `AppSettings::uses_provider` reads it.
     providers: BTreeMap<crate::agent::Provider, bool>,
+    /// Whether a chat's footer shows each item, as
+    /// `AppSettings::shows_in_chat_footer` reads it.
+    chat_footer: BTreeMap<settings::ChatFooterItem, bool>,
     chat_enter_sends: bool,
     chat_expand_tool_groups: bool,
     chat_content_fraction: String,
@@ -4077,6 +4085,14 @@ struct SettingsDraft {
     link_open_gesture: LinkOpenGesture,
     pull_request_open_target: PullRequestOpenTarget,
     keyboard_shortcuts: ShortcutDraft,
+}
+
+/// Whether a chat's footer shows each item, for the settings draft.
+fn chat_footer_draft(settings: &AppSettings) -> BTreeMap<settings::ChatFooterItem, bool> {
+    settings::ChatFooterItem::ALL
+        .into_iter()
+        .map(|item| (item, settings.shows_in_chat_footer(item)))
+        .collect()
 }
 
 impl SettingsDraft {
@@ -4133,6 +4149,7 @@ impl SettingsDraft {
                 .into_iter()
                 .map(|provider| (provider, settings.uses_provider(provider)))
                 .collect(),
+            chat_footer: chat_footer_draft(settings),
             confirm_multiline_paste: settings.confirm_multiline_paste,
             browser_search_url: settings.browser_search_url.clone(),
             chat_enter_sends: settings.chat_enter_sends,
@@ -4212,6 +4229,9 @@ impl SettingsDraft {
             }
             SettingsField::UseProvider(provider) => {
                 self.providers.insert(provider, value == "true");
+            }
+            SettingsField::ChatFooter(item) => {
+                self.chat_footer.insert(item, value == "true");
             }
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = value == "true",
@@ -4477,6 +4497,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|used| next.set_uses_provider(provider, used))
             .map_err(|_| "Choose whether this provider is used.".to_owned()),
+        SettingsField::ChatFooter(item) => value
+            .parse::<bool>()
+            .map(|shown| next.set_shows_in_chat_footer(item, shown))
+            .map_err(|_| "Choose whether the chat footer shows this.".to_owned()),
         SettingsField::ConfirmMultilinePaste => value
             .parse::<bool>()
             .map(|value| next.confirm_multiline_paste = value)
@@ -18886,6 +18910,7 @@ impl Cagents {
                         into.confirm_terminal_close = settings.confirm_terminal_close;
                         into.confirmations = settings.confirmations.clone();
                         into.providers = settings.providers.clone();
+                        into.chat_footer = settings.chat_footer.clone();
                         into.sidebar_worktrees_when_shown = settings.sidebar_worktrees_when_shown;
                     };
                     if let Some(saved) = lane.as_mut() {
@@ -18905,6 +18930,7 @@ impl Cagents {
                             .providers
                             .insert(provider, settings.uses_provider(provider));
                     }
+                    self.settings_draft.chat_footer = chat_footer_draft(&settings);
                     self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
                     self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
                     if self.account_ui.set_turned_off(&self.settings) {

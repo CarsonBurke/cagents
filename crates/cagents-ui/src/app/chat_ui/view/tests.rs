@@ -6491,6 +6491,17 @@ pub(super) fn lay_out(
     accounts: Option<ChatAccounts>,
     roles: &[&str],
 ) -> Laid {
+    lay_out_with(runtime, width, accounts, roles, FooterItems::default())
+}
+
+/// [`lay_out`], with the footer showing `items`.
+fn lay_out_with(
+    runtime: &Runtime,
+    width: f32,
+    accounts: Option<ChatAccounts>,
+    roles: &[&str],
+    items: FooterItems,
+) -> Laid {
     use iced::advanced::{
         Layout, layout,
         widget::{Operation, Tree, operation::Focusable},
@@ -6527,10 +6538,12 @@ pub(super) fn lay_out(
     }
     let renderer = crate::app::tests::headless_renderer();
     let shortcuts = crate::settings::KeyboardShortcuts::default();
-    let mut element = runtime.view(
+    let mut element = runtime.view_with_resets(
         None,
         false,
         true,
+        crate::settings::AccountUsageDisplay::default(),
+        items,
         &shortcuts,
         width,
         0.0,
@@ -6540,6 +6553,7 @@ pub(super) fn lay_out(
         true,
         accounts,
         vec![],
+        None,
         true,
     );
     let mut tree = Tree::new(element.as_widget());
@@ -6824,7 +6838,7 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
         let (runtime, _handle) = furnished_runtime();
         let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
         let footer = laid.footer;
-        let fit = FooterFit::for_width(width);
+        let fit = FooterFit::for_width(width, FooterItems::default());
         assert!(
             laid.controls["chat-model-picker"].x < laid.controls["chat-permission-picker"].x,
             "model precedes permissions at {width}"
@@ -6892,6 +6906,238 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
             );
         }
     }
+}
+
+/// The footer draws exactly the items the person chose, and each item
+/// alone appears or goes with its choice.
+#[test]
+fn footer_shows_each_item_as_chosen() {
+    let roles = [
+        "chat-account-picker",
+        "chat-model-picker",
+        "chat-permission-picker",
+    ];
+    let (mut runtime, _handle) = furnished_runtime();
+    let usage = &mut Arc::make_mut(&mut runtime.snapshot).usage;
+    usage.input_tokens = 4_200;
+    usage.output_tokens = 180;
+    let shown = |laid: &Laid, item: ChatFooterItem| {
+        let text = laid.footer_text.join(" | ");
+        match item {
+            ChatFooterItem::Branch => text.contains("feature/a-long-branch-name"),
+            ChatFooterItem::Account => laid.controls.contains_key("chat-account-picker"),
+            ChatFooterItem::Model => laid.controls.contains_key("chat-model-picker"),
+            ChatFooterItem::Permissions => laid.controls.contains_key("chat-permission-picker"),
+            ChatFooterItem::Context => text.contains("58% left"),
+            ChatFooterItem::Tokens => text.contains("4.2k in · 180 out"),
+            ChatFooterItem::Cost => text.contains("$1.23"),
+        }
+    };
+    let accounts = || Some(fixture_accounts());
+    let defaults = lay_out_with(&runtime, 900.0, accounts(), &roles, FooterItems::default());
+    for item in ChatFooterItem::ALL {
+        assert_eq!(
+            shown(&defaults, item),
+            item.shown_by_default(),
+            "{item:?} by default: {:?}",
+            defaults.footer_text
+        );
+    }
+    for toggled in ChatFooterItem::ALL {
+        let items = FooterItems::default().with(toggled, !toggled.shown_by_default());
+        let laid = lay_out_with(&runtime, 900.0, accounts(), &roles, items);
+        for item in ChatFooterItem::ALL {
+            assert_eq!(
+                shown(&laid, item),
+                items.shows(item),
+                "{item:?} with {toggled:?} toggled: {:?}",
+                laid.footer_text
+            );
+        }
+    }
+}
+
+/// A conversation with no context window has no ring: Context shows the
+/// counts in its place, once, and hiding Context hides them.
+#[test]
+fn footer_counts_stand_in_for_an_unmeasured_context_once() {
+    let (mut runtime, _handle) = furnished_runtime();
+    let usage = &mut Arc::make_mut(&mut runtime.snapshot).usage;
+    usage.context_limit = 0;
+    usage.input_tokens = 4_200;
+    usage.output_tokens = 180;
+    let counts = |items: FooterItems| {
+        lay_out_with(&runtime, 900.0, None, &[], items)
+            .footer_text
+            .iter()
+            .filter(|text| text.contains(" in · "))
+            .count()
+    };
+    let defaults = FooterItems::default();
+    assert_eq!(counts(defaults), 1);
+    assert_eq!(counts(defaults.with(ChatFooterItem::Tokens, true)), 1);
+    assert_eq!(counts(defaults.with(ChatFooterItem::Context, false)), 0);
+    assert_eq!(
+        counts(
+            defaults
+                .with(ChatFooterItem::Context, false)
+                .with(ChatFooterItem::Tokens, true)
+        ),
+        1
+    );
+}
+
+/// A hidden picker's shortcut still opens it: the control shows while its
+/// picker is open, so the picker has somewhere to open from.
+#[test]
+fn a_hidden_picker_shows_while_it_is_open() {
+    let roles = ["chat-account-picker", "chat-model-picker"];
+    let (mut runtime, _handle) = furnished_runtime();
+    let hidden = FooterItems::default()
+        .with(ChatFooterItem::Account, false)
+        .with(ChatFooterItem::Model, false);
+    let laid = lay_out_with(&runtime, 900.0, Some(fixture_accounts()), &roles, hidden);
+    assert!(laid.controls.is_empty(), "{:?}", laid.controls);
+    runtime.model_picker = Some(String::new());
+    runtime.account_picker = true;
+    let laid = lay_out_with(&runtime, 900.0, Some(fixture_accounts()), &roles, hidden);
+    for role in roles {
+        assert!(laid.controls.contains_key(role), "{role} while open");
+    }
+}
+
+/// However the footer is configured, it stays inside the pane, on one
+/// line where the pane is narrow, with the trailing group at the far edge;
+/// hidden items give their room to the rest, and added ones take theirs.
+#[test]
+fn a_configured_footer_keeps_its_line_and_gives_way_in_order() {
+    let roles = [
+        "chat-account-picker",
+        "chat-model-picker",
+        "chat-permission-picker",
+    ];
+    let (mut runtime, _handle) = furnished_runtime();
+    let usage = &mut Arc::make_mut(&mut runtime.snapshot).usage;
+    usage.input_tokens = 4_200;
+    usage.output_tokens = 180;
+    let defaults = FooterItems::default();
+    let every = ChatFooterItem::ALL
+        .into_iter()
+        .fold(defaults, |items, item| items.with(item, true));
+    let pared = ChatFooterItem::ALL
+        .into_iter()
+        .fold(defaults, |items, item| items.with(item, false))
+        .with(ChatFooterItem::Branch, true)
+        .with(ChatFooterItem::Context, true);
+    let no_account = defaults
+        .with(ChatFooterItem::Account, false)
+        .with(ChatFooterItem::Cost, false);
+    for (name, items) in [
+        ("defaults", defaults),
+        ("every item", every),
+        ("branch and context", pared),
+        ("no account or cost", no_account),
+    ] {
+        let mut previous = FooterFit::Wide;
+        for width in [
+            280.0_f32, 320.0, 400.0, 439.0, 470.0, 520.0, 599.0, 700.0, 900.0,
+        ] {
+            let fit = FooterFit::for_width(width, items);
+            let laid = lay_out_with(&runtime, width, Some(fixture_accounts()), &roles, items);
+            let footer = laid.footer;
+            for (role, control) in &laid.controls {
+                assert!(
+                    control.x >= footer.x && control.x + control.width <= footer.x + footer.width,
+                    "{name}: {role} stays inside the footer at {width}: {control:?} in {footer:?}"
+                );
+            }
+            if fit != FooterFit::Wide {
+                assert!(
+                    footer.height <= design::PRIMARY_CONTROL_SIZE + step::GAP_M + 1.0,
+                    "{name}: footer wrapped at {width}: {footer:?}"
+                );
+            }
+            let inner_right = footer.x + footer.width - (step::GAP_M + COMPOSER_PADDING);
+            assert!(
+                laid.footer_drawn_right <= inner_right + 1.0,
+                "{name}: drawn past the footer at {width}: {} in {footer:?}",
+                laid.footer_drawn_right
+            );
+            // Widening never gives way to a tighter form.
+            let rank = |fit| match fit {
+                FooterFit::Tight => 0,
+                FooterFit::Narrow => 1,
+                FooterFit::Wide => 2,
+            };
+            if width > 280.0 {
+                assert!(rank(fit) >= rank(previous), "{name} at {width}");
+            }
+            previous = fit;
+            let text = laid.footer_text.join(" | ");
+            assert_eq!(
+                text.contains("feature/a-long-branch-name"),
+                items.shows(ChatFooterItem::Branch) && fit == FooterFit::Wide,
+                "{name} at {width}: {text}"
+            );
+        }
+    }
+    // Hiding the account and cost leaves a split pane room for the branch;
+    // the default footer gives the branch up there first.
+    assert_eq!(FooterFit::for_width(520.0, defaults), FooterFit::Narrow);
+    assert_eq!(FooterFit::for_width(520.0, no_account), FooterFit::Wide);
+    assert_eq!(FooterFit::for_width(500.0, pared), FooterFit::Wide);
+    // Every figure at once needs more room than the default footer.
+    assert_eq!(FooterFit::for_width(600.0, defaults), FooterFit::Wide);
+    assert_eq!(FooterFit::for_width(600.0, every), FooterFit::Narrow);
+}
+
+/// A footer with nothing to show keeps its line, so the composer does not
+/// move and the line can still be right-clicked to bring items back.
+#[test]
+fn an_empty_footer_keeps_its_line() {
+    let (runtime, _handle) = furnished_runtime();
+    let none = ChatFooterItem::ALL
+        .into_iter()
+        .fold(FooterItems::default(), |items, item| {
+            items.with(item, false)
+        });
+    for width in [320.0_f32, 900.0] {
+        let shown = lay_out_with(
+            &runtime,
+            width,
+            Some(fixture_accounts()),
+            &[],
+            FooterItems::default(),
+        );
+        let empty = lay_out_with(&runtime, width, Some(fixture_accounts()), &[], none);
+        assert!(empty.footer_names.is_empty(), "{:?}", empty.footer_names);
+        assert!(
+            (empty.footer.height - shown.footer.height).abs() <= 1.0,
+            "at {width}: {:?} against {:?}",
+            empty.footer,
+            shown.footer
+        );
+    }
+}
+
+/// The footer's context menu changes the same setting Settings does.
+#[test]
+fn footer_menu_choices_change_the_shared_setting() {
+    use widget::menu::Action as _;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    assert!(!app.settings.shows_in_chat_footer(ChatFooterItem::Tokens));
+    let _ = app.update(FooterChoice(ChatFooterItem::Tokens, true).message());
+    assert!(app.settings.shows_in_chat_footer(ChatFooterItem::Tokens));
+    assert_eq!(
+        FooterItems::of(&app.settings),
+        FooterItems::default().with(ChatFooterItem::Tokens, true)
+    );
+    let _ = app.update(FooterChoice(ChatFooterItem::Model, false).message());
+    assert!(!app.settings.shows_in_chat_footer(ChatFooterItem::Model));
+    assert_eq!(
+        footer_menu(FooterItems::of(&app.settings)).len(),
+        ChatFooterItem::ALL.len()
+    );
 }
 
 #[test]
