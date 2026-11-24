@@ -651,8 +651,8 @@ fn terminal_handoff_completion_retires_only_exact_successes_and_reports_only_fai
     assert!(
         notices
             .iter()
-            .any(|notice| notice.contains("1 terminal(s) remain pending")
-                && notice.contains(&refused.id.to_string()))
+            .any(|notice| notice.contains("receipt refused")
+                && !notice.contains(&refused.id.to_string()))
     );
     assert!(
         notices

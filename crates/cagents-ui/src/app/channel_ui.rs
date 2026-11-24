@@ -214,7 +214,10 @@ fn close_sessions_through(
             .map_err(|error| error.to_string())
             .and_then(|outcome| match outcome {
                 crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                other => Err(format!("Channel terminal could not be closed: {other:?}")),
+                other => Err(format!(
+                    "Channel terminal could not be closed: {}",
+                    super::project_ui::terminal_close_refusal(other)
+                )),
             });
         if let Err(error) = result {
             let Some(fresh) = connect(socket)? else {

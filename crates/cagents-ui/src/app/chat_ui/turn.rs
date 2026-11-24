@@ -3274,7 +3274,7 @@ mod tests {
         assert!(
             turns[1]
                 .summary
-                .starts_with("Sent 2 messages to Fix the sidebar (95fcd1b9): Rebase first."),
+                .starts_with("Sent 2 messages to Fix the sidebar: Rebase first."),
             "{}",
             turns[1].summary
         );

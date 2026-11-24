@@ -5151,8 +5151,9 @@ fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebu
                     && node.node().label().is_some_and(|label| match step {
                         0 => label.starts_with("All subagents:"),
                         1 => {
-                            label.contains("Inspect repository")
-                                && label.ends_with(" · native-child")
+                            // The chooser's row, named by the child's
+                            // label, state and task, not by its ID.
+                            label.starts_with("Scout · Waiting · Task: Inspect repository")
                         }
                         // The open subagent's transcript does not show the
                         // main conversation's request, so its tab does.

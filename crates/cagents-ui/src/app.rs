@@ -12387,16 +12387,16 @@ impl Cagents {
                 }
             }
             BrowserEvent::Error(_) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {id}: a browser operation failed"
-                )));
+                self.status = Some(TransientNotice::error(
+                    "A browser operation failed".to_owned(),
+                ));
             }
             BrowserEvent::Crashed { reason, .. } => {
                 self.fail_runtime(id, reason.clone());
                 durable_changed = true;
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {id}: the browser stopped unexpectedly"
-                )));
+                self.status = Some(TransientNotice::error(
+                    "The browser stopped unexpectedly".to_owned(),
+                ));
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
             BrowserEvent::ClosedByContent => {
@@ -12722,7 +12722,7 @@ impl Cagents {
                             },
                         )
                         .accessible_name(format!(
-                            "Terminal {}, card {id}",
+                            "Terminal {}",
                             card.map_or_else(
                                 || "Terminal".to_owned(),
                                 |card| card.title.chars().take(80).collect::<String>()
@@ -18238,11 +18238,11 @@ impl Cagents {
                                 Err(error) => failures.push((terminal.id, error)),
                             }
                         }
-                        failures.first().map(|(id, error)| {
-                            terminal_handoff_pending_notice(format!(
-                                "{} terminal(s) remain pending; terminal {id}: {error}",
-                                failures.len()
-                            ))
+                        failures.first().map(|(_, error)| {
+                            terminal_handoff_pending_notice(match failures.len() {
+                                1 => error.to_string(),
+                                count => format!("{count} terminals are waiting: {error}"),
+                            })
                         })
                     }
                     Err(error) => Some(match self.unsaved_chat_return() {
@@ -18354,10 +18354,8 @@ impl Cagents {
                 cosmic::task::message(Message::FocusCard(card))
             }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserError { card, message: _ } => {
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {card}: a browser operation failed"
-                )));
+            Message::BrowserError { .. } => {
+                self.status = Some(TransientNotice::error("A browser operation failed".to_owned()));
                 Task::none()
             }
             Message::ExternalUrlOpened(result) => {
@@ -20654,9 +20652,9 @@ fn browser_command(
     if let Some(CardRuntime::Browser(browser)) = cards.get(&card)
         && command(&browser.handle).is_err()
     {
-        *status = Some(TransientNotice::error(format!(
-            "Browser card {card}: a browser operation failed"
-        )));
+        *status = Some(TransientNotice::error(
+            "A browser operation failed".to_owned(),
+        ));
     }
     Task::none()
 }
@@ -21093,22 +21091,18 @@ fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, S
             if proof.is_complete() {
                 Ok(TerminalStartMode::Attach(proof))
             } else {
-                Err(format!(
-                    "terminal {} has incomplete host continuity proof; explicit relaunch is required",
-                    session.id
-                ))
+                Err("This terminal could not be reattached. Start it again to continue.".into())
             }
         }
         TerminalContinuity::RelaunchAvailable { recipe, .. } => {
             terminal_relaunch_recipe(session, recipe).map(TerminalStartMode::Spawn)
         }
-        TerminalContinuity::Exited { .. } => Err(format!(
-            "terminal {} has exited; explicit relaunch is required",
-            session.id
-        )),
+        TerminalContinuity::Exited { .. } => {
+            Err("This terminal has exited. Start it again to continue.".into())
+        }
         TerminalContinuity::Failed { typed_error, .. } => Err(format!(
-            "terminal {} cannot resume: {}; explicit relaunch is required",
-            session.id, typed_error.message
+            "This terminal cannot resume: {}. Start it again to continue.",
+            typed_error.message
         )),
     }
 }
