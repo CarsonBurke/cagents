@@ -540,10 +540,7 @@ mod tests {
         let Some(home) = std::env::var_os(HOME_FIXTURE) else {
             // Isolate native install discovery without changing this test
             // binary's HOME or the account settings other tests rely on.
-            let home = tempfile::Builder::new()
-                .prefix("cagents-cu-")
-                .tempdir_in("/tmp")
-                .unwrap();
+            let home = tempfile::Builder::new().prefix("cu-").tempdir().unwrap();
             let runtime = home.path().join("runtime");
             fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
