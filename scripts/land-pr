@@ -34,6 +34,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -259,11 +260,18 @@ def landing_lock(root, repository, number):
 def restorations(root, head):
     """What HEAD's squash would undo of main's last RESTORE_WINDOW commits.
 
-    Each path the squash changes is checked against its own history on main
-    since then: content main has since replaced coming back, or a file main
-    added going away. A branch whose tree came from an older main, through a
-    soft reset onto a moved ref or copied files, does exactly that to every
-    file main changed since, however its commits are arranged.
+    A branch whose tree came from an older main, through a soft reset onto a
+    moved ref or copied files, undoes everything main changed since, however
+    its commits are arranged. Each path the squash changes is checked against
+    its own history on main in that window. Undone are:
+
+    - content main has since replaced coming back;
+    - a change main made that the base has and HEAD lacks, though HEAD also
+      edited the file, as when the PR's own edits sit on the older copy;
+    - a file main added deleted, when that wholly undoes the commit that added
+      it. Removing a recent file is otherwise routine.
+
+    Content from before the window is not considered.
     """
     base = git(root, "merge-base", f"refs/remotes/origin/{BASE}", head).stdout.strip()
     recent = git(root, "rev-list", f"--max-count={RESTORE_WINDOW + 1}", base).stdout.split()
@@ -272,23 +280,71 @@ def restorations(root, head):
     fields = iter(git(root, "diff", "--find-renames", "--name-status", "-z", base, head).stdout.split("\0"))
     changed = [(status[0], next(fields) if status[0] in "RC" else None, next(fields))
                for status in fields if status]
-    found = []
+    found, undone, deletions = [], set(), []
     for status, _, path in changed:
         blob = None if status == "D" else git(root, "rev-parse", f"{head}:{path}").stdout.strip()
-        log = git(root, "log", "--no-renames", "--raw", "--no-abbrev", "--format=%x01%H %s",
-                  *span, "--", path).stdout
+        log = git(root, "--literal-pathspecs", "log", "--no-renames", "--raw", "--no-abbrev",
+                  "--format=%x01%H %s", *span, "--", path).stdout
+        history = []
         for entry in log.split("\1")[1:]:
             title, *lines = entry.strip("\n").split("\n")
             commit, _, subject = title.partition(" ")
             # ":old-mode new-mode old-blob new-blob status\tpath"
-            changes = [line.split("\t", 1)[0].split() for line in lines if line.startswith(":")]
+            history.append((commit, subject, [line.split("\t", 1)[0].split()
+                                              for line in lines if line.startswith(":")]))
+        for commit, subject, changes in history:
             if blob and any(change[2] == blob for change in changes):
                 found.append(f"{path} returns to its content before {commit[:12]} ({subject})")
+                undone.add(path)
                 break
             if not blob and any(change[4] == "A" for change in changes):
-                found.append(f"{path} is deleted, which {commit[:12]} ({subject}) added")
+                deletions.append((path, commit, subject))
+                undone.add(path)
                 break
+        else:
+            # Only a file the base has can hold a change the base made.
+            if status == "M" and history:
+                missing = lacks_change(root, base, head, path, history)
+                if missing:
+                    commit, subject = missing
+                    found.append(f"{path} lacks {commit[:12]}'s change ({subject})")
+                    undone.add(path)
+    for path, commit, subject in deletions:
+        touched = git(root, "--literal-pathspecs", "show", "--no-renames", "--name-only", "--format=",
+                      commit).stdout.splitlines()
+        if set(touched) <= undone:
+            found.append(f"{path} is deleted, undoing {commit[:12]} ({subject}), which added it")
     return found
+
+
+def lacks_change(root, base, head, path, history):
+    """The newest commit in HISTORY whose change to PATH BASE has and HEAD lacks.
+
+    Its patch must apply to HEAD's file and not to the base's: a change a later
+    commit took out again applies to both and is not missing.
+    """
+    with tempfile.TemporaryDirectory(prefix="land-pr-") as directory:
+        trees = {}
+        # Each copy is a plain directory: apply checks it, not some repository above it.
+        outside = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION}
+        outside["GIT_CEILING_DIRECTORIES"] = directory
+        for name, revision in (("head", head), ("base", base)):
+            copy = Path(directory, name, path)
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{revision}:{path}"],
+                                            capture_output=True, check=True).stdout)
+            trees[name] = copy.parents[len(Path(path).parts) - 1]
+        for commit, subject, changes in history:
+            if len(changes) != 1 or changes[0][4] != "M":
+                continue
+            patch = git(root, "--literal-pathspecs", "diff", "--no-renames", f"{commit}^", commit,
+                        "--", path).stdout
+            applies = {name: subprocess.run(["git", "apply", "--check", "-"], cwd=tree, input=patch,
+                                            capture_output=True, text=True, env=outside).returncode == 0
+                       for name, tree in trees.items()}
+            if applies["head"] and not applies["base"]:
+                return commit, subject
+    return None
 
 
 def check_restorations(root, number, head):
@@ -517,12 +573,13 @@ def land(root, repository, number, update=False, dry_run=False, timeout=60, allo
             since = int(time.time())  # gh-pr-status reports whole seconds.
             fetch(root, branch, head)
             check_local(root, branch, head)
+            # Before sync can push anything for a branch that would be refused.
+            if not allow_restore:
+                check_restorations(root, number, head)
             target = sync(root, branch, head, update or pr.get("mergeable_state") == "dirty", dry_run)
             if target != head:
                 superseded.add(head)
                 since = int(time.time())
-            if not allow_restore:
-                check_restorations(root, number, target)
             title, body = squash_message(number, pr["title"], pr_commits(repository, number))
             if dry_run:
                 if target != head:
