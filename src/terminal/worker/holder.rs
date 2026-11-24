@@ -96,6 +96,8 @@ enum Request {
         size: PtySize,
         #[serde(default)]
         recovery: Option<Recovery>,
+        #[serde(default)]
+        isolate_codex_tmp: bool,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -264,7 +266,7 @@ pub(super) fn spawn(
     size: PtySize,
     exits: Sender<ChildExit>,
 ) -> Result<Held, String> {
-    spawn_recoverable(command, size, exits, None)
+    spawn_recoverable(command, size, exits, None, false)
 }
 
 pub(super) fn spawn_recoverable(
@@ -272,10 +274,18 @@ pub(super) fn spawn_recoverable(
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
+    isolate_codex_tmp: bool,
 ) -> Result<Held, String> {
     let reservation = crate::daemon::child_reaper::reserve()
         .map_err(|error| format!("reserve terminal holder child custody: {error}"))?;
-    spawn_reserved(command, size, exits, recovery, reservation)
+    spawn_reserved(
+        command,
+        size,
+        exits,
+        recovery,
+        isolate_codex_tmp,
+        reservation,
+    )
 }
 
 pub(super) fn spawn_reserved(
@@ -283,6 +293,7 @@ pub(super) fn spawn_reserved(
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
+    isolate_codex_tmp: bool,
     reservation: crate::daemon::child_reaper::Reservation,
 ) -> Result<Held, String> {
     #[cfg(test)]
@@ -347,6 +358,7 @@ pub(super) fn spawn_reserved(
             command,
             size,
             recovery,
+            isolate_codex_tmp,
         },
         &[],
         deadline,
@@ -1250,6 +1262,31 @@ impl Drop for Residence {
     }
 }
 
+struct PtyRoot {
+    pid: libc::pid_t,
+    pidfd: File,
+    exit: Option<libc::c_int>,
+    private_tmp: Option<crate::daemon::codex_temp::PrivateDir>,
+}
+
+impl PtyRoot {
+    fn poll_fd(&self) -> RawFd {
+        // A negative descriptor is skipped once the root is reaped.
+        if self.exit.is_some() {
+            -1
+        } else {
+            self.pidfd.as_raw_fd()
+        }
+    }
+
+    fn reap(&mut self) -> Option<libc::c_int> {
+        let status = reap(self.pid)?;
+        self.exit = Some(status);
+        drop(self.private_tmp.take());
+        Some(status)
+    }
+}
+
 fn serve(control: UnixStream) -> i32 {
     // SAFETY: plain process attribute changes, made before anything else
     // runs. A write to a daemon that went away must fail rather than kill the
@@ -1268,15 +1305,16 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery) = match receive::<Request>(&control) {
+    let (command, size, mut recovery, isolate_codex_tmp) = match receive::<Request>(&control) {
         Ok(Some((
             Request::Spawn {
                 command,
                 size,
                 recovery,
+                isolate_codex_tmp,
             },
             _,
-        ))) => (command, size, recovery),
+        ))) => (command, size, recovery, isolate_codex_tmp),
         _ => return 1,
     };
     if let Some(recovery) = &recovery {
@@ -1330,10 +1368,29 @@ fn serve(control: UnixStream) -> i32 {
     if let Err(error) = enter_launch_directory(&mut command, &launch_directory) {
         return fail(error);
     }
+    // The holder survives daemon replacement, as does the directory it
+    // owns. Resolve a relative TMPDIR from the pinned cwd just entered.
+    let mut private_tmp = if isolate_codex_tmp {
+        let cwd = command.get_cwd().map(Path::new);
+        match crate::daemon::codex_temp::PrivateDir::create(command.get_env("TMPDIR"), cwd) {
+            Ok(directory) => {
+                for key in crate::daemon::codex_temp::TEMP_ENV_KEYS {
+                    command.env(key, directory.path());
+                }
+                Some(directory)
+            }
+            Err(error) => return fail(format!("create private Codex terminal directory: {error}")),
+        }
+    } else {
+        None
+    };
     let child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(error) => return fail(format!("spawn {program}: {error:#}")),
     };
+    if let Some(directory) = &mut private_tmp {
+        directory.launched();
+    }
     drop(pair.slave);
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
@@ -1390,7 +1447,12 @@ fn serve(control: UnixStream) -> i32 {
     )
     .is_err();
 
-    let mut exit = None;
+    let mut root = PtyRoot {
+        pid,
+        pidfd,
+        exit: None,
+        private_tmp,
+    };
     let mut cached_screen = None;
     let mut pending_replay: Option<(String, Vec<u8>, bool)> = None;
     let mut control = control;
@@ -1399,14 +1461,7 @@ fn serve(control: UnixStream) -> i32 {
         let disposition = if lost {
             Attendance::Lost
         } else {
-            attend(
-                &control,
-                pid,
-                &pidfd,
-                &mut exit,
-                &mut cached_screen,
-                &mut pending_replay,
-            )
+            attend(&control, &mut root, &mut cached_screen, &mut pending_replay)
         };
         let (socket, screen, output, screen_lost) = match disposition {
             Attendance::Release => break,
@@ -1467,9 +1522,7 @@ fn serve(control: UnixStream) -> i32 {
         let successor = await_successor(
             &listener,
             master,
-            pid,
-            &pidfd,
-            &mut exit,
+            &mut root,
             &screen,
             residence.as_ref().map(|residence| &residence.record),
             &mut recovery,
@@ -1497,10 +1550,10 @@ fn serve(control: UnixStream) -> i32 {
     if cleanup_proved && let (Some(residence), Some(recovery)) = (&residence, &recovery) {
         // The checked worker has already stopped its exact process family;
         // independently require that this holder reaped the root too.
-        if exit.is_none() && exits_within(&pidfd, Duration::ZERO).unwrap_or(false) {
-            exit = reap(pid);
+        if root.exit.is_none() && exits_within(&root.pidfd, Duration::ZERO).unwrap_or(false) {
+            root.reap();
         }
-        if exit.is_some() {
+        if root.exit.is_some() {
             loop {
                 if registry::cleanup::publish(&residence.record, recovery).is_ok()
                     && residence.retire().is_ok()
@@ -1527,9 +1580,7 @@ enum Attendance {
 
 fn attend(
     control: &UnixStream,
-    pid: libc::pid_t,
-    pidfd: &File,
-    exit: &mut Option<libc::c_int>,
+    root: &mut PtyRoot,
     cached_screen: &mut Option<(String, bool)>,
     pending_replay: &mut Option<(String, Vec<u8>, bool)>,
 ) -> Attendance {
@@ -1541,12 +1592,7 @@ fn attend(
                 revents: 0,
             },
             libc::pollfd {
-                // A negative descriptor is skipped once the root is reaped.
-                fd: if exit.is_some() {
-                    -1
-                } else {
-                    pidfd.as_raw_fd()
-                },
+                fd: root.poll_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1562,10 +1608,9 @@ fn attend(
             // A root this holder cannot reap leaves nothing to report: ending
             // the holder lets the daemon report that exit as unknown instead
             // of polling a pidfd that stays ready forever.
-            let Some(wait_status) = reap(pid) else {
+            let Some(wait_status) = root.reap() else {
                 return Attendance::Release;
             };
-            *exit = Some(wait_status);
             let _ = send(control, &Report::Exited { wait_status }, &[]);
         }
         if targets[0].revents != 0 {
@@ -1585,7 +1630,7 @@ fn attend(
                 _,
             ))) = &request
             {
-                if exit.is_some() && screen.len() <= MAX_SCREEN.div_ceil(3) * 4 {
+                if root.exit.is_some() && screen.len() <= MAX_SCREEN.div_ceil(3) * 4 {
                     *cached_screen = Some((screen.clone(), *screen_lost));
                     if send(control, &Report::ScreenCached, &[]).is_ok() {
                         continue;
@@ -1621,9 +1666,7 @@ fn attend(
 fn await_successor(
     listener: &UnixListener,
     master: RawFd,
-    pid: libc::pid_t,
-    pidfd: &File,
-    exit: &mut Option<libc::c_int>,
+    root: &mut PtyRoot,
     screen: &str,
     record: Option<&Record>,
     recovery: &mut Option<Recovery>,
@@ -1648,11 +1691,7 @@ fn await_successor(
                 revents: 0,
             },
             libc::pollfd {
-                fd: if exit.is_some() {
-                    -1
-                } else {
-                    pidfd.as_raw_fd()
-                },
+                fd: root.poll_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1674,7 +1713,7 @@ fn await_successor(
         }
         if targets[1].revents != 0 {
             // As when attended: nothing to hand over is better than a spin.
-            *exit = Some(reap(pid)?);
+            root.reap()?;
         }
         if targets[2].revents != 0 {
             let room = (DETACHED_OUTPUT - output.len()).min(buffer.len());
@@ -1693,9 +1732,9 @@ fn await_successor(
             && hand_over(
                 &successor,
                 master,
-                pid,
-                pidfd,
-                *exit,
+                root.pid,
+                &root.pidfd,
+                root.exit,
                 screen,
                 &output,
                 record,
@@ -2071,29 +2110,20 @@ mod tests {
         let mut replay = Some(("screen".to_owned(), b"orphan-output".to_vec(), false));
         let expected = replay.clone();
         // An already reaped child has no pollable pidfd; the descriptor is ignored.
-        let placeholder = File::open("/dev/null").unwrap();
-        let result = attend(
-            &holder,
-            0,
-            &placeholder,
-            &mut Some(0),
-            &mut None,
-            &mut replay,
-        );
+        let mut root = PtyRoot {
+            pid: 0,
+            pidfd: File::open("/dev/null").unwrap(),
+            exit: Some(0),
+            private_tmp: None,
+        };
+        let result = attend(&holder, &mut root, &mut None, &mut replay);
         assert!(matches!(result, Attendance::Lost));
         assert_eq!(replay, expected);
 
         let (successor, holder) = UnixStream::pair().unwrap();
         send(&successor, &Request::CommitAdoption, &[]).unwrap();
         send(&successor, &Request::Release, &[]).unwrap();
-        let result = attend(
-            &holder,
-            0,
-            &placeholder,
-            &mut Some(0),
-            &mut None,
-            &mut replay,
-        );
+        let result = attend(&holder, &mut root, &mut None, &mut replay);
         assert!(matches!(result, Attendance::Release));
         assert!(matches!(
             receive::<Report>(&successor).unwrap(),
@@ -2773,7 +2803,7 @@ mod tests {
     #[test]
     fn same_parent_detach_adopt_close_reaps_the_original_holder_without_other_waits() {
         let reaper = crate::daemon::child_reaper::TestService::new(1);
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = tempfile::tempdir().unwrap();
         struct Unrelated(Child);
         impl Drop for Unrelated {
             fn drop(&mut self) {
@@ -2790,15 +2820,22 @@ mod tests {
                 .unwrap(),
         );
         let (exits, _exited) = crossbeam_channel::bounded(1);
+        let mut terminal = command("printf '%s' \"$TMPDIR\" > \"$1\"; echo ready; read line");
+        let observed_tmp = directory.path().join("tmp-path");
+        terminal.args([std::ffi::OsStr::new("fixture"), observed_tmp.as_os_str()]);
+        terminal.env("XDG_RUNTIME_DIR", directory.path());
         let mut held = spawn_reserved(
-            command("echo ready; read line"),
+            terminal,
             size(),
             exits,
             None,
+            true,
             reaper.reserve().unwrap(),
         )
         .unwrap();
         read_until(&held.master, "ready");
+        let private_tmp = PathBuf::from(std::fs::read_to_string(observed_tmp).unwrap());
+        assert!(private_tmp.is_dir());
         let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
         let root = registry::Process::read(held.child.pid()).unwrap();
         assert_eq!(reaper.free(), 0);
@@ -2807,6 +2844,7 @@ mod tests {
         drop(held);
         assert!(owner.is_current());
         assert!(root.is_current());
+        assert!(private_tmp.is_dir(), "the detached root still uses TMPDIR");
         assert_eq!(reaper.retained_custody_error(), None);
         assert_eq!(
             reaper.free(),
@@ -2820,11 +2858,13 @@ mod tests {
             "adoption must not invent original wait authority"
         );
         assert_eq!(adopted.child.pid(), root.pid);
+        assert!(private_tmp.is_dir(), "the adopted root still uses TMPDIR");
         adopted.child.kill().unwrap();
         exited
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
+        assert!(!private_tmp.exists(), "reaping the root must remove TMPDIR");
         drop(adopted);
         reaper.await_free(1);
         assert!(
@@ -2852,6 +2892,7 @@ mod tests {
             size(),
             exits,
             None,
+            false,
             reaper.reserve().unwrap(),
         )
         .unwrap();
@@ -2926,6 +2967,7 @@ mod tests {
             size(),
             exits,
             None,
+            false,
             reaper.reserve().unwrap(),
         )
         .unwrap();
@@ -3054,8 +3096,14 @@ mod tests {
             };
             let (exits, _exited) = crossbeam_channel::bounded(1);
             assert!(
-                spawn_recoverable(command("exit 0"), size(), exits, Some(recovery.clone()))
-                    .is_err(),
+                spawn_recoverable(
+                    command("exit 0"),
+                    size(),
+                    exits,
+                    Some(recovery.clone()),
+                    false
+                )
+                .is_err(),
                 "a complete proof without the daemon lease cannot register a holder"
             );
             let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
@@ -3065,6 +3113,7 @@ mod tests {
                 size(),
                 exits,
                 Some(recovery),
+                false,
             )
             .unwrap();
             read_until(&held.master, "ready");

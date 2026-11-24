@@ -2209,6 +2209,11 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    #[cfg(feature = "host")]
+    fn needs_private_temp(&self) -> bool {
+        true
+    }
+
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;

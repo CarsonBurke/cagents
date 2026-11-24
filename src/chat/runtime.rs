@@ -802,7 +802,12 @@ impl LocalHandle {
                         let child = if actor.native_holder.is_some() {
                             Ok(None)
                         } else {
-                            spawn_provider(&spec, &actor.stop, scope_wake)
+                            spawn_provider(
+                                &spec,
+                                &actor.stop,
+                                scope_wake,
+                                actor.adapter.needs_private_temp(),
+                            )
                         };
                         let child = child.and_then(|child| {
                             if let Some(child) = &child {
@@ -2127,6 +2132,7 @@ fn spawn_provider(
     spec: &ProcessSpec,
     stop: &AtomicBool,
     wake: Option<UnixStream>,
+    private_temp: bool,
 ) -> Result<Option<ChildGuard>, String> {
     if matches!(
         spec.transport,
@@ -2201,13 +2207,29 @@ fn spawn_provider(
     if stop.load(Ordering::Acquire) {
         return Err("Provider startup was cancelled before process creation".into());
     }
+    let mut temp = if private_temp {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
+        let inherited = spec.environment.get("TMPDIR").map(std::ffi::OsStr::new);
+        let cwd = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let temporary = PrivateDir::create(inherited, Some(&cwd))
+            .map_err(|error| format!("Cannot create private Codex temporary directory: {error}"))?;
+        process.envs(TEMP_ENV_KEYS.map(|key| (key, temporary.path())));
+        Some(temporary)
+    } else {
+        None
+    };
     // A retained actor sweeps its unregistered exited children; this
     // registration keeps the provider's status for its ChildGuard.
     let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+    if let Some(temporary) = &mut temp {
+        temporary.launched();
+    }
     let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
     child.directory = Some(directory);
+    child._temp = temp;
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
@@ -2276,6 +2298,7 @@ struct ChildGuard {
     stop_detached: bool,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
+    _temp: Option<crate::daemon::codex_temp::PrivateDir>,
 }
 impl ChildGuard {
     /// Wait on the original child capability without reaping it or releasing
@@ -2365,6 +2388,7 @@ impl ChildGuard {
             directory: None,
             scope: None,
             _registration: registration,
+            _temp: None,
         })
     }
 

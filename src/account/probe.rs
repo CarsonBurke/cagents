@@ -911,6 +911,7 @@ struct Group {
     child: Child,
     /// The group's id - the child's pid - until the group has been killed.
     id: Option<i32>,
+    temp_dir: Option<crate::daemon::codex_temp::PrivateDir>,
 }
 
 impl Group {
@@ -918,15 +919,48 @@ impl Group {
     /// just installed or updated, or inherited for an instant by a process
     /// another thread is forking - is busy rather than missing, so it is
     /// tried again a few times before the start counts as failed.
-    async fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(command: Command) -> Result<Self, String> {
+        Self::spawn_inner(command, false).await
+    }
+
+    async fn spawn_inner(mut command: Command, codex_temp: bool) -> Result<Self, String> {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
         let mut delay = Duration::from_millis(10);
         loop {
             let (returned, spawned) = tokio::task::spawn_blocking(move || {
+                // The blocking attempt can outlive its caller. Create the
+                // directory here so the spawned group's owner always has it.
                 let _account = super::registry::authorize_command(command.as_std())
                     .map_err(|error| error.to_string())?;
+                let mut temp_dir = if codex_temp {
+                    let inherited = command
+                        .as_std()
+                        .get_envs()
+                        .find_map(|(key, value)| (key == "TMPDIR").then_some(value));
+                    let ambient = std::env::var_os("TMPDIR");
+                    let directory = PrivateDir::create(
+                        inherited.unwrap_or(ambient.as_deref()),
+                        command.as_std().get_current_dir(),
+                    )
+                    .map_err(|error| {
+                        format!("Cannot prepare Codex's temporary directory: {error}")
+                    })?;
+                    command.envs(TEMP_ENV_KEYS.map(|key| (key, directory.path())));
+                    Some(directory)
+                } else {
+                    None
+                };
                 let spawned = command.spawn().map(|child| {
+                    if let Some(directory) = &mut temp_dir {
+                        directory.launched();
+                    }
                     let id = child.id().and_then(|id| i32::try_from(id).ok());
-                    Self { child, id }
+                    Self {
+                        child,
+                        id,
+                        temp_dir,
+                    }
                 });
                 Ok::<_, String>((command, spawned))
             })
@@ -966,6 +1000,11 @@ impl Group {
         }
         self.kill();
         let _ = self.child.wait().await;
+        if let Some(cleanup) = self.temp_dir.take().and_then(|temp| temp.defer_cleanup())
+            && let Ok(Err(error)) = cleanup.await
+        {
+            tracing::warn!(%error, "Codex probe temporary directory could not be cleaned up");
+        }
     }
 
     /// Whether the leader has exited, without reaping it: until it is
@@ -1008,6 +1047,9 @@ impl Drop for Group {
         // timeout most of all. `kill_on_drop` covers the child; this covers
         // anything it started.
         self.kill();
+        if let Some(temp) = self.temp_dir.take() {
+            let _ = temp.defer_cleanup();
+        }
     }
 }
 
@@ -1019,9 +1061,23 @@ struct Session {
 }
 
 impl Session {
-    async fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(command: Command) -> Result<Self, String> {
+        Self::spawn_inner(command, false).await
+    }
+
+    async fn spawn_codex(
+        account: &Account,
+        program: &Path,
+        search_path: Option<&OsStr>,
+    ) -> Result<Self, String> {
+        let mut command = command_with_path(account, program, search_path);
+        command.arg("app-server");
+        Self::spawn_inner(command, true).await
+    }
+
+    async fn spawn_inner(mut command: Command, codex_temp: bool) -> Result<Self, String> {
         command.stdin(Stdio::piped());
-        let mut group = Group::spawn(command).await?;
+        let mut group = Group::spawn_inner(command, codex_temp).await?;
         let stdin = group.child.stdin.take();
         let stdout = group.stdout()?;
         Ok(Self {
@@ -1551,9 +1607,7 @@ async fn probe_codex_with_path(
     program: &Path,
     search_path: Option<&OsStr>,
 ) -> Result<Probed, String> {
-    let mut command = command_with_path(account, program, search_path);
-    command.arg("app-server");
-    let mut session = Session::spawn(command).await?;
+    let mut session = Session::spawn_codex(account, program, search_path).await?;
     let result = codex_exchange(&mut session).await;
     finish_codex_probe(after_close(result, session.close()).await)
 }
@@ -2811,6 +2865,50 @@ cat >/dev/null
         assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
         assert!(snapshot.windows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_account_sessions_use_private_temp_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let script = fixture.path().join("codex");
+        let record = fixture.path().join("temp-dir");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+test "$1" = app-server || exit 1
+test "$TMP" = "$TMPDIR" && test "$TEMP" = "$TMPDIR" || exit 1
+printf '%s' "$TMPDIR" > "${0%/*}/temp-dir"
+printf '%s\n' '{"ready":true}'
+exec /bin/cat >/dev/null
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        let account = Account::system(Provider::Codex);
+        let read_temp = || PathBuf::from(OsString::from_vec(std::fs::read(&record).unwrap()));
+
+        let mut first = Session::spawn_codex(&account, &script, None).await.unwrap();
+        assert_eq!(first.next().await.unwrap()["ready"], true);
+        let first_path = read_temp();
+        assert!(first_path.is_absolute());
+        assert_ne!(first_path, std::env::temp_dir());
+        assert_eq!(
+            std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::write(first_path.join("marker"), b"temporary").unwrap();
+
+        let mut second = Session::spawn_codex(&account, &script, None).await.unwrap();
+        assert_eq!(second.next().await.unwrap()["ready"], true);
+        let second_path = read_temp();
+        assert_ne!(first_path, second_path);
+        first.close().await;
+        assert!(!first_path.exists());
+        assert!(second_path.is_dir());
+        second.close().await;
+        assert!(!second_path.exists());
     }
 
     #[tokio::test]

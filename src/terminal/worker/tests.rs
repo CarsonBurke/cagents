@@ -4293,6 +4293,165 @@ fn env_recipe(environment: BTreeMap<String, String>) -> LaunchRecipe {
 }
 
 #[test]
+fn codex_terminal_uses_private_temp_variables_and_cleans_up_on_exit() {
+    use std::path::Path;
+
+    let directory = tempdir().unwrap();
+    let shared = directory.path().join("shared");
+    let runtime = directory.path().join("runtime");
+    fs::create_dir(&shared).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    let physical_shared = shared.canonicalize().unwrap();
+    let reported = directory.path().join("reported-tmpdir");
+    let mut previous_tmpdir = None;
+
+    for (program, returned) in [("codex", false), ("codex", true), ("shell", false)] {
+        let entrypoint = directory.path().join(program);
+        fs::write(
+            &entrypoint,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$TMPDIR\" \"$TMP\" \"$TEMP\" > tmpdir.part\n\
+             /bin/mv tmpdir.part reported-tmpdir\n\
+             read -r line\n",
+        )
+        .unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut recipe = env_recipe(BTreeMap::from([
+            ("HOME".into(), directory.path().to_str().unwrap().into()),
+            ("TMPDIR".into(), "shared".into()),
+            ("TMP".into(), "original-tmp".into()),
+            ("TEMP".into(), "original-temp".into()),
+            ("XDG_RUNTIME_DIR".into(), runtime.to_str().unwrap().into()),
+        ]));
+        recipe.program = entrypoint.to_str().unwrap().into();
+        recipe.working_directory = directory.path().into();
+        let config = TerminalConfig {
+            execution_environment: returned
+                .then(|| crate::terminal_ipc::ChatExecutionEnvironment(recipe.environment.clone())),
+            ..TerminalConfig::default()
+        };
+        if returned {
+            recipe
+                .environment
+                .insert("TMPDIR".into(), runtime.to_str().unwrap().into());
+        }
+        let (worker, _) = capture_worker_with(recipe, config);
+        crate::test_timing::eventually("the terminal's TMPDIR report", || reported.is_file());
+        let values = fs::read_to_string(&reported).unwrap();
+        let [tmpdir, tmp, temp]: [&str; 3] = values.lines().collect::<Vec<_>>().try_into().unwrap();
+        let tmpdir = PathBuf::from(tmpdir);
+        fs::remove_file(&reported).unwrap();
+
+        if program == "codex" {
+            assert_eq!(tmpdir.parent(), Some(physical_shared.as_path()));
+            assert_eq!(Path::new(tmp), tmpdir);
+            assert_eq!(Path::new(temp), tmpdir);
+            assert_ne!(Some(&tmpdir), previous_tmpdir.as_ref());
+            assert_eq!(
+                fs::metadata(&tmpdir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            fs::create_dir(tmpdir.join(".git")).unwrap();
+        } else {
+            assert_eq!(tmpdir, Path::new("shared"));
+            assert_eq!(tmp, "original-tmp");
+            assert_eq!(temp, "original-temp");
+        }
+
+        std::io::Write::write_all(
+            &mut File::from(worker.master.duplicate().unwrap()),
+            b"done\n",
+        )
+        .unwrap();
+        worker.run();
+        if program == "codex" {
+            assert!(!tmpdir.exists());
+            previous_tmpdir = Some(tmpdir);
+        }
+        assert!(shared.is_dir());
+        assert!(!shared.join(".git").exists());
+    }
+}
+
+#[test]
+fn a_detached_codex_terminal_child_can_use_tmpdir_after_the_terminal_exits() {
+    use std::path::Path;
+
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let release = directory.path().join("release");
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&release)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Keep both ends open so the detached child can start without blocking
+    // on opening its end and waits here until the terminal has exited.
+    let mut release = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(release)
+        .unwrap();
+    let program = directory.path().join("codex");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+/usr/bin/setsid /bin/sh -c '
+    printf "%s\n%s" "$$" "$TMPDIR" > reported.part
+    /bin/mv reported.part reported
+    read -r line
+    printf "detached" > "$TMPDIR/used-after-exit"
+' < release > /dev/null 2>&1 &
+read -r line
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let launch = LaunchRecipe {
+        program: program.to_str().unwrap().into(),
+        working_directory: directory.path().into(),
+        ..env_recipe(BTreeMap::from([
+            ("HOME".into(), directory.path().to_str().unwrap().into()),
+            ("TMPDIR".into(), directory.path().to_str().unwrap().into()),
+        ]))
+    };
+    let session = TerminalSession {
+        launch: launch.clone(),
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: launch,
+            last_exit: None,
+        },
+        ..shell_session("")
+    };
+    let terminal = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
+    let report = directory.path().join("reported");
+    crate::test_timing::eventually("the detached child's TMPDIR report", || report.is_file());
+    let report = fs::read_to_string(report).unwrap();
+    let (pid, tmpdir) = report.split_once('\n').unwrap();
+    let pid = pid.parse::<i32>().unwrap();
+    let tmpdir = Path::new(tmpdir);
+    let base = directory.path().canonicalize().unwrap();
+    assert_eq!(tmpdir.parent(), Some(base.as_path()));
+    terminal.input(b"done\n").unwrap();
+    crate::test_timing::eventually("the terminal's natural exit", || terminal.is_completed());
+    assert!(tmpdir.is_dir());
+    let marker = tmpdir.join("used-after-exit");
+    std::io::Write::write_all(&mut release, b"done\n").unwrap();
+    crate::test_timing::eventually("the detached child using its TMPDIR", || {
+        fs::read(&marker).is_ok_and(|bytes| bytes == b"detached")
+    });
+    let environment = format!("/proc/{pid}/environ");
+    crate::test_timing::eventually("the detached child's exit", || {
+        fs::read(&environment).is_ok_and(|bytes| bytes.is_empty())
+            || !Path::new(&environment).exists()
+    });
+}
+
+#[test]
 fn a_recipe_saved_inside_another_session_does_not_hand_the_child_its_socket() {
     let command = command_from_recipe(&env_recipe(BTreeMap::from([
         ("CLAUDECODE".to_owned(), "1".to_owned()),

@@ -651,6 +651,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
+    if let Err(error) = daemon::codex_temp::sweep() {
+        tracing::warn!(%error, "stale Codex temporary directories could not be swept");
+    }
     if let Err(error) = start_scope_collection() {
         tracing::warn!(%error, "empty session scopes were not collected");
     }

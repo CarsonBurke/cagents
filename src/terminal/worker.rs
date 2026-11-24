@@ -3282,6 +3282,10 @@ impl Worker {
                 // Before the holder forks, so nothing this launch starts
                 // predates its record.
                 crate::lineage_birth::record_instance_launch(&session)?;
+                let isolate_codex_tmp = matches!(
+                    crate::agent::Provider::launched(&execution),
+                    Some((crate::agent::Provider::Codex, _))
+                );
                 #[cfg(test)]
                 let reservation = published.test_holder_reservation.lock().unwrap().take();
                 #[cfg(test)]
@@ -3291,6 +3295,7 @@ impl Worker {
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        isolate_codex_tmp,
                         reservation,
                     )?
                 } else {
@@ -3299,6 +3304,7 @@ impl Worker {
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        isolate_codex_tmp,
                     )?
                 };
                 #[cfg(not(test))]
@@ -3307,6 +3313,7 @@ impl Worker {
                     pty_size(current_size),
                     child_exit_tx,
                     config.holder_recovery.clone(),
+                    isolate_codex_tmp,
                 )?;
                 (held, Vec::new())
             }
