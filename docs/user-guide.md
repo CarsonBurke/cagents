@@ -242,9 +242,10 @@ matching refresh re-enables creation.
 
 ## Pull request review
 
-In Projects' **Pull requests** filter, click a project name to browse all of its
-open PRs, including those with no local worktree. A matching worktree row opens
-its PR directly. The **pull request pane** shows open pull requests on the left, and the selected
+In the **Worktrees** pane, a GitHub project's heading has a pull requests
+button (its tooltip reads "Pull requests in" and the project's name). It
+opens that project's open PRs, including those with no local worktree. The
+**pull request pane** shows open pull requests on the left, and the selected
 one's changed files with their GitHub **viewed** marks under a header that shows
 progress and links to GitHub.
 

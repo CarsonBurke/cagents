@@ -414,8 +414,9 @@ running the script again rewrites the cache and keeps the commits. Other seeds
 in `fixture-forge-prs.json` are kept.
 
 To open the review as a person does, open the Worktrees pane
-(`Ctrl+Shift+E`), press the project heading's **Pull requests in project**
-button and click #57 in the list it opens. The draft's
+(`Ctrl+Shift+E`), press the project heading's pull requests button (its tooltip
+reads *Pull requests in project*) and click #57, "Key the response cache by
+locale", in the list it opens. The draft's
 composer sits under line 23; its buttons are below the fold at the default
 height, so scroll the diff to reach them. Don't click a diff gutter in a
 revision without the fix for #3417: that starts a comment the cached review has
@@ -428,8 +429,8 @@ evidence drive wait 'Worktrees' --timeout 60 >/dev/null
 evidence drive key ctrl+shift+e >/dev/null
 evidence drive wait 'Pull requests in project' --timeout 60 >/dev/null
 evidence drive click 'Pull requests in project' >/dev/null
-evidence drive wait '#57' --timeout 60 >/dev/null
-evidence drive click '#57' >/dev/null
+evidence drive wait 'Key the response cache' --timeout 60 >/dev/null
+evidence drive click 'Key the response cache' >/dev/null
 evidence drive wait 'read only' --timeout 30 >/dev/null
 evidence drive wait 'empty locale' --timeout 30 >/dev/null
 evidence shot offline-review

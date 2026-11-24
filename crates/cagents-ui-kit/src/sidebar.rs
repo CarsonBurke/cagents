@@ -6229,15 +6229,15 @@ pub fn checkouts_toggle_focus_id() -> Id {
 /// The checkouts toggle's accessible name, whatever its state.
 const CHECKOUTS_TOGGLE_NAME: &str = "Hide checkouts";
 
-/// Shows or hides every project's checkouts. Like the filters beside it, it
-/// is lit while it narrows the list, so a list without checkouts never
+/// Shows or hides every project's checkouts. Like the Attention bell beside
+/// it, it is lit while it narrows the list, so a list without checkouts never
 /// passes for the whole one. Its name stays fixed and its pressed state says
 /// whether checkouts are hidden, as the bell's does for its filter; the
 /// tooltip says what a press does. Hiding them by default overrides each
 /// project's own mode, which the hidden tooltip says.
 ///
-/// Only the All view lists checkouts: Attention names panes instead and Pull
-/// requests always shows them. The setting persists, so the toggle stays
+/// Only the All view lists checkouts: Attention names panes instead. The
+/// setting persists, so the toggle stays
 /// live elsewhere and its tooltip names the view it changes.
 fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, SidebarAction> {
     let hidden = !state.sidebar_worktrees.shows_checkouts();
