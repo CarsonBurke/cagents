@@ -199,7 +199,7 @@ impl Root {
     /// that child exits; `/proc/self` would name the child's different FD table.
     /// Darwin has no per-process descriptor namespace another process can
     /// address, so there is no equivalent there.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", any(feature = "ui", feature = "host")))]
     pub(crate) fn process_path(&self) -> PathBuf {
         PathBuf::from(format!(
             "/proc/{}/fd/{}",
@@ -452,6 +452,39 @@ fn entry_metadata(
     Ok(metadata)
 }
 
+/// The `(device, inode)` of the directory named `name` in `directory`,
+/// observed without opening it or following a final link, so it needs no
+/// permission on the entry itself. `None` when the entry is not a directory.
+fn directory_entry_identity(
+    directory: &Root,
+    name: &OsStr,
+) -> Result<Option<(u64, u64)>, ResolveError> {
+    let reported = directory.path.join(name);
+    let raw = c_component(name, &directory.path)?;
+    let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the retained descriptor and `raw` outlive the call, which fills
+    // the buffer and never follows a final symbolic link.
+    let status = unsafe {
+        libc::fstatat(
+            directory.descriptor(),
+            raw.as_ptr(),
+            entry.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status < 0 {
+        return Err(classify(&reported, &io::Error::last_os_error()));
+    }
+    // SAFETY: fstatat succeeded, so the buffer is initialized.
+    let entry = unsafe { entry.assume_init() };
+    #[cfg(target_os = "linux")]
+    let device = entry.st_dev;
+    // The standard library widens Darwin's signed `dev_t` the same way.
+    #[cfg(target_os = "macos")]
+    let device = entry.st_dev as u64;
+    Ok((entry.st_mode & libc::S_IFMT == libc::S_IFDIR).then_some((device, entry.st_ino)))
+}
+
 /// The path the kernel currently records for an open descriptor. It is a name,
 /// not an identity: a caller must verify what it reaches through it.
 #[cfg(target_os = "macos")]
@@ -585,6 +618,55 @@ pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> 
     Ok(())
 }
 
+/// Whether a retained directory has been removed from its filesystem. Linux
+/// reports a removed directory's link count as zero.
+#[cfg(target_os = "linux")]
+pub(crate) fn directory_unlinked(directory: &Root) -> io::Result<bool> {
+    Ok(std::os::unix::fs::MetadataExt::nlink(&directory.metadata()?) == 0)
+}
+
+/// APFS keeps a removed directory's link count, and `F_GETPATH` keeps its last
+/// name, so Darwin asks the filesystem to name the object id instead: a
+/// renamed directory has a path and a removed one has none. The descriptor
+/// keeps the id from being reused. A filesystem that cannot look up object
+/// ids reports an error rather than a guess.
+#[cfg(target_os = "macos")]
+pub(crate) fn directory_unlinked(directory: &Root) -> io::Result<bool> {
+    unsafe extern "C" {
+        fn fsgetpath(
+            buffer: *mut libc::c_char,
+            size: libc::size_t,
+            fsid: *mut libc::fsid_t,
+            object: u64,
+        ) -> libc::ssize_t;
+    }
+    let mut fsid = filesystem_id(directory)?;
+    let object = std::os::unix::fs::MetadataExt::ino(&directory.metadata()?);
+    let mut path = vec![0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: the buffer and fsid outlive the call, which writes at most
+    // `path.len()` bytes.
+    if unsafe { fsgetpath(path.as_mut_ptr(), path.len(), &mut fsid, object) } >= 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        return Ok(true);
+    }
+    Err(error)
+}
+
+/// The mounted filesystem instance holding a retained descriptor.
+#[cfg(target_os = "macos")]
+fn filesystem_id(directory: &Root) -> io::Result<libc::fsid_t> {
+    let mut metadata = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: the Root retains its descriptor and fstatfs fills the buffer.
+    if unsafe { libc::fstatfs(directory.descriptor(), metadata.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs succeeded, so the buffer is initialized.
+    Ok(unsafe { metadata.assume_init() }.f_fsid)
+}
+
 /// Removes only an empty direct child through its retained parent.
 pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), ResolveError> {
     let raw = c_component(name, &directory.path)?;
@@ -612,7 +694,7 @@ mod recovery_cache;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use recovery_cache::fixture_fail_next_save_preparation_sync;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
 pub use recovery_cache::{
     RecoveryDirectoryError, RecoveryParentCandidates, SavePreparationDurability,
@@ -1682,7 +1764,7 @@ fn walk(
     let intermediate = INTERMEDIATE_HANDLE | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     for part in leading {
         let child = open_at(directory.as_raw_fd(), part, intermediate)
-            .map_err(|error| classify(reported, &error))?;
+            .map_err(|error| classify_intermediate(&directory, part, reported, &error))?;
         let metadata =
             metadata_of_descriptor(&child).map_err(|error| ResolveError::io(reported, &error))?;
         let kind = metadata.file_type();
@@ -1774,6 +1856,51 @@ fn classify(reported: &Path, error: &io::Error) -> ResolveError {
         Some(libc::ELOOP | libc::EXDEV) => ResolveError::escaped(reported),
         _ => ResolveError::io(reported, error),
     }
+}
+
+/// Darwin's `O_SEARCH` implies `O_DIRECTORY`, so an intermediate symlink is
+/// refused with `ENOTDIR` before `O_NOFOLLOW` reports it. The entry itself
+/// tells the two apart, so a link is still classified as an escape.
+#[cfg(target_os = "macos")]
+fn classify_intermediate(
+    directory: &OwnedFd,
+    part: &OsStr,
+    reported: &Path,
+    error: &io::Error,
+) -> ResolveError {
+    if error.raw_os_error() != Some(libc::ENOTDIR) {
+        return classify(reported, error);
+    }
+    let Ok(raw) = c_name(part) else {
+        return classify(reported, error);
+    };
+    let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the descriptor and C string outlive the call, which fills the
+    // buffer and never follows a final symbolic link.
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            raw.as_ptr(),
+            entry.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    // SAFETY: fstatat succeeded, so the buffer is initialized.
+    if status == 0 && unsafe { entry.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return ResolveError::escaped(reported);
+    }
+    ResolveError::message(reported, "not a directory")
+}
+
+/// Linux opens an intermediate symlink as `O_PATH` and the walk inspects it.
+#[cfg(target_os = "linux")]
+fn classify_intermediate(
+    _directory: &OwnedFd,
+    _part: &OsStr,
+    reported: &Path,
+    error: &io::Error,
+) -> ResolveError {
+    classify(reported, error)
 }
 
 /// Stats an owned descriptor without taking ownership of it.
@@ -1995,8 +2122,17 @@ pub(crate) mod tests {
             destination.metadata().unwrap().uid(),
             source.metadata().unwrap().uid()
         );
-        let root = Root::open(directory.path()).unwrap();
-        let unusable = File::from(root.directory.try_clone().unwrap());
+        // Linux refuses fchown on an O_PATH descriptor; Darwin on a pipe.
+        #[cfg(target_os = "linux")]
+        let unusable = File::from(
+            Root::open(directory.path())
+                .unwrap()
+                .directory
+                .try_clone()
+                .unwrap(),
+        );
+        #[cfg(target_os = "macos")]
+        let unusable = refusing_pipe();
         assert!(copy_ownership(&source, &unusable).is_err());
     }
 
@@ -2108,7 +2244,9 @@ pub(crate) mod tests {
         let metadata = metadata_of(&file).expect("metadata");
 
         assert!(!metadata.is_file());
-        assert_eq!(metadata.mode() & libc::S_IFMT, libc::S_IFIFO);
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(
+            &metadata.file_type()
+        ));
     }
 
     #[test]
@@ -2281,6 +2419,7 @@ pub(crate) mod tests {
         let name = c_path(path).expect("path");
         // SAFETY: both strings and the value outlive the call, and the length
         // passed is the value's own.
+        #[cfg(target_os = "linux")]
         let status = unsafe {
             libc::setxattr(
                 name.as_ptr(),
@@ -2290,10 +2429,23 @@ pub(crate) mod tests {
                 0,
             )
         };
+        // Darwin also takes a resource-fork position.
+        #[cfg(target_os = "macos")]
+        let status = unsafe {
+            libc::setxattr(
+                name.as_ptr(),
+                c"user.note".as_ptr(),
+                b"keepme".as_ptr().cast::<libc::c_void>(),
+                6,
+                0,
+                0,
+            )
+        };
         status == 0
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn only_the_user_and_access_control_namespaces_are_reproduced() {
         // The namespace split is the whole policy, so it is asserted directly
         // rather than inferred from a filesystem that happens to carry one of
@@ -2317,6 +2469,31 @@ pub(crate) mod tests {
             assert!(
                 !is_content_attribute(name),
                 "{name:?} belongs to the kernel or the filesystem",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn only_kernel_kept_attributes_are_withheld_on_darwin() {
+        for name in [
+            c"com.apple.FinderInfo",
+            c"com.apple.ResourceFork",
+            c"com.apple.quarantine",
+            c"com.apple.metadata:_kMDItemUserTags",
+            c"user.note",
+        ] {
+            assert!(is_content_attribute(name), "{name:?} is the file's own");
+        }
+        for name in [
+            c"com.apple.system.Security",
+            c"com.apple.provenance",
+            c"com.apple.macl",
+            c"com.apple.rootless",
+        ] {
+            assert!(
+                !is_content_attribute(name),
+                "{name:?} belongs to the kernel",
             );
         }
     }
@@ -2380,6 +2557,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// Linux refuses `user.*` on a FIFO. Darwin accepts it there, but refuses
+    /// every attribute on an anonymous pipe.
+    #[cfg(target_os = "linux")]
+    fn attribute_refusing_destination(root: &Root) -> File {
+        let name = c_path(&root.path().join("pipe")).expect("path");
+        // SAFETY: `name` is a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        open_beneath_writable(root, Path::new("pipe"))
+            .expect("open")
+            .expect("writable")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn attribute_refusing_destination(_root: &Root) -> File {
+        refusing_pipe()
+    }
+
+    /// An anonymous pipe, which Darwin refuses attributes, ACLs and ownership.
+    #[cfg(target_os = "macos")]
+    fn refusing_pipe() -> File {
+        let (_reader, writer) = std::io::pipe().expect("pipe");
+        File::from(std::os::fd::OwnedFd::from(writer))
+    }
+
     #[test]
     fn an_attribute_the_replacement_refuses_is_reported_rather_than_raised() {
         // A `user.*` attribute may only live on a regular file or a directory,
@@ -2393,15 +2594,9 @@ pub(crate) mod tests {
         if !tag(&original) {
             return;
         }
-        let pipe = directory.path().join("pipe");
-        let name = c_path(&pipe).expect("path");
-        // SAFETY: `name` is a NUL-terminated string that outlives the call.
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let root = Root::open(directory.path()).expect("root");
         let source = open_beneath(&root, Path::new("notes.txt")).expect("open");
-        let destination = open_beneath_writable(&root, Path::new("pipe"))
-            .expect("open")
-            .expect("writable");
+        let destination = attribute_refusing_destination(&root);
 
         let lost = copy_extended_attributes(&source, &destination);
 
@@ -2421,9 +2616,18 @@ pub(crate) mod tests {
         if !set_test_access_acl(&source, &restrictive_access_acl()) {
             return;
         }
-        let root = Root::open(directory.path()).unwrap();
-        // An O_PATH descriptor is deliberately unable to receive an ACL.
-        let invalid_destination = File::from(root.directory.try_clone().unwrap());
+        // Linux's O_PATH descriptor is deliberately unable to receive an ACL;
+        // Darwin's O_SEARCH descriptor can, but a pipe cannot.
+        #[cfg(target_os = "linux")]
+        let invalid_destination = File::from(
+            Root::open(directory.path())
+                .unwrap()
+                .directory
+                .try_clone()
+                .unwrap(),
+        );
+        #[cfg(target_os = "macos")]
+        let invalid_destination = refusing_pipe();
         assert!(copy_access_acl(&source, &invalid_destination).is_err());
     }
 

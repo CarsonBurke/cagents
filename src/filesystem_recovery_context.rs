@@ -604,7 +604,7 @@ impl FilesystemRecoveryContext {
     }
 }
 
-#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod fixtures {
     use super::*;
@@ -641,7 +641,7 @@ pub mod fixtures {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
