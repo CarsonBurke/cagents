@@ -289,6 +289,16 @@ fn accept(
                 Some(ceiling.child(spec.provider, spec.permission_mode.as_deref())?);
         }
         selected.account = Some(selected_account(&selected)?.id());
+        // The registry starts an agent placed in a worktree, by this CLI or an
+        // older one, in its checkout's channel, and checks the checkout is
+        // the project's. The project is named here by its key, however the
+        // caller named it.
+        let key = selected.target.repository.clone();
+        if let Some(crate::agent_execution::Placement::Worktree { repository, .. }) =
+            &mut selected.target.placement
+        {
+            *repository = key;
+        }
         Some(selected)
     } else {
         None

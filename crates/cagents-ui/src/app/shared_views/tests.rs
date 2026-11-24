@@ -5043,10 +5043,22 @@ fn reference_view_scopes(app: &Cagents) -> Vec<Scope> {
 }
 
 #[test]
-fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
+fn batched_projection_matches_the_reference_over_every_workspace_shape() {
+    // The indexed projection must equal the per-scope reference, which is
+    // quadratic. The workspace keeps the shapes a long-lived one has: most
+    // panes closed, a third of them terminals scoped by their launch, a
+    // seventh listed in the channel, and worktrees that hold no pane. Its
+    // size only has to cover every shape; at a thousand panes the
+    // cards x scopes x cards listing check took minutes in a test build.
+    const CARDS: usize = 79;
+    const OPEN: usize = 13;
+    const EMPTY_WORKTREES: usize = 6;
+    // The last pane is a closed terminal outside the channel.
+    const LAST: usize = CARDS - 1;
+    const _: () = assert!(LAST.is_multiple_of(3) && !LAST.is_multiple_of(7) && LAST >= OPEN);
     let (mut app, channel, _, pane) = fixture();
     let repository = PathBuf::from("/repo/.git");
-    let paths = (0..1105)
+    let paths = (0..CARDS + EMPTY_WORKTREES)
         .map(|index| PathBuf::from(format!("/repo/worktree-{index}")))
         .collect::<Vec<_>>();
     let worktrees = paths
@@ -5077,9 +5089,9 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
     let terminal = fresh_terminal_session(LaunchRecipe::shell(paths[0].clone()).unwrap());
     let durable = Arc::make_mut(&mut app.durable);
     durable.cards.clear();
-    for (index, path) in paths[..1024].iter().enumerate() {
+    for (index, path) in paths[..CARDS].iter().enumerate() {
         let id = CardId::new();
-        let existence = if index < 172 {
+        let existence = if index < OPEN {
             Existence::Open
         } else {
             Existence::Closed {
@@ -5127,20 +5139,16 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
         .user_titles
         .insert(app.durable.cards[2].id, "custom title".into());
 
-    let started = Instant::now();
     let batched = app.local_views();
-    let batched_elapsed = started.elapsed();
-    let started = Instant::now();
     let scopes = reference_view_scopes(&app);
     let reference = scopes
         .iter()
         .map(|scope| (scope.clone(), app.local_view_panes(scope)))
         .collect::<HashMap<_, _>>();
-    let reference_elapsed = started.elapsed();
     assert_eq!(batched.scopes, scopes);
     assert_eq!(app.local_view_scopes(), scopes);
     assert_eq!(batched.panes, reference);
-    for card in app.durable.cards.iter().step_by(17) {
+    for card in &app.durable.cards {
         let listing = scopes
             .iter()
             .filter(|scope| app.local_view_cards(scope).contains(&card.id))
@@ -5149,15 +5157,13 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
         assert_eq!(app.local_scopes_listing(card.id), listing);
     }
     assert!(batched.panes[&Scope::Channel(channel)][0].pending_terminal_start);
+    // The last pane's worktree is listed but shows nothing.
     assert!(
         batched.panes[&Scope::Worktree {
             repository,
-            path: paths[1023].clone(),
+            path: paths[LAST].clone(),
         }]
             .is_empty()
-    );
-    eprintln!(
-        "large workspace projection: indexed {batched_elapsed:?}, reference {reference_elapsed:?}"
     );
 }
 #[test]
