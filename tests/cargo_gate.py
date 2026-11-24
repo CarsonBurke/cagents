@@ -1703,8 +1703,13 @@ class PreflightCancellation(unittest.TestCase):
                 self.assert_preflight_unslotted(self.calls())
                 self.assertTrue(self.slot_is_free())
 
+    def install_offload(self):
+        # The real router, with the helper it reads beside itself.
+        for name in ("cargo-offload", "git_ancestry.py"):
+            shutil.copy2(ROOT / "scripts" / name, self.root / name)
+
     def test_read_only_cargo_queries_skip_build_preflight_and_admission(self):
-        shutil.copy2(ROOT / "scripts/cargo-offload", self.root / "cargo-offload")
+        self.install_offload()
         self.configure(guard_exit=2)
         with self.lock.open("a") as slot:
             fcntl.flock(slot, fcntl.LOCK_EX)
@@ -1721,7 +1726,7 @@ class PreflightCancellation(unittest.TestCase):
                     self.assertFalse(calls[0]["marker"], calls)
 
     def test_other_local_cargo_commands_keep_build_preflight(self):
-        shutil.copy2(ROOT / "scripts/cargo-offload", self.root / "cargo-offload")
+        self.install_offload()
         self.configure(guard_exit=2)
         for arguments in (("clean",), ("fmt",), ("build-alias",), ("--offline", "metadata")):
             with self.subTest(arguments=arguments):
@@ -1732,7 +1737,7 @@ class PreflightCancellation(unittest.TestCase):
                 self.assertEqual([event["phase"] for event in self.calls()], ["metadata", "guard"])
 
     def test_local_cargo_queries_use_real_cargo_inside_gate_exec(self):
-        shutil.copy2(ROOT / "scripts/cargo-offload", self.root / "cargo-offload")
+        self.install_offload()
         process = self.start("exec", "sh", "-c", "cargo metadata --format-version=1",
                              environment=self.env | {"CAGENTS_BUILD_SHARES": "1"})
         _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
