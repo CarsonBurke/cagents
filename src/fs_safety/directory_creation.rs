@@ -965,6 +965,8 @@ fn create_unverified(
     reason: String,
 ) -> Result<DirectoryCreation, DirectoryCreateError> {
     let leaf = c_component(name, &parent.path)?;
+    let mode =
+        kernel_mode(mode).map_err(|error| ResolveError::io(&parent.path.join(name), &error))?;
     // No creation authority is inferred from mkdir followed by name resolution.
     let status = unsafe { libc::mkdirat(parent.descriptor(), leaf.as_ptr(), mode) };
     if status < 0 {
@@ -1109,6 +1111,7 @@ fn prepare_private_stage(
         {
             return Ok(false);
         }
+        let mode = kernel_mode(mode).map_err(|e| ResolveError::io(&outer.path, &e))?;
         if unsafe { libc::mkdirat(outer.descriptor(), c"directory".as_ptr(), mode) } != 0 {
             return Err(ResolveError::io(
                 &outer.path.join("directory"),

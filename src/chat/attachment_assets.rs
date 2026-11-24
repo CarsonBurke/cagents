@@ -102,17 +102,9 @@ impl Store {
         Ok(Self { root })
     }
     fn lock(&self) -> Result<crate::instance::OwnedLock, String> {
-        use std::os::unix::fs::OpenOptionsExt;
         // Our retained directory descriptor is the only parent. This fixed
         // internal leaf cannot escape or be redirected by renaming the store.
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(self.root.process_path().join(LOCK))
+        let file = fs_safety::open_or_create_within(&self.root, OsStr::new(LOCK), 0o600)
             .map_err(storage_error)?;
         validate_private(&file)?;
         crate::instance::owned_file_lock(file, libc::LOCK_EX).map_err(storage_error)
@@ -201,8 +193,9 @@ impl Store {
         }
         // Lost metadata must never silently reset numbers/device or turn
         // existing bytes into new, unrelated image identities.
-        for entry in std::fs::read_dir(self.root.process_path()).map_err(storage_error)? {
-            let name = entry.map_err(storage_error)?.file_name();
+        let names = fs_safety::directory_entries_beneath(&self.root, Path::new(""), usize::MAX)
+            .map_err(storage_error)?;
+        for name in names {
             if is_staging_temporary(&name) {
                 self.remove_private_temporary(&name)?;
                 continue;
@@ -446,14 +439,14 @@ impl Store {
     ))]
     fn remove_orphans(&self, registry: &Registry) -> Result<(), String> {
         let mut unrecognized = false;
-        for (count, entry) in std::fs::read_dir(self.root.process_path())
-            .map_err(storage_error)?
-            .enumerate()
-        {
+        // One past the bound is enough to report that it was exceeded.
+        let names =
+            fs_safety::directory_entries_beneath(&self.root, Path::new(""), MAX_STORE_IMAGES + 130)
+                .map_err(storage_error)?;
+        for (count, name) in names.into_iter().enumerate() {
             if count > MAX_STORE_IMAGES + 128 {
                 return Err("Image storage has too many unrecognized files.".into());
             }
-            let name = entry.map_err(storage_error)?.file_name();
             if is_staging_temporary(&name) {
                 self.remove_private_temporary(&name)?;
                 continue;

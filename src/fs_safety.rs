@@ -67,6 +67,12 @@ const TEMPORARY_NAME_ATTEMPTS: usize = 8;
 /// that in a loop cannot make a save spin.
 const ATTRIBUTE_SIZE_ATTEMPTS: usize = 4;
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "fs_safety confines paths with Linux openat2/O_PATH or macOS O_NOFOLLOW_ANY/O_SEARCH; \
+     another platform needs its own backend"
+);
+
 /// `struct open_how` from `linux/openat2.h`.
 ///
 /// Declared here rather than reusing `libc::open_how`, which is
@@ -83,7 +89,10 @@ struct OpenHow {
 
 /// Flags for a directory handle that grants lookup beneath it and nothing
 /// else: `O_PATH` on Linux, which needs no permission on the directory at all,
-/// and `O_SEARCH` on macOS, which needs search (execute) permission.
+/// and `O_SEARCH` on macOS, which needs search (execute) permission. So on
+/// macOS a directory without search permission cannot be held as a [`Root`],
+/// and an ancestor walk stops below one; neither can be resolved beneath
+/// there in any case.
 #[cfg(target_os = "linux")]
 const DIRECTORY_HANDLE: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
 #[cfg(target_os = "macos")]
@@ -558,11 +567,17 @@ pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> 
     )
 }
 
+/// Permission bits in the kernel's `mode_t`, which is narrower than `u32` on
+/// Darwin. A value that does not fit is refused rather than truncated.
+pub(crate) fn kernel_mode(mode: u32) -> io::Result<libc::mode_t> {
+    libc::mode_t::try_from(mode)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mode out of range"))
+}
+
 /// Changes permissions through the exact retained directory descriptor.
 #[cfg(target_os = "macos")]
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
-    let mode = libc::mode_t::try_from(mode)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mode out of range"))?;
+    let mode = kernel_mode(mode)?;
     // SAFETY: the Root owns a live descriptor for the duration of the call.
     if unsafe { libc::fchmod(directory.descriptor(), mode) } < 0 {
         return Err(io::Error::last_os_error());
@@ -618,6 +633,7 @@ pub fn create_directories_beneath(
     if relative.as_os_str().is_empty() {
         return Ok(directory);
     }
+    let mode = kernel_mode(mode).map_err(|error| ResolveError::io(relative, &error))?;
     let parts = components(relative).ok_or_else(|| ResolveError::escaped(relative))?;
     for component in parts {
         let name = c_component(component, directory.path())?;
@@ -864,6 +880,7 @@ pub fn link_anonymous_new(directory: &Root, _file: &File, to: &OsStr) -> Result<
 /// the case where randomness is unavailable.
 pub fn create_temporary_in(directory: &Root, mode: u32) -> Result<(File, OsString), ResolveError> {
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mode = kernel_mode(mode).map_err(|error| ResolveError::io(&directory.path, &error))?;
     let mut last = None;
     for _ in 0..TEMPORARY_NAME_ATTEMPTS {
         let name = temporary_name().map_err(|error| ResolveError::io(&directory.path, &error))?;
@@ -876,7 +893,7 @@ pub fn create_temporary_in(directory: &Root, mode: u32) -> Result<(File, OsStrin
                 directory.descriptor(),
                 raw.as_ptr(),
                 flags,
-                libc::mode_t::from(mode),
+                libc::c_uint::from(mode),
             )
         };
         if descriptor >= 0 {
@@ -895,6 +912,42 @@ pub fn create_temporary_in(directory: &Root, mode: u32) -> Result<(File, OsStrin
         Some(error) => ResolveError::io(&directory.path, &error),
         None => ResolveError::message(&directory.path, "no temporary name was attempted"),
     })
+}
+
+/// Opens `name` directly inside `directory` for reading and writing, creating
+/// it with `mode` if it is absent, without following a symbolic link there and
+/// without blocking on a FIFO. The caller validates what it opened.
+///
+/// # Errors
+///
+/// Returns [`ResolveError::Escaped`] when `name` is not a single component or
+/// is a symbolic link, and [`ResolveError::Io`] for every other failure.
+pub fn open_or_create_within(
+    directory: &Root,
+    name: &OsStr,
+    mode: u32,
+) -> Result<File, ResolveError> {
+    let raw = c_component(name, &directory.path)?;
+    let reported = directory.path.join(name);
+    let flags =
+        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let mode = kernel_mode(mode).map_err(|error| ResolveError::io(&reported, &error))?;
+    // SAFETY: `raw` outlives the call; `openat` returns a fresh owned
+    // descriptor or -1, and `O_CREAT` requires the variadic mode argument.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.descriptor(),
+            raw.as_ptr(),
+            flags,
+            libc::c_uint::from(mode),
+        )
+    };
+    if descriptor < 0 {
+        return Err(classify(&reported, &io::Error::last_os_error()));
+    }
+    // SAFETY: `descriptor` was just returned by a successful `openat` and is
+    // not owned anywhere else.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 /// Renames `from` to `to`, both relative to `directory`, with no path
@@ -1301,13 +1354,15 @@ fn is_content_attribute(name: &CStr) -> bool {
 /// resource forks, `com.apple.quarantine`, a user's tags) except those the
 /// kernel keeps for itself. `com.apple.system.*` holds protected kernel state,
 /// `com.apple.provenance` is stamped by the kernel and refused to anyone else,
-/// and `com.apple.rootless` marks System Integrity Protection. An access ACL is
-/// not an attribute there; [`AccessAcl`] carries it.
+/// `com.apple.macl` records sandbox grants that only the system may write, and
+/// `com.apple.rootless` marks System Integrity Protection. An access ACL is not
+/// an attribute there; [`AccessAcl`] carries it.
 #[cfg(target_os = "macos")]
 fn is_content_attribute(name: &CStr) -> bool {
     let bytes = name.to_bytes();
     !(bytes.starts_with(b"com.apple.system.")
         || bytes == b"com.apple.provenance"
+        || bytes == b"com.apple.macl"
         || bytes == b"com.apple.rootless")
 }
 
@@ -1387,7 +1442,7 @@ fn attribute_names_with_limit(file: &File, limit: usize) -> io::Result<Vec<CStri
             let error = io::Error::last_os_error();
             // A filesystem that has no such thing as an extended attribute
             // carries none, which is an answer and not a failure.
-            if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::ENOSYS)) {
+            if error.raw_os_error() == Some(libc::ENOSYS) || attributes_unsupported(&error) {
                 return Ok(Vec::new());
             }
             return Err(error);
@@ -1420,6 +1475,13 @@ fn attribute_names_with_limit(file: &File, limit: usize) -> io::Result<Vec<CStri
         // The list grew between being sized and being read, so ask again.
     }
     Err(io::Error::from_raw_os_error(libc::ERANGE))
+}
+
+/// Whether a filesystem has no extended attributes at all. Linux gives
+/// `ENOTSUP` and `EOPNOTSUPP` one number; Darwin gives them two.
+fn attributes_unsupported(error: &io::Error) -> bool {
+    let errno = error.raw_os_error();
+    errno == Some(libc::ENOTSUP) || errno == Some(libc::EOPNOTSUPP)
 }
 
 /// Splits `flistxattr`'s NUL-terminated, concatenated names.

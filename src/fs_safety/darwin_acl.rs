@@ -48,9 +48,14 @@ impl Drop for Owned {
 
 /// Whether a failed ACL read means the file simply has none.
 fn absent(error: &io::Error) -> bool {
-    // `ENOENT` is how `acl_get_fd_np` reports a file without an ACL;
-    // a filesystem that has no ACLs at all answers `ENOTSUP`.
-    matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTSUP))
+    // `ENOENT` is how `acl_get_fd_np` reports a file without an ACL.
+    error.raw_os_error() == Some(libc::ENOENT) || unsupported(error)
+}
+
+/// Whether the filesystem has no ACLs at all. Darwin, unlike Linux, gives
+/// `ENOTSUP` and `EOPNOTSUPP` different numbers, and volumes answer either.
+fn unsupported(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP))
 }
 
 impl AccessAcl {
@@ -88,15 +93,16 @@ impl AccessAcl {
             // SAFETY: the bytes are an external form this library wrote, and
             // they outlive the call; the result is null or a new owned ACL.
             Some(external) => Owned::new(unsafe { acl_copy_int_native(external.as_ptr().cast()) })?,
-            // An empty ACL replaces whatever the destination inherited from
-            // its parent directory, as removing the POSIX attribute does.
+            // Setting an empty ACL removes the destination's ACL entirely, as
+            // removing the POSIX attribute does on Linux: afterwards
+            // `acl_get_fd_np` answers `ENOENT` and `ls -le` lists nothing.
             // SAFETY: the result is null or a new owned ACL.
             None => Owned::new(unsafe { acl_init(0) })?,
         };
         // SAFETY: the descriptor and the ACL are both live for the call.
         if unsafe { acl_set_fd_np(destination.as_raw_fd(), acl.0, ACL_TYPE_EXTENDED) } < 0 {
             let error = io::Error::last_os_error();
-            if self.0.is_none() && error.raw_os_error() == Some(libc::ENOTSUP) {
+            if self.0.is_none() && unsupported(&error) {
                 // Nothing to remove on a filesystem without ACLs.
                 return Ok(());
             }
