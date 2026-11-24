@@ -912,14 +912,21 @@ impl Claude {
     }
 
     fn observe_title(&mut self, step: &mut Step) {
-        if let Some(id) = self.session_id.clone()
+        if let Some(id) = &self.session_id
             && let Some(titles) = &mut self.titles
-            && let Some(title) = titles.update(&id)
+            && let Some(title) = titles.update(id)
         {
             step.events.push(Event::Session {
-                id,
+                id: id.clone(),
                 title: Some(title),
             });
+        }
+        if let Some(title) = self
+            .history
+            .as_mut()
+            .and_then(|history| history.opening_title.take())
+        {
+            step.events.push(Event::OpeningTitle(title));
         }
     }
 
@@ -3672,6 +3679,25 @@ impl Adapter for Claude {
     fn outcome_pending(&self) -> bool {
         !self.deferred_attention.is_empty()
     }
+    fn metadata_wake(&self) -> Option<super::MetadataWake<'_>> {
+        // Result frames account for ordinary writes during a turn. While
+        // idle a title can change without any provider frame to wake us.
+        if self.busy {
+            return None;
+        }
+        self.titles.as_ref()?.metadata_wake()
+    }
+    fn refresh_metadata(&mut self) -> Option<Step> {
+        let id = self.session_id.as_ref()?;
+        let title = self.titles.as_mut()?.refresh(id)?;
+        Some(Step {
+            events: vec![Event::Session {
+                id: id.clone(),
+                title: Some(title),
+            }],
+            ..Step::default()
+        })
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         self.initialize_for_start()
             .map_err(|error| error.to_string())
@@ -4280,6 +4306,9 @@ impl Claude {
                 self.started_generation = None;
                 self.session_id = None;
                 self.history = None;
+                if let Some(titles) = &mut self.titles {
+                    titles.reset();
+                }
                 self.pending.clear();
                 self.retired.clear();
                 self.streams.clear();
@@ -5344,6 +5373,57 @@ fn actual_user_prompt(frame: &Value) -> bool {
                     .any(|block| matches!(string(block, "type"), "text" | "image" | "document"))
         });
     prompt && delivery(frame).is_empty()
+}
+
+/// Project just the human text for naming an opening on the saved chain.
+/// Image and document blocks do not contribute a title.
+fn opening_title(frame: &Value) -> Option<crate::chat::OpeningTitle> {
+    if !actual_user_prompt(frame)
+        || frame["isSidechain"] == true
+        || !string(frame, "teamName").is_empty()
+        || !string(frame, "parent_tool_use_id").is_empty()
+        || [
+            "isSynthetic",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ]
+        .iter()
+        .any(|key| frame[*key] == true)
+        || stop_record(&frame["message"])
+    {
+        return None;
+    }
+    let title = |text: &str| {
+        let text = text.trim();
+        if model_only_note(text)
+            || text.starts_with(SKILL_DIRECTORY)
+            || text.starts_with("<local-command-")
+            || hook_feedback(text)
+        {
+            return None;
+        }
+        crate::chat::OpeningTitle::from_text(slash_command_prompt(text).as_deref().unwrap_or(text))
+    };
+    let content = &frame["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return title(text);
+    }
+    let mut fallback = None;
+    for block in content.as_array()? {
+        let candidate = match block["type"].as_str() {
+            Some("text") => block["text"].as_str().and_then(title),
+            Some("image") => Some(crate::chat::OpeningTitle::Image),
+            Some("document") => Some(crate::chat::OpeningTitle::Conversation),
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            if !candidate.provisional() {
+                return Some(candidate);
+            }
+            fallback.get_or_insert(candidate);
+        }
+    }
+    fallback
 }
 
 /// What a user frame Claude Code wrote on another agent's behalf delivers,
@@ -8140,6 +8220,7 @@ struct History {
     /// Latest actual user prompt on the displayed chain; provider notices and
     /// tool-result carriers never advance the current failure scope.
     latest_prompt: Option<u64>,
+    opening_title: Option<crate::chat::OpeningTitle>,
     background_agent_tools: HashSet<String>,
     /// How the background work other calls started ended, by call, as the
     /// transcript's notifications recorded it. One entry per notified call,
@@ -9085,6 +9166,7 @@ impl History {
             agent_labels: HashMap::new(),
             agent_status: HashMap::new(),
             latest_prompt,
+            opening_title: None,
             background_agent_tools: HashSet::new(),
             call_outcomes: HashMap::new(),
             result_calls,
@@ -9093,8 +9175,33 @@ impl History {
             oversized,
             marked,
         };
+        history.opening_title = history.find_opening_title(&user_prompts);
         history_branches::index_activity(&mut history, &nodes, &ambiguous, &task_notices)?;
         Ok(history)
+    }
+
+    /// The earliest readable prompt on this conversation's displayed branch,
+    /// including prompts older than the page loaded at startup.
+    fn find_opening_title(&mut self, prompts: &HashSet<u64>) -> Option<crate::chat::OpeningTitle> {
+        let mut fallback = None;
+        for index in 0..self.chain.len() {
+            let Link::Record(offset, len, base) = self.chain[index] else {
+                continue;
+            };
+            if !prompts.contains(&offset) {
+                continue;
+            }
+            let Ok(frame) = self.read_record_for_start(offset, len, base) else {
+                continue;
+            };
+            if let Some(title) = opening_title(&frame) {
+                if !title.provisional() {
+                    return Some(title);
+                }
+                fallback.get_or_insert(title);
+            }
+        }
+        fallback
     }
     /// A transcript records what ran, not proof of a process still running.
     /// Keep confirmed terminal outcomes; unresolved runs have ended for the

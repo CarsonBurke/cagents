@@ -1715,6 +1715,10 @@ pub struct Snapshot {
     #[serde(default)]
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
+    /// The first meaningful user prompt, kept independently of loaded pages.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    pub(crate) opening_title: Option<OpeningTitle>,
     pub error: Option<String>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
@@ -3701,6 +3705,81 @@ pub enum Event {
     /// Live evidence about the main conversation's prompt cache. The
     /// runtime keeps it beside the transcript, never in it.
     PromptCache(prompt_cache::Evidence),
+    /// A prompt-derived title from the exact conversation's opening.
+    #[cfg(feature = "host")]
+    OpeningTitle(OpeningTitle),
+}
+
+#[cfg(feature = "host")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A provider-independent title inferred from user content on the daemon.
+pub enum OpeningTitle {
+    Conversation,
+    Image,
+    Prompt(String),
+}
+
+#[cfg(feature = "host")]
+impl OpeningTitle {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Image => "Image conversation",
+            Self::Prompt(title) => title,
+        }
+    }
+
+    pub(crate) fn provisional(&self) -> bool {
+        !matches!(self, Self::Prompt(_))
+    }
+
+    pub(crate) fn from_text(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() || mailbox_prompt(text) {
+            return None;
+        }
+        let title = crate::workspace_model::channel_title_from_prompt(text)
+            .map(Self::Prompt)
+            .unwrap_or_else(|| {
+                if crate::workspace_model::image_placeholder_prompt(text) {
+                    Self::Image
+                } else {
+                    Self::Conversation
+                }
+            });
+        Some(title)
+    }
+
+    pub(crate) fn observe(current: &mut Option<Self>, item: &Item) {
+        if item.role != Role::User || current.as_ref().is_some_and(|title| !title.provisional()) {
+            return;
+        }
+        let candidate = match &item.content {
+            ItemContent::Text {
+                text,
+                thinking: false,
+                ..
+            } => Self::from_text(text),
+            ItemContent::Image { .. } => Some(Self::Image),
+            _ => None,
+        };
+        if let Some(candidate) = candidate
+            && (current.is_none() || !candidate.provisional())
+        {
+            *current = Some(candidate);
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn mailbox_prompt(text: &str) -> bool {
+    // This filters title candidates on replay. A seal grants no authority
+    // here. Only the daemon's recognizer can turn a prompt into a delivery.
+    text.starts_with("[cagents ")
+        && crate::agent_execution::mailbox::open(text, |_, seal| {
+            seal.len() == 32 && seal.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .is_some()
 }
 
 #[cfg(test)]

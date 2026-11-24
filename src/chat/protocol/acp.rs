@@ -35,6 +35,8 @@ mod tools;
 /// What an agent calls a conversation it has not named yet, as Muse's own
 /// session list does.
 const PLACEHOLDER_TITLES: &[&str] = &["New session"];
+const MAX_TITLE_BYTES: usize = 4096;
+const MAX_TITLE_LIST_PAGES: u8 = 64;
 /// The ACP version this client speaks.
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_COMMANDS: usize = 256;
@@ -46,6 +48,12 @@ const MAX_SEGMENT_IDS: usize = 4096;
 /// The approvals that may be open at once; an agent asking for more is
 /// refused rather than piling them up in front of the reader.
 const MAX_PERMISSIONS: usize = 64;
+
+fn title_text(value: &Value) -> Option<&str> {
+    let title = value.as_str()?;
+    let title = title[..title.floor_char_boundary(title.len().min(MAX_TITLE_BYTES))].trim();
+    (!title.is_empty() && !PLACEHOLDER_TITLES.contains(&title)).then_some(title)
+}
 
 /// What one agent needs beyond the protocol itself.
 pub struct Profile {
@@ -213,6 +221,7 @@ enum Setting {
 enum Pending {
     Initialize,
     Open,
+    ListTitle { pages_left: u8 },
     Setting(Setting),
     Prompt,
 }
@@ -251,6 +260,8 @@ struct Acp {
     next_request: u64,
     pending: HashMap<u64, Pending>,
     session: Option<String>,
+    list_titles: bool,
+    title: Option<String>,
     images: bool,
     config: config::Config,
     /// Settings waiting to be sent; only one is in flight at a time, since
@@ -281,6 +292,8 @@ impl Acp {
             next_request: 0,
             pending: HashMap::new(),
             session: None,
+            list_titles: false,
+            title: None,
             images: false,
             config: config::Config::default(),
             settings: VecDeque::new(),
@@ -312,6 +325,65 @@ impl Acp {
 
     fn session_id(&self) -> &str {
         self.session.as_deref().unwrap_or_default()
+    }
+
+    fn set_title(&mut self, title: &str, events: &mut Vec<Event>) {
+        if self.title.as_deref() != Some(title) {
+            self.title = Some(title.to_owned());
+            events.push(Event::Session {
+                id: self.session_id().to_owned(),
+                title: self.title.clone(),
+            });
+        }
+    }
+
+    fn discard_title_request(&mut self) {
+        self.pending
+            .retain(|_, request| !matches!(request, Pending::ListTitle { .. }));
+    }
+
+    fn refresh_title(&mut self, step: &mut Step) {
+        if self.list_titles {
+            self.discard_title_request();
+            self.list_title_page(None, MAX_TITLE_LIST_PAGES, step);
+        }
+    }
+
+    fn list_title_page(&mut self, cursor: Option<&str>, pages_left: u8, step: &mut Step) {
+        let mut params = json!({"cwd": self.cwd});
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let (_, frame) = self.request("session/list", params, Pending::ListTitle { pages_left });
+        step.writes.push(frame);
+    }
+
+    fn listed_title(&mut self, outcome: Result<&Value, &Value>, pages_left: u8, step: &mut Step) {
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                if error["code"].as_i64() == Some(rpc::METHOD_NOT_FOUND) {
+                    self.list_titles = false;
+                }
+                return;
+            }
+        };
+        let own_session = result["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["sessionId"].as_str() == self.session.as_deref());
+        if let Some(entry) = own_session {
+            if let Some(title) = title_text(&entry["title"]) {
+                self.set_title(title, &mut step.events);
+            }
+        } else if pages_left > 1
+            && let Some(cursor) = result["nextCursor"]
+                .as_str()
+                .filter(|cursor| !cursor.is_empty())
+        {
+            self.list_title_page(Some(cursor), pages_left - 1, step);
+        }
     }
 
     /// The message a reader is shown for an error reply: its own words, or
@@ -618,6 +690,7 @@ impl Acp {
             key: Some(turn.key),
             outcome: kind,
         });
+        self.refresh_title(step);
     }
 
     fn respond(&mut self, id: u64, outcome: Result<&Value, &Value>, step: &mut Step) {
@@ -647,6 +720,7 @@ impl Acp {
                     self.fail(message, step);
                 }
             },
+            Pending::ListTitle { pages_left } => self.listed_title(outcome, pages_left, step),
             Pending::Setting(setting) => {
                 self.setting_in_flight = false;
                 match outcome {
@@ -714,6 +788,7 @@ impl Acp {
         }
         let capabilities = &result["agentCapabilities"];
         self.images = capabilities["promptCapabilities"]["image"].as_bool() == Some(true);
+        self.list_titles = capabilities["sessionCapabilities"]["list"].is_object();
         self.stage = Stage::Opening;
         let cwd = self.cwd.clone();
         match self.resume.clone() {
@@ -767,8 +842,12 @@ impl Acp {
             for (id, content) in self.calls.stop_running() {
                 replay.absorb(Event::Item(tool_item(id, content)));
             }
+            let (items, opening_title) = replay.finish();
+            if let Some(title) = opening_title {
+                step.events.push(Event::OpeningTitle(title));
+            }
             step.events.push(Event::History {
-                items: replay.finish(),
+                items,
                 has_earlier: false,
             });
         }
@@ -783,6 +862,11 @@ impl Acp {
         self.stage = Stage::Configuring;
         if !self.send_setting(step) {
             self.become_ready(step);
+        }
+        // Session load replays messages, but an agent may only publish a
+        // saved conversation's title in session/list.
+        if self.resume.is_some() {
+            self.refresh_title(step);
         }
     }
 
@@ -965,17 +1049,12 @@ impl Acp {
                 }
             }
             "session_info_update" => {
-                // A placeholder names no conversation; the reader's first
-                // prompt names it better until the agent gives it a name.
-                if let Some(title) = update["title"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|title| !title.is_empty() && !PLACEHOLDER_TITLES.contains(title))
-                {
-                    events.push(Event::Session {
-                        id: self.session_id().to_owned(),
-                        title: Some(title.to_owned()),
-                    });
+                if let Some(title) = title_text(&update["title"]) {
+                    // An agent that publishes title changes live needs no
+                    // listing, and an outstanding list may be older.
+                    self.list_titles = false;
+                    self.discard_title_request();
+                    self.set_title(title, &mut events);
                 }
             }
             "usage_update" => {

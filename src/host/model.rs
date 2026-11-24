@@ -227,6 +227,23 @@ impl Registry {
         Ok(view)
     }
 
+    pub(crate) fn title_channel_for_chat(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<Option<ChannelId>, String> {
+        let Some(card) = views::store::chat_pane(&self.db, id)? else {
+            return Ok(None);
+        };
+        match views::store::owner(&self.db, card)? {
+            Some(crate::workspace_model::views::Scope::Channel(id)) => Ok(Some(id)),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn channel(&self, id: ChannelId) -> Result<Option<ModelChannel>, String> {
+        channel_row(&self.db, id)
+    }
+
     /// Metadata-only queries pin the same coherent WAL snapshot as full reads.
     pub(crate) fn metadata(
         &self,

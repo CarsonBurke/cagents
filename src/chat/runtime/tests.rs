@@ -4530,6 +4530,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
             | Update::Ready
             | Update::PromptAvailable
             | Update::RetainedOutcomes
+            | Update::ConversationNameChanged
             | Update::Execution { .. } => None,
         })
         .collect();

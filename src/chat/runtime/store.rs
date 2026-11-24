@@ -211,6 +211,8 @@ pub(crate) struct Store {
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
+    naming_session: Option<String>,
+    opening_title: Option<crate::chat::OpeningTitle>,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
 }
@@ -467,6 +469,8 @@ impl Store {
                 presentation: None,
                 presented_children: Default::default(),
                 pending_text: None,
+                naming_session: None,
+                opening_title: None,
             })
         })();
         if result.is_err() {
@@ -976,6 +980,59 @@ impl Store {
     ) -> Result<Vec<Event>, crate::chat::protocol::SetupError> {
         self.apply_inner(event).map_err(Into::into)
     }
+
+    fn observe_opening(&mut self, event: &Event, out: &mut Vec<Event>) {
+        use crate::chat::OpeningTitle;
+        match event {
+            Event::Reset { .. } => {
+                self.naming_session = None;
+                self.opening_title = None;
+            }
+            Event::Session { id, .. } if self.naming_session.as_ref() != Some(id) => {
+                if self.naming_session.replace(id.clone()).is_some() {
+                    self.opening_title = None;
+                }
+            }
+            Event::OpeningTitle(title) => self.opening_title = Some(title.clone()),
+            _ => {}
+        }
+        if self
+            .opening_title
+            .as_ref()
+            .is_some_and(|title| !title.provisional())
+        {
+            return;
+        }
+        let items = match event {
+            Event::Item(item) => std::slice::from_ref(item),
+            Event::History {
+                items,
+                has_earlier: false,
+            }
+            | Event::LatestHistory {
+                items,
+                has_earlier: false,
+            } => items.as_slice(),
+            _ => return,
+        };
+        let previous = self.opening_title.clone();
+        for item in items {
+            OpeningTitle::observe(&mut self.opening_title, item);
+            if self
+                .opening_title
+                .as_ref()
+                .is_some_and(|title| !title.provisional())
+            {
+                break;
+            }
+        }
+        if self.opening_title != previous
+            && let Some(title) = &self.opening_title
+        {
+            out.push(Event::OpeningTitle(title.clone()));
+        }
+    }
+
     fn apply_inner(&mut self, mut event: Event) -> Result<Vec<Event>, StoreError> {
         self.diagnostics.observe(&mut event);
         if let Some(seal) = &self.messages {
@@ -989,6 +1046,7 @@ impl Store {
         }
         self.index_child_event(&event)?;
         let mut out = Vec::new();
+        self.observe_opening(&event, &mut out);
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
             && let Some(warning) = self.flush_text()?

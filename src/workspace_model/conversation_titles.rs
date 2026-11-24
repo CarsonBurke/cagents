@@ -31,9 +31,10 @@ pub fn channel_title_from_prompt(prompt: &str) -> Option<String> {
     let mut context_depth = 0usize;
     let mut best: Option<(usize, String)> = None;
     for line in prompt[..limit].lines().take(INPUT_LINES) {
-        let mut line = line.trim();
+        let text = without_image_placeholders(line);
+        let line = text.trim();
         let quoted = line.starts_with('>');
-        line = line.trim_start_matches(['>', ' ']);
+        let line = line.trim_start_matches(['>', ' ']);
         if line.starts_with("```") || line.starts_with("~~~") {
             let marker = line.as_bytes()[0];
             if fence == Some(marker) {
@@ -96,6 +97,12 @@ fn candidate(line: &str, quoted: bool) -> Option<(usize, String)> {
         return None;
     }
     let lower = line.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "image inputs (in order):" | "unlabeled image"
+    ) {
+        return None;
+    }
     if [
         "you are ",
         "act as ",
@@ -104,6 +111,8 @@ fn candidate(line: &str, quoted: bool) -> Option<(usize, String)> {
         "hello",
         "hi there",
         "user request",
+        "unlabeled image:",
+        "attached file:",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
@@ -186,6 +195,51 @@ fn candidate(line: &str, quoted: bool) -> Option<(usize, String)> {
     Some((score, title))
 }
 
+/// The caption Claude and Codex add for an attachment does not describe the
+/// conversation. Preserve the surrounding prompt, including inline text.
+fn without_image_placeholders(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut cleaned = String::new();
+    let mut start = 0;
+    for (index, _) in text.match_indices('[') {
+        let tail = &text[index..];
+        let fixed = [
+            "[image]",
+            "[Image shown in the conversation]",
+            "[Image unavailable or exceeds the 16 MiB image limit]",
+        ];
+        let end = fixed
+            .iter()
+            .find(|marker| tail.starts_with(**marker))
+            .map(|marker| index + marker.len())
+            .or_else(|| {
+                let label = tail.strip_prefix("[Image ")?;
+                let digits = label.bytes().take_while(u8::is_ascii_digit).count();
+                (digits > 0 && label.as_bytes().get(digits) == Some(&b']'))
+                    .then_some(index + "[Image ".len() + digits + 1)
+            });
+        if let Some(end) = end {
+            cleaned.push_str(&text[start..index]);
+            cleaned.push(' ');
+            start = end;
+        }
+    }
+    if start == 0 {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        cleaned.push_str(&text[start..]);
+        std::borrow::Cow::Owned(cleaned)
+    }
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn image_placeholder_prompt(text: &str) -> bool {
+    // Most prompts have no attachment marker. Bound the detection the same way
+    // the title parser bounds ordinary prompt text.
+    text.len() <= INPUT_BYTES
+        && (text.contains("[Image ") || text.contains("[image]"))
+        && without_image_placeholders(text).trim().is_empty()
+}
+
 fn strip_prefix<'a>(mut text: &'a str, prefixes: &[&str]) -> &'a str {
     for _ in 0..3 {
         let Some(prefix) = prefixes.iter().find(|prefix| {
@@ -252,6 +306,33 @@ mod tests {
             channel_title_from_prompt("```rust\nlet ignored = 1;\n```\n- Fix history paging")
                 .as_deref(),
             Some("Fix history paging")
+        );
+    }
+
+    #[test]
+    fn attachment_captions_leave_only_the_prompt_text() {
+        for text in [
+            "[Image 236]",
+            "[Image 3] [Image 27]",
+            "[Image shown in the conversation]",
+            "[image]",
+        ] {
+            assert_eq!(channel_title_from_prompt(text), None);
+        }
+        assert_eq!(
+            channel_title_from_prompt("[Image 206] Please fix the spacing [Image 207]").as_deref(),
+            Some("fix the spacing")
+        );
+        assert_eq!(
+            channel_title_from_prompt("Compare [Image 206] with the reference").as_deref(),
+            Some("Compare with the reference")
+        );
+        let bookkeeping = "Image inputs (in order):\nUnlabeled image: /work/screenshot.png\nAttached file: /work/error log.txt";
+        assert_eq!(channel_title_from_prompt(bookkeeping), None);
+        assert_eq!(
+            channel_title_from_prompt(&format!("Compare the screenshots\n{bookkeeping}"))
+                .as_deref(),
+            Some("Compare the screenshots")
         );
     }
 

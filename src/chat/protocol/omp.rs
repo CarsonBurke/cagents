@@ -3558,6 +3558,35 @@ mod tests {
         assert_eq!(titled(Value::Null), Some(None));
     }
 
+    #[test]
+    fn a_completed_turn_refreshes_the_provider_session_name() {
+        let mut adapter = Omp::default();
+        let state = |request: &Value, name: &str| {
+            json!({"type":"response", "id":request["id"], "command":"get_state", "success":true,
+                "data":{"sessionId":"session", "sessionName":name}})
+        };
+        let title = |title: &str| Event::Session {
+            id: "session".into(),
+            title: Some(title.into()),
+        };
+        let request = adapter.request("get_state");
+        let initial = adapter
+            .receive(state(&request, "Original session name"))
+            .unwrap();
+        assert!(initial.events.contains(&title("Original session name")));
+
+        let ended = adapter
+            .receive(json!({"type":"agent_end", "isTerminal":true}))
+            .unwrap();
+        let request = ended
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let refreshed = adapter.receive(state(request, "Renamed session")).unwrap();
+        assert!(refreshed.events.contains(&title("Renamed session")));
+    }
+
     /// Compaction's only visible effect is the context figure, so the reply
     /// to one has to ask for the session's state again. The surface draws
     /// that figure as a ring beside the composer's compact control, and a
