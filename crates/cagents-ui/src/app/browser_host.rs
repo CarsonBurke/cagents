@@ -424,7 +424,7 @@ mod tests {
             assert_eq!(host.node().label(), Some("Browser host"));
             let description = host.node().description().unwrap();
             assert!(description.contains(state.label()));
-            assert!(description.contains(&card.to_string()));
+            assert!(!description.contains(&card.to_string()));
             assert!(description.contains("https://example.test/path"));
             assert!(description.contains("Embedded webpage accessibility is unavailable"));
             assert!(!host.node().supports_action(Action::Focus));
@@ -503,7 +503,8 @@ mod tests {
             accessible.root()[0].id().clone().into();
         assert_ne!(old_id, new_id);
         let description = accessible.root()[0].node().description().unwrap();
-        assert!(description.contains(&second.to_string()));
+        // The new host's identity is its node, not words in its description.
+        assert!(!description.contains(&second.to_string()));
         assert!(!description.contains(&first.to_string()));
     }
 
@@ -738,7 +739,7 @@ mod tests {
             assert_eq!(app.workspace.focused(), focus);
             assert_eq!(app.durable.focused, saved);
             let message = &app.status.as_ref().unwrap().message;
-            assert!(message.contains(&card.to_string()));
+            assert!(!message.contains(&card.to_string()));
             for forbidden in ["password", "secret", "token", "https", "bob"] {
                 assert!(!message.contains(forbidden));
             }

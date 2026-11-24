@@ -1158,6 +1158,13 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
         for open in [false, true] {
             runtime.child_picker =
                 open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
+            // What a chooser row for each child is named.
+            let choice_names: std::collections::HashSet<String> = runtime
+                .snapshot
+                .subagents
+                .iter()
+                .map(|child| runtime.child_choice_name(child, &runtime.child_label(child, 80)))
+                .collect();
             for height in [180.0, 600.0] {
                 // The navbar contains only the trigger. Exercise the actual
                 // in-pane chooser, including its bounded window of choices.
@@ -1194,11 +1201,7 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                         node.node().role() == iced_accessibility::accesskit::Role::Button
                     })
                     .filter_map(|node| node.node().label())
-                    .filter(|label| {
-                        label
-                            .rsplit_once(" · ")
-                            .is_some_and(|(_, id)| id.starts_with("worker-"))
-                    })
+                    .filter(|label| choice_names.contains(*label))
                     .collect();
                 // The chooser builds only the rows in and near its view.
                 if open {

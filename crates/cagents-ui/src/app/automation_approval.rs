@@ -1154,10 +1154,7 @@ mod tests {
         let id = crate::model::ChannelId::new();
         proposal.definition.agent.target.placement = Some(Placement::Channel(id));
         proposal.channel_title = Some("Review queue".into());
-        assert_eq!(
-            placement_description(&proposal),
-            format!("Channel Review queue ({id})")
-        );
+        assert_eq!(placement_description(&proposal), "Channel Review queue");
         proposal.definition.agent.target.placement = Some(Placement::Worktree {
             repository: "/fixture".into(),
             path: "/fixture/feature branch".into(),
