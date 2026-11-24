@@ -570,15 +570,15 @@ rehearse() {
     on_host "$incoming" <<'HOST' || fail "cannot prepare $BUILD_HOST for the rehearsal"
 mkdir -p -- ~/.cache/cagents-release-rehearsal/"$2"
 HOST
-    if ! scp -q -- "${files[@]}" "$BUILD_HOST:.cache/cagents-release-rehearsal/$incoming/"; then
-        on_host "$incoming" <<<'rm -rf -- ~/.cache/cagents-release-rehearsal/"$2"' || :
-        fail "cannot copy the cut to $BUILD_HOST"
-    fi
     # Interrupted here, stop the run there too: it would hold the lock and
     # the desktop for minutes, its output going nowhere.
     trap 'trap - INT TERM; printf "Stopping the rehearsal on %s.\n" "$BUILD_HOST" >&2
           on_host "$incoming" <<<"kill -TERM -- -\$(cat ~/.cache/cagents-release-rehearsal/\$2.pid) 2>/dev/null; rm -rf -- ~/.cache/cagents-release-rehearsal/\$2" || :
           exit 130' INT TERM
+    if ! scp -q -- "${files[@]}" "$BUILD_HOST:.cache/cagents-release-rehearsal/$incoming/"; then
+        on_host "$incoming" <<<'rm -rf -- ~/.cache/cagents-release-rehearsal/"$2"' || :
+        fail "cannot copy the cut to $BUILD_HOST"
+    fi
     status=0
     on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" "$REHEARSAL_PARENTS" "$incoming" <<'HOST' || status=$?
 # Parsed whole before it runs, so nothing it starts reads the rest of it.
@@ -628,7 +628,7 @@ fi
 # afresh, so that nothing else in the directory can redirect Git.
 git -C "$repository" worktree remove --force "$harness" 2>/dev/null || rm -rf -- "$harness"
 git -C "$repository" worktree prune
-git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main
+git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main || :
 git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin "$sha"
 git -C "$repository" worktree add -q --detach "$harness" "$sha"
 local rehearse=$harness/scripts/rehearse-update
@@ -649,6 +649,9 @@ if [[ -e $root ]]; then
 fi
 before=$(git_above "$(dirname -- "$root")")
 [[ -z $before ]] || { echo "release: $before is above $root, and the product refuses a root inside a checkout; set CAGENTS_RELEASE_REHEARSAL_ROOT" >&2; exit 1; }
+# An interrupt stops the harness, which then stops what it started; the
+# lock stays held until it has.
+trap : TERM
 "$rehearse" --root "$root" run --old-dir "$old" --old-version "$previous" --old-installer "$old/install.sh" \
     --new-dir "$new" --new-version "$version" --new-installer "$new/install.sh" --answer yes \
     --ended-provider "${path[@]}" >/dev/null 9>&- || status=$?
@@ -701,8 +704,11 @@ fi
 setsid -w bash -c "$(declare -f main main_run); main \"\$@\"" bash "$@" </dev/null
 HOST
     trap - INT TERM
-    printf '%s %s to %s in %d min %d s.\n' "$( ((status == 0)) && echo Rehearsed || echo 'The rehearsal of')" \
-        "$previous" "$VERSION" $(((SECONDS - started) / 60)) $(((SECONDS - started) % 60))
+    if ((status == 0)); then
+        printf 'Rehearsed %s to %s in %d min %d s.\n' "$previous" "$VERSION" $(((SECONDS - started) / 60)) $(((SECONDS - started) % 60))
+    else
+        printf 'The rehearsal of %s to %s failed after %d min %d s.\n' "$previous" "$VERSION" $(((SECONDS - started) / 60)) $(((SECONDS - started) % 60))
+    fi
     ((status == 0)) || fail "the rehearsal of $VERSION did not pass"
 }
 

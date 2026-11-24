@@ -183,7 +183,9 @@ steps, each through `mise run release` (`scripts/release --help`):
      reopens them, and requires the same again.
 
    It takes about 12 minutes, plus the published release's download the
-   first time. Interrupting it stops the run on the host too.
+   first time. Interrupting it stops the run on the host too. The options
+   it passes come from this checkout and the harness from the cut commit, so
+   a cut older than the harness options (#3919, #3938) is refused by them.
 
    Either way the update must end `Complete` with no refusal. A reopened
    window reports anything else as "Update failed" or "Update not installed",
