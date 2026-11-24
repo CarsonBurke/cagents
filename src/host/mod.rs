@@ -993,15 +993,16 @@ fn finish_terminal_shutdown(
     handles: &[crate::terminal::TerminalHandle],
 ) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
     // Request and register every original before waiting on any one worker.
-    // One absolute deadline bounds the whole batch, including pending joins;
-    // an unfinished owner cannot consume another five seconds per sibling.
-    let deadline = std::time::Instant::now() + crate::terminal::TerminalHandle::SHUTDOWN_TIMEOUT;
+    // Every join budget counts from this one instant, so the batch, including
+    // pending joins, ends within the longest budget: an unfinished owner
+    // cannot consume another join budget per sibling.
+    let started = std::time::Instant::now();
     for handle in handles {
         handle.request_shutdown();
     }
     handles
         .iter()
-        .map(|handle| handle.shutdown_until(deadline))
+        .map(|handle| handle.shutdown_until(started + handle.shutdown_join_budget()))
         .collect()
 }
 

@@ -1256,6 +1256,7 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
+    /// The product's [`Self::shutdown_join_budget`].
     pub(crate) const SHUTDOWN_TIMEOUT: Duration = WORKER_JOIN_TIMEOUT;
     /// Captured from the authenticated original holder before worker startup;
     /// never rediscovered by a reusable terminal ID.
@@ -2377,7 +2378,7 @@ impl TerminalHandle {
             self.request_shutdown();
             if !joins::wait_until(
                 &self.inner.worker,
-                Some(std::time::Instant::now() + self.inner.published.shutdown_budget().join),
+                Some(std::time::Instant::now() + self.shutdown_join_budget()),
                 true,
             ) {
                 return TerminalCloseResult::Unknown(
@@ -2405,7 +2406,13 @@ impl TerminalHandle {
     }
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
-        self.shutdown_until(std::time::Instant::now() + self.inner.published.shutdown_budget().join)
+        self.shutdown_until(std::time::Instant::now() + self.shutdown_join_budget())
+    }
+
+    /// How long a caller waits for this worker to finish shutting down:
+    /// [`Self::SHUTDOWN_TIMEOUT`] in the product.
+    pub(crate) fn shutdown_join_budget(&self) -> Duration {
+        self.inner.published.shutdown_budget().join
     }
 
     pub(crate) fn shutdown_until(
