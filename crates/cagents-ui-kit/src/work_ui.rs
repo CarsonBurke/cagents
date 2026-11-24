@@ -1441,17 +1441,6 @@ fn quiet_column(column: Column) -> Option<&'static str> {
     matches!(column, Column::Landed | Column::Stale).then(|| column.label())
 }
 
-/// `↑6 ↓22`: commits ahead of and behind the project's base, when either.
-fn comparison_counts(item: &Item) -> Option<String> {
-    let comparison = item.comparison.as_ref()?;
-    match (comparison.ahead, comparison.behind) {
-        (0, 0) => None,
-        (ahead, 0) => Some(format!("↑{ahead}")),
-        (0, behind) => Some(format!("↓{behind}")),
-        (ahead, behind) => Some(format!("↑{ahead} ↓{behind}")),
-    }
-}
-
 /// What a card's naming line says on hover, one fact a line: its worktree's
 /// folder, its Linear ticket's title, and how far it has gone from its base.
 fn details(item: &Item) -> Option<String> {
