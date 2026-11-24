@@ -52,9 +52,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.key
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -64,13 +68,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.cagents.mobile.client.Conversation
 import dev.cagents.mobile.client.ConnectionState
 import dev.cagents.mobile.protocol.ConversationState
 import dev.cagents.mobile.protocol.PlanStatus
 import dev.cagents.mobile.protocol.SendMode
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.time.Duration.Companion.milliseconds
+
+/** How far from the newest item still counts as at the end. */
+private const val END_SLOP_PX = 48
+private val STOP_ARM_DELAY = 1500.milliseconds
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -80,15 +92,17 @@ fun ConversationScreen(
     snackbar: SnackbarHostState,
     onBack: () -> Unit,
 ) {
-    DisposableEffect(session) {
-        vm.openConversation(session)
-        onDispose { vm.closeConversation(session) }
-    }
+    // Watched for as long as this screen is on the back stack: across
+    // configuration changes, not just while composed.
+    viewModel(key = "watch/$session") { ConversationWatch(vm, session) }
     val remote by vm.remote.collectAsStateWithLifecycle()
     val conversation = remote.conversations[session]
     val listed = remote.sessions?.firstOrNull { it.id == session }
     val state = conversation?.state ?: ConversationState()
     val title = state.title ?: listed?.let(::sessionTitle) ?: "Conversation"
+    // Whether the transcript keeps to the newest item as items arrive. Only
+    // the person scrolling changes it, and sending a message turns it back on.
+    var follow by rememberSaveable(session) { mutableStateOf(true) }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
@@ -134,7 +148,7 @@ fun ConversationScreen(
         bottomBar = {
             Column(Modifier.imePadding().navigationBarsPadding()) {
                 if (conversation != null) {
-                    BottomPanel(vm, session, conversation, remote.connection == ConnectionState.Connected)
+                    BottomPanel(vm, session, conversation, remote.connection == ConnectionState.Connected) { follow = true }
                 }
             }
         },
@@ -143,21 +157,54 @@ fun ConversationScreen(
             when {
                 conversation == null || (!conversation.loaded && conversation.ended == null) ->
                     Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
-                else -> Transcript(vm, session, conversation)
+                else -> Transcript(vm, session, conversation, follow) { follow = it }
             }
         }
     }
 }
 
+/** Follows one conversation from when its screen opens until it leaves the back stack. */
+private class ConversationWatch(private val vm: MainViewModel, private val session: String) : ViewModel() {
+    init {
+        vm.openConversation(session)
+    }
+
+    override fun onCleared() = vm.closeConversation(session)
+}
+
 @Composable
-private fun Transcript(vm: MainViewModel, session: String, conversation: Conversation) {
-    // Newest at the bottom, anchored there: a reversed list follows the
-    // stream by itself while the person is at the end, and keeps their place
-    // when they have scrolled back.
+private fun Transcript(
+    vm: MainViewModel,
+    session: String,
+    conversation: Conversation,
+    follow: Boolean,
+    onFollow: (Boolean) -> Unit,
+) {
+    // Newest at the bottom: a reversed list, so text streaming into the newest
+    // item grows upwards from the composer.
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val reversed = remember(conversation.items) { conversation.items.asReversed() }
-    val awayFromEnd by remember { derivedStateOf { listState.firstVisibleItemIndex > 1 } }
+    val atEnd by remember {
+        derivedStateOf { listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= END_SLOP_PX }
+    }
+
+    // A lazy list keeps the item it shows in place when another is inserted
+    // before it, so a new newest item would otherwise slide in out of view.
+    // Asked for in the same frame, before layout, so it never shows the gap.
+    val newest = conversation.items.lastOrNull()?.id
+    val seenNewest = remember { arrayOf(newest) }
+    SideEffect {
+        if (newest != seenNewest[0]) {
+            seenNewest[0] = newest
+            if (follow) listState.requestScrollToItem(0)
+        }
+    }
+    // Only a scroll, the person's or the jump button's, decides whether to follow.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to atEnd }
+            .collect { (scrolling, end) -> if (scrolling) onFollow(end) }
+    }
 
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
@@ -193,7 +240,7 @@ private fun Transcript(vm: MainViewModel, session: String, conversation: Convers
             }
         }
         AnimatedVisibility(
-            visible = awayFromEnd,
+            visible = !atEnd,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
@@ -250,7 +297,13 @@ private fun PlanStrip(state: ConversationState) {
 
 /** What waits for the person, what is queued, and the composer. */
 @Composable
-private fun BottomPanel(vm: MainViewModel, session: String, conversation: Conversation, connected: Boolean) {
+private fun BottomPanel(
+    vm: MainViewModel,
+    session: String,
+    conversation: Conversation,
+    connected: Boolean,
+    onSent: () -> Unit,
+) {
     val state = conversation.state
     Surface(tonalElevation = 2.dp) {
         Column {
@@ -262,8 +315,10 @@ private fun BottomPanel(vm: MainViewModel, session: String, conversation: Conver
             if (state.requests.isNotEmpty()) {
                 Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp)) {
                     state.requests.forEach { request ->
-                        RequestCard(request) { action, answers, done ->
-                            vm.answer(session, request.id, action, answers, done)
+                        key(request.id) {
+                            RequestCard(request) { action, answers, done ->
+                                vm.answer(session, request.id, action, answers, done)
+                            }
                         }
                     }
                 }
@@ -300,7 +355,7 @@ private fun BottomPanel(vm: MainViewModel, session: String, conversation: Conver
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
                 )
             } else {
-                Composer(vm, session, state, connected)
+                Composer(vm, session, state, connected, onSent)
             }
         }
     }
@@ -326,10 +381,26 @@ private fun Notice(text: String, error: Boolean = false, action: String? = null,
  * or waits in the queue for it to end, and the stop button interrupts it.
  */
 @Composable
-private fun Composer(vm: MainViewModel, session: String, state: ConversationState, connected: Boolean) {
+private fun Composer(
+    vm: MainViewModel,
+    session: String,
+    state: ConversationState,
+    connected: Boolean,
+    onSent: () -> Unit,
+) {
     var text by rememberSaveable(session) { mutableStateOf("") }
     var mode by rememberSaveable(session) { mutableStateOf(SendMode.Steer) }
     var sending by remember { mutableStateOf(false) }
+    // Stop takes Send's place once the text clears; a second tap meant for
+    // Send mustn't interrupt the turn it just steered.
+    var stopArmed by remember { mutableStateOf(true) }
+    var lastSend by remember { mutableIntStateOf(0) }
+    LaunchedEffect(lastSend) {
+        if (lastSend == 0) return@LaunchedEffect
+        stopArmed = false
+        delay(STOP_ARM_DELAY)
+        stopArmed = true
+    }
     val busy = state.busy
     val canSend = connected && text.isNotBlank() && !sending && (state.ready || busy)
 
@@ -367,7 +438,7 @@ private fun Composer(vm: MainViewModel, session: String, state: ConversationStat
             if (busy && text.isBlank()) {
                 FilledTonalIconButton(
                     onClick = { vm.interrupt(session) },
-                    enabled = connected,
+                    enabled = connected && stopArmed,
                     colors = IconButtonDefaults.filledTonalIconButtonColors(
                         containerColor = MaterialTheme.colorScheme.errorContainer,
                         contentColor = MaterialTheme.colorScheme.onErrorContainer,
@@ -378,10 +449,17 @@ private fun Composer(vm: MainViewModel, session: String, state: ConversationStat
                 FilledIconButton(
                     onClick = {
                         sending = true
+                        stopArmed = false
+                        lastSend++
                         val sent = text
                         vm.send(session, sent.trim(), if (busy) mode else SendMode.Send) { delivered ->
                             sending = false
-                            if (delivered && text == sent) text = ""
+                            if (delivered) {
+                                onSent()
+                                if (text == sent) text = ""
+                                // Count the delay from when the text cleared and Stop appeared.
+                                lastSend++
+                            }
                         }
                     },
                     enabled = canSend,

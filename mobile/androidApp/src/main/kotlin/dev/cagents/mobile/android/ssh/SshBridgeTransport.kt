@@ -5,7 +5,10 @@ import dev.cagents.mobile.android.data.ConnectionSettings
 import dev.cagents.mobile.client.BridgeTransport
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.LineChannel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -41,7 +44,7 @@ class SshBridgeTransport(
     private val hostKeys: HostKeyStore,
 ) : BridgeTransport {
 
-    override suspend fun open(): LineChannel = withContext(Dispatchers.IO) {
+    override suspend fun open(): LineChannel {
         val target = settings()
         if (!target.isComplete) throw ConnectFailure.Refused("Enter your computer's address in Settings.")
         val key = phoneKey()
@@ -49,34 +52,57 @@ class SshBridgeTransport(
         val client = SSHClient(configFor(key))
         client.addHostKeyVerifier(verifier)
         client.connectTimeout = 10_000
+        // Bounds every read, including waiting for the server's banner. sshj's
+        // reader carries on past a read timeout once connected, so it doesn't
+        // limit how long the connection stays idle.
+        client.timeout = 15_000
+        // Set once the channel exists, so whatever happens after, including a
+        // cancellation that discards the result, the connection is closed.
+        var made: SshLineChannel? = null
         try {
-            try {
-                client.connect(target.host, target.port)
-            } catch (e: TransportException) {
-                verifier.failure?.let { throw it }
-                throw ConnectFailure.Network(describe(e, target), e)
-            } catch (e: IOException) {
-                throw ConnectFailure.Network(describe(e, target), e)
+            return coroutineScope {
+                val work = async(Dispatchers.IO) { establish(client, verifier, key, target).also { made = it } }
+                try {
+                    work.await()
+                } catch (e: CancellationException) {
+                    // Socket I/O ignores interrupts; closing the socket ends a connect or read in progress.
+                    runCatching { client.disconnect() }
+                    throw e
+                }
             }
-            try {
-                client.authPublickey(target.user, PhoneKeyProvider(key))
-            } catch (e: UserAuthException) {
-                throw ConnectFailure.Unauthorized(
-                    "${target.user}@${target.host} didn't accept this phone's key. " +
-                        "Add it to ~/.ssh/authorized_keys there, as Settings shows.",
-                )
+        } catch (e: Throwable) {
+            made?.close() ?: runCatching { client.disconnect() }
+            throw when (e) {
+                is CancellationException, is ConnectFailure -> e
+                is Exception -> ConnectFailure.Network(describe(e, target), e)
+                else -> e
             }
-            client.connection.keepAlive.keepAliveInterval = KEEPALIVE_SECONDS
-            val session = client.startSession()
-            val command = session.exec(target.command)
-            SshLineChannel(client, session, command)
-        } catch (e: ConnectFailure) {
-            runCatching { client.disconnect() }
-            throw e
-        } catch (e: IOException) {
-            runCatching { client.disconnect() }
+        }
+    }
+
+    private fun establish(
+        client: SSHClient,
+        verifier: PinningVerifier,
+        key: PhoneKey,
+        target: ConnectionSettings,
+    ): SshLineChannel {
+        try {
+            client.connect(target.host, target.port)
+        } catch (e: TransportException) {
+            verifier.failure?.let { throw it }
             throw ConnectFailure.Network(describe(e, target), e)
         }
+        try {
+            client.authPublickey(target.user, PhoneKeyProvider(key))
+        } catch (e: UserAuthException) {
+            throw ConnectFailure.Unauthorized(
+                "${target.user}@${target.host} didn't accept this phone's key. " +
+                    "Add it to ~/.ssh/authorized_keys there, as Settings shows.",
+            )
+        }
+        client.connection.keepAlive.keepAliveInterval = KEEPALIVE_SECONDS
+        val session = client.startSession()
+        return SshLineChannel(client, session.exec(target.command))
     }
 
     private fun describe(e: Throwable, target: ConnectionSettings): String {
@@ -127,7 +153,7 @@ internal class Ed25519PublicKey(private val raw: ByteArray) : PublicKey {
     override fun getFormat() = "X.509"
     override fun getEncoded(): ByteArray = X509_PREFIX + raw
 
-    private companion object {
+    companion object {
         val X509_PREFIX = byteArrayOf(0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00)
     }
 }
@@ -167,7 +193,6 @@ private class PinningVerifier(
  */
 private class SshLineChannel(
     private val client: SSHClient,
-    private val session: Session,
     command: Session.Command,
 ) : LineChannel {
     private val reader = BufferedReader(InputStreamReader(command.inputStream, Charsets.UTF_8))
@@ -212,8 +237,11 @@ private class SshLineChannel(
         }
     }
 
+    /**
+     * Drops the whole connection without waiting for the computer: closing the
+     * session channel first would wait for its reply, which a dead network never sends.
+     */
     override fun close() {
-        runCatching { session.close() }
         runCatching { client.disconnect() }
     }
 }

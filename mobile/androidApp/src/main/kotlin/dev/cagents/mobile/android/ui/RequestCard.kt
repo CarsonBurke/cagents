@@ -25,6 +25,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -38,6 +39,10 @@ import androidx.compose.ui.unit.dp
 import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.PendingRequest
 import dev.cagents.mobile.protocol.RequestKind
+import kotlinx.coroutines.delay
+import kotlin.time.Duration.Companion.milliseconds
+
+private val ARM_DELAY = 500.milliseconds
 
 /**
  * Something the conversation waits for the person to decide. Every action
@@ -58,6 +63,13 @@ fun RequestCard(
         }
     }
     var sending by remember(request.id) { mutableStateOf<String?>(null) }
+    // A card that appears, or takes another's place, under a finger already on
+    // its way down mustn't take that tap as an answer.
+    var armed by remember(request.id) { mutableStateOf(false) }
+    LaunchedEffect(request.id) {
+        delay(ARM_DELAY)
+        armed = true
+    }
 
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
@@ -139,6 +151,7 @@ fun RequestCard(
                     OutlinedButton(
                         enabled = sending == null,
                         onClick = {
+                            if (!armed) return@OutlinedButton
                             sending = action.id
                             val answers = request.fields.mapNotNull { field ->
                                 values[field.id]?.filter { it.isNotEmpty() }?.takeIf { it.isNotEmpty() }

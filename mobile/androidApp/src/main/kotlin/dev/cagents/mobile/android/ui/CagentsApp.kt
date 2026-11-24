@@ -11,6 +11,8 @@ import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
+import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
+import androidx.lifecycle.viewmodel.navigation3.rememberViewModelStoreNavEntryDecorator
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -38,6 +40,11 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
     NavDisplay(
         backStack = backStack,
         onBack = { if (backStack.size > 1) backStack.removeAt(backStack.lastIndex) },
+        // Each screen keeps its own saved state and ViewModels until it leaves the back stack.
+        entryDecorators = listOf(
+            rememberSaveableStateHolderNavEntryDecorator(),
+            rememberViewModelStoreNavEntryDecorator(),
+        ),
         entryProvider = entryProvider {
             entry<SessionsRoute> {
                 SessionsScreen(

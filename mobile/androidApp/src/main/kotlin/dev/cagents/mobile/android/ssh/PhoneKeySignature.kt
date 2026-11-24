@@ -20,6 +20,10 @@ internal class PhoneKeySignature(private val key: PhoneKey) : Signature {
         override fun create(): Signature = PhoneKeySignature(key)
     }
 
+    private companion object {
+        val ED25519_ALGORITHMS = setOf("Ed25519", "EdDSA")
+    }
+
     private val data = ByteArrayOutputStream()
     private var verifier: Ed25519Signer? = null
 
@@ -31,8 +35,19 @@ internal class PhoneKeySignature(private val key: PhoneKey) : Signature {
     }
 
     override fun initVerify(pubkey: PublicKey) {
-        val encoded = pubkey.encoded
-        val raw = Ed25519PublicKeyParameters(encoded, encoded.size - Ed25519PublicKeyParameters.KEY_SIZE)
+        // Only an Ed25519 key in its X.509 encoding: the prefix names the curve,
+        // so the trailing 32 bytes are never read out of some other kind of key.
+        val encoded: ByteArray? = pubkey.encoded
+        val prefix = Ed25519PublicKey.X509_PREFIX
+        if (
+            pubkey.algorithm !in ED25519_ALGORITHMS ||
+            encoded == null ||
+            encoded.size != prefix.size + Ed25519PublicKeyParameters.KEY_SIZE ||
+            !encoded.copyOfRange(0, prefix.size).contentEquals(prefix)
+        ) {
+            throw SSHRuntimeException("Expected an Ed25519 host key, got ${pubkey.algorithm}")
+        }
+        val raw = Ed25519PublicKeyParameters(encoded, prefix.size)
         verifier = Ed25519Signer().apply { init(false, raw) }
         data.reset()
     }

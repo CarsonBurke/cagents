@@ -53,7 +53,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun saveSettings(new: ConnectionSettings) {
         graph.settings.save(new)
         _pinned.value = graph.hostKeys.pinned(settings.value.hostKeyId)
-        viewModelScope.launch { controller.restart() }
+        // Closing the old connection may wait on the network.
+        viewModelScope.launch(Dispatchers.Default) { controller.restart() }
     }
 
     fun trustHostKey(failure: ConnectFailure.UnknownHostKey) {
