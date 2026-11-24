@@ -249,7 +249,8 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
 }
 
 /// A copy's refusal stays on its control's one line in a narrow pane, so it
-/// never draws over the text it was copying; the tooltip has all of it.
+/// never draws over the text it was copying: it fades at its slot's end and
+/// the tooltip has all of it.
 #[test]
 fn a_copy_refusal_keeps_to_one_line_beside_its_control() {
     use iced::advanced::{Layout, layout, widget::Tree};
@@ -283,14 +284,23 @@ fn a_copy_refusal_keeps_to_one_line_beside_its_control() {
         &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
     );
     let row = Layout::new(&node).bounds();
+    let said = Layout::new(&node)
+        .children()
+        .nth(1)
+        .expect("the refusal's slot")
+        .bounds();
     let shaped = paragraph(&tree).expect("the refusal's text").min_bounds();
     assert!(
         row.height <= super::MESSAGE_ACTION_HEIGHT,
         "the refusal fits the action row: {row:?}, text {shaped:?}"
     );
     assert!(
-        row.width <= width + 0.1 && shaped.width <= width,
-        "the refusal stays inside the pane: {row:?}, text {shaped:?}"
+        row.width <= width + 0.1 && said.x + said.width <= width + 0.1,
+        "the refusal stays inside the pane: {row:?}, slot {said:?}"
+    );
+    assert!(
+        shaped.width > said.width,
+        "the refusal is longer than its slot, so it fades there: slot {said:?}, text {shaped:?}"
     );
 }
 
@@ -1808,7 +1818,7 @@ fn contentless_thinking_draws_no_row_and_leaves_the_working_indicator_in_place()
     assert_eq!(placed(&runtime), [1, 3]);
     assert_eq!(
         runtime.strip_status(&runtime.turns[0]),
-        Some(chat::ToolStatus::Running)
+        Some(chat::ToolStatus::Running.into())
     );
 }
 
@@ -1882,7 +1892,7 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     // A command still running while the agent thinks: the thought is the
     // newest work, so the strip keeps its glyph and the closing line
     // keeps its place empty.
-    assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running));
+    assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running.into()));
     assert!(turn.summary.ends_with(" · working"));
     assert_eq!(runtime.strip_status(turn), None);
     assert!(runtime.work_shown(None));
@@ -1934,9 +1944,12 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     regroup(&mut runtime);
     assert_eq!(runtime.turns.len(), 2);
     let (older, newer) = (&runtime.turns[0], &runtime.turns[1]);
-    assert_eq!(older.glyph(), Some(chat::ToolStatus::Running));
+    assert_eq!(older.glyph(), Some(chat::ToolStatus::Running.into()));
     assert_eq!(runtime.strip_status(older), None);
-    assert_eq!(runtime.strip_status(newer), Some(chat::ToolStatus::Running));
+    assert_eq!(
+        runtime.strip_status(newer),
+        Some(chat::ToolStatus::Running.into())
+    );
     assert_eq!(closing(&runtime), blank);
 
     // Between steps nothing in the transcript is live, so the closing
@@ -1949,7 +1962,7 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
         runtime
             .turns
             .iter()
-            .all(|turn| runtime.strip_status(turn) != Some(chat::ToolStatus::Running))
+            .all(|turn| runtime.strip_status(turn) != Some(chat::ToolStatus::Running.into()))
     );
     assert_eq!(
         closing(&runtime),
@@ -1961,11 +1974,11 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     Arc::make_mut(&mut runtime.snapshot).busy = false;
     assert_eq!(
         runtime.strip_status(&runtime.turns[0]),
-        Some(chat::ToolStatus::Running)
+        Some(chat::ToolStatus::Running.into())
     );
     assert_eq!(
         runtime.strip_status(&runtime.turns[1]),
-        Some(chat::ToolStatus::Succeeded)
+        Some(chat::ToolStatus::Succeeded.into())
     );
 
     // Once subagents work after the lead has finished, the closing line
@@ -5148,8 +5161,9 @@ fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebu
                     && node.node().label().is_some_and(|label| match step {
                         0 => label.starts_with("All subagents:"),
                         1 => {
-                            label.contains("Inspect repository")
-                                && label.ends_with(" · native-child")
+                            // The chooser's row, named by the child's
+                            // label, state and task, not by its ID.
+                            label.starts_with("Scout · Waiting · Task: Inspect repository")
                         }
                         // The open subagent's transcript does not show the
                         // main conversation's request, so its tab does.
@@ -6100,7 +6114,7 @@ fn footer_picker_rows_center_single_lines_and_subtitled_blocks() {
     ] {
         let mut row = picker_choice_row(
             "High".into(),
-            detail,
+            detail.map(Cow::Borrowed),
             "High".into(),
             widget::Id::unique(),
             true,
@@ -9982,7 +9996,7 @@ fn a_kept_strip_stops_spinning_when_a_message_follows_its_step() {
     };
     assert_eq!(
         runtime.strip_status(&runtime.turns[0]),
-        Some(chat::ToolStatus::Running)
+        Some(chat::ToolStatus::Running.into())
     );
     let before = row_fingerprints(&runtime, 0);
     publish_working(&mut runtime, &handle, |snapshot| {
@@ -11404,6 +11418,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Opus 5.5"
@@ -11457,6 +11472,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Default (Opus 5.5)"
@@ -11470,6 +11486,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Default (Opus 5.5) · High"
@@ -11530,6 +11547,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
                 false,
                 Provider::Claude,
                 fit,
+                None,
                 None
             ),
             "Opus 5.5"
@@ -11541,6 +11559,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
                 true,
                 Provider::Claude,
                 fit,
+                None,
                 None
             ),
             "Default (Opus 5.5)"
@@ -11554,6 +11573,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             true,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Default (Opus 5.5)"
@@ -11566,6 +11586,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "Opus 5.5"
@@ -11578,6 +11599,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             false,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "next-turn-model"
@@ -11589,6 +11611,7 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
             true,
             Provider::Claude,
             FooterFit::Wide,
+            None,
             None
         ),
         "next-turn-model"
@@ -11678,6 +11701,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            None,
             catalog.default_effort(snapshot.selected_model.as_deref())
         ),
         "Offline Mini"
@@ -11689,6 +11713,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            None,
             None
         ),
         "Offline Mini · Medium",
@@ -11702,10 +11727,30 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            advertised_default(&snapshot.models, Some(&catalog)),
             catalog.default_effort(None)
         ),
-        "ChatGPT · Default model"
+        "Default (Offline Mini)",
+        "the default reads as the model it resolves to, as Claude's does"
     );
+    for (fit, unknown) in [
+        (FooterFit::Wide, "ChatGPT · Default model"),
+        (FooterFit::Narrow, "Default model"),
+    ] {
+        assert_eq!(
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                true,
+                Provider::Codex,
+                fit,
+                None,
+                catalog.default_effort(None)
+            ),
+            unknown,
+            "a default the provider has not named still says whose it is"
+        );
+    }
     snapshot.selected_model = Some("offline-mini".into());
     snapshot.reasoning = Some("high".into());
     assert_eq!(
@@ -11715,6 +11760,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
             true,
             Provider::Codex,
             FooterFit::Wide,
+            None,
             catalog.default_effort(snapshot.selected_model.as_deref())
         ),
         "Offline Mini · High"
@@ -11743,6 +11789,7 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Resolved model"
@@ -11755,6 +11802,7 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Resolved model"
@@ -11767,6 +11815,7 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
                 false,
                 provider,
                 FooterFit::Wide,
+                None,
                 None
             ),
             "Resolved model · High"
@@ -11808,6 +11857,174 @@ fn a_draft_offers_each_providers_default_ahead_of_its_models() {
     assert_eq!(
         listed(&model_rows(&offers, "gpt-b", true)),
         [(Provider::Codex, vec!["gpt-b"])]
+    );
+}
+
+/// Every provider's default reads one way: "Default" and the model it
+/// resolves to, whether the provider lists the default as an alias, as
+/// Claude does, or marks one of its models, as Codex, ACP agents and Muse
+/// do. Where it hasn't said, the row says what the default is instead.
+#[test]
+fn every_providers_default_names_the_model_it_resolves_to() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, value: &str) {
+            self.0.push(value.to_owned());
+        }
+    }
+    let catalog = |models: &[chat::Model], default: Option<&str>| crate::account::cache::Catalog {
+        models: models.to_vec(),
+        observed_at: 1,
+        default_model: default.map(str::to_owned),
+        reasoning_defaults: Default::default(),
+    };
+    let codex = [model("gpt-5.4", "GPT-5.4"), model("gpt-5.5", "GPT-5.5")];
+    let codex_catalog = catalog(&codex, Some("gpt-5.5"));
+    let claude = [
+        model("default", "Default (Opus 5.5)"),
+        model("opus", "Opus 5.5"),
+    ];
+    let gemini = [model("gemini-4-neon", "Gemini 4 Neon")];
+    let gemini_catalog = catalog(&gemini, Some("gemini-4-neon"));
+    let omp = [model("kimi", "Kimi")];
+    // A default naming a model the provider no longer lists is unknown.
+    let omp_catalog = catalog(&omp, Some("retired"));
+    let offers = [
+        Offer {
+            provider: Provider::Codex,
+            models: &codex,
+            catalog: Some(&codex_catalog),
+        },
+        Offer {
+            provider: Provider::Claude,
+            models: &claude,
+            catalog: None,
+        },
+        Offer {
+            provider: Provider::Antigravity,
+            models: &gemini,
+            catalog: Some(&gemini_catalog),
+        },
+        Offer {
+            provider: Provider::Omp,
+            models: &omp,
+            catalog: Some(&omp_catalog),
+        },
+        Offer {
+            provider: Provider::Muse,
+            models: &[],
+            catalog: None,
+        },
+    ];
+    let renderer = crate::app::tests::headless_renderer();
+    let mut list = model_list(
+        Target {
+            card: CardId::new(),
+            generation: 1,
+        },
+        &offers,
+        true,
+        (Provider::Codex, None),
+        "",
+    );
+    let mut tree = Tree::new(list.as_widget());
+    let node = list.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 4000.0)),
+    );
+    let mut texts = Texts(Vec::new());
+    list.as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    let texts = texts.0;
+    let after = |heading: &str| {
+        let at = texts.iter().position(|text| text == heading).unwrap();
+        texts[at + 1..].iter().take(2).cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(
+        after("ChatGPT"),
+        ["Default (GPT-5.5)", "GPT-5.4"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Claude"),
+        ["Default (Opus 5.5)", "Opus 5.5"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Antigravity"),
+        ["Default (Gemini 4 Neon)", "Gemini 4 Neon"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Other models"),
+        ["Default model", "Whichever its settings choose"],
+        "{texts:?}"
+    );
+    assert_eq!(
+        after("Muse"),
+        ["Default model", "Its models are listed once it has run"],
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("would choose itself")),
+        "{texts:?}"
+    );
+    // The default is found by the model it resolves to, as Claude's
+    // `default` alias is found by its label, but after the model the search
+    // names, so Enter takes that model rather than whatever the provider's
+    // setting next makes its default.
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "5.5", true)),
+        [(Provider::Codex, vec!["gpt-5.5", "default"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[1..2], "opus", true)),
+        [(Provider::Claude, vec!["opus", "default"])]
+    );
+    // A search for the default itself, or for the provider, still heads
+    // with it.
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "def", true)),
+        [(Provider::Codex, vec!["default"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "chatgpt", true)),
+        [(Provider::Codex, vec!["default", "gpt-5.4", "gpt-5.5"])]
+    );
+    assert_eq!(
+        listed(&model_rows(&offers[..1], "5.4", true)),
+        [(Provider::Codex, vec!["gpt-5.4"])]
+    );
+}
+
+#[test]
+fn a_default_label_names_what_it_resolves_to_once() {
+    assert_eq!(
+        default_choice_label(Some("GPT-5.5"), "Default model"),
+        "Default (GPT-5.5)"
+    );
+    assert_eq!(
+        default_choice_label(Some("Default (recommended)"), "Default model"),
+        "Default (recommended)"
+    );
+    assert_eq!(default_choice_label(None, "Default model"), "Default model");
+    assert_eq!(
+        model_choice_label(&model("default", "Opus 5.5")),
+        "Default (Opus 5.5)"
+    );
+    assert_eq!(
+        model_choice_label(&model("default", "Default (Opus 5.5)")),
+        "Default (Opus 5.5)"
     );
 }
 
@@ -12003,7 +12220,9 @@ fn file_change_review_fits_narrow_and_wide_panes_and_names_delegated_proposals()
         for expected in [
             "Files changed",
             "Proposed edit",
-            "Subagent: child",
+            // An agent the conversation does not list is named only as a
+            // subagent: its ID is not a name to show.
+            "Subagent",
             "pending",
             "from src/old.rs",
             "Close",
@@ -12013,6 +12232,10 @@ fn file_change_review_fits_narrow_and_wide_panes_and_names_delegated_proposals()
                 "{width}: missing {expected}: {labels:?}"
             );
         }
+        assert!(
+            !labels.iter().any(|label| label.contains("child")),
+            "{width}: {labels:?}"
+        );
         assert!(
             !labels.iter().any(|label| label == "Open file"),
             "unresolved child-relative paths must not route to the parent"
@@ -12662,6 +12885,74 @@ fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
             }
         }
     }
+}
+
+/// Stop and Send now are the two ways to reach a working turn, and each
+/// says how it differs from the other: Stop cancels the turn and what it
+/// started, Send now cancels nothing.
+#[test]
+fn stop_and_send_now_each_say_what_the_other_does() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    let renderer = crate::app::tests::headless_renderer();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.capabilities.queue_remove = true;
+    snapshot.capabilities.send_queued_now = true;
+    snapshot.capabilities.interrupt_stops_background = true;
+    snapshot.queued_messages = vec![chat::QueuedMessage::new("a".into(), "First".into())];
+    let mut element = runtime.view(
+        None,
+        false,
+        true,
+        &shortcuts,
+        960.0,
+        0.0,
+        Place { branch: None },
+        true,
+        None,
+        vec![],
+        true,
+    );
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(960.0, 900.0)),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    let nodes: Vec<_> = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .map(|node| {
+            (
+                node.node().label().unwrap_or_default().to_owned(),
+                node.node().description().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let stop = nodes
+        .iter()
+        .find(|(label, _)| label.starts_with("Cancel active turn"))
+        .unwrap_or_else(|| panic!("Stop: {nodes:?}"));
+    assert!(
+        stop.0
+            .ends_with("Send now delivers queued messages without cancelling the turn."),
+        "{stop:?}"
+    );
+    let send_now = nodes
+        .iter()
+        .find(|(label, _)| label == "Send the queued message now")
+        .unwrap_or_else(|| panic!("Send now: {nodes:?}"));
+    assert!(
+        send_now.1.contains("keep running") && send_now.1.contains("Stop cancels the turn"),
+        "{send_now:?}"
+    );
 }
 
 /// An agent started, a step, a thought and a report are each a line of the
@@ -13395,6 +13686,7 @@ fn draft_label_names_only_a_reasoning_level_the_chosen_model_offers() {
             provider,
             FooterFit::Wide,
             None,
+            None,
         )
         .into_owned()
     };
@@ -13545,4 +13837,95 @@ fn the_context_meter_falls_back_to_the_whole_window() {
             .starts_with("95% left before auto-compact · 14k of 300k tokens · ")
     );
     assert_eq!(ContextMeter::of(&crate::chat::Usage::default(), Left), None);
+}
+
+#[test]
+fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
+    let mut runtime = Runtime::draft(
+        Target {
+            card: CardId::new(),
+            generation: 0,
+        },
+        chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                session_id: None,
+                draft_model: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::ReconnectOnly,
+        },
+        Snapshot::default(),
+        true,
+        crate::settings::EditorSyntaxTheme::default(),
+    );
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.queue_remove = true;
+    snapshot.queued_messages = vec![
+        chat::QueuedMessage::new("a".into(), "First".into()),
+        chat::QueuedMessage::new("b".into(), "Second".into()),
+    ];
+    snapshot.busy = true;
+    // Without the provider's say-so the queue waits for the turn.
+    assert_eq!(runtime.send_now_count(), 0);
+    assert!(!runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .send_queued_now = true;
+    assert_eq!(runtime.send_now_count(), 2);
+    assert!(runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+
+    // A message on its way back to the composer does not go early.
+    runtime.taken_back.push("b".into());
+    assert_eq!(runtime.send_now_count(), 1);
+    runtime.taken_back.clear();
+
+    // One request at a time, and the heading says it is on its way.
+    for state in [chat::SendNow::Requested, chat::SendNow::Delivering] {
+        Arc::make_mut(&mut runtime.snapshot).send_now = Some(state);
+        assert!(!runtime.can_send_now());
+        assert_eq!(runtime.queue_title(2), "Queued · 2 · sending now…");
+    }
+    Arc::make_mut(&mut runtime.snapshot).send_now = Some(chat::SendNow::Stopped);
+    assert!(!runtime.can_send_now());
+    assert_eq!(
+        runtime.queue_title(2),
+        "Queued · 2 · reply cut short, sending now…"
+    );
+    // Declined leaves the queue to the turn, not to be asked again until
+    // the queue changes.
+    Arc::make_mut(&mut runtime.snapshot).send_now = Some(chat::SendNow::Declined);
+    assert!(!runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2 · couldn't send early");
+
+    // Between turns the queue starts on its own; nothing to send early.
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.send_now = None;
+    snapshot.busy = false;
+    assert_eq!(runtime.send_now_count(), 0);
+    assert!(!runtime.can_send_now());
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    runtime.disconnected = true;
+    assert!(!runtime.can_send_now());
+    runtime.disconnected = false;
+
+    // The control fits beside the heading at narrow and wide widths.
+    let renderer = crate::app::tests::headless_renderer();
+    for width in [320.0, 960.0] {
+        let mut element = runtime.queue_view().unwrap();
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0)),
+        );
+        assert_eq!(node.size().width, width);
+    }
 }

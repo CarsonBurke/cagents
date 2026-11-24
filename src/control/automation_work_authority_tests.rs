@@ -54,7 +54,7 @@ enum Business {
     List,
 }
 
-struct Peer(Option<JoinHandle<(UnixListener, usize, usize)>>);
+struct Peer(Option<JoinHandle<UnixListener>>);
 impl Peer {
     fn new(
         business: Business,
@@ -72,53 +72,41 @@ impl Peer {
         listener.set_nonblocking(true).unwrap();
         Self(Some(thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(6);
-            let mut probes = 0;
-            let mut raw_probes = 0;
-            let (mut peer, mut request) = loop {
-                let mut peer = loop {
-                    match listener.accept() {
-                        Ok((peer, _)) => break peer,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(
-                                Instant::now() < deadline,
-                                "CLI did not reach its private peer"
-                            );
-                            thread::sleep(Duration::from_millis(2));
-                        }
-                        Err(error) => panic!("private listener: {error}"),
+            let mut peer = loop {
+                match listener.accept() {
+                    Ok((peer, _)) => break peer,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "CLI did not reach its private peer"
+                        );
+                        thread::sleep(Duration::from_millis(2));
                     }
-                };
-                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                peer.set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                let Some(hello) = read_frame::<ClientEnvelope>(&mut peer).unwrap() else {
-                    // User --no-start checks endpoint existence without a
-                    // framed handshake. Accept it before business dispatch.
-                    raw_probes += 1;
-                    assert!(raw_probes <= 1, "no repeated existence probe");
-                    continue;
-                };
-                assert!(matches!(hello.request, ClientRequest::Connect { .. }));
-                assert!(hello.proof.is_none());
-                reply(
-                    &mut peer,
-                    &hello,
-                    ServerMessage::Response {
-                        response: ServerResponse::Connected {
-                            proof: proof(),
-                            resumed: vec![],
-                        },
-                    },
-                );
-                if let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
-                    assert_eq!(request.proof.as_ref(), Some(&proof()));
-                    break (peer, request);
+                    Err(error) => panic!("private listener: {error}"),
                 }
-                // A connection that only handshakes is a separate readiness
-                // probe. Diagnose it only after valid business behavior.
-                probes += 1;
-                assert!(probes <= 1, "no repeated readiness or fallback");
             };
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let hello = read_frame::<ClientEnvelope>(&mut peer)
+                .unwrap()
+                .expect("the first connection handshakes");
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            assert!(hello.proof.is_none());
+            reply(
+                &mut peer,
+                &hello,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let mut request = read_frame::<ClientEnvelope>(&mut peer)
+                .unwrap()
+                .expect("the same connection carries the Automation or Work request");
+            assert_eq!(request.proof.as_ref(), Some(&proof()));
             if matches!(business, Business::Pin) && authority.token().is_some() {
                 assert!(matches!(&request.request,
                     ClientRequest::Authenticate { authority: actual } if actual == &authority));
@@ -198,17 +186,16 @@ impl Peer {
                 read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
                 "no extra request, Authenticate on a global read, or User retry"
             );
-            (listener, probes, raw_probes)
+            listener
         })))
     }
 
-    fn finished(mut self) -> (usize, usize) {
-        let (listener, probes, raw_probes) = self.0.take().unwrap().join().unwrap();
+    fn finished(mut self) {
+        let listener = self.0.take().unwrap().join().unwrap();
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
             "no fallback connection after the business reply"
         );
-        (probes, raw_probes)
     }
 }
 impl Drop for Peer {
@@ -268,8 +255,8 @@ fn exercise_local(role: &str) {
                 Business::Proposal | Business::Pin => ExitCode::FAILURE,
             }
         );
-        let (probes, raw_probes) = peer.finished();
-        routing.push((business, staged.get(), probes, raw_probes));
+        peer.finished();
+        routing.push((business, staged.get()));
     }
     // Readiness hands its connection to the request, so each route shows in
     // how its command reports the daemon once it is gone.
@@ -282,20 +269,11 @@ fn exercise_local(role: &str) {
     }
     // Drive every business envelope before checking routing, so a routing
     // failure is reported only after each request reached its business peer.
-    for (business, staged, probes, raw_probes) in routing {
+    for (business, staged) in routing {
         assert_eq!(
             staged,
             usize::from(!scoped),
             "{business:?}: scoped services must bypass staged owner lookup/recovery after reaching business dispatch"
-        );
-        assert_eq!(
-            probes, 0,
-            "{business:?}: readiness hands its connection to the request rather than handshaking twice"
-        );
-        assert_eq!(
-            raw_probes,
-            usize::from(!scoped && no_start),
-            "{business:?}: User no-start keeps its endpoint probe; scoped services connect directly"
         );
     }
 }

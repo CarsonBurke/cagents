@@ -381,6 +381,9 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
     runtime.attach([path.clone()]);
     assert_eq!(runtime.attachments.len(), 1);
     let queued = runtime.take_attachments();
+    // The preview leaves with the message, until nothing shows it.
+    assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+    runtime.sync_thumbnails();
     assert!(runtime.thumbnails.subscriptions(runtime.target).is_empty());
     runtime.take_back("queued", queued, PromptMode::Queue);
     assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
@@ -417,6 +420,28 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
     assert!(runtime.thumbnails.subscriptions(target).is_empty());
     runtime.attach([path]);
     assert_eq!(runtime.thumbnails.subscriptions(target).len(), 1);
+}
+
+/// A message waiting to be sent shows its images' previews, which outlast
+/// the draft they left and any later edit of the next draft.
+#[test]
+fn a_queued_message_keeps_its_image_previews() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let path = PathBuf::from("/fixture/image.png");
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().attach([path.clone()]);
+    write(&mut app, card, "Here is the layout");
+    submit(&mut app, card);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let queued = runtime.queued.as_ref().unwrap();
+    assert_eq!(queued.prompt.attachments[0].path, path);
+    assert!(runtime.attachments.is_empty());
+    runtime.sync_thumbnails();
+    assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+    runtime.queued = None;
+    runtime.sync_thumbnails();
+    assert!(runtime.thumbnails.subscriptions(runtime.target).is_empty());
 }
 
 #[test]
@@ -6246,6 +6271,39 @@ fn permission_approval_popup_and_transcript_keep_distinct_named_widget_state() {
     cosmic::iced::advanced::widget::tree::NAMED.with(|named| named.borrow_mut().clear());
 }
 
+/// A block a subagent hit names the subagent as its tab does, never by
+/// the provider's ID for it.
+#[test]
+fn a_subagent_block_names_its_agent_not_its_id() {
+    const AGENT: &str = "a404930e4df62e728";
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some("denied agent"));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert_eq!(runtime.denial_agent(AGENT), "From a subagent");
+    let handle = runtime.handle().unwrap().clone();
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.subagents = vec![chat::Subagent {
+        id: AGENT.into(),
+        kind: "general-purpose".into(),
+        description: "Build and install the app".into(),
+        model: None,
+        status: chat::ToolStatus::Running,
+        waiting: false,
+        detail: String::new(),
+        background: true,
+        items: Vec::new(),
+    }];
+    handle.publish_delta_snapshot_for_test(snapshot);
+    runtime.refresh();
+    let named = runtime
+        .listed_agent_name(AGENT)
+        .expect("the agent is listed");
+    assert!(!named.contains(&AGENT[..8]), "{named}");
+    assert_eq!(runtime.denial_agent(AGENT), format!("Subagent: {named}"));
+}
+
 #[test]
 fn permission_keyboard_traverses_visible_approvals_pages_retry_and_close_both_ways() {
     use crate::workspace_widget::GlobalShortcut;
@@ -10471,6 +10529,38 @@ fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
 }
 
 #[test]
+fn send_now_goes_to_the_provider_only_when_the_turn_can_take_the_queue() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.queued_messages = vec![chat::QueuedMessage::new("a".into(), "Next".into())];
+    let busy = (*runtime.snapshot).clone();
+    show_chat_snapshot_for_test(&mut app, card, busy.clone());
+    // A provider that cannot take its queue early is not asked to.
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    assert!(chat_runtime(&app, card).commands.is_idle());
+
+    let mut able = busy;
+    able.capabilities.send_queued_now = true;
+    show_chat_snapshot_for_test(&mut app, card, able.clone());
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.commands.in_flight().is_some());
+    assert!(runtime.commands.repeats(&Command::SendQueuedNow));
+    settle(&mut app, card, Ok(()));
+
+    // Once the provider has it, a second press waits for its answer.
+    let mut requested = able;
+    requested.send_now = Some(chat::SendNow::Requested);
+    show_chat_snapshot_for_test(&mut app, card, requested);
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    assert!(chat_runtime(&app, card).commands.is_idle());
+}
+
+#[test]
 fn cancel_confirmation_does_not_cross_a_coalesced_turn_boundary() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -10509,6 +10599,8 @@ fn a_declined_send_is_a_notice_unless_the_conversation_cannot_go_on() {
         (delivery::UNACKNOWLEDGED_INPUT, false),
         (delivery::UNACKNOWLEDGED_ANSWER, false),
         (delivery::UNACKNOWLEDGED_STOP, false),
+        (delivery::DELIVERY_HISTORY_UNAVAILABLE, false),
+        (delivery::DELIVERY_NOT_SENT, false),
         (delivery::UNSETTLED_INPUT, false),
         (delivery::RECONNECTING_INPUT, false),
         (delivery::CROWDED_INPUT, false),

@@ -170,7 +170,9 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
 /// Commits one edit through the registry's own path, without the per-edit
 /// schema check `seed_at` already made once.
 fn seed_commit(registry: &mut Registry, edit: &ModelEdit) -> Result<(), String> {
-    registry.commit_delta(edit, |_, _| Ok(()), false).map(drop)
+    registry
+        .commit_delta(edit, |_, _| Ok(((), false)), false)
+        .map(drop)
 }
 
 /// Records `view.edits` operations on the view, leaving its panes as seeded,

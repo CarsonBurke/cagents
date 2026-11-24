@@ -433,7 +433,11 @@ fn notification_title_matches_resident_session_identity_across_metadata_only_fra
                     session("native-b", Some("Provider B")),
                     session("native-b", None),
                 ],
-                4 => vec![
+                4 => vec![Event::ProviderTitleCleared {
+                    id: "native-b".into(),
+                }],
+                5 => vec![
+                    session("native-b", Some("Provider B again")),
                     Event::Reset {
                         reason: "Explicit new conversation".into(),
                     },
@@ -458,16 +462,16 @@ fn notification_title_matches_resident_session_identity_across_metadata_only_fra
     // frame before the next command, then retires its actual cat child.
     let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
         Box::new(Names),
-        (0..5).map(|index| serde_json::json!(index)).collect(),
+        (0..6).map(|index| serde_json::json!(index)).collect(),
         false,
     );
-    assert_eq!(receipts.len(), 5);
+    assert_eq!(receipts.len(), 6);
     assert_eq!(
         receipts
             .iter()
             .map(|(_, content)| content.conversation.as_str())
             .collect::<Vec<_>>(),
-        ["Provider A", "Provider A", "", "Provider B", ""]
+        ["Provider A", "Provider A", "", "Provider B", "", ""]
     );
     assert_eq!(snapshot.session_id.as_deref(), Some("native-b"));
     assert_eq!(snapshot.title, None);
@@ -664,7 +668,7 @@ fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure
             })
         }
     }
-    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
         followed: false,
@@ -840,6 +844,42 @@ fn usage_keeps_the_compaction_point_each_reading_states() {
     apply_event(&mut state, &mut indices, reading(20_000, None));
     assert_eq!(state.usage.compact_limit, None);
     assert_eq!(state.usage.context_budget(), 1_000_000);
+}
+
+/// A request to send what is queued now is the provider's to report, and
+/// lasts no longer than the provider or the conversation it was made in.
+#[test]
+fn send_now_follows_the_provider_and_ends_with_it() {
+    let mut state = Snapshot::default();
+    let mut indices = BTreeMap::new();
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Delivering)),
+    );
+    assert_eq!(state.send_now, Some(crate::chat::SendNow::Delivering));
+    apply_event(&mut state, &mut indices, Event::SendNow(None));
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Reset {
+            reason: "reset".into(),
+        },
+    );
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(&mut state, &mut indices, Event::Exited { code: None });
+    assert_eq!(state.send_now, None);
 }
 
 #[test]
@@ -3006,7 +3046,7 @@ fn identity_only_context_never_recaptures_a_replacement_directory() {
         environment: BTreeMap::new(),
         unset_environment: Default::default(),
     };
-    assert!(spawn_provider(&spec, &AtomicBool::new(false), None).is_err());
+    assert!(spawn_provider(&spec, &AtomicBool::new(false), None, false).is_err());
 }
 
 struct Echo;
@@ -4530,6 +4570,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
             | Update::Ready
             | Update::PromptAvailable
             | Update::RetainedOutcomes
+            | Update::ConversationNameChanged
             | Update::Execution { .. } => None,
         })
         .collect();
@@ -4717,6 +4758,52 @@ fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() 
     assert!(!snapshot.ready);
     assert!(snapshot.error.is_none(), "{snapshot:?}");
     assert!(handle.failure().is_none());
+}
+
+// Claude's answer to initialize prompts the adapter's own request for the
+// context figure. A provider that exits cleanly before reading it lost none
+// of the reader's input, while one that leaves a prompt unread did (#3888).
+#[test]
+fn claude_clean_exit_reports_only_lost_reader_input() {
+    // Closing its stdin before answering fails that request's write with
+    // EPIPE every time, rather than only when the exit wins a race.
+    let (_directory, handle) = claude_initialization_pipe(
+        "import os\nos.close(0)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
+    );
+    let snapshot = finish_initialization_pipe(&handle);
+    assert!(snapshot.error.is_none(), "{snapshot:?}");
+    assert!(handle.failure().is_none());
+
+    // This one reads the context request, then stops reading and exits
+    // cleanly once the test has sent a prompt it can no longer read.
+    let (directory, handle) = claude_initialization_pipe(
+        "import os, time\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
+             assert json.loads(sys.stdin.readline())['request']['subtype'] == 'get_context_usage'\n\
+             os.close(0)\n\
+             open('stopped-reading', 'w').close()\n\
+             while not os.path.exists('prompt-sent'):\n    time.sleep(0.01)\n",
+    );
+    crate::test_timing::eventually("the provider to stop reading", || {
+        directory.path().join("stopped-reading").exists()
+    });
+    handle
+        .command(Command::Prompt {
+            text: "Never read".into(),
+            attachments: Vec::new(),
+            mode: crate::chat::PromptMode::Send,
+        })
+        .unwrap();
+    std::fs::write(directory.path().join("prompt-sent"), b"").unwrap();
+    let snapshot = finish_initialization_pipe(&handle);
+    assert!(
+        snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Provider stdin")),
+        "{snapshot:?}"
+    );
 }
 
 // Closing a busy turn sends Claude an interrupt. When the turn's result was
@@ -5273,6 +5360,40 @@ fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
 }
 
 #[test]
+fn json_line_batches_preserve_order_across_blank_lines_and_the_poll_budget() {
+    let mut output = String::from("\n");
+    let mut expected = String::new();
+    for index in 0..=FRAMES_PER_POLL {
+        if index == FRAMES_PER_POLL {
+            output.push('\n');
+        }
+        let digit = format!("{:x}", index % 16);
+        output.push_str(&format!("{}\n", json!({"text": digit})));
+        expected.push_str(&digit);
+    }
+    output.push('\n');
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/usr/bin/printf".into(),
+        arguments: vec!["%s".into(), output],
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let mut initial = Step::default();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+    let snapshot = until(&handle, |snapshot| snapshot.exited);
+    assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+    assert_eq!(unstamped(&snapshot.items), vec![text("echo", &expected)]);
+    handle.close().unwrap();
+}
+
+#[test]
 fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
     let mut output = String::new();
     for text in ["hello", " world"] {
@@ -5805,6 +5926,48 @@ fn direct_provider_non_reaping_observation_preserves_exit_status() {
 }
 
 #[test]
+fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
+    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+
+    let working = tempfile::tempdir().unwrap();
+    let recipe = crate::model::LaunchRecipe {
+        program: "/usr/bin/printenv".into(),
+        arguments: ["TMPDIR", "TMP", "TEMP"].map(str::to_owned).to_vec(),
+        working_directory: working.path().to_path_buf(),
+        environment: BTreeMap::from([
+            ("TMPDIR".into(), ".".into()),
+            ("TMP".into(), "/original-tmp".into()),
+            ("TEMP".into(), "/original-temp".into()),
+        ]),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let mut child = spawn_provider(&spec, &AtomicBool::new(false), None, true)
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut child.child.stdout.take().unwrap(), &mut bytes).unwrap();
+    let paths: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
+    let [first, second, third, []] = paths.as_slice() else {
+        panic!("expected three environment paths");
+    };
+    assert_eq!(first, second);
+    assert_eq!(first, third);
+    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(first.to_vec()));
+    assert_eq!(
+        temp.parent(),
+        Some(working.path().canonicalize().unwrap().as_path())
+    );
+    assert_eq!(
+        std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    std::fs::create_dir(temp.join(".git")).unwrap();
+    drop(child);
+    assert!(!temp.exists());
+}
+
+#[test]
 fn a_provider_is_never_handed_a_parent_session() {
     use std::io::Read;
     let spec = ProcessSpec {
@@ -5827,7 +5990,7 @@ fn a_provider_is_never_handed_a_parent_session() {
         .into(),
         unset_environment: Default::default(),
     };
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
         .unwrap()
         .unwrap();
     let mut output = String::new();
@@ -5864,7 +6027,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
         environment: Default::default(),
         unset_environment: Default::default(),
     };
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
         .unwrap()
         .unwrap();
     let pid = provider.child.id();
@@ -5947,7 +6110,7 @@ fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
         unset_environment: Default::default(),
     };
     let (wake, mut woken) = UnixStream::pair().unwrap();
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake))
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake), false)
         .unwrap()
         .unwrap();
     let root = provider.child.id();
@@ -6144,7 +6307,7 @@ fn a_detached_command_outlives_a_closed_or_finished_provider() {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
             .unwrap()
             .unwrap();
         if !provider

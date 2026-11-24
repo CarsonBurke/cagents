@@ -81,7 +81,7 @@ fn assert_operation(request: &ClientEnvelope, authority: &Authority, expected: &
         "exact Agent operation with original authority; never Authenticate or User fallback"
     );
 }
-struct Peer(Option<JoinHandle<(Option<UnixListener>, usize, usize)>>);
+struct Peer(Option<JoinHandle<Option<UnixListener>>>);
 impl Peer {
     fn new(business: Business, authority: Authority) -> Self {
         let socket = daemon_socket_path().unwrap();
@@ -93,8 +93,6 @@ impl Peer {
         let listener = UnixListener::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         Self(Some(thread::spawn(move || {
-            let mut readiness = 0;
-            let mut raw = 0;
             let attempts = if matches!(business, Business::Send) {
                 2
             } else {
@@ -103,48 +101,39 @@ impl Peer {
             let mut listener = Some(listener);
             for attempt in 0..attempts {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                let (mut peer, request) = loop {
-                    let mut peer = loop {
-                        match listener.as_ref().unwrap().accept() {
-                            Ok((peer, _)) => break peer,
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                assert!(
-                                    Instant::now() < deadline,
-                                    "private Agent invocation did not connect"
-                                );
-                                thread::sleep(Duration::from_millis(2));
-                            }
-                            Err(error) => panic!("private listener: {error}"),
+                let mut peer = loop {
+                    match listener.as_ref().unwrap().accept() {
+                        Ok((peer, _)) => break peer,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "private Agent invocation did not connect"
+                            );
+                            thread::sleep(Duration::from_millis(2));
                         }
-                    };
-                    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                    peer.set_write_timeout(Some(Duration::from_secs(3)))
-                        .unwrap();
-                    let Some(hello) = read_frame::<ClientEnvelope>(&mut peer).unwrap() else {
-                        raw += 1;
-                        assert!(raw <= attempts, "no repeated User no-start probe");
-                        continue;
-                    };
-                    assert!(matches!(hello.request, ClientRequest::Connect { .. }));
-                    assert!(hello.proof.is_none());
-                    response(
-                        &mut peer,
-                        &hello,
-                        ServerResponse::Connected {
-                            proof: proof(),
-                            resumed: vec![],
-                        },
-                    );
-                    if let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
-                        assert_eq!(request.proof.as_ref(), Some(&proof()));
-                        break (peer, request);
+                        Err(error) => panic!("private listener: {error}"),
                     }
-                    // A connection that only handshakes is a separate
-                    // readiness probe. Reach actual business before
-                    // diagnosing it.
-                    readiness += 1;
-                    assert!(readiness <= attempts, "no repeated readiness/fallback");
                 };
+                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let hello = read_frame::<ClientEnvelope>(&mut peer)
+                    .unwrap()
+                    .expect("each attempt handshakes on its first connection");
+                assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+                assert!(hello.proof.is_none());
+                response(
+                    &mut peer,
+                    &hello,
+                    ServerResponse::Connected {
+                        proof: proof(),
+                        resumed: vec![],
+                    },
+                );
+                let request = read_frame::<ClientEnvelope>(&mut peer)
+                    .unwrap()
+                    .expect("the same connection carries the Agent request");
+                assert_eq!(request.proof.as_ref(), Some(&proof()));
                 if attempt == 0 {
                     assert_operation(&request, &authority, &Operation::List);
                     response(
@@ -201,18 +190,17 @@ impl Peer {
                     );
                 }
             }
-            (listener, readiness, raw)
+            listener
         })))
     }
-    fn finished(mut self) -> (usize, usize) {
-        let (listener, readiness, raw) = self.0.take().unwrap().join().unwrap();
+    fn finished(mut self) {
+        let listener = self.0.take().unwrap().join().unwrap();
         if let Some(listener) = listener {
             assert!(
                 matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
                 "no extra connection after the definitive refusal"
             );
         }
-        (readiness, raw)
     }
 }
 impl Drop for Peer {
@@ -266,26 +254,16 @@ fn exercise(role: &str) {
                 ExitCode::FAILURE
             }
         );
-        let (ready, raw) = peer.finished();
-        routing.push((business, staged.get(), ready, raw));
+        peer.finished();
+        routing.push((business, staged.get()));
     }
     startup_route::run_absent(arguments(Business::List, no_start));
-    for (business, staged, ready, raw) in routing {
-        let connections = if matches!(business, Business::Send) {
-            2
-        } else {
-            1
-        };
+    for (business, staged) in routing {
         assert_eq!(
             staged,
             usize::from(!scoped),
             "{business:?}: scoped Agent requests cannot delegate before capture"
         );
-        assert_eq!(
-            ready, 0,
-            "{business:?}: readiness hands its connection to the request rather than handshaking twice"
-        );
-        assert_eq!(raw, if !scoped && no_start { connections } else { 0 });
     }
 }
 #[test]

@@ -2009,6 +2009,14 @@ pub mod test_support {
         state
     }
 
+    /// A review that has opened with no file chosen yet, as one does when
+    /// it is picked from the list.
+    pub fn ready_unselected() -> State {
+        let mut state = ready();
+        state.selected = None;
+        state
+    }
+
     pub fn with_old_head_review(state: &mut State) {
         let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
         next.context.pending = Some(crate::github::PendingReview {

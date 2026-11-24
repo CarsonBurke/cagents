@@ -10,7 +10,12 @@ use std::collections::BTreeSet;
 
 const VERSION: u8 = 1;
 /// How long the update lets `verify-update-census` run before stopping it.
-const VERIFIER_LIMIT: Duration = Duration::from_secs(20);
+pub(super) const VERIFIER_LIMIT: Duration = Duration::from_secs(20);
+/// The detail of the receipt a coordinator saves before it runs the target's
+/// verifier, so a stale usable receipt cannot stand in for that run. Every
+/// release since 0.2.3 writes exactly this text; a window that reads it knows
+/// a verifier is, or was, running.
+const PENDING_VERIFICATION: &str = "Fresh readiness verification is pending";
 /// The deadline, from the start of one verifier run, that every inventory
 /// fence of that run shares. No fence is sent unless its admission wait and a
 /// prompt reply fit before this deadline, so a daemon that is busy, steadily
@@ -457,7 +462,7 @@ impl Census {
         }
         let receipt_path = outcome_path(state, job);
         // A stale usable receipt must never substitute for this probe.
-        self.unverified("Fresh readiness verification is pending".into())?
+        self.unverified(PENDING_VERIFICATION.into())?
             .save(&receipt_path)?;
         let mut command = Command::new(&executable);
         command
@@ -1821,18 +1826,45 @@ pub(super) fn outcome_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.recovery.json"))
 }
 
+/// What `job`'s recovery receipt says, read against its saved census.
+#[cfg(any(feature = "ui", feature = "host", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Reading {
+    /// The target's verifier found the service usable, served by `0`.
+    Usable(HostSessionProof),
+    /// The placeholder saved just before a verifier run, at `since`. Until
+    /// that run ends it says nothing about the service.
+    Pending { since: std::time::SystemTime },
+    /// Anything else: the verifier did not find the service usable.
+    Unusable,
+}
+
+#[cfg(any(feature = "ui", feature = "host", test))]
+pub(super) fn read_receipt(state: &Path, job: &str) -> Result<Reading, UpdateError> {
+    let census = Census::load(&census_path(state, job))?;
+    let path = outcome_path(state, job);
+    let bytes = read_private(&path, JOB_STATE_LIMIT)?;
+    // Each save renames a new file into place, so this is when it was written.
+    let since = fs::symlink_metadata(&path)?.modified()?;
+    let receipt: Receipt = serde_json::from_slice(&bytes)?;
+    receipt.matches(&census)?;
+    if receipt == census.unverified(PENDING_VERIFICATION.into())? {
+        return Ok(Reading::Pending { since });
+    }
+    Ok(match receipt.outcome {
+        Outcome::Usable { serving, .. } => Reading::Usable(serving),
+        _ => Reading::Unusable,
+    })
+}
+
 /// The daemon `job`'s recovery receipt found usable against its saved census.
-#[cfg(any(feature = "ui", test))]
+#[cfg(test)]
 pub(super) fn verified_serving(
     state: &Path,
     job: &str,
 ) -> Result<Option<HostSessionProof>, UpdateError> {
-    let census = Census::load(&census_path(state, job))?;
-    let receipt: Receipt =
-        serde_json::from_slice(&read_private(&outcome_path(state, job), JOB_STATE_LIMIT)?)?;
-    receipt.matches(&census)?;
-    Ok(match receipt.outcome {
-        Outcome::Usable { serving, .. } => Some(serving),
+    Ok(match read_receipt(state, job)? {
+        Reading::Usable(serving) => Some(serving),
         _ => None,
     })
 }
@@ -2631,6 +2663,62 @@ mod tests {
         assert!(!error.failure().to_string().contains("daemon start"));
     }
 
+    /// The placeholder a coordinator saves just before the target's verifier
+    /// runs, exactly as 0.2.3 writes it for the e8bbb84f2 census, reads as a
+    /// verification still under way rather than as an unusable service.
+    #[test]
+    fn the_pending_verification_placeholder_is_not_a_verdict() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/update-e8bbb84f2-reached-target");
+        let job = "467204f6-b633-4600-b92d-afd4a95547f8";
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path();
+        let write = |path: PathBuf, bytes: &[u8]| {
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(
+            census_path(state, job),
+            &fs::read(fixture.join("census.json")).unwrap(),
+        );
+        let pending = fs::read_to_string(fixture.join("pending.json")).unwrap();
+        let census = Census::load(&census_path(state, job)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&census.unverified(PENDING_VERIFICATION.into()).unwrap())
+                .unwrap(),
+            pending,
+            "this build saves the same placeholder 0.2.3 does"
+        );
+        write(outcome_path(state, job), pending.as_bytes());
+        let Reading::Pending { since } = read_receipt(state, job).unwrap() else {
+            panic!("the placeholder must read as pending");
+        };
+        assert_eq!(
+            since,
+            fs::metadata(outcome_path(state, job))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+
+        // The same shape with any other detail is the verifier's verdict.
+        let failed = pending.replace(
+            PENDING_VERIFICATION,
+            "The verifier did not finish successfully; its partial receipt is not readiness proof",
+        );
+        write(outcome_path(state, job), failed.as_bytes());
+        assert_eq!(read_receipt(state, job).unwrap(), Reading::Unusable);
+
+        write(
+            outcome_path(state, job),
+            &fs::read(fixture.join("recovery.json")).unwrap(),
+        );
+        assert!(matches!(
+            read_receipt(state, job).unwrap(),
+            Reading::Usable(_)
+        ));
+    }
+
     /// The census and receipt an e8bbb84f2 worker wrote after its successor
     /// check failed against a newer protocol: the target's verifier had found
     /// every session usable. Paths and user names are anonymized; the digest is
@@ -2699,6 +2787,7 @@ mod tests {
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let completion = finish_reopening_windows(
             state,

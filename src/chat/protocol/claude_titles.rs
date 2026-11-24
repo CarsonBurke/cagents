@@ -1,16 +1,33 @@
-//! Claude's persisted names, refreshed only after a confirmed resume/result.
+//! Claude's persisted names, including titles appended after a turn ends.
 //! Metadata is presentation only, never execution or filesystem ownership proof.
+use super::MetadataWake;
 use crate::chat::{
     Launch,
     claude_metadata::{Lines, Names},
 };
-use std::{fs::File, os::unix::fs::MetadataExt, path::PathBuf};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    ffi::CString,
+    fs::{File, Metadata},
+    io::{self, Read, Write},
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd},
+        unix::fs::MetadataExt,
+    },
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+const WATCH_RETRY: Duration = Duration::from_secs(10);
 
 pub(super) struct ClaudeTitles {
     config: PathBuf,
     cwd: PathBuf,
     previous: Option<(String, String)>,
     transcript: Option<Transcript>,
+    retry_at: Option<Instant>,
 }
 
 struct Transcript {
@@ -23,6 +40,7 @@ struct Transcript {
     changed: (i64, i64, i64, i64),
     lines: Lines,
     names: Names,
+    watch: Option<TranscriptWatch>,
 }
 
 impl ClaudeTitles {
@@ -52,10 +70,42 @@ impl ClaudeTitles {
             cwd: recipe.working_directory.clone(),
             previous: None,
             transcript: None,
+            retry_at: None,
         })
     }
 
+    pub(super) fn metadata_wake(&self) -> Option<MetadataWake<'_>> {
+        let retry_at = self.retry_at?;
+        let watch = self
+            .transcript
+            .as_ref()
+            .and_then(|saved| saved.watch.as_ref());
+        Some(watch.map_or(MetadataWake::RetryAt(retry_at), |watch| {
+            MetadataWake::Changed(watch.wake.as_fd())
+        }))
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.retry_at = None;
+        self.previous = None;
+        self.transcript = None;
+    }
+
+    pub(super) fn refresh(&mut self, id: &str) -> Option<String> {
+        // Dropping the subscription discards coalesced events and re-arms the
+        // watch on the current inode, including after a rename or replacement.
+        if let Some(saved) = &mut self.transcript {
+            saved.watch = None;
+        }
+        self.update(id)
+    }
+
     pub(super) fn update(&mut self, id: &str) -> Option<String> {
+        self.retry_at = Some(Instant::now() + WATCH_RETRY);
+        let watch = self
+            .transcript
+            .as_mut()
+            .and_then(|saved| saved.watch.take());
         let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
         if !cwd.is_absolute() {
             return None;
@@ -71,6 +121,18 @@ impl ClaudeTitles {
         if !metadata.is_file() {
             return None;
         }
+        let watch = watch
+            .filter(|_| {
+                self.transcript.as_ref().is_some_and(|saved| {
+                    saved.path == path
+                        && saved.device == metadata.dev()
+                        && saved.inode == metadata.ino()
+                })
+            })
+            .or_else(|| watch_transcript(&file, &path, &metadata));
+        // Read the end after installing the watch, so a concurrent append
+        // is covered by this scan or wakes the worker for the next one.
+        let metadata = file.metadata().ok()?;
         let changed = (
             metadata.mtime(),
             metadata.mtime_nsec(),
@@ -97,6 +159,7 @@ impl ClaudeTitles {
                 changed,
                 lines: Lines::default(),
                 names: Names::default(),
+                watch: None,
             });
         }
         let saved = self.transcript.as_mut()?;
@@ -112,6 +175,7 @@ impl ClaudeTitles {
             .ok()?;
         saved.len = metadata.len();
         saved.changed = changed;
+        saved.watch = watch;
         // Do not publish an inferior partial first-pass result on an IO error
         // or interrupted coverage. Subsequent results only read new bytes.
         let title = complete.then(|| saved.names.title()).flatten()?.to_owned();
@@ -124,6 +188,177 @@ impl ClaudeTitles {
         }
         self.previous = Some((id.to_owned(), title.clone()));
         Some(title)
+    }
+}
+
+fn watch_transcript(file: &File, path: &Path, metadata: &Metadata) -> Option<TranscriptWatch> {
+    let watch = TranscriptWatches::shared()?.register(file)?;
+    // If the path was already replaced when we attached the watch, no event
+    // for that replacement is pending. Let the ordinary retry resolve it.
+    let visible = path.symlink_metadata().ok()?;
+    (visible.dev() == metadata.dev() && visible.ino() == metadata.ino()).then_some(watch)
+}
+
+// One kernel inotify instance per process. Each actor polls its own eventfd
+// so an event only wakes the actors watching that inode and each sees the edge.
+type Subscribers = HashMap<i32, Vec<Arc<File>>>;
+
+struct TranscriptWatches {
+    inotify: File,
+    subscribers: Mutex<Option<Subscribers>>,
+}
+
+impl TranscriptWatches {
+    fn shared() -> Option<Arc<Self>> {
+        static SERVICE: Mutex<Option<Arc<TranscriptWatches>>> = Mutex::new(None);
+        let mut service = SERVICE.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(service) = service.as_ref() {
+            return Some(service.clone());
+        }
+        // Leave failed initialization retryable if the inotify limit is full.
+        let started = Self::start().ok()?;
+        *service = Some(started.clone());
+        Some(started)
+    }
+
+    fn start() -> io::Result<Arc<Self>> {
+        // SAFETY: a successful call gives us an exclusively owned descriptor.
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let service = Arc::new(Self {
+            // SAFETY: fd is the successful result of inotify_init1 above.
+            inotify: unsafe { File::from_raw_fd(fd) },
+            subscribers: Mutex::new(Some(HashMap::new())),
+        });
+        let worker = service.clone();
+        thread::Builder::new()
+            .name("cagents-claude-titles".into())
+            .spawn(move || worker.dispatch())?;
+        Ok(service)
+    }
+
+    fn register(self: &Arc<Self>, file: &File) -> Option<TranscriptWatch> {
+        let pinned = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+        // SAFETY: a successful call gives us an exclusively owned descriptor.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: fd is the successful result of eventfd above.
+        let wake = Arc::new(unsafe { File::from_raw_fd(fd) });
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let subscribers = subscribers.as_mut()?;
+        let events = libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF;
+        // SAFETY: inotify is owned by self and pinned names the open file.
+        let id =
+            unsafe { libc::inotify_add_watch(self.inotify.as_raw_fd(), pinned.as_ptr(), events) };
+        if id < 0 {
+            return None;
+        }
+        subscribers.entry(id).or_default().push(wake.clone());
+        Some(TranscriptWatch {
+            service: self.clone(),
+            id,
+            wake,
+        })
+    }
+
+    fn dispatch(&self) {
+        let mut buffer = [0; 4096];
+        loop {
+            let size = match (&self.inotify).read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => size,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let mut subscribers = self
+                .subscribers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(subscribers) = subscribers.as_mut() else {
+                break;
+            };
+            let mut records = &buffer[..size];
+            while let Some(header) = records.first_chunk::<{ size_of::<libc::inotify_event>() }>() {
+                // SAFETY: header covers a complete inotify event header of integers.
+                let event = unsafe {
+                    header
+                        .as_ptr()
+                        .cast::<libc::inotify_event>()
+                        .read_unaligned()
+                };
+                records = &records[header.len() + event.len as usize..];
+                if event.mask & libc::IN_Q_OVERFLOW != 0 {
+                    // Anyone may have missed a change when the kernel queue filled.
+                    for wake in subscribers.values().flatten() {
+                        Self::signal(wake);
+                    }
+                } else if event.mask & libc::IN_IGNORED != 0 {
+                    // An automatically removed watch needs to be registered again.
+                    for wake in subscribers.remove(&event.wd).into_iter().flatten() {
+                        Self::signal(&wake);
+                    }
+                } else if let Some(wakes) = subscribers.get(&event.wd) {
+                    for wake in wakes {
+                        Self::signal(wake);
+                    }
+                }
+            }
+        }
+        // A reader failure leaves actors on the ordinary path retry.
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (id, wakes) in subscribers.take().into_iter().flatten() {
+            self.remove(id);
+            for wake in wakes {
+                Self::signal(&wake);
+            }
+        }
+    }
+
+    fn signal(mut wake: &File) {
+        // A full nonblocking counter already has a wake pending.
+        let _ = wake.write_all(&1_u64.to_ne_bytes());
+    }
+
+    fn remove(&self, id: i32) {
+        // SAFETY: inotify is live and id came from this instance.
+        unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), id) };
+    }
+}
+
+struct TranscriptWatch {
+    service: Arc<TranscriptWatches>,
+    id: i32,
+    wake: Arc<File>,
+}
+
+impl Drop for TranscriptWatch {
+    fn drop(&mut self) {
+        let mut subscribers = self
+            .service
+            .subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(subscribers) = subscribers.as_mut() else {
+            return;
+        };
+        if let Entry::Occupied(mut entry) = subscribers.entry(self.id) {
+            let wakes = entry.get_mut();
+            wakes.retain(|wake| !Arc::ptr_eq(wake, &self.wake));
+            if wakes.is_empty() {
+                entry.remove();
+                self.service.remove(self.id);
+            }
+        }
     }
 }
 
@@ -371,6 +606,53 @@ mod tests {
 
     fn history(path: &Path, id: &str, cwd: &Path, name: &str) {
         std::fs::write(path, format!("{}\n{}\n", json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"First prompt"}}), json!({"type":"custom-title","sessionId":id,"customTitle":name}))).unwrap();
+    }
+
+    fn watch_ready(watch: &TranscriptWatch, timeout: i32) -> bool {
+        let mut poll = libc::pollfd {
+            fd: watch.wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll borrows the live watch for this call.
+        assert!(unsafe { libc::poll(&mut poll, 1, timeout) } >= 0);
+        poll.revents & libc::POLLIN != 0
+    }
+
+    #[test]
+    fn one_inotify_instance_dispatches_to_individual_transcript_watchers() {
+        let mut first = tempfile::NamedTempFile::new().unwrap();
+        let mut second = tempfile::NamedTempFile::new().unwrap();
+        let watch = |transcript: &tempfile::NamedTempFile| {
+            let file = transcript.as_file();
+            watch_transcript(file, transcript.path(), &file.metadata().unwrap()).unwrap()
+        };
+        let first_watch = watch(&first);
+        let duplicate = watch(&first);
+        let second_watch = watch(&second);
+
+        assert!(Arc::ptr_eq(&first_watch.service, &second_watch.service));
+        assert_eq!(first_watch.id, duplicate.id);
+        assert_ne!(first_watch.id, second_watch.id);
+
+        writeln!(first, "first change").unwrap();
+        assert!(watch_ready(&first_watch, 2000));
+        assert!(watch_ready(&duplicate, 2000));
+        assert!(!watch_ready(&second_watch, 0));
+
+        drop(first_watch);
+        (&*duplicate.wake).read_exact(&mut [0; 8]).unwrap();
+        writeln!(first, "another change").unwrap();
+        assert!(watch_ready(&duplicate, 2000));
+
+        let id = duplicate.id;
+        drop(duplicate);
+        let subscribers = second_watch.service.subscribers.lock().unwrap();
+        assert!(!subscribers.as_ref().unwrap().contains_key(&id));
+        drop(subscribers);
+
+        writeln!(second, "other transcript").unwrap();
+        assert!(watch_ready(&second_watch, 2000));
     }
 
     #[test]

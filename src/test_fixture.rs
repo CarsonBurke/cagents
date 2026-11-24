@@ -94,14 +94,14 @@ fn validate_root(root: &Path, protected: &[(PathBuf, &'static str)]) -> io::Resu
             ));
         }
         let git = ancestor.join(".git");
-        match fs::symlink_metadata(&git) {
-            Ok(_) => {
+        match crate::git_marker::present(&git) {
+            Ok(true) => {
                 return Err(refusal(
                     root,
                     format!("enclosing Git marker {} exists", git.display()),
                 ));
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(false) => {}
             Err(error) => {
                 return Err(refusal(
                     root,
@@ -290,7 +290,11 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             let marker = parent.join(".git");
             match kind {
-                "directory" => fs::create_dir(&marker).unwrap(),
+                "directory" => {
+                    fs::create_dir(&marker).unwrap();
+                    drop(create_in(&root, "case-", &[]).unwrap());
+                    fs::write(marker.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+                }
                 "file" => fs::write(&marker, b"gitdir: owned sentinel").unwrap(),
                 _ => symlink("owned-missing-target", &marker).unwrap(),
             }

@@ -29,6 +29,9 @@ jobs:
     name: Protocol and unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # mobile/gradlew runs only where this is set; a runner is a build host.
+    env:
+      CAGENTS_GRADLE_LOCAL: "1"
     defaults:
       run:
         working-directory: mobile

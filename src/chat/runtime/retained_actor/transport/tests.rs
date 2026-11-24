@@ -466,7 +466,9 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
             Ok(Step::default())
         }
     }
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    // Use the build gate's private TMPDIR when it provides one.
+    let base = std::env::var_os("TMPDIR").unwrap_or_else(|| "/var/tmp".into());
+    let root = tempfile::tempdir_in(base).unwrap();
     let remote = RemoteActor::fixture();
     let mut identity = remote.identity();
     let proof = remote.0.proof.clone();
@@ -3111,6 +3113,47 @@ impl Drop for ServedHelper {
         }
     }
 }
+#[test]
+fn replacement_proxy_reclaims_an_orphaned_unknown_receipt() {
+    let identity = InputIdentity {
+        sequence: 1,
+        id: uuid::Uuid::new_v4(),
+        hash: [7; 32],
+    };
+    let served = ServedHelper::new(|server| {
+        let mut journal = server.journal.lock().unwrap();
+        journal.admit(&identity).unwrap();
+        journal
+            .finish(&identity, InputState::Unknown("no provider receipt".into()))
+            .unwrap();
+    });
+    let actor = &served.actor;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while actor.0.recovering_inputs.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "unknown receipt was never retired"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        actor
+            .call::<Option<InputReceipt>>("input_receipt", json!([identity]))
+            .unwrap_err(),
+        journal::RETIRED_RECEIPT
+    );
+    assert!(
+        served
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _)| method != "input")
+    );
+    let next = actor.enqueue(None, Command::Refresh).unwrap();
+    assert_eq!(next.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(), Ok(()));
+    assert_eq!(served.input_request(2)[0]["sequence"], 2);
+}
 /// #2242: an input the helper refused without a receipt fenced every
 /// later input of the conversation for good.
 #[test]
@@ -3621,7 +3664,7 @@ fn lost_retirement_reply_keeps_bounded_ack_metadata_and_never_resends_input() {
         actor.pending_inputs().is_empty(),
         "a failed metadata ACK never restores a provider envelope"
     );
-    // Accepted and Unknown receipts are not retirement candidates.
+    // Accepted input keeps its waiter until a terminal outcome arrives.
     let response = actor.enqueue(None, Command::Refresh).unwrap();
     let other = actor.pending_inputs().pop().unwrap();
     actor.apply_receipts(&[InputReceipt {
@@ -3629,13 +3672,20 @@ fn lost_retirement_reply_keeps_bounded_ack_metadata_and_never_resends_input() {
         state: InputState::Accepted,
     }]);
     assert!(response.try_recv().is_err());
+    assert_eq!(actor.pending_inputs(), vec![other.clone()]);
     actor.apply_receipts(&[InputReceipt {
-        identity: other,
+        identity: other.clone(),
         state: InputState::Unknown("uncertain".into()),
     }]);
-    assert!(response.try_recv().unwrap().is_err());
-    assert_eq!(*actor.0.retiring_inputs.lock().unwrap(), vec![identity]);
-    assert_eq!(actor.pending_inputs().len(), 1);
+    assert_eq!(
+        response.try_recv(),
+        Ok(Err(Rejection::Unacknowledged("uncertain".into())))
+    );
+    assert_eq!(
+        *actor.0.retiring_inputs.lock().unwrap(),
+        vec![identity, other]
+    );
+    assert!(actor.pending_inputs().is_empty());
 }
 
 #[test]

@@ -480,8 +480,12 @@ pub enum DaemonCommand {
     #[command(hide = true)]
     Bridge {
         /// Serve the stable mobile API instead, as JSON lines (docs/mobile-api.md).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "pair")]
         mobile: bool,
+        /// Take one phone's pairing request for the pairing in this directory:
+        /// the forced command of a one-time pairing key (docs/mobile-api.md).
+        #[arg(long, value_name = "DIRECTORY")]
+        pair: Option<PathBuf>,
     },
     /// Start the daemon if it is not already running.
     Start,
@@ -1177,6 +1181,21 @@ impl ControlClient {
         Self::from_stream_inner(stream, deadline, Instant::now() + io_timeout())
     }
 
+    /// Consult the restoration deadline only if the ordinary hello budget runs out.
+    pub(crate) fn from_stream_with_startup_deadline(
+        stream: UnixStream,
+        startup_deadline: impl FnOnce() -> Instant,
+    ) -> Result<Self, ControlError> {
+        let now = Instant::now();
+        Self::from_stream_at(
+            stream,
+            now + Self::handshake_timeout(),
+            now + io_timeout(),
+            PROTOCOL_VERSION,
+            Some(startup_deadline),
+        )
+    }
+
     pub(crate) fn from_stream_with_deadline(
         stream: UnixStream,
         deadline: Instant,
@@ -1195,7 +1214,13 @@ impl ControlClient {
         if !crate::update::source::is_qualified_source(protocol) {
             return Err(ControlError::UnsupportedVersion { actual: protocol });
         }
-        Self::from_stream_at(stream, deadline, deadline, protocol)
+        Self::from_stream_at(
+            stream,
+            deadline,
+            deadline,
+            protocol,
+            None::<fn() -> Instant>,
+        )
     }
 
     fn from_stream_inner(
@@ -1203,7 +1228,13 @@ impl ControlClient {
         deadline: Instant,
         write_deadline: Instant,
     ) -> Result<Self, ControlError> {
-        Self::from_stream_at(stream, deadline, write_deadline, PROTOCOL_VERSION)
+        Self::from_stream_at(
+            stream,
+            deadline,
+            write_deadline,
+            PROTOCOL_VERSION,
+            None::<fn() -> Instant>,
+        )
     }
 
     fn from_stream_at(
@@ -1211,6 +1242,7 @@ impl ControlClient {
         deadline: Instant,
         write_deadline: Instant,
         protocol: u16,
+        extend: Option<impl FnOnce() -> Instant>,
     ) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(Self::handshake_timeout()))
@@ -1223,7 +1255,7 @@ impl ControlClient {
             next_request_id: 1,
             protocol,
         };
-        let proof = client.handshake(deadline, write_deadline)?;
+        let proof = client.handshake(deadline, write_deadline, extend)?;
         client
             .stream
             .set_read_timeout(Some(io_timeout()))
@@ -3160,6 +3192,33 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
+/// Extend a timed-out hello read inside the frame reader, which still holds
+/// any prefix or payload bytes already received on this connection.
+struct HandshakeReplyReader<'a, F> {
+    reader: DeadlineReader<'a>,
+    extend: Option<F>,
+}
+
+impl<F: FnOnce() -> Instant> Read for HandshakeReplyReader<'_, F> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let result = self.reader.read(buffer);
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+        }) && let Some(extend) = self.extend.take()
+        {
+            let deadline = extend();
+            if deadline > self.reader.deadline {
+                self.reader.deadline = deadline;
+                return self.reader.read(buffer);
+            }
+        }
+        result
+    }
+}
+
 /// Bound every partial write of a request against the same overall deadline.
 struct DeadlineWriter<'a> {
     stream: &'a mut UnixStream,
@@ -3195,6 +3254,7 @@ impl HandshakeClient {
         &mut self,
         deadline: Instant,
         write_deadline: Instant,
+        extend: Option<impl FnOnce() -> Instant>,
     ) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
@@ -3217,16 +3277,22 @@ impl HandshakeClient {
             },
             &request,
         )?;
-        let timeout = deadline.saturating_duration_since(Instant::now());
-        let envelope: ServerEnvelope = read_frame_from(
-            self.protocol,
-            &mut DeadlineReader {
+        let started = Instant::now();
+        let mut reader = HandshakeReplyReader {
+            reader: DeadlineReader {
                 stream: &mut self.stream,
                 deadline,
             },
-        )
-        .map_err(|error| reply_error(error, Some(timeout)))?
-        .ok_or(ControlError::ConnectionClosed)?;
+            extend,
+        };
+        let envelope: ServerEnvelope = read_frame_from(self.protocol, &mut reader)
+            .map_err(|error| {
+                reply_error(
+                    error,
+                    Some(reader.reader.deadline.saturating_duration_since(started)),
+                )
+            })?
+            .ok_or(ControlError::ConnectionClosed)?;
         validate_handshake(&envelope, self.protocol, request_id)
             .cloned()
             .map_err(|error| match error {
@@ -3556,32 +3622,33 @@ impl Drop for OutputPolicy {
     }
 }
 
-fn control_daemon_socket() -> Result<PathBuf, AppError> {
-    if !daemon_autostart_disabled() {
-        return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
-    }
-    let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;
-    match UnixStream::connect(&socket) {
-        Ok(_) => Ok(socket),
-        Err(error) if daemon_missing(&error) => {
-            confirm_daemon_absent(&socket)?;
+/// Only a failed socket connection can mean the daemon is absent. Once the
+/// socket connects, a failed handshake is reported as a connection failure.
+fn existing_daemon_client(
+    socket: &Path,
+    connection: Result<ControlClient, ControlError>,
+    handshake_error: impl FnOnce(ControlError) -> AppError,
+) -> Result<ControlClient, AppError> {
+    match connection {
+        Err(ControlError::Connect(error)) if daemon_missing(&error) => {
+            confirm_daemon_absent(socket)?;
             Err(AppError::new(
                 "daemon_not_running",
                 "The daemon is not running; omit --no-start to start it",
             ))
         }
-        Err(error) => Err(AppError::new("daemon_connection", error)),
+        Err(ControlError::Connect(error)) => Err(AppError::new("daemon_connection", error)),
+        connection => connection.map_err(handshake_error),
     }
 }
 
-/// A connection to the daemon [`control_daemon_socket`] selects. A daemon this
-/// call may start is reached on the connection that proved it ready, rather
-/// than proven ready and then connected to again.
+/// Connect to the daemon, starting it when allowed and needed.
 fn control_daemon_client() -> Result<ControlClient, AppError> {
     if daemon_autostart_disabled() {
-        let socket = control_daemon_socket()?;
-        return ControlClient::connect(&socket)
-            .map_err(|error| AppError::new("daemon_connection", error));
+        let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;
+        return existing_daemon_client(&socket, ControlClient::connect(&socket), |error| {
+            AppError::new("daemon_connection", error)
+        });
     }
     connect_ready_daemon_client()
 }
@@ -4032,9 +4099,18 @@ where
         }
     }
     if let TopCommand::Daemon {
-        command: DaemonCommand::Bridge { mobile },
+        command: DaemonCommand::Bridge { mobile, pair },
     } = cli.command
     {
+        if let Some(directory) = pair {
+            return match crate::mobile::pairing::serve_pairing(&directory) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("cagents daemon bridge --pair: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         let served = if mobile {
             crate::mobile::serve_bridge()
         } else {
@@ -4739,12 +4815,15 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
         DaemonCommand::Start => {
-            let socket = control_daemon_socket()?;
-            if daemon_autostart_disabled() {
+            let socket = if daemon_autostart_disabled() {
+                let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;
                 // Readiness still requires the matched protocol; a listener
                 // alone does not prove this daemon can serve CLI requests.
-                let _client = ControlClient::connect(&socket).map_err(protocol_error)?;
-            }
+                existing_daemon_client(&socket, ControlClient::connect(&socket), protocol_error)?;
+                socket
+            } else {
+                terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?
+            };
             let mut data = json!({ "instance": instance::NAME, "running": true, "socket": socket });
             // Installers discard a successful start's output, but a daemon that
             // came up without some retained conversations must still say so.
@@ -5658,16 +5737,8 @@ impl ProjectChannelContext {
     fn connect(&self, mutation: bool) -> Result<ControlClient, AppError> {
         self.connect_with(
             mutation,
-            || {
-                if mutation && self.authority.token().is_some() {
-                    daemon_socket_path().map_err(|error| AppError::new("socket_path", error))
-                } else {
-                    // Preserve --no-start absence and ownership checks for
-                    // ordinary Users and intentionally global reads alike.
-                    control_daemon_socket()
-                }
-            },
-            control_daemon_client,
+            || daemon_socket_path().map_err(|error| AppError::new("socket_path", error)),
+            connect_ready_daemon_client,
             ControlClient::connect,
         )
     }
@@ -5681,15 +5752,19 @@ impl ProjectChannelContext {
         ready: impl FnOnce() -> Result<ControlClient, AppError>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
     ) -> Result<ControlClient, AppError> {
-        let scoped = self.authority.token().is_some();
-        let mut client = if (scoped && mutation) || self.no_start {
-            connect(&existing()?).map_err(|error| AppError::new("daemon_connection", error))?
+        let scoped_mutation = self.authority.token().is_some() && mutation;
+        let connection_error = |error| AppError::new("daemon_connection", error);
+        let mut client = if scoped_mutation {
+            connect(&existing()?).map_err(connection_error)?
+        } else if self.no_start {
+            let socket = existing()?;
+            existing_daemon_client(&socket, connect(&socket), connection_error)?
         } else {
             ready()?
         };
         // Lists are deliberately global reads, including for an invalid or
         // empty inherited capability. Only legacy mutations bind the stream.
-        if scoped && mutation {
+        if scoped_mutation {
             client
                 .authenticate(self.authority.clone())
                 .map_err(protocol_error)?;
@@ -8192,6 +8267,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn warm_startup_handshake_skips_deadline_estimation() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        write_frame(
+            &mut server,
+            &connected_envelope(1, pinned.clone(), pinned.clone()),
+        )
+        .unwrap();
+
+        let client = ControlClient::from_stream_with_startup_deadline(client, || {
+            panic!("a warm hello must not read the upgrade checkpoint")
+        })
+        .unwrap();
+        assert_eq!(client.proof(), &pinned);
+        let request: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+        assert!(matches!(request.request, ClientRequest::Connect { .. }));
+    }
+
     /// `channel spawn` opens the project before creating the channel in it,
     /// mints the id itself, and reports the created channel under the
     /// `channel.spawn` envelope every automation keys on.
@@ -8425,6 +8519,7 @@ mod tests {
         // Broken metadata deliberately proves the existing key is consulted
         // before attempting Git rediscovery, not only corrected afterwards.
         std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "invalid ref\n").unwrap();
         let ResolvedProject::Open { repository, .. } = (ProjectCommand::Open {
             path: Some(root.clone()),
         })

@@ -1,6 +1,6 @@
 //! Exact, opt-in agent recovery evidence. Never searches a session directory or
 //! selects a recent conversation; unknown launches retain their shell fallback.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 use std::path::Path;
 #[cfg(feature = "host")]
 use std::{fs, io::Read};
@@ -827,12 +827,30 @@ pub fn fresh_native_environment(
     provider: Provider,
     persistable: bool,
 ) -> std::collections::BTreeMap<String, String> {
-    if crate::device::is_remote() {
-        return crate::device::environment(provider, persistable);
+    let mut environment = if crate::device::is_remote() {
+        crate::device::environment(provider, persistable)
+    } else {
+        std::env::vars()
+            .filter(|(name, value)| fresh_environment_key(provider, name, value, persistable))
+            .collect()
+    };
+    normalize_temporary_environment(&mut environment);
+    environment
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn normalize_temporary_environment(environment: &mut std::collections::BTreeMap<String, String>) {
+    use crate::daemon::codex_temp::{TEMP_ENV_KEYS, managed_base};
+
+    // The captured environment must outlive the Codex process that owns its
+    // private directory. The chosen base remains valid even after cleanup.
+    for name in TEMP_ENV_KEYS {
+        if let Some(value) = environment.get_mut(name)
+            && let Some(base) = managed_base(Path::new(value)).and_then(Path::to_str)
+        {
+            *value = base.to_owned();
+        }
     }
-    std::env::vars()
-        .filter(|(name, value)| fresh_environment_key(provider, name, value, persistable))
-        .collect()
 }
 
 #[cfg(feature = "host")]
@@ -965,6 +983,7 @@ fn preserved_native_environment(
             environment.insert(name.to_owned(), value.to_owned());
         }
     }
+    normalize_temporary_environment(&mut environment);
     // Absent explicit variables stay absent; never restore stale launch values.
     Ok(environment)
 }
@@ -1658,6 +1677,65 @@ mod tests {
                 ("HOME".to_owned(), "/source".to_owned()),
             ])
         );
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn fresh_native_environment_uses_the_base_of_an_inherited_codex_directory() {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
+        const BASE: &str = "CAGENTS_TEST_FRESH_TEMP_BASE";
+        if let Ok(base) = std::env::var(BASE) {
+            for persistable in [false, true] {
+                let environment = fresh_native_environment(Provider::Claude, persistable);
+                for name in TEMP_ENV_KEYS {
+                    assert_eq!(environment[name], base);
+                }
+                assert_eq!(environment["HOME"], "/fixture");
+            }
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let private = PrivateDir::create(Some(base.as_os_str()), None).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "model::agent_recovery::tests::fresh_native_environment_uses_the_base_of_an_inherited_codex_directory",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(BASE, base)
+            .env("HOME", "/fixture")
+            .env("TMPDIR", private.path())
+            .env("TMP", private.path().join("nested"))
+            .env("TEMP", private.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn persisted_native_environment_uses_the_base_of_a_removed_codex_directory() {
+        use crate::daemon::codex_temp::PrivateDir;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let private = PrivateDir::create(Some(base.as_os_str()), None).unwrap();
+        let path = private.path().to_str().unwrap().to_owned();
+        drop(private);
+        let source = format!("TMPDIR={path}\0TMP={path}/nested\0TEMP=/other/temp\0");
+
+        let (durable, execution) =
+            native_environment_parts(source.as_bytes(), Provider::Claude, &BTreeMap::new(), None)
+                .unwrap();
+        for environment in [durable, execution] {
+            assert_eq!(environment["TMPDIR"], base.to_str().unwrap());
+            assert_eq!(environment["TMP"], base.to_str().unwrap());
+            assert_eq!(environment["TEMP"], "/other/temp");
+        }
     }
 
     #[cfg(feature = "host")]

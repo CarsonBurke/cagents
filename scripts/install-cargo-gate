@@ -24,7 +24,7 @@ Usage: scripts/install-cargo-gate [DIRECTORY]
 
 Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
 build-host, cargo-gate-command.py, cargo-host-test-helper.py, cargo_artifacts.py,
-cargo-gate-sync.py, cargo-gate-rustc-guard, cargo-incremental-retry.py, cargo-offload, seed-build-dir,
+cargo-gate-sync.py, cargo-gate-rustc-guard, cargo-incremental-retry.py, cargo-offload, git_ancestry.py, seed-build-dir,
 build-disk-guard, memory-capped and prune-build-dirs beside it (default DIRECTORY: /var/tmp). Exits 3, changing
 nothing, when the installed gate's version is newer than this checkout's.
 EOF
@@ -47,6 +47,7 @@ cargo-gate-sync.py:cargo-gate-sync.py
 cargo-gate-rustc-guard:cargo-gate-rustc-guard
 cargo-incremental-retry.py:cargo-incremental-retry.py
 cargo-offload:cargo-offload
+git_ancestry.py:git_ancestry.py
 seed-build-dir:seed-build-dir
 build-disk-guard:build-disk-guard
 memory-capped:memory-capped

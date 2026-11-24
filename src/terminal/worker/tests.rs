@@ -623,34 +623,32 @@ fn a_second_search_window_cannot_cancel_the_first_windows_query() {
     assert_eq!(local.load(Ordering::Acquire), 1);
 }
 
+/// Filling a history is what these cost, so the default budget's history
+/// serves both of its contracts: it holds over ten thousand rows, and a
+/// smaller budget holds less than half as many.
 #[test]
-fn default_scrollback_byte_budget_retains_over_ten_thousand_rows() {
+fn default_scrollback_byte_budget_retains_over_ten_thousand_rows_and_a_smaller_budget_fewer() {
     let config = TerminalConfig::default();
-    let mut terminal = Terminal::new(TerminalOptions {
-        cols: config.columns,
-        rows: config.rows,
-        max_scrollback: config.max_scrollback_bytes,
-    })
-    .unwrap();
-    terminal.vt_write(&b"output\r\n".repeat(20_000));
-    assert!(terminal.scrollbar().unwrap().total > 10_000);
-}
-
-#[test]
-fn scrollback_byte_budget_changes_retained_history() {
-    let retained = |budget| {
+    let retained = |max_scrollback| {
         let mut terminal = Terminal::new(TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: budget,
+            cols: config.columns,
+            rows: config.rows,
+            max_scrollback,
         })
         .unwrap();
         terminal.vt_write(&b"output\r\n".repeat(20_000));
         terminal.scrollbar().unwrap().total
     };
+    let default = retained(config.max_scrollback_bytes);
+    assert!(
+        default > 10_000,
+        "the default budget retained only {default} rows"
+    );
     let low = retained(2 * 1024 * 1024);
-    let high = retained(TerminalConfig::default().max_scrollback_bytes);
-    assert!(high > low * 2, "low={low}, high={high}");
+    assert!(
+        default > low * 2,
+        "a smaller budget must retain less history: low={low}, default={default}"
+    );
 }
 
 #[test]
@@ -3342,11 +3340,18 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
             let _ = self.0.force_kill();
         }
     }
-    for (script, expected_code) in [
-        ("trap '' HUP; printf ready; while :; do sleep 1; done", None),
+    // A family that ignores its hangup waits out the grace, so it gets the
+    // product's; one that handles it ends the grace whenever it exits.
+    for (script, expected_code, budget) in [
+        (
+            "trap '' HUP; printf ready; while :; do sleep 1; done",
+            None,
+            ShutdownBudget::PATIENT_PRODUCT_GRACE,
+        ),
         (
             "trap 'exit 3' HUP; printf ready; while :; do sleep 0.05; done",
             Some(3),
+            ShutdownBudget::PATIENT,
         ),
     ] {
         let mut command = portable_pty::CommandBuilder::new("/bin/sh");
@@ -3415,7 +3420,6 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
         assert_eq!(&ready, b"ready");
         let root = RootIdentity::capture(held.child.pid(), None).unwrap();
         let started = std::time::Instant::now();
-        let budget = ShutdownBudget::PATIENT;
         let status = shutdown_child_exit(
             &held.child,
             &held.master,
@@ -4287,6 +4291,165 @@ fn env_recipe(environment: BTreeMap<String, String>) -> LaunchRecipe {
 }
 
 #[test]
+fn codex_terminal_uses_private_temp_variables_and_cleans_up_on_exit() {
+    use std::path::Path;
+
+    let directory = tempdir().unwrap();
+    let shared = directory.path().join("shared");
+    let runtime = directory.path().join("runtime");
+    fs::create_dir(&shared).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    let physical_shared = shared.canonicalize().unwrap();
+    let reported = directory.path().join("reported-tmpdir");
+    let mut previous_tmpdir = None;
+
+    for (program, returned) in [("codex", false), ("codex", true), ("shell", false)] {
+        let entrypoint = directory.path().join(program);
+        fs::write(
+            &entrypoint,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$TMPDIR\" \"$TMP\" \"$TEMP\" > tmpdir.part\n\
+             /bin/mv tmpdir.part reported-tmpdir\n\
+             read -r line\n",
+        )
+        .unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut recipe = env_recipe(BTreeMap::from([
+            ("HOME".into(), directory.path().to_str().unwrap().into()),
+            ("TMPDIR".into(), "shared".into()),
+            ("TMP".into(), "original-tmp".into()),
+            ("TEMP".into(), "original-temp".into()),
+            ("XDG_RUNTIME_DIR".into(), runtime.to_str().unwrap().into()),
+        ]));
+        recipe.program = entrypoint.to_str().unwrap().into();
+        recipe.working_directory = directory.path().into();
+        let config = TerminalConfig {
+            execution_environment: returned
+                .then(|| crate::terminal_ipc::ChatExecutionEnvironment(recipe.environment.clone())),
+            ..TerminalConfig::default()
+        };
+        if returned {
+            recipe
+                .environment
+                .insert("TMPDIR".into(), runtime.to_str().unwrap().into());
+        }
+        let (worker, _) = capture_worker_with(recipe, config);
+        crate::test_timing::eventually("the terminal's TMPDIR report", || reported.is_file());
+        let values = fs::read_to_string(&reported).unwrap();
+        let [tmpdir, tmp, temp]: [&str; 3] = values.lines().collect::<Vec<_>>().try_into().unwrap();
+        let tmpdir = PathBuf::from(tmpdir);
+        fs::remove_file(&reported).unwrap();
+
+        if program == "codex" {
+            assert_eq!(tmpdir.parent(), Some(physical_shared.as_path()));
+            assert_eq!(Path::new(tmp), tmpdir);
+            assert_eq!(Path::new(temp), tmpdir);
+            assert_ne!(Some(&tmpdir), previous_tmpdir.as_ref());
+            assert_eq!(
+                fs::metadata(&tmpdir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            fs::create_dir(tmpdir.join(".git")).unwrap();
+        } else {
+            assert_eq!(tmpdir, Path::new("shared"));
+            assert_eq!(tmp, "original-tmp");
+            assert_eq!(temp, "original-temp");
+        }
+
+        std::io::Write::write_all(
+            &mut File::from(worker.master.duplicate().unwrap()),
+            b"done\n",
+        )
+        .unwrap();
+        worker.run();
+        if program == "codex" {
+            assert!(!tmpdir.exists());
+            previous_tmpdir = Some(tmpdir);
+        }
+        assert!(shared.is_dir());
+        assert!(!shared.join(".git").exists());
+    }
+}
+
+#[test]
+fn a_detached_codex_terminal_child_can_use_tmpdir_after_the_terminal_exits() {
+    use std::path::Path;
+
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let release = directory.path().join("release");
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&release)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Keep both ends open so the detached child can start without blocking
+    // on opening its end and waits here until the terminal has exited.
+    let mut release = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(release)
+        .unwrap();
+    let program = directory.path().join("codex");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+/usr/bin/setsid /bin/sh -c '
+    printf "%s\n%s" "$$" "$TMPDIR" > reported.part
+    /bin/mv reported.part reported
+    read -r line
+    printf "detached" > "$TMPDIR/used-after-exit"
+' < release > /dev/null 2>&1 &
+read -r line
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let launch = LaunchRecipe {
+        program: program.to_str().unwrap().into(),
+        working_directory: directory.path().into(),
+        ..env_recipe(BTreeMap::from([
+            ("HOME".into(), directory.path().to_str().unwrap().into()),
+            ("TMPDIR".into(), directory.path().to_str().unwrap().into()),
+        ]))
+    };
+    let session = TerminalSession {
+        launch: launch.clone(),
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: launch,
+            last_exit: None,
+        },
+        ..shell_session("")
+    };
+    let terminal = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
+    let report = directory.path().join("reported");
+    crate::test_timing::eventually("the detached child's TMPDIR report", || report.is_file());
+    let report = fs::read_to_string(report).unwrap();
+    let (pid, tmpdir) = report.split_once('\n').unwrap();
+    let pid = pid.parse::<i32>().unwrap();
+    let tmpdir = Path::new(tmpdir);
+    let base = directory.path().canonicalize().unwrap();
+    assert_eq!(tmpdir.parent(), Some(base.as_path()));
+    terminal.input(b"done\n").unwrap();
+    crate::test_timing::eventually("the terminal's natural exit", || terminal.is_completed());
+    assert!(tmpdir.is_dir());
+    let marker = tmpdir.join("used-after-exit");
+    std::io::Write::write_all(&mut release, b"done\n").unwrap();
+    crate::test_timing::eventually("the detached child using its TMPDIR", || {
+        fs::read(&marker).is_ok_and(|bytes| bytes == b"detached")
+    });
+    let environment = format!("/proc/{pid}/environ");
+    crate::test_timing::eventually("the detached child's exit", || {
+        fs::read(&environment).is_ok_and(|bytes| bytes.is_empty())
+            || !Path::new(&environment).exists()
+    });
+}
+
+#[test]
 fn a_recipe_saved_inside_another_session_does_not_hand_the_child_its_socket() {
     let command = command_from_recipe(&env_recipe(BTreeMap::from([
         ("CLAUDECODE".to_owned(), "1".to_owned()),
@@ -4647,8 +4810,8 @@ const FRAMES: usize = 40;
 const NOTCHES_PER_FRAME: usize = 8;
 const LINES_PER_NOTCH: isize = 3;
 
-/// One measured scroll run: what the pipeline actually did, what it cost,
-/// where it started and where it ended up.
+/// One measured phase of a scroll run: what the pipeline actually did during
+/// it, what that cost, where the run started and where this phase left it.
 #[derive(Debug)]
 struct ScrollRun {
     commands: usize,
@@ -4660,10 +4823,12 @@ struct ScrollRun {
     latency: crate::performance::LatencySummary,
 }
 
-/// Applies `deltas` to a filled scrollback, driving every command through
-/// the viewport re-read, the snapshot capture and the wire encoding the
-/// daemon would have performed for it.
-fn scroll_run(deltas: impl IntoIterator<Item = isize>) -> ScrollRun {
+/// Applies each phase's deltas in turn to one filled scrollback, driving
+/// every command through the viewport re-read, the snapshot capture and the
+/// wire encoding the daemon would have performed for it. Each phase reports
+/// its own commands, captures, wire bytes and latency, and where it left
+/// the viewport, so later phases continue from where earlier ones stopped.
+fn scroll_run<const PHASES: usize>(phases: [Vec<isize>; PHASES]) -> [ScrollRun; PHASES] {
     use crate::performance::{Action, Recorder};
     use crate::terminal::ipc::{TerminalSnapshot, write_frame};
     use std::time::Instant;
@@ -4705,50 +4870,52 @@ fn scroll_run(deltas: impl IntoIterator<Item = isize>) -> ScrollRun {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let mut recorder = Recorder::default();
     let mut previous = worker.published.snapshot.load_full();
     let origin = (previous.scroll.offset, screen(&previous));
-    let mut commands = 0;
-    let mut captures = 0;
-    let mut wire_bytes = 0;
-    for delta in deltas {
-        // Returning credit first is what the UI does after drawing, so the
-        // worker is free to capture the command that follows.
-        worker.published.acknowledge(worker.generation);
-        let generation = recorder.commit(Action::TerminalScroll).unwrap();
-        assert!(
-            !worker.handle_command(Command::Scroll(ScrollCommand::Delta(delta))),
-            "a scroll command must not request shutdown"
-        );
-        let published = worker.published.snapshot.load_full();
-        if published.generation != previous.generation {
-            captures += 1;
-            let mut frame = Vec::new();
-            write_frame(&mut frame, &TerminalSnapshot::diff(&published, &previous)).unwrap();
-            wire_bytes += frame.len();
+    phases.map(|deltas| {
+        let mut recorder = Recorder::default();
+        let mut commands = 0;
+        let mut captures = 0;
+        let mut wire_bytes = 0;
+        for delta in deltas {
+            // Returning credit first is what the UI does after drawing, so
+            // the worker is free to capture the command that follows.
+            worker.published.acknowledge(worker.generation);
+            let generation = recorder.commit(Action::TerminalScroll).unwrap();
+            assert!(
+                !worker.handle_command(Command::Scroll(ScrollCommand::Delta(delta))),
+                "a scroll command must not request shutdown"
+            );
+            let published = worker.published.snapshot.load_full();
+            if published.generation != previous.generation {
+                captures += 1;
+                let mut frame = Vec::new();
+                write_frame(&mut frame, &TerminalSnapshot::diff(&published, &previous)).unwrap();
+                wire_bytes += frame.len();
+            }
+            assert!(recorder.redraw_scheduled(generation, Instant::now()));
+            previous = published;
+            commands += 1;
         }
-        assert!(recorder.redraw_scheduled(generation, Instant::now()));
-        previous = published;
-        commands += 1;
-    }
 
-    let mut durations: Vec<_> = recorder
-        .samples()
-        .filter_map(|sample| sample.redraw_scheduling_ns.map(Duration::from_nanos))
-        .collect();
-    ScrollRun {
-        commands,
-        captures,
-        wire_bytes,
-        origin,
-        offset: previous.scroll.offset,
-        screen: screen(&previous),
-        latency: crate::performance::LatencySummary::from_durations(&mut durations).unwrap(),
-    }
+        let mut durations: Vec<_> = recorder
+            .samples()
+            .filter_map(|sample| sample.redraw_scheduling_ns.map(Duration::from_nanos))
+            .collect();
+        ScrollRun {
+            commands,
+            captures,
+            wire_bytes,
+            origin: origin.clone(),
+            offset: previous.scroll.offset,
+            screen: screen(&previous),
+            latency: crate::performance::LatencySummary::from_durations(&mut durations).unwrap(),
+        }
+    })
 }
 
 /// Deterministic scroll workload for issue #101, plus the equivalence that
-/// makes coalescing safe.
+/// makes coalescing safe, mid-history and at either bound.
 ///
 /// The widget lives in the `ui` feature graph and the emulator in `host`,
 /// so no single build can drive a wheel gesture end to end. This half
@@ -4758,17 +4925,35 @@ fn scroll_run(deltas: impl IntoIterator<Item = isize>) -> ScrollRun {
 /// into one command lands on exactly the same screen. The folding itself
 /// is covered by `terminal::widget::tests`.
 ///
+/// Filling the history is most of what a run costs, so one per-notch run
+/// and one coalesced run each carry the gesture through three phases: a
+/// flick inside scrollback, an overshoot past its top, and the way back
+/// down past the live screen. Each phase checks what an independent run
+/// of the same commands would have.
+///
 /// Timings are printed, never asserted: a `test`-profile build with an
 /// unoptimized parser gives a ratio, not a latency budget, and this crate
 /// treats even release numbers as non-gating.
 #[test]
-fn coalescing_a_frame_of_notches_costs_one_capture_and_lands_on_the_same_screen() {
+fn coalesced_scrolling_costs_one_capture_per_frame_and_lands_where_every_notch_does() {
     let notches = FRAMES * NOTCHES_PER_FRAME;
-    let per_event = scroll_run(std::iter::repeat_n(-LINES_PER_NOTCH, notches));
-    let per_frame = scroll_run(std::iter::repeat_n(
-        -LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
-        FRAMES,
-    ));
+    // Twice the history, so the overshoot clamps at either bound.
+    let overshoot_notches = (SCROLLBACK_LINES as isize * 2 / LINES_PER_NOTCH) as usize;
+    let overshoot_frames = overshoot_notches / NOTCHES_PER_FRAME;
+    let per_notch = |direction: isize, count: usize| vec![direction * LINES_PER_NOTCH; count];
+    let coalesced = |direction: isize, count: usize| {
+        vec![direction * LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize; count]
+    };
+    let [per_event, top_per_event, bottom_per_event] = scroll_run([
+        per_notch(-1, notches),
+        per_notch(-1, overshoot_notches - notches),
+        per_notch(1, overshoot_notches),
+    ]);
+    let [per_frame, top_per_frame, bottom_per_frame] = scroll_run([
+        coalesced(-1, FRAMES),
+        coalesced(-1, overshoot_frames - FRAMES),
+        coalesced(1, overshoot_frames),
+    ]);
 
     // The whole point: the same gesture reaches the same place, showing
     // the same rows, for an eighth of the commands and captures.
@@ -4781,6 +4966,22 @@ fn coalescing_a_frame_of_notches_costs_one_capture_and_lands_on_the_same_screen(
     assert!(
         per_event.offset > 0,
         "the workload must stay inside scrollback rather than clamp"
+    );
+
+    // Folding must not change where a gesture stops, which is the one place
+    // a summed delta could plausibly differ from the notches it replaced.
+    assert_eq!(top_per_event.offset, 0, "the top of scrollback is row zero");
+    assert_eq!(top_per_frame.offset, 0);
+    assert_eq!(top_per_frame.screen, top_per_event.screen);
+
+    // Coming back down has to land on the live screen again, not one row
+    // short of it or past the end of history.
+    assert_eq!(bottom_per_frame.offset, bottom_per_event.offset);
+    assert_eq!(bottom_per_frame.screen, bottom_per_event.screen);
+    assert_eq!(
+        (bottom_per_event.offset, &bottom_per_event.screen),
+        (bottom_per_event.origin.0, &bottom_per_event.origin.1),
+        "returning to the bottom must show the live screen again"
     );
 
     let budget = crate::performance::PerformanceBudget {
@@ -4811,46 +5012,5 @@ fn coalescing_a_frame_of_notches_costs_one_capture_and_lands_on_the_same_screen(
         per_event.wire_bytes as f64 / per_frame.wire_bytes as f64,
         per_event.latency.median * per_event.commands as u32,
         per_frame.latency.median * per_frame.commands as u32
-    );
-}
-
-/// Folding must not change where a gesture stops, which is the one place
-/// a summed delta could plausibly differ from the notches it replaced.
-#[test]
-fn overshooting_either_bound_clamps_the_same_whether_or_not_it_was_coalesced() {
-    let overshoot = SCROLLBACK_LINES as isize * 2;
-    let notches = (overshoot / LINES_PER_NOTCH) as usize;
-
-    let top_per_event = scroll_run(std::iter::repeat_n(-LINES_PER_NOTCH, notches));
-    let top_per_frame = scroll_run(std::iter::repeat_n(
-        -LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
-        notches / NOTCHES_PER_FRAME,
-    ));
-    assert_eq!(top_per_event.offset, 0, "the top of scrollback is row zero");
-    assert_eq!(top_per_frame.offset, 0);
-    assert_eq!(top_per_frame.screen, top_per_event.screen);
-
-    // Coming back down has to land on the live screen again, not one row
-    // short of it or past the end of history.
-    let bottom_per_event = scroll_run(
-        std::iter::repeat_n(-LINES_PER_NOTCH, notches)
-            .chain(std::iter::repeat_n(LINES_PER_NOTCH, notches)),
-    );
-    let bottom_per_frame = scroll_run(
-        std::iter::repeat_n(
-            -LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
-            notches / NOTCHES_PER_FRAME,
-        )
-        .chain(std::iter::repeat_n(
-            LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
-            notches / NOTCHES_PER_FRAME,
-        )),
-    );
-    assert_eq!(bottom_per_frame.offset, bottom_per_event.offset);
-    assert_eq!(bottom_per_frame.screen, bottom_per_event.screen);
-    assert_eq!(
-        (bottom_per_event.offset, &bottom_per_event.screen),
-        (bottom_per_event.origin.0, &bottom_per_event.origin.1),
-        "returning to the bottom must show the live screen again"
     );
 }

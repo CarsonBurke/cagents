@@ -348,7 +348,7 @@ class InstalledGateSync(unittest.TestCase):
 
     files = ("cargo-gate", "build-host", "cargo-gate-command.py", "cargo-gate-sync.py",
              "cargo-host-test-helper.py", "cargo_artifacts.py",
-             "cargo-gate-rustc-guard", "cargo-incremental-retry.py", "cargo-offload", "memory-capped",
+             "cargo-gate-rustc-guard", "cargo-incremental-retry.py", "cargo-offload", "git_ancestry.py", "memory-capped",
              "seed-build-dir", "build-disk-guard", "prune-build-dirs", "install-cargo-gate")
 
     def setUp(self):

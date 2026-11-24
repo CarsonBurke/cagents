@@ -98,7 +98,7 @@ pub(super) fn notice(snapshot: &Snapshot) -> Option<String> {
         [] => None,
         [denial] => Some(format!(
             "{} blocked",
-            Runtime::short_description(&denial.tool_name, 24)
+            Runtime::short_description(&tool_title::Title::unread(&denial.tool_name).label, 24)
         )),
         denials => Some(format!("{} permission blocks", denials.len())),
     }
@@ -239,7 +239,11 @@ impl Runtime {
         });
         for denial in snapshot.permission_denials.iter().rev() {
             let mut details = vec![
-                design::body(format!("{} blocked", denial.tool_name)).into(),
+                design::body(format!(
+                    "{} blocked",
+                    tool_title::Title::unread(&denial.tool_name).label
+                ))
+                .into(),
                 view::body(if denial.reason.is_empty() {
                     "Claude did not provide a denial reason."
                 } else {
@@ -247,7 +251,7 @@ impl Runtime {
                 }),
             ];
             if let Some(agent) = &denial.agent_id {
-                details.push(design::caption(format!("Subagent: {agent}")).into());
+                details.push(design::caption(self.denial_agent(agent)).into());
             }
             if let Some(input) = &denial.tool_input {
                 details.push(
@@ -341,6 +345,15 @@ impl Runtime {
             }
         }
         permissions_surface(content, width, target.card)
+    }
+
+    /// The subagent a block stopped, as its tab names it. The provider
+    /// addresses it by an ID, which is not a name the person knows.
+    pub(super) fn denial_agent(&self, agent: &str) -> String {
+        match self.listed_agent_name(agent) {
+            Some(name) => format!("Subagent: {name}"),
+            None => "From a subagent".into(),
+        }
     }
 
     /// A blocked call's input as lines to read; the retry draft keeps the
@@ -598,5 +611,21 @@ mod tests {
         });
         assert_eq!(notice(&snapshot).as_deref(), Some("Approval needed"));
         assert!(super::super::permissions_available(&snapshot));
+    }
+
+    /// A block names its tool as the timeline does, not by the provider's
+    /// wire name for it.
+    #[test]
+    fn a_block_names_an_integration_tool_as_the_timeline_does() {
+        let mut blocked = denial();
+        blocked.tool_name = "mcp__linear__get_issue".into();
+        let snapshot = Snapshot {
+            permission_denials: vec![blocked],
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            notice(&snapshot).as_deref(),
+            Some("Linear: get issue blocked")
+        );
     }
 }

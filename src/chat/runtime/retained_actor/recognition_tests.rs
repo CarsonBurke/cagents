@@ -274,6 +274,12 @@ for line in sys.stdin:
     let identity = original.0.identity();
     let provider = identity.record.root.clone();
     assert_provider_isolation(&provider, &forms);
+    // A helper of this build opens today's frames itself; the daemon leaves
+    // its reads alone.
+    original
+        .0
+        .open_frames_for_older_helper(&Arc::new(signer.recognizer()));
+    assert!(!original.0.opens_frames_for_helper());
     submit(&original.0, &valid_before);
     assert!(delivered(&original.0.snapshot(None).unwrap(), before_body));
     for invalid in [&bad_body, &bad_sender, &bad_tag] {

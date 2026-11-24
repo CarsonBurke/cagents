@@ -167,6 +167,27 @@ pub(in crate::host::model) fn scope_id(
     .map_err(sql)
 }
 
+/// Reads the scope revision without loading pane descriptors or tombstones.
+pub(in crate::host::model) fn revision(db: &Connection, scope: &Scope) -> Result<u64, String> {
+    let (channel, repository, worktree) = columns(scope)?;
+    let revision: Option<i64> = match channel {
+        Some(channel) => db
+            .prepare_cached("SELECT revision FROM view_scopes WHERE channel = ?1")
+            .and_then(|mut statement| statement.query_row([channel], |row| row.get(0)).optional()),
+        None => db
+            .prepare_cached(
+                "SELECT revision FROM view_scopes WHERE repository = ?1 AND worktree = ?2",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_row(params![repository, worktree], |row| row.get(0))
+                    .optional()
+            }),
+    }
+    .map_err(sql)?;
+    Ok(revision.unwrap_or(0) as u64)
+}
+
 /// The scope's row, created at revision 0 when absent. A view that has never
 /// been written is still empty at revision 0, as it was before it existed.
 pub(in crate::host::model) fn register(db: &Connection, scope: &Scope) -> Result<i64, String> {
@@ -441,14 +462,19 @@ fn collect(db: &Connection, occupied: bool) -> Result<Vec<View>, String> {
 }
 
 fn collect_for_start(db: &Connection, occupied: bool) -> Result<Vec<View>, SetupError> {
-    let filter = if occupied {
-        "WHERE EXISTS(SELECT 1 FROM panes p WHERE p.scope = s.id)"
+    // Drive both indexed lookups from the live pane scopes. The scope table
+    // and its tombstones can grow long after the last pane is gone.
+    let (scope_filter, retired_filter) = if occupied {
+        (
+            "WHERE id IN (SELECT DISTINCT scope FROM panes)",
+            "WHERE scope IN (SELECT DISTINCT scope FROM panes)",
+        )
     } else {
-        ""
+        ("", "")
     };
     let mut statement = db
         .prepare_cached(&format!(
-            "SELECT id, channel, repository, worktree, revision FROM view_scopes s {filter}
+            "SELECT id, channel, repository, worktree, revision FROM view_scopes {scope_filter}
              ORDER BY id"
         ))
         .map_err(read_error)?;
@@ -493,7 +519,9 @@ fn collect_for_start(db: &Connection, occupied: bool) -> Result<Vec<View>, Setup
             .push(row.pane().map_err(SetupError::Invalid)?);
     }
     let mut retired = db
-        .prepare_cached("SELECT scope, pane FROM retired_panes ORDER BY scope, ordinal")
+        .prepare_cached(&format!(
+            "SELECT scope, pane FROM retired_panes {retired_filter} ORDER BY scope, ordinal"
+        ))
         .map_err(read_error)?;
     let rows = retired
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))

@@ -17,9 +17,11 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD = ROOT / "scripts/build-release-linux"
 SMOKE = ROOT / "scripts/smoke-release-artifacts"
 PREPARE = ROOT / "scripts/prepare-release-smoke-rootfs"
 ENTRYPOINT = ROOT / "packaging/smoke-release-artifact"
+TMP_DIR = os.environ.get("TMPDIR", "/var/tmp")
 VERSION = "1.2.3"
 SMOKE_CACHE_ID = (
     "cagents-release-smoke-v4 ubuntu-24.04.3 amd64 "
@@ -38,7 +40,7 @@ ARTIFACTS = (
 
 class SmokeBoundary(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="cagents-smoke-contract-", dir="/var/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="cagents-smoke-contract-", dir=TMP_DIR)
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         self.bin = self.directory / "bin"
@@ -255,6 +257,27 @@ class SmokeBoundary(unittest.TestCase):
         self.assertEqual(self.recorded(), [])
         self.assertFalse(self.network_calls.exists())
 
+    def test_release_checks_runtime_cache_before_starting_the_build(self):
+        smoke_cache = self.directory / "old-runtime-cache"
+        smoke_cache.mkdir(mode=0o700)
+        marker = smoke_cache / ".cagents-release-smoke-cache"
+        marker.write_text(SMOKE_CACHE_ID.replace("v4", "v3", 1))
+        build_cache = self.directory / "build-cache"
+        output = self.directory / "release-output"
+
+        result = self.invoke(
+            BUILD, ["--ref", "HEAD", "--output", str(output)],
+            CARGO_BUILD_JOBS="1",
+            CAGENTS_RELEASE_CACHE=str(build_cache),
+            CAGENTS_RELEASE_SMOKE_CACHE=str(smoke_cache),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cache marker does not match this runtime", result.stderr)
+        self.assertFalse(self.network_calls.exists())
+        self.assertEqual(self.recorded(), [])
+        self.assertEqual(list(output.iterdir()), [])
+
     def test_preparation_respects_existing_cache_lock_before_fetching(self):
         cache = self.directory / "locked-cache"
         cache.mkdir(mode=0o700)
@@ -317,7 +340,7 @@ class ShutdownOrdering(unittest.TestCase):
         guard = source[source.index("    same_daemon() {"):source.index('    "$daemon_cli" --json terminal list')]
         start = source.index('    "$daemon_cli" --json daemon stop-for-rebuild --including-subagents > /tmp/stop')
         shutdown = source[start:source.index("    daemon_cli=\n", start)]
-        with tempfile.TemporaryDirectory(prefix="smoke-stop-", dir="/var/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="smoke-stop-", dir=TMP_DIR) as temporary:
             directory = Path(temporary)
             endpoint = directory / "socket"
             acknowledged = directory / "stopping"

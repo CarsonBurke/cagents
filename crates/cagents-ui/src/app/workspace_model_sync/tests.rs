@@ -5529,6 +5529,7 @@ fn a_fresh_window_adopts_the_shared_folder_kind_without_git_rediscovery() {
     let directory = tempfile::tempdir().unwrap();
     let repository = directory.path().canonicalize().unwrap();
     std::fs::create_dir(repository.join(".git")).unwrap();
+    std::fs::write(repository.join(".git/HEAD"), "invalid ref\n").unwrap();
     let mut app = super::super::tests::context_inspector_test_app(false);
     app.workspace_model = WorkspaceModel {
         projects: vec![ModelProject {

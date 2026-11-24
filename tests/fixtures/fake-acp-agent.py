@@ -460,6 +460,7 @@ class Agent:
         session = Session(params["sessionId"], params.get("cwd", ""))
         if not os.path.exists(session.path()):
             return fail(id, -32002, f"Session {session.id} not found")
+        session.title = self.index().get(session.id, {}).get("title")
         self.sessions[session.id] = session
         session.hold_presence()
         for index in range(int(os.environ.get("FAKE_ACP_REPLAY") or 0)):

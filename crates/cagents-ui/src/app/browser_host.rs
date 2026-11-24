@@ -68,7 +68,7 @@ pub(super) fn surface<'a, Message: 'a>(
     Element::new(Host {
         id: card_control_id(card, "browser.host"),
         description: format!(
-            "Browser card {card}. Location: {}. {}. {}. {}. {}Embedded webpage accessibility is unavailable. Use Open in system browser to access the webpage in your browser.",
+            "Browser. Location: {}. {}. {}. {}. {}Embedded webpage accessibility is unavailable. Use Open in system browser to access the webpage in your browser.",
             location.as_str(),
             match capability {
                 BrowserCapability::Integrated => "Integrated browser",
@@ -341,11 +341,9 @@ impl Cagents {
             return;
         }
         self.status = Some(if opened {
-            TransientNotice::success(format!("Browser card {card}: opened in the system browser"))
+            TransientNotice::success("Opened in the system browser")
         } else {
-            TransientNotice::error(format!(
-                "Browser card {card}: could not open in the system browser"
-            ))
+            TransientNotice::error("Could not open in the system browser")
         });
     }
 }
@@ -426,7 +424,7 @@ mod tests {
             assert_eq!(host.node().label(), Some("Browser host"));
             let description = host.node().description().unwrap();
             assert!(description.contains(state.label()));
-            assert!(description.contains(&card.to_string()));
+            assert!(!description.contains(&card.to_string()));
             assert!(description.contains("https://example.test/path"));
             assert!(description.contains("Embedded webpage accessibility is unavailable"));
             assert!(!host.node().supports_action(Action::Focus));
@@ -474,11 +472,14 @@ mod tests {
     fn replacing_a_browser_card_in_a_retained_slot_changes_host_identity() {
         let first = CardId::new();
         let second = CardId::new();
-        let location = SanitizedLocation::from(&Url::parse("https://example.test/").unwrap());
+        let locations = [
+            SanitizedLocation::from(&Url::parse("https://first.example.test/").unwrap()),
+            SanitizedLocation::from(&Url::parse("https://second.example.test/").unwrap()),
+        ];
         let make = |card| {
             surface::<()>(
                 card,
-                &location,
+                &locations[usize::from(card == second)],
                 BrowserCapability::Integrated,
                 LoadState::Loading,
                 false,
@@ -505,7 +506,10 @@ mod tests {
             accessible.root()[0].id().clone().into();
         assert_ne!(old_id, new_id);
         let description = accessible.root()[0].node().description().unwrap();
-        assert!(description.contains(&second.to_string()));
+        // The new host describes its own page, and names no card by its ID.
+        assert!(description.contains("second.example.test"));
+        assert!(!description.contains("first.example.test"));
+        assert!(!description.contains(&second.to_string()));
         assert!(!description.contains(&first.to_string()));
     }
 
@@ -740,7 +744,7 @@ mod tests {
             assert_eq!(app.workspace.focused(), focus);
             assert_eq!(app.durable.focused, saved);
             let message = &app.status.as_ref().unwrap().message;
-            assert!(message.contains(&card.to_string()));
+            assert!(!message.contains(&card.to_string()));
             for forbidden in ["password", "secret", "token", "https", "bob"] {
                 assert!(!message.contains(forbidden));
             }

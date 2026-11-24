@@ -4,8 +4,8 @@ only signs and publishes what is already built and smoke-tested.
 
 Run with no command, as the cagents-prebuild user service that main's
 sentinel starts after each check, it bundles the newest main commit that
-compiled, unless that commit's tests failed, it is bundled already, or the
-version it declares is released already, before main's version bump. Each
+compiled. If its tests failed, it looks back for a passing commit of the same
+version. It skips existing bundles and versions already released. Each
 bundle is what `scripts/build-release-linux` makes of the commit with its own
 scripts, smoke checks included, kept by commit under the store with the
 metadata that lists every file's size and digest. Bundles are built in a
@@ -273,12 +273,17 @@ class Store:
         return sorted(found, key=lambda path: (read_json(path / "bundle.json") or {}).get("built_at", 0),
                       reverse=True)
 
-    def evict(self, keep):
-        """Removes all but the `keep` newest bundles and those pinned, with
-        what a stopped build or an eviction left behind; the store lock is held."""
+    def evict(self, keep, repository, sentinel):
+        """Keeps the newest bundles up to `keep` and any pinned ones. With
+        room for both, reserves a slot for a tested bundle of the current
+        version. The store lock is held."""
         now = time.time()
         with self.pins():
             kept = self.kept()
+            tested = tested_bundle(repository, sentinel, kept) if keep > 1 else None
+            if tested is not None:
+                kept.remove(tested)
+                kept.insert(0, tested)
             for index, path in enumerate(kept):
                 pinned = path / "pinned"
                 if index < keep or pinned.exists() and now - pinned.stat().st_mtime < PIN_SECONDS:
@@ -296,16 +301,51 @@ class Store:
                     shutil.rmtree(path, ignore_errors=True)
 
 
-def sentinel_target(sentinel):
-    """The newest main commit that compiled, unless its tests failed."""
+def sentinel_verdict(sentinel, sha):
+    verdict = read_json(sentinel / "verdicts" / f"{sha}.json")
+    return verdict if isinstance(verdict, dict) and verdict.get("sha") == sha else {}
+
+
+def passing_main_commits(repository, sentinel, through, candidates):
+    # An on-demand test can write an older verdict later, or test a commit
+    # that never was on main. Consider only first-parent main, newest first.
+    if candidates:
+        for sha in git(repository, "rev-list", "--first-parent", through, check=False).splitlines():
+            if sha in candidates and sentinel_verdict(sentinel, sha).get("passed") is True:
+                yield sha
+
+
+def tested_bundle(repository, sentinel, bundles):
+    """Reserves one of the bundle slots for a releasable commit."""
     state = read_json(sentinel / "state.json") or {}
     sha = state.get("compiled")
-    if not sha:
+    if not sha or not bundles:
         return None
-    verdict = read_json(sentinel / "verdicts" / f"{sha}.json")
-    if verdict is not None and not verdict.get("passed") and not verdict.get("outside_code"):
+    version = declared_version(repository, sha)
+    if version is None:
         return None
-    return sha
+    candidates = {bundle.name: bundle for bundle in bundles
+                  if (read_json(bundle / "bundle.json") or {}).get("version") == version}
+    tested = next(passing_main_commits(repository, sentinel, sha, candidates), None)
+    return candidates.get(tested)
+
+
+def sentinel_target(repository, store, sentinel):
+    """The newest compiled main commit, or a tested fallback for its version."""
+    state = read_json(sentinel / "state.json") or {}
+    sha = state.get("compiled")
+    if not sha or not verdict_failed(sentinel, sha):
+        return sha
+    version = declared_version(repository, sha)
+    if version is None:
+        return None
+
+    tested = {path.stem for path in (sentinel / "verdicts").glob("*.json")}
+    for candidate in passing_main_commits(repository, sentinel, sha, tested):
+        eligible = store.built(candidate) or store.final_failure(candidate) is None
+        if eligible and declared_version(repository, candidate) == version:
+            return candidate
+    return None
 
 
 # How long an answer that a commit's version is not released yet holds; a
@@ -325,10 +365,10 @@ def network_git(repository, *args):
         return None
 
 
-def declared_version(repository, sha):
+def declared_version(repository, sha, *, fetch=False):
     """The version SHA's root Cargo.toml declares, or None."""
-    if subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"{sha}^{{commit}}"],
-                      stderr=subprocess.DEVNULL).returncode:
+    if fetch and subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"{sha}^{{commit}}"],
+                                stderr=subprocess.DEVNULL).returncode:
         network_git(repository, "fetch", "--no-tags", "origin", "main")
     shown = subprocess.run(["git", "-C", str(repository), "show", f"{sha}:Cargo.toml"], text=True,
                            capture_output=True)
@@ -350,7 +390,7 @@ def released(repository, store, sha):
         return known[sha]
     if time.monotonic() - UNRELEASED.get(sha, -RELEASE_RECHECK_SECONDS) < RELEASE_RECHECK_SECONDS:
         return None
-    version = declared_version(repository, sha)
+    version = declared_version(repository, sha, fetch=True)
     if version is None:
         return None
     tags = network_git(repository, "ls-remote", "--tags", "--refs", "origin", f"refs/tags/v{version}")
@@ -367,8 +407,13 @@ def released(repository, store, sha):
 
 
 def verdict_failed(sentinel, sha):
-    verdict = read_json(sentinel / "verdicts" / f"{sha}.json")
-    return verdict is not None and not verdict.get("passed") and not verdict.get("outside_code")
+    verdict = sentinel_verdict(sentinel, sha)
+    return verdict.get("passed") is False and not verdict.get("outside_code")
+
+
+def report_failed_tests(sentinel, sha):
+    print(f"{PROGRAM}: {sha} failed its tests; see its test logs under {sentinel / 'logs'}", file=sys.stderr)
+    return 1
 
 
 def choose(repository, store, sentinel):
@@ -378,7 +423,7 @@ def choose(repository, store, sentinel):
             store.done(sha)
             continue
         return sha, "normal"
-    sha = sentinel_target(sentinel)
+    sha = sentinel_target(repository, store, sentinel)
     if sha and not store.built(sha) and store.final_failure(sha) is None \
             and released(repository, store, sha) is None:
         return sha, "background"
@@ -464,6 +509,9 @@ def build(repository, store, sentinel, cache, sha, priority, first_tried_at=None
     """Builds `sha`'s bundle into the store. Returns True once it is bundled,
     False once its build failed, and raises Stopped if it was stopped.
     `first_tried_at` is when its first try began, for the wait it records."""
+    if verdict_failed(sentinel, sha):
+        store.fail(sha, "tests failed")
+        return False
     try:
         checkout = prepare_checkout(repository, sha)
     except subprocess.CalledProcessError as error:
@@ -513,7 +561,7 @@ def build(repository, store, sentinel, cache, sha, priority, first_tried_at=None
                 say(f"stopping {sha}: {reason}")
                 stop(child)
                 if verdict_failed(sentinel, sha):
-                    store.fail(sha, "tests failed")
+                    store.fail(sha, "tests failed", partial / "build.log")
                     shutil.rmtree(partial, ignore_errors=True)
                     return False
                 raise Stopped(reason)
@@ -579,11 +627,14 @@ def why_stop(store, sentinel, sha, priority, queued=False):
         return "its tests failed"
     if priority == "normal":
         return None
-    if sha in store.requested():
-        return "it was requested at normal priority"
-    others = [other for other in store.requested() if other != sha and not store.built(other)]
-    if others:
-        return f"{others[0]} was requested"
+    requested = next((other for other in store.requested()
+                      if not store.built(other) and not verdict_failed(sentinel, other)), None)
+    if requested is not None:
+        if requested != sha:
+            return f"{requested} was requested"
+        if priority == "background":
+            return "it was requested at normal priority"
+        # A starved build already uses normal-priority admission and scheduling.
     return busy_reason(starved=priority == "starved", queued=queued)
 
 
@@ -606,7 +657,7 @@ def run(repository, store, sentinel, cache, keep):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
-        store.evict(keep)
+        store.evict(keep, repository, sentinel)
         while True:
             sha, priority = choose(repository, store, sentinel)
             if sha is None:
@@ -626,7 +677,7 @@ def run(repository, store, sentinel, cache, keep):
                     continue
                 store.done(sha)
                 if done:
-                    store.evict(keep)
+                    store.evict(keep, repository, sentinel)
                 continue
             state = read_json(store.root / "state.json") or {}
             if state.get("sha") != sha:
@@ -674,20 +725,21 @@ def run(repository, store, sentinel, cache, keep):
             write_json(store.root / "state.json", {})
             store.done(sha)
             if done:
-                store.evict(keep)
+                store.evict(keep, repository, sentinel)
 
 
-def status(store, sentinel, as_json):
+def status(repository, store, sentinel, as_json):
     store.prepare()
     building = read_json(store.root / "building.json")
     if building and building.get("pid") and not Path(f"/proc/{building['pid']}").exists():
         building = None
+    target = sentinel_target(repository, store, sentinel)
     report = {
         "bundles": [read_json(path / "bundle.json") for path in store.kept()],
         "building": building,
         "requested": store.requested(),
-        "target": sentinel_target(sentinel),
-        "released_target": (read_json(store.root / "released.json") or {}).get(sentinel_target(sentinel)),
+        "target": target,
+        "released_target": (read_json(store.root / "released.json") or {}).get(target),
         "failures": sorted((read_json(path) or {}).get("sha", path.stem)
                            for path in store.failures.glob("*.json")),
         "state": read_json(store.root / "state.json") or {},
@@ -751,9 +803,11 @@ def main():
     if args.command is None:
         return run(repository, store, args.sentinel_state, args.cache, args.keep)
     if args.command == "status":
-        return status(store, args.sentinel_state, args.json)
+        return status(repository, store, args.sentinel_state, args.json)
     store.prepare()
     if args.command == "request":
+        if verdict_failed(args.sentinel_state, sha):
+            return report_failed_tests(args.sentinel_state, sha)
         if not store.built(sha):
             (store.failures / f"{sha}.json").unlink(missing_ok=True)
             write_json(store.requests / f"{sha}.json", {"sha": sha, "requested_at": time.time()})
@@ -771,7 +825,7 @@ def main():
             else:
                 pin.unlink(missing_ok=True)
         return 0
-    return wait(store, args.sentinel_state, sha, args.timeout)
+    return wait(repository, store, args.sentinel_state, sha, args.timeout)
 
 
 def start_service():
@@ -779,12 +833,16 @@ def start_service():
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def wait(store, sentinel, sha, timeout):
+def wait(repository, store, sentinel, sha, timeout):
     """Blocks until `sha` is bundled, starting the service again whenever it
     is not building it, as when a request reached it as it was ending."""
     deadline = None if timeout is None else time.monotonic() + timeout
     last = None
-    while not store.built(sha):
+    while True:
+        if verdict_failed(sentinel, sha):
+            return report_failed_tests(sentinel, sha)
+        if store.built(sha):
+            break
         failure = store.failure(sha)
         if failure is not None:
             say(f"{sha} failed: {failure['status']}; see {store.failures / f'{sha}.log'}")
@@ -796,8 +854,8 @@ def wait(store, sentinel, sha, timeout):
         if building and not Path(f"/proc/{building.get('pid')}").exists():
             building = None
         if (building or {}).get("sha") != sha and sha not in store.requested():
-            if sha != sentinel_target(sentinel):
-                say(f"{sha} is neither requested nor main's newest compiled commit; request it")
+            if sha != sentinel_target(repository, store, sentinel):
+                say(f"{sha} is neither requested nor the background prebuild target; request it")
                 return 1
             version = (read_json(store.root / "released.json") or {}).get(sha)
             if version:

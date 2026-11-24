@@ -69,8 +69,8 @@ fn discover_at(launch: &Launch, home: &Path, root: &Path) -> Vec<Skill> {
             // No native chat offers their skills yet.
             Provider::Antigravity | Provider::Muse => {}
         }
-        // A worktree has a .git file; an ordinary repository has a directory.
-        if directory.join(".git").exists() || directory == home {
+        if directory == home || crate::git_marker::present(&directory.join(".git")).unwrap_or(false)
+        {
             break;
         }
     }
@@ -443,6 +443,7 @@ mod tests {
         let cwd = home.join("project/subdirectory");
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(home.join("project/.git")).unwrap();
+        fs::write(home.join("project/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let account = home.join("account");
         write_skill(
             &account.join("skills/account"),
@@ -560,7 +561,7 @@ mod tests {
             let repository = home.join("parent/project");
             let cwd = repository.join("src");
             let account = home.join("account");
-            fs::create_dir_all(&cwd).unwrap();
+            fs::create_dir_all(cwd.join(".git")).unwrap();
             if worktree {
                 fs::write(
                     repository.join(".git"),
@@ -569,6 +570,7 @@ mod tests {
                 .unwrap();
             } else {
                 fs::create_dir(repository.join(".git")).unwrap();
+                fs::write(repository.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
             }
             write_skill(
                 &repository.join(".claude/skills/inside"),
@@ -586,7 +588,8 @@ mod tests {
                 "Outside command",
             )
             .unwrap();
-            let skills = discover(&launch(Provider::Claude, &cwd, home, &account));
+            let launch = launch(Provider::Claude, &cwd, home, &account);
+            let skills = discover(&launch);
             assert_eq!(
                 skills
                     .iter()
@@ -594,6 +597,8 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["inside"]
             );
+            fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            assert!(discover(&launch).is_empty());
         }
     }
 

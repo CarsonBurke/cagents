@@ -805,14 +805,14 @@ impl State {
         ];
         if let Some(pull_request) = &item.pull_request {
             lines.push(
-                design::body(format!("#{} {}", pull_request.number, pull_request.title))
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(2),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
+                crate::ui_controls::fade_text(format!(
+                    "#{} {}",
+                    pull_request.number, pull_request.title
+                ))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .lines(2)
+                .width(Length::Fill)
+                .into(),
             );
         }
         let facts = self.facts(item);

@@ -11,7 +11,11 @@ TARGET=x86_64-unknown-linux-gnu
 VERSION=
 VERIFY_ONLY=false
 PUSH_TAG=false
+DRAFT=false
+DIST_SET=
+PROMOTE=
 SMOKE_ROOTFS=
+BRIDGE_DIR=
 export LC_ALL=C
 
 fail() {
@@ -21,12 +25,19 @@ fail() {
 
 usage() {
     printf '%s\n' \
-        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--smoke-rootfs DIR] [--verify-only | --push-tag]' \
+        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--smoke-rootfs DIR] [--bridge DIR] [--verify-only | --push-tag | --draft]' \
+        '       scripts/publish-release --version VERSION --promote SHA256 [--bridge DIR]' \
         'Validate an existing local bundle and publish it through authenticated gh.' \
+        '--draft uploads and verifies it as a draft release, and publishes nothing.' \
+        "--promote SHA256 publishes VERSION's existing draft, uploading nothing: it downloads the draft, verifies it" \
+        "again as a bundle, and requires its own trust generation's metadata to have the SHA-256 digest SHA256," \
+        'which a passing rehearsal of the draft records.' \
         'Defaults: version from Cargo manifests; dist from CAGENTS_DIST_DIR or checkout/dist.' \
         '--verify-only validates local files and the local tag without network access.' \
-        'Both modes install/run/remove artifacts in private offline rootfs copies before publication.' \
+        'Every mode but --promote, whose draft was smoke-tested before it was left, installs/runs/removes artifacts in private offline rootfs copies first.' \
         '--smoke-rootfs overrides the runtime image prepared by the local release builder.' \
+        "Older trust generations' metadata names carry the metadata of the release that began the next generation:" \
+        '--verify-only reads those files, as published, from --bridge DIR; publication downloads them and compares any --bridge.' \
         'Publication requires the identical existing tag on github.com/CarsonBurke/cagents.' \
         '--push-tag pushes the local tag to origin once the local checks pass, so a refused bundle leaves none there.' \
         'Only drafts owned by this local publisher for this exact bundle may be resumed.' \
@@ -35,19 +46,29 @@ usage() {
 
 while (($#)); do
     case $1 in
-        --version|--dist|--smoke-rootfs)
+        --version|--dist|--smoke-rootfs|--bridge|--promote)
             (($# >= 2)) || fail "missing value for $1"
             [[ -n $2 ]] || fail "empty value for $1"
-            case $1 in --version) VERSION=$2 ;; --dist) DIST_DIR=$2 ;; --smoke-rootfs) SMOKE_ROOTFS=$2 ;; esac
+            case $1 in
+                --version) VERSION=$2 ;; --dist) DIST_DIR=$2; DIST_SET=true ;; --smoke-rootfs) SMOKE_ROOTFS=$2 ;;
+                --bridge) BRIDGE_DIR=$2 ;; --promote) PROMOTE=$2 ;;
+            esac
             shift 2
             ;;
         --verify-only) VERIFY_ONLY=true; shift ;;
         --push-tag) PUSH_TAG=true; shift ;;
+        --draft) DRAFT=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
 done
 ! { "$VERIFY_ONLY" && "$PUSH_TAG"; } || fail '--verify-only does not push; drop --push-tag'
+! { "$VERIFY_ONLY" && "$DRAFT"; } || fail '--verify-only uploads nothing; drop --draft'
+if [[ -n $PROMOTE ]]; then
+    [[ $PROMOTE =~ ^[0-9a-f]{64}$ ]] || fail '--promote takes the SHA-256 of the rehearsed metadata'
+    ! "$VERIFY_ONLY" && ! "$PUSH_TAG" && ! "$DRAFT" && [[ -z $SMOKE_ROOTFS && -z $DIST_SET ]] \
+        || fail '--promote publishes the draft on GitHub; it takes no --dist, --smoke-rootfs, --verify-only, --push-tag or --draft'
+fi
 
 for command in git jq sed sort sha256sum tar mktemp cp cmp ssh-keygen; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
@@ -106,12 +127,83 @@ PAYLOADS=(
     "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
     "$EDITOR_ARCHIVE" SHA256SUMS-browserless SHA256SUMS-ceditor install.sh
 )
-# The signed metadata names every other asset with its size and digest.
-ASSETS=("${PAYLOADS[@]}" SHA256SUMS release-metadata.json release-metadata.json.sig)
+# The signed metadata names every other asset with its size and digest. A
+# bundle holds it as release-metadata.json. Published, each trust generation
+# has its own name (src/update/feed.rs): a release carries its own metadata
+# under its generation's name, and under each older generation's name the
+# metadata of the first release of the generation after it, which builds of
+# that older generation can verify and update to. Generation 1, up to 0.2.3,
+# reads release-metadata.json and accepts exactly one signature.
+metadata_name() {
+    if (($1 == 1)); then printf 'release-metadata.json\n'; else printf 'release-metadata-%s.json\n' "$1"; fi
+}
+
+# The trust generation of a tagged source; generation 1 predates them.
+generation_at() {
+    local generation
+    generation=$(checkout_git show "$1:src/update/feed.rs" 2>/dev/null \
+        | sed -n 's/^const GENERATION: usize = \([1-9][0-9]*\);$/\1/p')
+    printf '%s\n' "${generation:-1}"
+}
+
+GENERATION=$(generation_at "$SOURCE_COMMIT")
+BUNDLE_ASSETS=("${PAYLOADS[@]}" SHA256SUMS release-metadata.json release-metadata.json.sig)
+ASSETS=("${PAYLOADS[@]}" SHA256SUMS)
+for ((generation = 1; generation <= GENERATION; generation++)); do
+    name=$(metadata_name "$generation")
+    ASSETS+=("$name" "$name.sig")
+done
+OWN_METADATA=$(metadata_name "$GENERATION")
+EXPECTED_BUNDLE=$(printf '%s\n' "${BUNDLE_ASSETS[@]}" | sort)
 EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
 
+version_after() {
+    [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
+}
+
+# The releases before this one whose builds check for updates, oldest first,
+# as `TAG GENERATION` lines. Publication takes them from GitHub: a tag pushed
+# but never published is no one's build, and no bridge. Every one must be in
+# this checkout, where its keys and generation are read. --verify-only, which
+# works offline, takes every release tag in the tagged history.
+EARLIER=()
+if "$VERIFY_ONLY"; then
+    candidates=$(checkout_git tag --merged "$SOURCE_COMMIT" --list 'v[0-9]*') || fail 'cannot list the release tags here'
+else
+    command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
+    candidates=$(GH_HOST=github.com GH_PROMPT_DISABLED=1 gh api --hostname github.com --paginate \
+        "repos/$REPOSITORY/releases?per_page=100" | jq -rs '.[][] | select(.draft == false) | .tag_name') \
+        || fail 'cannot list the published releases'
+fi
+while IFS= read -r earlier; do
+    [[ $earlier =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    version_after "$VERSION" "${earlier#v}" || continue
+    checkout_git merge-base --is-ancestor "refs/tags/$earlier" "$SOURCE_COMMIT" 2>/dev/null \
+        || fail "the published $earlier is not in $TAG's history here; fetch the release tags"
+    checkout_git cat-file -e "$earlier:src/update/release-keys.pub" 2>/dev/null || continue
+    EARLIER+=("$earlier $(generation_at "$earlier")")
+done < <(sort -uV <<< "$candidates")
+PREVIOUS_GENERATION=1
+if ((${#EARLIER[@]})); then PREVIOUS_GENERATION=${EARLIER[-1]##* }; fi
+((GENERATION >= PREVIOUS_GENERATION && GENERATION <= PREVIOUS_GENERATION + 1)) \
+    || fail "$TAG is trust generation $GENERATION after generation $PREVIOUS_GENERATION; a generation follows the one before it"
+
+# The earlier release tags of GENERATION.
+tags_of_generation() {
+    local entry
+    for entry in "${EARLIER[@]}"; do
+        [[ ${entry##* } != "$1" ]] || printf '%s\n' "${entry% *}"
+    done
+}
+
+# DIRECTORY holds exactly the bundle's files, or with --published exactly the
+# release's published assets.
 check_asset_set() {
-    local directory=$1 path actual
+    local directory=$1 expected=$EXPECTED_BUNDLE count=${#BUNDLE_ASSETS[@]} path actual
+    if [[ ${2:-} == --published ]]; then
+        expected=$EXPECTED_ASSETS
+        count=${#ASSETS[@]}
+    fi
     local -a names=()
     [[ -d $directory ]] || fail "missing release directory: $directory"
     shopt -s nullglob dotglob
@@ -121,7 +213,8 @@ check_asset_set() {
     done
     shopt -u nullglob dotglob
     actual=$(printf '%s\n' "${names[@]}" | sort)
-    [[ $actual == "$EXPECTED_ASSETS" ]] || fail 'release directory must contain exactly the 14 expected assets (no extra files or directories)'
+    [[ $actual == "$expected" ]] \
+        || fail "release directory must contain exactly the $count expected assets (no extra files or directories)"
 }
 
 # Parse names before sha256sum: even a valid checksum must never read outside dist.
@@ -156,13 +249,52 @@ allowed_signers() {
     sed -n 's/^[[:space:]]*\(ssh-ed25519\|sk-ssh-ed25519@openssh\.com\) \([A-Za-z0-9+/=]*\).*$/cagents-release namespaces="cagents-release" \1 \2/p' <<< "$1"
 }
 
+# The armored signatures in a signature file, one file each under DIRECTORY.
+# A file may hold several, as during a change of keys; the updater accepts
+# one by a key it trusts, and refuses any other text and more than four.
+split_signatures() {
+    local file=$1 directory=$2 line count=0 inside=false
+    mkdir -p -- "$directory"
+    while IFS= read -r line || [[ -n $line ]]; do
+        if ! "$inside"; then
+            [[ -z ${line//[[:space:]]/} ]] && continue
+            [[ $line == '-----BEGIN SSH SIGNATURE-----' ]] || return 1
+            ((count += 1))
+            ((count <= 4)) || return 1
+            inside=true
+        fi
+        printf '%s\n' "$line" >> "$directory/$count.sig"
+        [[ $line != '-----END SSH SIGNATURE-----' ]] || inside=false
+    done < "$file"
+    ! "$inside" && ((count > 0)) || return 1
+    printf '%s\n' "$count"
+}
+
+# Whether the signature file SIG holds a signature of METADATA by a key in
+# the allowed-signers file ALLOWED.
 verify_signature() {
-    ssh-keygen -q -Y verify -f "$2" -I cagents-release -n cagents-release \
-        -s "$1/release-metadata.json.sig" < "$1/release-metadata.json" >/dev/null
+    local metadata=$1 sig=$2 allowed=$3 blocks block
+    rm -rf -- "$WORK_DIR/signatures"
+    blocks=$(split_signatures "$sig" "$WORK_DIR/signatures") || return 1
+    for ((block = 1; block <= blocks; block++)); do
+        if ssh-keygen -q -Y verify -f "$allowed" -I cagents-release -n cagents-release \
+                -s "$WORK_DIR/signatures/$block.sig" < "$metadata" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The keys a tagged source trusts, as an allowed-signers file at PATH.
+tagged_signers() {
+    local keys
+    keys=$(checkout_git show "$1:src/update/release-keys.pub" 2>/dev/null) || return 1
+    allowed_signers "$keys" > "$2"
+    [[ -s $2 ]]
 }
 
 check_metadata() {
-    local keys source protocol previous
+    local keys source protocol
     source=$(checkout_git show "$SOURCE_COMMIT:src/terminal/ipc.rs") || fail "$TAG has no src/terminal/ipc.rs"
     protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9]*\);$/\1/p' <<< "$source")
     [[ $protocol =~ ^[1-9][0-9]*$ ]] || fail "cannot read the daemon protocol at $TAG"
@@ -173,23 +305,28 @@ check_metadata() {
         || fail "release metadata does not name the tagged daemon protocol $protocol"
     # Builds trust the keys their source lists; the tagged list must already
     # hold the signing key, so the release's own build accepts its successor.
-    keys=$(checkout_git show "$SOURCE_COMMIT:src/update/release-keys.pub") \
+    checkout_git cat-file -e "$SOURCE_COMMIT:src/update/release-keys.pub" 2>/dev/null \
         || fail "$TAG has no src/update/release-keys.pub"
-    allowed_signers "$keys" > "$WORK_DIR/allowed-signers"
-    [[ -s $WORK_DIR/allowed-signers ]] || fail "$TAG trusts no release signing key; see docs/releasing.md#signing"
-    verify_signature "$1" "$WORK_DIR/allowed-signers" \
+    tagged_signers "$SOURCE_COMMIT" "$WORK_DIR/allowed-signers" \
+        || fail "$TAG trusts no release signing key; see docs/releasing.md#signing"
+    verify_signature "$1/release-metadata.json" "$1/release-metadata.json.sig" "$WORK_DIR/allowed-signers" \
         || fail 'release-metadata.json.sig is not a signature by a key the tagged source trusts'
-    # Installed builds of the previous release verify this one with that
-    # release's keys, so a rotation must still be signed by a key it lists.
-    previous=$(checkout_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$SOURCE_COMMIT^" 2>/dev/null) \
-        || previous=
-    if [[ -n $previous ]] && keys=$(checkout_git show "$previous:src/update/release-keys.pub" 2>/dev/null); then
-        allowed_signers "$keys" > "$WORK_DIR/previous-signers"
-        if [[ -s $WORK_DIR/previous-signers ]]; then
-            verify_signature "$1" "$WORK_DIR/previous-signers" \
-                || fail "release-metadata.json.sig is not signed by a key $previous trusts, so its users could not update"
-        fi
+    # Every build of this generation reads this release, and so does every
+    # build of the generation before when this release begins its own: each
+    # must find a signature by a key it trusts, or it is stranded.
+    local readers=() reader
+    mapfile -t readers < <(tags_of_generation "$GENERATION")
+    if ((${#readers[@]} == 0 && GENERATION > 1)); then
+        mapfile -t readers < <(tags_of_generation "$((GENERATION - 1))")
+        # A release cannot begin generation 2 or later with no builds
+        # before it; finding none means the releases were not found.
+        ((${#readers[@]})) || fail "no release of generation $GENERATION or $((GENERATION - 1)) comes before $TAG here; fetch the release tags"
     fi
+    for reader in "${readers[@]}"; do
+        tagged_signers "$reader" "$WORK_DIR/reader-signers" || fail "$reader trusts no release signing key"
+        verify_signature "$1/release-metadata.json" "$1/release-metadata.json.sig" "$WORK_DIR/reader-signers" \
+            || fail "release-metadata.json.sig is not signed by a key $reader trusts, so its users could not update"
+    done
     [[ $(sed -n '/^DEFAULT_REPOSITORY=/p' "$1/install.sh") == "DEFAULT_REPOSITORY='$REPOSITORY'" ]] \
         || fail 'installer is not stamped for the canonical repository'
 }
@@ -281,15 +418,75 @@ check_archive() {
     fi
 }
 
-check_asset_set "$DIST_DIR"
+# Under generation GENERATION's name, DIRECTORY holds the metadata of the first
+# release of the generation after it, BRIDGE, which every build of GENERATION
+# must verify; generation 1 reads exactly one signature.
+check_bridge() {
+    local generation=$1 bridge=$2 directory=$3 name reader
+    name=$(metadata_name "$generation")
+    [[ -f $directory/$name && ! -L $directory/$name && -f $directory/$name.sig && ! -L $directory/$name.sig ]] \
+        || fail "the bridge for generation $generation must hold $name and $name.sig"
+    jq -e --arg version "${bridge#v}" '.version == $version' "$directory/$name" >/dev/null 2>&1 \
+        || fail "the bridge metadata $name is not $bridge's"
+    if ((generation == 1)); then
+        [[ $(split_signatures "$directory/$name.sig" "$WORK_DIR/bridge-signatures") == 1 ]] \
+            || fail "the bridge signature $name.sig must be exactly one signature, the only form generation 1 reads"
+    fi
+    local readers=()
+    mapfile -t readers < <(tags_of_generation "$generation")
+    ((${#readers[@]})) || fail "no release of generation $generation is found to check $bridge's metadata against"
+    for reader in "${readers[@]}"; do
+        tagged_signers "$reader" "$WORK_DIR/bridge-signers" || fail "$reader trusts no release signing key"
+        verify_signature "$directory/$name" "$directory/$name.sig" "$WORK_DIR/bridge-signers" \
+            || fail "the bridge metadata $name is not signed by a key $reader trusts"
+    done
+}
+
+# A bundle is checked before anything is made for it; promotion makes it
+# from the draft.
+[[ -n $PROMOTE ]] || check_asset_set "$DIST_DIR"
 WORK_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/cagents-publish.XXXXXX")
 cleanup() { rm -rf -- "$WORK_DIR"; }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
+# The draft's assets, which promotion publishes, by name, id, size and upload
+# time: promotion refuses if any changes after it downloaded them.
+draft_assets() {
+    jq -c '[.assets[] | {name, id, size, updated_at}] | sort_by(.name)' <<< "$1"
+}
+
+if [[ -n $PROMOTE ]]; then
+    # Promotion publishes the draft the release workflow left, which it reads
+    # back as the bundle it was made from and verifies again from the start.
+    command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
+    export GH_HOST=github.com GH_PROMPT_DISABLED=1
+    unset GH_DEBUG
+    draft=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
+        jq -sce --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("not one release") end') \
+        || fail "there is no one release of $TAG to publish; the release workflow leaves it as a draft"
+    jq -e '.draft == true' <<< "$draft" >/dev/null || fail "$TAG is published already"
+    DRAFT_ASSETS=$(draft_assets "$draft")
+    mkdir "$WORK_DIR/draft"
+    gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/draft" \
+        || fail "cannot download the draft of $TAG"
+    check_asset_set "$WORK_DIR/draft" --published
+    rehearsed=$(sha256sum "$WORK_DIR/draft/$OWN_METADATA")
+    rehearsed=${rehearsed%% *}
+    [[ $rehearsed == "$PROMOTE" ]] \
+        || fail "the draft of $TAG is not what was rehearsed: its $OWN_METADATA has SHA-256 $rehearsed, the rehearsal's $PROMOTE; rehearse the draft: scripts/release rehearse $VERSION --from-draft"
+    mkdir "$WORK_DIR/from-draft"
+    for asset in "${PAYLOADS[@]}" SHA256SUMS; do
+        cp -- "$WORK_DIR/draft/$asset" "$WORK_DIR/from-draft/$asset"
+    done
+    cp -- "$WORK_DIR/draft/$OWN_METADATA" "$WORK_DIR/from-draft/release-metadata.json"
+    cp -- "$WORK_DIR/draft/$OWN_METADATA.sig" "$WORK_DIR/from-draft/release-metadata.json.sig"
+    DIST_DIR=$WORK_DIR/from-draft
+fi
+
 # A private snapshot keeps uploads and comparisons bound to the bytes validated here.
 mkdir "$WORK_DIR/bundle"
-for asset in "${ASSETS[@]}"; do
+for asset in "${BUNDLE_ASSETS[@]}"; do
     cp --reflink=auto --preserve=mode -- "$DIST_DIR/$asset" "$WORK_DIR/bundle/$asset"
 done
 DIST_DIR=$WORK_DIR/bundle
@@ -299,10 +496,65 @@ check_metadata "$DIST_DIR"
 check_archive "$DIST_DIR" "$FULL_ARCHIVE" cagents dev.cagents.Cagents
 check_archive "$DIST_DIR" "$BROWSERLESS_ARCHIVE" cagents-browserless dev.cagents.Cagents.Browserless
 check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
-smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
-if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
-"$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
-printf 'Validated %s: 14 assets, the signed metadata, checksums, archive layouts, and source %s\n' "$TAG" "$SOURCE_COMMIT"
+if [[ -z $PROMOTE ]]; then
+    smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
+    if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
+    "$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
+fi
+
+# What builds of older generations read under their names: the first release
+# of the generation after theirs, which may be this one.
+mkdir "$WORK_DIR/bridges"
+for ((generation = 1; generation < GENERATION; generation++)); do
+    name=$(metadata_name "$generation")
+    bridge=$(tags_of_generation "$((generation + 1))" | head -n1)
+    if [[ -z $bridge ]]; then
+        # This release begins its generation, so builds of the one before
+        # read its own metadata, which must then be signed the way they read.
+        ((generation == GENERATION - 1)) || fail "no release begins trust generation $((generation + 1))"
+        if ((generation == 1)); then
+            [[ $(split_signatures "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/own-signatures") == 1 ]] \
+                || fail "$TAG begins generation $GENERATION, so its signature must be exactly one signature, the only form generation 1 reads"
+        fi
+        cp -- "$DIST_DIR/release-metadata.json" "$WORK_DIR/bridges/$name"
+        cp -- "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/bridges/$name.sig"
+        continue
+    fi
+    if "$VERIFY_ONLY"; then
+        [[ -n $BRIDGE_DIR ]] || fail "$TAG carries $bridge's metadata as $name; pass the published files with --bridge DIR"
+        cp -- "$BRIDGE_DIR/$name" "$BRIDGE_DIR/$name.sig" "$WORK_DIR/bridges/" 2>/dev/null \
+            || fail "--bridge $BRIDGE_DIR must hold $name and $name.sig, as $bridge published them"
+    else
+        # Publication carries the bytes the bridge release serves, and a
+        # supplied copy must match them.
+        command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
+        GH_HOST=github.com GH_PROMPT_DISABLED=1 gh release download "$bridge" --repo "$REPOSITORY" \
+            --dir "$WORK_DIR/bridges" --pattern "$name" --pattern "$name.sig" \
+            || fail "cannot download $name from the published $bridge"
+        if [[ -n $BRIDGE_DIR ]]; then
+            cmp -s -- "$BRIDGE_DIR/$name" "$WORK_DIR/bridges/$name" \
+                && cmp -s -- "$BRIDGE_DIR/$name.sig" "$WORK_DIR/bridges/$name.sig" \
+                || fail "--bridge $BRIDGE_DIR differs from what $bridge publishes as $name"
+        fi
+    fi
+    check_bridge "$generation" "$bridge" "$WORK_DIR/bridges"
+done
+if ((GENERATION == 1)); then
+    [[ $(split_signatures "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/own-signatures") == 1 ]] \
+        || fail "generation 1 reads exactly one signature in release-metadata.json.sig"
+fi
+# The release as published: its own metadata under the new names, and what
+# older builds read under the old ones.
+mkdir "$WORK_DIR/upload"
+for asset in "${PAYLOADS[@]}" SHA256SUMS; do
+    cp --reflink=auto --preserve=mode -- "$DIST_DIR/$asset" "$WORK_DIR/upload/$asset"
+done
+cp -- "$WORK_DIR/bridges/"* "$WORK_DIR/upload/" 2>/dev/null || :
+cp -- "$DIST_DIR/release-metadata.json" "$WORK_DIR/upload/$OWN_METADATA"
+cp -- "$DIST_DIR/release-metadata.json.sig" "$WORK_DIR/upload/$OWN_METADATA.sig"
+check_asset_set "$WORK_DIR/upload" --published
+printf 'Validated %s: %s assets, the signed metadata, checksums, archive layouts, and source %s\n' \
+    "$TAG" "${#ASSETS[@]}" "$SOURCE_COMMIT"
 if "$VERIFY_ONLY"; then
     exit 0
 fi
@@ -325,7 +577,8 @@ export GH_HOST=github.com GH_PROMPT_DISABLED=1
 unset GH_DEBUG
 
 # API errors (including authentication failures) are fatal, never treated as absence.
-gh api --hostname github.com user --jq .login >/dev/null
+# A workflow's token cannot read /user, so this asks about the repository.
+gh api --hostname github.com "repos/$REPOSITORY" --jq .full_name >/dev/null
 if "$PUSH_TAG"; then
     # Idempotent: origin refuses a different tag of the same name, and
     # check_remote_tag confirms origin is this repository.
@@ -352,6 +605,10 @@ check_remote_tag() {
 check_remote_tag
 
 RELEASE_MARKER='<!-- cagents-local-release -->'
+BUILT_BY='Built and verified locally from'
+if [[ ${GITHUB_ACTIONS:-} == true && -n ${GITHUB_RUN_ID:-} ]]; then
+    BUILT_BY="Built, signed and verified in [GitHub Actions run $GITHUB_RUN_ID](https://github.com/$REPOSITORY/actions/runs/$GITHUB_RUN_ID) from"
+fi
 BUNDLE_HASH=$(sha256sum "$DIST_DIR/release-metadata.json")
 BUNDLE_HASH=${BUNDLE_HASH%% *}
 BUNDLE_MARKER="<!-- source_commit=$SOURCE_COMMIT release-metadata.json=$BUNDLE_HASH -->"
@@ -382,9 +639,9 @@ Debian packages are upgraded with the system package manager. The standalone
 ceditor archive unpacks into \`~/.local\`:
 \`tar -xzf $EDITOR_ARCHIVE --strip-components=1 -C ~/.local\`.
 
-Built and verified locally from \`$SOURCE_COMMIT\`.
-\`release-metadata.json\` lists every asset with its SHA-256 and is signed in
-\`release-metadata.json.sig\` (\`ssh-keygen -Y verify -n cagents-release\`).
+$BUILT_BY \`$SOURCE_COMMIT\`.
+\`$OWN_METADATA\` lists every asset with its SHA-256 and is signed in
+\`$OWN_METADATA.sig\` (\`ssh-keygen -Y verify -n cagents-release\`).
 EOF
 } > "$NOTES"
 
@@ -400,11 +657,12 @@ assert_owned_draft() {
     jq -e --arg tag "$TAG" --arg marker "$RELEASE_MARKER" --arg bundle "$BUNDLE_MARKER" '
         .tag_name == $tag and .draft == true and
         (.body | split("\n") | index($marker) != null and index($bundle) != null)
-    ' <<< "$1" >/dev/null || fail 'refusing to modify a published release or a draft not owned by this local publisher for this exact bundle'
+    ' <<< "$1" >/dev/null || fail "refusing to modify a published release or a draft not owned by this local publisher for this exact bundle; to publish this bundle instead of an unpublished draft of $TAG, delete that draft on GitHub first"
 }
 
 releases=$(release_for_tag)
 if [[ $(jq 'length' <<< "$releases") == 0 ]]; then
+    [[ -z $PROMOTE ]] || fail "the draft of $TAG is gone"
     # Use the creation response: the releases listing can lag behind this write.
     release=$(gh api --hostname github.com --method POST "repos/$REPOSITORY/releases" \
         -f "tag_name=$TAG" -f "name=cagents and ceditor $TAG" \
@@ -432,26 +690,62 @@ assert_current_draft() {
     assert_owned_draft "$current"
 }
 assert_current_draft
-upload_assets=()
-for asset in "${ASSETS[@]}"; do upload_assets+=("$DIST_DIR/$asset"); done
-gh release upload "$TAG" "${upload_assets[@]}" --repo "$REPOSITORY" --clobber
+if [[ -z $PROMOTE ]]; then
+    upload_assets=()
+    for asset in "${ASSETS[@]}"; do upload_assets+=("$WORK_DIR/upload/$asset"); done
+    gh release upload "$TAG" "${upload_assets[@]}" --repo "$REPOSITORY" --clobber
 
-release=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
-assert_owned_draft "$release"
-actual_assets=$(jq -r '.assets[].name' <<< "$release" | sort)
-[[ $actual_assets == "$EXPECTED_ASSETS" ]] || fail 'refusing to publish: uploaded assets do not match the exact expected set'
-mkdir "$WORK_DIR/downloaded"
-# gh uses authentication for private repositories and draft asset downloads.
-gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/downloaded"
-check_asset_set "$WORK_DIR/downloaded"
+    release=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
+    assert_owned_draft "$release"
+    actual_assets=$(jq -r '.assets[].name' <<< "$release" | sort)
+    [[ $actual_assets == "$EXPECTED_ASSETS" ]] || fail 'refusing to publish: uploaded assets do not match the exact expected set'
+    mkdir "$WORK_DIR/downloaded"
+    # gh uses authentication for private repositories and draft asset downloads.
+    gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/downloaded"
+else
+    # Promotion uploads nothing: what it compares with the release as it
+    # would have uploaded it is the draft it downloaded, still unchanged.
+    [[ $(draft_assets "$release") == "$DRAFT_ASSETS" ]] \
+        || fail "the draft of $TAG changed while it was verified; run this again"
+    mv -- "$WORK_DIR/draft" "$WORK_DIR/downloaded"
+fi
+check_asset_set "$WORK_DIR/downloaded" --published
 for asset in "${ASSETS[@]}"; do
-    cmp -- "$DIST_DIR/$asset" "$WORK_DIR/downloaded/$asset" \
+    cmp -- "$WORK_DIR/upload/$asset" "$WORK_DIR/downloaded/$asset" \
         || fail "refusing to publish: GitHub served different bytes for $asset"
 done
-check_checksums "$WORK_DIR/downloaded"
-check_metadata "$WORK_DIR/downloaded"
+# The served release, read back as the bundle it was published from.
+mkdir "$WORK_DIR/served"
+for asset in "${PAYLOADS[@]}" SHA256SUMS; do
+    cp -- "$WORK_DIR/downloaded/$asset" "$WORK_DIR/served/$asset"
+done
+cp -- "$WORK_DIR/downloaded/$OWN_METADATA" "$WORK_DIR/served/release-metadata.json"
+cp -- "$WORK_DIR/downloaded/$OWN_METADATA.sig" "$WORK_DIR/served/release-metadata.json.sig"
+check_checksums "$WORK_DIR/served"
+check_metadata "$WORK_DIR/served"
 check_remote_tag
 assert_current_draft
+# Publishing makes this the latest release; never above a newer one, nor a
+# second release of a version.
+newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
+    jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' |
+    sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' |
+    while IFS= read -r published; do
+        version_after "$VERSION" "$published" || printf '%s\n' "$published"
+    done)
+[[ -z $newer ]] || fail "refusing to publish $TAG: $(head -n1 <<< "$newer") is published already"
+if "$DRAFT"; then
+    printf 'Verified %s as a draft; rehearse its update, then publish it.\n' "$TAG"
+    exit 0
+fi
+if [[ -n $PROMOTE ]]; then
+    [[ $(draft_assets "$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")") == "$DRAFT_ASSETS" ]] \
+        || fail "the draft of $TAG changed while it was verified; run this again"
+fi
 gh api --hostname github.com --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
     -F draft=false --jq .html_url
-printf 'Published %s from verified local assets.\n' "$TAG"
+if [[ -n $PROMOTE ]]; then
+    printf 'Published %s from its verified, rehearsed draft.\n' "$TAG"
+else
+    printf 'Published %s from verified local assets.\n' "$TAG"
+fi
