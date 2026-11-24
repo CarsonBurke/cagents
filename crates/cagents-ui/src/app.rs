@@ -22,6 +22,7 @@ mod dispatch_tests;
 mod ingress;
 mod inspector_activity;
 mod inspector_rail;
+mod phone_ui;
 use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
@@ -348,6 +349,8 @@ enum NoticeKey {
     TerminalStart(CardId),
     /// Restoring this card from the window's saved state at startup.
     CardRestore(CardId),
+    /// Closing this pane, which waits for another pane's close to finish.
+    CloseWaiting(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3345,6 +3348,12 @@ fn background_poll(message: &Message) -> bool {
         Message::AutomationApproval(
             automation_approval::Action::Tick | automation_approval::Action::Read { .. }
         ) | Message::AccountUi(account_ui::Action::Tick | account_ui::Action::OmpRead(_))
+            // The phone's status is read only by its own control and popover.
+            | Message::Phone(
+                phone_ui::Action::Tick
+                    | phone_ui::Action::Probed(_)
+                    | phone_ui::Action::Progressed(_)
+            )
     )
 }
 
@@ -4969,6 +4978,7 @@ fn grouped_digits(value: usize) -> String {
 #[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
+    Phone(phone_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
         collapsed: bool,
@@ -5730,9 +5740,14 @@ impl PullRequestPane {
     }
 }
 
-/// Whether a pull request card `width` wide hides its side panel.
+/// Whether a pull request card `width` wide hides its side panel: the
+/// person's choice, or else whether a narrow card needs the room for a file's
+/// diff. Until a file is chosen the panel holds what to choose from, the
+/// pull requests or the review's files, and the rest of the card is empty, so
+/// it is never folded away unasked.
 fn review_files_collapsed(pane: &PullRequestPane, width: f32) -> bool {
-    pane.file_panel_collapsed.unwrap_or(width < 640.0)
+    pane.file_panel_collapsed
+        .unwrap_or(width < 640.0 && pane.review.selected().is_some())
 }
 
 /// Static chrome strings for a card kind.
@@ -5951,6 +5966,7 @@ struct HoverFocus {
 pub struct Cagents {
     startup_gate: startup_gate::State,
     device_ui: device_ui::State,
+    phone_ui: phone_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
@@ -8300,10 +8316,11 @@ impl Cagents {
         let file_panel_toggle = || {
             crate::ui_controls::icon_button(
                 Icon::Sidebar,
-                if collapsed {
-                    "Show review files"
-                } else {
-                    "Hide review files"
+                match (collapsed, review.is_open()) {
+                    (true, true) => "Show review files",
+                    (false, true) => "Hide review files",
+                    (true, false) => "Show pull requests",
+                    (false, false) => "Hide pull requests",
                 },
             )
             .selected(!collapsed)
@@ -10982,6 +10999,12 @@ impl Cagents {
         {
             return (task, Projection::Full);
         }
+        if is_escape_press(&event) && self.phone_ui.open && !self.modal_is_open() {
+            return (
+                self.update_phone(phone_ui::Action::Menu(false)),
+                Projection::Full,
+            );
+        }
         if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
             return (
                 self.update_device(device_ui::Action::Menu(false)),
@@ -12379,16 +12402,16 @@ impl Cagents {
                 }
             }
             BrowserEvent::Error(_) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {id}: a browser operation failed"
-                )));
+                self.status = Some(TransientNotice::error(
+                    "A browser operation failed".to_owned(),
+                ));
             }
             BrowserEvent::Crashed { reason, .. } => {
                 self.fail_runtime(id, reason.clone());
                 durable_changed = true;
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {id}: the browser stopped unexpectedly"
-                )));
+                self.status = Some(TransientNotice::error(
+                    "The browser stopped unexpectedly".to_owned(),
+                ));
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
             BrowserEvent::ClosedByContent => {
@@ -12714,7 +12737,7 @@ impl Cagents {
                             },
                         )
                         .accessible_name(format!(
-                            "Terminal {}, card {id}",
+                            "Terminal {}",
                             card.map_or_else(
                                 || "Terminal".to_owned(),
                                 |card| card.title.chars().take(80).collect::<String>()
@@ -15152,11 +15175,10 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => {
-                self.sidebar_model.project(id).and_then(|project| {
-                    sidebar::project_primary_action(project, self.sidebar_state.filter())
-                })
-            }
+            sidebar::SelectionRow::Project(id) => self
+                .sidebar_model
+                .project(id)
+                .and_then(sidebar::project_primary_action),
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -15513,6 +15535,17 @@ impl Cagents {
             .is_none_or(|card| !card.existence.is_open())
         {
             return Task::none();
+        }
+        // Only a reservation sends this. A commit for one given up meanwhile,
+        // as a stranded one is when a pane waiting behind it is closed again,
+        // has nothing left to commit, and starts nothing: the pane stays open.
+        if !self
+            .workspace
+            .pending_close()
+            .is_some_and(|pending| pending.unmounting == id)
+        {
+            self.abandon_removal(id);
+            return self.next_queued_card_close();
         }
         if self.pending_terminal_spawn(id) {
             return self.begin_card_close(id);
@@ -16399,6 +16432,7 @@ impl Cagents {
         if previous.show_status_bar != self.settings.show_status_bar {
             self.account_ui.set_turned_off(&self.settings);
             self.device_ui.menu_open = false;
+            self.phone_ui.open = false;
             tasks.push(self.accounts_surface_changed());
         } else if self.account_ui.set_turned_off(&self.settings) {
             // A provider turned back on is read again at once, rather than
@@ -16789,6 +16823,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
+            phone_ui: phone_ui::State::default(),
             account_ui: account_ui::State::installation().into(),
             sign_ins: account_ui::SignIns::default(),
             automation_ui: crate::automation_ui::State::default(),
@@ -17173,6 +17208,7 @@ impl Application for Cagents {
             },
         ));
         subscriptions.extend(operation_subscriptions);
+        subscriptions.push(self.phone_subscription());
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.pane_inspectors.is_animating())
         {
@@ -18038,6 +18074,10 @@ impl Cagents {
         }
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
+        let closing = match message {
+            Message::CloseCard(card) => Some(card),
+            _ => None,
+        };
         if self.update_prepared && user_message_blocked_during_update(&message) {
             // Nothing else would ever deliver this removal.
             if let Message::CommitClose(card) = message {
@@ -18047,6 +18087,13 @@ impl Cagents {
                 ));
                 return ControlFlow::Break(self.return_kept_panes());
             }
+            // A Close turned away says why, rather than doing nothing.
+            if let Some(card) = closing {
+                let me = self.pane_name(card);
+                self.status = Some(TransientNotice::warning(format!(
+                    "{me} can't close while an update is being prepared. Close it again if the update is cancelled."
+                )));
+            }
             return ControlFlow::Break(Task::none());
         }
         if self.modal_is_open() {
@@ -18055,9 +18102,32 @@ impl Cagents {
             && !matches!(&message, Message::ChromeUi(_))
             && user_workspace_message_blocked_while_modal(&message)
         {
-            return ControlFlow::Break(Task::none());
+            // A menu only dismisses itself under a click elsewhere, but a pane's
+            // Close is aimed at the pane: the menu goes and the close goes on,
+            // as does a rename of the pane being closed. Another rename keeps
+            // what was typed, and says why the pane stays.
+            match closing {
+                Some(card) if !self.chrome_ui.renaming_other_than(card) => {
+                    self.chrome_ui.close();
+                    self.chrome_ui.cancel_rename();
+                }
+                Some(card) => {
+                    let me = self.pane_name(card);
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Finish or cancel the rename first, then close {me}."
+                    )));
+                    return ControlFlow::Break(Task::none());
+                }
+                None => return ControlFlow::Break(Task::none()),
+            }
         }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
+            if let Some(card) = closing {
+                let me = self.pane_name(card);
+                self.status = Some(TransientNotice::warning(format!(
+                    "Close or answer the open dialog first, then close {me}."
+                )));
+            }
             return ControlFlow::Break(Task::none());
         }
         if self.focused_repository_is_saving() && workspace_navigation_blocked_during_save(&message)
@@ -18157,6 +18227,7 @@ impl Cagents {
             Message::TerminalSave(action) => self.update_terminal_save(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
+            Message::Phone(action) => self.update_phone(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
                 self.run_workspace_command(command, keyboard::Modifiers::empty())
@@ -18186,11 +18257,11 @@ impl Cagents {
                                 Err(error) => failures.push((terminal.id, error)),
                             }
                         }
-                        failures.first().map(|(id, error)| {
-                            terminal_handoff_pending_notice(format!(
-                                "{} terminal(s) remain pending; terminal {id}: {error}",
-                                failures.len()
-                            ))
+                        failures.first().map(|(_, error)| {
+                            terminal_handoff_pending_notice(match failures.len() {
+                                1 => error.to_string(),
+                                count => format!("{count} terminals are waiting: {error}"),
+                            })
                         })
                     }
                     Err(error) => Some(match self.unsaved_chat_return() {
@@ -18302,10 +18373,8 @@ impl Cagents {
                 cosmic::task::message(Message::FocusCard(card))
             }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserError { card, message: _ } => {
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {card}: a browser operation failed"
-                )));
+            Message::BrowserError { .. } => {
+                self.status = Some(TransientNotice::error("A browser operation failed".to_owned()));
                 Task::none()
             }
             Message::ExternalUrlOpened(result) => {
@@ -19250,7 +19319,8 @@ impl Cagents {
                 if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
                     && (!self.settings.focus_follows_mouse
                         || self.chat_menu_open()
-                        || self.device_ui.menu_open)
+                        || self.device_ui.menu_open
+                        || self.phone_ui.open)
                 {
                     return Task::none();
                 }
@@ -20602,9 +20672,9 @@ fn browser_command(
     if let Some(CardRuntime::Browser(browser)) = cards.get(&card)
         && command(&browser.handle).is_err()
     {
-        *status = Some(TransientNotice::error(format!(
-            "Browser card {card}: a browser operation failed"
-        )));
+        *status = Some(TransientNotice::error(
+            "A browser operation failed".to_owned(),
+        ));
     }
     Task::none()
 }
@@ -21041,22 +21111,18 @@ fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, S
             if proof.is_complete() {
                 Ok(TerminalStartMode::Attach(proof))
             } else {
-                Err(format!(
-                    "terminal {} has incomplete host continuity proof; explicit relaunch is required",
-                    session.id
-                ))
+                Err("This terminal could not be reattached. Start it again to continue.".into())
             }
         }
         TerminalContinuity::RelaunchAvailable { recipe, .. } => {
             terminal_relaunch_recipe(session, recipe).map(TerminalStartMode::Spawn)
         }
-        TerminalContinuity::Exited { .. } => Err(format!(
-            "terminal {} has exited; explicit relaunch is required",
-            session.id
-        )),
+        TerminalContinuity::Exited { .. } => {
+            Err("This terminal has exited. Start it again to continue.".into())
+        }
         TerminalContinuity::Failed { typed_error, .. } => Err(format!(
-            "terminal {} cannot resume: {}; explicit relaunch is required",
-            session.id, typed_error.message
+            "This terminal cannot resume: {}. Start it again to continue.",
+            typed_error.message
         )),
     }
 }

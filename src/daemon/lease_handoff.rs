@@ -288,7 +288,7 @@ fn inherited() -> io::Result<Option<(File, bool)>> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn clone_inherited_lease() -> io::Result<Option<File>> {
+pub fn clone_inherited_lease() -> io::Result<Option<File>> {
     inherited().map(|lease| lease.map(|(lock, _)| lock))
 }
 
@@ -321,7 +321,7 @@ pub(crate) fn inherit_target_daemon_lease(command: &mut Command) -> io::Result<(
 /// # Safety
 /// The caller must be the single-threaded daemon entry point.
 #[cfg(feature = "host")]
-pub(crate) unsafe fn take_inherited_lease() -> io::Result<Option<File>> {
+pub unsafe fn take_inherited_lease() -> io::Result<Option<File>> {
     crate::upgrade::recovery::initialize_inherited()?;
     // The cache owns and seals recovery descriptors before any thread or
     // provider child exists. The daemon must not export their marker to its

@@ -23,6 +23,18 @@ macro_rules! test_binary_setup {
             report
         };
 
+        // Test-support code paths that differ between a test binary and a
+        // daemon built with test support, as integration tests run it, ask.
+        #[cfg(all(test, target_os = "linux"))]
+        #[used]
+        #[unsafe(link_section = ".init_array")]
+        static MARK_TEST_BINARY: extern "C" fn() = {
+            extern "C" fn mark() {
+                $crate::test_binary::mark_test_binary();
+            }
+            mark
+        };
+
         // With many test threads the descriptor-heavy fixtures exhaust the
         // customary soft limit of 1024. Fixtures that test the limit lower it
         // themselves.
@@ -36,6 +48,30 @@ macro_rules! test_binary_setup {
             raise
         };
     };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_BINARY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn mark_test_binary() {
+    TEST_BINARY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process is a library test binary of the workspace, rather
+/// than an executable, including one built with test support, such as the
+/// `cagentsd` integration tests run. Shared code that a test binary must not
+/// run as the product does, such as writing the person's state, asks this
+/// rather than `cfg!(test)`, which the daemon crate's tests do not set here.
+pub fn is_test_binary() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        cfg!(test) || TEST_BINARY.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        false
+    }
 }
 
 // The binary re-executes as a holder or actor, whose own `.init_array` hook may run

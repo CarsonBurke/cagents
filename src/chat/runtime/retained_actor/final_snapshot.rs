@@ -17,20 +17,20 @@ use std::{
 /// Observation is not retirement authority. Only the validated capsule grants
 /// a caller access to the authenticated, fully joined retirement descriptor.
 #[derive(Debug)]
-pub(crate) enum RetirementInspection {
+pub enum RetirementInspection {
     Running,
     ExitedUnproved,
     Verified(VerifiedRetirement),
 }
 /// Boxed so the inspection, and each owner that carries one, stays small.
 #[derive(Debug)]
-pub(crate) struct VerifiedRetirement(Box<RetirementReceipt>);
+pub struct VerifiedRetirement(Box<RetirementReceipt>);
 impl VerifiedRetirement {
-    pub(crate) fn receipt(&self) -> &RetirementReceipt {
+    pub fn receipt(&self) -> &RetirementReceipt {
         &self.0
     }
-    #[cfg(test)]
-    pub(crate) fn into_receipt(self) -> RetirementReceipt {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn into_receipt(self) -> RetirementReceipt {
         *self.0
     }
 }
@@ -426,8 +426,8 @@ fn validate_retired_publication(
     }
     Ok(())
 }
-#[cfg(test)]
-pub(super) fn retired_actor_receipt(
+#[cfg(any(test, feature = "test-support"))]
+pub fn retired_actor_receipt(
     record: &Record,
     current: &HostSessionProof,
 ) -> Result<Option<RetirementReceipt>, String> {
@@ -505,13 +505,13 @@ pub(super) fn compact_retired(record: &Record, current: &HostSessionProof) -> Re
 /// Runtime receipts of actors that no helper or provider backs, for the
 /// daemon's receipt collection tests. Each is published through the same
 /// writers a helper uses, so every reader validates it as it would a real one.
-#[cfg(test)]
-pub(crate) mod fixture {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixture {
     use super::*;
 
     /// How far an actor got toward a retirement its receipts can prove.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Stage {
+    pub enum Stage {
         /// The helper is still running.
         Running,
         /// The helper ended, but its provider may still be running.
@@ -525,18 +525,18 @@ pub(crate) mod fixture {
     }
 
     /// One published actor: its exact holder record and issued conversation.
-    pub(crate) struct Actor {
-        pub(crate) record: Record,
-        pub(crate) source: chat::Session,
-        pub(crate) final_receipt: PathBuf,
-        pub(crate) retirement_receipt: PathBuf,
+    pub struct Actor {
+        pub record: Record,
+        pub source: chat::Session,
+        pub final_receipt: PathBuf,
+        pub retirement_receipt: PathBuf,
     }
 
     /// Publishes `stage`'s receipts for actor `instance` of the lease `proof`.
     ///
     /// `ended` is a process that has exited and been reaped; the calling
     /// process stands in for anything `stage` says is still running.
-    pub(crate) fn publish(
+    pub fn publish(
         instance: uuid::Uuid,
         proof: &HostSessionProof,
         ended: &registry::Process,
@@ -645,7 +645,7 @@ pub(crate) mod fixture {
     }
 
     /// Whether the final receipt at `path` was compacted.
-    pub(crate) fn compacted(path: &std::path::Path) -> bool {
+    pub fn compacted(path: &std::path::Path) -> bool {
         let receipt: Receipt = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         receipt.compacted
     }

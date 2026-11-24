@@ -277,9 +277,19 @@ pub(super) const PANE_KEPT_ELSEWHERE: &str =
     "This pane couldn't be removed everywhere, so it may come back. Close it again if it does.";
 
 /// A Close the registry refused or never received. The pane stays closed
-/// here, under its identity, but other windows may still show it.
-pub(super) const PANE_CLOSED_HERE_KEPT_ELSEWHERE: &str =
-    "This pane closed here, but other windows may still show it. Close it there if they do.";
+/// here, under its identity, but other windows may still show it. The notice
+/// comes once the pane is gone, so it names the pane when it has a title.
+pub(super) fn pane_closed_here_kept_elsewhere(title: Option<&str>) -> String {
+    match title {
+        Some(title) => format!(
+            "The pane \u{201c}{title}\u{201d} closed here, but other windows may still show it. Close it there if they do."
+        ),
+        None => {
+            "This pane closed here, but other windows may still show it. Close it there if they do."
+                .to_owned()
+        }
+    }
+}
 
 /// Any other pane edit the registry would not save: a rename, a resize, a
 /// move or an added pane. This window then shows the panes as saved.
@@ -956,8 +966,10 @@ impl Cagents {
             // The pane stays closed here whatever the registry kept: storage
             // holds its tombstone, and the view does not bring it back.
             tracing::warn!(?scope, %operation, %error, %card, "the registry kept a pane closed here");
-            self.notices
-                .record(TransientNotice::warning(PANE_CLOSED_HERE_KEPT_ELSEWHERE));
+            let notice = pane_closed_here_kept_elsewhere(
+                self.closed_pane_notice_title(card, scope).as_deref(),
+            );
+            self.notices.record(TransientNotice::warning(notice));
             return;
         }
         if kept && self.closes_in_background(card) {
@@ -4730,6 +4742,38 @@ impl Cagents {
             .is_some_and(|card| card.id == id && matches!(card.existence, Existence::Closed { .. }))
             && !self.shared_views.quarantined.contains(&id)
             && !self.chat_close_returns_through_stop(id)
+    }
+
+    /// The title a notice names `card` by, open or closed, when it has one.
+    pub(in crate::app) fn pane_notice_title(&self, card: CardId) -> Option<String> {
+        self.card_state(card)
+            .map(|state| self.card_display_title(state))
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// The title a notice names `card` by once it has closed out of `scope`.
+    /// A chat named for its channel no longer belongs to that channel, so it
+    /// is named as its tab was while it was open there, not by its provider.
+    pub(in crate::app) fn closed_pane_notice_title(
+        &self,
+        card: CardId,
+        scope: &Scope,
+    ) -> Option<String> {
+        let state = self.card_state(card)?;
+        let channel = match scope {
+            Scope::Channel(id) => self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == *id && !channel.title.is_empty()),
+            Scope::Worktree { .. } => None,
+        };
+        let title = match self.chat_channel_title(state, channel) {
+            Some(title) if !self.chrome_ui.user_titles.contains_key(&card) => title,
+            _ => self.card_display_title(state),
+        };
+        (!title.is_empty()).then(|| title.to_owned())
     }
 
     /// Whether a pane missing from its shared view should close here. Only a

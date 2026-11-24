@@ -262,13 +262,17 @@ zig_executable() (
 # checkout in $2, by default the current directory. Keep these in step with
 # scripts/run-development's builds, which cannot be asked to only build: the
 # before side may predate any option. A real-runner test fails if they drift.
-# A checkout from before the UI became its own package builds it from the root package.
+# A checkout from before the UI or the daemon became its own package builds it
+# from the root package.
 build_arguments() {
     local lane=${1:-browserless} checkout=${2:-.} ui
     local common='--locked --profile dev-runtime --no-default-features --features'
-    printf '%s\n' \
-        "$common development --bin cagents" \
-        "$common development,host --bin cagentsd"
+    printf '%s\n' "$common development --bin cagents"
+    if [ -e "$checkout/crates/cagents-host/Cargo.toml" ]; then
+        printf '%s\n' '--locked --profile dev-runtime --no-default-features -p cagents-host --features development --bin cagentsd'
+    else
+        printf '%s\n' "$common development,host --bin cagentsd"
+    fi
     if [ -e "$checkout/crates/cagents-ui/Cargo.toml" ]; then
         ui='--locked --profile dev-runtime -p cagents-ui --features development'
         [ "$lane" != integrated ] || ui+=',integrated-browser'

@@ -14,7 +14,7 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub(crate) struct Detached {
+pub struct Detached {
     pub record: Record,
     pub source: super::super::Session,
     pub proof: HostSessionProof,
@@ -69,8 +69,8 @@ pub(super) fn publish(
 }
 
 /// Publishes the receipt a holder of `record` writes as it closes `source`.
-#[cfg(test)]
-pub(crate) fn publish_closed_source(
+#[cfg(any(test, feature = "test-support"))]
+pub fn publish_closed_source(
     record: &Record,
     proof: &HostSessionProof,
     source: &crate::chat::Session,
@@ -115,7 +115,7 @@ fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
 impl Detached {
     /// Used only after find_source has authenticated the exact durable receipt
     /// and full issued-source digest; never from an untrusted candidate record.
-    pub(crate) fn from_receipt(
+    pub fn from_receipt(
         record: Record,
         source: crate::chat::Session,
         proof: HostSessionProof,
@@ -135,7 +135,7 @@ impl Detached {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn close(&self) -> Result<(), String> {
         self.close_with(false, DetachedWork::Stop)
     }
@@ -266,7 +266,7 @@ fn consume(
 
 /// An exact issued descriptor can retry a completed close after daemon loss.
 /// No launch recipe or environment is written into this private receipt.
-pub(crate) fn closed_source(
+pub fn closed_source(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
@@ -277,7 +277,7 @@ pub(crate) fn closed_source(
 /// provider are gone with everything in their process group and session. That
 /// is the evidence an abandoned retained actor gives, and discovery deletes
 /// such a record. Returns whether it did.
-pub(crate) fn retire_abandoned(record: &Record) -> Result<bool, String> {
+pub fn retire_abandoned(record: &Record) -> Result<bool, String> {
     if record.application != crate::instance::APPLICATION_ID
         || !crate::chat::runtime::retained_actor_abandoned(&record.holder, &record.root)?
     {
@@ -287,14 +287,14 @@ pub(crate) fn retire_abandoned(record: &Record) -> Result<bool, String> {
     Ok(true)
 }
 
-pub(crate) fn closed_pair_holder(
+pub fn closed_pair_holder(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<Option<Record>, String> {
     Ok(find_source(source, proof)?.and_then(|receipt| receipt.paired_holder))
 }
 
-pub(crate) fn confirm_pair_closed(
+pub fn confirm_pair_closed(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<(), String> {

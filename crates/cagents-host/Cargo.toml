@@ -1,0 +1,61 @@
+[package]
+name = "cagents-host"
+# The daemon ships in every release, so it carries the product version.
+version = "0.2.4"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+# The terminal and conversation daemon, `cagentsd`, and the host it runs. A
+# crate of its own so that editing the daemon recompiles only it, and so its
+# tests build beside the shared library's rather than inside one harness.
+# Never libcosmic or Servo.
+[features]
+default = ["full"]
+# Product identity, as the shared library's `full` feature.
+full = ["cagents/full"]
+development = ["cagents/development"]
+
+[lib]
+bench = false
+
+[[bin]]
+name = "cagentsd"
+test = false
+bench = false
+
+[dependencies]
+cagents = { path = "../..", default-features = false, features = ["host"] }
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio"] }
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+diesel = { version = "2.3.13", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
+futures-util = "0.3"
+jiff = "0.2.35"
+libc = "0.2.189"
+notify = "=9.0.0-rc.8"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.21"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"] }
+toml = { version = "1.1.4", features = ["preserve_order"] }
+tracing = "0.1"
+tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.12.3", default-features = false, features = ["wayland"] }
+
+[dev-dependencies]
+# The shared library's test fixtures, which the daemon's tests also use.
+cagents = { path = "../..", default-features = false, features = ["host", "test-support"] }
+tokio = { version = "1.47", features = ["test-util"] }

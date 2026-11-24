@@ -651,8 +651,8 @@ fn terminal_handoff_completion_retires_only_exact_successes_and_reports_only_fai
     assert!(
         notices
             .iter()
-            .any(|notice| notice.contains("1 terminal(s) remain pending")
-                && notice.contains(&refused.id.to_string()))
+            .any(|notice| notice.contains("receipt refused")
+                && !notice.contains(&refused.id.to_string()))
     );
     assert!(
         notices
@@ -3205,21 +3205,48 @@ fn review_file_panel_control_remains_accessible_across_pane_widths() {
     use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
-    let mut pane = app.pull_request_pane(&crate::model::PullRequestView {
+    let view = crate::model::PullRequestView {
         repository: PathBuf::from("/repo"),
         selected_number: None,
         file_panel_width: None,
         file_panel_collapsed: None,
-    });
+    };
+    let mut pane = app.pull_request_pane(&view);
     let renderer = headless_renderer();
-    for (width, collapsed, label) in [
-        (260.0, None, "Show review files"),
-        (260.0, Some(false), "Hide review files"),
-        (500.0, None, "Show review files"),
-        (900.0, None, "Hide review files"),
+    // Until a file is chosen the panel holds what to choose from, the pull
+    // requests or the review's files, so only a file's diff folds it away on
+    // a narrow card unasked.
+    #[derive(Clone, Copy)]
+    enum Review {
+        Browsing,
+        Opened,
+        FileChosen,
+    }
+    use crate::pull_request_review::discussion_ui::test_support::{ready, ready_unselected};
+    for (width, collapsed, review, label) in [
+        (260.0, None, Review::Browsing, "Hide pull requests"),
+        (260.0, Some(true), Review::Browsing, "Show pull requests"),
+        (500.0, None, Review::Browsing, "Hide pull requests"),
+        (260.0, None, Review::Opened, "Hide review files"),
+        (500.0, None, Review::Opened, "Hide review files"),
+        (500.0, Some(true), Review::Opened, "Show review files"),
+        (260.0, None, Review::FileChosen, "Show review files"),
+        (260.0, Some(false), Review::FileChosen, "Hide review files"),
+        (500.0, None, Review::FileChosen, "Show review files"),
+        (900.0, None, Review::FileChosen, "Hide review files"),
     ] {
         pane.file_panel_collapsed = collapsed;
+        pane.review = match review {
+            Review::Browsing => app.pull_request_pane(&view).review,
+            Review::Opened => ready_unselected(),
+            Review::FileChosen => ready(),
+        };
         drop(app.workspace.resize_viewport(width));
+        assert_eq!(
+            app.pull_request_side_shown(card, &pane),
+            label.starts_with("Hide"),
+            "the panel is drawn exactly when its toggle offers to hide it, at width {width}"
+        );
         let mut element = app.pull_request_card_view(card, &pane);
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -12281,6 +12308,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         source_control_mutations: HashMap::new(),
         operation_recovery: Default::default(),
         device_ui: device_ui::State::default(),
+        phone_ui: phone_ui::State::default(),
         account_ui: account_ui::Accounts::default(),
         sign_ins: account_ui::SignIns::default(),
         automation_ui: crate::automation_ui::State::default(),
@@ -16294,4 +16322,52 @@ fn choosing_a_listed_pull_request_in_the_pane_opens_it() {
         "closing the review forgets the pull request"
     );
     let _ = project;
+}
+
+/// A notice's details are held to their lines by the text engine's own
+/// ellipsis, which the vendored patch makes keep ordinary word wrapping up to
+/// the last line. Exercise the engine the UI reexports, so removing or
+/// bypassing that patch fails here.
+#[test]
+fn notice_detail_ellipsis_preserves_ordinary_word_wrap_geometry() {
+    use cosmic::iced::advanced::graphics::text::cosmic_text::{
+        Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
+        ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
+    };
+
+    let mut db = fontdb::Database::new();
+    db.load_font_data(
+        include_bytes!("../../../../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+    );
+    let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+    let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow. \
+                The five boxing wizards jump quickly.";
+    let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+    let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+    let layout = |ellipsize| {
+        let mut lines = Vec::new();
+        shaped.layout_to_buffer(
+            &mut ShapeBuffer::default(),
+            18.0,
+            Some(110.0),
+            Wrap::WordOrGlyph,
+            ellipsize,
+            None,
+            &mut lines,
+            None,
+            Hinting::Disabled,
+        );
+        lines
+    };
+    let ordinary = layout(Ellipsize::None);
+    let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
+        NOTICE_DETAIL_LINES,
+    )));
+    assert!(ordinary.len() > NOTICE_DETAIL_LINES);
+    assert_eq!(limited.len(), NOTICE_DETAIL_LINES);
+    let expected = &ordinary[NOTICE_DETAIL_LINES - 1].glyphs[0];
+    let actual = &limited[NOTICE_DETAIL_LINES - 1].glyphs[0];
+    assert_eq!(actual.start, expected.start);
+    assert_eq!(actual.x, expected.x);
+    assert!(!text[actual.start..actual.end].starts_with(' '));
 }

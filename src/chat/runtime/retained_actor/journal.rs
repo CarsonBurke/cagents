@@ -37,7 +37,7 @@ const MAX_FINISHED_ENTRY_BYTES: usize = 6
 const OVERFLOW_REASON: &str = "Claude holder outcome journal overflowed before the daemon committed its updates; the in-flight run outcome is unconfirmed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct OutboxEntry {
+pub struct OutboxEntry {
     pub sequence: u64,
     pub update: Update,
     /// The conversation the helper had confirmed when it journaled this
@@ -50,7 +50,7 @@ pub(crate) struct OutboxEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InputIdentity {
+pub struct InputIdentity {
     pub sequence: u64,
     pub id: uuid::Uuid,
     pub hash: [u8; 32],
@@ -86,7 +86,7 @@ pub(crate) struct InputReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ContinuityLoss {
+pub struct ContinuityLoss {
     pub id: uuid::Uuid,
     pub affected_runs: Vec<crate::model::RunId>,
     pub reason: String,

@@ -54,14 +54,14 @@ pub(crate) struct ReadyView(Publication);
 
 /// Captured before normal restoration consumes the exact Ready checkpoint.
 #[cfg(feature = "host")]
-pub(crate) struct ReadyCapture {
+pub struct ReadyCapture {
     checkpoint_hash: String,
     capture_hash: String,
     capture: CapturedCensus,
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn capture() -> Result<Option<ReadyCapture>, String> {
+pub fn capture() -> Result<Option<ReadyCapture>, String> {
     let Some(store) = super::super::super::handoff::Store::existing()? else {
         return Ok(None);
     };
@@ -341,7 +341,7 @@ impl ReadyView {
 /// Runs under the startup daemon's lease, after restoration/presentation and
 /// before Ready. It records no guessed replacement or provider launch intent.
 #[cfg(feature = "host")]
-pub(crate) fn publish(
+pub fn publish(
     ready: Option<ReadyCapture>,
     serving: &HostSessionProof,
     target: &Path,
@@ -411,11 +411,19 @@ pub(crate) fn publish(
             });
         }
     }
-    #[cfg(all(test, feature = "host", target_os = "linux"))]
-    crate::host::observe_fixture_startup("Ready proof: hash executable", None);
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        feature = "host",
+        target_os = "linux"
+    ))]
+    crate::fixture_startup::observe("Ready proof: hash executable", None);
     let target_hash = executable_hash(target)?;
-    #[cfg(all(test, feature = "host", target_os = "linux"))]
-    crate::host::observe_fixture_startup("Ready proof: executable hashed", None);
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        feature = "host",
+        target_os = "linux"
+    ))]
+    crate::fixture_startup::observe("Ready proof: executable hashed", None);
     let publication = Publication {
         version: 1,
         serving: serving.clone(),
@@ -429,8 +437,12 @@ pub(crate) fn publish(
     }
     let path = store.path.with_file_name(FILE);
     let temporary = path.with_file_name(format!(".ready-outcome-{}", uuid::Uuid::new_v4()));
-    #[cfg(all(test, feature = "host", target_os = "linux"))]
-    crate::host::observe_fixture_startup("Ready proof: publish file", None);
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        feature = "host",
+        target_os = "linux"
+    ))]
+    crate::fixture_startup::observe("Ready proof: publish file", None);
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -450,8 +462,12 @@ pub(crate) fn publish(
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
-    #[cfg(all(test, feature = "host", target_os = "linux"))]
-    crate::host::observe_fixture_startup(
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        feature = "host",
+        target_os = "linux"
+    ))]
+    crate::fixture_startup::observe(
         "Ready proof: publication returned",
         result.as_ref().err().map(String::as_str),
     );

@@ -830,36 +830,36 @@ impl Fact {
     }
 }
 
-/// A row's facts on its second line with a dot between each, cut short
-/// with an ellipsis when the row is too narrow, so the facts that matter
-/// most go first.
+/// A row's facts on its second line with a dot between each, fading where
+/// the row is too narrow, so the facts that matter most go first.
 fn facts_line<'a>(facts: &[Fact]) -> Element<'a, Action> {
-    let theme = cosmic::theme::active();
-    let mut spans: Vec<iced::widget::text::Span<'static, ()>> = Vec::with_capacity(facts.len() * 3);
+    let mut line = String::new();
+    let mut tints = Vec::new();
     for (index, fact) in facts.iter().enumerate() {
         if index > 0 {
-            spans.push(iced::widget::span(" · "));
+            line.push_str(" · ");
         }
         for (part, (text, tone)) in fact.0.iter().enumerate() {
             if part > 0 {
-                spans.push(iced::widget::span(" "));
+                line.push(' ');
             }
-            spans.push(
-                iced::widget::span(text.clone())
-                    .color_maybe(tone.and_then(|tone| tone(&theme).color)),
-            );
+            let start = line.len();
+            line.push_str(text);
+            if let Some(tone) = tone {
+                tints.push((start..line.len(), *tone));
+            }
         }
     }
-    iced::widget::rich_text(spans)
+    tints
+        .into_iter()
+        .fold(
+            crate::ui_controls::FadeText::caption(line),
+            |line, (range, tone)| line.tint(range, cosmic::theme::Text::Custom(tone)),
+        )
         .size(design::TEXT_DESCRIPTION)
         .line_height(iced::widget::text::LineHeight::Absolute(
             list::CAPTION_LINE.into(),
         ))
-        .wrapping(iced::widget::text::Wrapping::None)
-        .ellipsize(iced::widget::text::Ellipsize::End(
-            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-        ))
-        .class(cosmic::theme::Text::Custom(design::muted_text))
         .width(Length::Fill)
         .into()
 }

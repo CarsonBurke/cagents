@@ -3,18 +3,18 @@ pub(crate) mod adopted_orphans;
 #[cfg(feature = "host")]
 pub(crate) mod child_events;
 #[cfg(all(feature = "host", target_os = "linux"))]
-pub(crate) mod child_reaper;
+pub mod child_reaper;
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) mod codex_temp;
+pub mod codex_temp;
 pub mod holder_registry;
 pub(crate) mod hosting;
-pub(crate) mod lease_handoff;
+pub mod lease_handoff;
 #[cfg(feature = "host")]
-pub(crate) mod lost_processes;
+pub mod lost_processes;
 #[cfg(feature = "host")]
-pub(crate) mod owned_children;
+pub mod owned_children;
 #[cfg(feature = "host")]
-pub(crate) mod process_scope;
+pub mod process_scope;
 
 use std::{
     env,
@@ -81,7 +81,7 @@ static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 #[cfg(feature = "host")]
 /// A socket pair used purely as a wakeup channel: any byte written to `writer`
 /// interrupts a [`wait_for_activity_until`] blocked on `reader`.
-struct Wakeup {
+pub struct Wakeup {
     reader: UnixStream,
     writer: UnixStream,
 }
@@ -129,7 +129,7 @@ fn wakeup() -> io::Result<&'static Wakeup> {
 /// Interrupts a blocking [`wait_for_activity_until`] from any thread. Losing a byte to
 /// a full pipe is harmless, because a full pipe is a pending wakeup.
 #[cfg(feature = "host")]
-pub(crate) fn wake() {
+pub fn wake() {
     if let Ok(wakeup) = &*WAKEUP {
         wakeup.wake();
     }
@@ -137,8 +137,8 @@ pub(crate) fn wake() {
 
 /// Blocks until `listener` has a connection pending or something calls [`wake`].
 /// There is no timeout: an idle daemon causes no wakeups at all.
-#[cfg(all(test, feature = "host"))]
-pub(crate) fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
     wait_for_activity_with(listener, wakeup()?)
 }
 
@@ -146,7 +146,7 @@ pub(crate) fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
 /// original holder descriptors retained by a pending retirement. No periodic
 /// timer is armed; callers revalidate ownership after every returned edge.
 #[cfg(feature = "host")]
-pub(crate) fn wait_for_activity_until(
+pub fn wait_for_activity_until(
     listener: &UnixListener,
     deadline: Option<Instant>,
     holders: &[Arc<File>],
@@ -154,8 +154,8 @@ pub(crate) fn wait_for_activity_until(
     wait_for_activity_until_with(listener, wakeup()?, deadline, holders)
 }
 
-#[cfg(all(test, feature = "host"))]
-fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Result<()> {
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Result<()> {
     wait_for_activity_until_with(listener, wakeup, None, &[])
 }
 
@@ -231,14 +231,14 @@ pub enum PlatformError {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimePaths {
-    pub(crate) directory: PathBuf,
-    pub(crate) socket: PathBuf,
-    pub(crate) lock: PathBuf,
+pub struct RuntimePaths {
+    pub directory: PathBuf,
+    pub socket: PathBuf,
+    pub lock: PathBuf,
 }
 
 impl RuntimePaths {
-    pub(crate) fn discover() -> Result<Self, PlatformError> {
+    pub fn discover() -> Result<Self, PlatformError> {
         let base = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
@@ -352,15 +352,12 @@ pub struct HostLease {
 
 impl HostLease {
     #[cfg(feature = "host")]
-    pub(crate) fn acquire(
-        paths: &RuntimePaths,
-        proof: &HostSessionProof,
-    ) -> Result<Self, PlatformError> {
+    pub fn acquire(paths: &RuntimePaths, proof: &HostSessionProof) -> Result<Self, PlatformError> {
         Self::acquire_with_handoff(paths, proof, None)
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn acquire_with_handoff(
+    pub fn acquire_with_handoff(
         paths: &RuntimePaths,
         proof: &HostSessionProof,
         inherited: Option<File>,
@@ -411,7 +408,7 @@ impl HostLease {
 
     /// A closed listening socket is not proof that process shutdown completed.
     /// The inventory lease remains held until writers and the checkpoint drain.
-    pub(crate) fn is_held(paths: &RuntimePaths) -> Result<bool, PlatformError> {
+    pub fn is_held(paths: &RuntimePaths) -> Result<bool, PlatformError> {
         Self::is_lock_held(&paths.lock)
     }
 
@@ -530,7 +527,7 @@ impl HostLease {
     /// which may run when no daemon has started since the runtime directory
     /// was cleared: creates the lock file a daemon would, without metadata, so
     /// a status check still sees no daemon.
-    pub(crate) fn acquire_for_store_maintenance(
+    pub fn acquire_for_store_maintenance(
         paths: &RuntimePaths,
         inherited: Option<File>,
     ) -> Result<Self, PlatformError> {
@@ -821,10 +818,7 @@ fn read_lock_metadata<T: serde::de::DeserializeOwned>(
 
 /// Validate the exclusive owner before its public listener exists. Holders use
 /// this during startup adoption, and compare it to the connecting peer's PID.
-pub(crate) fn lease_owner(
-    lock_path: &Path,
-    proof: &HostSessionProof,
-) -> Result<u32, PlatformError> {
+pub fn lease_owner(lock_path: &Path, proof: &HostSessionProof) -> Result<u32, PlatformError> {
     lease_owner_process(lock_path, proof).map(|(pid, _)| pid)
 }
 
@@ -1304,7 +1298,7 @@ fn recover_stale_socket(path: &Path) -> Result<(), PlatformError> {
     Ok(())
 }
 
-pub(crate) fn current_uid() -> u32 {
+pub fn current_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and no failure state.
     unsafe { libc::geteuid() }
 }
@@ -1320,7 +1314,7 @@ pub fn seal_inherited_descriptors() -> io::Result<()> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     // SAFETY: zero is valid for every scalar field of the kernel credential buffer.
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
     let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
@@ -1379,7 +1373,7 @@ extern "C" fn request_termination(_signal: c_int) {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn install_signal_handlers() -> io::Result<()> {
+pub fn install_signal_handlers() -> io::Result<()> {
     // The handler writes to the wakeup pipe, so the pipe must exist first.
     wakeup()?;
     // SAFETY: request_termination is async-signal-safe because it only stores
@@ -1399,7 +1393,7 @@ pub(crate) fn install_signal_handlers() -> io::Result<()> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn termination_requested() -> bool {
+pub fn termination_requested() -> bool {
     TERMINATION_REQUESTED.load(Ordering::Acquire)
 }
 

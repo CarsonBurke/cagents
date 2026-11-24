@@ -46,7 +46,7 @@ impl Process {
     /// process, and until then its `/proc` entry still names this identity.
     /// How soon the reaper runs depends on scheduling, so a test asserting
     /// absence after such a proof waits for it here.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reaped(&self) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while self.is_current() {
@@ -72,7 +72,7 @@ pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
 /// Behavioural identity is separate from the wire protocol: additive fields
 /// keep existing durable helpers adoptable while exposing upgrades to users.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BuildIdentity {
+pub struct BuildIdentity {
     pub version: String,
     pub commit: Option<String>,
     pub capabilities: Vec<String>,
@@ -80,7 +80,7 @@ pub(crate) struct BuildIdentity {
 
 impl BuildIdentity {
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn current(kind: Kind) -> Self {
+    pub fn current(kind: Kind) -> Self {
         Self {
             version: crate::version().into(),
             commit: crate::version()
@@ -97,7 +97,7 @@ impl BuildIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Record {
+pub struct Record {
     pub version: u32,
     #[serde(default)]
     pub build: Option<BuildIdentity>,
@@ -113,13 +113,13 @@ pub(crate) struct Record {
 }
 
 #[cfg(feature = "host")]
-pub(crate) const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v2";
+pub const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v2";
 
 /// Retained Claude discovery visibility only. Attachment still requires the
 /// original record, authenticated peer, daemon lease and actor epoch. Ordinary
 /// terminal discovery and native Codex matching remain application-exact.
 #[cfg(feature = "host")]
-pub(crate) fn record_application_matches(record: &Record) -> bool {
+pub fn record_application_matches(record: &Record) -> bool {
     record_application_matches_for(
         record,
         crate::instance::APPLICATION_ID,
@@ -150,7 +150,7 @@ fn recovery_role(application: &str) -> bool {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
+pub fn production_role_pair(original: &str, successor: &str) -> bool {
     matches!(
         (original, successor),
         ("dev.cagents.Cagents", "dev.cagents.Cagents.Browserless")
@@ -162,7 +162,7 @@ pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
 /// or an exact durable cleanup receipt, and exact issued-source matching. It never changes the original Record.
 #[cfg(feature = "host")]
 #[derive(Clone)]
-pub(crate) struct OriginalRole {
+pub struct OriginalRole {
     record: Record,
     original: crate::model::HostSessionProof,
     successor: crate::model::HostSessionProof,
@@ -171,7 +171,7 @@ pub(crate) struct OriginalRole {
 
 #[cfg(feature = "host")]
 impl OriginalRole {
-    pub(crate) fn authenticated(
+    pub fn authenticated(
         record: &Record,
         original: &crate::model::HostSessionProof,
         successor: &crate::model::HostSessionProof,
@@ -216,7 +216,7 @@ impl OriginalRole {
     }
 }
 
-pub(crate) fn directory(kind: Kind) -> Result<PathBuf, String> {
+pub fn directory(kind: Kind) -> Result<PathBuf, String> {
     crate::daemon::RuntimePaths::discover()
         .map(|paths| {
             paths.directory.join(match kind {
@@ -228,14 +228,14 @@ pub(crate) fn directory(kind: Kind) -> Result<PathBuf, String> {
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
+pub fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
     directory.join(terminal.to_string())
 }
 
 /// A Unix address includes its terminating NUL. Filesystem paths have no such
 /// small limit; Linux can resolve a long endpoint through a held directory FD.
 #[cfg(feature = "host")]
-pub(crate) fn socket_fits(path: &Path) -> bool {
+pub fn socket_fits(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     // SAFETY: sockaddr_un is plain data and only its field length is read.
     let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
@@ -245,7 +245,7 @@ pub(crate) fn socket_fits(path: &Path) -> bool {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn with_socket_address<T>(
+pub fn with_socket_address<T>(
     path: &Path,
     operation: impl FnOnce(&Path) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -291,7 +291,7 @@ pub(crate) fn with_socket_address<T>(
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+pub fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
     with_socket_address(path, |address| {
         std::os::unix::net::UnixListener::bind(address)
     })
@@ -482,7 +482,7 @@ fn read_checked(
 /// runs; reading that held inode still reports pending until the next poll.
 /// It never grants adoption authority or turns unsafe evidence into absence.
 #[cfg(feature = "host")]
-pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
+pub fn retirement_pending(expected: &Record) -> io::Result<bool> {
     let path = expected.path(&directory(expected.kind).map_err(io::Error::other)?);
     let file = match OpenOptions::new()
         .read(true)
@@ -497,14 +497,14 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+pub fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, false)
 }
 
 /// Untrusted routing evidence for the recovery Inspect handshake only. Ordinary
 /// discovery stays application-exact; no caller may infer adoption from this.
 #[cfg(feature = "host")]
-pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+pub fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, true)
 }
 
@@ -512,7 +512,7 @@ pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Rec
 /// Old boots and foreign holders still describe execution; callers must check
 /// the boot before interpreting process identities that the kernel can reuse.
 #[cfg(feature = "host")]
-pub(crate) fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
+pub fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
     let record = match read(&socket.with_extension("json")) {
         Ok(record) => record,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -625,12 +625,12 @@ fn ended_with_holder(record: &Record) -> bool {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
+pub fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, false)
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn recovery_candidates(
+pub fn recovery_candidates(
     directory: &Path,
     boot: &BootId,
     kind: Kind,

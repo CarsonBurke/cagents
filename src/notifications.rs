@@ -33,7 +33,7 @@ pub enum Target {
 
 impl Target {
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn storage_key(&self) -> String {
+    pub fn storage_key(&self) -> String {
         match self {
             Self::Session(id) => id.to_string(),
             Self::PullRequest(request) => request.storage_key(),
@@ -80,6 +80,17 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const fn asks(self) -> bool {
+        match self {
+            Self::Waiting
+            | Self::ReviewRequested
+            | Self::MessageReceived
+            | Self::AutomationPaused
+            | Self::AutomationBlocked => true,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Interrupted => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Succeeded => "Agent finished",
@@ -246,7 +257,7 @@ impl Event {
     /// Only the JSON journal accepts the old shape. Keeping wire decoding
     /// explicit avoids untagged/self-describing serde requirements in postcard.
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn from_journal(value: &str) -> Result<Self, serde_json::Error> {
+    pub fn from_journal(value: &str) -> Result<Self, serde_json::Error> {
         #[derive(Deserialize)]
         struct Legacy {
             session: TerminalId,
@@ -320,6 +331,13 @@ pub struct Notice {
     pub delivered: bool,
     pub acknowledged: bool,
     pub window: Option<String>,
+}
+
+impl Notice {
+    /// Whether this notice asks something of the person reading it.
+    pub const fn asks(&self) -> bool {
+        self.event.evidence.kind.asks()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

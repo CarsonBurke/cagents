@@ -95,10 +95,13 @@ const COMPOSER_INSET_Y: f32 =
 /// How far a scrolled draft runs on into the editor's vertical inset (#2824):
 /// up to the composer's border, never over it.
 const COMPOSER_TEXT_REACH: f32 = COMPOSER_INSET_Y - design::BORDER_WIDTH;
-/// The side of an image's square tile in the composer's tray.
-const ATTACHMENT_TILE: f32 = 56.0;
-/// The height of a file's chip in the tray, centred against the tiles.
+/// The height of an attachment's chip, an image's or a file's.
 const ATTACHMENT_CHIP: f32 = 40.0;
+/// The side of an image chip's thumbnail, inset in the chip.
+const ATTACHMENT_THUMBNAIL: f32 = ATTACHMENT_CHIP - 2.0 * ATTACHMENT_THUMBNAIL_INSET;
+const ATTACHMENT_THUMBNAIL_INSET: f32 = 4.0;
+/// The most characters of a name a chip shows before it fades out.
+const ATTACHMENT_NAME_LIMIT: usize = 32;
 /// The × in a tile's corner.
 const ATTACHMENT_CLOSE: f32 = 18.0;
 
@@ -120,6 +123,83 @@ pub(super) fn is_image_attachment(attachment: &Attachment) -> bool {
                     .iter()
                     .any(|known| extension.eq_ignore_ascii_case(known))
             })
+}
+
+/// The name an attachment goes by: an image by the `[Image N]` reference the
+/// message holds for it, a file by its own name.
+pub(super) fn attachment_title(attachment: &Attachment) -> String {
+    if attachment.reference.is_none() && clipboard_image::is_pasted(&attachment.path) {
+        "Pasted image".to_owned()
+    } else {
+        attachment.label()
+    }
+}
+
+/// Where an image came from, under its reference: the file it was attached
+/// from, or "Pasted image". Nothing where that is already its title.
+fn attachment_source(attachment: &Attachment) -> Option<&str> {
+    attachment
+        .reference
+        .as_ref()
+        .map(|reference| reference.name.as_str())
+        .filter(|name| !name.is_empty())
+}
+
+/// An image attachment as one chip: its thumbnail, or an image glyph until
+/// one is loaded, beside the reference it goes by and where it came from,
+/// each in its own place rather than written over the picture. `trailing`
+/// is the room kept at its end, as for the composer's ×.
+fn image_chip<'a>(
+    thumbnail: Option<&iced::widget::image::Handle>,
+    title: String,
+    source: Option<&'a str>,
+    trailing: f32,
+) -> Element<'a, Message> {
+    let size = Length::Fixed(ATTACHMENT_THUMBNAIL);
+    let radius = (design::RADIUS_S - ATTACHMENT_THUMBNAIL_INSET / 2.0).max(2.0);
+    let picture: Element<'a, Message> = match thumbnail {
+        Some(handle) => iced::widget::image(handle.clone())
+            .width(size)
+            .height(size)
+            .content_fit(iced::ContentFit::Cover)
+            .border_radius([radius; 4])
+            .into(),
+        None => widget::container(crate::ui_controls::passive_icon(
+            Icon::Image,
+            design::COMPACT_ICON_SIZE,
+        ))
+        .center(size)
+        .into(),
+    };
+    let mut names: Vec<Element<'a, Message>> = vec![
+        crate::ui_controls::FadeText::caption(title)
+            .limit(ATTACHMENT_NAME_LIMIT)
+            .into(),
+    ];
+    if let Some(source) = source {
+        names.push(
+            crate::ui_controls::FadeText::caption(source)
+                .limit(ATTACHMENT_NAME_LIMIT)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into(),
+        );
+    }
+    widget::container(
+        widget::row::with_children(vec![picture, widget::column::with_children(names).into()])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center),
+    )
+    .padding(
+        iced::Padding::from([0.0, ATTACHMENT_THUMBNAIL_INSET]).right(trailing.max(step::GAP_S)),
+    )
+    .height(Length::Fixed(ATTACHMENT_CHIP))
+    .align_y(iced::alignment::Vertical::Center)
+    .class(design::surface(
+        Some(design::sunken),
+        [design::RADIUS_S; 4],
+        true,
+    ))
+    .into()
 }
 
 /// The tray's small remove button, which sits inside its tile's corner. A
@@ -588,23 +668,36 @@ enum Trailing {
     Submit { mode: PromptMode, slot: usize },
     /// Cancels the active turn.
     Stop,
+    /// Starts or stops dictating into the draft.
+    Dictate,
 }
 
 /// The composer's trailing controls, leading edge first.
 ///
 /// The submit controls appear only while there is something to send, and
-/// lead the group: whatever follows them - Stop while the agent works - keeps
-/// its place at the trailing edge as a draft is typed or cleared, so a
-/// pointer resting on Stop is never moved onto Send. A disabled Send beside
-/// an empty draft said nothing a reader could act on, and while the agent
-/// works it sat where Stop belonged.
-fn composer_trailing(modes: &[PromptMode], busy: bool, has_draft: bool) -> Vec<Trailing> {
+/// lead the group: whatever follows them - Stop while the agent works, then
+/// the microphone where this copy can dictate - keeps its place as a draft
+/// is typed or cleared, so a pointer resting on Stop is never moved onto
+/// Send. A disabled Send beside an empty draft said nothing a reader could
+/// act on, and while the agent works it sat where Stop belonged.
+///
+/// The microphone holds the very edge because dictation writes into the
+/// draft while it listens: Send appears mid-session, and a microphone ahead
+/// of it would slide away from a pointer about to stop dictating, leaving
+/// Send under it. At the edge it stays put whatever comes and goes beside it.
+fn composer_trailing(
+    modes: &[PromptMode],
+    busy: bool,
+    has_draft: bool,
+    dictation: bool,
+) -> Vec<Trailing> {
     let offered = if has_draft { modes } else { &[] };
     offered
         .iter()
         .enumerate()
         .map(|(slot, &mode)| Trailing::Submit { mode, slot })
         .chain(busy.then_some(Trailing::Stop))
+        .chain(dictation.then_some(Trailing::Dictate))
         .collect()
 }
 
@@ -713,6 +806,9 @@ fn history_key(
 
 /// The lines of a waiting message its row shows.
 const QUEUE_PREVIEW_LINES: usize = 2;
+/// How much of a selected agent's task its summary shows, after the `· `
+/// that sets it off: a task can be a whole prompt.
+const TASK_CHARS: usize = 2 + 160;
 
 /// How much of a waiting message is handed to its row to be laid out. Two
 /// lines never show more, and a hundred entries of sixteen kibibytes each
@@ -781,16 +877,12 @@ fn queue_row<'a>(
             unconfirmed_detail(retry),
         ),
     };
+    // Named as the composer named them: an image by its `[Image N]`
+    // reference, not the stored copy's file name.
     let names = || {
         attachments
             .iter()
-            .map(|attachment| {
-                attachment
-                    .path
-                    .file_name()
-                    .unwrap_or(attachment.path.as_os_str())
-                    .to_string_lossy()
-            })
+            .map(attachment_title)
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -811,12 +903,9 @@ fn queue_row<'a>(
         ));
     }
     let preview = widget::container(
-        design::heading(preview)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-            .width(Length::Fill)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(QUEUE_PREVIEW_LINES),
-            )),
+        crate::ui_controls::FadeText::heading(preview)
+            .lines(QUEUE_PREVIEW_LINES)
+            .width(Length::Fill),
     )
     .width(Length::Fill)
     .max_height(QUEUE_LINE_HEIGHT * QUEUE_PREVIEW_LINES as f32)
@@ -1864,6 +1953,64 @@ fn agent_caption<'a>(agent: &chat::Subagent, work: Option<&'a str>) -> &'a str {
     }
 }
 
+/// How `agent` stands, as a row's trailing column marks it, with the words
+/// of what it waits on where its transcript names that. A failure has no
+/// mark there: the row's leading glyph tells it.
+pub(super) fn agent_mark(
+    agent: &chat::Subagent,
+    work: Option<&str>,
+) -> (Option<disclosure::Mark>, Option<String>) {
+    use disclosure::Mark;
+    let mark = match agent.status {
+        chat::ToolStatus::Running if agent.waiting => Mark::Attention,
+        chat::ToolStatus::Running => Mark::Working,
+        chat::ToolStatus::Waiting => {
+            return (
+                Some(Mark::WaitingOnBackgroundWork),
+                work.map(lowercase_initial),
+            );
+        }
+        chat::ToolStatus::Succeeded => Mark::Finished,
+        chat::ToolStatus::Failed => return (None, None),
+        chat::ToolStatus::Denied => Mark::Denied,
+        chat::ToolStatus::Stopped | chat::ToolStatus::Ended => Mark::Stopped,
+    };
+    (Some(mark), None)
+}
+
+/// How long `agent` has worked: from its first step to its last, or to now
+/// while it has yet to end. `None` where its transcript carries no times.
+pub(super) fn agent_elapsed_ms(agent: &chat::Subagent, now: Option<u64>) -> Option<u64> {
+    let first = agent.items.first()?;
+    let start = first.started_at.or(first.at)?;
+    let end = if agent.status.is_live() {
+        now?
+    } else {
+        agent
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| item.at.or(item.started_at))?
+    };
+    Some(end.saturating_sub(start))
+}
+
+/// How a background command's notice marks its outcome: a failure by the
+/// row's leading glyph, with its exit status, where it gave one, as words.
+fn command_mark(outcome: &str) -> (Option<disclosure::Mark>, Option<String>) {
+    match outcome {
+        "finished" => (Some(disclosure::Mark::Finished), None),
+        "stopped" => (Some(disclosure::Mark::Stopped), None),
+        failed => (
+            None,
+            failed
+                .strip_prefix("failed (")
+                .and_then(|status| status.strip_suffix(')'))
+                .map(str::to_owned),
+        ),
+    }
+}
+
 /// What each listed agent waiting on its own background work waits on, as
 /// its caption says it, named once per installed publication so that
 /// drawing and fingerprinting only look it up.
@@ -1897,6 +2044,10 @@ struct DeliveryOutcome<'a> {
     outcome: Option<Cow<'a, str>>,
     failed: bool,
     glyph: Icon,
+    /// How the outcome is marked beside the row's time, and any words it
+    /// still needs there.
+    mark: Option<disclosure::Mark>,
+    detail: Option<String>,
     heading: String,
     /// Whether it is an agent's report, whose row names the agent.
     report: bool,
@@ -2471,8 +2622,8 @@ impl Runtime {
     /// newest row; otherwise a newer row or the closing line does. When the
     /// lead is idle, the group with the newest running step, such as a
     /// background command, carries it unless the closing line already
-    /// spins. A strip that does not keeps its kind glyph, and its caption and
-    /// counting time still say it is working.
+    /// spins. A strip that does not is marked as working by a still dot,
+    /// beside its counting time.
     pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<disclosure::Status> {
         let status = turn.glyph();
         if status != Some(chat::ToolStatus::Running.into()) {
@@ -2488,7 +2639,11 @@ impl Runtime {
         } else {
             turn.newest_running && !self.closing_spins()
         };
-        carries.then_some(chat::ToolStatus::Running.into())
+        Some(if carries {
+            chat::ToolStatus::Running.into()
+        } else {
+            disclosure::Status::Working
+        })
     }
 
     /// The glyph and words of the line that closes a working transcript.
@@ -2558,6 +2713,114 @@ impl Runtime {
                 .commands
                 .unsent()
                 .any(|outgoing| !outgoing.in_transcript())
+    }
+
+    /// How many waiting messages Send now would hand to the running turn:
+    /// those the provider holds, where it can take them early, and not on
+    /// their way back to the composer. Messages this app still holds, such
+    /// as follow-ups for a provider without a queue, cannot go early.
+    pub(super) fn send_now_count(&self) -> usize {
+        if !self.snapshot.capabilities.send_queued_now || !self.snapshot.busy {
+            return 0;
+        }
+        self.snapshot
+            .queued_messages
+            .iter()
+            .filter(|queued| {
+                !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
+            })
+            .count()
+    }
+
+    /// Whether Send now can be asked for this moment: one already on its way
+    /// is not asked for twice, and one Claude declined is not asked again
+    /// until the queue changes.
+    pub(super) fn can_send_now(&self) -> bool {
+        self.send_now_count() > 0
+            && self.snapshot.send_now.is_none()
+            && !self.disconnected
+            && !self.snapshot.exited
+            && self.snapshot.read_only_reason.is_none()
+    }
+
+    /// The queue's heading: how many wait, and how a Send now stands.
+    fn queue_title(&self, count: usize) -> String {
+        let send_now = self.send_now_count();
+        match self.snapshot.send_now {
+            Some(chat::SendNow::Requested | chat::SendNow::Delivering) if send_now > 0 => {
+                format!("Queued · {count} · sending now…")
+            }
+            Some(chat::SendNow::Stopped) if send_now > 0 => {
+                format!("Queued · {count} · reply cut short, sending now…")
+            }
+            Some(chat::SendNow::Declined) if send_now > 0 => {
+                format!("Queued · {count} · couldn't send early")
+            }
+            _ => format!("Queued · {count}"),
+        }
+    }
+
+    /// Send now, beside the queue's heading while the turn could take what
+    /// the provider holds. It names how many go, since it sends them all.
+    fn send_now_control(&self) -> Option<Element<'_, Message>> {
+        let count = self.send_now_count();
+        // Nothing to send, or a conversation that can take nothing now
+        // (disconnected, ended or read-only), offers no Send now; one asked
+        // for or declined stays, saying how it stands.
+        if count == 0 || (self.snapshot.send_now.is_none() && !self.can_send_now()) {
+            return None;
+        }
+        let (label, name): (Cow<'_, str>, Cow<'_, str>) = if count == 1 {
+            ("Send now".into(), "Send the queued message now".into())
+        } else {
+            (
+                format!("Send {count} now").into(),
+                format!("Send the {count} queued messages now").into(),
+            )
+        };
+        // Enabled, it says how it differs from Stop, the other way to reach
+        // a working turn; disabled, it says why: Claude found nothing it could
+        // take early, which holds until the queue changes, or a request is on
+        // its way.
+        let (it, they) = if count == 1 {
+            ("it", "it waits")
+        } else {
+            ("them", "they wait")
+        };
+        let tooltip: Cow<'_, str> = match self.snapshot.send_now {
+            Some(chat::SendNow::Declined) => format!(
+                "Claude couldn't take {it} early, so {they} in the queue. You can try again \
+                 once the queue changes."
+            )
+            .into(),
+            Some(_) => "Sending now…".into(),
+            None => {
+                // Where Stop also ends background subagents, say so: that
+                // is the difference that makes Send now worth choosing.
+                let stop = if self.snapshot.capabilities.interrupt_stops_background {
+                    " Stop cancels the turn and its background subagents."
+                } else {
+                    ""
+                };
+                format!(
+                    "Send {it} to Claude now. Subagents and background work keep running; the \
+                     reply being written may be cut short.{stop}"
+                )
+                .into()
+            }
+        };
+        Some(crate::interaction::tooltip(
+            crate::ui_controls::button::secondary(label)
+                .icon(Icon::Send)
+                .id(card_control_id(self.target.card, "chat-send-now"))
+                .name(name)
+                .description(tooltip.clone())
+                .on_press_maybe(
+                    self.can_send_now()
+                        .then(|| action(Action::SendQueuedNow(self.target))),
+                ),
+            tooltip,
+        ))
     }
 
     /// Whether the conversation's status reads "Sending": a message is on
@@ -3155,14 +3418,17 @@ impl Runtime {
             ];
             match Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
                 Some(task) => summary.push(
-                    design::caption(format!("· {}", Self::short_description(task, 160)))
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill)
-                        .into(),
+                    // Only what the budget can show, and a character past
+                    // it to say there is more, is copied on each frame.
+                    crate::ui_controls::FadeText::caption(format!(
+                        "· {}",
+                        task.char_indices()
+                            .nth(TASK_CHARS - 1)
+                            .map_or(task, |(end, _)| &task[..end])
+                    ))
+                    .limit(TASK_CHARS)
+                    .width(Length::Fill)
+                    .into(),
                 ),
                 None => summary.push(widget::Space::new().width(Length::Fill).into()),
             }
@@ -4364,38 +4630,46 @@ impl Runtime {
         // permanently present for something used occasionally.
         // Stop is there whenever the conversation works, turn or not: it is
         // the way out of a turn that is slow to begin.
-        let submissions: Vec<Element<'_, Message>> =
-            composer_trailing(modes, snapshot.busy, has_draft)
-                .into_iter()
-                .map(|control| match control {
-                    Trailing::Submit { mode, slot } => {
-                        let shown = match mode {
-                            PromptMode::Steer if !self.turn_running() => PromptMode::Send,
-                            mode => mode,
-                        };
-                        let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
-                        crate::ui_controls::icon_button(name, tooltip)
-                            .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
-                            .selected(slot == 0)
-                            .tone(crate::design::Tone::Themed(if slot == 0 {
-                                design::accent_color
-                            } else {
-                                design::muted_icon_color
-                            }))
-                            .on_press_maybe(
-                                (available
-                                    && !self.start_blocked.is_some()
-                                    && !self.provider_coming_up())
-                                .then(|| action(Action::SubmitControl(target, mode))),
-                            )
-                            .into()
-                    }
-                    Trailing::Stop => self.stop_control(available),
-                })
-                .collect();
-        // One row: `+`, the draft, then what sends or stops it. The controls
-        // hold the row's foot, so a draft that grows keeps them beside its
-        // last line, and the inset centers them on a single line of text.
+        let trailing_controls: Vec<Element<'_, Message>> = composer_trailing(
+            modes,
+            snapshot.busy,
+            has_draft,
+            crate::dictation::available(),
+        )
+        .into_iter()
+        .filter_map(|control| {
+            Some(match control {
+                Trailing::Submit { mode, slot } => {
+                    let shown = match mode {
+                        PromptMode::Steer if !self.turn_running() => PromptMode::Send,
+                        mode => mode,
+                    };
+                    let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
+                    crate::ui_controls::icon_button(name, tooltip)
+                        .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
+                        .selected(slot == 0)
+                        .tone(crate::design::Tone::Themed(if slot == 0 {
+                            design::accent_color
+                        } else {
+                            design::muted_icon_color
+                        }))
+                        .on_press_maybe(
+                            (available
+                                && !self.start_blocked.is_some()
+                                && !self.provider_coming_up())
+                            .then(|| action(Action::SubmitControl(target, mode))),
+                        )
+                        .into()
+                }
+                Trailing::Stop => self.stop_control(available),
+                Trailing::Dictate => self.dictation_control(shortcuts, !read_only)?,
+            })
+        })
+        .collect();
+        // One row: `+`, the draft, then what sends or stops it and the
+        // microphone. The controls hold the row's foot, so a draft that grows
+        // keeps them beside its last line, and the inset centers them on a
+        // single line of text.
         let control = |control: Element<'a, Message>| -> Element<'a, Message> {
             widget::container(control)
                 .padding(iced::Padding::ZERO.bottom(COMPOSER_CONTROL_INSET))
@@ -4407,9 +4681,8 @@ impl Runtime {
         };
         let mut row: Vec<Element<'_, Message>> = Vec::new();
         row.extend(plus.map(control));
-        row.extend(self.dictation_control(shortcuts, !read_only).map(control));
         row.push(editor);
-        row.extend(submissions.into_iter().map(control));
+        row.extend(trailing_controls.into_iter().map(control));
         // The editor and its controls are one object: a single raised
         // surface, so the composer reads as one place to type rather than a
         // field with a toolbar bolted under it. The `+` menu opens above it,
@@ -4828,16 +5101,25 @@ impl Runtime {
             "subagents"
         };
         let armed = self.interrupt_armed.is_some() && at_stake > 0;
+        // Send now reaches the turn without cancelling it, so while it is on
+        // offer Stop points there.
+        let instead = match (self.can_send_now(), at_stake > 0) {
+            (true, true) => {
+                ". Send now delivers queued messages without stopping the turn or its subagents."
+            }
+            (true, false) => ". Send now delivers queued messages without cancelling the turn.",
+            (false, _) => "",
+        };
         let tooltip = if armed {
             Cow::Owned(format!(
-                "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc)"
+                "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc){instead}"
             ))
         } else if at_stake > 0 {
             Cow::Owned(format!(
-                "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
+                "Cancel active turn and its {at_stake} background {subagents} (Esc){instead}"
             ))
         } else if self.turn_running() {
-            Cow::Borrowed("Cancel active turn (Esc)")
+            Cow::Owned(format!("Cancel active turn (Esc){instead}"))
         } else {
             Cow::Borrowed(
                 "Stop before the turn begins (Esc). Unsent messages return to the composer.",
@@ -4877,7 +5159,7 @@ impl Runtime {
     }
 
     /// The draft's attachments as one compact strip above the message: a
-    /// square thumbnail per image and a chip per file, wrapping onto more
+    /// chip per image, with its thumbnail, and per file, wrapping onto more
     /// rows in a narrow pane rather than hiding any off its edge.
     fn attachment_tray(&self, target: Target, transitioning: bool) -> Option<Element<'_, Message>> {
         if self.attachments.is_empty() {
@@ -4934,12 +5216,7 @@ impl Runtime {
         attachment: &'a Attachment,
         transitioning: bool,
     ) -> Element<'a, Message> {
-        let label =
-            if attachment.reference.is_none() && clipboard_image::is_pasted(&attachment.path) {
-                "Pasted image".to_owned()
-            } else {
-                attachment.label()
-            };
+        let label = attachment_title(attachment);
         // While the draft is fixed, so are its attachments, for the keyboard
         // as for the ×, and the message's history.
         let fixed = self.composer_read_only(transitioning);
@@ -4954,34 +5231,27 @@ impl Runtime {
         let removal =
             |removal| (!fixed).then(|| action(Action::RemoveAttachment(target, index, removal)));
         let remove = removal(Removal::Key);
-        let close = attachment_close(removal(Removal::Pointer));
+        let close = widget::container(attachment_close(removal(Removal::Pointer)))
+            .center_y(Length::Fixed(ATTACHMENT_CHIP - 6.0));
         let id = attachment_tile_id(target.card, index);
-        // The file's own name, which the tile's short label leaves out, as
-        // the attachment rows showed it.
-        let named = |tile: Element<'a, Message>| -> Element<'a, Message> {
-            widget::tooltip(
-                tile,
-                design::caption(attachment.reference.as_ref().map_or_else(
-                    || attachment.path.display().to_string(),
-                    |reference| reference.name.clone(),
-                )),
-                widget::tooltip::Position::Top,
-            )
-            .into()
+        // Room at the trailing end for the × it reveals, where it has one.
+        let trailing = if fixed {
+            step::GAP_S
+        } else {
+            ATTACHMENT_CLOSE + 6.0
         };
         if !is_image_attachment(attachment) {
             let face = widget::container(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(Icon::TextFile, design::ROW_ICON_SIZE),
                     crate::ui_controls::FadeText::caption(label.clone())
-                        .limit(32)
+                        .limit(ATTACHMENT_NAME_LIMIT)
                         .into(),
                 ])
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center),
             )
-            // Room at the trailing end for the × it reveals.
-            .padding(iced::Padding::from([0.0, step::GAP_S]).right(ATTACHMENT_CLOSE + 6.0))
+            .padding(iced::Padding::from([0.0, step::GAP_S]).right(trailing))
             .height(Length::Fixed(ATTACHMENT_CHIP))
             .align_y(iced::alignment::Vertical::Center)
             .class(design::surface(
@@ -4989,78 +5259,47 @@ impl Runtime {
                 [design::RADIUS_S; 4],
                 true,
             ));
-            return named(
-                attachment_tile::tile(
-                    id,
-                    face,
-                    widget::Space::new(),
-                    widget::container(close).center_y(Length::Fixed(ATTACHMENT_CHIP - 6.0)),
-                    label,
-                    remove,
-                )
-                .on_history(undo.clone(), redo.clone())
-                .into(),
+            // The chip names the file; where it is, the path, waits for the
+            // pointer, above the chip rather than over the draft below it.
+            return crate::interaction::tooltip_above(
+                attachment_tile::tile(id, face, close, label, remove).on_history(undo, redo),
+                attachment.path.display().to_string(),
             );
         }
-        let size = Length::Fixed(ATTACHMENT_TILE);
-        let face: Element<'_, Message> = match self.thumbnails.handle(&attachment.path) {
-            Some(handle) => iced::widget::image(handle.clone())
-                .width(size)
-                .height(size)
-                .content_fit(iced::ContentFit::Cover)
-                .border_radius([design::RADIUS_S; 4])
-                .into(),
-            None => widget::container(crate::ui_controls::passive_icon(
-                Icon::Image,
-                design::ROW_ICON_SIZE,
-            ))
-            .center(size)
-            .class(design::surface(
-                Some(design::sunken),
-                [design::RADIUS_S; 4],
-                true,
-            ))
-            .into(),
+        let source = attachment_source(attachment).filter(|source| *source != label);
+        let name = match source {
+            Some(source) => format!("{label}, {source}"),
+            None => label.clone(),
         };
-        let caption = widget::container(
-            design::caption(label.clone()).class(cosmic::theme::Text::Color(iced::Color::WHITE)),
-        )
-        .center_x(Length::Fill)
-        .padding([1, 2])
-        .class(cosmic::theme::Container::custom(|_theme| {
-            widget::container::Style {
-                background: Some(iced::Background::Color(iced::Color {
-                    a: 0.62,
-                    ..iced::Color::BLACK
-                })),
-                border: iced::Border {
-                    radius: [0.0, 0.0, design::RADIUS_S, design::RADIUS_S].into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }));
         let marked = attachment
             .reference
             .as_ref()
             .is_some_and(|reference| self.caret_reference == Some(reference.id));
-        named(
-            attachment_tile::tile(
-                id,
-                face,
-                widget::container(caption)
-                    .width(size)
-                    .height(size)
-                    .align_y(iced::alignment::Vertical::Bottom),
-                close,
+        // Everything a reader needs is on the chip itself, so it has no
+        // tooltip of its own to cover it or its neighbours, unless the file
+        // it came from is named too long to show whole.
+        let full = source
+            .filter(|source| source.chars().count() > ATTACHMENT_NAME_LIMIT)
+            .map(str::to_owned);
+        let tile = attachment_tile::tile(
+            id,
+            image_chip(
+                self.thumbnails.handle(&attachment.path),
                 label,
-                remove,
-            )
-            .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
-            .on_history(undo, redo)
-            .marked(marked)
-            .into(),
+                source,
+                trailing,
+            ),
+            close,
+            name,
+            remove,
         )
+        .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
+        .on_history(undo, redo)
+        .marked(marked);
+        match full {
+            Some(full) => crate::interaction::tooltip_above(tile, full),
+            None => tile.into(),
+        }
     }
 
     /// The `+` at the composer's leading edge, and the menu it opens while it
@@ -5332,9 +5571,10 @@ impl Runtime {
         }
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
-            let default_effort = offers
+            let own = offers
                 .iter()
-                .find(|offer| offer.provider == self.session.launch.provider)
+                .find(|offer| offer.provider == self.session.launch.provider);
+            let default_effort = own
                 .and_then(|offer| offer.catalog)
                 .and_then(|catalog| catalog.default_effort(self.chosen_model().id));
             let label = footer_model_label(
@@ -5343,6 +5583,7 @@ impl Runtime {
                 draft,
                 self.session.launch.provider,
                 fit,
+                own.and_then(|offer| advertised_default(offer.models, offer.catalog)),
                 default_effort,
             );
             if transitioning {
@@ -6306,7 +6547,7 @@ impl Runtime {
         if coordinating {
             for agent in &self.snapshot.subagents {
                 (&agent.id, &agent.kind, &agent.description, &agent.model).hash(&mut hasher);
-                self.hash_agent_state(agent, &mut hasher);
+                self.hash_agent_state(agent, now, &mut hasher);
             }
             // The client replaces its map whenever it learns an address, and a
             // new handle brings its own.
@@ -6316,9 +6557,18 @@ impl Runtime {
     }
 
     /// What a row saying how `agent` stands draws from it.
-    fn hash_agent_state(&self, agent: &chat::Subagent, hasher: &mut crate::fingerprint::Hasher) {
+    fn hash_agent_state(
+        &self,
+        agent: &chat::Subagent,
+        now: Option<u64>,
+        hasher: &mut crate::fingerprint::Hasher,
+    ) {
         use std::hash::Hash;
         (agent.status, agent.waiting, self.agent_work.get(&agent.id)).hash(hasher);
+        // Its time counts up while it works, at the second it is shown to.
+        agent_elapsed_ms(agent, now)
+            .map(|millis| millis / 1_000)
+            .hash(hasher);
     }
 
     /// What one item of an exchange, drawn from `cached`, contributes to its
@@ -6413,7 +6663,7 @@ impl Runtime {
         {
             if delivery_names_agent(from, sender, summary) {
                 if let Some(agent) = self.subagent(sender) {
-                    self.hash_agent_state(agent, hasher);
+                    self.hash_agent_state(agent, now, hasher);
                 }
                 std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
             }
@@ -6919,7 +7169,7 @@ impl Runtime {
             rows.push(design::caption("Showing the first 128 queued messages").into());
         }
         let mut header: Vec<Element<'_, Message>> = vec![
-            design::caption(format!("Queued · {count}"))
+            design::caption(self.queue_title(count))
                 .width(Length::Fill)
                 .into(),
         ];
@@ -6941,10 +7191,12 @@ impl Runtime {
                 },
             ));
         }
+        header.extend(self.send_now_control());
         Some(
             widget::container(
                 widget::column::with_children(vec![
                     widget::row::with_children(header)
+                        .align_y(Alignment::Center)
                         .spacing(step::GAP_S)
                         .padding([0.0, step::GAP_XS])
                         .into(),
@@ -7150,15 +7402,35 @@ impl Runtime {
         if !local.text().trim().is_empty() {
             rows.push(user_bubble(body, false, false));
         }
-        for attachment in &local.attachments {
+        // Its attachments read as they did in the composer: an image by its
+        // chip, a file by its name.
+        if !local.attachments.is_empty() {
             rows.push(
-                design::caption(
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy(),
+                widget::row::with_children(
+                    local
+                        .attachments
+                        .iter()
+                        .map(|attachment| {
+                            let title = attachment_title(attachment);
+                            if is_image_attachment(attachment) {
+                                let source =
+                                    attachment_source(attachment).filter(|source| *source != title);
+                                image_chip(
+                                    self.thumbnails.handle(&attachment.path),
+                                    title,
+                                    source,
+                                    step::GAP_S,
+                                )
+                            } else {
+                                design::caption(title).into()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
                 )
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .wrap()
+                .vertical_spacing(step::GAP_S)
                 .into(),
             );
         }
@@ -7455,23 +7727,17 @@ impl Runtime {
                     || report.is_some_and(|(_, outcome)| outcome == "failed")
             }
         };
-        // Where a turn was stopped, and an agent that was stopped or ended
-        // without saying how it went, are marked as other stopped work is,
-        // by a still mark unlike the Stop control, as the agent's row and
-        // tab mark it.
-        let ended = agent.is_some_and(|agent| {
-            matches!(
-                agent.status,
-                chat::ToolStatus::Stopped | chat::ToolStatus::Ended
-            )
-        });
+        // Where a turn was stopped is marked as other stopped work is, by a
+        // still mark unlike the Stop control. A report keeps its kind's
+        // glyph, and says how its agent stands beside its time.
         let glyph = if failed {
             Icon::Error
-        } else if stopped || ended {
+        } else if stopped {
             Icon::Ended
         } else if notice && delivery_command_outcome(heading).is_some() {
             Icon::Terminal
-        } else if kind == chat::DeliveryKind::Notice {
+        } else if kind == chat::DeliveryKind::Notice && report.is_none() {
+            // An agent's notice reads as its report, under a report's glyph.
             Icon::Attention
         } else {
             Icon::Chat
@@ -7486,6 +7752,13 @@ impl Runtime {
             ),
             (None, Some((title, outcome)), None) => (title, Some(Cow::Borrowed(outcome))),
             (None, None, _) => (first, None),
+        };
+        let (mark, detail) = match (command, report, agent) {
+            (Some((_, outcome)), ..) => command_mark(outcome),
+            (None, _, Some(agent)) => agent_mark(agent, self.agent_work.get(&agent.id)),
+            (None, Some((_, "finished")), None) => (Some(disclosure::Mark::Finished), None),
+            (None, Some((_, "was stopped")), None) => (Some(disclosure::Mark::Stopped), None),
+            _ => (None, None),
         };
         // Its tooltip and accessible name say it in the same words, and keep
         // what the report said where the agent has since moved on.
@@ -7509,6 +7782,8 @@ impl Runtime {
             outcome,
             failed,
             glyph,
+            mark,
+            detail,
             heading,
             report: report.is_some(),
         }
@@ -7558,9 +7833,11 @@ impl Runtime {
         let has_body = delivery_has_body(notice, body, remainder);
         let DeliveryOutcome {
             title,
-            outcome,
+            outcome: _,
             failed,
             glyph,
+            mark,
+            detail,
             heading,
             report,
         } = self.delivery_outcome(
@@ -7588,19 +7865,34 @@ impl Runtime {
             monitor,
             notice.is_some_and(|notice| notice.body.long),
         );
+        // An agent's report counts the agent's time, as a step's row does.
+        let elapsed = report
+            .then(|| self.subagent(sender))
+            .flatten()
+            .and_then(|agent| agent_elapsed_ms(agent, self.source_now_ms()))
+            .and_then(disclosure::shown_duration);
+        let named = match &elapsed {
+            Some(elapsed) => format!("{heading} · {elapsed}"),
+            None => heading.clone(),
+        };
+        let trailing = disclosure::Trailing {
+            detail,
+            mark,
+            elapsed,
+        };
         let heading_row = disclosure::row_named(
             headline,
             if disclosure {
                 format!(
-                    "{} delivery details: {heading}",
+                    "{} delivery details: {named}",
                     if expanded { "Hide" } else { "Show" }
                 )
             } else {
-                heading.clone()
+                named
             },
             glyph,
             failed.then_some(chat::ToolStatus::Failed.into()),
-            outcome.map(|outcome| disclosure::Trailing::Outcome(outcome.into_owned())),
+            trailing,
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );
@@ -8442,11 +8734,41 @@ pub(super) fn answer_control_id(
 
 /// Keep the provider's alias as a choice while naming the model it resolves to.
 fn model_choice_label(model: &chat::Model) -> Cow<'_, str> {
-    if model.id == "default" && !model.label.to_lowercase().starts_with("default") {
-        format!("Default ({})", model.label).into()
+    if model.id == "default" {
+        default_choice_label(Some(&model.label), "Default model")
     } else {
         model.label.as_str().into()
     }
+}
+
+/// How a provider's default reads wherever it can be chosen or is shown:
+/// "Default" with what it resolves to, `resolved`, where the provider has
+/// said, and `unknown` where it has not. Every provider's default reads
+/// this one way, whether it lists the default as an alias of its own, as
+/// Claude's `default` is, or only marks one of its models as the default.
+fn default_choice_label<'a>(resolved: Option<&'a str>, unknown: &'a str) -> Cow<'a, str> {
+    match resolved {
+        // A provider's own name for its default already says so.
+        Some(label) if label.to_lowercase().starts_with("default") => label.into(),
+        Some(label) => format!("Default ({label})").into(),
+        None => unknown.into(),
+    }
+}
+
+/// The model a provider advertises as its default, where it has, by the
+/// name it lists it under: Codex marks one model of its list, and an ACP
+/// agent reports the model it is configured with. `models` is what the
+/// conversation itself lists; the catalog's own list stands in for it.
+fn advertised_default<'a>(
+    models: &'a [chat::Model],
+    catalog: Option<&'a crate::account::cache::Catalog>,
+) -> Option<&'a chat::Model> {
+    let catalog = catalog?;
+    let id = catalog.default_model.as_deref()?;
+    models
+        .iter()
+        .chain(&catalog.models)
+        .find(|model| model.id == id)
 }
 
 /// Provider identifiers stay in the protocol; people see these names everywhere.
@@ -8527,6 +8849,7 @@ fn footer_model_label<'a>(
     draft: bool,
     provider: Provider,
     fit: FooterFit,
+    advertised: Option<&'a chat::Model>,
     draft_default_effort: Option<&str>,
 ) -> Cow<'a, str> {
     let selected = chosen.model(snapshot);
@@ -8537,10 +8860,12 @@ fn footer_model_label<'a>(
         match selected {
             Some(model) if provider == Provider::Omp && !draft => model.label.as_str().into(),
             Some(model) => model_choice_label(model),
-            None => match chosen.id {
-                Some(id) => id.into(),
-                None if fit != FooterFit::Wide => "Default model".into(),
-                None => format!("{} · Default model", family_label(provider)).into(),
+            None => match (chosen.id, advertised) {
+                (Some(id), _) => id.into(),
+                // Named, it says which provider it is, as Claude's does.
+                (None, Some(model)) => default_choice_label(Some(&model.label), "Default model"),
+                (None, None) if fit != FooterFit::Wide => "Default model".into(),
+                (None, None) => format!("{} · Default model", family_label(provider)).into(),
             },
         }
     };
@@ -8612,10 +8937,17 @@ fn model_rows<'a>(
         .filter_map(|offer| {
             // A letter alone begins too many names to mean one provider.
             let named = needle.chars().count() > 1 && names_provider(offer.provider, &needle);
+            let by_name = needle.is_empty() || named || "default".starts_with(&needle);
+            // The default is also found by the model it resolves to, as a
+            // listed `default` alias is by its label.
+            let resolves = || {
+                advertised_default(offer.models, offer.catalog)
+                    .is_some_and(|model| !model_hits(std::slice::from_ref(model), query).is_empty())
+            };
             let default = ((draft && !offer.models.iter().any(|model| model.id == "default"))
                 || offer.models.is_empty())
-                && (needle.is_empty() || named || "default".starts_with(&needle));
-            let rows: Vec<ModelRow<'a>> = default
+                && (by_name || resolves());
+            let (mut rows, defaults): (Vec<ModelRow<'a>>, Vec<ModelRow<'a>>) = default
                 .then_some(ModelRow {
                     provider: offer.provider,
                     model: None,
@@ -8629,7 +8961,11 @@ fn model_rows<'a>(
                             model: Some(model),
                         }),
                 )
-                .collect();
+                // A search that names a model rather than the default puts
+                // that model first, so Enter takes the model it named: the
+                // default follows the provider's setting wherever it goes.
+                .partition(|row| by_name || row.model.is_some_and(|model| model.id != "default"));
+            rows.extend(defaults);
             (!rows.is_empty()).then_some((offer.provider, rows))
         })
         .collect()
@@ -8659,7 +8995,7 @@ fn picker_section_header<'a>(content: Element<'a, Message>, top: f32) -> Element
 
 fn picker_choice_row<'a>(
     title: Cow<'a, str>,
-    detail: Option<&'a str>,
+    detail: Option<Cow<'a, str>>,
     name: Cow<'a, str>,
     id: widget::Id,
     selected: bool,
@@ -8768,32 +9104,43 @@ fn model_list<'a>(
                 },
             ));
         }
+        let offer = offers.iter().find(|offer| offer.provider == provider);
+        let advertised = offer.and_then(|offer| advertised_default(offer.models, offer.catalog));
+        let listed = offer.is_some_and(|offer| !offer.models.is_empty());
         for row in models {
             let selected =
                 provider == current.0 && row.model.map(|model| model.id.as_str()) == current.1;
-            let (title, id, name) = match row.model {
-                Some(model) => (
-                    model_choice_label(model),
-                    Some(model.id.as_str()),
-                    model_choice_label(model),
-                ),
+            let (title, id) = match row.model {
+                Some(model) => (model_choice_label(model), Some(model.id.as_str())),
                 None => (
-                    Cow::Borrowed("Default model"),
+                    default_choice_label(
+                        advertised.map(|model| model.label.as_str()),
+                        "Default model",
+                    ),
                     None,
-                    Cow::Owned(format!("{} default model", family_label(provider))),
                 ),
+            };
+            // Under a heading for each provider the default's own name
+            // doesn't say whose it is; a model's name does.
+            let name = match id {
+                None | Some("default") if headed => {
+                    Cow::Owned(format!("{} {title}", family_label(provider)))
+                }
+                _ => title.clone(),
             };
             // The identifier is shown only where it is not already the
             // label, because most providers use one string for both and a
-            // row that prints it twice is half a list of duplicates.
-            let listed = offers
-                .iter()
-                .any(|offer| offer.provider == provider && !offer.models.is_empty());
+            // row that prints it twice is half a list of duplicates. A
+            // default named for what it resolves to needs no second line
+            // either: "default" is already its title.
             let detail = match id {
-                Some(id) if id != title.as_ref() => Some(id),
+                Some("default") => None,
+                Some(id) if id != title.as_ref() => Some(Cow::Borrowed(id)),
                 Some(_) => None,
-                None if listed => Some("Whichever it would choose itself"),
-                None => Some("Its models are listed once it has run"),
+                None if advertised.is_some() => None,
+                // The agent's own settings decide, and haven't said.
+                None if listed => Some(Cow::Borrowed("Whichever its settings choose")),
+                None => Some(Cow::Borrowed("Its models are listed once it has run")),
             };
             rows.push(picker_choice_row(
                 title,

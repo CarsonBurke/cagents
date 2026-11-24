@@ -9,7 +9,7 @@ use std::os::{
 /// reconstructed from an existing directory or an "empty" observation. This
 /// is creation provenance only; it does not grant provider/history read access.
 /// Deliberately has no Clone, Deserialize or public constructor.
-pub(crate) struct NewHomeCreationReceipt {
+pub struct NewHomeCreationReceipt {
     #[cfg_attr(
         not(any(test, feature = "host")),
         expect(
@@ -32,7 +32,7 @@ pub(crate) struct NewHomeCreationReceipt {
     directory: fs::File,
 }
 impl NewHomeCreationReceipt {
-    pub(crate) fn revalidate(&self) -> io::Result<()> {
+    pub fn revalidate(&self) -> io::Result<()> {
         crate::secure_file::reject_symlink_components(&self.path)?;
         same_directory(&self.parent, &self.parent_path)?;
         same_directory(&self.directory, &self.path)
@@ -90,20 +90,20 @@ impl NewHomeCreationReceipt {
 /// What host enrollment and initializers read from a fresh home.
 #[cfg(any(test, feature = "host"))]
 impl NewHomeCreationReceipt {
-    pub(crate) fn provider(&self) -> Provider {
+    pub fn provider(&self) -> Provider {
         self.provider
     }
-    pub(crate) fn key(&self) -> Uuid {
+    pub fn key(&self) -> Uuid {
         self.key
     }
-    pub(crate) fn home(&self) -> &Path {
+    pub fn home(&self) -> &Path {
         &self.path
     }
     #[cfg(test)]
     pub(crate) fn parent(&self) -> &fs::File {
         &self.parent
     }
-    pub(crate) fn directory(&self) -> &fs::File {
+    pub fn directory(&self) -> &fs::File {
         &self.directory
     }
 }

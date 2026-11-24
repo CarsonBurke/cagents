@@ -26,7 +26,7 @@ LANES = {"cli": set(), "host": {"host"}, "ui": {"ui"}, "browser": {"browser-prot
 # The application and its widget kit are packages of their own; the UI lanes
 # select both, and `ui` the shared library with them. No packages means the
 # root's default member.
-PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui", "cagents-ui-kit"},
+PACKAGES = {"cli": set(), "host": {"cagents", "cagents-host"}, "ui": {"cagents", "cagents-ui", "cagents-ui-kit"},
             "browser": {"cagents-ui", "cagents-ui-kit"},
             "editor": {"ceditor"}, "dictate": {"cagents-dictate"}}
 
@@ -36,8 +36,8 @@ PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui", "cagent
 ALL_TARGETS = ('arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" '
                'help="Cargo arguments, after --; they replace the default --all-targets"')
 NO_ARGUMENTS = 'arg "[unexpected]..." var=#true hide=#true'
-SENTINEL_LANES = {"cli": "cli", "host": "host", "ui": "ui", "app": "ui", "browser": "browser",
-                  "dictate": "dictate", "editor": "editor"}
+SENTINEL_LANES = {"cli": "cli", "host": "host", "daemon": "host", "ui": "ui", "app": "ui",
+                  "browser": "browser", "dictate": "dictate", "editor": "editor"}
 
 
 def sentinel_lanes():
@@ -294,7 +294,8 @@ class Behavior(unittest.TestCase):
         result = self.mise_run("check:host")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [
-            ["cargo-lane", "clippy", "--locked", "--no-default-features", "--features", "host", "--all-targets"],
+            ["cargo-lane", "clippy", "--locked", "--no-default-features", "--package", "cagents", "--package", "cagents-host",
+             "--features", "cagents/host", "--all-targets"],
         ])
 
     def test_forwarded_arguments_replace_the_target_selection_and_keep_quoting(self):
@@ -313,7 +314,8 @@ class Behavior(unittest.TestCase):
         # build check, of every target, says otherwise.
         self.assertEqual(self.mise_run("test:host").returncode, 0)
         self.assertEqual(self.calls(), [
-            ["cargo-lane", "test", "--locked", "--no-default-features", "--features", "host", "--all-targets"],
+            ["cargo-lane", "test", "--locked", "--no-default-features", "--package", "cagents", "--package", "cagents-host",
+             "--features", "cagents/host", "--all-targets"],
         ])
         self.log.unlink()
         # Failing tests are the news; the check waits for them.

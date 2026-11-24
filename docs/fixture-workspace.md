@@ -178,7 +178,7 @@ as the runner does, one feature set per invocation:
 
 ```sh
 scripts/cargo-gate build --locked --profile dev-runtime --no-default-features \
-    --features development,host --bin cagentsd
+    -p cagents-host --features development --bin cagentsd
 scripts/cargo-gate build --locked --profile dev-runtime -p cagents-ui \
     --features development --bin cagents-ui
 scripts/fixture-workspace apply --root "$root" --bin-dir target/dev-runtime --instance seeded

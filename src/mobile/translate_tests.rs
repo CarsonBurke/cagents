@@ -298,4 +298,14 @@ fn only_unacknowledged_notices_reach_the_phone_newest_first() {
     assert_eq!(previews, ["newer", "older"]);
     assert_eq!(sent[0].request, Some(api::RequestKind::Approval));
     assert_eq!(sent[0].title, "Agent needs your attention");
+    assert!(sent.iter().all(|notice| notice.asks));
+
+    let mut finished = notice(false, "done");
+    finished.event.evidence.kind = notifications::Kind::Succeeded;
+    finished.event.content = None;
+    let finished_snapshot = notifications::Snapshot {
+        notices: vec![finished],
+        diagnostic: None,
+    };
+    assert!(!notices(&finished_snapshot)[0].asks);
 }

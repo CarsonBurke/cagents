@@ -530,7 +530,7 @@ qualification against the native Codex executable:
 
 ```sh
 CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
-    --no-default-features --features host \
+    --no-default-features -p cagents-host \
     --test codex_continuity_qualification -- --ignored --test-threads=1
 ```
 

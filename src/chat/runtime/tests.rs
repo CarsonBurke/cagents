@@ -846,6 +846,42 @@ fn usage_keeps_the_compaction_point_each_reading_states() {
     assert_eq!(state.usage.context_budget(), 1_000_000);
 }
 
+/// A request to send what is queued now is the provider's to report, and
+/// lasts no longer than the provider or the conversation it was made in.
+#[test]
+fn send_now_follows_the_provider_and_ends_with_it() {
+    let mut state = Snapshot::default();
+    let mut indices = BTreeMap::new();
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Delivering)),
+    );
+    assert_eq!(state.send_now, Some(crate::chat::SendNow::Delivering));
+    apply_event(&mut state, &mut indices, Event::SendNow(None));
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Reset {
+            reason: "reset".into(),
+        },
+    );
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(&mut state, &mut indices, Event::Exited { code: None });
+    assert_eq!(state.send_now, None);
+}
+
 #[test]
 fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
     let mut state = Snapshot::default();
@@ -4722,6 +4758,52 @@ fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() 
     assert!(!snapshot.ready);
     assert!(snapshot.error.is_none(), "{snapshot:?}");
     assert!(handle.failure().is_none());
+}
+
+// Claude's answer to initialize prompts the adapter's own request for the
+// context figure. A provider that exits cleanly before reading it lost none
+// of the reader's input, while one that leaves a prompt unread did (#3888).
+#[test]
+fn claude_clean_exit_reports_only_lost_reader_input() {
+    // Closing its stdin before answering fails that request's write with
+    // EPIPE every time, rather than only when the exit wins a race.
+    let (_directory, handle) = claude_initialization_pipe(
+        "import os\nos.close(0)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
+    );
+    let snapshot = finish_initialization_pipe(&handle);
+    assert!(snapshot.error.is_none(), "{snapshot:?}");
+    assert!(handle.failure().is_none());
+
+    // This one reads the context request, then stops reading and exits
+    // cleanly once the test has sent a prompt it can no longer read.
+    let (directory, handle) = claude_initialization_pipe(
+        "import os, time\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
+             assert json.loads(sys.stdin.readline())['request']['subtype'] == 'get_context_usage'\n\
+             os.close(0)\n\
+             open('stopped-reading', 'w').close()\n\
+             while not os.path.exists('prompt-sent'):\n    time.sleep(0.01)\n",
+    );
+    crate::test_timing::eventually("the provider to stop reading", || {
+        directory.path().join("stopped-reading").exists()
+    });
+    handle
+        .command(Command::Prompt {
+            text: "Never read".into(),
+            attachments: Vec::new(),
+            mode: crate::chat::PromptMode::Send,
+        })
+        .unwrap();
+    std::fs::write(directory.path().join("prompt-sent"), b"").unwrap();
+    let snapshot = finish_initialization_pipe(&handle);
+    assert!(
+        snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Provider stdin")),
+        "{snapshot:?}"
+    );
 }
 
 // Closing a busy turn sends Claude an interrupt. When the turn's result was

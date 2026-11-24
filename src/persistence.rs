@@ -2902,7 +2902,7 @@ pub enum SavedSessionOwner {
 /// One budget spans all source windows. Per-row bounds alone would allow
 /// thousands of individually valid descriptors to exhaust updater memory.
 #[cfg(any(feature = "host", test))]
-pub(crate) struct MigrationInspectionBudget {
+pub struct MigrationInspectionBudget {
     remaining_rows: usize,
     remaining_bytes: u64,
     deadline: Instant,
@@ -2910,7 +2910,7 @@ pub(crate) struct MigrationInspectionBudget {
 
 #[cfg(any(feature = "host", test))]
 impl MigrationInspectionBudget {
-    pub(crate) fn new(deadline: Instant) -> Self {
+    pub fn new(deadline: Instant) -> Self {
         Self {
             remaining_rows: crate::upgrade::handoff::MAX_SESSIONS,
             remaining_bytes: 64 * 1024 * 1024,
@@ -2975,11 +2975,11 @@ pub(crate) fn read_open_migration_sessions_with_budget(
 
 /// The saved presentation and exact descriptor share one read-only snapshot.
 #[cfg(any(feature = "host", test))]
-pub(crate) struct MigrationPane {
-    pub(crate) card: CardId,
-    pub(crate) kind: CardKind,
-    pub(crate) label: crate::update::source_inspection::PaneLabel,
-    pub(crate) inert: bool,
+pub struct MigrationPane {
+    pub card: CardId,
+    pub kind: CardKind,
+    pub label: crate::update::source_inspection::PaneLabel,
+    pub inert: bool,
 }
 
 /// Persisted sidebar roots, bounded independently of the saved pane inventory.
@@ -3041,7 +3041,7 @@ fn migration_project_roots(
 }
 
 #[cfg(any(feature = "host", test))]
-pub(crate) fn read_labeled_migration_sessions_with_budget(
+pub fn read_labeled_migration_sessions_with_budget(
     path: &Path,
     budget: &mut MigrationInspectionBudget,
 ) -> Result<Vec<MigrationPane>> {

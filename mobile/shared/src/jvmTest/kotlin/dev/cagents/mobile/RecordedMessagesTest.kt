@@ -128,6 +128,12 @@ class RecordedMessagesTest {
     }
 
     @Test
+    fun notificationsCarryTheDaemonsAsksClassification() {
+        val notices = event<Event.Notifications>("event notifications asks").notices
+        assertEquals(listOf(true, false), notices.map { it.asks })
+    }
+
+    @Test
     fun conversationResetWithStateAndAppends() {
         val update = event<Event.Conversation>("event conversation").update
         assertTrue(update.reset)

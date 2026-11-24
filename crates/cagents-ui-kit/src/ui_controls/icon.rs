@@ -122,6 +122,7 @@ icons! {
     OpenFolder => "open-folder",
     PartlyFailed => "partly-failed",
     Permission => "permission",
+    Phone => "phone",
     Plus => "plus",
     PopOut => "pop-out",
     Preview => "preview",

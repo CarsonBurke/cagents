@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/cagents-ui", "crates/cagents-ui-kit", "crates/cagents-dictate", "crates/ceditor", "crates/browser-import", "crates/iced-contracts", "crates/cosmic-text-contracts", "crates/mobile-api"]
+members = [".", "crates/cagents-host", "crates/cagents-ui", "crates/cagents-ui-kit", "crates/cagents-dictate", "crates/ceditor", "crates/browser-import", "crates/iced-contracts", "crates/cosmic-text-contracts", "crates/mobile-api"]
 # Existing root build lanes keep their isolated feature graphs.
 default-members = ["."]
 resolver = "3"
@@ -38,17 +38,15 @@ latency-harness = ["ui"]
 # Product identity only. Keep this separate from the embedded-browser
 # implementation so the CLI and daemon do not resolve Servo.
 full = []
-# Test fixtures that the UI crate's tests share with this library's. Only a
-# dev-dependency selects it.
+# Test fixtures that the UI and daemon crates' tests share with this
+# library's. Only a dev-dependency selects it.
 test-support = []
 host = [
     "dep:yaml-rust",
-    "dep:diesel",
     "dep:unicode-casefold",
     "dep:croner",
     "dep:jiff",
     "dep:ashpd",
-    "dep:futures-util",
     "dep:hmac",
     "dep:image",
     "dep:ksni",
@@ -94,13 +92,6 @@ path = "src/main.rs"
 test = false
 bench = false
 
-[[bin]]
-name = "cagentsd"
-path = "src/bin/cagentsd.rs"
-test = false
-bench = false
-required-features = ["host"]
-
 [[example]]
 name = "repair-closed-terminal-owner"
 required-features = ["ui"]
@@ -116,39 +107,7 @@ required-features = ["host"]
 # Skip empty harnesses outside their owning lane. Keep the source cfgs for
 # platform restrictions; integrated-browser also selects the UI tests.
 [[test]]
-name = "account_default_contract"
-required-features = ["host"]
-
-[[test]]
-name = "agent_console_contract"
-required-features = ["host"]
-
-[[test]]
-name = "older_client_contract"
-required-features = ["host"]
-
-[[test]]
-name = "automation_cli_contract"
-required-features = ["host"]
-
-[[test]]
-name = "automation_precheck_contract"
-required-features = ["host"]
-
-[[test]]
-name = "codex_continuity_qualification"
-required-features = ["host"]
-
-[[test]]
 name = "terminal_load_contract"
-required-features = ["host"]
-
-[[test]]
-name = "terminal_metadata_contract"
-required-features = ["host"]
-
-[[test]]
-name = "upgrade_inspection_contract"
 required-features = ["host"]
 
 [[test]]
@@ -177,7 +136,8 @@ crossbeam-channel = "0.5"
 directories = "6.0"
 # Verifies the signature on a release's metadata before an update trusts it.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
-futures-util = { version = "0.3", optional = true }
+# The one-time key a phone pairs with; already in the graph through uuid.
+getrandom = "0.4"
 glob = "0.3.4"
 # Seals the messages the daemon delivers between sessions, so a conversation
 # can tell them apart from text that merely looks like one. Daemon only.
@@ -200,7 +160,6 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # Shared bounded notification excerpts use the same CommonMark parser as the UI.
 pulldown-cmark = { version = "0.12.2", default-features = false }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
-diesel = { version = "2.3.13", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35"], optional = true }
 croner = { version = "4.0", default-features = false, features = ["jiff"], optional = true }
 jiff = { version = "0.2.35", optional = true }
 serde = { version = "1.0", features = ["derive", "rc"] }

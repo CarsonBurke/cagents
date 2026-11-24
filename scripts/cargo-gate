@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=43
+gate_version=44
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -100,7 +100,8 @@ script that only builds, one slot there is leased first and held until
 COMMAND exits: its Cargo commands build in that slot one at a time.
 
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
-here through scripts/build-host. A build waits for its share of the memory
+here through scripts/build-host. Queries such as `metadata` and `tree` skip
+build admission. A build waits for its share of the memory
 set aside for builds (three quarters of the host's, in shares of 4 GiB; a
 check or CLI build takes one, a host or UI build two), then starts at once.
 While they are taken, a build that only builds first asks Cargo, in a short
@@ -271,7 +272,7 @@ build_shares() {
         case ,$names, in
             # A feature may be named with its package, as in cagents/ui.
             *[,\ /]ui[,\ ]*|*integrated-browser*|*cagents-ui*) lane=ui ;;
-            *[,\ /]host[,\ ]*|*cagentsd*) [ "$lane" = ui ] || lane=host ;;
+            *[,\ /]host[,\ ]*|*cagentsd*|*cagents-host*) [ "$lane" = ui ] || lane=host ;;
         esac
     done
     case $1:$lane in
@@ -433,13 +434,17 @@ cargo_shim() {
 # Rust compiles on the build host when there is one, whether or not this
 # command is inside a slot here. `scripts/cargo-offload --host` exits 0 when
 # there is one, and 75 when this is the build host or CAGENTS_BUILD_REMOTE is
-# `local`; anything else is a failure, never a reason to build here. Its wait
+# `local`. Status 76 means the local Cargo command needs no slot. Its wait
 # for that host spends the admission budget; the build there does not.
 cargo=${CAGENTS_BUILD_CARGO:-cargo}
 offload=$here/cargo-offload
 if [ -x "$offload" ]; then
     where=0
-    remote_host=$("$offload" --host) || where=$?
+    if [ "$mode" = cargo ]; then
+        remote_host=$("$offload" --host "$@") || where=$?
+    else
+        remote_host=$("$offload" --host) || where=$?
+    fi
 elif [ "${CAGENTS_BUILD_REMOTE-}" = local ]; then
     where=75
 else
@@ -447,7 +452,7 @@ else
 fi
 case $where in
     0) ;;
-    75) ;;
+    75|76) ;;
     *) fail "$offload could not tell where Rust compiles (status $where)" ;;
 esac
 if [ "$where" -eq 0 ]; then
@@ -499,6 +504,9 @@ fi
 # that `cargo run` started, and may be another build's.
 if [ "${CAGENTS_BUILD_METADATA_SUPPLIED-}" = 1 ]; then
     unset CAGENTS_BUILD_METADATA CAGENTS_BUILD_METADATA_SUPPLIED
+fi
+if [ "$where" -eq 76 ]; then
+    exec "$cargo" "$@"
 fi
 
 # Whether Cargo already has a runner for the programs it starts. Two

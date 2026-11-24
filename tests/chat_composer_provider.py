@@ -271,6 +271,63 @@ class Provider(unittest.TestCase):
                                    ("fixture-task-planner-1", "stopped")])
         self.assertFalse(any(frame.get("subtype") == "task_updated" for frame in output), output)
 
+    def send_now(self, answer, *, subagents=False):
+        (self.config / "fixture-send-now").write_text(f"{answer}\n0\n")
+        if subagents:
+            (self.config / "fixture-subagents").touch()
+        queued = [dict(prompt(2), uuid="queued-a"), dict(prompt(3), uuid="queued-b")]
+        cancel = {"type": "control_request", "request_id": "cancel-1",
+                  "request": {"subtype": "cancel_async_message", "message_uuid": "queued-b"}}
+        now = {"type": "control_request", "request_id": "now-1",
+               "request": {"subtype": "interrupt", "send_now": True, "message_uuid": "queued-a"}}
+        result, output, _ = self.run_provider(frames=(prompt(1), *queued, cancel, now))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        answered = next(index for index, frame in enumerate(output)
+                        if frame.get("type") == "control_response"
+                        and frame["response"]["request_id"] == "now-1")
+        return output, output[answered]["response"]["response"], output[answered + 1:]
+
+    def test_send_now_is_advertised_only_with_its_switch(self):
+        _, output, _ = self.run_provider()
+        init = next(frame for frame in output if frame.get("subtype") == "init")
+        self.assertNotIn("capabilities", init)
+        (self.config / "fixture-send-now").touch()
+        _, output, _ = self.run_provider()
+        init = next(frame for frame in output if frame.get("subtype") == "init")
+        self.assertEqual(init["capabilities"], ["interrupt_send_now_v1"])
+
+    def test_send_now_delivering_cuts_the_turn_short_and_starts_what_is_still_queued(self):
+        _, answer, after = self.send_now("delivering", subagents=True)
+        self.assertEqual(answer, {"still_queued": ["queued-a"], "send_now": "delivering"})
+        made_way = after[0]
+        self.assertEqual((made_way["type"], made_way["subtype"], made_way["terminal_reason"]),
+                         ("result", "success", "aborted_streaming"))
+        self.assertEqual([frame["uuid"] for frame in after if frame.get("isReplay")], ["queued-a"])
+        self.assertEqual([(frame["command_uuid"], frame["state"]) for frame in after
+                          if frame.get("type") == "command_lifecycle"],
+                         [("queued-a", "started"), ("queued-a", "completed")])
+        self.assertEqual(after[-1]["terminal_reason"], "completed")
+        # Subagents keep running: none is stopped.
+        self.assertFalse(any(frame.get("subtype") == "task_notification" for frame in after))
+
+    def test_send_now_stopped_records_a_stop_then_starts_the_queue(self):
+        _, answer, after = self.send_now("stopped")
+        self.assertEqual(answer["send_now"], "stopped")
+        self.assertEqual(after[0]["message"]["content"][0]["text"], "[Request interrupted by user]")
+        self.assertEqual(after[1]["terminal_reason"], "aborted_streaming")
+        self.assertEqual([frame["uuid"] for frame in after if frame.get("isReplay")], ["queued-a"])
+
+    def test_send_now_with_nothing_waiting_leaves_the_turn_running(self):
+        _, answer, after = self.send_now("nothing_waiting")
+        self.assertEqual(answer["send_now"], "nothing_waiting")
+        self.assertFalse(any(frame.get("type") == "result" for frame in after), after)
+
+    def test_a_send_now_answer_that_is_not_one_is_refused(self):
+        (self.config / "fixture-send-now").write_text("soon\n")
+        result, _, _ = self.run_provider()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("fixture-send-now", result.stderr)
+
     def test_a_status_that_is_not_one_is_refused_with_its_line(self):
         for status in ("x", 256, -1, 1.5):
             with self.subTest(status=status):

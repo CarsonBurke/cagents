@@ -26,14 +26,15 @@ SERVO = {"servo": "Servo"}
 UI = {"libcosmic": "libcosmic"}
 SQLITE = {"rusqlite": "SQLite"}
 APPLICATION = {"cagents-ui": "the application"}
+DAEMON = {"cagents-host": "the daemon"}
 FORBIDDEN = {
-    "cli": {**UI, **GHOSTTY, **SQLITE, **SERVO},
+    "cli": {**UI, **GHOSTTY, **SQLITE, **SERVO, **DAEMON},
     "host": {**UI, **SERVO},
-    "ui": {**GHOSTTY, **SERVO},
-    "browser": {**GHOSTTY},
+    "ui": {**GHOSTTY, **SERVO, **DAEMON},
+    "browser": {**GHOSTTY, **DAEMON},
     # ceditor builds on the UI kit, never on the application above it.
-    "editor": {**GHOSTTY, **SERVO, **APPLICATION},
-    "dictate": {**UI, **GHOSTTY, **SERVO},
+    "editor": {**GHOSTTY, **SERVO, **APPLICATION, **DAEMON},
+    "dictate": {**UI, **GHOSTTY, **SERVO, **DAEMON},
 }
 
 

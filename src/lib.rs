@@ -65,8 +65,10 @@ pub fn refuse_filtered_test_run(mut arguments: impl Iterator<Item = String>) {
 
 crate::test_binary_setup!();
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) mod retained_fixture;
+// The host crate's tests share the retained-fixture supervisor.
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+#[doc(hidden)]
+pub mod retained_fixture;
 #[cfg(all(test, feature = "host", target_os = "linux"))]
 #[path = "../tests/support/retained_fixture_tests.rs"]
 mod retained_fixture_tests;

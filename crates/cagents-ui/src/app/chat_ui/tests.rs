@@ -381,6 +381,9 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
     runtime.attach([path.clone()]);
     assert_eq!(runtime.attachments.len(), 1);
     let queued = runtime.take_attachments();
+    // The preview leaves with the message, until nothing shows it.
+    assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+    runtime.sync_thumbnails();
     assert!(runtime.thumbnails.subscriptions(runtime.target).is_empty());
     runtime.take_back("queued", queued, PromptMode::Queue);
     assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
@@ -417,6 +420,28 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
     assert!(runtime.thumbnails.subscriptions(target).is_empty());
     runtime.attach([path]);
     assert_eq!(runtime.thumbnails.subscriptions(target).len(), 1);
+}
+
+/// A message waiting to be sent shows its images' previews, which outlast
+/// the draft they left and any later edit of the next draft.
+#[test]
+fn a_queued_message_keeps_its_image_previews() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let path = PathBuf::from("/fixture/image.png");
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().attach([path.clone()]);
+    write(&mut app, card, "Here is the layout");
+    submit(&mut app, card);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let queued = runtime.queued.as_ref().unwrap();
+    assert_eq!(queued.prompt.attachments[0].path, path);
+    assert!(runtime.attachments.is_empty());
+    runtime.sync_thumbnails();
+    assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
+    runtime.queued = None;
+    runtime.sync_thumbnails();
+    assert!(runtime.thumbnails.subscriptions(runtime.target).is_empty());
 }
 
 #[test]
@@ -10501,6 +10526,38 @@ fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
     idle.busy = false;
     show_chat_snapshot_for_test(&mut app, card, idle);
     assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+}
+
+#[test]
+fn send_now_goes_to_the_provider_only_when_the_turn_can_take_the_queue() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.queued_messages = vec![chat::QueuedMessage::new("a".into(), "Next".into())];
+    let busy = (*runtime.snapshot).clone();
+    show_chat_snapshot_for_test(&mut app, card, busy.clone());
+    // A provider that cannot take its queue early is not asked to.
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    assert!(chat_runtime(&app, card).commands.is_idle());
+
+    let mut able = busy;
+    able.capabilities.send_queued_now = true;
+    show_chat_snapshot_for_test(&mut app, card, able.clone());
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.commands.in_flight().is_some());
+    assert!(runtime.commands.repeats(&Command::SendQueuedNow));
+    settle(&mut app, card, Ok(()));
+
+    // Once the provider has it, a second press waits for its answer.
+    let mut requested = able;
+    requested.send_now = Some(chat::SendNow::Requested);
+    show_chat_snapshot_for_test(&mut app, card, requested);
+    drop(app.handle_chat_ui(Action::SendQueuedNow(target)));
+    assert!(chat_runtime(&app, card).commands.is_idle());
 }
 
 #[test]

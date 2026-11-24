@@ -2412,14 +2412,14 @@ fn close_sessions_in_scope(
         let id = session.id;
         if let Err(error) = client.close_chat(session) {
             client = crate::control::ControlClient::connect(&socket)
-                .map_err(|reconnect| format!("Could not verify chat {id}: {reconnect}"))?;
+                .map_err(|reconnect| format!("Could not check that a chat closed: {reconnect}"))?;
             if client
                 .list_chats()
-                .map_err(|list| format!("Could not verify chat {id}: {list}"))?
+                .map_err(|list| format!("Could not check that a chat closed: {list}"))?
                 .iter()
                 .any(|live| live.id == id)
             {
-                return Err(format!("Could not close chat {id}: {error}"));
+                return Err(format!("Could not close a chat: {error}"));
             }
         }
     }
@@ -2453,7 +2453,7 @@ fn close_sessions_in_scope(
                 .map_err(|error| error.to_string())
                 .and_then(|outcome| match outcome {
                     crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+                    other => Err(terminal_close_refusal(other)),
                 })
         } else {
             client
@@ -2461,21 +2461,22 @@ fn close_sessions_in_scope(
                 .map_err(|error| error.to_string())
                 .and_then(|outcome| match outcome {
                     crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+                    other => Err(terminal_close_refusal(other)),
                 })
         };
         if let Err(error) = result {
             // Another window or a natural exit may have won the race. Query a
             // fresh connection; a failed request can desynchronize this one.
-            client = crate::control::ControlClient::connect(&socket)
-                .map_err(|reconnect| format!("Could not verify terminal {id}: {reconnect}"))?;
+            client = crate::control::ControlClient::connect(&socket).map_err(|reconnect| {
+                format!("Could not check that a terminal closed: {reconnect}")
+            })?;
             if client
                 .list()
-                .map_err(|list| format!("Could not verify terminal {id}: {list}"))?
+                .map_err(|list| format!("Could not check that a terminal closed: {list}"))?
                 .iter()
                 .any(|live| live.session.id == id)
             {
-                return Err(format!("Could not close terminal {id}: {error}"));
+                return Err(format!("Could not close a terminal: {error}"));
             }
         }
     }
@@ -2489,6 +2490,20 @@ fn close_sessions_in_scope(
 pub struct ProjectSessionClosure {
     scope: ProjectSessionScope,
     ownership: ProjectSessionOwnership,
+}
+
+/// Why the daemon did not close a terminal, in words rather than its reply.
+/// An unconfirmed close's reason describes the daemon's own bookkeeping, so
+/// it goes to the log, not the person.
+pub(super) fn terminal_close_refusal(result: crate::terminal::ipc::TerminalCloseResult) -> String {
+    match result {
+        crate::terminal::ipc::TerminalCloseResult::Active => "it is still running".into(),
+        crate::terminal::ipc::TerminalCloseResult::Closed
+        | crate::terminal::ipc::TerminalCloseResult::Unknown(_) => {
+            tracing::warn!(?result, "a terminal close was not confirmed");
+            "the app could not confirm that it stopped".into()
+        }
+    }
 }
 
 #[cfg(test)]

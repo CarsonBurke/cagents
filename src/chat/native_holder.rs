@@ -3,12 +3,12 @@
 
 mod cleanup;
 mod transport;
-#[cfg(test)]
-pub(crate) use cleanup::publish_closed_source;
-pub(crate) use cleanup::{
+#[cfg(any(test, feature = "test-support"))]
+pub use cleanup::publish_closed_source;
+pub use cleanup::{
     Detached, closed_pair_holder, closed_source, confirm_pair_closed, retire_abandoned,
 };
-pub(crate) use transport::{Holder, adopt, inspect, spawn};
+pub use transport::{Holder, adopt, inspect, spawn};
 
 use crate::{
     agent::Provider,
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Kept only in the holder's memory. Discovery files contain process identity,
 /// never the launch recipe or its environment.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Recovery {
+pub struct Recovery {
     pub source: super::Session,
     pub execution_console: Option<crate::model::LaunchRecipe>,
     #[serde(default)]
@@ -283,7 +283,7 @@ impl Recovery {
 /// This is deliberately an allowlist: a 0.x version increment is not a promise
 /// that an app-server preserves all three boundaries without a client.
 ///
-/// `tests/codex_continuity_qualification.rs` is that verification, run against
+/// `crates/cagents-host/tests/codex_continuity_qualification.rs` is that verification, run against
 /// the real executable through a killed daemon. A version belongs here only
 /// after it passes; a server of any other version ends with its daemon.
 pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1", "0.160.1", "0.161.0", "0.162.0"];

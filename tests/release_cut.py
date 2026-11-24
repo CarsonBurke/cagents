@@ -98,6 +98,22 @@ case "$1 $2" in
         sha256sum "cagents-$version-x86_64-unknown-linux-gnu.tar.gz" install.sh > SHA256SUMS ;;
     "variable list") [[ ! -e $FIXTURE/variables-fail ]] || exit 1
         echo '[{"name":"RELEASE_SIGNING_PUBLIC_KEY","value":"ssh-ed25519 FIXTURE"}]' ;;
+    "api --silent")
+        [[ $3 == --method && $4 == POST && $5 == repos/CarsonBurke/cagents/statuses/* ]] || exit 99
+        [[ ! -e $FIXTURE/status-write-fails ]] || exit 1
+        sha=${5##*/}
+        mkdir -p "$FIXTURE/statuses"
+        printf '{"sha":"%s","statuses":[{"context":"cagents/fw16-tests","state":"success"}]}\n' "$sha" \
+            > "$FIXTURE/statuses/$sha" ;;
+    "api repos/"*/status\?per_page=100)
+        [[ ! -e $FIXTURE/status-read-fails ]] || exit 1
+        sha=${2%/status\?per_page=100}
+        sha=${sha##*/}
+        if [[ -e $FIXTURE/statuses/$sha ]]; then
+            cat "$FIXTURE/statuses/$sha"
+        else
+            printf '{"sha":"%s","statuses":[]}\n' "$sha"
+        fi ;;
 esac
 exit 0
 """
@@ -155,6 +171,7 @@ esac
 # The workflow's admission, as asked before pushing a tag: refuses when the
 # fixture says so, and otherwise says whether Actions would sign.
 ADMIT = r"""#!/bin/bash
+[[ $1 == admit ]] || exec "$(dirname "$0")/real-release-actions" "$@"
 echo "release-actions $* public=$RELEASE_SIGNING_PUBLIC_KEY" >> "$FIXTURE/calls.log"
 [[ ! -e $FIXTURE/admit-refuses ]] || { echo "release-actions: refused by the fixture" >&2; exit 1; }
 echo "sign=$(cat "$FIXTURE/admit-sign" 2>/dev/null || echo true)" >> "$GITHUB_OUTPUT"
@@ -203,13 +220,15 @@ class ReleaseCut(unittest.TestCase):
         # what they hand on to.
         for name in ("release", "release-metadata"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        shutil.copy2(ROOT / "scripts/release-actions", self.repo / "scripts/real-release-actions")
         self.tool(self.repo / "scripts/publish-release", PUBLISH)
         self.tool(self.repo / "scripts/land-pr", LAND)
         self.tool(self.repo / "scripts/rehearse-update", REHEARSE)
         self.tool(self.repo / "scripts/release-actions", ADMIT)
         (self.repo / ".gitignore").write_text(".worktrees/\n")
         lock = ["version = 4\n"]
-        for name, manifest in (("cagents", "Cargo.toml"), ("cagents-ui", "crates/cagents-ui/Cargo.toml"),
+        for name, manifest in (("cagents", "Cargo.toml"), ("cagents-host", "crates/cagents-host/Cargo.toml"),
+                               ("cagents-ui", "crates/cagents-ui/Cargo.toml"),
                                ("ceditor", "crates/ceditor/Cargo.toml"),
                                ("cagents-dictate", "crates/cagents-dictate/Cargo.toml")):
             path = self.repo / manifest
@@ -782,7 +801,8 @@ class ReleaseCut(unittest.TestCase):
         branch = self.git("show", "release/bump-0.2.5:crates/ceditor/Cargo.toml", cwd=self.origin)
         self.assertIn('version = "0.2.5"', branch)
         lock = self.git("show", "release/bump-0.2.5:Cargo.lock", cwd=self.origin)
-        self.assertEqual(lock.count('version = "0.2.5"'), 4)
+        # One per product package: the library, daemon, UI, editor and dictation helper.
+        self.assertEqual(lock.count('version = "0.2.5"'), 5)
         self.assertEqual(self.git("log", "-1", "--format=%s", "release/bump-0.2.5", cwd=self.origin),
                          "chore(release): start 0.2.5 after v0.2.4")
         self.assertFalse((self.repo / ".worktrees/release-bump-0.2.5").exists())
@@ -825,6 +845,8 @@ class ReleaseCut(unittest.TestCase):
         # Pushed, not published: it says what to do next, and is not done.
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("release-actions admit v0.2.4 public=ssh-ed25519 FIXTURE", self.log("calls.log"))
+        self.assertTrue(any(line.endswith(f"--require-tests {self.fix}") for line in self.log("sentinel.log")))
+        self.assertTrue((self.root / "statuses" / self.fix).exists())
         self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}", cwd=self.origin), self.fix)
         self.assertIn("scripts/release rehearse 0.2.4 --from-draft\n  scripts/release publish 0.2.4 --actions",
                       result.stdout)
@@ -980,6 +1002,46 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("refused by the fixture", result.stderr)
         self.assertIn("would refuse v0.2.4; nothing is pushed", result.stderr)
         self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
+
+    def test_publish_in_actions_refuses_to_push_without_a_recorded_pass(self):
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--actions").returncode, 0)
+        sentinel_status = self.root / "sentinel-status"
+        sentinel_status.write_text("1")
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertIn(f"no passing fw16 sentinel verdict for {self.fix}", result.stderr)
+        self.assertFalse((self.root / "statuses").exists())
+        self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
+
+        sentinel_status.unlink()
+        (self.root / "status-write-fails").touch()
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertIn(f"cannot record the fw16 test status for {self.fix} on GitHub", result.stderr)
+        self.assertEqual(self.git("tag", "--list", "v0.2.4", cwd=self.origin), "")
+
+    def test_publish_in_actions_recovers_the_status_for_an_already_pushed_tag(self):
+        self.bundle(self.fix)
+        self.assertEqual(self.release("cut", "--actions").returncode, 0)
+        self.git("push", "-q", "origin", "main", "v0.2.4")
+        tag = self.git("rev-parse", "v0.2.4")
+        self.assertFalse((self.root / "statuses").exists())
+
+        (self.root / "status-read-fails").touch()
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertIn("cannot verify the fw16 test status", result.stderr)
+        self.assertEqual(self.log("sentinel.log"), [])
+        (self.root / "status-read-fails").unlink()
+
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Rerun the failed Release workflow", result.stdout)
+        self.assertTrue((self.root / "statuses" / self.fix).exists())
+        self.assertEqual(self.git("rev-parse", "v0.2.4", cwd=self.origin), tag)
+
+        self.git("tag", "-fa", "v0.2.4", "-m", "a different commit", self.feature)
+        result = self.release("publish", "0.2.4", "--actions", "--yes")
+        self.assertIn(f"on origin points at {self.fix}, while the local tag points at {self.feature}", result.stderr)
+        self.assertFalse((self.root / "statuses" / self.feature).exists())
 
     def test_a_tag_pushed_but_never_published_is_cut_here_from_the_same_tag(self):
         self.bundle(self.fix)

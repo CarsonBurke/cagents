@@ -1262,10 +1262,9 @@ dependencies = [
  "clap_complete",
  "croner",
  "crossbeam-channel",
- "diesel",
  "directories",
  "ed25519-dalek",
- "futures-util",
+ "getrandom 0.4.3",
  "glob",
  "hmac 0.12.1",
  "iced_accessibility",
@@ -1345,6 +1344,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "cagents-host"
+version = "0.2.4"
+dependencies = [
+ "ashpd 0.12.3",
+ "cagents",
+ "clap",
+ "crossbeam-channel",
+ "diesel",
+ "futures-util",
+ "jiff",
+ "libc",
+ "notify 9.0.0-rc.8",
+ "postcard",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "tungstenite",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "cagents-iced-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1380,6 +1407,7 @@ dependencies = [
  "dpi 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "euclid",
  "foldhash 0.2.0",
+ "glob",
  "iced",
  "iced_accessibility",
  "image",
@@ -1441,6 +1469,7 @@ dependencies = [
  "mermaid-rs-renderer",
  "notify 9.0.0-rc.8",
  "pulldown-cmark",
+ "qrcode",
  "regex",
  "resvg",
  "roxmltree",
@@ -8174,6 +8203,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcode"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ace1a365f55004297f2cf24acfd96d02966246ca423385273b58a7dc873ee14d"
 
 [[package]]
 name = "quick-error"

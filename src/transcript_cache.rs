@@ -189,7 +189,7 @@ fn legacy_open_directories(
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn sweep(root: &Path) -> io::Result<Usage> {
+pub fn sweep(root: &Path) -> io::Result<Usage> {
     sweep_with_procfs(root, Path::new("/proc"))
 }
 

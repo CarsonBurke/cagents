@@ -149,7 +149,7 @@ impl SourceInspection {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn record_console_outcome(
+    pub fn record_console_outcome(
         &mut self,
         pane: TerminalId,
         kind: super::impact::SessionKind,
@@ -180,13 +180,7 @@ impl SourceInspection {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn stop(
-        &mut self,
-        pane: TerminalId,
-        kind: StoppedKind,
-        reason: &str,
-        recovery: &str,
-    ) {
+    pub fn stop(&mut self, pane: TerminalId, kind: StoppedKind, reason: &str, recovery: &str) {
         if self
             .stopped
             .iter()

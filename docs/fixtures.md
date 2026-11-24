@@ -21,6 +21,7 @@ person.
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
+| The status bar's phone popover: paired phones, a connected phone, Tailscale up or down, no SSH server | [The phone host marker](#phone-connection-states), `home/.cagents-fixture-mobile-host`, and the fixture HOME's own `.ssh/authorized_keys` |
 | A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
 | An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
@@ -413,8 +414,10 @@ outside the app's clock, so the app's next save of the review replaces it, and
 running the script again rewrites the cache and keeps the commits. Other seeds
 in `fixture-forge-prs.json` are kept.
 
-To open the review as a person does, show the sidebar's search, choose its
-**Pull requests** filter and click the `fix/cache-key` row. The draft's
+To open the review as a person does, open the Worktrees pane
+(`Ctrl+Shift+E`), press the project heading's pull requests button (its tooltip
+reads *Pull requests in project*) and click #57, "Key the response cache by
+locale", in the list it opens. The draft's
 composer sits under line 23; its buttons are below the fold at the default
 height, so scroll the diff to reach them. Don't click a diff gutter in a
 revision without the fix for #3417: that starts a comment the cached review has
@@ -424,18 +427,18 @@ no authority for, and the app panics. A steps file:
 evidence env python3 -I "$tool/tests/fixtures/offline-review-cache.py" >/dev/null
 evidence cli project open '{fixture}/project' >/dev/null
 evidence drive wait 'Worktrees' --timeout 60 >/dev/null
-evidence drive click 206,67 >/dev/null    # the sidebar's search
-evidence drive wait 'Pull requests' --timeout 10 >/dev/null
-evidence drive click 'Pull requests' >/dev/null
-evidence drive wait 'cache-key' --timeout 60 >/dev/null
-evidence drive click 'cache-key' >/dev/null
+evidence drive key ctrl+shift+e >/dev/null
+evidence drive wait 'Pull requests in project' --timeout 60 >/dev/null
+evidence drive click 'Pull requests in project' >/dev/null
+evidence drive wait 'Key the response cache' --timeout 60 >/dev/null
+evidence drive click 'Key the response cache' >/dev/null
 evidence drive wait 'read only' --timeout 30 >/dev/null
 evidence drive wait 'empty locale' --timeout 30 >/dev/null
 evidence shot offline-review
 ```
 
-If `Worktrees` is collapsed, the filter shows no `fix/cache-key` row until it
-is expanded. `tests/offline_review_cache_fixture.py` checks the rows the
+The button appears once the app has read the project's GitHub remote.
+`tests/offline_review_cache_fixture.py` checks the rows the
 script writes against the tables `src/persistence.rs` creates, and that the
 forge lists #57 at the cached head; the native review is what shows the app
 reads them.
@@ -1471,6 +1474,34 @@ Every refusal names its cause and the next command. The common ones:
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
 beside the others in the fixture's contract suite.
+
+## Phone connection states
+
+The phone popover reads this computer's network, SSH server and running
+mobile bridges. In a native-evidence task, a JSON file at
+`home/.cagents-fixture-mobile-host` stands in for all of them; paired phones
+still come from the fixture HOME's `.ssh/authorized_keys`, which pairing also
+writes:
+
+```sh
+scripts/native-evidence env sh -c 'cat >"$CAGENTS_EVIDENCE_FIXTURE/home/.cagents-fixture-mobile-host" <<EOF
+{"name":"workstation","port":22,"listening":true,
+ "host_key":"SHA256:I7uYBbsuJDf9UOOdWpjHuU7LQcImmvDuSC3TnbMc5jo",
+ "tailscale":{"name":"workstation.tail4a1c.ts.net","addresses":["100.101.102.103"]},
+ "lan":["192.168.1.20"],"connections":["100.88.1.4"]}
+EOF'
+```
+
+Every field is optional. `tailscale` set to `null` reports Tailscale as
+installed but not connected, and leaving it out reports it as not installed.
+`listening` set to `false` reports no SSH server, `blocked` lists network
+addresses the firewall blocks SSH on while it allows SSH over Tailscale, and
+`connections` lists the addresses of connected phones. Leave `connections`
+out to show the phones really connected, as when a real phone pairs with the
+fixture over an SSH server that reads the fixture HOME's `authorized_keys`. The file is read each time the popover checks
+again, every two seconds while it is open, so it can be changed while the
+session runs. Debug builds whose `HOME` is in a native-evidence task read it;
+other builds and homes ignore it.
 
 ## An update restore in progress or held
 

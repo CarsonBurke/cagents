@@ -274,7 +274,7 @@ pub fn item(item: &chat::Item) -> api::Item {
         chat::ItemContent::Delivery {
             kind,
             from,
-            sender: _,
+            sender,
             summary,
             body,
         } => {
@@ -286,6 +286,7 @@ pub fn item(item: &chat::Item) -> api::Item {
                     chat::DeliveryKind::Notice => api::DeliveryKind::Notice,
                 },
                 from: from.clone(),
+                sender: sender.clone(),
                 summary: summary.clone(),
                 body: body.into(),
                 clipped,
@@ -374,6 +375,7 @@ fn notice(notice: &notifications::Notice) -> api::Notice {
     let nonempty = |text: &str| (!text.is_empty()).then(|| text.to_owned());
     api::Notice {
         id: notice.id.to_string(),
+        asks: notice.asks(),
         kind: match event.evidence.kind {
             Kind::Succeeded => api::NoticeKind::Succeeded,
             Kind::Failed => api::NoticeKind::Failed,

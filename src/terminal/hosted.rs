@@ -3293,16 +3293,20 @@ fn publish_event(
 }
 
 /// The real client publication state, retained across host-handler test steps.
-#[cfg(all(test, feature = "host"))]
-pub(crate) struct RetainedPresentationFixture(HostedPublishedState);
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub struct RetainedPresentationFixture(HostedPublishedState);
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
 impl RetainedPresentationFixture {
-    pub(crate) fn new() -> Self {
+    #[allow(
+        clippy::new_without_default,
+        reason = "a test fixture, constructed only explicitly"
+    )]
+    pub fn new() -> Self {
         Self(HostedPublishedState::new(None, true, Arc::new(|_| {})))
     }
 
-    pub(crate) fn set_visibility(&self, visibility: TerminalVisibility) {
+    pub fn set_visibility(&self, visibility: TerminalVisibility) {
         if visibility == TerminalVisibility::Hibernated {
             self.0.hibernate();
         } else {
@@ -3310,19 +3314,19 @@ impl RetainedPresentationFixture {
         }
     }
 
-    pub(crate) fn cursor(&self) -> u64 {
+    pub fn cursor(&self) -> u64 {
         self.0.snapshot_cursor()
     }
 
-    pub(crate) fn needs_snapshot(&self, generation: u64) -> bool {
+    pub fn needs_snapshot(&self, generation: u64) -> bool {
         self.0.needs_snapshot(generation, false)
     }
 
-    pub(crate) fn apply(&self, snapshot: TerminalSnapshot) -> bool {
+    pub fn apply(&self, snapshot: TerminalSnapshot) -> bool {
         self.0.apply(snapshot)
     }
 
-    pub(crate) fn frame(&self) -> Arc<RenderSnapshot> {
+    pub fn frame(&self) -> Arc<RenderSnapshot> {
         self.0.frame()
     }
 }

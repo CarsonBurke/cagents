@@ -1,6 +1,6 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
 pub mod floor;
-pub(crate) mod recovery;
+pub mod recovery;
 #[cfg(any(feature = "host", feature = "ui"))]
 use crate::lineage_birth::LineageBirth;
 use crate::model::HostSessionProof;
@@ -59,7 +59,7 @@ impl RecoveryKind {
 }
 
 /// Automatic recovery never replays arbitrary command recipes.
-pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
+pub fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
     recovery_plan(session).map(|(recipe, _)| recipe)
 }
 
@@ -107,14 +107,14 @@ fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
 
 /// Setup recipes are retained for an explicit reviewed run, never automatic
 /// upgrade replay. The marker is classification, not execution authority.
-pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
+pub fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
     recipe
         .environment
         .get("CAGENTS_WORKTREE_SETUP")
         .is_some_and(|value| value == "1")
 }
 
-pub(crate) fn checkpoint_recipe(
+pub fn checkpoint_recipe(
     session: &TerminalSession,
     relaunches: &[crate::terminal_ipc::UpgradeRelaunch],
 ) -> Result<LaunchRecipe, String> {
@@ -945,7 +945,7 @@ pub(crate) fn process_error(error: io::Error) -> String {
     format!("cannot rule out surviving terminal processes; automatic recovery is unsafe: {error}")
 }
 
-pub(crate) mod handoff {
+pub mod handoff {
     use super::*;
     use crate::chat;
     use crate::fs_safety;
@@ -961,8 +961,8 @@ pub(crate) mod handoff {
     const VERSION: u16 = 5;
     const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
-    pub(crate) const MAX_TERMINALS: usize = 1024;
-    pub(crate) const MAX_CHATS: usize = crate::native_chat_capacity::MAX_LIMIT as usize;
+    pub const MAX_TERMINALS: usize = 1024;
+    pub const MAX_CHATS: usize = crate::native_chat_capacity::MAX_LIMIT as usize;
     pub(crate) const MAX_SESSIONS: usize = MAX_TERMINALS + MAX_CHATS;
     const FILE: &str = "daemon-upgrade.json";
     const ABANDONED_FILE: &str = "daemon-upgrade.abandoned.json";
@@ -996,7 +996,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub(crate) enum Phase {
+    pub enum Phase {
         /// Persisted before any irreversible stop. Provider closure is unproven.
         Prepared,
         /// All old writers were confirmed closed and latest identities saved.
@@ -1015,7 +1015,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Terminal {
+    pub struct Terminal {
         pub source: TerminalSession,
         /// Oldest first; each source's safe restart is the next issued launch.
         #[serde(default)]
@@ -1030,7 +1030,7 @@ pub(crate) mod handoff {
     /// processes, screen and all. Its launch is unchanged, so its lineage
     /// records the carry as a source whose successor launched the same way.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Carried {
+    pub struct Carried {
         pub source: TerminalSession,
         /// Oldest first, as for [`Terminal`].
         #[serde(default)]
@@ -1041,7 +1041,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Chat {
+    pub struct Chat {
         /// Immutable issued launch and former daemon ownership, independent of
         /// any visible-only session identity cached by a client.
         pub source: chat::Session,
@@ -1052,7 +1052,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct ChatSource {
+    pub struct ChatSource {
         pub source: chat::Session,
         /// Provider-confirmed continuation. Durable native aliases all retain
         /// the same live thread; ordinary restarts use the next daemon's launch.
@@ -1060,7 +1060,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Checkpoint {
+    pub struct Checkpoint {
         /// Read and checked here; the host writer derives it from what the
         /// checkpoint holds.
         #[serde(skip_serializing)]
@@ -1078,7 +1078,7 @@ pub(crate) mod handoff {
     }
 
     impl Checkpoint {
-        #[cfg(any(feature = "host", test))]
+        #[cfg(any(feature = "host", test, feature = "test-support"))]
         pub fn new(
             proof: HostSessionProof,
             terminals: Vec<Terminal>,
@@ -1434,7 +1434,7 @@ pub(crate) mod handoff {
     /// Keep the descriptor already issued to the chat while validating the
     /// separate exact execution selected by its original daemon. Older writers
     /// stored the derived resume hint on the checkpoint's terminal copy.
-    pub(crate) fn paired_terminal_source(
+    pub fn paired_terminal_source(
         chat: &Chat,
         terminal: &Terminal,
     ) -> Result<TerminalSession, String> {
@@ -1470,7 +1470,7 @@ pub(crate) mod handoff {
 
     /// Check the immutable descriptor against the separate effective restart.
     /// Call while the old provider and windows are still usable, before handoff.
-    pub(crate) fn validate_chat_source(
+    pub fn validate_chat_source(
         source: &chat::Session,
         launch: &chat::Launch,
     ) -> Result<(), String> {
@@ -1522,7 +1522,7 @@ pub(crate) mod handoff {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
+    pub fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
         // Actor aliases are an explicit helper journal. A known issued source
         // cannot synthesize an earlier unnamed capability.
         (!matches!(
@@ -1549,7 +1549,7 @@ pub(crate) mod handoff {
     /// immutable descriptor was issued. Only identities recorded by this
     /// authenticated source or its effective restart qualify as that alias.
     #[cfg(feature = "host")]
-    pub(crate) fn issued_chat_source_matches(saved: &ChatSource, source: &chat::Session) -> bool {
+    pub fn issued_chat_source_matches(saved: &ChatSource, source: &chat::Session) -> bool {
         if issued_chat_matches(&saved.source, source) {
             return true;
         }
@@ -1561,7 +1561,7 @@ pub(crate) mod handoff {
     /// Publish the descriptor windows were issued, with only its confirmed
     /// presentation identity advanced. Resume argv belongs to `launch` alone.
     #[cfg(feature = "host")]
-    pub(crate) fn restored_chat(
+    pub fn restored_chat(
         source: &chat::Session,
         launch: &chat::Launch,
     ) -> Result<chat::Session, String> {
@@ -1581,7 +1581,7 @@ pub(crate) mod handoff {
     /// A conversation whose provider-confirmed ID only an update checkpoint
     /// records.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-    pub(crate) struct CheckpointIdentity {
+    pub struct CheckpointIdentity {
         pub id: crate::model::TerminalId,
         pub provider: crate::agent::Provider,
         pub conversation: String,
@@ -1591,7 +1591,7 @@ pub(crate) mod handoff {
     /// What any client may read about an unattached conversation. The host
     /// writes the exact evidence beside it; readers ignore that payload.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
-    pub(crate) struct UnattachedSummary {
+    pub struct UnattachedSummary {
         pub id: crate::model::TerminalId,
         pub provider: crate::agent::Provider,
         /// The provider's confirmed conversation (Codex thread) identity.
@@ -1608,7 +1608,7 @@ pub(crate) mod handoff {
     /// What became of an unattached conversation's provider.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
-    pub(crate) enum UnattachedDisposition {
+    pub enum UnattachedDisposition {
         /// It outlived the previous daemon and was left exactly as it was:
         /// nothing was restarted or resent for it.
         #[default]
@@ -1621,7 +1621,7 @@ pub(crate) mod handoff {
 
     #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct UnattachedChat {
+    pub struct UnattachedChat {
         #[serde(flatten)]
         pub summary: UnattachedSummary,
         /// The checkpoint entry exactly as the previous daemon issued it.
@@ -1673,7 +1673,7 @@ pub(crate) mod handoff {
     // attached or the conversation is explicitly closed.
     const RECOVERED_FILE: &str = "daemon-upgrade.recovered.json";
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct RecoveredChat {
+    pub struct RecoveredChat {
         pub evidence: Chat,
         pub replacement: chat::Session,
         #[serde(default)]
@@ -1683,7 +1683,7 @@ pub(crate) mod handoff {
     /// Completed checkpoint lineage is evidence about a listed replacement,
     /// never authority to restore or attach a conversation.
     #[derive(Debug, Default)]
-    pub(crate) struct RecoveredChats {
+    pub struct RecoveredChats {
         entries: Vec<RecoveredChat>,
     }
 
@@ -1707,7 +1707,7 @@ pub(crate) mod handoff {
     }
 
     impl RecoveredChats {
-        pub(crate) fn proves(
+        pub fn proves(
             &self,
             source: &chat::Session,
             current: &chat::Session,
@@ -1821,7 +1821,7 @@ pub(crate) mod handoff {
         deserializer.deserialize_seq(Count)
     }
 
-    pub(crate) struct Store {
+    pub struct Store {
         root: fs_safety::Root,
         pub path: PathBuf,
         /// Serializes this daemon's read-modify-write updates of the
@@ -2025,7 +2025,7 @@ pub(crate) mod handoff {
         /// Read immutable issued lineage once for a fenced daemon inventory.
         /// Missing evidence grants no continuity; unsafe or ambiguous evidence
         /// is an error and remains untouched.
-        pub(crate) fn recovered_chats(&self) -> Result<RecoveredChats, String> {
+        pub fn recovered_chats(&self) -> Result<RecoveredChats, String> {
             let entries = self.read_recovered()?;
             let mut ids = std::collections::BTreeSet::new();
             if entries
@@ -2043,14 +2043,14 @@ pub(crate) mod handoff {
         /// Preserve aliases after the replay checkpoint is consumed. This file
         /// is read only to verify a live replacement, never to start a writer.
         #[cfg(any(feature = "host", test))]
-        pub(crate) fn record_recovered(&self, entries: &[RecoveredChat]) -> Result<(), String> {
+        pub fn record_recovered(&self, entries: &[RecoveredChat]) -> Result<(), String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             let bytes = self.recovered_bytes(entries)?;
             self.write_named(RECOVERED_FILE, &bytes)
         }
 
         #[cfg(feature = "host")]
-        pub(crate) fn preflight_recovered(&self, chats: &[Chat]) -> Result<(), String> {
+        pub fn preflight_recovered(&self, chats: &[Chat]) -> Result<(), String> {
             let entries = chats
                 .iter()
                 .map(|chat| {
@@ -2148,7 +2148,7 @@ pub(crate) mod handoff {
         }
 
         #[cfg(feature = "host")]
-        pub(crate) fn recovered_sources(
+        pub fn recovered_sources(
             &self,
             source: &chat::Session,
             replacement: &chat::Session,
@@ -2174,7 +2174,7 @@ pub(crate) mod handoff {
         }
 
         #[cfg(feature = "host")]
-        pub(crate) fn retire_recovered(&self, id: crate::model::TerminalId) -> Result<(), String> {
+        pub fn retire_recovered(&self, id: crate::model::TerminalId) -> Result<(), String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             let mut entries = self.read_recovered()?;
             let before = entries.len();

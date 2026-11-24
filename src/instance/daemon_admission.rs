@@ -8,7 +8,7 @@ use std::{
     time::Instant,
 };
 
-pub(crate) const DAEMON_FENCE_ENV: &str = "CAGENTS_DAEMON_LAUNCH_FENCE_FD";
+pub const DAEMON_FENCE_ENV: &str = "CAGENTS_DAEMON_LAUNCH_FENCE_FD";
 const DAEMON_FENCE_FD: i32 = 198;
 const MAX_CAPABILITY_BYTES: usize = 512;
 
@@ -466,7 +466,7 @@ pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result
 /// Acquire before mutable daemon ownership/socket/store operations and keep
 /// through listener readiness. No live window can publish midway through admit.
 #[cfg(any(feature = "host", test))]
-pub(crate) struct DaemonAdmissionGuard {
+pub struct DaemonAdmissionGuard {
     _launch: DaemonLaunch,
     _legacy: OwnedLock,
 }
@@ -483,7 +483,7 @@ enum DaemonLaunch {
 
 #[cfg(any(feature = "host", test))]
 impl DaemonAdmissionGuard {
-    pub(crate) fn acquire() -> io::Result<Self> {
+    pub fn acquire() -> io::Result<Self> {
         let runtime = runtime_directory()?;
         let launch = if let Some((file, descriptor)) = inherited_fence()? {
             upgrade_fence(&file)?;

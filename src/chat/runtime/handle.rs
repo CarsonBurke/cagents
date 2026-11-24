@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 pub struct Handle(Owner);
 /// Why a read of the conversation or its changed files failed.
 #[derive(Debug)]
-pub(crate) struct ReadFailure {
+pub struct ReadFailure {
     pub message: String,
     /// Whether the conversation's owner was alive when the read failed, so
     /// reading again can succeed. For the transcript the owner then asks the
@@ -33,8 +33,8 @@ enum Owner {
     Remote(RemoteActor),
 }
 /// Outcome observed after a fixture proxy has admitted an exact envelope.
-#[cfg(test)]
-pub(crate) enum RetainedInputOutcome {
+#[cfg(any(test, feature = "test-support"))]
+pub enum RetainedInputOutcome {
     Acknowledged(Result<(), String>),
     Unknown(String),
     Unavailable,
@@ -44,8 +44,8 @@ pub(crate) enum RetainedInputOutcome {
 impl Handle {
     /// A real remote proxy with no external provider or helper. The returned
     /// responder waits for actual production admission before settling it.
-    #[cfg(test)]
-    pub(crate) fn fixture_retained_input() -> (
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_retained_input() -> (
         Self,
         impl FnOnce(RetainedInputOutcome) -> u64 + Send + 'static,
     ) {
@@ -57,8 +57,8 @@ impl Handle {
     }
     /// A retained attachment for `source` whose helper is a script the test
     /// edits; see [`ScriptedHelper`](super::retained_actor::transport::scripted_helper::ScriptedHelper).
-    #[cfg(test)]
-    pub(crate) fn fixture_scripted(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_scripted(
         source: &crate::chat::Session,
         scope: Result<crate::account::scope::LaunchAccountScope, String>,
     ) -> (
@@ -70,22 +70,22 @@ impl Handle {
         (Self(Owner::Remote(remote)), helper)
     }
     /// A retained attachment whose proxy already recorded a terminal failure.
-    #[cfg(test)]
-    pub(crate) fn fixture_failed_remote() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_failed_remote() -> Self {
         Self(Owner::Remote(RemoteActor::completed_failure_fixture()))
     }
     /// Model the provider naming its conversation after it started, as a new
     /// one does.
-    #[cfg(test)]
-    pub(crate) fn fixture_publish_session(&self, session: String) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_publish_session(&self, session: String) {
         match &self.0 {
             Owner::Remote(remote) => remote.publish_session_fixture(session),
             Owner::Local(_) => panic!("session publication fixture requires a retained actor"),
         }
     }
     /// Model the provider confirming its conversation after this attachment.
-    #[cfg(test)]
-    pub(crate) fn fixture_confirm_session(&self, session: String) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_confirm_session(&self, session: String) {
         match &self.0 {
             Owner::Remote(remote) => remote.confirm_session_fixture(session),
             Owner::Local(_) => panic!("session confirmation fixture requires a retained actor"),
@@ -93,21 +93,21 @@ impl Handle {
     }
     /// Same retained actor identity, distinct proxy attachment allocations.
     /// Neither fixture has a live helper or permits real provider operations.
-    #[cfg(test)]
-    pub(crate) fn fixture_remote_attachment_pair() -> (Self, Self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_remote_attachment_pair() -> (Self, Self) {
         let first = RemoteActor::fixture();
         let second = first.distinct_attachment_fixture();
         (Self(Owner::Remote(first)), Self(Owner::Remote(second)))
     }
-    #[cfg(test)]
-    pub(crate) fn local_command_queue_is_empty(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn local_command_queue_is_empty(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.0.commands.is_empty(),
             Owner::Remote(_) => panic!("courier barrier fixture requires a local actor"),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn start(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
@@ -118,7 +118,7 @@ impl Handle {
         LocalHandle::start(spec, adapter, initial, store, session_id, notify)
             .map(|local| Self(Owner::Local(local)))
     }
-    pub(crate) fn start_owned(
+    pub fn start_owned(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
@@ -138,7 +138,7 @@ impl Handle {
         )
         .map(|local| Self(Owner::Local(local)))
     }
-    pub(crate) fn start_adopted(
+    pub fn start_adopted(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
@@ -150,7 +150,7 @@ impl Handle {
         LocalHandle::start_adopted(spec, adapter, initial, store, recovery, holder, notify)
             .map(|local| Self(Owner::Local(local)))
     }
-    pub(crate) fn start_remote_owned(
+    pub fn start_remote_owned(
         spec: ProcessSpec,
         source: chat::Session,
         prepared_identity: chat::protocol::claude::PreparedIdentity,
@@ -166,7 +166,7 @@ impl Handle {
         )
         .map(|remote| Self(Owner::Remote(remote)))
     }
-    pub(crate) fn adopt_remote(
+    pub fn adopt_remote(
         record: &crate::daemon::holder_registry::Record,
         source: chat::Session,
         proof: crate::model::HostSessionProof,
@@ -174,7 +174,7 @@ impl Handle {
     ) -> Result<Self, String> {
         RemoteActor::adopt(record, source, proof, notify).map(|remote| Self(Owner::Remote(remote)))
     }
-    pub(crate) fn adopt_remote_for_close(
+    pub fn adopt_remote_for_close(
         record: &crate::daemon::holder_registry::Record,
         source: chat::Session,
         proof: crate::model::HostSessionProof,
@@ -183,23 +183,34 @@ impl Handle {
         RemoteActor::adopt_for_close(record, source, proof, notify)
             .map(|remote| Self(Owner::Remote(remote)))
     }
-    pub(crate) fn is_close_only(&self) -> bool {
+    /// Lets the daemon open, with `recognizer`, the frames it sealed in what
+    /// a retained helper built before them shows as a person's prompts. A
+    /// conversation this process owns opens them itself.
+    pub fn open_frames_for_older_helper(
+        &self,
+        recognizer: &std::sync::Arc<crate::agent_execution::mailbox::Recognizer>,
+    ) {
+        if let Owner::Remote(remote) = &self.0 {
+            remote.open_frames_for_older_helper(recognizer);
+        }
+    }
+    pub fn is_close_only(&self) -> bool {
         matches!(&self.0, Owner::Remote(remote) if remote.is_close_only())
     }
-    pub(crate) fn inspect_remote(
+    pub fn inspect_remote(
         record: &crate::daemon::holder_registry::Record,
         proof: crate::model::HostSessionProof,
     ) -> Result<super::retained_actor::transport::ActorInspection, String> {
         RemoteActor::inspect(record, proof)
     }
-    pub(crate) fn inspect_remote_until(
+    pub fn inspect_remote_until(
         record: &crate::daemon::holder_registry::Record,
         proof: crate::model::HostSessionProof,
         deadline: std::time::Instant,
     ) -> Result<super::retained_actor::transport::ActorInspection, String> {
         RemoteActor::inspect_until(record, proof, deadline)
     }
-    pub(crate) fn retained_close_proved(
+    pub fn retained_close_proved(
         &self,
         source: &chat::Session,
         proof: &crate::model::HostSessionProof,
@@ -209,47 +220,47 @@ impl Handle {
             Owner::Local(_) => Ok(false),
         }
     }
-    pub(crate) fn inspect_retained_retirement(
+    pub fn inspect_retained_retirement(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,
     ) -> Result<super::RetirementInspection, String> {
         RemoteActor::inspect_retained_retirement(record, proof)
     }
-    pub(crate) fn inspect_abandoned_actor(
+    pub fn inspect_abandoned_actor(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,
     ) -> Result<bool, String> {
         RemoteActor::inspect_abandoned(record, proof)
     }
-    #[cfg(test)]
-    pub(crate) fn retired_actor_receipt(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn retired_actor_receipt(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,
     ) -> Result<Option<super::retained_actor::transport::RetirementReceipt>, String> {
         RemoteActor::retired_actor_receipt(record, proof)
     }
-    pub(crate) fn compact_retired_receipt(
+    pub fn compact_retired_receipt(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,
     ) -> Result<u64, String> {
         RemoteActor::compact_retired_receipt(record, proof)
     }
-    pub(crate) fn is_remote_record(record: &crate::daemon::holder_registry::Record) -> bool {
+    pub fn is_remote_record(record: &crate::daemon::holder_registry::Record) -> bool {
         RemoteActor::is_record(record)
     }
-    pub(crate) fn wake_retained_outcomes(&self) {
+    pub fn wake_retained_outcomes(&self) {
         if let Owner::Remote(remote) = &self.0 {
             remote.wake_outcomes();
         }
     }
     /// See [`RemoteActor::uncommitted_outcomes`].
-    pub(crate) fn uncommitted_outcomes(&self) -> Result<Vec<OutboxEntry>, String> {
+    pub fn uncommitted_outcomes(&self) -> Result<Vec<OutboxEntry>, String> {
         match &self.0 {
             Owner::Remote(remote) => remote.uncommitted_outcomes(),
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
-    pub(crate) fn retained_outcome_clock_until(
+    pub fn retained_outcome_clock_until(
         &self,
         deadline: std::time::Instant,
     ) -> Result<(u64, u64), String> {
@@ -259,7 +270,7 @@ impl Handle {
         remote.outcome_clock_until(deadline)
     }
     /// See [`RemoteActor::uncommitted_outcomes_until`].
-    pub(crate) fn uncommitted_outcomes_until(
+    pub fn uncommitted_outcomes_until(
         &self,
         deadline: std::time::Instant,
     ) -> Result<Vec<OutboxEntry>, String> {
@@ -268,7 +279,7 @@ impl Handle {
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
-    pub(crate) fn recognize_retained_sources_until(
+    pub fn recognize_retained_sources_until(
         &self,
         sources: &[chat::Session],
         deadline: std::time::Instant,
@@ -280,26 +291,26 @@ impl Handle {
             _ => Err("This actor has no retained source authority".into()),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
         match &self.0 {
             Owner::Local(local) => local.provider_process(),
             Owner::Remote(remote) => remote.state().provider_process.clone(),
         }
     }
-    pub(crate) fn actor_identity(&self) -> Option<ActorIdentity> {
+    pub fn actor_identity(&self) -> Option<ActorIdentity> {
         match &self.0 {
             Owner::Remote(remote) => Some(remote.identity()),
             _ => None,
         }
     }
-    pub(crate) fn commit_retained_outcomes(&self, through: u64) -> Result<(), String> {
+    pub fn commit_retained_outcomes(&self, through: u64) -> Result<(), String> {
         match &self.0 {
             Owner::Remote(remote) => remote.call("ack_outbox", serde_json::json!([through])),
             _ => Err("This actor has no remote outbox".into()),
         }
     }
-    pub(crate) fn commit_retained_outcomes_until(
+    pub fn commit_retained_outcomes_until(
         &self,
         through: u64,
         deadline: std::time::Instant,
@@ -311,16 +322,14 @@ impl Handle {
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn pending_retained_inputs(
-        &self,
-    ) -> Vec<super::retained_actor::journal::InputIdentity> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_retained_inputs(&self) -> Vec<super::retained_actor::journal::InputIdentity> {
         match &self.0 {
             Owner::Remote(remote) => remote.pending_inputs(),
             _ => Vec::new(),
         }
     }
-    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+    pub fn same_actor(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (Owner::Local(a), Owner::Local(b)) => a.same_actor(b),
             (Owner::Remote(a), Owner::Remote(b)) => a.identity() == b.identity(),
@@ -328,17 +337,14 @@ impl Handle {
         }
     }
     /// Identity alone survives epoch changes; grants retain this exact proxy.
-    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+    pub fn same_attachment(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (Owner::Local(a), Owner::Local(b)) => a.same_actor(b),
             (Owner::Remote(a), Owner::Remote(b)) => a.same_attachment(b),
             _ => false,
         }
     }
-    pub(crate) fn resolve_retained_source(
-        &self,
-        source: &chat::Session,
-    ) -> Result<chat::Session, String> {
+    pub fn resolve_retained_source(&self, source: &chat::Session) -> Result<chat::Session, String> {
         match &self.0 {
             Owner::Remote(remote) => remote.resolve_source(source),
             _ => Err("This actor has no retained source resolver".into()),
@@ -354,7 +360,7 @@ impl Handle {
         }
     }
     /// Delivers work through the daemon's ledger, which outlives this owner.
-    pub(crate) fn deliver(
+    pub fn deliver(
         &self,
         deliveries: &super::Deliveries,
         chat: crate::model::TerminalId,
@@ -368,23 +374,20 @@ impl Handle {
         }
         .map_err(String::from)
     }
-    pub(crate) fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
+    pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
         match &self.0 {
             Owner::Local(local) => local.try_idle_prompt(text),
             Owner::Remote(remote) => remote.try_idle_prompt(text),
         }
     }
     /// Exact source recognition is checked by the helper under this attachment epoch.
-    pub(crate) fn recognize_retained_sources(
-        &self,
-        sources: &[chat::Session],
-    ) -> Result<(), String> {
+    pub fn recognize_retained_sources(&self, sources: &[chat::Session]) -> Result<(), String> {
         match &self.0 {
             Owner::Remote(remote) => remote.call("recognize_sources", serde_json::json!([sources])),
             Owner::Local(_) => Err("This actor has no retained source authority".into()),
         }
     }
-    pub(crate) fn command_for_run(
+    pub fn command_for_run(
         &self,
         run: crate::model::RunId,
         command: Command,
@@ -394,7 +397,7 @@ impl Handle {
             Owner::Remote(remote) => remote.submit(Some(run), command).map_err(String::from),
         }
     }
-    pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
+    pub fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.close_if_idle_for_resume(generation),
             Owner::Remote(remote) => {
@@ -402,16 +405,16 @@ impl Handle {
             }
         }
     }
-    pub(crate) fn check_update_readiness(&self) -> Result<UpdateReadiness, String> {
+    pub fn check_update_readiness(&self) -> Result<UpdateReadiness, String> {
         match &self.0 {
             Owner::Local(local) => local.check_update_readiness(),
             Owner::Remote(remote) => remote.call("readiness", serde_json::Value::Null),
         }
     }
-    pub(crate) fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
+    pub fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
         self.interrupt_owned(Some(run), false)
     }
-    pub(crate) fn interrupt_owned(
+    pub fn interrupt_owned(
         &self,
         run: Option<crate::model::RunId>,
         including_subagents: bool,
@@ -421,7 +424,7 @@ impl Handle {
             Owner::Remote(remote) => remote.interrupt(run, including_subagents),
         }
     }
-    pub(crate) fn update_native_source(
+    pub fn update_native_source(
         &self,
         source: chat::Session,
         execution_console: Option<crate::model::LaunchRecipe>,
@@ -443,7 +446,7 @@ impl Handle {
             Owner::Remote(remote) => remote.set_visible(visible),
         }
     }
-    pub(crate) fn observe_next_update(&self) -> u64 {
+    pub fn observe_next_update(&self) -> u64 {
         match &self.0 {
             Owner::Local(local) => local.observe_next_update(),
             Owner::Remote(remote) => remote.observe_next_update(),
@@ -451,10 +454,7 @@ impl Handle {
     }
     /// Answer a changed files query from the cached edit metadata. Only
     /// [`Command::queries_file_changes`] commands are queries.
-    pub(crate) fn file_query(
-        &self,
-        command: &Command,
-    ) -> Result<chat::FileChangeReply, ReadFailure> {
+    pub fn file_query(&self, command: &Command) -> Result<chat::FileChangeReply, ReadFailure> {
         let reply = match &self.0 {
             Owner::Local(local) => local.file_query(command)?,
             Owner::Remote(remote) => remote.file_query(command)?,
@@ -462,7 +462,7 @@ impl Handle {
         reply.ok_or_else(|| ReadFailure::from("Expected a changed files query".to_string()))
     }
     /// Copy is served by the same Store which published the immutable source.
-    pub(crate) fn text_copy(
+    pub fn text_copy(
         &self,
         source: &chat::TextCopySource,
         offset: u64,
@@ -472,7 +472,7 @@ impl Handle {
             Owner::Remote(remote) => remote.call("text_copy", serde_json::json!([source, offset])),
         }
     }
-    pub(crate) fn history_is_covered_by(&self, reloaded: &Store) -> Result<bool, String> {
+    pub fn history_is_covered_by(&self, reloaded: &Store) -> Result<bool, String> {
         match &self.0 {
             Owner::Local(local) => local.history_is_covered_by(reloaded),
             Owner::Remote(_) => Err(
@@ -480,10 +480,10 @@ impl Handle {
             ),
         }
     }
-    pub(crate) fn is_read_only_history(&self) -> bool {
+    pub fn is_read_only_history(&self) -> bool {
         matches!(&self.0, Owner::Local(local) if local.is_read_only_history())
     }
-    pub(crate) fn resident_generation(&self) -> u64 {
+    pub fn resident_generation(&self) -> u64 {
         match &self.0 {
             Owner::Local(local) => {
                 local
@@ -496,7 +496,7 @@ impl Handle {
             Owner::Remote(remote) => remote.state().generation,
         }
     }
-    pub(crate) fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
+    pub fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
         match &self.0 {
             Owner::Local(local) => local.try_close_if_idle(generation),
             Owner::Remote(remote) => remote.try_close_if_idle(generation),
@@ -505,7 +505,7 @@ impl Handle {
     /// Ends an idle conversation's provider when `generation` is still
     /// current, with `detached` deciding what it leaves running, as a close
     /// does. False means the conversation changed and nothing stopped.
-    pub(crate) fn try_stop_if_idle(
+    pub fn try_stop_if_idle(
         &self,
         generation: u64,
         detached: crate::daemon::owned_children::DetachedWork,
@@ -515,25 +515,25 @@ impl Handle {
             Owner::Remote(remote) => remote.try_stop_if_idle(generation, detached),
         }
     }
-    pub(crate) fn usage(&self) -> chat::Usage {
+    pub fn usage(&self) -> chat::Usage {
         match &self.0 {
             Owner::Local(local) => local.usage(),
             Owner::Remote(remote) => remote.state().usage.clone(),
         }
     }
-    pub(crate) fn refresh_retained_state(&self) -> Result<(), String> {
+    pub fn refresh_retained_state(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(_) => Ok(()),
             Owner::Remote(remote) => remote.refresh_state(),
         }
     }
-    pub(crate) fn continuity_loss(&self) -> Option<super::retained_actor::journal::ContinuityLoss> {
+    pub fn continuity_loss(&self) -> Option<super::retained_actor::journal::ContinuityLoss> {
         match &self.0 {
             Owner::Local(_) => None,
             Owner::Remote(remote) => remote.state().continuity_loss.clone(),
         }
     }
-    pub(crate) fn ack_continuity_loss(&self, id: uuid::Uuid) -> Result<(), String> {
+    pub fn ack_continuity_loss(&self, id: uuid::Uuid) -> Result<(), String> {
         match &self.0 {
             Owner::Local(_) => {
                 Err("This local actor has no retained continuity loss receipt".into())
@@ -541,14 +541,14 @@ impl Handle {
             Owner::Remote(remote) => remote.call("ack_loss", serde_json::json!([id])),
         }
     }
-    pub(crate) fn retained_runs(&self) -> Vec<crate::model::RunId> {
+    pub fn retained_runs(&self) -> Vec<crate::model::RunId> {
         match &self.0 {
             Owner::Local(_) => Vec::new(),
             Owner::Remote(remote) => remote.state().retained_runs.clone(),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn attachment_snapshot(&self) -> Snapshot {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attachment_snapshot(&self) -> Snapshot {
         match &self.0 {
             Owner::Local(local) => local.snapshot(None).expect("unconditional local snapshot"),
             Owner::Remote(remote) => remote.attachment_snapshot(),
@@ -570,7 +570,7 @@ impl Handle {
             Owner::Remote(remote) => remote.snapshot(after),
         }
     }
-    pub(crate) fn presentation_wire(
+    pub fn presentation_wire(
         &self,
         chat_id: crate::model::TerminalId,
         after: Option<u64>,
@@ -592,7 +592,7 @@ impl Handle {
             Owner::Remote(remote) => remote.state().session_id.clone(),
         }
     }
-    pub(crate) fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.is_ready(),
             Owner::Remote(remote) => remote.state().ready,
@@ -600,36 +600,31 @@ impl Handle {
     }
     /// How long a server this conversation launched has waited behind another
     /// process's file lock. A retained remote actor launches none here.
-    pub(crate) fn startup_lock_wait(&self) -> std::time::Duration {
+    pub fn startup_lock_wait(&self) -> std::time::Duration {
         match &self.0 {
             Owner::Local(local) => local.startup_lock_wait(),
             Owner::Remote(_) => std::time::Duration::ZERO,
         }
     }
-    pub(crate) fn confirmed_session_id(&self) -> Option<String> {
+    pub fn confirmed_session_id(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.confirmed_session_id(),
             Owner::Remote(remote) => remote.state().confirmed_session.clone(),
         }
     }
-    pub(crate) fn launch_account_scope(
-        &self,
-    ) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
+    pub fn launch_account_scope(&self) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
         match &self.0 {
             Owner::Local(local) => local.launch_account_scope(),
             Owner::Remote(remote) => remote.launch_account_scope(),
         }
     }
-    pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
+    pub fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         match &self.0 {
             Owner::Local(local) => local.execution_environment(),
             Owner::Remote(remote) => remote.execution_environment(),
         }
     }
-    pub(crate) fn recovery_environment_matches(
-        &self,
-        environment: &BTreeMap<String, String>,
-    ) -> bool {
+    pub fn recovery_environment_matches(&self, environment: &BTreeMap<String, String>) -> bool {
         match &self.0 {
             Owner::Local(local) => local.recovery_environment_matches(environment),
             Owner::Remote(remote) => remote.recovery_environment_matches(environment),
@@ -657,7 +652,7 @@ impl Handle {
     }
     /// The conversation's prompt cache activity, and the context its next
     /// request reads, as of the latest observation.
-    pub(crate) fn prompt_cache(&self) -> (chat::prompt_cache::Activity, u64) {
+    pub fn prompt_cache(&self) -> (chat::prompt_cache::Activity, u64) {
         match &self.0 {
             Owner::Local(local) => (local.prompt_cache(), local.context_tokens()),
             Owner::Remote(remote) => {
@@ -672,7 +667,7 @@ impl Handle {
             Owner::Remote(remote) => remote.owns_work(),
         }
     }
-    pub(crate) fn activity(&self) -> crate::agent::ActivityState {
+    pub fn activity(&self) -> crate::agent::ActivityState {
         match &self.0 {
             Owner::Local(local) => local.activity(),
             Owner::Remote(remote) => remote.state().activity,
@@ -680,7 +675,7 @@ impl Handle {
     }
     /// Whether the conversation's own turn is under way or awaiting the user,
     /// apart from its background children.
-    pub(crate) fn turn_accepted(&self) -> bool {
+    pub fn turn_accepted(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.turn_accepted(),
             Owner::Remote(remote) => {
@@ -689,7 +684,7 @@ impl Handle {
             }
         }
     }
-    pub(crate) fn update_activity(&self) -> (bool, bool) {
+    pub fn update_activity(&self) -> (bool, bool) {
         match &self.0 {
             Owner::Local(local) => local.update_activity(),
             Owner::Remote(remote) => {
@@ -705,13 +700,13 @@ impl Handle {
         }
     }
     /// What holds the conversation, in the terms its reader knows it by.
-    pub(crate) fn work_hold(&self) -> chat::WorkHold {
+    pub fn work_hold(&self) -> chat::WorkHold {
         match &self.0 {
             Owner::Local(local) => local.work_hold(),
             Owner::Remote(remote) => remote.state().work_hold(),
         }
     }
-    pub(crate) fn is_idle(&self) -> bool {
+    pub fn is_idle(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.is_idle(),
             Owner::Remote(remote) => remote.state().idle,
@@ -719,7 +714,7 @@ impl Handle {
     }
     /// The provider-confirmed permission mode. A local actor reads it
     /// without publishing a snapshot.
-    pub(crate) fn permission_mode(&self) -> Option<String> {
+    pub fn permission_mode(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.permission_mode(),
             Owner::Remote(remote) => remote
@@ -727,13 +722,13 @@ impl Handle {
                 .and_then(|snapshot| snapshot.permission_mode),
         }
     }
-    pub(crate) fn requests(&self) -> Vec<chat::Request> {
+    pub fn requests(&self) -> Vec<chat::Request> {
         match &self.0 {
             Owner::Local(local) => local.requests(),
             Owner::Remote(remote) => remote.state().requests.clone(),
         }
     }
-    pub(crate) fn background_subagents(&self) -> Vec<String> {
+    pub fn background_subagents(&self) -> Vec<String> {
         match &self.0 {
             Owner::Local(local) => local.background_subagents(),
             Owner::Remote(remote) => remote.state().background_subagents.clone(),
@@ -741,20 +736,20 @@ impl Handle {
     }
     /// How many background tasks the provider reports live, or `None` from
     /// a helper that predates reporting them.
-    pub(crate) fn background_tasks(&self) -> Option<usize> {
+    pub fn background_tasks(&self) -> Option<usize> {
         match &self.0 {
             Owner::Local(local) => Some(local.background_tasks()),
             Owner::Remote(remote) => remote.state().background_tasks,
         }
     }
-    pub(crate) fn interrupt_subagents(&self) -> Vec<String> {
+    pub fn interrupt_subagents(&self) -> Vec<String> {
         match &self.0 {
             Owner::Local(local) => local.interrupt_subagents(),
             Owner::Remote(remote) => remote.state().interrupt_subagents.clone(),
         }
     }
     /// Provider-confirmed model status from the local or retained owner.
-    pub(crate) fn active_model(&self) -> (u64, Option<chat::ActiveModel>) {
+    pub fn active_model(&self) -> (u64, Option<chat::ActiveModel>) {
         match &self.0 {
             Owner::Local(local) => local.active_model(),
             Owner::Remote(remote) => {
@@ -765,32 +760,32 @@ impl Handle {
     }
     /// How the provider addresses the conversation's subagents, where that
     /// is not by the IDs its snapshot lists them under.
-    pub(crate) fn agent_addresses(&self) -> Vec<chat::AgentAddress> {
+    pub fn agent_addresses(&self) -> Vec<chat::AgentAddress> {
         match &self.0 {
             Owner::Local(local) => local.agent_addresses(),
             Owner::Remote(remote) => remote.state().agent_addresses.clone(),
         }
     }
-    pub(crate) fn title(&self) -> Option<String> {
+    pub fn title(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.title(),
             Owner::Remote(remote) => remote.state().title.clone(),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn resource_lifetime(&self) -> Box<dyn Fn() -> bool> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resource_lifetime(&self) -> Box<dyn Fn() -> bool> {
         match &self.0 {
             Owner::Local(local) => Box::new(local.resource_lifetime()),
             Owner::Remote(remote) => remote.resource_lifetime(),
         }
     }
-    pub(crate) fn finish_retained_close(&self) -> Result<(), String> {
+    pub fn finish_retained_close(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(_) => Ok(()),
             Owner::Remote(remote) => remote.finish_close(),
         }
     }
-    pub(crate) fn commit_native_installation(&self) -> Result<(), String> {
+    pub fn commit_native_installation(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => {
                 local.commit_native_installation();
@@ -799,13 +794,13 @@ impl Handle {
             Owner::Remote(remote) => remote.commit_installation(),
         }
     }
-    pub(crate) fn native_continuity(&self) -> chat::NativeContinuity {
+    pub fn native_continuity(&self) -> chat::NativeContinuity {
         match &self.0 {
             Owner::Local(local) => local.native_continuity(),
             Owner::Remote(remote) => remote.state().native_continuity.clone(),
         }
     }
-    pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
+    pub fn preserve_for_restart(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.preserve_for_restart(),
             Owner::Remote(remote) => remote.preserve(),
@@ -814,16 +809,13 @@ impl Handle {
     /// Decides, before any close, whether it leaves running the work the
     /// provider had already detached from itself, such as a server a command
     /// started with `nohup`. Closes that have not decided stop it.
-    pub(crate) fn decide_detached_work(
-        &self,
-        detached: crate::daemon::owned_children::DetachedWork,
-    ) {
+    pub fn decide_detached_work(&self, detached: crate::daemon::owned_children::DetachedWork) {
         match &self.0 {
             Owner::Local(local) => local.decide_detached_work(detached),
             Owner::Remote(remote) => remote.decide_detached_work(detached),
         }
     }
-    pub(crate) fn close_for_resume(&self) -> Result<(), String> {
+    pub fn close_for_resume(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.close_for_resume(),
             Owner::Remote(remote) => remote.close(),
@@ -835,31 +827,27 @@ impl Handle {
             Owner::Remote(remote) => remote.close(),
         }
     }
-    pub(crate) fn decline_answer(&self, command: Command) -> Result<(), String> {
+    pub fn decline_answer(&self, command: Command) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.decline_answer(command),
             Owner::Remote(remote) => remote.decline_answer(command),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn conversation_title(
-        &self,
-    ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn conversation_title(&self) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
         match &self.0 {
             Owner::Local(local) => local.conversation_title(),
             Owner::Remote(remote) => remote.conversation_title(),
         }
     }
-    pub(crate) fn conversation_naming(
-        &self,
-    ) -> Result<super::ConversationNaming, TitleUnavailable> {
+    pub fn conversation_naming(&self) -> Result<super::ConversationNaming, TitleUnavailable> {
         match &self.0 {
             Owner::Local(local) => local.conversation_naming(),
             Owner::Remote(remote) => remote.conversation_naming(),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn fixture_retained_native_holder(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_retained_native_holder(
         &self,
         holder: chat::native_holder::Holder,
         reason: String,

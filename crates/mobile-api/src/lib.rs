@@ -31,6 +31,8 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 
 use serde::{Deserialize, Serialize};
 
+pub mod pairing;
+
 /// The newest API version this build speaks.
 pub const API_VERSION: u32 = 1;
 /// The oldest API version this build still serves.
@@ -621,6 +623,11 @@ pub enum ItemBody {
         delivery: DeliveryKind,
         /// The sender's name; may be empty.
         from: String,
+        /// What tells two senders of one name apart, never for display: a
+        /// message's sending session as its short ID, or a report's task ID.
+        /// Empty when there is none, and absent from older servers.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sender: String,
         summary: String,
         body: String,
         clipped: bool,
@@ -713,6 +720,9 @@ pub struct Notifications {
 pub struct Notice {
     pub id: String,
     pub kind: NoticeKind,
+    /// Whether the notice asks something of the person reading it.
+    #[serde(default)]
+    pub asks: bool,
     /// A short heading, such as `Agent needs your attention`.
     pub title: String,
     /// The session it is about, when it is about one.

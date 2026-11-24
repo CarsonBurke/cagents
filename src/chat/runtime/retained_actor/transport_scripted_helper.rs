@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 
 /// What the scripted helper reports and what the daemon asked of it.
 #[derive(Default)]
-pub(crate) struct Script {
+pub struct Script {
     pub confirmed_session: Option<String>,
     pub continuity_loss: Option<ContinuityLoss>,
     pub retained_runs: Vec<crate::model::RunId>,
@@ -19,12 +19,12 @@ pub(crate) struct Script {
 }
 
 impl Script {
-    pub(crate) fn calls_of(&self, method: &str) -> usize {
+    pub fn calls_of(&self, method: &str) -> usize {
         self.calls.iter().filter(|call| *call == method).count()
     }
 }
 
-pub(crate) struct ScriptedHelper {
+pub struct ScriptedHelper {
     pub script: Arc<Mutex<Script>>,
     socket: PathBuf,
     stop: Arc<AtomicBool>,

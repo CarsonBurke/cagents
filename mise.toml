@@ -8,13 +8,14 @@
 zig = "0.15.2"
 
 # Each implementation graph is its own Cargo invocation. Cargo features are
-# package-wide, so no task combines `host` with `ui`. The UI lanes select the
-# cagents-ui package, which holds the application, and cagents-ui-kit, its
+# package-wide, so no task combines `host` with `ui`. The host lane selects the
+# shared library and cagents-host, the daemon built on it. The UI lanes select
+# the cagents-ui package, which holds the application, and cagents-ui-kit, its
 # widgets and views; `ui` also selects the shared library, so one invocation
 # covers every package's targets in that graph.
 [vars]
 cli = "--locked --no-default-features"
-host = "--locked --no-default-features --features host"
+host = "--locked --no-default-features --package cagents --package cagents-host --features cagents/host"
 ui = "--locked --no-default-features --package cagents --package cagents-ui --package cagents-ui-kit --features cagents/ui"
 # The integrated browser with its Wayland registry test server, which the
 # browser tests use, as main's build check selects it.
@@ -81,7 +82,7 @@ usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-t
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.cli}} "$@"'
 
 [tasks."check:host"]
-description = "Type-check and lint the terminal daemon lane"
+description = "Type-check and lint the terminal daemon lane: the daemon and the shared library it builds on"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.host}} "$@"'
 
@@ -147,7 +148,7 @@ run = [
 ]
 
 [tasks."test:host"]
-description = "Test the terminal daemon lane"
+description = "Test the terminal daemon lane: the daemon and the shared library it builds on"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.host}} "$@"',

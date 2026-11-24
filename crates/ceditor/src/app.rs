@@ -3096,11 +3096,7 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
                                     widget::button::custom(
                                         widget::row::with_children(vec![
                                     widget::container(icon).center_y(Length::Fill).into(),
-                                    design::body(title.clone())
-                                        .wrapping(iced::widget::text::Wrapping::None)
-                                        .ellipsize(iced::widget::text::Ellipsize::End(
-                                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                        ))
+                                    cagents_ui_kit::ui_controls::fade_text(title.clone())
                                         .width(Length::Fill)
                                         .into(),
                                 ])

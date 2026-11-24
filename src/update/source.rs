@@ -23,7 +23,7 @@ use std::{
 
 /// A source daemon authenticated at the protocol it serves: its exact local
 /// peer is pinned and rechecked against the kernel-held lease per request.
-pub(crate) struct Client {
+pub struct Client {
     pub(super) client: ControlClient,
     pub(super) peer: Peer,
     /// How long requests the source refuses as busy are asked again.
@@ -73,7 +73,7 @@ const SOURCE_BUSY_PATIENCE: Duration = Duration::from_secs(30);
 
 /// How long source requests refused as busy keep being asked again.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum BusyPatience {
+pub enum BusyPatience {
     /// Each request may be asked again for this long.
     PerRequest(Duration),
     /// Every request shares this deadline, so a run of several requests ends
@@ -87,7 +87,7 @@ impl BusyPatience {
     pub(crate) const PER_REQUEST: Self = Self::PerRequest(SOURCE_BUSY_PATIENCE);
     /// Each request is asked once; a busy refusal is final.
     #[cfg(any(feature = "host", test))]
-    pub(crate) const ONCE: Self = Self::PerRequest(Duration::ZERO);
+    pub const ONCE: Self = Self::PerRequest(Duration::ZERO);
 
     /// One deadline, `patience` from now, for every request that uses it.
     pub(crate) fn shared_for(patience: Duration) -> Self {
@@ -293,7 +293,7 @@ fn process_start(pid: u32) -> Result<String, UpdateError> {
 }
 
 impl Client {
-    pub(crate) fn connect(socket: &Path) -> Result<Self, ControlError> {
+    pub fn connect(socket: &Path) -> Result<Self, ControlError> {
         if crate::device::is_remote() {
             return Err(ControlError::Configure(io::Error::other(
                 "Cross-version application upgrades require the local source daemon",
@@ -446,11 +446,11 @@ impl Client {
         self.peer.pid
     }
 
-    pub(crate) fn protocol(&self) -> u16 {
+    pub fn protocol(&self) -> u16 {
         self.client.protocol()
     }
 
-    pub(crate) fn proof(&self) -> &HostSessionProof {
+    pub fn proof(&self) -> &HostSessionProof {
         self.client.proof()
     }
 
@@ -565,7 +565,7 @@ impl Client {
 
     /// Capture history once, immediately before a confirmed service stop. The
     /// returned snapshot is not evidence that shutdown was accepted.
-    pub(crate) fn capture_chat_snapshot(
+    pub fn capture_chat_snapshot(
         &mut self,
         session: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, UpdateError> {
@@ -655,8 +655,8 @@ impl InstalledIdentity {
 /// readiness checks on every qualified source. A source sends the chat
 /// events in [`UNSOLICITED_SINCE`] unasked once its protocol has them.
 /// Keep this beside source admission so adding support always runs the proof.
-#[cfg(test)]
-pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
+#[cfg(any(test, feature = "test-support"))]
+pub const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
     (
         "ClientRequest",
         &[
@@ -731,8 +731,8 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
 /// Chat events a source sends attached clients unasked, from the protocol
 /// that introduced each. The source clients accept them, so a source serving
 /// one must send it as this build reads it.
-#[cfg(test)]
-pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
+#[cfg(any(test, feature = "test-support"))]
+pub const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
     ("ServerMessage", "chat_limit", 160),
     ("ServerMessage", "chat_agent_addresses", 173),
     ("ServerMessage", "chat_active_model", 182),
@@ -742,8 +742,8 @@ pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
 /// Lifecycle requests and their replies that the source clients use only with
 /// a source whose protocol has them, from the protocol that introduced each.
 /// From there they are frozen like the rest of [`LIFECYCLE_VARIANTS`].
-#[cfg(test)]
-pub(crate) const LIFECYCLE_SINCE: &[(&str, &str, u16)] = &[
+#[cfg(any(test, feature = "test-support"))]
+pub const LIFECYCLE_SINCE: &[(&str, &str, u16)] = &[
     ("ClientRequest", "ListPage", 190),
     ("ServerResponse", "listed_page", 190),
 ];
@@ -894,10 +894,14 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         202,
         "intermediate #3840 protocol; no release qualified as a live-update source",
     ),
+    (
+        203,
+        "intermediate #3900 protocol; superseded by 205 without a qualified installed update source",
+    ),
 ];
 
-#[cfg(test)]
-pub(crate) fn protocols() -> impl Iterator<Item = u16> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn protocols() -> impl Iterator<Item = u16> {
     RELEASED_SOURCES
         .iter()
         .map(|source| source.protocol)
@@ -908,7 +912,7 @@ pub(crate) fn protocols() -> impl Iterator<Item = u16> {
 /// Whether a live update may start from a daemon serving this protocol. Every
 /// qualified source speaks this release's wire for the frozen lifecycle and
 /// inspector subset, so one client serves them all.
-pub(crate) fn is_qualified_source(protocol: u16) -> bool {
+pub fn is_qualified_source(protocol: u16) -> bool {
     protocol == crate::terminal_ipc::PROTOCOL_VERSION
         || RELEASED_SOURCES
             .iter()

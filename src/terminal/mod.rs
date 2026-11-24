@@ -1,5 +1,5 @@
 #[cfg(feature = "host")]
-pub(crate) mod holder;
+pub mod holder;
 mod hosted;
 pub mod ipc;
 #[cfg(feature = "host")]
@@ -27,8 +27,8 @@ mod worker;
 pub const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 
-#[cfg(all(test, feature = "host"))]
-pub(crate) use hosted::RetainedPresentationFixture;
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub use hosted::RetainedPresentationFixture;
 pub use hosted::{
     HostedTerminalHandle, HostedTerminalStartError, ReadyDaemon, connect_ready_daemon,
     connect_ready_daemon_for, ensure_daemon_ready, ensure_daemon_ready_for,
@@ -49,17 +49,17 @@ pub use types::{
 pub use widget::ReviewInputBarrier;
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
-#[cfg(all(test, feature = "host"))]
-pub(crate) use worker::RenderStreamFixture;
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub use worker::RenderStreamFixture;
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
 #[cfg(feature = "host")]
-pub(crate) use worker::TerminalRetirement;
+pub use worker::TerminalRetirement;
 #[cfg(feature = "host")]
-pub(crate) use worker::UpgradeSnapshot;
+pub use worker::UpgradeSnapshot;
 #[cfg(feature = "host")]
-pub(crate) use worker::WeakTerminalHandle;
-#[cfg(all(test, feature = "host"))]
-pub(crate) use worker::flush_archived_notices;
+pub use worker::WeakTerminalHandle;
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub use worker::flush_archived_notices;
 #[cfg(feature = "host")]
-pub(crate) use worker::holder::inspect as inspect_holder;
+pub use worker::holder::inspect as inspect_holder;

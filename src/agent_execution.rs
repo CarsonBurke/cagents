@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 #[cfg(feature = "host")]
-pub(crate) mod bundled;
+pub mod bundled;
 pub mod directory;
 pub mod mailbox;
 pub mod permission;
@@ -131,7 +131,7 @@ impl Authority {
 /// Internal acceptance failures; these are never serialized onto the wire.
 #[cfg(feature = "host")]
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AcceptanceError {
+pub enum AcceptanceError {
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -531,14 +531,14 @@ impl Agent {
 /// replacement directory or blocking interruption of an existing provider.
 #[cfg(feature = "host")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DirectoryIdentity {
+pub struct DirectoryIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
 #[cfg(feature = "host")]
 impl DirectoryIdentity {
-    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
         Self {
             device: metadata.dev(),
@@ -590,7 +590,7 @@ impl ResultSummary {
     }
 }
 
-pub(crate) fn truncate(text: &mut String, limit: usize) -> bool {
+pub fn truncate(text: &mut String, limit: usize) -> bool {
     if text.len() <= limit {
         return false;
     }
