@@ -134,15 +134,20 @@ fi
 
 # Look up the checkout only when this process is about to run the pruner.
 run_pruner() {
-    set -- "$@" --apply --max-idle "$idle" --lock "$pruner_state.lock" \
-        --log "$pruner_state.tsv" --stamp "$pruner_state.scheduled" --keep "$build_dir"
+    mode=$1
+    shift
     # Worktrees' build output lives in the repository's main checkout, whose
     # own build seeds theirs and stays. A bare repository's parent holds
     # other repositories, so only a checkout's is searched.
     common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
     case $common in
-        */.git) set -- "$@" --root "${common%/.git}" --keep-checkout "${common%/.git}" ;;
+        */.git) set -- --root "${common%/.git}" --keep-checkout "${common%/.git}" "$@" ;;
     esac
+    set -- "$pruner" --apply --max-idle "$idle" --lock "$pruner_state.lock" \
+        --log "$pruner_state.tsv" --stamp "$pruner_state.scheduled" --keep "$build_dir" "$@"
+    if [ "$mode" = detached ]; then
+        set -- $setsid nice -n "$niceness" $ionice "$@"
+    fi
     exec "$@"
 }
 
@@ -174,7 +179,7 @@ detach() {
             $setsid nice -n "$niceness" $ionice "$offload" --trim-slots "$floor" \
                 >"$pruner_state.slots.log" 2>&1 &
         fi
-        run_pruner $setsid nice -n "$niceness" $ionice "$pruner" --output "$pruner_state.log" "$@"
+        run_pruner detached --output "$pruner_state.log" "$@"
     ) &
 }
 
@@ -237,7 +242,7 @@ if [ -n "$prune$pruner" ] && open7 "$state"; then
                 fi
             fi
             if [ -n "$pruner" ]; then
-                (run_pruner "$pruner" $urgent --budget "$budget" --wait) >&2 || :
+                (run_pruner foreground $urgent --budget "$budget" --wait) >&2 || :
             else
                 sh -c "$prune" >&2 || :
             fi
