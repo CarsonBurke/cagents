@@ -88,7 +88,8 @@ if [ "$probe" = false ] && [ -n "$resumed" ] && [ -e "$config/fixture-fail-resum
     printf '%s\n' 'fixture: the resumed provider could not start' >&2
     exit 1
 fi
-project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
+cwd=$(pwd -P)
+project=$(printf '%s\n' "$cwd" | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
 history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
 parent=null
@@ -123,8 +124,8 @@ if [ "$probe" = false ] && [ -n "$resumed" ] && [ -f "$config/fixture-resume-par
     parent=$resume_parent
 fi
 persist_record() {
-    record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg parent "$parent" \
-        '. + {sessionId:$session,parentUuid:(if $parent == "null" then null else $parent end)}')
+    record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg cwd "$cwd" --arg parent "$parent" \
+        '. + {sessionId:$session,cwd:$cwd,parentUuid:(if $parent == "null" then null else $parent end)}')
     printf '%s\n' "$record" >> "$history"
     parent=$(printf '%s' "$record" | jq -r '.uuid')
 }
@@ -145,8 +146,8 @@ compact_turn() {
     boundary=fixture-compact-$turn
     jq -cn --arg uuid "$boundary" --arg session "$session" \
         '{type:"system",subtype:"compact_boundary",uuid:$uuid,session_id:$session,compact_metadata:{trigger:"manual",pre_tokens:48000}}'
-    jq -cn --arg uuid "$boundary" --arg session "$session" --arg previous "$parent" \
-        '{type:"system",subtype:"compact_boundary",uuid:$uuid,parentUuid:null,logicalParentUuid:(if $previous == "null" then null else $previous end),sessionId:$session,content:"Conversation compacted",compactMetadata:{trigger:"manual",preTokens:48000}}' >> "$history"
+    jq -cn --arg uuid "$boundary" --arg session "$session" --arg cwd "$cwd" --arg previous "$parent" \
+        '{type:"system",subtype:"compact_boundary",uuid:$uuid,parentUuid:null,logicalParentUuid:(if $previous == "null" then null else $previous end),sessionId:$session,cwd:$cwd,content:"Conversation compacted",compactMetadata:{trigger:"manual",preTokens:48000}}' >> "$history"
     parent=$boundary
     summary="This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
 
@@ -283,7 +284,7 @@ tools_turn() {
 # minutes for a hundred conversations.
 long_history_turn() {
     local records
-    records=$(jq -cn --arg turn "$turn" --arg session "$session" --arg parent "$parent" \
+    records=$(jq -cn --arg turn "$turn" --arg session "$session" --arg cwd "$cwd" --arg parent "$parent" \
         --argjson count "${long_history% *}" --argjson bytes "${long_history#* }" '
         ("Reviewed the failing step, its logs and the last good run. " as $phrase
          | [range(0; $bytes / ($phrase | length) | ceil)] | map($phrase) | add // "" | .[:$bytes]) as $text
@@ -292,7 +293,7 @@ long_history_turn() {
             | .records += [(if $at % 2 == 0
                 then {type: "user", message: {role: "user", content: ("Step \($at): " + $text)}}
                 else {type: "assistant", message: {id: $uuid, role: "assistant", content: [{type: "text", text: ("Step \($at): " + $text)}]}}
-                end) + {uuid: $uuid, sessionId: $session, parentUuid: .parent}]
+                end) + {uuid: $uuid, sessionId: $session, cwd: $cwd, parentUuid: .parent}]
             | .parent = $uuid)
         | .records[]')
     [ -n "$records" ] || return 0
@@ -394,7 +395,8 @@ frames_turn() {
             if [ "$(printf '%s' "$frame" | jq -r '._linked // false')" = true ]; then
                 persist_record "$(printf '%s' "$frame" | jq -c 'del(._history, ._linked)')"
             else
-                printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+                printf '%s' "$frame" | jq -c --arg session "$session" --arg cwd "$cwd" \
+                    'del(._history) + {sessionId:$session,cwd:$cwd}' >> "$history"
             fi
             continue
         fi

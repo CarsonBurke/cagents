@@ -317,6 +317,7 @@ class Provider(unittest.TestCase):
                    next((self.config / "projects").glob(f"*/{session}.jsonl")).read_text().splitlines()]
         chain = [record["uuid"] for record in history]
         self.assertEqual([record["parentUuid"] for record in history], [None, *chain[:-1]])
+        self.assertEqual({record["cwd"] for record in history}, {str(self.project.resolve())})
         self.assertEqual(sum(uuid.startswith("fixture-history-") for uuid in chain), 6)
 
     def test_long_history_that_is_not_a_count_and_size_is_refused(self):
