@@ -2142,6 +2142,10 @@ guards. Private snapshots and resource-aware cooldowns live under
 `${XDG_STATE_HOME:-~/.local/state}/cagents/github-status`. Token environment
 and gh account/configuration changes select another cache. Rotating a keyring
 secret without changing its account/configuration is not detected locally.
+Status readers and the REST fallback share a daily sweep that expires generated
+snapshots and retry records after 30 days without a write. An active cooldown,
+the requested key, or a publication in progress keeps its records. Stable
+empty lock files remain so concurrent readers and older CLIs can share a flight.
 
 To measure a repository agent shell without generating additional requests,
 opt that shell into observation explicitly:
