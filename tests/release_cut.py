@@ -51,6 +51,11 @@ case $1 in
     pin) [[ ! -e $fixture/pin-fails ]] ;;
     unpin|request) ;;
     wait)
+        if [[ -p $fixture/wait-ready ]]; then
+            trap 'touch "$fixture/wait-cancelled"; exit 143' TERM
+            printf 'waiting\n' > "$fixture/wait-ready"
+            read -r -t 15 unused <>"$fixture/wait-release" || exit 99
+        fi
         mv "$fixture/waiting/$2" "$HOME/.local/state/cagents-prebuilt/bundles/$2"
         echo "$2" ;;
 esac
@@ -58,6 +63,9 @@ esac
 
 SENTINEL = r"""#!/bin/bash
 echo "$*" >> "$FIXTURE/sentinel.log"
+if [[ -p $FIXTURE/wait-ready ]]; then
+    read -r ready < "$FIXTURE/wait-ready"
+fi
 exit "$(cat "$FIXTURE/sentinel-status" 2>/dev/null || echo 0)"
 """
 
@@ -175,7 +183,8 @@ touch "${@: -1}.sig"
 
 class ReleaseCut(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="cagents-release-cut-", dir="/var/tmp")
+        self.directory = tempfile.TemporaryDirectory(prefix="cagents-release-cut-",
+                                                     dir=os.environ.get("TMPDIR", "/var/tmp"))
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.home = self.root / "home"
@@ -286,6 +295,14 @@ class ReleaseCut(unittest.TestCase):
         path = self.root / name
         return path.read_text().splitlines() if path.exists() else []
 
+    def assert_rehearsal_report_kept(self, result, root):
+        kept = root
+        if root.is_relative_to("/dev/shm"):
+            self.assertFalse(root.exists())
+            kept = self.host / ".cache/cagents-release-rehearsal/failed-0.2.4"
+        self.assertIn(f"in {kept}", result.stderr)
+        self.assertTrue((kept / "report.txt").is_file())
+
     def test_cut_releases_the_newest_bundle_of_main_whose_tests_passed(self):
         self.bundle(self.feature)
         # Newer, but its tests failed; and one main does not contain.
@@ -345,6 +362,17 @@ class ReleaseCut(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("fails its tests", result.stderr)
         self.assertFalse((self.root / "bundles/0.2.4").exists())
+
+    def test_wait_stops_when_testing_cannot_produce_a_verdict(self):
+        (self.root / "sentinel-status").write_text("3")
+        os.mkfifo(self.root / "wait-ready")
+        os.mkfifo(self.root / "wait-release")
+        result = self.release("cut", "--wait")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no verdict (status 3)", result.stderr)
+        self.assertTrue((self.root / "wait-cancelled").exists())
+        self.assertFalse((self.root / "bundles/0.2.4").exists())
+        self.assertEqual(self.git("tag", "--list", "v0.2.4"), "")
 
     def test_without_a_bundle_or_a_terminal_it_says_to_wait(self):
         result = self.release("cut")
@@ -472,21 +500,22 @@ class ReleaseCut(unittest.TestCase):
         (self.root / "rehearse-outcome").write_text("FAIL\n")
         result = self.release("rehearse", "0.2.4")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"in {parent}/release-0.2.4", result.stderr)
+        self.assertEqual(self.log("rehearse-roots.log")[0], str(parent / "release-0.2.4"))
+        self.assert_rehearsal_report_kept(result, parent / "release-0.2.4")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=stray), self.fix)
         self.assertFalse((stray / "leftover").exists())
 
     def test_an_earlier_failed_rehearsal_is_replaced(self):
         self.cut_signed()
-        (self.root / "rehearse-outcome").write_text("FAIL\n")
-        self.assertNotEqual(self.release("rehearse", "0.2.4").returncode, 0)
-        self.assertTrue((self.root / "cr/report.txt").exists())
-        (self.root / "rehearse-outcome").unlink()
+        earlier = self.root / "cr"
+        earlier.mkdir()
+        (earlier / ".rehearse-update").write_text(f"{earlier}\n")
+        (earlier / "report.txt").write_text("Outcome: FAIL\n")
         result = self.release("rehearse", "0.2.4")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Replacing the earlier rehearsal", result.stdout)
         commands = [line.split()[1] for line in self.log("rehearse.log")]
-        self.assertEqual(commands, ["run", "cleanup", "run", "cleanup"])
+        self.assertEqual(commands, ["cleanup", "run", "cleanup"])
 
     def test_a_rehearsal_whose_update_failed_or_was_refused_does_not_pass_either_way(self):
         # Reopened windows would show "Update failed" or "Update not
@@ -502,8 +531,7 @@ class ReleaseCut(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, mode)
                 self.assertIn(f"Update status: {shown}\n", result.stdout)
                 self.assertIn(f"the update ended {shown}, not Complete", result.stderr)
-                self.assertIn(f"in {self.root / 'cr'}", result.stderr)
-                self.assertTrue((self.root / "cr/report.txt").exists())
+                self.assert_rehearsal_report_kept(result, self.root / "cr")
 
     def test_the_root_avoids_a_parent_under_a_stray_git_and_a_failure_in_memory_keeps_only_its_evidence(self):
         self.cut_signed()

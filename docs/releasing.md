@@ -26,6 +26,13 @@ linked against the sherpa-onnx libraries `scripts/sherpa-onnx-libs` verifies,
 with its third-party notices; the builder and the publisher refuse a package
 from a source with the helper that lacks either.
 
+The build stages one copy of the dictation helper for both cagents variants.
+The standalone editor ships the same CLI and daemon as the browserless
+package. Each cagents variant builds its own CLI, daemon and UI for its
+product identity. Cargo runs one build at a time while a single-CPU worker
+packages the previous variant. The package size reports count the shared
+helper's build time under the full variant.
+
 Before exposing the bundle, the builder installs and removes each Debian
 package and extracts each portable archive in a disposable Ubuntu 24.04 runtime
 image, all five at once. This runtime checks actual package dependencies, shipped commands,
@@ -34,9 +41,10 @@ binaries were built without debug assertions or the development feature, the
 setting their whole production identity follows) and safe shutdown, live-daemon removal guards, and
 preservation of unrelated files and saved app data. The compiler environment
 remains Ubuntu 22.04; runtime smoke does not replace the glibc baseline checks.
-The runtime image is prepared once with network access by
-`scripts/prepare-release-smoke-rootfs`; every artifact execution uses a separate
-networkless namespace with private user state. The runtime cache defaults to
+Before compiling, the builder validates the runtime cache or provisions it with
+network access using `scripts/prepare-release-smoke-rootfs`. Every artifact
+execution uses a separate networkless namespace with private user state. The
+runtime cache defaults to
 `$XDG_CACHE_HOME/cagents-release-smoke/ubuntu-24.04-amd64` (or under `~/.cache`),
 and `CAGENTS_RELEASE_SMOKE_CACHE` overrides it. Each cache keeps one pinned base
 archive and one provisioned runtime image. The next preparation reclaims scratch
@@ -158,7 +166,8 @@ draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
    tests passed in main's sentinel. It shows how many commits that bundle is
    behind main and offers to wait for a prebuild of the tip instead; `--wait`
    waits without asking, building the tip at normal priority while its tests
-   run beside it. `--commit SHA` picks a particular bundle. It then:
+   run beside it. A failed or unavailable test verdict ends that wait.
+   `--commit SHA` picks a particular bundle. It then:
    - copies the bundle to `~/.local/state/cagents-release/VERSION`, where
      VERSION is the one the commit declares;
    - checks every file against the size and digest recorded when it was built

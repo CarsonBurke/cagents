@@ -140,6 +140,13 @@ assets=("$OUTPUT"/*)
 ((${#assets[@]} == 0)) || fail 'output directory must be empty; existing assets are never overwritten'
 shopt -u nullglob dotglob
 
+# Validate or provision the smoke runtime before starting the build. Runtime
+# preparation can use the network; artifact execution below runs offline.
+stage_started=$SECONDS
+SMOKE_ROOTFS=$("$ROOT_DIR/scripts/prepare-release-smoke-rootfs")
+printf '%s: smoke runtime ready in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
+
+stage_started=$SECONDS
 WORK=$(mktemp -d "$CACHE/run.XXXXXX")
 mkdir "$WORK/provision-tmp" "$WORK/build-tmp" "$WORK/build-var-tmp"
 cleanup() {
@@ -213,7 +220,9 @@ source_git clean -q -ffdx
 printf 'root:x:0:0:root:/root:/bin/bash\nbuilder:x:%s:%s:Release builder:/home/builder:/bin/bash\n' \
     "$CALLER_UID" "$CALLER_GID" > "$WORK/passwd"
 printf 'root:x:0:\nbuilder:x:%s:\n' "$CALLER_GID" > "$WORK/group"
+printf '%s: build environment and source ready in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
 printf 'Building %s (%s) locally in Ubuntu 22.04; assets: %s\n' "$REF" "$SOURCE_COMMIT" "$OUTPUT"
+stage_started=$SECONDS
 bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --new-session --clearenv \
     --ro-bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/build-tmp" /tmp --bind "$WORK/build-var-tmp" /var/tmp --tmpfs /run \
@@ -236,11 +245,11 @@ bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --setenv SOURCE_DATE_EPOCH "$SOURCE_DATE_EPOCH" \
     --setenv CC /usr/bin/clang --setenv CXX /usr/bin/clang++ --setenv LIBCLANG_PATH /usr/lib/llvm-14/lib \
     --chdir /source -- /bin/bash /release-build
-# Runtime image preparation can use the network; artifact execution below has
-# separate networkless namespaces and never mounts the host's home or credentials.
-SMOKE_ROOTFS=$("$ROOT_DIR/scripts/prepare-release-smoke-rootfs")
-VERSION=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}')
+printf '%s: artifacts built and checked in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
+stage_started=$SECONDS
+VERSION=$version
 "$ROOT_DIR/scripts/smoke-release-artifacts" --dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS"
+printf '%s: artifact smoke completed in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
 # The signed metadata names every asset with its size and digest, so an
 # installed cagents trusts the release through one signature.
 if [[ -z $NOTES ]]; then

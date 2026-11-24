@@ -163,6 +163,11 @@ JOBS = (
                       ("bash", "scripts/build-release-linux"))),
         Suite("release signatures", "tests/publish_release_signatures.py",
               sources=("scripts/publish-release", "scripts/release-metadata")),
+        Suite("release artifact smoke", "tests/release_artifact_smoke.py",
+              sources=("scripts/build-release-linux", "scripts/prepare-release-smoke-rootfs",
+                       "scripts/smoke-release-artifacts", "packaging/smoke-release-artifact"),
+              syntax=(("bash", "scripts/prepare-release-smoke-rootfs"),
+                      ("bash", "scripts/smoke-release-artifacts"), ("bash", "packaging/smoke-release-artifact"))),
         Suite("release cut", "tests/release_cut.py",
               sources=("scripts/release", "scripts/release-metadata", "scripts/publish-release",
                        "scripts/prebuild-release", "scripts/main-build-sentinel")),
@@ -225,14 +230,15 @@ UNSCHEDULED = (
     "tests/package_linux_artifacts.py",
     "tests/publish_release_git_environment.py",
     "tests/redraw_latency.py",
-    "tests/release_artifact_smoke.py",
     "tests/release_editor_archive.py",
     "tests/release_package_dependencies.py",
     "tests/terminal_escape_fixture.py",
 )
 
-# Shell entry points that have no suite of their own.
-SHELL_SYNTAX = (("sh", "scripts/run-development"), ("sh", "scripts/refuse-compile"), ("sh", "scripts/check-format"))
+# Shell entry points that do not run in a scheduled suite.
+SHELL_SYNTAX = (("sh", "scripts/run-development"), ("sh", "scripts/refuse-compile"), ("sh", "scripts/check-format"),
+                ("bash", "packaging/release-build"), ("bash", "scripts/package-release-linux"),
+                ("sh", "scripts/package-linux.sh"), ("sh", "scripts/package-ceditor-linux.sh"))
 
 # Run as `python3 -I -B -c SHARD FIXTURE INDEX COUNT VERBOSITY`: execute the fixture as
 # __main__, but let its unittest.main() run only every COUNT-th test, in id
