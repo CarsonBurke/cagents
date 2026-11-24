@@ -38,7 +38,9 @@ The runtime image is prepared once with network access by
 `scripts/prepare-release-smoke-rootfs`; every artifact execution uses a separate
 networkless namespace with private user state. The runtime cache defaults to
 `$XDG_CACHE_HOME/cagents-release-smoke/ubuntu-24.04-amd64` (or under `~/.cache`),
-and `CAGENTS_RELEASE_SMOKE_CACHE` overrides it.
+and `CAGENTS_RELEASE_SMOKE_CACHE` overrides it. Each cache keeps one pinned base
+archive and one provisioned runtime image. The next preparation reclaims scratch
+directories left by interrupted preparations while it holds the cache lock.
 
 Install `bubblewrap`, `curl`, `git`, and the standard archive tools locally,
 then build:
