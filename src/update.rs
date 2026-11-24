@@ -1750,14 +1750,13 @@ fn perform_update(
         ));
     }
     let installer = feed.download(&release, &release.installer, &cancellation)?;
-    let mut archive = feed.download(&release, &release.archive, &cancellation)?;
+    let archive = feed.download(&release, &release.archive, &cancellation)?;
     set_phase(
         state,
         job,
         UpdatePhase::Verifying,
         "Verifying the downloaded release",
     )?;
-    verify_digest(&mut archive, &archive_hash)?;
     let daemon_digest = archive_daemon_digest(&release, &archive, &cancellation)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
