@@ -20,8 +20,10 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   already registered repository selects it without duplicating the project or
   disturbing existing sessions. Selecting a worktree restores its panes;
   selecting it again does not create another terminal.
-- **Open folder** also accepts folders without Git. Select the project row to
-  work there with terminals, chats, channels, and the editor. The Files panel
+- **Open folder** also accepts folders without Git. Its project row folds like
+  a repository's; open the folder from its **Project folder** row in the
+  Worktrees pane (`Ctrl+Shift+E`) to work there with terminals, chats,
+  channels, and the editor. The Files panel
   lists children as you expand directories; Git actions appear only for Git
   projects. Folder projects survive restarts. If you later run `git init`,
   remove and reopen the project to enable Git features; existing open folder
