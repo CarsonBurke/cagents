@@ -6246,6 +6246,39 @@ fn permission_approval_popup_and_transcript_keep_distinct_named_widget_state() {
     cosmic::iced::advanced::widget::tree::NAMED.with(|named| named.borrow_mut().clear());
 }
 
+/// A block a subagent hit names the subagent as its tab does, never by
+/// the provider's ID for it.
+#[test]
+fn a_subagent_block_names_its_agent_not_its_id() {
+    const AGENT: &str = "a404930e4df62e728";
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some("denied agent"));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert_eq!(runtime.denial_agent(AGENT), "From a subagent");
+    let handle = runtime.handle().unwrap().clone();
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.subagents = vec![chat::Subagent {
+        id: AGENT.into(),
+        kind: "general-purpose".into(),
+        description: "Build and install the app".into(),
+        model: None,
+        status: chat::ToolStatus::Running,
+        waiting: false,
+        detail: String::new(),
+        background: true,
+        items: Vec::new(),
+    }];
+    handle.publish_delta_snapshot_for_test(snapshot);
+    runtime.refresh();
+    let named = runtime
+        .listed_agent_name(AGENT)
+        .expect("the agent is listed");
+    assert!(!named.contains(&AGENT[..8]), "{named}");
+    assert_eq!(runtime.denial_agent(AGENT), format!("Subagent: {named}"));
+}
+
 #[test]
 fn permission_keyboard_traverses_visible_approvals_pages_retry_and_close_both_ways() {
     use crate::workspace_widget::GlobalShortcut;

@@ -1771,16 +1771,15 @@ fn delivery_monitor(kind: chat::DeliveryKind, summary: &str) -> bool {
 }
 
 /// Whether a delivery has more to show than its heading's first line: a
-/// prepared notice's body, or a message's body, the rest of its heading or
-/// its sender.
+/// prepared notice's body, or a message's body or the rest of its heading.
+/// Its sender's address is not something to show: the heading names it.
 fn delivery_has_body(
     notice: Option<&literal_content::NoticeData>,
     body: &str,
     remainder: &str,
-    sender: &str,
 ) -> bool {
     notice.map_or_else(
-        || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
+        || !body.is_empty() || !remainder.is_empty(),
         |notice| notice.body.full.len() != 0,
     )
 }
@@ -6400,20 +6399,25 @@ impl Runtime {
             self.figures.version().hash(hasher);
         }
         // An agent's report says how the agent stands now, so it tracks that
-        // agent, and which agent its sender names. Nothing else a delivery
-        // says depends on either.
+        // agent, and which agent its sender names. A heading that names its
+        // sender as this conversation lists it changes when the listing does.
+        // Nothing else a delivery says depends on either.
         if let ItemContent::Delivery {
             from,
             sender,
             summary,
             ..
         } = &item.content
-            && delivery_names_agent(from, sender, summary)
+            && from.is_empty()
+            && !sender.is_empty()
         {
-            if let Some(agent) = self.subagent(sender) {
-                self.hash_agent_state(agent, hasher);
+            if delivery_names_agent(from, sender, summary) {
+                if let Some(agent) = self.subagent(sender) {
+                    self.hash_agent_state(agent, hasher);
+                }
+                std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
             }
-            std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
+            self.listed_agent_name(sender).hash(hasher);
         }
         // A coordinating step names agents by what this conversation calls
         // them, links their transcripts while it lists them, tells how those
@@ -7383,6 +7387,32 @@ impl Runtime {
         .into()
     }
 
+    /// A delivery's heading as the person reads it, which its row, tooltip
+    /// and Copy all say. A summary that only repeats the body is left out.
+    /// A sender the provider addresses only by a task or agent ID, with no
+    /// summary to describe it, is named as this conversation lists that
+    /// agent, or else as another agent: the ID itself means nothing to the
+    /// person and is never shown.
+    pub(super) fn delivery_heading(
+        &self,
+        kind: chat::DeliveryKind,
+        from: &str,
+        sender: &str,
+        summary: &str,
+        body: &str,
+    ) -> String {
+        let summary = if !body.is_empty() && body.trim() == summary.trim() {
+            ""
+        } else {
+            summary
+        };
+        if from.is_empty() && summary.is_empty() && !sender.is_empty() {
+            let name = self.listed_agent_name(sender);
+            return chat::delivery_heading(kind, name.as_deref().unwrap_or_default(), "", "");
+        }
+        chat::delivery_heading(kind, from, sender, summary)
+    }
+
     /// How a delivery's one line reads: its title, the outcome its badge
     /// gives, whether that is a failure, its glyph and the whole heading for
     /// its tooltip and accessible name. `first` is the heading's first line.
@@ -7516,18 +7546,7 @@ impl Runtime {
             None
         };
         let heading = notice.map_or_else(
-            || {
-                chat::delivery_heading(
-                    *kind,
-                    from,
-                    sender,
-                    if !body.is_empty() && body.trim() == summary.trim() {
-                        ""
-                    } else {
-                        summary
-                    },
-                )
-            },
+            || self.delivery_heading(*kind, from, sender, summary, body),
             |notice| notice.summary.plain().to_string(),
         );
         let (first, remainder) = heading
@@ -7536,7 +7555,7 @@ impl Runtime {
                 (first, rest.trim_start_matches(['\r', '\n']))
             });
         let monitor = delivery_monitor(*kind, summary);
-        let has_body = delivery_has_body(notice, body, remainder, sender);
+        let has_body = delivery_has_body(notice, body, remainder);
         let DeliveryOutcome {
             title,
             outcome,
@@ -7588,27 +7607,6 @@ impl Runtime {
         let heading_row = crate::interaction::tooltip(heading_row, heading.clone());
         let mut rows = Vec::new();
         if (expanded || monitor) && has_body {
-            if expanded
-                && *kind != chat::DeliveryKind::Notice
-                && !sender.is_empty()
-                && !heading.contains(sender)
-            {
-                rows.push(
-                    widget::container(selectable_prose::text(
-                        vec![
-                            iced::widget::text::Span::new(format!("Sender: {sender}"))
-                                .color(design::muted_color(&cosmic::theme::active())),
-                        ]
-                        .into(),
-                        design::TEXT_CAPTION.into(),
-                        iced::Font::default(),
-                        self.target,
-                        self.find.as_deref(),
-                    ))
-                    .padding([0, step::GAP_M as u16])
-                    .into(),
-                );
-            }
             if expanded && !remainder.is_empty() {
                 rows.push(selectable_prose::plain(
                     remainder.to_owned(),
@@ -7635,24 +7633,6 @@ impl Runtime {
                     .padding([0, step::GAP_M as u16])
                     .into(),
             );
-            if expanded {
-                let label = if *kind == chat::DeliveryKind::Report {
-                    "Copy report"
-                } else {
-                    "Copy message"
-                };
-                rows.push(
-                    widget::button::custom(design::caption(label))
-                        .name(label)
-                        .class(crate::ui_controls::control_style(false, None))
-                        .on_press(action(Action::Copy(
-                            self.target,
-                            item.id.clone(),
-                            CopyPart::Text,
-                        )))
-                        .into(),
-                );
-            }
         }
         // Like a step or a thought, a delivery that opens is a line of the
         // timeline until its detail is open. Open, or when it has nothing to
@@ -7710,25 +7690,13 @@ impl Runtime {
             else {
                 return false;
             };
-            (
-                delivery_has_body(Some(notice), body, "", sender),
-                notice.body.long,
-            )
+            (delivery_has_body(Some(notice), body, ""), notice.body.long)
         } else {
-            let heading = chat::delivery_heading(
-                *kind,
-                from,
-                sender,
-                if !body.is_empty() && body.trim() == summary.trim() {
-                    ""
-                } else {
-                    summary
-                },
-            );
+            let heading = self.delivery_heading(*kind, from, sender, summary, body);
             let remainder = heading
                 .split_once(['\r', '\n'])
                 .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));
-            (delivery_has_body(None, body, remainder, sender), false)
+            (delivery_has_body(None, body, remainder), false)
         };
         delivery_actions(has_body, monitor, long, self.item_expanded(&item.id))
     }
