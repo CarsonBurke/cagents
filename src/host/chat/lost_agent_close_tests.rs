@@ -229,9 +229,12 @@ fn closing_a_lost_agent_ends_it_without_starting_anything() {
     register_authority(&host, source);
     let accepted = lost_agent(&host, fixture.directory.path(), source);
     let history = fixture.history();
+    let (notifications, _) = super::super::notifications::Handle::inert_for_test();
+    host.lock().unwrap().notifications = Some(notifications.clone());
 
     let reply = close_agent(&host, accepted.agent.id).unwrap();
     assert!(matches!(reply, Reply::Closed(agent) if agent.closed));
+    assert!(notifications.session_read_pending_for_test(source.id));
     assert!(!fixture.marker.exists(), "closing started no provider");
     let run = registry(&host)
         .lock()

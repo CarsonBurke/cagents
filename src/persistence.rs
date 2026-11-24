@@ -31,6 +31,8 @@ use crate::{
     },
 };
 
+#[cfg(feature = "host")]
+pub(crate) mod attention;
 mod refusal;
 #[cfg(feature = "ui")]
 mod review_cache;

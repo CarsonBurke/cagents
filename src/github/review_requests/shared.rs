@@ -7,6 +7,7 @@ use crate::{
     github::{
         GitHubError, GitHubRepoKey, GitHubService, PullRequestKey, Revalidation, polling, pr_status,
     },
+    notifications::review::WatchUpdate,
     repository::{
         CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessFailureKind,
         ProcessOutput, SystemProcessExecutor,
@@ -21,6 +22,9 @@ const PACE: u64 = 6;
 const MAX_BACKOFF: u64 = 30 * 60;
 const OBSERVATION_AGE: u64 = 5 * 60;
 const OBSERVATION_PAGES: usize = 50;
+// A repository left unwatched mid-pass must restart discovery when reopened.
+// A continuously watched repository can take arbitrarily many paced pages.
+const ABANDONED_PASS: u64 = 24 * 60 * 60;
 /// A settled census starts again only once GitHub says, for free, that one
 /// of the repository's issues or pull requests changed, as a review request
 /// does, or once the last is this old: a request to a team the viewer just
@@ -121,10 +125,38 @@ pub fn poll(
     repository: &GitHubRepoKey,
     cancellation: &CancellationToken,
 ) -> Result<PollResult, String> {
+    let result = poll_repository(repository, cancellation);
+    if !cancellation.is_cancelled() {
+        let census = result
+            .as_ref()
+            .ok()
+            .filter(|result| result.error.is_none())
+            .and_then(|result| result.scan.settled_census())
+            .filter(|census| polling::now().saturating_sub(census.completed_at) < OBSERVATION_AGE)
+            .cloned();
+        let mut repository = repository.clone();
+        repository.owner.make_ascii_lowercase();
+        repository.name.make_ascii_lowercase();
+        // This is already the monitor's blocking worker. Watching an empty or
+        // unavailable repository renews its lease without starting a daemon.
+        // Failure to hand off simply leaves the next poll to retry.
+        if let Err(error) =
+            crate::control::ControlClient::report_review_watch(WatchUpdate { repository, census })
+        {
+            tracing::debug!(%error, "could not report review monitor activity");
+        }
+    }
+    result
+}
+
+fn poll_repository(
+    repository: &GitHubRepoKey,
+    cancellation: &CancellationToken,
+) -> Result<PollResult, String> {
     let credentials = pr_status::credential_fingerprint()?;
     polling::bind_scope(&repository.authority(), &credentials);
     let root = pr_status::state_root()?;
-    let result = poll_with(
+    poll_with(
         &root,
         &credentials,
         repository,
@@ -166,8 +198,7 @@ pub fn poll(
                 cancellation,
             )
         },
-    )?;
-    Ok(result)
+    )
 }
 
 /// The child retains the lease if its window dies while gh is still running.
@@ -249,6 +280,10 @@ fn poll_with(
     if cancellation.is_cancelled() {
         return Err("Review-request read cancelled".into());
     }
+    if !stored.scan.settled() && now.saturating_sub(stored.due) >= ABANDONED_PASS {
+        stored.scan.restart_after_pause();
+        stored.pending = None;
+    }
     // Preserve this exclusive description in gh, while the scoped owner still
     // releases unrelated fork copies after the executor has reaped the child.
     let lease = || {
@@ -257,7 +292,8 @@ fn poll_with(
             .map(Arc::new)
             .map_err(|error| format!("Cannot inherit the GitHub review flight: {error}"))
     };
-    if stored.scan.settled()
+    let retrying_census = stored.failures > 0 && stored.scan.starts_fresh_page();
+    if (stored.scan.settled() || retrying_census)
         && stored
             .probe_refused_at
             .is_none_or(|at| now.saturating_sub(at) >= PROBE_REFUSED_FOR)
@@ -295,7 +331,9 @@ fn poll_with(
         };
         stored.pending = Some((validator, now));
     }
+    let previous_viewer = stored.scan.viewer.as_ref().map(|viewer| viewer.id.clone());
     let work = stored.scan.next_work();
+    stored.scan.begin_census(&work, now);
     let lease = lease()?;
     let reply = polling::with_scope(credentials, || read(&work, lease));
     // A gh auth switch can race a subprocess. Never publish the response under
@@ -353,11 +391,28 @@ fn poll_with(
         }
         applied
     });
+    let viewer_changed = previous_viewer.as_ref().is_some_and(|previous| {
+        stored
+            .scan
+            .viewer
+            .as_ref()
+            .is_some_and(|viewer| &viewer.id != previous)
+    });
     if applied.is_err() {
         stored.scan.failed_history(&work);
+        stored.scan.restart_census();
+        stored.pending = None;
         observed.clear();
         stored.failures = stored.failures.saturating_add(1);
+    } else if viewer_changed {
+        // Even a one-page result on the account-switch read carries no
+        // withdrawal authority. The next pass can settle for the new viewer.
+        stored.validator = None;
+        stored.census_at = 0;
+        stored.pending = None;
+        stored.observed.clear();
     } else if stored.scan.settled() {
+        stored.scan.record_settlement(completed);
         stored.failures = 0;
         if let Some((validator, at)) = stored.pending.take() {
             stored.validator = validator;
@@ -802,6 +857,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(first.due, 1006);
+        assert!(first.scan.settled_census().is_none());
         poll_with(
             root.path(),
             "account",
@@ -833,6 +889,14 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(second.scan.settled());
+        let census = second.scan.settled_census().unwrap();
+        assert_eq!(census.viewer, "viewer");
+        assert_eq!(census.started_at, 1000);
+        assert_eq!(census.completed_at, 1006);
+        assert_eq!(
+            census.requests,
+            [(1, "request-1".into()), (51, "request-51".into())]
+        );
         assert_eq!(
             second.scan.requested.keys().copied().collect::<Vec<_>>(),
             [1, 51]
@@ -855,6 +919,127 @@ pub(crate) mod tests {
             fresh.scan.requested.keys().copied().collect::<Vec<_>>(),
             [51]
         );
+    }
+
+    #[test]
+    fn failed_discovery_page_cannot_settle_a_census_from_mixed_passes() {
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let read = |at, expected, reply| {
+            poll_with(
+                root.path(),
+                "account",
+                &repository(),
+                &cancel,
+                || at,
+                |work, _| {
+                    assert_eq!(*work, expected);
+                    reply
+                },
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        let partial = read(
+            1000,
+            Work::Page { cursor: None },
+            Ok(page("viewer", &[1], Some("next"))),
+        );
+        assert!(partial.scan.settled_census().is_none());
+        let failed = read(
+            1006,
+            Work::Page {
+                cursor: Some("next".into()),
+            },
+            Err(GitHubError::Inspection("offline".into())),
+        );
+        assert!(failed.scan.settled_census().is_none());
+        assert!(failed.scan.requested.contains_key(&1));
+        let empty = read(
+            1066,
+            Work::Page { cursor: None },
+            Ok(page("viewer", &[], None)),
+        );
+        let census = empty.scan.settled_census().unwrap();
+        assert_eq!(census.viewer, "viewer");
+        assert_eq!(census.completed_at, 1066);
+        assert!(census.requests.is_empty());
+    }
+
+    #[test]
+    fn reopening_a_repository_reads_fresh_first_page_before_settling() {
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let read = |at, expected, reply| {
+            poll_with(
+                root.path(),
+                "account",
+                &repository(),
+                &cancel,
+                || at,
+                |work, _| {
+                    assert_eq!(*work, expected);
+                    Ok(reply)
+                },
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        let first_page = Work::Page { cursor: None };
+        read(
+            1000,
+            first_page.clone(),
+            page("viewer", &[1], Some("from-last-week")),
+        );
+        let reopened_at = 1000 + 7 * 24 * 60 * 60;
+        let reopened = read(reopened_at, first_page, page("viewer", &[2], Some("fresh")));
+        assert!(reopened.scan.settled_census().is_none());
+        assert!(
+            reopened
+                .observed
+                .iter()
+                .any(|page| page.requests == [(2, "request-2".into())])
+        );
+        let settled = read(
+            reopened_at + PACE,
+            Work::Page {
+                cursor: Some("fresh".into()),
+            },
+            page("viewer", &[], None),
+        );
+        let census = settled.scan.settled_census().unwrap();
+        assert_eq!(census.started_at, reopened_at);
+        assert_eq!(census.requests, [(2, "request-2".into())]);
+    }
+
+    #[test]
+    fn account_change_itself_has_no_census_authority() {
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let read = |at, viewer, requests| {
+            poll_with(
+                root.path(),
+                "account",
+                &repository(),
+                &cancel,
+                || at,
+                |work, _| {
+                    assert_eq!(*work, Work::Page { cursor: None });
+                    Ok(page(viewer, requests, None))
+                },
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        let alice = read(1000, "alice", &[1]);
+        assert_eq!(alice.scan.settled_census().unwrap().viewer, "alice");
+        let switched = read(1060, "bob", &[]);
+        assert!(switched.scan.settled_census().is_none());
+        let bob = read(1120, "bob", &[]);
+        assert_eq!(bob.scan.settled_census().unwrap().viewer, "bob");
     }
 
     #[test]

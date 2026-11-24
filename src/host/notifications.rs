@@ -4,6 +4,8 @@ mod batching;
 mod journal;
 #[cfg(test)]
 mod registration_tests;
+mod session_attention;
+pub(super) mod session_census;
 mod withdrawals;
 use journal::Journal;
 use withdrawals::Withdrawals;
@@ -27,13 +29,17 @@ use uuid::Uuid;
 use super::state::{ClientId, HostLock, SharedHost};
 use crate::{
     model::TerminalId,
-    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target, TestOutcome},
+    notifications::{
+        Event, Notice, Preferences, Presence, Snapshot, Target, TestOutcome, review::WatchUpdate,
+    },
 };
 
 const MAX_PENDING: usize = 2048;
 // One stable portal ID and one legacy journal ID per retained notice.
 const MAX_WITHDRAWALS: usize = MAX_PENDING * 2;
 const MAX_ACTIONS: usize = 32;
+const MAX_REVIEW_WATCH_UPDATES: usize = 32;
+const REVIEW_EXPIRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MAX_ACTIVATION_TOKEN: usize = 4096;
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -100,6 +106,7 @@ impl Registration {
 
 #[derive(Default)]
 struct InboxAttention {
+    sequence: u64,
     pending: BTreeSet<crate::agent_execution::Lineage>,
     events: BTreeMap<Target, Event>,
 }
@@ -128,10 +135,12 @@ impl Drop for CommitReceipt {
 
 #[derive(Default)]
 struct Pending {
-    events: BTreeMap<Target, Event>,
-    committed_events: VecDeque<(Event, CommitReceipt)>,
+    events: BTreeMap<Target, (u64, Event)>,
+    committed_events: VecDeque<(u64, Event, CommitReceipt)>,
+    session_attention: session_attention::Pending,
+    sequence: u64,
     inboxes: Option<InboxAttention>,
-    retired: BTreeSet<Target>,
+    review_watches: VecDeque<(i64, WatchUpdate)>,
     acknowledged: BTreeSet<Uuid>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
@@ -146,18 +155,8 @@ struct Pending {
 }
 
 impl Pending {
-    /// This batch's work with `newer`, a later batch, applied after it, as if
-    /// both had been queued as one: a later retirement withdraws an earlier
-    /// event for its session, and a later event replaces an earlier one.
+    /// Merge a deferred batch with the newer work now waiting at the broker.
     fn followed_by(mut self, newer: Pending) -> Pending {
-        for target in &newer.retired {
-            self.events.remove(target);
-        }
-        for target in newer.retired {
-            if self.retired.len() < MAX_PENDING || self.retired.contains(&target) {
-                self.retired.insert(target);
-            }
-        }
         for (target, event) in newer.events {
             if self.events.len() < MAX_PENDING || self.events.contains_key(&target) {
                 self.events.insert(target, event);
@@ -169,9 +168,18 @@ impl Pending {
             }
         }
         self.committed_events.extend(newer.committed_events);
+        self.session_attention.extend(newer.session_attention);
+        self.sequence = newer.sequence;
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
         }
+        self.review_watches.extend(newer.review_watches);
+        self.review_watches.drain(
+            ..self
+                .review_watches
+                .len()
+                .saturating_sub(MAX_REVIEW_WATCH_UPDATES),
+        );
         self.presence_changed |= newer.presence_changed;
         self.actions.extend(newer.actions);
         if newer.portal_owner.is_some() {
@@ -193,8 +201,10 @@ impl Pending {
     fn deferred(self) -> Pending {
         Pending {
             events: self.events,
+            session_attention: self.session_attention.deferred(),
+            sequence: self.sequence,
             inboxes: self.inboxes,
-            retired: self.retired,
+            review_watches: self.review_watches,
             acknowledged: self.acknowledged,
             presence_changed: self.presence_changed,
             reload: self.reload,
@@ -209,6 +219,7 @@ fn take_pending(core: &Shared) -> Pending {
     let pending = std::mem::take(&mut *queue);
     // Stop admission remains closed while the broker drains this final batch.
     queue.stopped = pending.stopped;
+    queue.sequence = pending.sequence;
     pending
 }
 
@@ -241,7 +252,7 @@ impl Handle {
                 .unwrap()
                 .events
                 .values()
-                .cloned()
+                .map(|(_, event)| event.clone())
                 .collect()
         })
     }
@@ -261,11 +272,13 @@ impl Handle {
             return;
         }
         self.change(|pending| {
-            // Producers fence worker identity before enqueueing. A newer
-            // worker may reuse this session while retirement is still queued;
-            // apply that retirement first, then its new event in the broker.
+            // Producers fence worker identity before enqueueing, and this
+            // order keeps a new worker's outcome after an earlier clear.
             if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
-                pending.events.insert(event.target(), event);
+                pending.sequence += 1;
+                pending
+                    .events
+                    .insert(event.target(), (pending.sequence, event));
             }
         });
     }
@@ -285,9 +298,11 @@ impl Handle {
         if pending.committed_events.len() >= MAX_PENDING {
             return Err("Notification commit queue is full; outcome remains unacknowledged".into());
         }
+        pending.sequence += 1;
+        let sequence = pending.sequence;
         pending
             .committed_events
-            .push_back((event, CommitReceipt(Some(receipt))));
+            .push_back((sequence, event, CommitReceipt(Some(receipt))));
         drop(pending);
         let _ = self.0.wake.try_send(());
         Ok(result)
@@ -307,24 +322,114 @@ impl Handle {
             .map(|event| (event.target(), event))
             .collect();
         self.change(|pending| {
+            pending.sequence += 1;
             pending.inboxes = Some(InboxAttention {
+                sequence: pending.sequence,
                 pending: pending_lineages,
                 events,
             })
         });
     }
 
-    pub fn retire(&self, session: TerminalId) {
-        let session = Target::Session(session);
+    pub(super) fn reconcile_review_requests(&self, update: WatchUpdate) -> Result<(), String> {
+        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.stopped || self.0.wake.is_closed() {
+            return Err("Notification journal is stopping".into());
+        }
+        if pending.review_watches.len() >= MAX_REVIEW_WATCH_UPDATES {
+            return Err("Review monitor update queue is full".into());
+        }
+        pending
+            .review_watches
+            .push_back((review_watch_time(), update));
+        drop(pending);
+        let _ = self.0.wake.try_send(());
+        Ok(())
+    }
+
+    pub fn acknowledge_session(&self, session: TerminalId) {
+        self.change_session(session, session_attention::Clear::View(None));
+    }
+
+    pub fn acknowledge_turn(&self, session: TerminalId) {
+        self.change_session(session, session_attention::Clear::Turn);
+    }
+
+    pub fn acknowledge_waiting(&self, session: TerminalId) {
+        self.change_session(session, session_attention::Clear::Waiting);
+    }
+
+    fn change_session(&self, session: TerminalId, clear: session_attention::Clear) {
         self.change(|pending| {
-            pending.events.remove(&session);
-            pending
-                .committed_events
-                .retain(|(event, _)| event.target() != session);
-            if pending.retired.len() < MAX_PENDING {
-                pending.retired.insert(session);
-            }
+            pending.sequence += 1;
+            let _ = pending.session_attention.push((
+                pending.sequence,
+                session_attention::Change::Clear(session, clear, None),
+                None,
+            ));
         });
+    }
+
+    pub fn acknowledge_turn_committed(
+        &self,
+        session: TerminalId,
+        actor: Uuid,
+        sequence: u64,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+        self.change_session_committed(session, session_attention::Clear::Turn, (actor, sequence))
+    }
+
+    pub fn acknowledge_waiting_committed(
+        &self,
+        session: TerminalId,
+        actor: Uuid,
+        sequence: u64,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+        self.change_session_committed(
+            session,
+            session_attention::Clear::Waiting,
+            (actor, sequence),
+        )
+    }
+
+    fn change_session_committed(
+        &self,
+        session: TerminalId,
+        clear: session_attention::Clear,
+        cursor: (Uuid, u64),
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+        let (reply, receiver) = std::sync::mpsc::channel();
+        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.stopped || self.0.wake.is_closed() {
+            return Err(
+                "Notification journal is stopping; attention remains unacknowledged".into(),
+            );
+        }
+        pending.sequence += 1;
+        let sequence = pending.sequence;
+        pending.session_attention.push((
+            sequence,
+            session_attention::Change::Clear(session, clear, Some(cursor)),
+            Some(CommitReceipt(Some(reply))),
+        ))?;
+        drop(pending);
+        let _ = self.0.wake.try_send(());
+        Ok(receiver)
+    }
+
+    pub fn retire_session_notices(&self, census: session_census::Census) {
+        self.change(|pending| {
+            pending.sequence += 1;
+            let _ = pending.session_attention.push((
+                pending.sequence,
+                session_attention::Change::Retire(census),
+                None,
+            ));
+        });
+    }
+
+    pub fn refresh_session_routes(&self) {
+        self.change(|_| {});
     }
 
     pub fn presence(&self, client: ClientId, presence: Option<Presence>) {
@@ -457,15 +562,21 @@ fn supervise(
     }
 }
 
-fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
+fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, mut snapshot: Snapshot) {
     if let Some(shared) = shared.upgrade() {
+        let host = host.upgrade();
+        if let Some(host) = &host
+            && let Err(error) = session_attention::project(host, &mut snapshot)
+        {
+            tracing::debug!(%error, "Session notification routing is unavailable");
+        }
         let mut current = shared.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         if *current == snapshot {
             return;
         }
         *current = snapshot;
         drop(current);
-        if let Some(host) = host.upgrade() {
+        if let Some(host) = host {
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .notifications_changed();
@@ -924,6 +1035,29 @@ fn withdraw_notice(queue: &mut Withdrawals, notice: &Notice) {
     withdraw_target(queue, notice.id, &notice.event.target);
 }
 
+fn review_watch_time() -> i64 {
+    crate::github_rate_limit::now()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn apply_review_retirements(
+    result: Result<Vec<(Uuid, Target)>, String>,
+    snapshot: &mut Snapshot,
+    delivery: &mut BTreeMap<Target, Notice>,
+    withdrawals: &mut Withdrawals,
+) {
+    match result {
+        Ok(retired) => {
+            for (id, target) in retired {
+                delivery.remove(&target);
+                withdraw_target(withdrawals, id, &target);
+            }
+        }
+        Err(error) => snapshot.diagnostic = Some(error),
+    }
+}
+
 fn withdraw_target(queue: &mut Withdrawals, id: Uuid, target: &Target) {
     queue.group(batching::desktop_id(target));
     // A predecessor used the journal UUID as its portal ID. Retire that toast
@@ -1091,7 +1225,7 @@ impl JournalTestBridge {
             .unwrap()
             .committed_events
             .pop_front();
-        let Some((event, receipt)) = next else {
+        let Some((_, event, receipt)) = next else {
             return Ok(None);
         };
         record_attention_committed_policy(
@@ -1111,7 +1245,7 @@ impl JournalTestBridge {
             .unwrap()
             .committed_events
             .iter()
-            .map(|(event, _)| event.clone())
+            .map(|(_, event, _)| event.clone())
             .collect()
     }
 
@@ -1165,6 +1299,7 @@ async fn run(
     let mut withdrawals = Withdrawals::default();
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
+    let mut review_expiry = Instant::now();
     let mut snapshot = Snapshot {
         diagnostic: settings_error.clone(),
         ..Default::default()
@@ -1189,6 +1324,7 @@ async fn run(
         }
         .into_iter()
         .chain(store.retry_at())
+        .chain(store.journal().is_ok().then_some(review_expiry))
         .min(),
     )
     .await
@@ -1230,7 +1366,7 @@ async fn run(
             Ok(journal) => journal,
             Err(error) => {
                 let error = error.clone();
-                for (_, receipt) in pending.committed_events.drain(..) {
+                for (_, _, receipt) in pending.committed_events.drain(..) {
                     receipt.finish(Err(error.clone()));
                 }
                 // Without a journal there is no backlog to deliver, but the
@@ -1320,6 +1456,24 @@ async fn run(
             next_attempt = Instant::now();
             retry_delay = RETRY_DELAY;
         }
+        let review_watches = std::mem::take(&mut pending.review_watches);
+        for (at, update) in &review_watches {
+            apply_review_retirements(
+                journal.renew_review_watch(&update.repository, *at),
+                &mut snapshot,
+                &mut delivery,
+                &mut withdrawals,
+            );
+        }
+        if Instant::now() >= review_expiry {
+            review_expiry = Instant::now() + REVIEW_EXPIRY_INTERVAL;
+            apply_review_retirements(
+                journal.expire_review_watches(review_watch_time()),
+                &mut snapshot,
+                &mut delivery,
+                &mut withdrawals,
+            );
+        }
         if let Some(inboxes) = pending.inboxes.take() {
             // A complete durable pending snapshot retires inbox attention only
             // when mail is gone; offline recipients keep existing attention.
@@ -1329,56 +1483,102 @@ async fn run(
                         if let Target::SessionInbox(lineage) = notice.event.target
                             && !inboxes.pending.contains(&lineage)
                         {
-                            pending.retired.insert(Target::SessionInbox(lineage));
+                            delivery.remove(&notice.event.target);
+                            withdraw_notice(&mut withdrawals, &notice);
+                            if let Err(error) = journal.retire(notice.event.target) {
+                                snapshot.diagnostic = Some(error);
+                            }
                         }
                     }
                 }
                 Err(error) => snapshot.diagnostic = Some(error),
             }
-            pending.events.extend(inboxes.events);
-        }
-        for session in pending.retired {
-            if stopped(&shared) {
-                return;
-            }
-            delivery.remove(&session);
-            if let Some(old) = snapshot
-                .notices
-                .iter()
-                .find(|notice| notice.event.target() == session)
-            {
-                withdraw_notice(&mut withdrawals, old);
-            }
-            if let Err(error) = journal.retire(session) {
-                snapshot.diagnostic = Some(error);
-            }
+            pending.events.extend(
+                inboxes
+                    .events
+                    .into_iter()
+                    .map(|(target, event)| (target, (inboxes.sequence, event))),
+            );
         }
         for id in pending.acknowledged {
             if stopped(&shared) {
                 return;
             }
-            delivery.retain(|_, notice| notice.id != id);
-            if let Err(error) = journal.acknowledge(id) {
-                snapshot.diagnostic = Some(error);
-            }
-            if let Some(notice) = snapshot.notices.iter().find(|notice| notice.id == id) {
-                withdraw_notice(&mut withdrawals, notice);
+            let visible = snapshot.notices.iter().find(|notice| notice.id == id);
+            match session_attention::acknowledge(journal, host.upgrade().as_ref(), id, visible) {
+                Ok(cleared) => {
+                    for notice in cleared {
+                        delivery.remove(&notice.event.target);
+                        withdraw_notice(&mut withdrawals, &notice);
+                    }
+                }
+                Err(error) => snapshot.diagnostic = Some(error),
             }
         }
-        let events = pending
-            .events
-            .into_values()
-            .map(|event| (event, None))
-            .chain(
-                pending
-                    .committed_events
-                    .into_iter()
-                    .map(|(event, receipt)| (event, Some(receipt))),
-            );
-        for (event, receipt) in events {
+        enum Work {
+            Record(Event),
+            Session(session_attention::Change),
+        }
+        let mut work =
+            pending
+                .events
+                .into_values()
+                .map(|(sequence, event)| (sequence, Work::Record(event), None))
+                .chain(
+                    pending
+                        .committed_events
+                        .into_iter()
+                        .map(|(sequence, event, receipt)| {
+                            (sequence, Work::Record(event), Some(receipt))
+                        }),
+                )
+                .chain(
+                    pending.session_attention.entries().into_iter().map(
+                        |(sequence, change, receipt)| (sequence, Work::Session(change), receipt),
+                    ),
+                )
+                .collect::<Vec<_>>();
+        // Native helpers can commit multiple semantic edges in quick succession.
+        // A clear consumes evidence already observed, never a later outcome.
+        work.sort_unstable_by_key(|(sequence, _, _)| *sequence);
+        for (_, task, receipt) in work {
             if stopped(&shared) {
                 return;
             }
+            let event = match task {
+                Work::Record(event) => event,
+                Work::Session(change) => {
+                    let result = match change {
+                        session_attention::Change::Clear(session, clear, cursor) => host
+                            .upgrade()
+                            .ok_or_else(|| "Session inventory is unavailable".to_owned())
+                            .and_then(|host| {
+                                session_attention::clear(journal, &host, session, clear, cursor)
+                            }),
+                        session_attention::Change::Retire(census) => host
+                            .upgrade()
+                            .ok_or_else(|| "Session inventory is unavailable".to_owned())
+                            .and_then(|host| {
+                                census
+                                    .apply(&host, |notices| journal.retire_session_notices(notices))
+                                    .map(Option::unwrap_or_default)
+                            }),
+                    };
+                    if let Some(receipt) = receipt {
+                        receipt.finish(result.as_ref().map(|_| ()).map_err(Clone::clone));
+                    }
+                    match result {
+                        Ok(cleared) => {
+                            for notice in cleared {
+                                delivery.remove(&notice.event.target);
+                                withdraw_notice(&mut withdrawals, &notice);
+                            }
+                        }
+                        Err(error) => snapshot.diagnostic = Some(error),
+                    }
+                    continue;
+                }
+            };
             let focused = presence.values().any(|window| {
                 event
                     .source_session()
@@ -1409,6 +1609,21 @@ async fn run(
                 }
                 Ok(None) => {}
                 Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
+        // Reconcile after positive reports from this broker batch.
+        for (_, update) in review_watches {
+            if let Some(census) = update.census {
+                apply_review_retirements(
+                    journal.reconcile_review_census(
+                        &update.repository,
+                        census,
+                        review_watch_time(),
+                    ),
+                    &mut snapshot,
+                    &mut delivery,
+                    &mut withdrawals,
+                );
             }
         }
         match journal.list() {
@@ -1561,12 +1776,23 @@ async fn run(
             if let Some(notice) = action_notice(&snapshot, action)
                 && let Some(host) = host.upgrade()
             {
+                let mut routed = Snapshot {
+                    notices: vec![notice.clone()],
+                    diagnostic: None,
+                };
+                let _ = session_attention::project(&host, &mut routed);
+                let notice = &routed.notices[0];
+                let source = notice.event.source_session();
+                let target = match notice.event.target() {
+                    Target::Session(session) => Target::Session(source.unwrap_or(session)),
+                    target => target,
+                };
                 let window = host
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .activate_notification_destination(
-                        notice.event.target(),
-                        notice.event.source_session(),
+                        target,
+                        source,
                         notice.window.as_deref(),
                         notice.event.destination.as_ref(),
                     );
@@ -1635,7 +1861,7 @@ mod tests {
         let test = handle.test();
         let mut first = take_pending(&shared);
         // As the broker does while its journal is unavailable.
-        for (_, receipt) in first.committed_events.drain(..) {
+        for (_, _, receipt) in first.committed_events.drain(..) {
             receipt.finish(Err("journal unavailable".into()));
         }
         answer_tests(&first.tests, &TestOutcome::Unavailable("portal".into()));
@@ -1648,19 +1874,20 @@ mod tests {
         assert!(test.try_recv().is_ok());
         assert!(deferred.actions.is_empty() && deferred.tests.is_empty());
 
-        handle.retire(retired);
+        handle.acknowledge_session(retired);
         handle.record(attention_event(replaced, "newer"));
         let merged = deferred.followed_by(take_pending(&shared));
-        // A deferred retirement still precedes a later worker's event.
+        // A deferred acknowledgement still precedes a later worker's event.
         handle.record(attention_event(retired, "after-retirement"));
         let merged = merged.deferred().followed_by(take_pending(&shared));
         let keys = merged
             .events
             .values()
-            .map(|event| event.evidence.key.as_str())
+            .map(|(_, event)| event.evidence.key.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(keys, BTreeSet::from(["kept", "newer", "after-retirement"]));
-        assert!(merged.retired.contains(&Target::Session(retired)));
+        let (_, clear, _) = merged.session_attention.entries().pop_front().unwrap();
+        assert!(matches!(clear, session_attention::Change::Clear(id, _, None) if id == retired));
         assert!(merged.acknowledged.contains(&acknowledged));
         assert!(merged.presence_changed);
     }
@@ -1694,27 +1921,37 @@ mod tests {
     }
 
     #[test]
-    fn helper_commit_retirement_fails_prior_evidence_but_preserves_a_later_worker() {
+    fn helper_commit_clear_precedes_a_later_outcome_and_preserves_both_receipts() {
         let (shared, _receiver) = shared();
         let handle = Handle(shared.clone());
         let session = TerminalId::new();
-        let old = handle
-            .record_committed(attention_event(session, "old"))
+        let cleared = handle
+            .acknowledge_turn_committed(session, Uuid::new_v4(), 4)
             .unwrap();
-        handle.retire(session);
-        assert!(old.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
         let later = handle
             .record_committed(attention_event(session, "later"))
             .unwrap();
         let pending = take_pending(&shared);
-        assert!(pending.retired.contains(&Target::Session(session)));
         assert_eq!(pending.committed_events.len(), 1);
-        assert_eq!(pending.committed_events[0].0.evidence.key, "later");
+        assert_eq!(pending.committed_events[0].1.evidence.key, "later");
+        let mut changes = pending.session_attention.entries();
+        let (sequence, clear, receipt) = changes.pop_front().unwrap();
+        assert!(sequence < pending.committed_events[0].0);
+        assert!(
+            matches!(clear, session_attention::Change::Clear(id, session_attention::Clear::Turn, Some((_, 4))) if id == session)
+        );
         assert!(matches!(
             later.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
-        drop(pending);
+        drop(receipt);
+        drop(pending.committed_events);
+        assert!(
+            cleared
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
         assert!(later.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
     }
 
@@ -1749,7 +1986,7 @@ mod tests {
         let event = attention_event(TerminalId::new(), "suppressed-helper");
         let policy = Preferences::default();
         let waiting = handle.record_committed(event.clone()).unwrap();
-        let (queued, receipt) = shared
+        let (_, queued, receipt) = shared
             .pending
             .lock()
             .unwrap()
@@ -1774,7 +2011,7 @@ mod tests {
         reopened.acknowledge(notice.id).unwrap();
 
         let replay = handle.record_committed(event).unwrap();
-        let (queued, receipt) = shared
+        let (_, queued, receipt) = shared
             .pending
             .lock()
             .unwrap()
@@ -1911,7 +2148,7 @@ mod tests {
             ),
             "queueing alone never confirms delivery"
         );
-        let (queued, reply) = shared
+        let (_, queued, reply) = shared
             .pending
             .lock()
             .unwrap()
@@ -1933,7 +2170,7 @@ mod tests {
                 .any(|notice| notice.event == event)
         );
         let replay = handle.record_committed(event.clone()).unwrap();
-        let (queued, reply) = shared
+        let (_, queued, reply) = shared
             .pending
             .lock()
             .unwrap()
@@ -1954,7 +2191,7 @@ mod tests {
         let mut next = event.clone();
         next.evidence.key = "journal-write-fails".into();
         let failed = handle.record_committed(next).unwrap();
-        let (queued, reply) = shared
+        let (_, queued, reply) = shared
             .pending
             .lock()
             .unwrap()
@@ -2001,7 +2238,7 @@ mod tests {
         handle.reconcile_inboxes(BTreeSet::from([lineage]), vec![inbox.clone()]);
         handle.reconcile_inboxes(BTreeSet::from([lineage]), vec![]);
         let pending = shared.pending.lock().unwrap();
-        assert_eq!(pending.events[&Target::Session(session)], lifecycle);
+        assert_eq!(pending.events[&Target::Session(session)].1, lifecycle);
         assert_eq!(
             pending.inboxes.as_ref().unwrap().pending,
             BTreeSet::from([lineage])
@@ -2095,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn retirement_coalescing_preserves_only_later_worker_evidence() {
+    fn lifecycle_coalescing_orders_an_outcome_after_a_view() {
         let (wake, _receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
@@ -2117,13 +2354,13 @@ mod tests {
             },
         };
         handle.record(event("old"));
-        handle.retire(session);
-        assert!(handle.0.pending.lock().unwrap().events.is_empty());
+        handle.acknowledge_session(session);
         handle.record(event("new"));
-        let pending = handle.0.pending.lock().unwrap();
-        assert!(pending.retired.contains(&Target::Session(session)));
+        let pending = take_pending(&handle.0);
+        let (clear_sequence, _, _) = pending.session_attention.entries().pop_front().unwrap();
+        assert!(clear_sequence < pending.events[&Target::Session(session)].0);
         assert_eq!(
-            pending.events[&Target::Session(session)].evidence.key,
+            pending.events[&Target::Session(session)].1.evidence.key,
             "new"
         );
     }
@@ -2531,7 +2768,7 @@ mod tests {
                     reply.try_recv(),
                     Err(std::sync::mpsc::TryRecvError::Empty)
                 ));
-                let (queued, receipt) = shared
+                let (_, queued, receipt) = shared
                     .pending
                     .lock()
                     .unwrap()

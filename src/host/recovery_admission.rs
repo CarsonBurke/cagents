@@ -87,11 +87,13 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatCandidates { .. }
         | R::UpgradeImpact { .. }
         | R::ObserveReviewRequests { .. }
+        | R::ReconcileReviewRequests { .. }
         | R::WatchNotifications { .. }
         | R::NotificationPresence { .. }
         | R::ReadNotifications
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
+        | R::AcknowledgeSessionNotifications { .. }
         | R::SendTestNotification
         | R::WatchWork
         | R::WatchConversationPullRequests { .. }

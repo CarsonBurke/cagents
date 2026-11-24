@@ -2173,6 +2173,12 @@ pub(crate) mod handoff {
                 .unwrap_or_default())
         }
 
+        /// Includes the retained predecessor and paired-terminal descriptors.
+        #[cfg(feature = "host")]
+        pub(crate) fn unattached_descriptors(&self) -> Result<Vec<UnattachedChat>, String> {
+            Ok(self.read_unattached()?.unwrap_or_default())
+        }
+
         fn read_unattached<T: serde::de::DeserializeOwned>(
             &self,
         ) -> Result<Option<Vec<T>>, String> {

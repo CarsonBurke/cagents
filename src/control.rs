@@ -1563,6 +1563,26 @@ impl ControlClient {
         self.accepted(ClientRequest::ObserveReviewRequests { observed })
     }
 
+    #[cfg(any(feature = "host", feature = "ui"))]
+    pub(crate) fn report_review_watch(
+        update: crate::notifications::review::WatchUpdate,
+    ) -> Result<(), ControlError> {
+        let timeout = Duration::from_secs(1);
+        let deadline = Instant::now() + timeout;
+        let path = crate::terminal::ipc::daemon_socket_path().map_err(ControlError::Connect)?;
+        let stream = connect_control_socket(&path, timeout).map_err(ControlError::Connect)?;
+        let mut client = Self::from_stream_inner(stream, deadline, deadline)?;
+        match client.request_with_deadline(
+            ClientRequest::ReconcileReviewRequests {
+                update: Box::new(update),
+            },
+            deadline,
+        )? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("review monitor update", &response)),
+        }
+    }
+
     pub fn notification_presence(
         &mut self,
         presence: crate::notifications::Presence,
@@ -1602,6 +1622,13 @@ impl ControlClient {
 
     pub fn acknowledge_notification(&mut self, id: uuid::Uuid) -> Result<(), ControlError> {
         self.accepted(ClientRequest::AcknowledgeNotification { id })
+    }
+
+    pub fn acknowledge_session_notifications(
+        &mut self,
+        session: TerminalId,
+    ) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::AcknowledgeSessionNotifications { session })
     }
 
     pub fn next_notification(&mut self) -> Result<crate::notifications::Update, ControlError> {

@@ -115,11 +115,13 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ApplyWorkspaceEdit { .. }
         | R::RefreshAgentActivity { .. }
         | R::ObserveReviewRequests { .. }
+        | R::ReconcileReviewRequests { .. }
         | R::WatchNotifications { .. }
         | R::NotificationPresence { .. }
         | R::ReadNotifications
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
+        | R::AcknowledgeSessionNotifications { .. }
         | R::SendTestNotification
         | R::ChatStart { .. }
         | R::ChatStartInPane { .. }

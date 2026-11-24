@@ -1,4 +1,6 @@
 //! Single-writer durable attention, independent of workspace/card persistence.
+mod review;
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -8,6 +10,8 @@ use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection}
 use uuid::Uuid;
 
 use crate::notifications::{Event, Notice, Target};
+
+mod session_attention;
 
 const MAX_SESSIONS: i64 = 2048;
 const KEYS_PER_SESSION: i64 = 32;
@@ -93,7 +97,13 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS review_requests_seen (identity TEXT PRIMARY KEY);
             PRAGMA user_version=3;").map_err(|error| error.to_string())?;
-        Ok(Self(connection))
+        session_attention::migrate(&mut connection)?;
+        connection
+            .batch_execute(review::SCHEMA)
+            .map_err(|error| error.to_string())?;
+        let mut journal = Self(connection);
+        journal.seed_review_routes()?;
+        Ok(journal)
     }
 
     /// Coalesce latest attention without resurrecting dismissed duplicates.
@@ -109,12 +119,13 @@ impl Journal {
                     // Immutable review identity outlives bounded payloads and
                     // dismissal; every new request node receives its own alert.
                     debug_assert!(request.validate().is_ok());
+                    review::record_route(connection, request, &session)?;
                     let inserted = diesel::insert_into(review_requests_seen::table)
                         .values(review_requests_seen::identity.eq(&session))
                         .on_conflict_do_nothing()
                         .execute(connection)?;
                     if inserted == 0 {
-                        return Err(diesel::result::Error::RollbackTransaction);
+                        return Ok(None);
                     }
                 }
                 let ordinal = diesel::insert_into(seen::table)

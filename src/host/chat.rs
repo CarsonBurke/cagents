@@ -594,6 +594,21 @@ fn changed_for_instance(
         return;
     }
     let proof = state.proof().clone();
+    if let Update::AttentionCleared(clear) = &update {
+        if state.chats.contains_key(&id)
+            && let Some(notifications) = &state.notifications
+        {
+            match clear {
+                crate::agent::observe::AttentionClear::TurnStarted => {
+                    notifications.acknowledge_turn(id)
+                }
+                crate::agent::observe::AttentionClear::LeftWaiting => {
+                    notifications.acknowledge_waiting(id)
+                }
+            }
+        }
+        return;
+    }
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind.
     if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
@@ -5049,7 +5064,7 @@ pub(super) fn close_captured(
         state.inventory_generation += 1;
         let record = state.chats.remove(&chat_id);
         if let Some(notifications) = &state.notifications {
-            notifications.retire(chat_id);
+            notifications.acknowledge_session(chat_id);
         }
         if let Some((source, _)) = terminal {
             state.retire_terminal(source.id);
@@ -5615,7 +5630,7 @@ pub(super) fn stop_failed_upgrade_restore(
         if record.is_some() {
             state.inventory_generation += 1;
             if let Some(notifications) = &state.notifications {
-                notifications.retire(id);
+                notifications.refresh_session_routes();
             }
         }
         if terminal.is_some() {

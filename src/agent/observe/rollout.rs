@@ -92,10 +92,10 @@ impl Rollouts {
         pid: i32,
         process_start: u64,
         started: Option<u64>,
-    ) -> Option<(ActivityState, Option<crate::notifications::Evidence>)> {
+    ) -> Option<(ActivityState, super::attention::Changes)> {
         let process = Path::new("/proc").join(pid.to_string());
         let mut state = None;
-        let mut evidence = None;
+        let mut attention = super::attention::Changes::default();
         for entry in std::fs::read_dir(process.join("fd")).ok()?.take(MAX_FDS) {
             let Ok(entry) = entry else { continue };
             let Ok(target) = std::fs::read_link(entry.path()) else {
@@ -125,16 +125,21 @@ impl Rollouts {
             };
             let turn = self.turn(&file, name.to_owned());
             state = Some(merge(state, activity(turn, started)));
-            if let Ok(Some(observed)) = self
+            if let Ok(observed) = self
                 .attention
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .read_for_process(&file, super::attention::Format::Codex, (pid, process_start))
             {
-                evidence = Some(observed);
+                attention.started |= observed.started;
+                // A descriptor listing does not order two separate rollouts.
+                // Only a later start in the same rollout supersedes its result.
+                if let Some(evidence) = observed.evidence {
+                    attention.evidence = Some(evidence);
+                }
             }
         }
-        state.map(|state| (state, evidence))
+        state.map(|state| (state, attention))
     }
 
     fn turn(&self, file: &File, name: OsString) -> Option<Turn> {

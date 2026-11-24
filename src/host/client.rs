@@ -1698,6 +1698,29 @@ fn process_admitted_request(
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }
+        ClientRequest::ReconcileReviewRequests { update } => {
+            update.validate().map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            let notifications = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notifications
+                .clone()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "Notification delivery is unavailable",
+                        true,
+                    )
+                })?;
+            notifications
+                .reconcile_review_requests(*update)
+                .map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::StoreBusy, message, true)
+                })?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::ObserveReviewRequests { observed } => {
             observed.validate().map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1862,6 +1885,14 @@ fn process_admitted_request(
                 &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
             {
                 notifications.acknowledge(id);
+            }
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::AcknowledgeSessionNotifications { session } => {
+            if let Some(notifications) =
+                &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+            {
+                notifications.acknowledge_session(session);
             }
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }

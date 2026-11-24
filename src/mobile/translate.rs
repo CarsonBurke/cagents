@@ -387,7 +387,9 @@ fn notice(notice: &notifications::Notice) -> api::Notice {
         },
         title: event.evidence.kind.label().into(),
         session: match &event.target {
-            notifications::Target::Session(id) => Some(id.to_string()),
+            notifications::Target::Session(id) => {
+                Some(event.source_session.unwrap_or(*id).to_string())
+            }
             notifications::Target::PullRequest(_)
             | notifications::Target::AgentRun(_)
             | notifications::Target::SessionInbox(_)

@@ -59,6 +59,7 @@ mod navigation;
 mod public_delta_tests;
 mod retired_channel_work;
 mod schema;
+pub(super) mod session_attention;
 mod terminal_owners;
 mod terminal_retention;
 pub(in crate::host) mod terminal_sources;

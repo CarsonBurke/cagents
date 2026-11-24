@@ -23,6 +23,7 @@ pub(in crate::host) enum NativeActorEvent {
         evidence: crate::notifications::Evidence,
         content: Option<crate::notifications::Content>,
     },
+    AttentionCleared(crate::agent::observe::AttentionClear),
 }
 
 impl NativeActorEvent {
@@ -37,7 +38,7 @@ impl NativeActorEvent {
             Self::AttentionContext { evidence, content } => {
                 Some((evidence.clone(), content.clone()))
             }
-            Self::Execution { .. } => None,
+            Self::Execution { .. } | Self::AttentionCleared(_) => None,
         }
     }
 }

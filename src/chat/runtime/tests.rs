@@ -3721,6 +3721,15 @@ fn notification_waiting_context_revises_without_an_activity_transition() {
                     busy: false,
                     detail: "Unrelated metadata".into(),
                 }],
+                5 => vec![Event::RequestResolved { id: "b".into() }],
+                6 => vec![
+                    Event::TurnStarted,
+                    Event::TurnSettled,
+                    Event::TurnFinished {
+                        key: Some("quick-turn".into()),
+                        outcome: crate::notifications::Kind::Succeeded,
+                    },
+                ],
                 _ => return Err("fixture exhausted".into()),
             };
             Ok(Step {
@@ -3750,20 +3759,35 @@ fn notification_waiting_context_revises_without_an_activity_transition() {
     let store = preflight(&spec, &mut initial).unwrap();
     let (send, receive) = crossbeam_channel::bounded(8);
     let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
-        if let Update::AttentionContext { evidence, .. } = update {
-            let _ = send.try_send(evidence);
+        if matches!(
+            update,
+            Update::AttentionContext { .. } | Update::AttentionCleared(_)
+        ) {
+            let _ = send.try_send(update);
         }
     })
     .unwrap();
     until(&handle, |snapshot| snapshot.ready);
+    let next = || receive.recv_timeout(Duration::from_secs(2)).unwrap();
     let mut keys = Vec::new();
-    for expected in [
+    for (index, expected) in [
         "First question?",
         "Second question?",
         "Updated second question?",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         handle.command(Command::Refresh).unwrap();
-        let evidence = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        if index == 0 {
+            assert_eq!(
+                next(),
+                Update::AttentionCleared(AttentionClear::TurnStarted)
+            );
+        }
+        let Update::AttentionContext { evidence, .. } = next() else {
+            panic!("expected a new waiting notice");
+        };
         assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
         assert_eq!(handle.notification_content(evidence.kind).preview, expected);
         assert_eq!(
@@ -3777,6 +3801,19 @@ fn notification_waiting_context_revises_without_an_activity_transition() {
     assert!(
         receive.try_recv().is_err(),
         "unrelated metadata must not repeat an actionable alert"
+    );
+    handle.command(Command::Refresh).unwrap();
+    assert_eq!(
+        next(),
+        Update::AttentionCleared(AttentionClear::LeftWaiting)
+    );
+    handle.command(Command::Refresh).unwrap();
+    assert_eq!(
+        next(),
+        Update::AttentionCleared(AttentionClear::TurnStarted)
+    );
+    assert!(
+        matches!(next(), Update::AttentionContext { evidence, .. } if evidence.key == "quick-turn")
     );
     handle.close().unwrap();
 }
@@ -4527,6 +4564,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
             | Update::ActiveModel { .. }
             | Update::Attention(_)
             | Update::AttentionContext { .. }
+            | Update::AttentionCleared(_)
             | Update::Ready
             | Update::PromptAvailable
             | Update::RetainedOutcomes

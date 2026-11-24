@@ -1,4 +1,5 @@
 //! Exact GitHub review-request authority, independent of a provider session.
+use crate::github_identity::GitHubRepoKey;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -14,44 +15,23 @@ pub struct ReviewRequest {
 
 impl ReviewRequest {
     pub fn validate(&self) -> Result<(), String> {
-        let component = |s: &str| {
-            !s.is_empty()
-                && s.len() <= 100
-                && s != "."
-                && s != ".."
-                && s.bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-        };
-        let node = |s: &str| {
-            !s.is_empty()
-                && s.len() <= 256
-                && s.bytes().all(|c| {
-                    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'+' | b'/' | b'=')
-                })
-        };
-        if self.host.is_empty()
-            || self.host.len() > 253
-            || self.host != self.host.to_ascii_lowercase()
-            || self.owner != self.owner.to_ascii_lowercase()
-            || self.repository != self.repository.to_ascii_lowercase()
-            || !component(&self.owner)
-            || !component(&self.repository)
-            || self.number == 0
+        if self.number == 0
             || self.number > i32::MAX as u64
-            || !node(&self.viewer)
-            || !node(&self.request)
+            || !valid_node(&self.viewer)
+            || !valid_node(&self.request)
         {
             return Err("Invalid review-request identity".into());
         }
-        let url = url::Url::parse(&self.url()).map_err(|_| "Invalid review repository host")?;
-        if url.host_str() != Some(self.host.as_str())
-            || url.username() != ""
-            || url.password().is_some()
-            || url.port_or_known_default() != Some(self.port.unwrap_or(443))
-        {
-            return Err("Invalid review repository host".into());
+        validate_repository(&self.repository_key())
+    }
+
+    pub fn repository_key(&self) -> GitHubRepoKey {
+        GitHubRepoKey {
+            host: self.host.clone(),
+            port: self.port,
+            owner: self.owner.clone(),
+            name: self.repository.clone(),
         }
-        Ok(())
     }
 
     pub fn url(&self) -> String {
@@ -68,18 +48,92 @@ impl ReviewRequest {
     /// rename), but the same viewer/request must never be charged a second alert.
     #[cfg(any(feature = "host", test))]
     pub(crate) fn storage_key(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let mut digest = Sha256::new();
-        for part in [
-            self.host.as_bytes(),
-            self.viewer.as_bytes(),
-            self.request.as_bytes(),
-        ] {
-            digest.update((part.len() as u64).to_le_bytes());
-            digest.update(part);
+        request_key(&self.host, self.port, &self.viewer, &self.request)
+    }
+}
+
+fn valid_node(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'+' | b'/' | b'='))
+}
+
+fn validate_repository(repository: &GitHubRepoKey) -> Result<(), String> {
+    let component = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s != "."
+            && s != ".."
+            && s.bytes().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'-' | b'_' | b'.')
+            })
+    };
+    if repository.host.is_empty()
+        || repository.host.len() > 253
+        || repository.host != repository.host.to_ascii_lowercase()
+        || !component(&repository.owner)
+        || !component(&repository.name)
+    {
+        return Err("Invalid review repository identity".into());
+    }
+    let url = url::Url::parse(&format!("https://{}/", repository.authority()))
+        .map_err(|_| "Invalid review repository host")?;
+    if url.host_str() != Some(repository.host.as_str())
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(repository.port.unwrap_or(443))
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Invalid review repository host".into());
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "host", test))]
+pub(crate) fn request_key(host: &str, port: Option<u16>, viewer: &str, request: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in [host.as_bytes(), viewer.as_bytes(), request.as_bytes()] {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part);
+    }
+    digest.update(port.unwrap_or(443).to_le_bytes());
+    format!("review:{:x}", digest.finalize())
+}
+
+/// A complete, error-free monitor pass for one viewer. An empty set is an
+/// authoritative observation. Partial, failed and cancelled reads send no set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Census {
+    pub viewer: String,
+    pub started_at: u64,
+    pub completed_at: u64,
+    pub requests: Vec<(u64, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchUpdate {
+    pub repository: GitHubRepoKey,
+    pub census: Option<Census>,
+}
+
+impl WatchUpdate {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_repository(&self.repository)?;
+        if let Some(census) = &self.census
+            && (!valid_node(&census.viewer)
+                || census.started_at == 0
+                || census.completed_at < census.started_at
+                || census.requests.iter().any(|(number, request)| {
+                    *number == 0 || *number > i32::MAX as u64 || !valid_node(request)
+                }))
+        {
+            return Err("Invalid settled review-request census".into());
         }
-        digest.update(self.port.unwrap_or(443).to_le_bytes());
-        format!("review:{:x}", digest.finalize())
+        Ok(())
     }
 }
 
@@ -121,15 +175,6 @@ impl ObservedRequests {
 
 #[cfg(feature = "ui")]
 impl ReviewRequest {
-    pub fn repository_key(&self) -> crate::github::GitHubRepoKey {
-        crate::github::GitHubRepoKey {
-            host: self.host.clone(),
-            port: self.port,
-            owner: self.owner.clone(),
-            name: self.repository.clone(),
-        }
-    }
-
     /// Activation is a fresh authorization read, not a replay of notification
     /// content under a potentially different GitHub account.
     pub fn verify_current(&self) -> Result<(), String> {

@@ -328,7 +328,10 @@ use crate::{
 /// request to one is written without it.
 ///
 /// Version 203 appends the provider CLI inventory query and reply.
-pub const PROTOCOL_VERSION: u16 = 203;
+///
+/// Version 206 appends settled review monitor census updates and lineage-scoped
+/// notification acknowledgment for a viewed session. Older clients send neither.
+pub const PROTOCOL_VERSION: u16 = 206;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -864,6 +867,15 @@ pub enum ClientRequest {
         nonce: [u8; crate::device_trust::SECRET_BYTES],
     },
     ProviderStatus,
+    /// Activity of the independent GitHub review monitor. Only a settled
+    /// census can revoke individual requests.
+    ReconcileReviewRequests {
+        update: Box<crate::notifications::review::WatchUpdate>,
+    },
+    /// A conversation was read. Clear notices on the daemon's session lineage.
+    AcknowledgeSessionNotifications {
+        session: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -120,6 +120,12 @@ fn a_conversation_that_goes_away_ends_its_watch_and_answers_what_was_in_flight()
         next_line(&lines),
         api::ServerLine::Event(api::Event::Conversation(update)) if update.reset
     ));
+    let acknowledgement = daemon.receive();
+    assert!(matches!(
+        acknowledgement.request,
+        ClientRequest::AcknowledgeSessionNotifications { session } if session == chat_id
+    ));
+    daemon.respond(&acknowledgement, ServerResponse::Accepted);
 
     let read = daemon.receive();
     assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
@@ -185,6 +191,11 @@ fn a_watch_stopped_while_attaching_answers_once_and_sends_no_conversation() {
     };
     assert_eq!(error.code, api::ErrorCode::NotWatching);
     assert_eq!(ending.recv_timeout(WAIT).unwrap().1, None);
+    assert!(
+        read_frame::<ClientEnvelope>(&mut daemon.0)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         lines
             .outgoing

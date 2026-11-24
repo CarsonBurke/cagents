@@ -3,6 +3,7 @@ mod paired_upgrade_tests;
 mod presentation;
 mod removal;
 mod retention;
+mod session_attention;
 pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
@@ -497,6 +498,9 @@ impl HostState {
         if let (Some(work), Some(record)) = (&self.work, self.chats.get(&id)) {
             work.chat_added(record.session.launch.provider);
         }
+        if let Some(notifications) = &self.notifications {
+            notifications.refresh_session_routes();
+        }
     }
 
     pub(super) fn enable_holder_recovery(&mut self) {
@@ -709,6 +713,19 @@ impl HostState {
             },
             super::notifications::Handle::snapshot,
         )
+    }
+
+    pub(super) fn notification_sessions(&self) -> BTreeSet<TerminalId> {
+        self.terminals
+            .keys()
+            .chain(self.chats.keys())
+            .copied()
+            .chain(
+                self.notification_watchers
+                    .values()
+                    .flat_map(|presence| presence.sessions.iter().copied()),
+            )
+            .collect()
     }
 
     pub(super) fn watch_notifications(
@@ -1514,7 +1531,7 @@ impl HostState {
             .observe(terminal_id, record.handle.execution_instance());
         self.notification_closed.remove(&terminal_id);
         if let Some(notifications) = &self.notifications {
-            notifications.retire(terminal_id);
+            notifications.refresh_session_routes();
         }
         let clients: Vec<_> = self
             .subscriptions
@@ -1546,7 +1563,7 @@ impl HostState {
             None => {}
         }
         if let Some(notifications) = &self.notifications {
-            notifications.retire(terminal_id);
+            notifications.acknowledge_session(terminal_id);
         }
     }
 
@@ -1863,6 +1880,9 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.notification_closed.remove(&terminal_id);
+        if let Some(notifications) = &self.notifications {
+            notifications.refresh_session_routes();
+        }
         self.terminals.insert(
             terminal_id,
             TerminalRecord {

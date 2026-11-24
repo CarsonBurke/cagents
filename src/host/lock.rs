@@ -91,16 +91,33 @@ impl<T> HostMutex<T> {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             }
         };
+        Ok(self.acquired(guard, thread))
+    }
+
+    /// A background task abandons a proof rather than waiting with other
+    /// admission or writer fences held.
+    #[track_caller]
+    pub(super) fn try_lock(&self) -> Option<HostGuard<'_, T>> {
+        let guard = match self.inner.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(self.acquired(guard, current_thread()))
+    }
+
+    #[track_caller]
+    fn acquired<'a>(&'a self, guard: MutexGuard<'a, T>, thread: u64) -> HostGuard<'a, T> {
         self.site.store(
             std::ptr::from_ref(Location::caller()).cast_mut(),
             Ordering::Relaxed,
         );
         self.acquisitions.fetch_add(1, Ordering::Relaxed);
         self.owner.store(thread, Ordering::Relaxed);
-        Ok(HostGuard {
+        HostGuard {
             guard,
             owner: &self.owner,
-        })
+        }
     }
 
     /// The acquisition currently holding the lock, if any.

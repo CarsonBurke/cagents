@@ -292,6 +292,7 @@ fn start_runtime_collection(
     root: std::path::PathBuf,
     model: Option<model::Registry>,
 ) -> io::Result<()> {
+    let model = model.map(|model| Arc::new(std::sync::Mutex::new(model)));
     let mut next_upgrade_collection = std::time::Instant::now();
     runtime_collector(host, RUNTIME_COLLECT_INTERVAL, move |host, first| {
         let now = std::time::Instant::now();
@@ -337,7 +338,7 @@ fn runtime_collector(
 fn collect_runtime_directory(
     host: SharedHost,
     root: &std::path::Path,
-    model: Option<&model::Registry>,
+    model: Option<&Arc<std::sync::Mutex<model::Registry>>>,
     first: bool,
 ) {
     if !first {
@@ -364,13 +365,16 @@ fn collect_runtime_directory(
     }
     // Its own connection, so a batch never waits on or holds the host lock.
     if let Some(model) = model {
-        match service::attempt("pane change collection", || model.collect_view_operations()) {
+        let registry = model.lock().unwrap_or_else(|p| p.into_inner());
+        match service::attempt("pane change collection", || {
+            registry.collect_view_operations()
+        }) {
             Ok(0) => {}
             Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
             Err(error) => tracing::warn!(%error, "applied pane changes were not collected"),
         }
         match service::attempt("worktree view compaction", || {
-            model.compact_worktree_views()
+            registry.compact_worktree_views()
         }) {
             Ok(Some((sequence, effects))) => {
                 announce_compacted_views(&host, sequence, &effects);
@@ -381,6 +385,14 @@ fn collect_runtime_directory(
             }
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, "worktree view compaction did not finish"),
+        }
+        drop(registry);
+        if !first
+            && let Err(error) = service::attempt("session attention collection", || {
+                notifications::session_census::collect(&host, model)
+            })
+        {
+            tracing::warn!(%error, "session attention was kept because its owners could not be reconciled");
         }
     }
 }

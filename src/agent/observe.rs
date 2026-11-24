@@ -13,6 +13,7 @@ mod claude;
 mod codex;
 mod rollout;
 pub(crate) mod socket;
+pub(crate) use attention::Clear as AttentionClear;
 
 /// How long a census, or a failure to take one, answers without checking.
 const TTL: Duration = Duration::from_secs(2);
@@ -113,6 +114,7 @@ pub(crate) struct Observation {
     pub activity: Option<Activity>,
     pub title: Option<String>,
     pub attention: Option<crate::notifications::Evidence>,
+    pub attention_clear: Option<AttentionClear>,
 }
 
 pub(crate) enum ObserveError {
@@ -157,7 +159,8 @@ impl Observer {
             return Ok(Observation {
                 activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
                 title: None,
-                attention,
+                attention: attention.evidence,
+                attention_clear: attention.started.then_some(AttentionClear::TurnStarted),
             });
         }
         let key = key(provider, recipe).map_err(|_| ObserveError::Unavailable)?;
@@ -253,15 +256,15 @@ impl Observer {
                                 (process.pid, process.start),
                             )
                             .ok()
-                            .flatten()
                     })
+                    .unwrap_or_default()
             }
-            Inventory::Codex(_) => None,
+            Inventory::Codex(_) => attention::Changes::default(),
         };
-        let waiting = (|| {
+        let previous = (|| {
             // Claude's PID-scoped inventory explicitly distinguishes waiting.
             // A first census is a baseline, including when already waiting.
-            if provider != Provider::Claude {
+            if provider != Provider::Claude || state == ActivityState::Unknown {
                 return None;
             }
             let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
@@ -275,20 +278,36 @@ impl Observer {
                     waiting.remove(&stale);
                 }
             }
-            let old = waiting.insert(key, (state, Instant::now()));
-            (state.waits_on_user() && old.is_some_and(|(old, _)| old != state)).then(|| {
-                crate::notifications::Evidence {
-                    key: format!("waiting:{}", uuid::Uuid::new_v4()),
-                    kind: crate::notifications::Kind::Waiting,
-                }
-            })
+            waiting
+                .insert(key, (state, Instant::now()))
+                .map(|(old, _)| old)
         })();
+        let waiting = entered_waiting(previous, state).then(|| crate::notifications::Evidence {
+            key: format!("waiting:{}", uuid::Uuid::new_v4()),
+            kind: crate::notifications::Kind::Waiting,
+        });
         Ok(Observation {
             activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
             title,
-            attention: waiting.or(attention),
+            attention: waiting.or(attention.evidence),
+            attention_clear: if attention.started {
+                Some(AttentionClear::TurnStarted)
+            } else if left_waiting(previous, state) {
+                Some(AttentionClear::LeftWaiting)
+            } else {
+                None
+            },
         })
     }
+}
+
+fn entered_waiting(previous: Option<ActivityState>, state: ActivityState) -> bool {
+    state.waits_on_user() && previous.is_some_and(|old| old != state)
+}
+
+fn left_waiting(previous: Option<ActivityState>, state: ActivityState) -> bool {
+    matches!(state, ActivityState::Working | ActivityState::Idle)
+        && previous.is_some_and(ActivityState::waits_on_user)
 }
 
 fn absolute(recipe: &LaunchRecipe, value: &str) -> ProbeResult<PathBuf> {
@@ -431,6 +450,33 @@ mod tests {
         });
         assert!(failure.is_err());
         assert!(entry.is_poisoned());
+    }
+
+    #[test]
+    fn waiting_clears_only_after_a_known_nonwaiting_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let process = process(directory.path(), directory.path().join("fixture"));
+        let observer = Observer::new();
+        let entry = cached_account(&observer, &process, ActivityState::Waiting, "Fixture");
+        let observe = || {
+            observer
+                .try_observe(&process)
+                .unwrap_or_else(|_| panic!("fresh census failed"))
+        };
+        let set = |state| {
+            let mut entry = entry.lock().unwrap();
+            entry.checked = Some(Instant::now());
+            let Some(Inventory::Claude(census)) = &mut entry.census else {
+                panic!("expected Claude's exact PID census");
+            };
+            census.get_mut(&process.pid).unwrap().1 = state;
+        };
+        assert!(observe().attention_clear.is_none());
+        set(ActivityState::Unknown);
+        assert!(observe().attention_clear.is_none());
+        set(ActivityState::Working);
+        assert_eq!(observe().attention_clear, Some(AttentionClear::LeftWaiting));
+        assert!(observe().attention_clear.is_none());
     }
 
     #[test]

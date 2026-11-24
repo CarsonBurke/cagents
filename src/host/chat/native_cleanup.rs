@@ -394,7 +394,7 @@ fn close_retained_inner(
         state.native_closing.remove(&source.id);
         state.native_adoption_failures.clear(source.id);
         if let Some(notifications) = &state.notifications {
-            notifications.retire(source.id);
+            notifications.acknowledge_session(source.id);
         }
         drop(state);
         super::super::state::retire_unattached_upgrade_chat(host, source.id);

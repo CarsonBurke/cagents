@@ -1815,6 +1815,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .close_agent(&origin, id)?;
+        acknowledge_closed_agent(host, &agent);
         announce(host, &registry);
         return Ok(agent);
     }
@@ -1920,12 +1921,21 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     let result = store.close_agent(&origin, id)?;
     drop(store);
     drop(lost_holder_fence);
+    acknowledge_closed_agent(host, &result);
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .execution_startups
         .remove(&id);
     announce(host, &registry);
     Ok(result)
+}
+
+fn acknowledge_closed_agent(host: &SharedHost, agent: &Agent) {
+    if let Some(session) = &agent.session
+        && let Some(notifications) = &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+    {
+        notifications.acknowledge_session(session.id());
+    }
 }
 
 /// Preserve typed mailbox capacity and store contention at the service boundary.

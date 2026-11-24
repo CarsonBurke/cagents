@@ -14,6 +14,20 @@ const MAX_FILES: usize = 4096;
 const MAX_LINE: usize = 256 * 1024;
 const MAX_READ: u64 = 8 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Clear {
+    TurnStarted,
+    LeftWaiting,
+}
+
+/// A start invalidates older outcomes in the same read. An outcome after
+/// that start remains new attention even when the turn fit between polls.
+#[derive(Default)]
+pub(super) struct Changes {
+    pub started: bool,
+    pub evidence: Option<Evidence>,
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Format {
     Codex,
@@ -34,7 +48,7 @@ pub(super) struct Tails(BTreeMap<(i32, u64, u64, u64), Cursor>);
 impl Tails {
     #[cfg(test)]
     fn read(&mut self, file: &File, format: Format) -> io::Result<Option<Evidence>> {
-        self.read_for_process(file, format, (1, 1))
+        Ok(self.read_for_process(file, format, (1, 1))?.evidence)
     }
 
     pub fn read_for_process(
@@ -42,10 +56,10 @@ impl Tails {
         file: &File,
         format: Format,
         process: (i32, u64),
-    ) -> io::Result<Option<Evidence>> {
+    ) -> io::Result<Changes> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
-            return Ok(None);
+            return Ok(Changes::default());
         }
         let key = (process.0, process.1, metadata.dev(), metadata.ino());
         let size = metadata.len();
@@ -53,7 +67,7 @@ impl Tails {
             self.0
                 .retain(|_, cursor| cursor.seen.elapsed() < Duration::from_secs(600));
             if self.0.len() >= MAX_FILES {
-                return Ok(None);
+                return Ok(Changes::default());
             }
         }
         if self.0.get(&key).is_none_or(|cursor| cursor.offset > size) {
@@ -76,7 +90,7 @@ impl Tails {
                     eligible,
                 },
             );
-            return Ok(None);
+            return Ok(Changes::default());
         }
         let cursor = self.0.get_mut(&key).expect("cursor was initialized");
         cursor.seen = Instant::now();
@@ -85,11 +99,11 @@ impl Tails {
         }
         if cursor.eligible != Some(true) {
             cursor.offset = size;
-            return Ok(None);
+            return Ok(Changes::default());
         }
         let end = size.min(cursor.offset.saturating_add(MAX_READ));
         let mut buffer = [0; 64 * 1024];
-        let mut evidence = None;
+        let mut changes = Changes::default();
         while cursor.offset < end {
             let length = (end - cursor.offset).min(buffer.len() as u64) as usize;
             file.read_exact_at(&mut buffer[..length], cursor.offset)?;
@@ -111,14 +125,22 @@ impl Tails {
                 }
                 if complete {
                     if !cursor.skipping
-                        && let Some((kind, identity)) = boundary(&cursor.partial, format)
+                        && let Some(boundary) = boundary(&cursor.partial, format)
                     {
-                        evidence = Some(Evidence {
-                            key: identity.unwrap_or_else(|| {
-                                format!("log:{}:{}:{}", key.2, key.3, cursor.offset)
-                            }),
-                            kind,
-                        });
+                        match boundary {
+                            Boundary::Started => {
+                                changes.started = true;
+                                changes.evidence = None;
+                            }
+                            Boundary::Finished(kind, identity) => {
+                                changes.evidence = Some(Evidence {
+                                    key: identity.unwrap_or_else(|| {
+                                        format!("log:{}:{}:{}", key.2, key.3, cursor.offset)
+                                    }),
+                                    kind,
+                                });
+                            }
+                        }
                     }
                     cursor.partial.clear();
                     cursor.skipping = false;
@@ -126,7 +148,7 @@ impl Tails {
             }
         }
         cursor.partial.shrink_to(4096);
-        Ok(evidence)
+        Ok(changes)
     }
 }
 
@@ -145,10 +167,19 @@ fn main_codex_rollout(file: &File) -> io::Result<Option<bool>> {
     ))
 }
 
-fn boundary(line: &[u8], format: Format) -> Option<(Kind, Option<String>)> {
+enum Boundary {
+    Started,
+    Finished(Kind, Option<String>),
+}
+
+fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
     let markers: &[&[u8]] = match format {
-        Format::Codex => &[b"\"task_complete\"", b"\"turn_aborted\""],
-        Format::Claude => &[b"\"end_turn\""],
+        Format::Codex => &[
+            b"\"task_started\"",
+            b"\"task_complete\"",
+            b"\"turn_aborted\"",
+        ],
+        Format::Claude => &[b"\"user\"", b"\"end_turn\""],
     };
     if !markers
         .iter()
@@ -160,14 +191,16 @@ fn boundary(line: &[u8], format: Format) -> Option<(Kind, Option<String>)> {
     match format {
         Format::Codex if value["type"] == "event_msg" => {
             let kind = match value["payload"]["type"].as_str()? {
+                "task_started" => return Some(Boundary::Started),
                 "task_complete" => Kind::Succeeded,
                 "turn_aborted" => Kind::Cancelled,
                 _ => return None,
             };
             // File identity + offset is stable across observer reconnects and
             // distinguishes repeated provider turn IDs in imported history.
-            Some((kind, None))
+            Some(Boundary::Finished(kind, None))
         }
+        Format::Claude if claude_prompt(&value) => Some(Boundary::Started),
         Format::Claude if value["type"] == "assistant" && value["isSidechain"] != true => {
             let kind = match value["message"]["stop_reason"].as_str()? {
                 "end_turn" => Kind::Succeeded,
@@ -177,10 +210,44 @@ fn boundary(line: &[u8], format: Format) -> Option<(Kind, Option<String>)> {
                 .as_str()
                 .filter(|id| id.len() <= 128)
                 .map(|id| format!("claude:{id}"));
-            Some((kind, identity))
+            Some(Boundary::Finished(kind, identity))
         }
         _ => None,
     }
+}
+
+fn claude_prompt(value: &serde_json::Value) -> bool {
+    if value["type"] != "user"
+        || [
+            "isSidechain",
+            "isMeta",
+            "isSynthetic",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ]
+        .into_iter()
+        .any(|key| value[key] == true)
+        || !value["toolUseResult"].is_null()
+    {
+        return false;
+    }
+    let user_text = |text: &str| {
+        let text = text.trim_start();
+        !text.is_empty()
+            && !["<local-command-", "<command-name>", "<task-notification>"]
+                .iter()
+                .any(|marker| text.starts_with(marker))
+    };
+    let content = &value["message"]["content"];
+    content.as_str().is_some_and(user_text)
+        || content.as_array().is_some_and(|blocks| {
+            !blocks.iter().any(|block| block["type"] == "tool_result")
+                && blocks.iter().any(|block| match block["type"].as_str() {
+                    Some("text") => block["text"].as_str().is_some_and(user_text),
+                    Some("image" | "document") => true,
+                    _ => false,
+                })
+        })
 }
 
 #[cfg(test)]
@@ -293,6 +360,7 @@ mod tests {
             tails
                 .read_for_process(&file, Format::Claude, (7, 10))
                 .unwrap()
+                .evidence
                 .is_none()
         );
         writeln!(
@@ -305,6 +373,7 @@ mod tests {
             tails
                 .read_for_process(&file, Format::Claude, (7, 11))
                 .unwrap()
+                .evidence
                 .is_none()
         );
         writeln!(
@@ -316,8 +385,67 @@ mod tests {
             tails
                 .read_for_process(&file, Format::Claude, (7, 11))
                 .unwrap()
+                .evidence
                 .is_some()
         );
+    }
+
+    #[test]
+    fn an_appended_codex_start_supersedes_only_earlier_outcomes() {
+        let mut file = tempfile::tempfile().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"source":"cli"}}}}"#
+        )
+        .unwrap();
+        let event = |kind: &str| format!(r#"{{"type":"event_msg","payload":{{"type":"{kind}"}}}}"#);
+        writeln!(file, "{}", event("task_started")).unwrap();
+        let mut tails = Tails::default();
+        let read = |tails: &mut Tails, file: &File| {
+            tails.read_for_process(file, Format::Codex, (1, 1)).unwrap()
+        };
+        assert!(
+            !read(&mut tails, &file).started,
+            "historical start is a baseline"
+        );
+
+        writeln!(file, "{}", event("task_complete")).unwrap();
+        writeln!(file, "{}", event("task_started")).unwrap();
+        let changes = read(&mut tails, &file);
+        assert!(changes.started);
+        assert!(changes.evidence.is_none());
+
+        writeln!(file, "{}", event("task_started")).unwrap();
+        writeln!(file, "{}", event("turn_aborted")).unwrap();
+        let changes = read(&mut tails, &file);
+        assert!(changes.started);
+        assert_eq!(changes.evidence.unwrap().kind, Kind::Cancelled);
+        assert!(!read(&mut tails, &file).started);
+    }
+
+    #[test]
+    fn only_new_root_claude_prompts_clear_outcomes() {
+        let mut file = tempfile::tempfile().unwrap();
+        let mut tails = Tails::default();
+        let read = |tails: &mut Tails, file: &File| {
+            tails
+                .read_for_process(file, Format::Claude, (1, 1))
+                .unwrap()
+        };
+        assert!(!read(&mut tails, &file).started);
+        for record in [
+            serde_json::json!({"type": "user", "isMeta": true, "message": {"content": "hook"}}),
+            serde_json::json!({"type": "user", "isSidechain": true, "message": {"content": "child"}}),
+            serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result"}]}}),
+            serde_json::json!({"type": "user", "message": {"content": "<local-command-stdout>status</local-command-stdout>"}}),
+        ] {
+            writeln!(file, "{record}").unwrap();
+        }
+        assert!(!read(&mut tails, &file).started);
+        let message =
+            serde_json::json!({"type": "user", "message": {"content": "Continue the work"}});
+        writeln!(file, "{message}").unwrap();
+        assert!(read(&mut tails, &file).started);
     }
 
     #[test]

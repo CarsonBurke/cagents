@@ -227,6 +227,13 @@ impl Connection {
             );
             return End::Phone;
         }
+        // The watch has shown its first snapshot. A watch cancelled during
+        // attachment must leave the conversation's attention unread.
+        if let Err(error) = self.request(ClientRequest::AcknowledgeSessionNotifications {
+            session: self.chat_id,
+        }) {
+            return End::Daemon(lost(&error));
+        }
         // From here on the reader thread waits for frames for as long as the
         // conversation is followed.
         let reader = self
@@ -458,9 +465,10 @@ impl Connection {
             chat_id: self.chat_id,
             visible: true,
         })? {
-            ServerResponse::Accepted => Ok(snapshot),
-            _ => Err(internal("The daemon answered unexpectedly.")),
+            ServerResponse::Accepted => {}
+            _ => return Err(internal("The daemon answered unexpectedly.")),
         }
+        Ok(snapshot)
     }
 
     /// Send `request` and wait for its answer. Only for the setup before the

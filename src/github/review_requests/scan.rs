@@ -1,6 +1,7 @@
 //! A resumable scan: one page per call, alternating repository discovery and
 //! request history. A long timeline can never starve PRs beyond the first page.
 use super::{Current, Entry, HistoryPage, Page, Viewer};
+use crate::notifications::review::Census;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -400,8 +401,12 @@ pub struct Scan {
     seen: BTreeSet<u64>,
     histories: VecDeque<PendingHistory>,
     history_next: bool,
-    /// Whether this viewer's census has ever reached the last page.
+    /// Whether the current pass has reached the last repository page.
     censused: bool,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    completed: Option<Census>,
 }
 
 impl Scan {
@@ -417,6 +422,11 @@ impl Scan {
             }
         }
         self.history_next = true;
+        if self.cursor.is_none() {
+            self.censused = false;
+            self.started_at = None;
+            self.completed = None;
+        }
         Work::Page {
             cursor: self.cursor.clone(),
         }
@@ -488,9 +498,7 @@ impl Scan {
         {
             // Restart discovery after malformed pagination, preserving the
             // last observed requests until a complete new census replaces it.
-            self.cursor = None;
-            self.cursors.clear();
-            self.seen.clear();
+            self.restart_census();
             return Err("GitHub repeated a review scan cursor".into());
         }
         for entry in page.entries {
@@ -585,6 +593,53 @@ impl Scan {
     /// A scan reset for a new viewer has read nothing, so it is not settled.
     pub fn settled(&self) -> bool {
         self.censused && self.cursor.is_none() && self.histories.is_empty()
+    }
+
+    /// The monitor's latest complete pass, available only while it remains
+    /// settled. Cached scans written before settlement tracking have no census.
+    pub fn settled_census(&self) -> Option<&Census> {
+        self.completed.as_ref()
+    }
+
+    pub(super) fn record_settlement(&mut self, completed_at: u64) {
+        if let Some(viewer) = self.viewer.as_ref().filter(|_| self.settled())
+            && let Some(started_at) = self.started_at
+        {
+            self.completed = Some(Census {
+                viewer: viewer.id.clone(),
+                started_at,
+                completed_at,
+                requests: self
+                    .requested
+                    .iter()
+                    .map(|(&number, request)| (number, request.current.id.clone()))
+                    .collect(),
+            });
+        }
+    }
+
+    pub(super) fn starts_fresh_page(&self) -> bool {
+        self.cursor.is_none() && (!self.history_next || self.histories.is_empty())
+    }
+
+    pub(super) fn begin_census(&mut self, work: &Work, now: u64) {
+        if matches!(work, Work::Page { cursor: None }) {
+            self.started_at = Some(now);
+        }
+    }
+
+    pub(super) fn restart_census(&mut self) {
+        self.censused = false;
+        self.started_at = None;
+        self.completed = None;
+        self.cursor = None;
+        self.cursors.clear();
+        self.seen.clear();
+    }
+
+    pub(super) fn restart_after_pause(&mut self) {
+        self.restart_census();
+        self.history_next = false;
     }
 
     /// An unavailable timeline never revokes the authoritative current request.

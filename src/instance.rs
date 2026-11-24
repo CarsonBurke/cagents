@@ -1009,6 +1009,27 @@ pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
     AdmissionFence::acquire()
 }
 
+/// Block new window stores while existing stores are fenced for attention
+/// collection. An already admitted window may still be opening its database.
+#[cfg(feature = "host")]
+pub(crate) fn attention_window_census_fence() -> io::Result<Option<(AdmissionFence, OwnedLock)>> {
+    let launch = AdmissionFence::acquire()?;
+    let runtime = runtime_directory()?;
+    let legacy = owned_lock(
+        &runtime.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )?;
+    for slot in running_window_slots(&runtime)? {
+        match fs::symlink_metadata(window_database_path(&slot)?) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some((launch, legacy)))
+}
+
 pub(crate) struct VerifiedWindow {
     pub executable: PathBuf,
     pidfd: File,

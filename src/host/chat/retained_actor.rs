@@ -913,6 +913,30 @@ pub(in crate::host) mod drain_fence {
     }
 }
 
+fn commit_attention_clear(
+    notifications: Option<&super::super::notifications::Handle>,
+    session: TerminalId,
+    actor: uuid::Uuid,
+    sequence: u64,
+    clear: crate::agent::observe::AttentionClear,
+    timeout: Duration,
+) -> Result<(), String> {
+    use crate::agent::observe::AttentionClear;
+    let notifications = notifications
+        .ok_or("The notification journal is unavailable; attention remains retained")?;
+    let receipt = match clear {
+        AttentionClear::TurnStarted => {
+            notifications.acknowledge_turn_committed(session, actor, sequence)
+        }
+        AttentionClear::LeftWaiting => {
+            notifications.acknowledge_waiting_committed(session, actor, sequence)
+        }
+    }?;
+    receipt
+        .recv_timeout(timeout)
+        .map_err(|_| "The notification journal has not confirmed this attention change")?
+}
+
 /// The broker and synchronous Answer boundary share the same semantic writes,
 /// exact owner checks, notification receipts and commit-before-ACK ordering.
 fn commit_semantic_entry(
@@ -939,6 +963,7 @@ fn commit_semantic_entry(
         Update::AttentionContext { evidence, content } => {
             NativeActorEvent::AttentionContext { evidence, content }
         }
+        Update::AttentionCleared(clear) => NativeActorEvent::AttentionCleared(clear),
         _ => return Err("The retained semantic outbox contains an unsupported event".into()),
     };
     let execution = matches!(semantic, NativeActorEvent::Execution { .. });
@@ -984,6 +1009,21 @@ fn commit_semantic_entry(
     };
     if changed {
         super::super::agent_execution::announce(host, registry);
+    }
+    if let NativeActorEvent::AttentionCleared(clear) = semantic
+        && !automation
+    {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("Retained semantic acknowledgement deadline expired")?;
+        commit_attention_clear(
+            target.notifications.as_ref(),
+            target.source.id,
+            target.identity.instance,
+            sequence,
+            clear,
+            remaining.min(Duration::from_secs(10)),
+        )?;
     }
     if let Some((evidence, content)) = semantic.attention()
         && !automation
@@ -2838,7 +2878,7 @@ fn remove_closed_resident(
         if ending == Ending::Closed
             && let Some(notifications) = &state.notifications
         {
-            notifications.retire(source.id);
+            notifications.acknowledge_session(source.id);
         }
         state.inventory_generation += 1;
         removed
@@ -3041,7 +3081,7 @@ fn close_verified_unattached(
         if ending == Ending::Closed
             && let Some(notifications) = &state.notifications
         {
-            notifications.retire(requested.id);
+            notifications.acknowledge_session(requested.id);
         }
         state.inventory_generation += 1;
     }
@@ -3671,6 +3711,7 @@ pub(in crate::host) fn finish_close(
                 Update::AttentionContext { evidence, content } => {
                     NativeActorEvent::AttentionContext { evidence, content }
                 }
+                Update::AttentionCleared(clear) => NativeActorEvent::AttentionCleared(clear),
                 _ => {
                     return Err(
                         "Closing actor journal contains an unsupported semantic event".into(),
@@ -3712,6 +3753,18 @@ pub(in crate::host) fn finish_close(
             };
             if changed {
                 super::super::agent_execution::announce(host, &registry);
+            }
+            if let NativeActorEvent::AttentionCleared(clear) = event
+                && !automation
+            {
+                commit_attention_clear(
+                    notifications.as_ref(),
+                    source.id,
+                    identity.instance,
+                    entry.sequence,
+                    clear,
+                    Duration::from_secs(10),
+                )?;
             }
             if let Some((evidence, content)) = event.attention()
                 && !automation

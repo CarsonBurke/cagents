@@ -278,7 +278,10 @@ impl Journal {
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
             update,
-            Update::Execution { .. } | Update::Attention(_) | Update::AttentionContext { .. }
+            Update::Execution { .. }
+                | Update::Attention(_)
+                | Update::AttentionContext { .. }
+                | Update::AttentionCleared(_)
         ) {
             return Ok(());
         }
@@ -816,6 +819,30 @@ mod tests {
         let entry: OutboxEntry = serde_json::from_value(older.clone()).unwrap();
         assert_eq!(entry.confirmed_session, None);
         assert_eq!(serde_json::to_value(&entry).unwrap(), older);
+    }
+
+    #[test]
+    fn outbox_keeps_attention_clears_in_outcome_order_until_acknowledged() {
+        use crate::agent::observe::AttentionClear;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let start = Update::AttentionCleared(AttentionClear::TurnStarted);
+        let answer = Update::AttentionCleared(AttentionClear::LeftWaiting);
+        let outcome = Update::Attention(crate::notifications::Evidence {
+            key: "new-turn".into(),
+            kind: crate::notifications::Kind::Succeeded,
+        });
+        for update in [&start, &answer, &outcome] {
+            journal.append(update, Some("conversation")).unwrap();
+        }
+        let page = journal.page(journal.acknowledged().unwrap()).unwrap();
+        assert_eq!(
+            page.iter().map(|entry| &entry.update).collect::<Vec<_>>(),
+            [&start, &answer, &outcome]
+        );
+        journal.ack(page[1].sequence).unwrap();
+        let remaining = journal.page(journal.acknowledged().unwrap()).unwrap();
+        assert_eq!(remaining[0].update, outcome);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use super::{
     protocol::{Adapter, HeldStop, ProcessSpec, SetupError, Step, TransportSpec},
 };
 use crate::account::LiveReport;
-use crate::agent::ActivityState;
+use crate::agent::{ActivityState, observe::AttentionClear};
 use crate::daemon::owned_children::DetachedWork;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -265,6 +265,7 @@ pub(crate) enum Update {
         revision: u64,
         model: Option<super::ActiveModel>,
     },
+    AttentionCleared(AttentionClear),
 }
 
 /// The conversation's prompt cache activity, which the actor records and
@@ -3977,6 +3978,9 @@ impl Actor {
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
         ) {
+            if self.attention_baselined && matches!(event, Event::TurnStarted) {
+                (self.notify)(Update::AttentionCleared(AttentionClear::TurnStarted));
+            }
             if let Some(evidence) = self.attention.apply(&event) {
                 (self.notify)(Update::AttentionContext { evidence, content });
             }
@@ -4054,6 +4058,9 @@ impl Actor {
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         let activity_changed = activity != self.activity;
+        if baselined && self.activity.waits_on_user() && !activity.waits_on_user() {
+            (self.notify)(Update::AttentionCleared(AttentionClear::LeftWaiting));
+        }
         if activity_changed {
             self.activity = activity;
             if let Some((run, update)) = self.execution.activity(activity) {
