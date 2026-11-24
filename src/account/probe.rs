@@ -310,10 +310,7 @@ async fn run_reading(
         // post-consume refresh collide with this probe's unfinished write.
         // A cache write failure still leaves the observed answer usable.
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = cache.store_observed(&key, entry, fingerprint);
-            if let Some(catalog) = catalog {
-                let _ = cache.store_catalog(provider, catalog);
-            }
+            cache.store_probe(&key, entry, fingerprint, provider, catalog);
             drop(lock);
         })
         .await;
