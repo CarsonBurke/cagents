@@ -76,12 +76,12 @@ JOBS = (
     Job("build offload", shards=2, suites=(
         Suite("build offload", "tests/cargo_offload.py",
               sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py", "scripts/build-host",
-                       "scripts/cargo-gate-rustc-guard")),
+                       "scripts/cargo-gate-rustc-guard", "scripts/cargo-incremental-retry.py")),
     )),
     Job("cargo gate", suites=(
         Suite("held-command cancellation", "tests/cargo_gate.py",
               sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py",
-                       "scripts/build-host", "scripts/memory-capped"),
+                       "scripts/build-host", "scripts/memory-capped", "scripts/cargo-incremental-retry.py"),
               syntax=(("sh", "scripts/cargo-gate"),)),
         Suite("build host admission and jobserver", "tests/build_host.py",
               sources=("scripts/build-host", "scripts/memory-capped", "scripts/cargo-gate-rustc-guard")),

@@ -603,7 +603,7 @@ def real_cargo(environment):
 # What runs a build on the build host, sent with each command: build-host and
 # the helpers beside it, including the compiler wrapper of its probes. The host test helper and its artifact reader travel
 # when this checkout has them.
-TOOLS = ("build-host", "memory-capped", "cargo-gate-rustc-guard")
+TOOLS = ("build-host", "memory-capped", "cargo-gate-rustc-guard", "cargo-incremental-retry.py")
 OPTIONAL_TOOLS = ("cargo-host-test-helper.py", "cargo_artifacts.py")
 
 
@@ -740,13 +740,16 @@ def pressure_floor(path, floor):
 
 
 def target_directories(slot, pattern):
-    """The directories `pattern` names in each profile of the slot's
-    target, with or without a `--target` triple: `<profile>/<pattern>` and
-    `<triple>/<profile>/<pattern>`."""
-    target = glob.escape(os.path.join(slot, "src", "target"))
+    build = os.path.join(os.path.realpath(slot), "src", "target")
+    return [path for path in profile_directories(build, pattern) if os.path.realpath(path) == path]
+
+
+def profile_directories(build, pattern):
+    """Each profile's `pattern` directory, with or without a target triple."""
+    build = glob.escape(build)
     return sorted(path for depth in ("*", "*/*")
-                  for path in glob.glob(os.path.join(target, depth, pattern))
-                  if os.path.isdir(path) and not os.path.islink(path))
+                  for path in glob.glob(os.path.join(build, depth, pattern))
+                  if os.path.isdir(path))
 
 
 def tree_size(path, seen):
@@ -792,12 +795,9 @@ def evict(slot, path):
 
 
 def session_time(name):
-    """When rustc started the incremental session `name`, as the number its
-    name begins with, or None for a name that is not a finalized session's:
-    `s-TIME-RANDOM-SVH`, TIME in base 36. A session being written ends in
-    `-working` instead of an SVH."""
+    """When rustc started `s-TIME-RANDOM-SVH` or `s-TIME-RANDOM-working`."""
     parts = name.split("-")
-    if len(parts) != 4 or parts[0] != "s" or parts[3] == "working":
+    if len(parts) != 4 or parts[0] != "s":
         return None
     try:
         return int(parts[1], 36)
@@ -814,9 +814,94 @@ def superseded(crate):
     sessions = []
     for entry in os.scandir(crate):
         started = session_time(entry.name)
-        if started is not None and entry.is_dir(follow_symlinks=False):
+        if (started is not None and not entry.name.endswith("-working")
+                and entry.is_dir(follow_symlinks=False)):
             sessions.append((started, entry.name))
     return [name for _, name in sorted(sessions)[:-1]]
+
+
+def interrupted_incremental(crate):
+    """Whether rustc may have overwritten a finalized session while compiling.
+
+    Rustc 1.93 hard-links the previous session into its working directory,
+    then can overwrite linked ThinLTO keys and pre-LTO bitcode before it
+    publishes a new work-product index. A newer working session or an input
+    written after the last index means the old cache may mix two builds.
+    See rust-lang/rust#159287.
+    """
+    working, finalized = [], []
+    for entry in os.scandir(crate):
+        started = session_time(entry.name)
+        if started is None or not entry.is_dir(follow_symlinks=False):
+            continue
+        if entry.name.endswith("-working"):
+            working.append(started)
+        else:
+            finalized.append((started, entry.path))
+    if not finalized:
+        return False
+    started, last = max(finalized)
+    if working and max(working) >= started:
+        return True
+    try:
+        indexed = os.stat(os.path.join(last, "work-products.bin")).st_mtime_ns
+    except FileNotFoundError:
+        return False  # Rustc cannot reuse work products without their index.
+    with os.scandir(last) as entries:
+        return any(entry.stat(follow_symlinks=False).st_mtime_ns > indexed
+                   for entry in entries
+                   if entry.name == "thin-lto-past-keys.bin" or entry.name.endswith(".pre-lto.bc"))
+
+
+def incremental_epoch(slot):
+    """The cache epoch, valid while every intervening lease used this check."""
+    try:
+        with open(os.path.join(slot, "incremental-epoch")) as file:
+            stamp, epoch = file.read().split()
+        if int(stamp) == os.stat(os.path.join(slot, "owner")).st_mtime_ns:
+            return epoch
+    except (OSError, ValueError):
+        pass
+    return str(time.time_ns())
+
+
+def repair_incremental(slot, build, epoch):
+    """Evicts suspect crates whole, under this slot's running lock."""
+    # A previous successful compile may already have incorporated damaged
+    # bitcode. Start from empty incremental state once when adopting this
+    # check, while retaining Cargo's compiled outputs and dependencies.
+    marker = os.path.join(build, ".cagents-incremental-verified")
+    try:
+        with open(marker) as file:
+            verified = file.read().strip() == epoch
+    except FileNotFoundError:
+        verified = False
+    moved, safe = False, True
+    for incremental in profile_directories(build, "incremental"):
+        if os.path.realpath(incremental) != incremental:
+            safe = False
+            continue
+        for crate in os.scandir(incremental):
+            if not crate.is_dir(follow_symlinks=False):
+                continue
+            if verified and not interrupted_incremental(crate.path):
+                continue
+            if in_use(crate.path):
+                safe = False
+                continue
+            evict(slot, crate.path)
+            moved = True
+            if verified:
+                print(f"cargo-gate: discarded interrupted incremental state for {crate.name}",
+                      file=sys.stderr, flush=True)
+    if moved:
+        remove_evicted([slot])
+    if safe and not verified:
+        os.makedirs(build, exist_ok=True)
+        with open(marker + ".new", "w") as file:
+            file.write(epoch + "\n")
+        os.replace(marker + ".new", marker)
+    return safe
 
 
 def trim(slot, budget, pressed):
@@ -830,8 +915,8 @@ def trim(slot, budget, pressed):
     whatever started it."""
     if pressed:
         budget //= PRESSED_SHARE
-    # A finalized session never changes, and rustc names each new one
-    # afresh, so the size of each is measured once, when first seen.
+    # Rustc names each finalized session afresh, so measure its size when
+    # first seen and reuse that measurement for later trims.
     record = os.path.join(slot, "incremental-sizes")
     try:
         with open(record) as file:
@@ -1472,10 +1557,13 @@ if command == "lease":
                     os.utime(os.path.join(directory, name), (now, now), follow_symlinks=False)
                 except OSError:
                     pass
+    epoch = incremental_epoch(slot)
     with open(owner, "w") as file:
         file.write(key + "\n")
     with open(marker, "w") as file:
         file.write(stamp() + "\n")
+    with open(os.path.join(slot, "incremental-epoch"), "w") as file:
+        file.write(f"{stamp()} {epoch}\n")
     # Files a command's settings name on the calling host, copied in beside
     # the checkout: from the checkout's ignored files, or its target.
     for kind in ("checkout", "target"):
@@ -1603,27 +1691,45 @@ elif command == "run":
         environment["PATH"] = shims + os.pathsep + environment.get("PATH", "")
         # See the note at the top of scripts/cargo-gate: a test's fixture may move HOME.
         environment.setdefault("MISE_DATA_DIR", os.path.dirname(shims))
-    if request.get("directories") is not None:
+    directories = {}
+    if request.get("metadata") is not None:
         # Where this host's Cargo puts the build's results and intermediates,
-        # which its own configuration may move out of the slot: the caller
-        # maps the paths Cargo reports there onto its own.
+        # which its own configuration may move out of the slot. Only the
+        # slot's own directories are protected by its running lock.
+        cargo_options, metadata_options = request["metadata"]
+        metadata_environment = dict(environment)
+        if request.get("target_dir"):
+            metadata_environment["CARGO_TARGET_DIR"] = request["target_dir"]
         found = subprocess.run(
-            [arguments[0], "metadata", "--format-version", "1", "--no-deps", "--offline",
-             *request["directories"]],
-            env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            [arguments[0], *cargo_options, "metadata", "--format-version", "1", "--no-deps",
+             "--offline", *metadata_options],
+            env=metadata_environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL)
         try:
             described = json.loads(found.stdout)
             directories = {"target": described["target_directory"],
                            "build": described.get("build_directory") or described["target_directory"]}
         except (ValueError, KeyError, TypeError):
-            directories = {}
+            described = {}
+        build_dir = os.path.realpath(directories["build"]) if directories else None
+        if (build_dir and os.path.commonpath([os.path.realpath(base), build_dir])
+                == os.path.realpath(base)
+                and repair_incremental(base, build_dir, incremental_epoch(base))):
+            environment["CAGENTS_BUILD_OFFLOAD_BUILD_DIR"] = build_dir
+            members = set(described.get("workspace_members", ()))
+            environment["CAGENTS_BUILD_OFFLOAD_WORKSPACE_DIRS"] = json.dumps([
+                os.path.realpath(os.path.dirname(package["manifest_path"]))
+                for package in described.get("packages", ()) if package["id"] in members])
+        else:
+            # The configured build directory may be shared with commands
+            # outside this slot. Do not read or modify its incremental cache.
+            environment["CARGO_INCREMENTAL"] = "0"
+    if request.get("report_directories"):
         sys.stdout.write(DIRECTORIES_MARKER + json.dumps(directories) + "\n")
         sys.stdout.flush()
     # Outside its build output, as the command starts: what it writes comes back.
     outputs = [os.path.join(base, "src", "target"), *request.get("outputs", [])]
-    if request.get("directories") is not None:
-        outputs += directories.values()
+    outputs += directories.values()
     record_checkout(base, outputs)
     # The gate's helpers travel with this invocation, including installed
     # gates and arbitrary Cargo workspaces that have no repository scripts.
@@ -1679,6 +1785,7 @@ elif command == "run":
             time.sleep(3600)
     # What the command left running would keep the connection open.
     end(signal.SIGTERM)
+    remove_evicted([base])
     os._exit(status if status >= 0 else 128 - status)
 '''
 
@@ -2232,8 +2339,10 @@ class Offload:
         remote_build = remote_target
         # The settings that may move the build host's directories, for it to
         # describe them.
-        configs = [value for option, value in zip(arguments, arguments[1:]) if option == "--config"]
-        configs += [word.partition("=")[2] for word in arguments if word.startswith("--config=")]
+        metadata_options = [arg for value in plan.values("--config")
+                            for arg in ("--config", translate("--config", value))]
+        if "--manifest-path" in directories:
+            metadata_options += ["--manifest-path", directories["--manifest-path"][0]]
 
         listing = subprocess.run(
             ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
@@ -2301,6 +2410,9 @@ class Offload:
         try:
             request = {"environment": environment,
                        "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1",
+                       "metadata": [[plan.toolchain] if plan.toolchain else [], metadata_options],
+                       "target_dir": remote_target if "--target-dir" in directories else None,
+                       "report_directories": plan.captures,
                        # Build output in the checkout, which does not come back as written.
                        "outputs": sorted({remote_target, *(remote for remote, _ in directories.values())})}
             request["tools"] = self.tools
@@ -2310,8 +2422,6 @@ class Offload:
             left = remaining(admission_deadline(self.environment))
             if left is not None:
                 request["admission_seconds"] = max(0, int(left))
-            if plan.captures:
-                request["directories"] = [arg for value in configs for arg in ("--config", value)]
             command.stdin.write((json.dumps(request) + "\n").encode())
             command.stdin.flush()
         except (BrokenPipeError, ValueError):

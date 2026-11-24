@@ -91,6 +91,140 @@ class InstalledGateDeferral(unittest.TestCase):
                          "checkout\n")
 
 
+class IncrementalLinkRecovery(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-incremental-retry-")
+        self.addCleanup(temporary.cleanup)
+        self.slot = Path(temporary.name)
+        self.source = self.slot / "src"
+        self.source.mkdir()
+        self.build = self.slot / "separate-build-dir"
+        self.incremental = self.build / "local/incremental"
+        self.out = self.build / "local/deps"
+        self.out.mkdir(parents=True)
+        self.cache = self.incremental / "fixture-stale"
+        self.same_name = self.incremental / "fixture-other"
+        for cache in (self.cache, self.same_name):
+            session = cache / "s-abc-0-def"
+            session.mkdir(parents=True)
+            (session / "codegen.o").write_text(cache.name)
+        (self.cache / "s-abc-0.lock").touch()
+        os.link(self.cache / "s-abc-0-def/codegen.o", self.out / "fixture-0123.codegen.run.rcgu.o")
+        self.cargo = self.slot / "cargo"
+        self.cargo.write_text(textwrap.dedent(f"""\
+            #!{sys.executable}
+            import json, os, subprocess, sys
+            rustc = json.loads(os.environ["FIXTURE_RUSTC"])
+            wrapper = os.environ.get("RUSTC_WRAPPER")
+            print("wrapper:", os.path.basename(wrapper) if wrapper else "none", flush=True)
+            sys.exit(subprocess.call(([wrapper] if wrapper else []) + rustc))
+            """))
+        self.cargo.chmod(0o755)
+        self.rustc = self.slot / "rustc"
+        self.rustc.write_text(textwrap.dedent(f"""\
+            #!{sys.executable}
+            import os, sys
+            from pathlib import Path
+            stale = Path(os.environ["FIXTURE_CACHE"]).is_dir()
+            print("compiled with", "cached" if stale else "fresh", "state", flush=True)
+            if os.environ.get("FIXTURE_SIGNAL"):
+                os.kill(os.getpid(), int(os.environ["FIXTURE_SIGNAL"]))
+            if stale or os.environ.get("FIXTURE_PERSISTENT"):
+                print(os.environ["FIXTURE_DIAGNOSTIC"], file=sys.stderr)
+                sys.exit(1)
+            """))
+        self.rustc.chmod(0o755)
+        self.undefined = json.dumps({
+            "level": "error", "message": "linking with `cc` failed: exit status: 1",
+            "children": [{"level": "note", "message": "rust-lld: error: undefined hidden symbol: Arc::drop_slow"}],
+        })
+        self.env = os.environ | {
+            "CARGO_HOME": str(self.slot / "cargo-home"),
+            "CAGENTS_OFFLOAD_SLOT": str(self.slot),
+            "CAGENTS_BUILD_OFFLOAD_BUILD_DIR": str(self.build),
+            "CAGENTS_BUILD_OFFLOAD_WORKSPACE_DIRS": json.dumps([str(self.source)]),
+            "CARGO_MANIFEST_DIR": str(self.source),
+            "FIXTURE_CACHE": str(self.cache),
+            "FIXTURE_DIAGNOSTIC": self.undefined,
+        }
+        self.env.pop("RUSTC_WRAPPER", None)
+        self.env.pop("CARGO_BUILD_RUSTC_WRAPPER", None)
+
+    def arguments(self):
+        return [str(self.rustc), "--crate-name", "fixture", "--out-dir", str(self.out),
+                "-C", f"incremental={self.incremental}", "-Cextra-filename=-0123"]
+
+    def compile(self, *, environment=None, flags=()):
+        return subprocess.run(
+            [str(ROOT / "scripts/build-host"), "cargo", "--shares", "0", "--",
+             str(self.cargo), "build", *flags],
+            env=self.env | {"FIXTURE_RUSTC": json.dumps(self.arguments())} | (environment or {}),
+            cwd=self.source, capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+
+    def test_undefined_symbol_retries_only_the_failed_incremental_unit(self):
+        result = self.compile()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["wrapper: cargo-incremental-retry.py",
+                                                       "compiled with cached state", "compiled with fresh state"])
+        self.assertIn("retrying fixture", result.stderr)
+        self.assertNotIn(self.undefined, result.stderr)
+        self.assertFalse(self.cache.exists())
+        self.assertTrue(self.same_name.exists())
+        (evicted,) = (self.slot / "evicted").iterdir()
+        self.assertTrue(evicted.name.endswith(self.cache.name))
+
+    def test_a_second_undefined_symbol_failure_is_returned_without_another_retry(self):
+        result = self.compile(environment={"FIXTURE_PERSISTENT": "1"})
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.count("compiled with"), 2)
+        self.assertEqual(result.stderr.count("retrying fixture"), 1)
+        self.assertEqual(result.stderr.count(self.undefined), 1)
+
+    def test_a_human_linker_error_also_retries(self):
+        result = self.compile(environment={"FIXTURE_DIAGNOSTIC":
+            "error: linking with `cc` failed: exit status: 1\n"
+            "  = note: /usr/bin/ld: undefined reference to `fixture`"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retrying fixture", result.stderr)
+        self.assertFalse(self.cache.exists())
+
+    def test_an_unrelated_error_or_dependency_does_not_evict_incremental_state(self):
+        for environment in ({"CARGO_MANIFEST_DIR": str(self.source / "dependency")},
+                            {"FIXTURE_DIAGNOSTIC": "error: failed to type-check undefined symbol"}):
+            with self.subTest(environment=environment):
+                result = self.compile(environment=environment)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout.count("compiled with"), 1)
+                self.assertNotIn("retrying fixture", result.stderr)
+                self.assertTrue(self.cache.exists())
+
+    def test_a_live_incremental_session_stays_untouched(self):
+        with (self.cache / "s-abc-0.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.compile()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(self.undefined, result.stderr)
+        self.assertNotIn("retrying fixture", result.stderr)
+        self.assertTrue(self.cache.exists())
+
+    def test_cargo_can_distinguish_a_signalled_compiler_from_an_exit_code(self):
+        result = subprocess.run(
+            [str(ROOT / "scripts/cargo-incremental-retry.py"), *self.arguments()],
+            env=self.env | {"FIXTURE_SIGNAL": str(signal.SIGTERM)}, cwd=self.source,
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(result.returncode, -signal.SIGTERM)
+        self.assertNotIn("retrying fixture", result.stderr)
+        self.assertTrue(self.cache.exists())
+
+    def test_an_explicit_rustc_wrapper_is_preserved(self):
+        self.assertIn("wrapper: true", self.compile(environment={"RUSTC_WRAPPER": "/bin/true"}).stdout)
+        result = self.compile(flags=("--config", 'build.rustc-wrapper="/bin/true"'))
+        self.assertIn("wrapper: none", result.stdout)
+        self.assertTrue(self.cache.exists())
+
+
 class ThroughAMiseShim(unittest.TestCase):
     """Under a moved HOME a mise shim finds itself on PATH and re-executes forever."""
 
@@ -195,7 +329,7 @@ class InstalledGateSync(unittest.TestCase):
 
     files = ("cargo-gate", "build-host", "cargo-gate-command.py", "cargo-gate-sync.py",
              "cargo-host-test-helper.py", "cargo_artifacts.py",
-             "cargo-gate-rustc-guard", "cargo-offload", "memory-capped",
+             "cargo-gate-rustc-guard", "cargo-incremental-retry.py", "cargo-offload", "memory-capped",
              "seed-build-dir", "build-disk-guard", "prune-build-dirs", "install-cargo-gate")
 
     def setUp(self):
