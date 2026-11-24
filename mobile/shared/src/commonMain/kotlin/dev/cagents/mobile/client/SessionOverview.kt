@@ -68,8 +68,14 @@ data class SessionOverview(
             // one notice per session stands for the older ones.
             val (asks, outcomeNotices) = notices.partition { it.kind in ASKS }
             val (reviews, requests) = asks.partition { it.kind == NoticeKind.ReviewRequested }
+            // A request whose session has moved on (answered, or closed)
+            // no longer asks anything.
             val asking = requests
-                .filter { notice -> notice.session.let { it == null || it in bySession } }
+                .filter { notice ->
+                    val session = notice.session ?: return@filter true
+                    val current = bySession[session] ?: return@filter false
+                    notice.kind != NoticeKind.Waiting || (current.activity == Activity.Waiting && !current.exited)
+                }
                 .groupBy { it.session ?: "notice/${it.id}" }
                 .values
             // A session that is working again has moved past its last outcome.

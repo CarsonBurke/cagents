@@ -59,6 +59,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import dev.cagents.mobile.client.isBlankThinking
 import dev.cagents.mobile.protocol.CommandAction
 import dev.cagents.mobile.protocol.Item
 import dev.cagents.mobile.protocol.ItemBody
@@ -68,6 +69,7 @@ import dev.cagents.mobile.protocol.ToolStatus
 /** One transcript item. Prose reads in full; tool activity is one line until opened. */
 @Composable
 fun TranscriptItem(item: Item) {
+    if (item.isBlankThinking) return
     when (val body = item.body) {
         is ItemBody.Text -> when {
             item.role == Role.User -> UserMessage(body.text)

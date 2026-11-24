@@ -66,7 +66,8 @@ class SessionOverviewTest {
         val sessions = listOf(
             session("work", Activity.Working, 3),
             session("done", Activity.Idle, 2),
-            session("asks", Activity.Idle, 1),
+            session("asks", Activity.Waiting, 1),
+            session("answered", Activity.Working, 4),
         )
         fun notice(id: String, kind: NoticeKind, session: String? = null) =
             Notice(id = id, kind = kind, title = kind.name, session = session)
@@ -75,6 +76,7 @@ class SessionOverviewTest {
             notice("a2", NoticeKind.Waiting, "asks") +
             notice("a1", NoticeKind.Waiting, "asks") +
             notice("gone", NoticeKind.Waiting, "closed") +
+            notice("stale", NoticeKind.Waiting, "answered") +
             notice("f2", NoticeKind.Failed, "done") +
             notice("f1", NoticeKind.Succeeded, "done") +
             notice("w1", NoticeKind.Succeeded, "work") +
@@ -86,7 +88,8 @@ class SessionOverviewTest {
         assertEquals(500, assertIs<AttentionItem.Reviews>(overview.attention[1]).notices.size)
         // The working session's "finished" belongs to an earlier turn.
         assertEquals(mapOf("done" to "f2"), overview.outcomes.mapValues { it.value.id })
-        assertEquals(listOf("work"), overview.working.map { it.session.id })
-        assertEquals(listOf("done", "asks"), overview.recent.map { it.session.id })
+        // "answered" is working again, so its old request is no longer a card.
+        assertEquals(listOf("answered", "work"), overview.working.map { it.session.id })
+        assertEquals(listOf("done"), overview.recent.map { it.session.id })
     }
 }

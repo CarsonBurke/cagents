@@ -67,3 +67,10 @@ data class Conversation(
         )
     }
 }
+
+/**
+ * Whether [this] has nothing for a person to read: reasoning whose text the
+ * provider withheld or hasn't streamed yet. It is shown once text arrives.
+ */
+val Item.isBlankThinking: Boolean
+    get() = (body as? ItemBody.Text)?.let { it.thinking && it.text.isBlank() } == true
