@@ -669,6 +669,10 @@ impl RemoteActor {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub(in crate::chat::runtime) fn take_pending_visibility_fixture(&self) -> Option<bool> {
+        self.0.desired_visible.lock().unwrap().take()
+    }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn distinct_attachment_fixture(&self) -> Self {
         let mut other = Self::fixture();
         let remote = Arc::get_mut(&mut other.0).unwrap();

@@ -567,6 +567,66 @@ IFS= read -r finish < finish
 }
 
 #[test]
+fn only_detaching_the_last_visible_chat_subscriber_wakes_the_actor() {
+    let (handle, _other_attachment) = Handle::fixture_remote_attachment_pair();
+    let identity = handle.actor_identity().unwrap();
+    let proof = HostSessionProof {
+        host_session_id: "visibility-host".into(),
+        boot_id: "visibility-boot".into(),
+        host_incarnation: "visibility-incarnation".into(),
+    };
+    let chat_id = identity.record.terminal;
+    let mut state = HostState::new(proof.clone());
+    for client in 1..=4 {
+        state.register_client(client);
+    }
+    state.chats.insert(
+        chat_id,
+        Record {
+            execution_instance: identity.instance,
+            console_recipe: None,
+            paired_terminal: None,
+            session: Session {
+                id: chat_id,
+                launch: chat::Launch {
+                    provider: Provider::Claude,
+                    recipe: LaunchRecipe::shell("/".into()).unwrap(),
+                    session_id: None,
+                    draft_model: None,
+                },
+                proof: Some(proof),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+            },
+            handle: handle.clone(),
+            source_process: None,
+            subscribers: BTreeMap::from([(1, true), (2, true), (3, false)]),
+            observations: BTreeMap::from([
+                (1, Observation::default()),
+                (2, Observation::default()),
+                (3, Observation::default()),
+            ]),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+
+    drop(state.unregister_client(4)); // Control connection with no attachment.
+    drop(state.unregister_client(3)); // Hidden subscriber.
+    assert_eq!(handle.take_pending_visibility_fixture(), None);
+
+    let host = Arc::new(HostLock::new(state));
+    process(&host, 1, ClientRequest::ChatDetach { chat_id }).unwrap();
+    assert_eq!(handle.take_pending_visibility_fixture(), None);
+    let mut state = host.lock().unwrap();
+    drop(state.unregister_client(2));
+    assert_eq!(handle.take_pending_visibility_fixture(), Some(false));
+    assert!(state.chats[&chat_id].subscribers.is_empty());
+    assert!(state.chats[&chat_id].observations.is_empty());
+}
+
+#[test]
 fn chat_read_reports_remote_endpoint_failure_without_retiring_owned_chat() {
     let (handle, _other_attachment) = Handle::fixture_remote_attachment_pair();
     let identity = handle.actor_identity().unwrap();

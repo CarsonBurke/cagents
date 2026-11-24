@@ -2340,7 +2340,9 @@ fn restore_actor_inner(
             })
             .collect();
     }
-    let visible = record.subscribers.values().any(|visible| *visible);
+    // A retained actor can still carry its previous attachment's visibility.
+    // Publish the new level under HostState before a client can change it.
+    handle.set_visible(record.subscribers.values().any(|visible| *visible));
     let retired = state.chats.insert(id, record);
     state.chat_added(id);
     state.upgrade_chats.insert(id, previous_sources);
@@ -2348,9 +2350,6 @@ fn restore_actor_inner(
     state.inventory_generation += 1;
     drop(state);
     drop(retired);
-    if visible {
-        handle.set_visible(true);
-    }
     handle.wake_retained_outcomes();
     super::super::state::retire_unattached_upgrade_chat(host, id);
     Ok(response)

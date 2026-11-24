@@ -1138,11 +1138,7 @@ impl HostState {
             receipt.detach(client_id);
         }
         for record in self.chats.values_mut() {
-            record.subscribers.remove(&client_id);
-            record.observations.remove(&client_id);
-            record
-                .handle
-                .set_visible(record.subscribers.values().any(|visible| *visible));
+            record.detach(client_id);
         }
         // With each terminal's visibility before the disconnect: only a change
         // is sent, as every other writer does. Re-sending Visible while

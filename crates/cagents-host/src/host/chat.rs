@@ -94,6 +94,16 @@ pub(super) struct Record {
 }
 
 impl Record {
+    /// Only the last visible subscriber leaving changes the actor's visibility.
+    pub(super) fn detach(&mut self, client: ClientId) {
+        self.observations.remove(&client);
+        if self.subscribers.remove(&client) == Some(true)
+            && !self.subscribers.values().any(|visible| *visible)
+        {
+            self.handle.set_visible(false);
+        }
+    }
+
     /// The conversation as its actor now holds it: the source it started
     /// from, with the provider conversation ID and continuity the actor has
     /// learned since. A new conversation learns its ID only after it starts,
@@ -4500,11 +4510,7 @@ fn process_inner(
                 return Ok(ServerResponse::Detached);
             }
             let record = attached_mut(&mut state, client, chat_id)?;
-            record.subscribers.remove(&client);
-            record.observations.remove(&client);
-            record
-                .handle
-                .set_visible(record.subscribers.values().any(|visible| *visible));
+            record.detach(client);
             Ok(ServerResponse::Detached)
         }
         ClientRequest::ChatCommand { chat_id, command } => {

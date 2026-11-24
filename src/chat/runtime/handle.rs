@@ -100,6 +100,13 @@ impl Handle {
         (Self(Owner::Remote(first)), Self(Owner::Remote(second)))
     }
     #[cfg(any(test, feature = "test-support"))]
+    pub fn take_pending_visibility_fixture(&self) -> Option<bool> {
+        match &self.0 {
+            Owner::Remote(remote) => remote.take_pending_visibility_fixture(),
+            Owner::Local(_) => panic!("visibility fixture requires a retained actor"),
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn local_command_queue_is_empty(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.0.commands.is_empty(),
