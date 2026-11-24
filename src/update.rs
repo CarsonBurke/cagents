@@ -12,6 +12,8 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
+#[cfg(test)]
+mod ledger;
 mod pending_recovery;
 pub(crate) mod recovery;
 mod retention;
