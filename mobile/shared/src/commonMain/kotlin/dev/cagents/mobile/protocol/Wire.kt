@@ -56,10 +56,10 @@ sealed interface Event {
     data class Unknown(val name: String?) : Event
 
     /**
-     * Not from the server: a line this app couldn't decode, with the session
-     * it named, if any.
+     * Not from the server: a conversation line this app couldn't decode, with
+     * the session it named and whether it was a reset.
      */
-    data class Unreadable(val session: String?, val reason: String) : Event
+    data class Unreadable(val session: String, val reset: Boolean, val reason: String) : Event
 }
 
 /** Reads one line from the bridge. Throws [SerializationException] for malformed JSON. */

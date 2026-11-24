@@ -104,11 +104,28 @@ class RemoteController(
     @kotlin.concurrent.Volatile
     private var syncs: Channel<Sync>? = null
 
-    /** A conversation to watch or unwatch; [force] watches it again even when watched, for a fresh reset. */
-    private data class Sync(val session: String, val force: Boolean)
+    /** A conversation to bring in line, and why. */
+    private data class Sync(val session: String, val kind: SyncKind)
+
+    private enum class SyncKind {
+        /** Watch it if held and not ended, unwatch it otherwise. */
+        Settle,
+
+        /** Watch it if held, even when ended or already watched, for a fresh reset. */
+        Watch,
+
+        /** Like [Watch], unless the recovery that asked for it was settled meanwhile. */
+        Resync,
+    }
 
     /** Conversations watched again to recover, whose updates wait for the reset. Guarded by [locked]. */
     private val resyncing = HashSet<String>()
+
+    /**
+     * Recoveries in a row for each conversation, with no update applying
+     * cleanly in between. Guarded by [locked].
+     */
+    private val recoveries = HashMap<String, Int>()
 
     /** Starts connecting, unless already running. */
     fun start() = locked {
@@ -177,23 +194,28 @@ class RemoteController(
             added = true
             state.copy(conversations = state.conversations + (session to Conversation(session)))
         }
-        if (added) sync(session, force = true)
+        if (added) sync(session, SyncKind.Watch)
     }
 
     /** Stops following a conversation. */
     fun close(session: String) {
         _state.update { it.copy(conversations = it.conversations - session) }
-        locked { resyncing -= session }
-        sync(session, force = false)
+        locked {
+            resyncing -= session
+            recoveries -= session
+        }
+        sync(session, SyncKind.Settle)
     }
 
     /** Asks for an ended conversation again. */
     fun rewatch(session: String) {
-        if (session in _state.value.conversations) sync(session, force = true)
+        if (session !in _state.value.conversations) return
+        locked { recoveries -= session }
+        sync(session, SyncKind.Watch)
     }
 
-    private fun sync(session: String, force: Boolean) {
-        syncs?.trySend(Sync(session, force))
+    private fun sync(session: String, kind: SyncKind) {
+        syncs?.trySend(Sync(session, kind))
     }
 
     suspend fun send(session: String, text: String, mode: SendMode) = call(Call.Send(session, text, mode))
@@ -260,14 +282,17 @@ class RemoteController(
             val queue = Channel<Sync>(Channel.UNLIMITED)
             return coroutineScope {
                 val reader = async { bridge.run { event -> handle(event) } }
-                locked { resyncing.clear() }
+                locked {
+                    resyncing.clear()
+                    recoveries.clear()
+                }
                 syncs = queue
                 current = bridge
                 _state.update { it.copy(connection = ConnectionState.Connected, welcome = welcome) }
                 launch {
                     subscribe(bridge)
                     // Opened before this connection, or while it was being made.
-                    _state.value.conversations.keys.forEach { queue.trySend(Sync(it, force = true)) }
+                    _state.value.conversations.keys.forEach { queue.trySend(Sync(it, SyncKind.Watch)) }
                     reconcile(bridge, queue)
                 }
                 launch { keepalive(bridge) }
@@ -293,19 +318,23 @@ class RemoteController(
      */
     private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) {
         val watched = HashSet<String>()
-        for ((session, force) in queue) {
-            // A forced sync watches any held conversation, ended or not; otherwise
-            // an ended one, whose updates stopped or can't be read, is let go.
+        for ((session, kind) in queue) {
+            // A recovery given up on, or closed, since it was queued.
+            if (kind == SyncKind.Resync && locked { session !in resyncing }) continue
+            val force = kind != SyncKind.Settle
+            // An ended conversation, whose updates stopped or can't be read, is
+            // let go unless asked for again.
             val held = _state.value.conversations[session]
             val wanted = held != null && (force || held.ended == null)
             try {
                 if (wanted && (force || session !in watched)) {
-                    watched += session
                     try {
                         bridge.call(Call.WatchConversation(session))
+                        watched += session
                     } catch (e: RequestFailed) {
                         // Whatever the reason, including `unavailable`, no updates follow.
-                        watched -= session
+                        // An earlier watch may still stand on the server, so it stays
+                        // in `watched` to be unwatched; that is harmless if it doesn't.
                         locked { resyncing -= session }
                         markEnded(session, e.message ?: "This conversation can't be followed.")
                     }
@@ -366,22 +395,23 @@ class RemoteController(
                     if (desynced) return@update state
                     state.copy(conversations = state.conversations + (session to applied.conversation))
                 }
-                if (desynced) {
-                    resync(session)
-                } else if (update.reset) {
-                    locked { resyncing -= session }
+                when {
+                    desynced -> resync(session, "This conversation keeps falling out of step.")
+                    update.reset -> locked { resyncing -= session }
+                    // Back in step: a later slip starts the count over.
+                    else -> locked { recoveries -= session }
                 }
             }
             is Event.Unreadable -> {
-                val session = event.session ?: return
+                val session = event.session
                 if (session !in _state.value.conversations) return
-                // A second unreadable line before the reset means watching again won't help.
-                if (locked { session in resyncing }) {
-                    locked { resyncing -= session }
-                    markEnded(session, "This app can't read part of this conversation. Update the app.")
-                    sync(session, force = false)
-                } else {
-                    resync(session)
+                val recovering = locked { session in resyncing }
+                when {
+                    // Even a fresh reset can't be read: watching again won't help.
+                    recovering && event.reset -> giveUp(session, UNREADABLE)
+                    // From before the reset that is on its way.
+                    recovering -> Unit
+                    else -> resync(session, UNREADABLE)
                 }
             }
             is Event.ConversationEnded -> markEnded(event.session, event.message)
@@ -389,9 +419,31 @@ class RemoteController(
         }
     }
 
-    /** Watches [session] again for a fresh reset, unless that is already under way. */
-    private fun resync(session: String) {
-        if (locked { resyncing.add(session) }) sync(session, force = true)
+    /**
+     * Watches [session] again for a fresh reset, unless that is already under
+     * way, or gives up with [failure] once that has failed to help a few times in a row.
+     */
+    private fun resync(session: String, failure: String) {
+        val start = locked {
+            if (session in resyncing) return@locked null
+            val count = (recoveries[session] ?: 0) + 1
+            recoveries[session] = count
+            if (count > MAX_RECOVERIES) return@locked false
+            resyncing += session
+            true
+        } ?: return
+        if (start) sync(session, SyncKind.Resync) else giveUp(session, failure)
+    }
+
+    private fun giveUp(session: String, message: String) {
+        locked { resyncing -= session }
+        markEnded(session, message)
+        sync(session, SyncKind.Settle)
+    }
+
+    private companion object {
+        const val MAX_RECOVERIES = 3
+        const val UNREADABLE = "This app can't read part of this conversation. Update the app."
     }
 
     private fun backoff(attempt: Int): Duration {

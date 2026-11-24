@@ -16,6 +16,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.coroutines.sync.Mutex
@@ -78,6 +79,8 @@ class BridgeSession(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // Half a connection is no connection: end it, so the reader sees it too.
+                channel.close()
                 throw ConnectionLost(e.message ?: "The connection was lost.")
             }
             answer.await()
@@ -97,6 +100,9 @@ class BridgeSession(
         } catch (e: CancellationException) {
             end("The connection was closed.")
             throw e
+        } catch (e: ConnectFailure) {
+            end(e.message ?: "cagents sent something this app can't read.")
+            throw e
         } catch (e: Exception) {
             e.message ?: "The connection was lost."
         }
@@ -112,10 +118,12 @@ class BridgeSession(
             val decoded = try {
                 decode(line)
             } catch (e: ConnectFailure.Refused) {
-                // One unreadable line, such as an item a newer cagents shapes
-                // differently, mustn't end the connection; the controller
-                // decides what to do about the conversation it concerned.
-                onEvent(Event.Unreadable(sessionOf(line), e.message.orEmpty()))
+                // One unreadable conversation line, such as an item a newer
+                // cagents shapes differently, mustn't end the connection; the
+                // controller decides what to do about that conversation. Any
+                // other line, such as the session list, can't be done without.
+                val (session, reset) = conversationOf(line) ?: throw e
+                onEvent(Event.Unreadable(session, reset, e.message.orEmpty()))
                 continue
             }
             when (decoded) {
@@ -142,9 +150,13 @@ class BridgeSession(
         throw ConnectFailure.Refused("cagents sent something this app can't read: ${e.message}")
     }
 
-    private fun sessionOf(line: String): String? = runCatching {
-        val data = WireJson.parseToJsonElement(line).jsonObject["data"] as? JsonObject
-        (data?.get("session") as? JsonPrimitive)?.contentOrNull
+    /** The session and reset flag of a `conversation` event line, if it is one. */
+    private fun conversationOf(line: String): Pair<String, Boolean>? = runCatching {
+        val root = WireJson.parseToJsonElement(line).jsonObject
+        if ((root["event"] as? JsonPrimitive)?.contentOrNull != "conversation") return@runCatching null
+        val data = root["data"] as? JsonObject ?: return@runCatching null
+        val session = (data["session"] as? JsonPrimitive)?.contentOrNull ?: return@runCatching null
+        session to ((data["reset"] as? JsonPrimitive)?.booleanOrNull ?: false)
     }.getOrNull()
 
     private suspend fun resolve(id: Long, error: RemoteError?) {

@@ -53,6 +53,8 @@ private val ARM_DELAY = 500.milliseconds
 @Composable
 fun RequestCard(
     request: PendingRequest,
+    /** Where the card sits among the waiting requests; moving disarms it again. */
+    position: Int,
     onAnswer: (action: String, answers: List<FieldAnswer>, done: () -> Unit) -> Unit,
 ) {
     val status = LocalStatusColors.current
@@ -63,10 +65,10 @@ fun RequestCard(
         }
     }
     var sending by remember(request.id) { mutableStateOf<String?>(null) }
-    // A card that appears, or takes another's place, under a finger already on
-    // its way down mustn't take that tap as an answer.
-    var armed by remember(request.id) { mutableStateOf(false) }
-    LaunchedEffect(request.id) {
+    // A card that appears, or slides into another's place, under a finger
+    // already on its way down mustn't take that tap as an answer.
+    var armed by remember(request.id, position) { mutableStateOf(false) }
+    LaunchedEffect(request.id, position) {
         delay(ARM_DELAY)
         armed = true
     }
@@ -149,9 +151,8 @@ fun RequestCard(
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 request.actions.forEach { action ->
                     OutlinedButton(
-                        enabled = sending == null,
+                        enabled = sending == null && armed,
                         onClick = {
-                            if (!armed) return@OutlinedButton
                             sending = action.id
                             val answers = request.fields.mapNotNull { field ->
                                 values[field.id]?.filter { it.isNotEmpty() }?.takeIf { it.isNotEmpty() }

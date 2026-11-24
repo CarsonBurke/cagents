@@ -77,6 +77,8 @@ import dev.cagents.mobile.protocol.ConversationState
 import dev.cagents.mobile.protocol.PlanStatus
 import dev.cagents.mobile.protocol.SendMode
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -200,10 +202,19 @@ private fun Transcript(
             if (follow) listState.requestScrollToItem(0)
         }
     }
-    // Only a scroll, the person's or the jump button's, decides whether to follow.
+    // Only scrolling decides whether to follow: leaving the end stops it, and
+    // where a scroll comes to rest decides. Read on rest, not per frame, since a
+    // fling's last frame can reach the end and stop in the same snapshot.
     LaunchedEffect(listState) {
-        snapshotFlow { listState.isScrollInProgress to atEnd }
-            .collect { (scrolling, end) -> if (scrolling) onFollow(end) }
+        launch {
+            snapshotFlow { listState.isScrollInProgress && !atEnd }
+                .filter { it }
+                .collect { onFollow(false) }
+        }
+        snapshotFlow { listState.isScrollInProgress }
+            .drop(1)
+            .filter { !it }
+            .collect { onFollow(atEnd) }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -245,7 +256,12 @@ private fun Transcript(
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
         ) {
-            SmallFloatingActionButton(onClick = { scope.launch { listState.animateScrollToItem(0) } }) {
+            SmallFloatingActionButton(
+                onClick = {
+                    onFollow(true)
+                    scope.launch { listState.animateScrollToItem(0) }
+                },
+            ) {
                 Icon(Icons.Outlined.KeyboardArrowDown, "Jump to latest")
             }
         }
@@ -314,9 +330,9 @@ private fun BottomPanel(
 
             if (state.requests.isNotEmpty()) {
                 Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()).padding(top = 8.dp)) {
-                    state.requests.forEach { request ->
+                    state.requests.forEachIndexed { index, request ->
                         key(request.id) {
-                            RequestCard(request) { action, answers, done ->
+                            RequestCard(request, index) { action, answers, done ->
                                 vm.answer(session, request.id, action, answers, done)
                             }
                         }

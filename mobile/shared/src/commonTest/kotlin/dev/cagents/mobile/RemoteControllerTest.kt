@@ -265,28 +265,100 @@ class RemoteControllerTest {
         assertEquals("conversation.unwatch", connection.nextRequest().op)
     }
 
+    private fun unreadable(reset: Boolean) =
+        """{"type":"event","event":"conversation","data":{"session":"$S","reset":$reset,"state":"from a newer cagents","items":[],"appends":[]}}"""
+
+    /** Opens the conversation and loads it with one text item, "Hello". */
+    private suspend fun FakeConnection.loadHello(controller: RemoteController) {
+        controller.open(S)
+        ok(expect("conversation.watch"))
+        send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+    }
+
     @Test
-    fun anUnreadableUpdateWatchesAgainThenGivesUp() = runTest {
-        val unreadable = """{"type":"event","event":"conversation","data":{"session":"$S","reset":false,"state":"from a newer cagents","items":[],"appends":[]}}"""
+    fun anUnreadableUpdateWatchesAgainAndSetsAsideWhatWasInFlight() = runTest {
         val controller = controller()
         controller.start()
         val connection = bridge.acceptWelcomed()
-        controller.open(S)
-        connection.ok(connection.expect("conversation.watch"))
-        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
-        controller.await { it.conversations[S]?.loaded == true }
+        connection.loadHello(controller)
 
-        connection.send(unreadable)
-        connection.ok(connection.expect("conversation.watch"))
-        // Updates still in flight from before the reset are set aside, not applied.
+        connection.send(unreadable(reset = false))
+        val again = connection.expect("conversation.watch")
+        // Sent before the reset: neither applied nor a reason to give up.
+        connection.send(unreadable(reset = false))
         connection.send(conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":5,"text":" there"}]"""))
-        connection.send(unreadable)
+        connection.ok(again)
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello there")}]"))
+        connection.send(conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":11,"text":"!"}]"""))
+
+        val held = controller.await {
+            (it.conversations[S]?.items?.singleOrNull()?.body as? ItemBody.Text)?.text == "Hello there!"
+        }.conversations.getValue(S)
+        assertNull(held.ended)
+        assertEquals(ConnectionState.Connected, controller.state.value.connection)
+    }
+
+    @Test
+    fun anUnreadableResetGivesUp() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        connection.send(unreadable(reset = false))
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(unreadable(reset = true))
         val ended = controller.await { it.conversations[S]?.ended != null }.conversations.getValue(S)
         assertEquals("Hello", (ended.items.single().body as ItemBody.Text).text)
         assertTrue(ended.ended!!.contains("Update the app"))
         assertEquals("conversation.unwatch", connection.nextRequest().op)
-        // The connection itself carries on.
         assertEquals(ConnectionState.Connected, controller.state.value.connection)
+    }
+
+    @Test
+    fun aConversationThatKeepsFallingOutOfStepEnds() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        val misaligned = conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":7,"text":"!"}]""")
+        repeat(3) {
+            connection.send(misaligned)
+            connection.ok(connection.expect("conversation.watch"))
+            connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        }
+        connection.send(misaligned)
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+        assertTrue(controller.state.value.conversations.getValue(S).ended!!.contains("out of step"))
+    }
+
+    @Test
+    fun aFailedWatchAgainStillUnwatchesOnClose() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        controller.rewatch(S)
+        connection.error(connection.expect("conversation.watch"), "unavailable", "Busy.")
+        controller.await { it.conversations[S]?.ended != null }
+        // The first watch may still stand on the server.
+        controller.close(S)
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+    }
+
+    @Test
+    fun anUnreadableSessionListAsksForAnUpdate() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.send("""{"type":"event","event":"sessions","data":{"sessions":"from a newer cagents"}}""")
+        val state = controller.await { it.connection is ConnectionState.NeedsAction }
+        assertIs<ConnectFailure.Refused>((state.connection as ConnectionState.NeedsAction).failure)
+        // Past the requests already sent, the app has closed the connection.
+        while (!connection.isClosedByClient()) continue
     }
 
     @Test
