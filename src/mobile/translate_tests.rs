@@ -303,8 +303,9 @@ fn only_unacknowledged_notices_reach_the_phone_newest_first() {
     let mut finished = notice(false, "done");
     finished.event.evidence.kind = notifications::Kind::Succeeded;
     finished.event.content = None;
-    assert!(!notices(&notifications::Snapshot {
+    let finished_snapshot = notifications::Snapshot {
         notices: vec![finished],
         diagnostic: None,
-    })[0].asks);
+    };
+    assert!(!notices(&finished_snapshot)[0].asks);
 }
