@@ -184,8 +184,9 @@ from the application's update notice or with `cagents daemon upgrade`. The
 coordinator retains the running daemon's own CLI, including across successive
 staged installs, so a protocol change does not require manually composing shell
 commands. Unknown ownership refuses the switch. If publishing launchers fails, the installer
-restores the previous version without stopping compatible sessions. Existing
-version directories are retained.
+restores the previous version without stopping compatible sessions. A successful
+install keeps the previous version for rollback and preserves versions still
+used by running processes. [Installed version retention](installation.md#withdraw-or-re-select-a-staged-build)
 
 Explicit `install.sh --stage-only` also preserves unsaved windows and never
 prepares, closes or reopens them. Before publishing the candidate, it records the

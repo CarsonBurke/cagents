@@ -1103,7 +1103,10 @@ awk '
         if (type == "-" && last == "/") exit 1
     }
 ' "$ARCHIVE_VERBOSE" || fail 'archive contains links, special files, or invalid entry types'
-if ! awk -v top="$TOP_LEVEL" '
+PREPARED_MARKER=.cagents-prepared-candidate-v1.json
+RETAINED_MARKER=.cagents-retained-candidate-v1.json
+validate_version_members() {
+    awk -v top="$1" -v installed="$2" -v prepared="$PREPARED_MARKER" -v retained="$RETAINED_MARKER" '
     function allowed(path) {
         return path == top "/" ||
             path == top "/bin/" ||
@@ -1131,7 +1134,9 @@ if ! awk -v top="$TOP_LEVEL" '
             path == top "/share/doc/" ||
             path == top "/share/doc/cagents/" ||
             path == top "/share/doc/cagents/LICENSE" ||
-            path == top "/share/doc/cagents/THIRD-PARTY-NOTICES"
+            path == top "/share/doc/cagents/THIRD-PARTY-NOTICES" ||
+            (installed && (path == top "/.deferred-owner.json" ||
+                path == top "/" prepared || path == top "/" retained))
     }
     !allowed($0) || seen[$0]++ { exit 1 }
     $0 == top "/bin/cagents" { required[1] = 1 }
@@ -1153,9 +1158,10 @@ if ! awk -v top="$TOP_LEVEL" '
         for (i = 1; i <= 11; i++) if (!required[i]) exit 1
         if (dictate != notices) exit 1
     }
-' "$ARCHIVE_LIST"; then
-    fail 'archive has an unexpected or incomplete entry structure'
-fi
+    '
+}
+validate_version_members "$TOP_LEVEL" 0 < "$ARCHIVE_LIST" \
+    || fail 'archive has an unexpected or incomplete entry structure'
 
 # The verified candidate owns the UI launch fence before any installation
 # mutation. Re-entry reuses these downloaded assets and is authorized only by
@@ -1304,6 +1310,99 @@ refresh_launcher_caches() {
     fi
 }
 
+# Run only after a verified publication, while still holding the launch fence.
+# `current` also serves a staged release. Keep the actual replaced tree and
+# the owner's matched set even if its daemon exited during this installation.
+prune_installed_versions() (
+    [ ! -L "$PREFIX/versions" ] && [ -e /proc/$$/exe ] || exit 0
+    versions_root=$(cd "$PREFIX/versions" && pwd -P) || exit 0
+    owner_uid=$(id -u) || exit 0
+    [ "$(find "$versions_root" -maxdepth 0 -uid "$owner_uid" ! -perm /022 -print)" = "$versions_root" ] || exit 0
+    # A bind mount can alias another tree on the same filesystem. Require an
+    # ordinary directory layout before considering recursive removal.
+    CAGENTS_RETENTION_VERSIONS_ROOT=$versions_root awk '
+        BEGIN {
+            root = ENVIRON["CAGENTS_RETENTION_VERSIONS_ROOT"] "/"
+            escaped[" "] = "\\040"
+            escaped["\t"] = "\\011"
+            escaped["\n"] = "\\012"
+            escaped["\\"] = "\\134"
+            for (i = 1; i <= length(root); i++) {
+                ch = substr(root, i, 1)
+                prefix = prefix (ch in escaped ? escaped[ch] : ch)
+            }
+        }
+        index($5, prefix) == 1 { exit 1 }
+    ' /proc/self/mountinfo || exit 0
+    previous_root=
+    if [ -n "$PREVIOUS_VERSION_DIR" ]; then
+        previous_root=$(readlink -f -- "$PREVIOUS_VERSION_DIR") || exit 0
+        # A retry can verify the same already selected tree. It has no new
+        # rollback target, so preserve the versions the last switch kept.
+        [ -d "$previous_root" ] && [ "$previous_root" != "$versions_root/$VERSION" ] || exit 0
+    fi
+    owner_root=
+    if [ -n "${CAGENTS_INSTALL_OWNER_CLI:-}" ]; then
+        owner_root=$(readlink -f -- "${CAGENTS_INSTALL_OWNER_CLI%/bin/cagents}") || exit 0
+    fi
+    in_use='|'
+    for process_exe in /proc/[0-9]*/exe; do
+        if ! process_image=$(readlink -- "$process_exe" 2>/dev/null); then
+            # A non-dumpable process can hide exe from its own user. Its
+            # status still reports credentials and the kernel executable name.
+            if awk -v uid="$owner_uid" '
+                $1 == "Uid:" { owned = ($3 == uid) }
+                $1 == "State:" { live = ($2 !~ /^[ZXx]$/) }
+                $1 == "Name:" { candidate = ($2 ~ /^cagents(d|-ui|-dictate|-uninsta)?$/) }
+                END { exit !(owned && live && candidate) }
+            ' "${process_exe%/exe}/status" 2>/dev/null; then
+                exit 0
+            fi
+            continue
+        fi
+        case $process_image in
+            "$versions_root"/*/*)
+                process_version=${process_image#"$versions_root/"}
+                in_use=$in_use${process_version%%/*}'|'
+                ;;
+        esac
+    done
+    for old_tree in "$versions_root"/[0-9]*; do
+        name=${old_tree##*/}
+        case $name in
+            "$VERSION"|*..*|*[!0-9A-Za-z.+~-]*) continue ;;
+        esac
+        case $in_use in *"|$name|"*) continue ;; esac
+        [ "$old_tree" != "$previous_root" ] && [ "$old_tree" != "$owner_root" ] || continue
+        [ -d "$old_tree" ] && [ ! -L "$old_tree" ] || continue
+        [ "$(find "$old_tree" -maxdepth 0 -uid "$owner_uid" ! -perm /022 -print)" = "$old_tree" ] || continue
+
+        # Keep private retry candidates for two weeks. A reviewed worker with
+        # an inherited daemon lease still owns recovery even after its inner
+        # installer commits, so leave marked trees to a later standalone pass.
+        for marker in "$old_tree/$PREPARED_MARKER" "$old_tree/$RETAINED_MARKER"; do
+            [ -e "$marker" ] || [ -L "$marker" ] || continue
+            if [ -n "${CAGENTS_DAEMON_LEASE_FD:-}" ] || \
+                [ "$(find "$marker" -maxdepth 0 -type f -mtime +13 -print)" != "$marker" ]; then
+                continue 2
+            fi
+        done
+
+        # Match the release footprint before removing a tree. Unexpected files,
+        # links and foreign-owned contents are outside this policy.
+        find "$old_tree" -xdev -mindepth 1 \
+            \( ! -uid "$owner_uid" -o -name '*
+*' \) -printf 'unknown\n' \
+            -o -type d -printf "$name/%P/\n" -o -type f -printf "$name/%P\n" \
+            -o -printf 'unknown\n' > "$DOWNLOAD_DIR/retention-members" || continue
+        validate_version_members "$name" 1 < "$DOWNLOAD_DIR/retention-members" || continue
+        [ "$(readlink "$PREFIX/current" 2>/dev/null)" = "versions/$VERSION" ] || exit 0
+        rm -rf --one-file-system -- "$old_tree" || \
+            printf '%s: could not prune old version at %s\n' "$PROGRAM" "$old_tree" >&2
+    done
+    exit 0
+)
+
 if [ -n "$SELECT_VERSION" ]; then
     # Nothing from this release is installed: its coordinator only switches
     # current, under the held launch fence and staging ownership checks, to a
@@ -1348,8 +1447,6 @@ if [ -L "$PREFIX/versions" ] || { [ -e "$PREFIX/versions" ] && [ ! -d "$PREFIX/v
     fail "unsafe versions path at $PREFIX"
 fi
 mkdir -p "$PREFIX/versions"
-PREPARED_MARKER=.cagents-prepared-candidate-v1.json
-RETAINED_MARKER=.cagents-retained-candidate-v1.json
 prepared_marker_contents() {
     printf '{"version":1,"job":"%s","archive_sha256":"%s"}\n' "${1:-$candidate_job}" "$ACTUAL_HASH"
 }
@@ -1876,6 +1973,7 @@ fi
 if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
     rm -f "$NEW_VERSION_DIR/$PREPARED_MARKER"
 fi
+prune_installed_versions
 refresh_launcher_caches
 
 

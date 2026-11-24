@@ -69,6 +69,13 @@ elif args[0] == 'verify-install-guard':
     if os.environ.get('FIXTURE_WINDOWS_PREPARED') and not stage_only:
         print('application windows have not finished closing', file=sys.stderr)
         sys.exit(1)
+elif args[:2] == ['record-deferred-install', '--stage-only']:
+    assert len(args) == 6 and args[2] == '--prefix' and args[4] == '--version-root'
+    assert os.environ['CAGENTS_UI_UPDATE_GUARD_FD'] == 'fixture-only'
+    version_root = pathlib.Path(args[5])
+    assert version_root.parent == pathlib.Path(args[3]) / 'versions'
+    assert (version_root / 'bin/cagents').is_file()
+    (version_root / '.deferred-owner.json').write_text('{"version":1,"owner_version":null}\n')
 elif args[:2] == ['daemon', 'capture-update-census']:
     assert args[2] == '--output' and args[4] == '--candidate-cli' and len(args) == 6
     assert pathlib.Path(args[5]).is_file()
@@ -346,6 +353,108 @@ class InstallerCoordinator(unittest.TestCase):
         self.assertEqual(sum(e['event'] == 'daemon-start-fixture' for e in events), 1)
         self.assertEqual(list(self.downloads.iterdir()), [], "downloaded coordinator pair was not cleaned")
         return next(e for e in events if e['event'] == 'coordinate')
+
+    def test_install_prunes_only_unneeded_release_trees(self):
+        versions = self.prefix / 'versions'
+        names = ('9.9.0', '9.9.1', '9.9.2', '9.9.3', '9.9.4', '9.9.5+local.123', '9.9.6', '9.9.7')
+        for name in names:
+            shutil.copytree(self.payload, versions / name)
+        self.write(self.prefix / '.cagents-install-root', 'cagents install root\n')
+        (self.prefix / 'current').symlink_to('versions/9.9.1')
+        (versions / '9.9.8').symlink_to('9.9.1')
+        self.write(versions / '9.9.3' / 'notes.txt', 'keep my notes\n')
+        self.write(versions / '9.9.4' / '.cagents-prepared-candidate-v1.json', '{}\n')
+        old_marker = versions / '9.9.6' / '.cagents-retained-candidate-v1.json'
+        self.write(old_marker, '{}\n')
+        expired = time.time() - 15 * 86400
+        os.utime(old_marker, (expired, expired))
+        self.write(versions / '9.9.7' / '.deferred-owner.json', '{}\n')
+
+        # Execute the binary itself so the kernel names the installed tree.
+        live = versions / '9.9.2/bin/cagentsd'
+        shutil.copy2(shutil.which('sleep'), live)
+        with subprocess.Popen([live, '60']) as process:
+            try:
+                self.assertEqual(os.readlink(f'/proc/{process.pid}/exe'), str(live))
+                self.assert_installed(self.install(), 'candidate')
+            finally:
+                process.terminate()
+
+        self.assertEqual({path.name for path in versions.iterdir()},
+                         {VERSION, '9.9.1', '9.9.2', '9.9.3', '9.9.4', '9.9.8'})
+        self.assertEqual((versions / '9.9.3/notes.txt').read_text(), 'keep my notes\n')
+
+    def test_staging_prunes_obsolete_versions_only_after_publication(self):
+        self.installed_cli(guarded=True)
+        obsolete = self.prefix / 'versions/9.9.0'
+        shutil.copytree(self.payload, obsolete)
+        self.environment['FIXTURE_PENDING_RECOVERY'] = '1'
+        failed = self.install('--stage-only')
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertTrue(obsolete.is_dir())
+
+        del self.environment['FIXTURE_PENDING_RECOVERY']
+        staged = self.install('--stage-only')
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+        self.assertTrue((self.prefix / 'versions/old').is_dir())
+        self.assertFalse(obsolete.exists())
+
+    def test_install_defers_pruning_when_a_live_cagents_executable_cannot_be_read(self):
+        self.installed_cli(guarded=True)
+        obsolete = self.prefix / 'versions/9.9.0'
+        shutil.copytree(self.payload, obsolete)
+        hidden = obsolete / 'bin/cagentsd'
+        shutil.copy2(sys.executable, hidden)
+        program = '''
+import ctypes, time
+assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0  # PR_SET_DUMPABLE
+print('ready', flush=True)
+time.sleep(60)
+'''
+        with subprocess.Popen([hidden, '-c', program], stdout=subprocess.PIPE, text=True) as process:
+            try:
+                self.assertEqual(process.stdout.readline(), 'ready\n')
+                with self.assertRaises(PermissionError):
+                    os.readlink(f'/proc/{process.pid}/exe')
+                self.assert_installed(self.install(), 'installed')
+                self.assertTrue(obsolete.is_dir())
+            finally:
+                process.terminate()
+
+    def test_install_defers_pruning_when_version_tree_contains_a_mount(self):
+        self.installed_cli(guarded=True)
+        obsolete = self.prefix / 'versions/9.9.0'
+        shutil.copytree(self.payload, obsolete)
+        mountinfo = self.directory / 'mountinfo'
+        mounted = str(obsolete / 'share').replace(' ', r'\040')
+        mountinfo.write_text(f'42 41 8:1 /other/share {mounted} rw - ext4 /dev/sda1 rw\n')
+        self.environment['FIXTURE_MOUNTINFO'] = str(mountinfo)
+        self.executable(self.tools / 'awk', '''#!/bin/bash
+if [[ ${!#} == /proc/self/mountinfo ]]; then
+    set -- "${@:1:$#-1}" "$FIXTURE_MOUNTINFO"
+fi
+exec /usr/bin/awk "$@"
+''')
+
+        self.assert_installed(self.install(), 'installed')
+        self.assertTrue(obsolete.is_dir())
+
+    def test_verifying_the_current_candidate_preserves_its_rollback_version(self):
+        self.prepare_candidate()
+        # Older installers could leave the prepared marker on a published tree.
+        current = self.prefix / 'current'
+        current.unlink()
+        current.symlink_to(f'versions/{VERSION}')
+        rollback = self.prefix / 'versions/9.9.0'
+        shutil.copytree(self.payload, rollback)
+        del self.environment['FIXTURE_WINDOWS_PREPARED']
+
+        result = self.install('--prepared-candidate', JOB)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'Installed cagents {VERSION}', result.stdout)
+        self.assertFalse((current / '.cagents-prepared-candidate-v1.json').exists())
+        self.assertTrue(rollback.is_dir())
 
     def test_fresh_prefix_uses_the_verified_candidate_pair(self):
         self.assertFalse(self.prefix.exists())

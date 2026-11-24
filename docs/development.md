@@ -2682,8 +2682,8 @@ to `refs/cagents/install-local` in the repository at the same path on that host
 and built there. The archive is copied back, and the script refuses it if it
 needs a newer glibc than this machine has. Uncommitted tracked changes are
 refused so that the version names its exact source. If that version is already
-current, the build is skipped. After staging, older `+local` builds are removed,
-except the two most recent and any that a running process still uses.
+current, the build is skipped. Local builds follow the same retention policy as
+published releases. [Installed version retention](installation.md#withdraw-or-re-select-a-staged-build)
 
 The script first fetches and checks what `HEAD` is, because a checkout nobody
 updated would install old code. It refuses a detached `HEAD` that is not the
