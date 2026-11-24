@@ -275,6 +275,11 @@ pub(in crate::app) const PANE_KEPT: &str =
 pub(super) const PANE_KEPT_ELSEWHERE: &str =
     "This pane couldn't be removed everywhere, so it may come back. Close it again if it does.";
 
+/// A Close the registry refused or never received. The pane stays closed
+/// here, under its identity, but other windows may still show it.
+pub(super) const PANE_CLOSED_HERE_KEPT_ELSEWHERE: &str =
+    "This pane closed here, but other windows may still show it. Close it there if they do.";
+
 /// Any other pane edit the registry would not save: a rename, a resize, a
 /// move or an added pane. This window then shows the panes as saved.
 pub(super) const PANE_CHANGE_NOT_SAVED: &str = "A pane change couldn't be saved. Try it again.";
@@ -941,6 +946,15 @@ impl Cagents {
             .views
             .iter()
             .any(|view| view.panes.iter().any(|pane| pane.id == card));
+        self.index_cards();
+        if kept && self.closed_here(card) {
+            // The pane stays closed here whatever the registry kept: storage
+            // holds its tombstone, and the view does not bring it back.
+            tracing::warn!(?scope, %operation, %error, %card, "the registry kept a pane closed here");
+            self.notices
+                .record(TransientNotice::warning(PANE_CLOSED_HERE_KEPT_ELSEWHERE));
+            return;
+        }
         if kept && self.closes_in_background(card) {
             // Its removal was judged against the conversation still running,
             // which is stopping; the pane, out of sight, goes once it has.
@@ -3568,15 +3582,23 @@ impl Cagents {
         // A scoped read or a deferred receipt may prove a close beyond the
         // snapshot that supplied a descriptor. Exact closed identity wins over
         // both that older descriptor and a pending local insertion overlay.
+        // So does this window's own close: a card it closed stays closed
+        // under its identity, whatever a view still lists. Storage holds its
+        // tombstone and would refuse it reopened (#2093, #2444).
+        self.index_cards();
         for view in &mut views {
             let closed: Vec<_> = view
                 .panes
                 .iter()
-                .filter(|pane| self.shared_views.closed.contains(&pane.id))
+                .filter(|pane| {
+                    self.shared_views.closed.contains(&pane.id) || self.closed_here(pane.id)
+                })
                 .map(|pane| pane.id)
                 .collect();
-            view.panes
-                .retain(|pane| !self.shared_views.closed.contains(&pane.id));
+            if closed.is_empty() {
+                continue;
+            }
+            view.panes.retain(|pane| !closed.contains(&pane.id));
             for id in closed {
                 if !view.retired.contains(&id) {
                     view.retired.push(id);
@@ -4663,6 +4685,21 @@ impl Cagents {
                 .views
                 .iter()
                 .any(|view| view.retired.contains(&id))
+    }
+
+    /// Whether this window closed `id` and keeps it closed whatever a view
+    /// lists: storage holds its tombstone, and an identity is never reopened.
+    /// A fenced pane has a close of its own, and so does a chat whose
+    /// started conversation is stopping, or that the daemon refused to stop.
+    ///
+    /// Reads `card_indices`, so a caller first brings them up to date.
+    fn closed_here(&self, id: CardId) -> bool {
+        self.card_indices
+            .get(&id)
+            .and_then(|index| self.durable.cards.get(*index))
+            .is_some_and(|card| card.id == id && matches!(card.existence, Existence::Closed { .. }))
+            && !self.shared_views.quarantined.contains(&id)
+            && !self.chat_close_returns_through_stop(id)
     }
 
     /// Whether a pane missing from its shared view should close here. Only a

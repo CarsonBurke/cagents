@@ -118,7 +118,23 @@ pub enum RefusedCheck<'a> {
     TypeMismatch,
 }
 
+/// The rule an open card breaks when it is offered over its own tombstone.
+/// Storage keeps the card closed: a closed identity never reopens, and a
+/// reopened pane is a new card under a new identity.
+pub const CARD_RESURRECTION: &str = "tombstoned card {card_id} cannot be resurrected";
+
 impl StoreError {
+    /// Whether storage refused an open copy of a card it holds closed. The
+    /// refusal leaves storage as the person left it, closed, so it is not a
+    /// change of theirs that failed to save.
+    pub fn resurrects_closed_card(&self) -> bool {
+        match self {
+            Self::Card { error, .. } => error.resurrects_closed_card(),
+            Self::InvalidState(violation) => violation.check == CARD_RESURRECTION,
+            _ => false,
+        }
+    }
+
     /// The rule this error says a write broke, when storage refused the write
     /// because of what it contains, so offering the same content again can
     /// only fail the same way.

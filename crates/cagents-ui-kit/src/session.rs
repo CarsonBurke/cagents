@@ -541,8 +541,60 @@ struct QueueState {
     /// conversations nor with a state that shows a change queued after them.
     staged_adoptions: Vec<IdentityReplacement>,
     retry_requested: bool,
-    checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
+    checkpoints: Vec<Checkpoint>,
     shutdown: bool,
+}
+
+/// A barrier waiting for the writer's next flush, and what it vouches for.
+#[derive(Debug)]
+enum Checkpoint {
+    /// The whole window's state: any refused part of it fails the barrier.
+    Window(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
+    /// One pane's state. A refusal of another pane's write leaves this one
+    /// saved, so only a refusal of what this pane's save needs fails it.
+    Pane(
+        CardId,
+        std::sync::mpsc::SyncSender<std::result::Result<(), PaneSaveRefusal>>,
+    ),
+}
+
+/// Why a pane's save barrier was not honoured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneSaveRefusal {
+    /// Storage could not take pending writes, or the writer is unavailable.
+    /// The words are already redacted and say what to do.
+    Unsaved(String),
+    /// Storage refused, by construction, a write the pane's save depends on:
+    /// the pane's own, or a whole window snapshot that held it. `pane` names
+    /// the pane storage refused, when it named one.
+    Refused {
+        pane: Option<CardId>,
+        category: SaveFailureCategory,
+        rule: crate::diagnostics::Check,
+    },
+}
+
+impl std::fmt::Display for PaneSaveRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsaved(reason) => formatter.write_str(reason),
+            Self::Refused {
+                pane,
+                category,
+                rule,
+            } => {
+                match pane {
+                    Some(pane) => write!(formatter, "storage refused pane {pane}")?,
+                    None => formatter.write_str("storage refused the window's panes")?,
+                }
+                write!(
+                    formatter,
+                    " ({}; refused by rule: {rule})",
+                    category.label()
+                )
+            }
+        }
+    }
 }
 
 impl QueueState {
@@ -1305,7 +1357,35 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("session writer is shutting down".into());
         }
-        queue.checkpoints.push(response);
+        queue.checkpoints.push(Checkpoint::Window(response));
+        changed.notify_one();
+        drop(queue);
+        Ok(receiver)
+    }
+
+    /// A writer-lane barrier for one pane: it holds once everything offered
+    /// before it has landed, unless storage refused what `card`'s own state
+    /// needs. Unlike [`Self::request_flush`], a refused write of another pane
+    /// does not fail it, so one stuck pane cannot stop every other pane's
+    /// save from being vouched for.
+    pub fn request_pane_flush(
+        &self,
+        card: CardId,
+    ) -> std::result::Result<
+        std::sync::mpsc::Receiver<std::result::Result<(), PaneSaveRefusal>>,
+        PaneSaveRefusal,
+    > {
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock
+            .lock()
+            .map_err(|_| PaneSaveRefusal::Unsaved("session writer queue unavailable".into()))?;
+        if queue.shutdown {
+            return Err(PaneSaveRefusal::Unsaved(
+                "session writer is shutting down".into(),
+            ));
+        }
+        queue.checkpoints.push(Checkpoint::Pane(card, response));
         changed.notify_one();
         drop(queue);
         Ok(receiver)
@@ -1587,6 +1667,31 @@ impl Quarantine {
             .min_by_key(|category| category.selection_rank())
     }
 
+    /// Why `card`'s own state is not saved, when a refusal is the reason: a
+    /// refused window snapshot, which held it, or a refused write of the
+    /// card itself. Another pane's refused write leaves it saved.
+    fn pane_state(
+        &self,
+        card: CardId,
+    ) -> Option<(
+        Option<CardId>,
+        SaveFailureCategory,
+        crate::diagnostics::Check,
+    )> {
+        if let Some((_, refused, refusal)) = &self.workspace {
+            return Some((*refused, refusal.category, refusal.check.clone()));
+        }
+        self.panes
+            .as_ref()
+            .and_then(|(_, panes)| panes.get(&card))
+            .or_else(|| {
+                self.identity_replacements
+                    .get(&card)
+                    .map(|(_, refusal)| refusal)
+            })
+            .map(|refusal| (Some(card), refusal.category, refusal.check.clone()))
+    }
+
     /// Rewrites a replacement that continues from a refused one to start at the
     /// identity storage still holds.
     ///
@@ -1646,6 +1751,17 @@ impl Quarantine {
         let panes = refused
             .iter()
             .filter_map(|error| match error {
+                // Storage kept a pane closed that the window offered open: a
+                // card the person closed, brought back in memory. Closed is
+                // what they left it, so nothing of theirs went unsaved, and a
+                // checkpoint - a first message, an update - does not wait on it.
+                // A pane shown again under its closed identity is not saved,
+                // which the warning records.
+                StoreError::Card { card, .. } if error.resurrects_closed_card() => {
+                    previous.remove(card);
+                    tracing::warn!(%card, "storage keeps a closed pane closed that the window offered open; changes to it are not saved");
+                    None
+                }
                 StoreError::Card { card, .. } => Some((
                     *card,
                     record_refusal(
@@ -3145,20 +3261,42 @@ fn persistence_loop(
             health.answer_retry(revision);
         }
         for checkpoint in checkpoints {
-            let result = if !writes.is_settled() {
-                Err(save_refusal(failure))
-            } else if let Some(category) = writes.quarantine.window_state() {
-                // A barrier vouches for the window's state - a terminal handoff
-                // releases the daemon's replay evidence on the strength of it -
-                // so a refused snapshot fails it. A refused catalog row does
-                // not: waiting cannot save it, and the window state is whole.
-                let refusal = window_state_refusal(category, &writes.quarantined());
-                tracing::warn!(%refusal, "a save barrier was refused");
-                Err(refusal)
-            } else {
-                Ok(())
-            };
-            let _ = checkpoint.send(result);
+            match checkpoint {
+                Checkpoint::Window(reply) => {
+                    let result = if !writes.is_settled() {
+                        Err(save_refusal(failure))
+                    } else if let Some(category) = writes.quarantine.window_state() {
+                        // A barrier vouches for the window's state - a terminal
+                        // handoff releases the daemon's replay evidence on the
+                        // strength of it - so a refused snapshot fails it. A
+                        // refused catalog row does not: waiting cannot save it,
+                        // and the window state is whole.
+                        let refusal = window_state_refusal(category, &writes.quarantined());
+                        tracing::warn!(%refusal, "a save barrier was refused");
+                        Err(refusal)
+                    } else {
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
+                Checkpoint::Pane(card, reply) => {
+                    let result = if !writes.is_settled() {
+                        Err(PaneSaveRefusal::Unsaved(save_refusal(failure)))
+                    } else if let Some((pane, category, rule)) = writes.quarantine.pane_state(card)
+                    {
+                        let refusal = PaneSaveRefusal::Refused {
+                            pane,
+                            category,
+                            rule,
+                        };
+                        tracing::warn!(%card, %refusal, "a pane's save barrier was refused");
+                        Err(refusal)
+                    } else {
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
+            }
         }
 
         if shutdown {
