@@ -5,12 +5,11 @@
 # step-failures-scene/frames.jsonl, and no account or model is contacted.
 #
 # Run on the build host with CAGENTS_EVIDENCE_TASK naming a native-evidence
-# task. The theme goes into the task's seed before a session starts; the
-# scene runs inside a ready session:
+# task, inside a ready session:
 #
-#   tests/fixtures/step-failures-scene.sh theme dark   # or light
 #   scripts/native-evidence start before --width 1200
-#   tests/fixtures/step-failures-scene.sh show dark
+#   tests/fixtures/step-failures-scene.sh show light
+#   tests/fixtures/step-failures-scene.sh retheme dark
 #   scripts/native-evidence stop
 #
 # The turn runs three commands of which one fails, says so, runs two that
@@ -20,13 +19,16 @@
 #
 # Scenes, each shooting with the side's prefix as native-evidence does:
 #
-#   show LABEL  step-failures-LABEL: the answered turn with its three groups
-#               collapsed
-#   theme KEY   writes the theme into the task's seed, which every later
-#               session starts from
+#   show LABEL    step-failures-LABEL: the answered turn with its three
+#                 groups collapsed
+#   retheme KEY   closes the app, sets the theme to KEY (dark or light),
+#                 relaunches it in the same session, reopens the same
+#                 conversation and shoots step-failures-KEY
+#   theme KEY     writes the theme into the task's seed instead, which every
+#                 later session starts from
 set -euo pipefail
 
-scene=${1:?usage: step-failures-scene.sh show LABEL | theme dark|light}
+scene=${1:?usage: step-failures-scene.sh show LABEL | retheme KEY | theme KEY}
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name a native-evidence task}"
@@ -48,26 +50,53 @@ if [ "$scene" = theme ]; then
     fi
     exit 0
 fi
-[ "$scene" = show ] || { printf 'step-failures-scene: unknown scene %s\n' "$scene" >&2; exit 2; }
-label=${2:?usage: step-failures-scene.sh show LABEL}
+case $scene in show | retheme) ;; *)
+    printf 'step-failures-scene: unknown scene %s\n' "$scene" >&2
+    exit 2
+    ;;
+esac
+label=${2:?name the shot}
 
 # Never create a provider directory except inside an existing evidence fixture.
 [ -d "$fixture/bin" ] && [ -d "$fixture/project/.git" ] || {
     printf '%s\n' 'step-failures-scene: start native-evidence first' >&2
     exit 2
 }
-mkdir -p "$config"
-cp "$here/step-failures-scene/frames.jsonl" "$config/fixture-frames.jsonl"
-printf '%s\n' 'The type error is fixed and the crate checks cleanly.' >"$config/fixture-reply.md"
 # The reply as the screen reading finds it, which splits a line into runs at
 # whichever spaces it likes.
 reply='type error is|checks cleanly|crate checks'
 
-# A fresh fixture has no project open yet; opening one again is harmless.
-evidence cli project open "$fixture/project" >/dev/null 2>&1 || true
-sleep 2
-evidence cli --json agent spawn --provider claude --model haiku --surface chat \
-    --repository "$fixture/project" --prompt 'Fix the failing library tests.' >/dev/null
+if [ "$scene" = show ]; then
+    mkdir -p "$config"
+    cp "$here/step-failures-scene/frames.jsonl" "$config/fixture-frames.jsonl"
+    printf '%s\n' 'The type error is fixed and the crate checks cleanly.' >"$config/fixture-reply.md"
+    # A fresh fixture has no project open yet; opening one again is harmless.
+    evidence cli project open "$fixture/project" >/dev/null 2>&1 || true
+    sleep 2
+    evidence cli --json agent spawn --provider claude --model haiku --surface chat \
+        --repository "$fixture/project" --prompt 'Fix the failing library tests.' >/dev/null
+else
+    case $label in dark|light) ;; *) exit 2 ;; esac
+    # Only this private native app receives a regular window-close request;
+    # the app reads its theme only at startup.
+    evidence nested niri msg action close-window >/dev/null
+    sleep 4
+    settings=$fixture/config/cagents-development/settings.toml
+    mkdir -p "${settings%/*}"
+    if [ -f "$settings" ] && grep -q '^app_theme' "$settings"; then
+        sed -i "s/^app_theme = .*/app_theme = \"$label\"/" "$settings"
+    elif [ -f "$settings" ]; then
+        sed -i "1i app_theme = \"$label\"" "$settings"
+    else
+        printf 'schema_version = 3\napp_theme = "%s"\n' "$label" >"$settings"
+    fi
+    # The relaunch stays until the session stops; it holds no build lock.
+    mkdir -p "$CAGENTS_EVIDENCE_TASK/logs"
+    nohup "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" \
+        --task "$CAGENTS_EVIDENCE_TASK" relaunch \
+        </dev/null >"$CAGENTS_EVIDENCE_TASK/logs/step-failures-relaunch.log" 2>&1 &
+    sleep 8
+fi
 # The conversation opens from its channel's row once its turn has answered;
 # a busy host can take a minute or two.
 for _ in $(seq 20); do
