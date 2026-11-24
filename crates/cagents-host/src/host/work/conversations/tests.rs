@@ -578,35 +578,32 @@ fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
     );
 }
 
-/// A transcript file under `/var/tmp`, removed when dropped.
-struct Transcript(PathBuf);
+/// A transcript file in a directory owned by its test.
+struct Transcript {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
+}
 
 impl Transcript {
     fn new(name: &str) -> Self {
-        let directory = Path::new("/var/tmp").join(format!(
-            "cagents-conversations-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        Self(directory.join("transcript.jsonl"))
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("cagents-conversations-{name}-"))
+            .tempdir()
+            .unwrap();
+        Self {
+            path: directory.path().join("transcript.jsonl"),
+            _directory: directory,
+        }
     }
 
     fn append(&self, text: &str) {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.0)
+            .open(&self.path)
             .unwrap()
             .write_all(text.as_bytes())
             .unwrap();
-    }
-}
-
-impl Drop for Transcript {
-    fn drop(&mut self) {
-        if let Some(directory) = self.0.parent() {
-            let _ = std::fs::remove_dir_all(directory);
-        }
     }
 }
 
@@ -642,7 +639,7 @@ fn located(path: &Path) -> Source {
 fn a_transcript_is_read_as_it_grows_one_whole_line_at_a_time() {
     let file = Transcript::new("grows");
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     read(&mut watched);
     assert!(matches!(
         watched.coverage,
@@ -663,7 +660,7 @@ fn a_transcript_is_read_as_it_grows_one_whole_line_at_a_time() {
     assert_eq!(numbers(&watched), vec![1, 2]);
 
     // A subagent's transcript is found beside it.
-    let subagents = file.0.with_extension("").join("subagents");
+    let subagents = file.path.with_extension("").join("subagents");
     std::fs::create_dir_all(&subagents).unwrap();
     std::fs::write(subagents.join("agent-a.jsonl"), mention(3)).unwrap();
     std::fs::write(subagents.join("notes.txt"), mention(4)).unwrap();
@@ -678,19 +675,19 @@ fn a_replaced_or_truncated_transcript_is_read_again_from_its_start() {
     file.append(&mention(1));
     file.append(&mention(2));
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     read(&mut watched);
     assert_eq!(numbers(&watched), vec![1, 2]);
 
     // Rewritten shorter in place.
-    std::fs::write(&file.0, mention(5)).unwrap();
+    std::fs::write(&file.path, mention(5)).unwrap();
     read(&mut watched);
     assert_eq!(numbers(&watched), vec![1, 2, 5]);
 
     // Replaced by a new file of the same length.
-    let replacement = file.0.with_extension("new");
+    let replacement = file.path.with_extension("new");
     std::fs::write(&replacement, mention(6)).unwrap();
-    std::fs::rename(&replacement, &file.0).unwrap();
+    std::fs::rename(&replacement, &file.path).unwrap();
     read(&mut watched);
     assert_eq!(numbers(&watched), vec![1, 2, 5, 6]);
 }
@@ -707,7 +704,7 @@ fn a_long_transcript_is_read_from_its_newest_part_and_says_so() {
     file.append(&padding);
     file.append(&mention(7));
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     // The backlog is read a pass at a time.
     for _ in 0..(FIRST_READ / READ_PER_PASS + 2) {
         read(&mut watched);
@@ -731,7 +728,7 @@ fn an_over_long_line_is_skipped_without_making_the_list_partial() {
     }
     file.append(&mention(8));
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     for _ in 0..4 {
         read(&mut watched);
     }
