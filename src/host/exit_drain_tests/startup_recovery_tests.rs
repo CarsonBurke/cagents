@@ -472,12 +472,7 @@ fn startup_recovery_and_exit_pending_keep_exact_close_available_until_foreign_ow
     } if terminal_id == original.session.id));
     // Keep this exact correlated-Close connection open through real Host.run
     // completion: neither client EOF nor a reaper ticket can supply its wake.
-    assert!(
-        completed
-            .recv_timeout(Duration::from_secs(8))
-            .unwrap()
-            .is_ok()
-    );
+    assert!(completed.recv_timeout(EVENTUALLY).unwrap().is_ok());
     running.join().unwrap();
     assert!(handle.worker_joined_for_test());
     prove_foreign_reaped(&mut pins[0].0);
@@ -564,12 +559,7 @@ fn final_foreign_worker_completion_wakes_exit_after_other_recovery_owner_checked
         b"exit naturally",
     )
     .unwrap();
-    assert!(
-        completed
-            .recv_timeout(Duration::from_secs(8))
-            .unwrap()
-            .is_ok()
-    );
+    assert!(completed.recv_timeout(EVENTUALLY).unwrap().is_ok());
     running.join().unwrap();
     assert!(active.worker_joined_for_test());
     prove_foreign_reaped(&mut pins[0].0);
@@ -736,12 +726,7 @@ fn completed_failed_startup_metadata_waits_for_exact_host_close_before_retiremen
         rpc.request(ClientRequest::Shutdown).unwrap(),
         ServerResponse::ShutdownAccepted
     ));
-    assert!(
-        completed
-            .recv_timeout(Duration::from_secs(8))
-            .unwrap()
-            .is_ok()
-    );
+    assert!(completed.recv_timeout(EVENTUALLY).unwrap().is_ok());
     running.join().unwrap();
     assert_eq!(
         fs::read_to_string(original.session.launch.working_directory.join("launches")).unwrap(),
