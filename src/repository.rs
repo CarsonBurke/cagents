@@ -15893,7 +15893,7 @@ mod worktree_journal_tests {
         let mut intended_child = intended_command.spawn().unwrap();
         let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
         let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
-        let mut unrelated = Command::new("/bin/true");
+        let mut unrelated = Command::new("true");
         // SAFETY: only async-signal-safe read/write on live inherited fds.
         unsafe {
             unrelated.pre_exec(move || {

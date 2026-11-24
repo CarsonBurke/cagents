@@ -849,7 +849,7 @@ mod tests {
         provider.terminate().unwrap();
         assert_eq!(provider.child.try_wait().unwrap().unwrap().code(), Some(7));
 
-        let mut provider = ChildGuard::spawn(Process::new("/bin/true").process_group(0));
+        let mut provider = ChildGuard::spawn(Process::new("true").process_group(0));
         provider.child.wait().unwrap();
         assert_eq!(
             join(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),

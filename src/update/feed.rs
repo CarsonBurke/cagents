@@ -480,6 +480,10 @@ mod tests {
 
     /// A `file://` feed holding one signed release, read through real curl.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn a_signed_release_is_discovered_and_downloaded_and_tampering_is_refused() {
         if !curl_available() {
             eprintln!("skipping: curl is not installed");
@@ -641,6 +645,10 @@ mod tests {
     /// `release-metadata-2.json`, and 0.2.4's, signed by the key 0.2.3
     /// trusts, as `release-metadata.json`.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn builds_that_trust_only_the_old_key_are_led_to_the_release_that_trusts_the_new_one() {
         if !curl_available() {
             eprintln!("skipping: curl is not installed");
@@ -693,6 +701,10 @@ mod tests {
     /// A feed whose newest release predates `release-metadata-2.json` still
     /// reads, through the name that release carries.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn a_release_from_before_generation_2_metadata_still_reads() {
         if !curl_available() {
             eprintln!("skipping: curl is not installed");

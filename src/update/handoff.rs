@@ -349,6 +349,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn source_that_answers_again_ends_update_without_waiting_for_its_exit() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -375,6 +379,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn lease_is_handed_over_only_after_the_releasing_source_exits() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -413,6 +421,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn source_exiting_during_successful_probe_is_not_reported_as_resumed() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -440,6 +452,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn empty_rival_is_stopped_and_handoff_retried_but_live_rival_is_preserved() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -510,6 +526,10 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn only_the_pinned_source_handshake_ends_wait_with_original_service_running() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;

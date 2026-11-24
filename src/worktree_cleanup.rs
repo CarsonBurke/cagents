@@ -1294,6 +1294,7 @@ mod tests {
         for pin in &protection._directories {
             let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
             assert!(flags >= 0);
+            #[cfg(target_os = "linux")]
             assert_ne!(flags & libc::O_PATH, 0);
         }
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();

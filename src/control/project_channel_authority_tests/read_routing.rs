@@ -33,12 +33,12 @@ fn exercise() {
         for no_start in [false, true] {
             let socket = daemon_socket_path().unwrap();
             fs::create_dir_all(socket.parent().unwrap()).unwrap();
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let worker = thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut peer = loop {
-                    match listener.accept() {
+                    match crate::descriptor::accept(&listener) {
                         Ok((peer, _)) => break peer,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             assert!(Instant::now() < deadline, "global read did not connect");
@@ -80,7 +80,7 @@ fn exercise() {
             assert_eq!(result, ExitCode::SUCCESS);
             assert_eq!(staged.get(), 1, "global reads retain staged-owner lookup");
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
             );
             drop(listener);
             fs::remove_file(socket).unwrap();

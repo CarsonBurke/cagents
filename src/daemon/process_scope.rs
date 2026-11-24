@@ -731,7 +731,7 @@ pub(crate) mod tests {
             eprintln!("scope withdrawal unqualified: OS user manager unavailable");
             return;
         }
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -783,7 +783,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_manager_that_exited_after_its_proof_receives_no_request() {
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
         // SAFETY: pidfd_open returns a new descriptor for this unreaped child.
         let peer = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
         assert!(peer >= 0);
@@ -1062,7 +1062,7 @@ pub(crate) mod tests {
     }
     pub(crate) fn rejected_scope_request() -> io::Result<()> {
         enroll_with(
-            Command::new("/bin/false"),
+            Command::new("false"),
             "fixture.scope",
             Duration::from_secs(1),
             || panic!("failed request must not verify membership"),
@@ -1072,7 +1072,7 @@ pub(crate) mod tests {
     #[test]
     fn successful_request_requires_exact_confirmed_membership() {
         let error = enroll_with(
-            Command::new("/bin/true"),
+            Command::new("true"),
             "fixture.scope",
             Duration::from_millis(30),
             || Ok("/app.slice/other.scope".into()),
@@ -1080,7 +1080,7 @@ pub(crate) mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         enroll_with(
-            Command::new("/bin/true"),
+            Command::new("true"),
             "fixture.scope",
             Duration::from_secs(1),
             || Ok("/app.slice/fixture.scope".into()),

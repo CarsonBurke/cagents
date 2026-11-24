@@ -122,6 +122,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn interrupt_signals_cancel_review_without_waiting_for_stdin() {
         const CHILD: &str = "CAGENTS_TEST_UPDATE_INTERRUPT";
         if let Some(ready) = std::env::var_os(CHILD) {

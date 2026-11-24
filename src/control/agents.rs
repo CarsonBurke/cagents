@@ -2881,6 +2881,9 @@ mod tests {
                 super::super::messages::message_lines(&messages[0])
                     .contains("Receipt not confirmed; this message may appear again.")
             );
+            // Darwin clears the receive timeout when the retired socket's
+            // read side is shut down; nothing can read it after that.
+            #[cfg(target_os = "linux")]
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert!(
                 client

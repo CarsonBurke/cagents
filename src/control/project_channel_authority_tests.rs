@@ -120,12 +120,12 @@ impl Peer {
         handshake: ServerMessage,
         serve: impl FnOnce(&mut UnixStream) + Send + 'static,
     ) -> Self {
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut stream = loop {
-                match listener.accept() {
+                match crate::descriptor::accept(&listener) {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "private peer was not connected");

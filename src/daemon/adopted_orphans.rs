@@ -322,7 +322,7 @@ exit 7"#,
 
     #[test]
     fn a_stale_registration_never_releases_a_recycled_pid() {
-        let (mut first, stale) = spawn_owned(&mut Command::new("/bin/true")).unwrap();
+        let (mut first, stale) = spawn_owned(&mut Command::new("true")).unwrap();
         first.wait().unwrap();
         // Model the pid's reuse by a new owner before the stale drop.
         let pid = first.id();

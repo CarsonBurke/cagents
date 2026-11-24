@@ -5552,7 +5552,7 @@ fn direct_provider_teardown_never_signals_a_reused_process_group() {
         "only the isolated namespace init may reset PID allocation"
     );
     std::fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
-    let mut original = Process::new("/bin/true");
+    let mut original = Process::new("true");
     // SAFETY: only the async-signal-safe setsid syscall runs after fork.
     unsafe {
         original.pre_exec(|| {

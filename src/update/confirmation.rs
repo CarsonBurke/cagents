@@ -1454,6 +1454,10 @@ mod tests {
         ));
     }
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn cancellation_during_verification_stops_probe_without_waiting_for_review() {
         let directory = tempfile::tempdir().unwrap();
         let mut job = job(directory.path());

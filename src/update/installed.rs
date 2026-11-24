@@ -750,6 +750,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn stopped_installed_candidate_rolls_back_only_without_a_live_writer() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         const ROOT: &str = "CAGENTS_INSTALLED_ROLLBACK_FIXTURE_ROOT";
@@ -800,7 +804,7 @@ else: raise AssertionError(sys.argv)
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         fs::create_dir_all(&paths.directory).unwrap();
         fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut stopped = Command::new("/bin/true").spawn().unwrap();
+        let mut stopped = Command::new("true").spawn().unwrap();
         let stopped_pid = stopped.id();
         stopped.wait().unwrap();
         let proof = crate::model::HostSessionProof {
