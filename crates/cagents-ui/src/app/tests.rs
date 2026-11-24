@@ -3205,21 +3205,48 @@ fn review_file_panel_control_remains_accessible_across_pane_widths() {
     use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
-    let mut pane = app.pull_request_pane(&crate::model::PullRequestView {
+    let view = crate::model::PullRequestView {
         repository: PathBuf::from("/repo"),
         selected_number: None,
         file_panel_width: None,
         file_panel_collapsed: None,
-    });
+    };
+    let mut pane = app.pull_request_pane(&view);
     let renderer = headless_renderer();
-    for (width, collapsed, label) in [
-        (260.0, None, "Show review files"),
-        (260.0, Some(false), "Hide review files"),
-        (500.0, None, "Show review files"),
-        (900.0, None, "Hide review files"),
+    // Until a file is chosen the panel holds what to choose from, the pull
+    // requests or the review's files, so only a file's diff folds it away on
+    // a narrow card unasked.
+    #[derive(Clone, Copy)]
+    enum Review {
+        Browsing,
+        Opened,
+        FileChosen,
+    }
+    use crate::pull_request_review::discussion_ui::test_support::{ready, ready_unselected};
+    for (width, collapsed, review, label) in [
+        (260.0, None, Review::Browsing, "Hide pull requests"),
+        (260.0, Some(true), Review::Browsing, "Show pull requests"),
+        (500.0, None, Review::Browsing, "Hide pull requests"),
+        (260.0, None, Review::Opened, "Hide review files"),
+        (500.0, None, Review::Opened, "Hide review files"),
+        (500.0, Some(true), Review::Opened, "Show review files"),
+        (260.0, None, Review::FileChosen, "Show review files"),
+        (260.0, Some(false), Review::FileChosen, "Hide review files"),
+        (500.0, None, Review::FileChosen, "Show review files"),
+        (900.0, None, Review::FileChosen, "Hide review files"),
     ] {
         pane.file_panel_collapsed = collapsed;
+        pane.review = match review {
+            Review::Browsing => app.pull_request_pane(&view).review,
+            Review::Opened => ready_unselected(),
+            Review::FileChosen => ready(),
+        };
         drop(app.workspace.resize_viewport(width));
+        assert_eq!(
+            app.pull_request_side_shown(card, &pane),
+            label.starts_with("Hide"),
+            "the panel is drawn exactly when its toggle offers to hide it, at width {width}"
+        );
         let mut element = app.pull_request_card_view(card, &pane);
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
