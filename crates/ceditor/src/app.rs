@@ -68,10 +68,9 @@ pub struct Opened {
     language: Option<DocumentLanguage>,
 }
 
-/// Shares successful Git reads while opening one batch in durable order.
+/// Shares worktree snapshots while opening one batch in durable order.
 struct OpenBatch<E> {
     git: RepositoryService<E>,
-    worktree_roots: HashMap<PathBuf, PathBuf>,
     snapshots: HashMap<PathBuf, Arc<RepositorySnapshot>>,
 }
 
@@ -79,7 +78,6 @@ impl<E: ProcessExecutor> OpenBatch<E> {
     fn new(git: RepositoryService<E>) -> Self {
         Self {
             git,
-            worktree_roots: HashMap::new(),
             snapshots: HashMap::new(),
         }
     }
@@ -101,13 +99,13 @@ impl<E: ProcessExecutor> OpenBatch<E> {
                 .to_path_buf()
         };
         let token = CancellationToken::default();
-        // A descendant may be a separate repository. Only reuse Git's result
-        // for this exact directory. Failed discovery still permits editing it.
-        let repository_root = self.worktree_roots.get(&directory).cloned().or_else(|| {
-            let root = self.git.discover(&directory, &token).ok()?.worktree_root?;
-            self.worktree_roots.insert(directory.clone(), root.clone());
-            Some(root)
-        });
+        // A repository can appear between tabs, even for the same directory.
+        // Failed discovery still permits editing an ordinary directory.
+        let repository_root = self
+            .git
+            .discover_worktree_root(&directory, &token)
+            .ok()
+            .flatten();
         let snapshot = repository_root
             .as_ref()
             .map(|root| {
@@ -8931,7 +8929,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_git_tabs_shares_discovery_and_worktree_snapshots() {
+    fn restoring_git_tabs_shares_worktree_snapshots() {
         use cagents::process::{CommandSpec, ProcessFailure, ProcessOutput, SystemProcessExecutor};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8980,9 +8978,8 @@ mod tests {
             .map(|(focus, opened)| (focus, opened.unwrap()))
             .collect();
 
-        // Five discovery calls per distinct directory and six snapshot calls
-        // per worktree, down from eleven calls for each of the four files.
-        assert_eq!(executor.0.load(Ordering::Relaxed), 3 * 5 + 2 * 6);
+        // One root lookup per file and six snapshot calls per worktree.
+        assert_eq!(executor.0.load(Ordering::Relaxed), 4 + 2 * 6);
         let snapshot = opened[0].1.snapshot.as_ref().unwrap();
         for (focus, opened) in &opened[..3] {
             assert_eq!(opened.root, root);
@@ -8997,6 +8994,46 @@ mod tests {
             snapshot,
             opened[3].1.snapshot.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn restoring_git_tabs_detects_a_repository_created_mid_batch() {
+        let repository = git_fixture();
+        let root = repository.path().canonicalize().unwrap();
+        let nested = root.join("nested");
+        let directory = nested.join("subdir");
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+
+        let mut batch = OpenBatch::new(RepositoryService::system("git"));
+        let first = batch.resolve(first).unwrap();
+        assert_eq!(first.root, root);
+        assert_eq!(
+            first.file.as_deref(),
+            Some(Path::new("nested/subdir/first.txt"))
+        );
+
+        git(&nested, &["init", "-b", "main"]);
+        let second = batch.resolve(second).unwrap();
+        assert_eq!(second.root, nested);
+        assert_eq!(second.file.as_deref(), Some(Path::new("subdir/second.txt")));
+        assert!(!Arc::ptr_eq(
+            first.snapshot.as_ref().unwrap(),
+            second.snapshot.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn opening_git_metadata_uses_the_registered_worktree() {
+        let repository = git_fixture();
+        let root = repository.path().canonicalize().unwrap();
+        let opened = Editor::resolve_open(root.join(".git")).unwrap();
+        assert_eq!(opened.root, root);
+        assert!(opened.file.is_none());
+        assert!(opened.snapshot.is_some());
     }
 
     #[test]
