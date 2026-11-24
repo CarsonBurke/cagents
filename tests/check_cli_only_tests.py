@@ -2,15 +2,18 @@
 
 import importlib.machinery
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "check-cli-only-tests"
-loader = importlib.machinery.SourceFileLoader("check_cli_only_tests", str(SCRIPT))
+loader = importlib.machinery.SourceFileLoader("check_cli_only_tests_script", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 script = importlib.util.module_from_spec(spec)
+# dataclasses look the module up by name while the class is being defined.
+sys.modules[loader.name] = script
 loader.exec_module(script)
 
 GATED = f"#[cfg({script.GATE})]\nmod tests {{\n    #[test]\n    fn works() {{}}\n}}\n"
