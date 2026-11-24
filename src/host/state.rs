@@ -9,7 +9,7 @@ pub(super) use presentation::snapshot as client_snapshot;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
@@ -724,22 +724,29 @@ impl HostState {
         activation
     }
 
-    /// The sessions this publication adds to its window's live claim.
-    pub(super) fn notification_sessions_unclaimed(
+    /// Partition a window publication into new and existing live claims.
+    pub(super) fn partition_notification_sessions(
         &self,
         presence: &crate::notifications::Presence,
-    ) -> Vec<TerminalId> {
+    ) -> (Vec<TerminalId>, Vec<TerminalId>) {
+        if presence.sessions.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let claimed: HashSet<_> = self
+            .notification_watchers
+            .values()
+            .filter(|current| {
+                current.application == presence.application && current.window == presence.window
+            })
+            .flat_map(|current| current.sessions.iter().copied())
+            .collect();
+        let mut seen = HashSet::with_capacity(presence.sessions.len());
         presence
             .sessions
             .iter()
-            .filter(|session| {
-                !self.notification_watchers.values().any(|current| {
-                    current.destination() == presence.destination()
-                        && current.sessions.contains(session)
-                })
-            })
             .copied()
-            .collect()
+            .filter(|session| seen.insert(*session))
+            .partition(|session| !claimed.contains(session))
     }
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
