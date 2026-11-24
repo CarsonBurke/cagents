@@ -3926,7 +3926,6 @@ impl Server {
                         chat::NativeContinuity::ReconnectOnly
                     },
                 )?;
-                self.session_stopping = true;
                 // Publication is single-threaded in this helper and the actor
                 // is already closed. Collect aliases before holding the journal
                 // lock across the retirement receipt/cache disposition.
@@ -3941,6 +3940,7 @@ impl Server {
                     journal.discard_attention()?;
                 }
                 journal.seal_for_retirement()?;
+                self.session_stopping = true;
                 let source = published_source(
                     &self.source,
                     confirmed.as_deref(),
