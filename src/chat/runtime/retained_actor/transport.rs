@@ -364,6 +364,10 @@ struct Remote {
     desired_visible: Mutex<Option<bool>>,
     wake: Arc<push::Wake>,
     binary_codec: std::sync::OnceLock<bool>,
+    /// The daemon's recognizer, held only for a helper built before the
+    /// frames the daemon now seals: what it shows as a person's prompt is
+    /// opened here, as its own store would have.
+    frames: std::sync::OnceLock<Arc<crate::agent_execution::mailbox::Recognizer>>,
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
@@ -597,6 +601,7 @@ impl RemoteActor {
             recovery_environment: Default::default(),
             desired_visible: Mutex::new(None),
             binary_codec: std::sync::OnceLock::new(),
+            frames: std::sync::OnceLock::new(),
             wake: Arc::new(push::Wake::new().unwrap()),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
@@ -746,6 +751,10 @@ impl RemoteActor {
     }
     pub fn is_close_only(&self) -> bool {
         self.0.close_only
+    }
+    #[cfg(test)]
+    pub(crate) fn opens_frames_for_helper(&self) -> bool {
+        self.0.frames.get().is_some()
     }
     pub fn is_record(record: &Record) -> bool {
         record.kind == Kind::Native
@@ -1288,6 +1297,7 @@ impl RemoteActor {
             socket,
             desired_visible: Mutex::new(None),
             binary_codec: std::sync::OnceLock::new(),
+            frames: std::sync::OnceLock::new(),
             wake: Arc::new(push::Wake::new()?),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
@@ -2406,16 +2416,32 @@ impl RemoteActor {
     }
 
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
-        if let Some(snapshot) = self
+        let final_snapshot = self
             .0
             .final_snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            return (after != Some(snapshot.generation)).then(|| snapshot.as_ref().clone());
+            .clone();
+        let mut snapshot = match final_snapshot {
+            Some(snapshot) => {
+                (after != Some(snapshot.generation)).then(|| snapshot.as_ref().clone())
+            }
+            None => self.call("snapshot", json!([after])).ok().flatten(),
+        };
+        if let (Some(frames), Some(snapshot)) = (self.0.frames.get(), snapshot.as_mut()) {
+            frames.recognize_snapshot(snapshot);
         }
-        self.call("snapshot", json!([after])).ok().flatten()
+        snapshot
+    }
+    /// Lets the daemon open the frames it sealed in what this helper shows,
+    /// when the helper was built before those frames and cannot.
+    pub fn open_frames_for_older_helper(
+        &self,
+        recognizer: &Arc<crate::agent_execution::mailbox::Recognizer>,
+    ) {
+        if !reads_current_frames(&self.0.identity.record) {
+            let _ = self.0.frames.set(recognizer.clone());
+        }
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
@@ -2842,6 +2868,9 @@ impl Server {
             .map_err(|error| error.to_string())?;
         let mut build = registry::BuildIdentity::current(Kind::Native);
         build.capabilities.push(CAPABILITY.into());
+        build
+            .capabilities
+            .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
         let identity = ActorIdentity {
             instance: uuid::Uuid::new_v4(),
             record: Record {
@@ -4547,3 +4576,78 @@ mod push;
 
 #[path = "transport_binary.rs"]
 mod binary;
+
+/// Whether the helper `record` describes opens the frames this daemon seals.
+fn reads_current_frames(record: &Record) -> bool {
+    record.build.as_ref().is_some_and(|build| {
+        build
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::agent_execution::mailbox::FRAMES_CAPABILITY)
+    })
+}
+
+#[cfg(test)]
+mod frame_capability_tests {
+    use super::*;
+
+    #[test]
+    fn the_daemon_opens_frames_only_for_a_helper_built_before_them() {
+        let older = RemoteActor::completed_failure_fixture();
+        let mut record = older.identity().record;
+        record.build = None;
+        assert!(!reads_current_frames(&record), "a record without a build");
+        record.build = Some(registry::BuildIdentity::current(Kind::Native));
+        assert!(!reads_current_frames(&record), "a build before the frames");
+        record
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
+        assert!(reads_current_frames(&record));
+        let seal = crate::agent_execution::mailbox::Seal::new([2; 32]);
+        older.open_frames_for_older_helper(&Arc::new(seal.recognizer()));
+        assert!(older.opens_frames_for_helper());
+
+        // What that helper shows reaches a window opened.
+        use crate::agent_execution::mailbox::{Message, Party, State};
+        use crate::model::{MessageId, TerminalId};
+        let sent = Message {
+            id: MessageId::new(),
+            from: Party {
+                lineage: None,
+                session: Some(TerminalId::new()),
+                title: Some("Spectra analysis".into()),
+            },
+            to: Party::user(),
+            reply_to: None,
+            body: "Which of these fit your plan?".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: 0,
+        };
+        let framed = seal.seal(&sent, 0);
+        let shown = Snapshot {
+            generation: 3,
+            items: vec![Arc::new(crate::chat::Item {
+                id: "prompt".into(),
+                role: crate::chat::Role::User,
+                content: crate::chat::ItemContent::Text {
+                    text: framed,
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            })],
+            ..Default::default()
+        };
+        *older.0.final_snapshot.lock().unwrap() = Some(Arc::new(shown));
+        let read = older.snapshot(None).unwrap();
+        assert!(matches!(
+            read.items[0].content,
+            crate::chat::ItemContent::Delivery { .. }
+        ));
+    }
+}

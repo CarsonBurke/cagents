@@ -1071,9 +1071,13 @@ impl Store {
         self.diagnostics.observe(&mut event);
         if let Some(seal) = &self.messages {
             match &mut event {
-                Event::Item(item) => seal.recognize(item),
+                Event::Item(item) => {
+                    seal.recognize(item);
+                }
                 Event::History { items, .. } | Event::LatestHistory { items, .. } => {
-                    items.iter_mut().for_each(|item| seal.recognize(item));
+                    items.iter_mut().for_each(|item| {
+                        seal.recognize(item);
+                    });
                 }
                 _ => {}
             }

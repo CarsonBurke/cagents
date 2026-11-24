@@ -183,6 +183,17 @@ impl Handle {
         RemoteActor::adopt_for_close(record, source, proof, notify)
             .map(|remote| Self(Owner::Remote(remote)))
     }
+    /// Lets the daemon open, with `recognizer`, the frames it sealed in what
+    /// a retained helper built before them shows as a person's prompts. A
+    /// conversation this process owns opens them itself.
+    pub(crate) fn open_frames_for_older_helper(
+        &self,
+        recognizer: &std::sync::Arc<crate::agent_execution::mailbox::Recognizer>,
+    ) {
+        if let Owner::Remote(remote) = &self.0 {
+            remote.open_frames_for_older_helper(recognizer);
+        }
+    }
     pub(crate) fn is_close_only(&self) -> bool {
         matches!(&self.0, Owner::Remote(remote) if remote.is_close_only())
     }

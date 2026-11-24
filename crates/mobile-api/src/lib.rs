@@ -621,6 +621,11 @@ pub enum ItemBody {
         delivery: DeliveryKind,
         /// The sender's name; may be empty.
         from: String,
+        /// What tells two senders of one name apart, never for display: a
+        /// message's sending session as its short ID, or a report's task ID.
+        /// Empty when there is none, and absent from older servers.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sender: String,
         summary: String,
         body: String,
         clipped: bool,
