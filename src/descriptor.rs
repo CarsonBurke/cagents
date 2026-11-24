@@ -140,7 +140,7 @@ pub(crate) fn connect(path: &std::path::Path) -> io::Result<UnixStream> {
 /// copies the setting from the listener to each connection as it queues, so
 /// it is in place before a fast peer can write, close, and leave the accepted
 /// stream refusing it.
-pub(crate) fn bind(path: impl AsRef<std::path::Path>) -> io::Result<UnixListener> {
+pub fn bind(path: impl AsRef<std::path::Path>) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     keep_options_after_shutdown(std::os::fd::AsFd::as_fd(&listener))?;
     Ok(listener)
@@ -150,7 +150,7 @@ pub(crate) fn bind(path: impl AsRef<std::path::Path>) -> io::Result<UnixListener
 /// inherits its listener's `O_NONBLOCK` across `accept`, which Linux never
 /// does, so the accepted stream is made blocking there. A listener from
 /// [`bind`] also hands it Linux's socket options after shutdown.
-pub(crate) fn accept(listener: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+pub fn accept(listener: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
     let (stream, address) = listener.accept()?;
     #[cfg(target_os = "macos")]
     stream.set_nonblocking(false)?;
