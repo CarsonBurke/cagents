@@ -36,6 +36,9 @@ restart the UI while your agents keep working.
   output. [Submit prompts and read structured results](docs/agent-execution.md)
   without an open window, or let sessions message one another. Use
   `cagents linear` to work with tickets from the command line.
+- **From your phone.** The [Android app](mobile/README.md) follows your agents
+  over SSH: see what needs you, read conversations as they stream, answer
+  approvals and questions, and send, steer or stop a turn.
 
 ## Install
 
@@ -106,6 +109,8 @@ options.
 - [Configuration](docs/configuration.md): settings and data locations
 - [Device windows](docs/devices.md): work on remote machines over SSH
 - [Agent execution](docs/agent-execution.md): hosted prompts, results, and messaging
+- [Android app](mobile/README.md): follow and steer agents from your phone
+- [Mobile API](docs/mobile-api.md): the protocol the phone app speaks
 - [Daemon and upgrades](docs/daemon.md): session ownership and upgrade behavior
 - [Development](docs/development.md): building, running, and testing
 - [Performance](docs/performance.md): workloads and reference results
