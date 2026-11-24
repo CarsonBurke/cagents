@@ -331,10 +331,20 @@ fn bounded_read(path: impl AsRef<Path>, limit: usize) -> Option<Vec<u8>> {
 }
 
 pub fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
-    let stat = std::str::from_utf8(stat).ok()?;
-    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let mut fields = process_stat_fields(stat)?;
     let group = fields.nth(2)?.parse().ok()?;
     Some((group, fields.nth(16)?.parse().ok()?))
+}
+
+pub(crate) fn process_stat_fields(stat: &[u8]) -> Option<std::str::SplitAsciiWhitespace<'_>> {
+    // The command name can contain arbitrary bytes. The fields after it
+    // contain the process identity.
+    let name_end = stat.iter().rposition(|&byte| byte == b')')?;
+    Some(
+        std::str::from_utf8(&stat[name_end + 1..])
+            .ok()?
+            .split_ascii_whitespace(),
+    )
 }
 
 /// Cheap liveness check for a previously discovered process. This is not launch
