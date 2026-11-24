@@ -1988,20 +1988,12 @@ impl State {
     }
 }
 
+/// Fixtures the application's tests share with this module's.
 #[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "the application's tests use its fixtures; its own tests compile only under cfg(test)"
-    )
-)]
 #[doc(hidden)]
-pub mod tests {
+pub mod test_support {
     use super::*;
-    use crate::github::ReviewDiffSide;
-    use crate::pull_request_review::tests::{entry, loaded, target};
+    use crate::pull_request_review::test_support::{entry, loaded, target};
 
     pub fn ready() -> State {
         let mut state = State::new(
@@ -2016,6 +2008,25 @@ pub mod tests {
         state.selected = Some(RepoPath::parse("file.rs").unwrap());
         state
     }
+
+    pub fn with_old_head_review(state: &mut State) {
+        let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+        next.context.pending = Some(crate::github::PendingReview {
+            id: "REVIEW_old".into(),
+            comment_count: 1,
+            commit_oid: Some("0".repeat(40)),
+        });
+        state.adopt(&next);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::github::ReviewDiffSide;
+    use crate::pull_request_review::test_support::{entry, loaded, target};
+
     fn anchor() -> Anchor {
         Anchor {
             path: "file.rs".into(),
@@ -2029,7 +2040,7 @@ pub mod tests {
     fn offline_cached_review_rejects_comment_actions_until_authority_refreshes() {
         use crate::pull_request_review::Action as ReviewAction;
 
-        let (mut state, _) = crate::pull_request_review::tests::state();
+        let (mut state, _) = crate::pull_request_review::test_support::state();
         drop(state.update(ReviewAction::Open(target(1))));
         state.cache_loading = true;
         drop(state.update(ReviewAction::Cached {
@@ -2064,7 +2075,7 @@ pub mod tests {
         }
         assert!(!state.can_mutate_discussion());
 
-        crate::pull_request_review::tests::finish_load(
+        crate::pull_request_review::test_support::finish_load(
             &mut state,
             loaded(vec![entry("src/main.rs", ChangeKind::Modified)], vec![]),
         );
@@ -2085,7 +2096,7 @@ pub mod tests {
         let drafts =
             serde_json::from_str(&serde_json::to_string(&drafted.local_drafts()).unwrap()).unwrap();
 
-        let (mut state, _) = crate::pull_request_review::tests::state();
+        let (mut state, _) = crate::pull_request_review::test_support::state();
         drop(state.update(ReviewAction::Open(target(1))));
         state.cache_loading = true;
         drop(state.update(ReviewAction::Cached {
@@ -2121,7 +2132,7 @@ pub mod tests {
         }
 
         // Once GitHub verifies the review, the kept draft can be posted.
-        crate::pull_request_review::tests::finish_load(
+        crate::pull_request_review::test_support::finish_load(
             &mut state,
             loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]),
         );
@@ -2143,7 +2154,7 @@ pub mod tests {
         let drafts =
             serde_json::from_str(&serde_json::to_string(&drafted.local_drafts()).unwrap()).unwrap();
 
-        let (mut state, _) = crate::pull_request_review::tests::state();
+        let (mut state, _) = crate::pull_request_review::test_support::state();
         drop(state.update(ReviewAction::Open(target(1))));
         state.cache_loading = true;
         drop(state.update(ReviewAction::Cached {
@@ -2892,16 +2903,6 @@ pub mod tests {
         assert_eq!(composer.content.text(), "Keep this draft");
         assert_eq!(composer.authority.context.head_oid, "c".repeat(40));
         assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 10));
-    }
-
-    pub fn with_old_head_review(state: &mut State) {
-        let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
-        next.context.pending = Some(crate::github::PendingReview {
-            id: "REVIEW_old".into(),
-            comment_count: 1,
-            commit_oid: Some("0".repeat(40)),
-        });
-        state.adopt(&next);
     }
 
     #[test]

@@ -198,18 +198,25 @@ pub(super) fn read_stop_choice_from(
 
 /// A single same-user census serves the entire stop list. A terminal's marker
 /// is inherited by its shell and jobs; never match another user's /proc data.
+#[derive(Clone, Default)]
 pub(super) struct TerminalProcesses {
     root: PathBuf,
     rows: BTreeMap<u32, ProcessRow>,
 }
 
+#[derive(Clone)]
 struct ProcessRow {
     stat: Stat,
     terminal: Option<TerminalId>,
 }
 
 impl TerminalProcesses {
-    pub(super) fn observe() -> Self {
+    /// Scans /proc only when there is a terminal to label: the scan reads
+    /// every process the user owns.
+    pub(super) fn observe(terminals: &[crate::terminal_ipc::TerminalDescriptor]) -> Self {
+        if terminals.is_empty() {
+            return Self::default();
+        }
         Self::at(Path::new("/proc"), crate::daemon::current_uid())
     }
 

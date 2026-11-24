@@ -5455,6 +5455,7 @@ pub enum Message {
     UpdateUi(update_ui::Action),
     UpdateResume(update_resume::Action),
     MovedPane(pane_follow::Action),
+    MissingCheckout(channel_ui::missing_checkout::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
     SidebarSelection(sidebar_selection_ui::Action),
@@ -17801,6 +17802,7 @@ impl Application for Cagents {
             self.daemon_health_banner(),
             self.update_resume_banner(),
             self.pane_follow_banner(),
+            self.missing_checkout_banner(),
             self.automation_approval_banner(),
             self.dictation_banner(),
             bar,
@@ -18359,7 +18361,13 @@ impl Cagents {
                 project_id,
                 generation,
                 result,
-            } => handled!(self.repository_loaded(open_cards, project_id, generation, result)),
+            } => {
+                let task = self.repository_loaded(open_cards, project_id, generation, result);
+                self.remember_worktree_branches(project_id);
+                // A strip whose project's rows were still loading waits for them.
+                self.adopt_strip_cards();
+                handled!(task)
+            }
             Message::AttachedWorktreePrsResolved {
                 project_id,
                 generation,
@@ -18718,6 +18726,7 @@ impl Cagents {
             Message::UpdateUi(action) => self.update_update_ui(action),
             Message::UpdateResume(action) => self.update_update_resume(action),
             Message::MovedPane(action) => self.update_pane_follow(action),
+            Message::MissingCheckout(action) => self.update_missing_checkout(action),
             Message::StartupWindowOpened(window) => {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();

@@ -115,7 +115,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .iter()
             .skip(1)
         {
-            if record.bare || !placement.starts_with(&record.path) {
+            // A worktree deleted without Git is still listed at its missing
+            // folder, which holds no checkout, and is the destination itself
+            // when that worktree is being made again where it was.
+            if record.bare
+                || !placement.starts_with(&record.path)
+                || matches!(std::fs::symlink_metadata(&record.path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
                 continue;
             }
             if checkout.as_ref().is_none_or(|current| {

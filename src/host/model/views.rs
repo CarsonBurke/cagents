@@ -258,6 +258,10 @@ fn project(db: &Connection, scope: &Scope) -> Result<PathBuf, String> {
     }
 }
 
+/// The refusal of a new pane in a worktree strip.
+pub(crate) const WORKTREE_VIEW_CLOSED: &str =
+    "A worktree's panes now open in its channel; open the worktree again to work there";
+
 /// Permanent transfer refusals are caller errors, distinct from storage
 /// failures. This same predicate runs before publication and inside the write
 /// transaction; a rejected edit never acknowledges an unchanged placement.
@@ -266,12 +270,23 @@ pub(super) fn refusal(
     scope: &Scope,
     change: &Change,
 ) -> Result<Option<String>, String> {
+    if let Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } = change {
+        // A worktree strip keeps the panes it holds until the startup repair
+        // moves them, but takes no new one: a worktree's work is in its
+        // checkout's channel.
+        return Ok((matches!(scope, Scope::Worktree { .. })
+            && !read(db, scope)?.panes.iter().any(|held| held.id == pane.id))
+        .then(|| WORKTREE_VIEW_CLOSED.into()));
+    }
     let Change::Transfer {
         id, destination, ..
     } = change
     else {
         return Ok(None);
     };
+    if matches!(destination, Scope::Worktree { .. }) {
+        return Ok(Some(WORKTREE_VIEW_CLOSED.into()));
+    }
     if !exists(db, scope)? {
         return Ok(Some("The source view is no longer open".into()));
     }
@@ -722,18 +737,20 @@ pub(super) fn apply_recorded(
                         view.apply(&Change::Remove { id: *id })?
                     }
                 }
-                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
-                    if resource_owner(transaction, pane)?.is_some() =>
-                {
-                    false
-                }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
-                    if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
-                        return Err(
-                            "pane already belongs to another view; use an atomic transfer".into(),
-                        );
+                    if let Some(reason) = refusal(transaction, scope, change)? {
+                        return Err(reason);
                     }
-                    view.apply(change)?
+                    if resource_owner(transaction, pane)?.is_some() {
+                        false
+                    } else {
+                        if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
+                            return Err("pane already belongs to another view; use an atomic \
+                                        transfer"
+                                .into());
+                        }
+                        view.apply(change)?
+                    }
                 }
                 Change::Update { before, pane }
                 | Change::UpdateTerminalSource { before, pane, .. } => {
@@ -1662,20 +1679,29 @@ mod tests {
             repository: "/repo".into(),
             path: "/repo/tree".into(),
         };
+        // A worktree's legacy strip hands its pane to a channel, the one way
+        // a pane crosses between them now.
         let p = pane();
-        seed(&mut r, a, vec![p.clone()]);
-        let transfer = edit(
-            &mut r,
-            a,
-            Change::Transfer {
+        r.apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![p.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+        seed(&mut r, a, vec![]);
+        let transfer = ModelEdit::ChangeView {
+            expected_revision: r.view_revision(&scope).unwrap(),
+            scope: scope.clone(),
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Transfer {
                 id: p.id,
-                destination: scope.clone(),
+                destination: Scope::Channel(a),
                 before: None,
             },
-        );
+        };
         r.apply(&transfer).unwrap();
-        assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
-        assert_eq!(read(&r.db, &scope).unwrap().panes, vec![p]);
+        assert!(read(&r.db, &scope).unwrap().panes.is_empty());
+        assert_eq!(read(&r.db, &Scope::Channel(a)).unwrap().panes, vec![p]);
         r.apply(&ModelEdit::CloseProject {
             repository: "/repo".into(),
         })
