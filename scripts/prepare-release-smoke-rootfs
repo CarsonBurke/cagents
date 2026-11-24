@@ -52,6 +52,24 @@ fi
 exec 9>"$CACHE/.lock"
 flock -n 9 || fail 'another preparation owns this cache'
 printf '%s\n' "$CACHE_ID" > "$CACHE/.cagents-release-smoke-cache"
+# A previous preparation can leave its scratch tree if it was killed. Every
+# writer uses this lock, and smoke runs only read the published rootfs.
+(
+    shopt -s nullglob dotglob
+    for leftover in "$CACHE"/prepare.??????; do
+        [[ ${leftover##*.} =~ ^[a-zA-Z0-9]{6}$ && -d $leftover && ! -L $leftover &&
+            $(stat -c '%u:%a' -- "$leftover") == "$CALLER_UID:700" ]] || continue
+        for entry in "$leftover"/*; do
+            [[ ! -L $entry ]] || continue 2
+            case ${entry##*/} in
+                rootfs) [[ -d $entry ]] || continue 2 ;;
+                ubuntu-base.tar.gz|resolv.conf|provision) [[ -f $entry ]] || continue 2 ;;
+                *) continue 2 ;;
+            esac
+        done
+        rm -rf --one-file-system -- "$leftover"
+    done
+)
 WORK=$(mktemp -d "$CACHE/prepare.XXXXXX")
 trap 'rm -rf -- "$WORK"' EXIT
 trap 'exit 1' HUP INT TERM

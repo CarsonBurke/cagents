@@ -21,6 +21,10 @@ SMOKE = ROOT / "scripts/smoke-release-artifacts"
 PREPARE = ROOT / "scripts/prepare-release-smoke-rootfs"
 ENTRYPOINT = ROOT / "packaging/smoke-release-artifact"
 VERSION = "1.2.3"
+SMOKE_CACHE_ID = (
+    "cagents-release-smoke-v4 ubuntu-24.04.3 amd64 "
+    "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9\n"
+)
 # Bounds only a hang; a passing wait returns as soon as its event arrives.
 HANG_GUARD = 60
 ARTIFACTS = (
@@ -254,17 +258,48 @@ class SmokeBoundary(unittest.TestCase):
     def test_preparation_respects_existing_cache_lock_before_fetching(self):
         cache = self.directory / "locked-cache"
         cache.mkdir(mode=0o700)
-        digest = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
-        (cache / ".cagents-release-smoke-cache").write_text(
-            f"cagents-release-smoke-v4 ubuntu-24.04.3 amd64 {digest}\n"
-        )
+        (cache / ".cagents-release-smoke-cache").write_text(SMOKE_CACHE_ID)
+        running = cache / "prepare.ABC123"
+        running.mkdir(mode=0o700)
+        partial = running / "ubuntu-base.tar.gz"
+        partial.write_text("partial download")
         with (cache / ".lock").open("w") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = self.invoke(PREPARE, ["--cache", str(cache)])
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("another preparation", result.stderr)
+            self.assertEqual(partial.read_text(), "partial download")
         self.assertEqual(self.recorded(), [])
         self.assertFalse(self.network_calls.exists())
+
+    def test_preparation_reclaims_only_abandoned_scratch_trees(self):
+        cache = self.directory / "interrupted-cache"
+        cache.mkdir(mode=0o700)
+        (cache / ".cagents-release-smoke-cache").write_text(SMOKE_CACHE_ID)
+        abandoned = cache / "prepare.ABC123"
+        abandoned.mkdir(mode=0o700)
+        (abandoned / "ubuntu-base.tar.gz").write_text("partial download")
+        (abandoned / "rootfs").mkdir()
+        (abandoned / "rootfs/fixture-link").symlink_to(self.base / "base-sentinel")
+        current = cache / "rootfs"
+        current.mkdir()
+        (current / "current-image").write_text("published image")
+        unknown = cache / "prepare.DEF456"
+        unknown.mkdir(mode=0o700)
+        (unknown / ".unrecognized").write_text("preserve me")
+        link = cache / "prepare.GHI789"
+        link.symlink_to(self.base, target_is_directory=True)
+
+        result = self.invoke(PREPARE, ["--cache", str(cache)])
+
+        # The test download stub terminates preparation after the sweep.
+        self.assertEqual(result.returncode, 99, result.stderr)
+        self.assertTrue(self.network_calls.exists())
+        self.assertFalse(abandoned.exists())
+        self.assertEqual((current / "current-image").read_text(), "published image")
+        self.assertEqual((unknown / ".unrecognized").read_text(), "preserve me")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((self.base / "base-sentinel").read_text(), "untouched\n")
 
 
 @unittest.skipUnless(
