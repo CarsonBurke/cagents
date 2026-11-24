@@ -1270,13 +1270,13 @@ class ShownUpdateOutcome(unittest.TestCase):
             if args[:2] == ("drive", "hover"):
                 pointer["x"] = int(args[2].split(",")[0])
             elif args[:2] == ("drive", "click"):
-                pointer["popover"] = True
+                pointer["popover"] = tooltips.get("opens", True)
             elif args[:2] == ("drive", "key"):
                 pointer["popover"] = False
             elif args[:2] == ("drive", "--json"):
                 text = tooltips.get(pointer["x"], shown or "Channels")
                 if pointer["popover"]:
-                    text = tooltips.get("popover", "")
+                    text = "Application notices " + tooltips.get("popover", "")
                 return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": text}]})
             return 0, ""
         rehearsal.call = call
@@ -1314,6 +1314,15 @@ class ShownUpdateOutcome(unittest.TestCase):
             rehearsal = self.rehearsal(Path(directory), {"phase": "Starting", "version": "2.0.0"}, {})
             self.assertIsNone(rehearsal.header_offers_update("2.0.0"))
             self.assertIn("would prove nothing", rehearsal.errors[0])
+
+    def test_a_notices_popover_that_does_not_open_is_an_unknown_outcome(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"},
+                                       {1136: "Application notices", "opens": False})
+            with patch.object(run.time, "sleep"):
+                rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertIn("main window could not be observed", rehearsal.errors[0])
 
     def test_a_window_never_observed_is_an_unknown_outcome(self):
         import rehearse_update_run as run

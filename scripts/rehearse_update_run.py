@@ -1178,10 +1178,19 @@ class Rehearsal:
             control = {'x': x, 'problem': problem, 'words': words}
             if problem.startswith('Application'):
                 self.call('drive', 'click', f'{x},{row}', timeout=30)
+                # Away from the control, its tooltip goes and only an open
+                # popover still shows the heading; it must open and then close.
+                self.call('drive', 'hover', '850,750', timeout=30)
                 opened = self.observe_window(window)
                 popover = ' '.join(run.get('text','') for run in (opened or {}).get('runs',[]))
                 control['popover'] = popover
                 self.call('drive', 'key', 'Escape', timeout=30)
+                closed = self.observe_window(window)
+                after = ' '.join(run.get('text','') for run in (closed or {}).get('runs',[]))
+                if (opened is None or closed is None or not visible_phrase(popover, 'Application notices')
+                        or visible_phrase(after, 'Application notices')):
+                    control['unread'] = True
+                    evidence['observed'] = False
                 control['problem'] = notices_problem(words, popover, self.update_version)
                 evidence['updated'] = evidence['updated'] or bool(shown_update_outcome(
                     {slot: {'runs': [{'text': popover}]}}, self.update_version)[1])
@@ -2194,7 +2203,9 @@ class Rehearsal:
                 # may record Failed for an update NEW's windows rightly accept.
                 _, self.shown_updated = self.watch_shown_update(args.new_version)
                 incomplete = update_completed(self.root,args.new_version)
-                known = [reason for reason in incomplete if args.feed and OLD_PROTOCOL_VERDICT.search(reason)]
+                status, _ = update_status(self.root)
+                known = [reason for reason in incomplete if args.feed and OLD_PROTOCOL_VERDICT.search(reason)
+                         and (status or {}).get('version') == args.new_version]
                 self.notes += [f'OLD\'s worker recorded (#3877): {reason}' for reason in known]
                 self.errors += [reason for reason in incomplete if reason not in known]
                 self.notes.append('a window confirmed "Updated to cagents '+args.new_version+'": '
