@@ -673,6 +673,17 @@ impl<'a> View<'a> {
                 "Agents waiting for you in this project's checkouts",
             ));
         }
+        // Its pull requests open as a pane listing them, from which any can be
+        // reviewed or checked out.
+        if project.kind == ProjectKind::Git && project.github_ready {
+            title.push(
+                icon_button(Icon::PullRequest, "Pull requests")
+                    .on_press_maybe(self.sidebar(SidebarAction::BrowsePullRequests {
+                        project_id: project.id,
+                    }))
+                    .into(),
+            );
+        }
         if project.kind == ProjectKind::Git {
             title.push(
                 icon_button(Icon::WorktreeAdd, "New worktree…")
