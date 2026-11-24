@@ -364,7 +364,10 @@ fn a_closed_card_back_in_memory_blocks_neither_an_update_nor_a_new_chat() {
             rule: crate::diagnostics::Check::new("a rule"),
         },
     );
-    assert!(identity.contains("Copy it into a new conversation"), "{identity}");
+    assert!(
+        identity.contains("Copy it into a new conversation"),
+        "{identity}"
+    );
     assert!(!identity.contains("Change the draft"), "{identity}");
     let window = app.draft_start_save_failure(
         fresh,
