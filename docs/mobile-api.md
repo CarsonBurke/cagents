@@ -45,6 +45,79 @@ Before the first line, a failure to start (no daemon could be started, or a
 refused environment) is written to standard error, and the command exits
 with a non-zero status without writing to standard output.
 
+## Pairing
+
+Rather than having the person copy the phone's key into `authorized_keys`, the
+desktop app can pair a phone: its status bar's phone control shows a pairing
+code as a QR code, and the person scans it with the app and confirms on the
+computer.
+
+The code is a URI:
+
+```text
+cagents-mobile://pair?v=1&name=workstation&user=person&port=22&hostkey=SHA256%3A…&host=workstation.tail1234.ts.net&host=100.101.102.103&host=192.168.1.20&key=…&expires=1800000300
+```
+
+The query is form-encoded (`application/x-www-form-urlencoded`), as Rust's
+`url` crate writes it: `+` stands for a space and `%2B` for a plus, so decode
+it as a form, not with plain percent-decoding. A `hostkey` such as
+`SHA256:ab+c/d` arrives as `SHA256%3Aab%2Bc%2Fd`. Parameters may come in any
+order; `host` keeps the order it is given in.
+
+| Parameter | Meaning |
+| --- | --- |
+| `v` | The code's format, `1`. A client refuses a version it doesn't know. |
+| `name` | The computer's host name, to show. |
+| `user`, `port` | The SSH login and port. |
+| `hostkey` | The SHA-256 fingerprint of the computer's Ed25519 host key, as `ssh-keygen -lf` prints it. Pin it for each `host`, rather than trusting a key on first use, and negotiate `ssh-ed25519` host keys so the fingerprint applies. The computer shows no code without it. |
+| `host` | Repeated: the addresses to try, in order. The Tailscale name and address come first, then local network addresses. Addresses where the computer's firewall (ufw) blocks SSH are left out. |
+| `key` | A one-time Ed25519 private key: its 32-byte seed, base64url without padding. |
+| `expires` | When the code stops working, in Unix seconds. |
+
+The one-time key is authorized until `expires`, with `restrict`, to run only
+`cagents daemon bridge --pair DIRECTORY`; sshd refuses it after its
+`expiry-time`, written in UTC, even if the computer never removes it. That
+needs OpenSSH 8.7 or later on the computer. Connect with it, and send one
+line:
+
+```json
+{"type":"pair","key":"ssh-ed25519 AAAA…","name":"Pixel 9"}
+```
+
+`key` is the phone's own public key, in OpenSSH form; only Ed25519 keys are
+accepted. `name` is how the computer will list the phone. Once the request is
+in front of the person, the computer answers:
+
+```json
+{"type":"pair_waiting"}
+```
+
+and then, when the person decides, one of these, and closes the connection.
+The code must be used before it expires; the person then has five more
+minutes to answer.
+
+```json
+{"type":"paired","host":"workstation"}
+{"type":"pair_declined"}
+{"type":"pair_error","message":"This pairing code has expired. Show a new one on the computer."}
+```
+
+`pair_error` may also come at once, instead of `pair_waiting`: an expired or
+already used code, or a request it couldn't read. While it waits, show the
+fingerprint of the phone's own key: the computer shows it beside the
+question, so the person can tell their phone's request from one sent by
+someone else who saw the code. Its message is written for
+the person. After `paired`, connect again with the phone's own key and run the
+bridge as described above: the computer has added
+
+```text
+command="…/current/bin/cagents daemon bridge --mobile",restrict ssh-ed25519 AAAA… Pixel 9
+```
+
+and removed the one-time key. Closing the connection before the answer
+withdraws the request. The definitions are in
+`cagents_mobile_api::pairing`.
+
 ## Framing
 
 Each message is one UTF-8 JSON object on one line, ending with `\n`. A client

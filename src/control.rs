@@ -480,8 +480,12 @@ pub enum DaemonCommand {
     #[command(hide = true)]
     Bridge {
         /// Serve the stable mobile API instead, as JSON lines (docs/mobile-api.md).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "pair")]
         mobile: bool,
+        /// Take one phone's pairing request for the pairing in this directory:
+        /// the forced command of a one-time pairing key (docs/mobile-api.md).
+        #[arg(long, value_name = "DIRECTORY")]
+        pair: Option<PathBuf>,
     },
     /// Start the daemon if it is not already running.
     Start,
@@ -4095,9 +4099,18 @@ where
         }
     }
     if let TopCommand::Daemon {
-        command: DaemonCommand::Bridge { mobile },
+        command: DaemonCommand::Bridge { mobile, pair },
     } = cli.command
     {
+        if let Some(directory) = pair {
+            return match crate::mobile::pairing::serve_pairing(&directory) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("cagents daemon bridge --pair: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         let served = if mobile {
             crate::mobile::serve_bridge()
         } else {

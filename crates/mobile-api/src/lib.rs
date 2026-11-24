@@ -31,6 +31,8 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 
 use serde::{Deserialize, Serialize};
 
+pub mod pairing;
+
 /// The newest API version this build speaks.
 pub const API_VERSION: u32 = 1;
 /// The oldest API version this build still serves.

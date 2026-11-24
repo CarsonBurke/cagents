@@ -25,6 +25,8 @@ mod owned;
 mod placeholder;
 mod popover;
 mod pull_request_state;
+mod qr_code;
+pub use qr_code::{QrMatrix, qr_code};
 mod reserved;
 mod responsive;
 mod shrinkable;
