@@ -75,9 +75,14 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
-- `release-metadata.json`: the version, source commit, daemon protocol,
+- `release-metadata-2.json`: the version, source commit, daemon protocol,
   release notes, and every other asset's size and SHA-256 (schema 2)
-- `release-metadata.json.sig`: its signature (see [Signing](#signing))
+- `release-metadata-2.json.sig`: its signature (see [Signing](#signing))
+- `release-metadata.json` and `release-metadata.json.sig`: what builds up to
+  0.2.3 read (see [Trust generations](#trust-generations))
+
+A bundle holds its metadata as `release-metadata.json` and its signature as
+`release-metadata.json.sig`; the publisher gives them their published names.
 
 Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
 supported build and package lane today. Windows and macOS need their own native
@@ -271,12 +276,60 @@ Prefer a security key: hosted agents run as the same user and can read a key
 file, but cannot touch a security key. Do not load a release key into a
 long-lived `ssh-agent`, which would sign for any process of the user.
 
-To replace a key, publish a release signed by the old key whose
-`release-keys.pub` lists the new one. To withdraw a compromised key, publish a
-release, signed by a remaining key, that no longer lists it. A build trusts
-exactly the keys it was built with, so builds that have not yet installed that
-release keep trusting the withdrawn key, and its holder can still sign updates
-for them until they do.
+`release-metadata.json.sig` may hold several signatures, one after another
+(at most four, nothing else). Builds from 0.2.4 on accept it when one is by a
+key they trust.
+
+### Trust generations
+
+Every release must be verifiable by every build that is offered it, or that
+build is stranded with no way to update. Releases therefore belong to trust
+generations, numbered by `GENERATION` in `src/update/feed.rs`. A build reads
+only its own generation's metadata name: `release-metadata.json` for
+generation 1 (up to 0.2.3, which also accepts only one signature),
+`release-metadata-2.json` for generation 2 (from 0.2.4), and so on.
+
+A release publishes its own metadata under its generation's name. Under each
+older generation's name it carries the metadata of the release that began the
+next generation, byte for byte. A build of an older generation is offered that
+release, installs it, and from there reaches the current one. Each step is
+signed with a key the build taking it already trusts. 0.2.4 begins generation
+2: every later release carries 0.2.4's metadata as `release-metadata.json`.
+Never delete a release that began a generation.
+
+`publish-release` refuses a release that would strand anyone. It counts the
+releases published on GitHub, read from their tags in the checkout;
+`--verify-only` counts every release tag in the tagged history.
+
+- Its signature must verify with the keys of its tagged source, and with those
+  of every earlier release tag of its generation.
+- A release that begins a generation must verify with the keys of every
+  release of the generation before. When that generation is 1, it must hold
+  exactly one signature.
+- A generation follows the one before it, never skipping one or going back.
+- The metadata it carries for older generations must be the one their
+  generation's successor published, signed as those builds read it. For
+  publication, it downloads them from GitHub and compares any `--bridge DIR`
+  copy. `--verify-only` reads them from `--bridge DIR`, which holds them under
+  their published names.
+
+`cagents upgrade VERSION` run on an older generation, for a version past its
+bridge, reads the bridge's metadata and refuses it; it updates to the bridge
+first. `release-metadata feed --generation G --bridge DIR` lays out a file
+feed the same way, for rehearsing the two-step update.
+
+Within a generation, every release must carry a signature by a key that
+every earlier release of the generation trusts. A key added partway through a
+generation is therefore only a co-signer: releases must still also be signed
+by an older key. A key is a sole signer only from the start of a generation,
+so the Actions key is listed from 0.2.4, the first release of generation 2.
+To drop a key,
+including a compromised one, begin a new generation: raise `GENERATION`, add
+its name to `GENERATIONS`, and remove the key from `release-keys.pub`. Sign
+that release with a key that every build of the current generation trusts,
+such as the security key, then sign later releases with the remaining keys.
+Builds that have not yet installed it still trust the dropped key, and its
+holder can sign updates for them until they do.
 
 A signature proves who made a release, not that it is the newest. Whoever can
 publish on GitHub can point `latest` at an older signed release: installed
