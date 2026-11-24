@@ -12286,6 +12286,18 @@ impl Cagents {
                     .unwrap_or_default();
                 format!("{LEAD} {reason}")
             }
+            // Storage would not move the pane to this conversation, as when
+            // it holds another identity for it. Storage refuses that by rule
+            // (never `Conflict`, which the writer retries itself), so neither
+            // an edit of the draft nor Send or Retry save repairs it: each
+            // offers storage the same move from the same identity. A new chat
+            // starts from no identity at all, so nothing is moved. The
+            // remedy comes first: the notice shows its first lines only.
+            // The storage rule and category stay in the log: "saved state is
+            // invalid" would suggest the reader's data is damaged.
+            PaneSaveRefusal::Identity { .. } => format!(
+                "{LEAD} Copy it into a new conversation and send it there. Storage won't let this pane start one, so sending here fails again."
+            ),
             PaneSaveRefusal::Refused { pane, category, .. } => {
                 let label = category.label();
                 match pane {
@@ -12293,14 +12305,10 @@ impl Cagents {
                         "{LEAD} Storage refused this pane's changes ({label}). Change the draft or its options, then send again."
                     ),
                     Some(pane) => {
-                        let what = self
-                            .card_state(*pane)
-                            .map(|state| self.card_display_title(state))
-                            .filter(|title| !title.is_empty())
-                            .map_or_else(
-                                || "another pane".to_owned(),
-                                |title| format!("the pane \u{201c}{title}\u{201d}"),
-                            );
+                        let what = self.pane_notice_title(*pane).map_or_else(
+                            || "another pane".to_owned(),
+                            |title| format!("the pane \u{201c}{title}\u{201d}"),
+                        );
                         format!(
                             "{LEAD} Storage refused changes to {what} ({label}). Close or change {what}, then send again."
                         )
