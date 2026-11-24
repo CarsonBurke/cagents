@@ -101,7 +101,11 @@ echo "$root" >> "$FIXTURE/rehearse-roots.log"
 case $command in
     cleanup) rm -rf "$root" ;;
     run)
-        feed=; while (($#)); do [[ $1 == --feed ]] && feed=$2; shift; done
+        feed=; while (($#)); do
+            [[ $1 == --feed ]] && feed=$2
+            [[ $1 != --new-dir ]] || cat "$2"/cagents-*.tar.gz > "$FIXTURE/rehearsed-archive"
+            shift
+        done
         [[ -z $feed ]] || ls "$feed/download" | sed "s|^|feed $feed offers |" >> "$FIXTURE/rehearse-feed.log"
         mkdir -p "$root/home/.local/share/cagents-install/.update"
         outcome=$(cat "$FIXTURE/rehearse-outcome" 2>/dev/null || echo PASS)
@@ -401,13 +405,18 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(run, f"{harness}/scripts/rehearse-update run --old-dir {old} --old-version 0.2.3 "
                               f"--old-installer {old}/install.sh --new-dir {new} --new-version 0.2.4 "
                               f"--new-installer {new}/install.sh --answer yes --ended-provider "
-                              f"--feed {feed} --empty-window")
+                              f"--feed {feed} --empty-window --restart-after-update")
         # The feed the published build read offered the signed cut; it goes once the rehearsal passes.
         self.assertIn(f"feed {feed} offers v0.2.4", self.log("rehearse-feed.log"))
         self.assertFalse(feed.exists())
-        # The cut's own bytes, not the host's store.
-        self.assertEqual((new / f"cagents-0.2.4-{TARGET}.tar.gz").read_bytes(),
+        # The cut's own bytes, not the host's store; its copy and the
+        # incoming copy go once it passes, and the report stays as evidence.
+        self.assertEqual((self.root / "rehearsed-archive").read_bytes(),
                          (self.root / f"bundles/0.2.4/cagents-0.2.4-{TARGET}.tar.gz").read_bytes())
+        self.assertFalse(new.exists())
+        cache = self.host / ".cache/cagents-release-rehearsal"
+        self.assertEqual(sorted(path.name for path in cache.iterdir()), ["0.2.3", "lock", "passed-0.2.4.txt"])
+        self.assertIn("Outcome: PASS", (cache / "passed-0.2.4.txt").read_text())
         self.assertFalse((self.root / "cr").exists())
         self.assertFalse(harness.exists())
         # The published release is fetched once and kept.
@@ -418,6 +427,9 @@ class ReleaseCut(unittest.TestCase):
     def test_the_default_root_and_a_harness_at_another_commit(self):
         self.cut_signed()
         self.env.pop("CAGENTS_RELEASE_REHEARSAL_ROOT")
+        # Never the real /var/tmp/cr, which a rehearsal on this host may hold.
+        parent = self.root / "parents/cr"
+        self.env["CAGENTS_RELEASE_REHEARSAL_PARENTS"] = str(parent)
         # A stray directory where the harness goes, which Git must not walk out of.
         stray = self.host / "repo/.worktrees/.rehearse-release"
         stray.mkdir(parents=True)
@@ -425,10 +437,9 @@ class ReleaseCut(unittest.TestCase):
         (self.root / "rehearse-outcome").write_text("FAIL\n")
         result = self.release("rehearse", "0.2.4")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("in /var/tmp/cr/release-0.2.4", result.stderr)
+        self.assertIn(f"in {parent}/release-0.2.4", result.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=stray), self.fix)
         self.assertFalse((stray / "leftover").exists())
-        self.addCleanup(shutil.rmtree, "/var/tmp/cr/release-0.2.4", True)
 
     def test_an_earlier_failed_rehearsal_is_replaced(self):
         self.cut_signed()
@@ -455,6 +466,7 @@ class ReleaseCut(unittest.TestCase):
                 result = self.release("rehearse", "0.2.4", *mode)
                 self.assertNotEqual(result.returncode, 0, mode)
                 self.assertIn(f"Update status: {shown}\n", result.stdout)
+                self.assertIn(f"the update ended {shown}, not Complete", result.stderr)
                 self.assertIn(f"in {self.root / 'cr'}", result.stderr)
                 self.assertTrue((self.root / "cr/report.txt").exists())
 
@@ -497,6 +509,14 @@ class ReleaseCut(unittest.TestCase):
         result = self.release("rehearse", "0.2.4")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT", result.stderr)
+
+    def test_a_root_the_hosts_shell_would_reparse_is_refused(self):
+        self.cut_signed()
+        self.env["CAGENTS_RELEASE_REHEARSAL_ROOT"] = str(self.root / "my rehearsal")
+        result = self.release("rehearse", "0.2.4")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("may hold only letters", result.stderr)
+        self.assertFalse((self.root / "rehearse.log").exists())
 
     def test_a_staged_rehearsal_needs_no_signature_and_runs_the_cuts_upgrade(self):
         self.bundle(self.fix)

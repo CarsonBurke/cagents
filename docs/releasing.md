@@ -178,7 +178,12 @@ steps, each through `mise run release` (`scripts/release --help`):
      updates;
    - it requires every pane, chat, agent and terminal to survive, NEW to
      serve, the windows to reopen on NEW, and no reopened window to show
-     "Update failed" or "Update not installed".
+     "Update failed" or "Update not installed";
+   - then, as after a reboot, it closes the windows, stops NEW's daemon and
+     reopens them, and requires the same again.
+
+   It takes about 12 minutes, plus the published release's download the
+   first time. Interrupting it stops the run on the host too.
 
    Either way the update must end `Complete` with no refusal. A reopened
    window reports anything else as "Update failed" or "Update not installed",
@@ -190,7 +195,8 @@ steps, each through `mise run release` (`scripts/release --help`):
    The rehearsal's private user goes in `/var/tmp/cr/release-VERSION` on the
    host. If `/var/tmp` has a `.git` above it, such as the empty mountpoints
    a sandbox masking `.git` leaves behind, it goes in `/dev/shm/cr` instead.
-   It takes about 700 MB and is removed once the rehearsal passes. If a
+   It takes about 700 MB and is removed once the rehearsal passes; the
+   report is kept in `~/.cache/cagents-release-rehearsal/passed-VERSION.txt`. If a
    `.git` appears above the root while the rehearsal runs, a failure says
    so instead of reporting it as a regression, and you rehearse again. A
    rehearsal that fails in `/var/tmp` keeps its report, records and
