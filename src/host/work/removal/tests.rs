@@ -1,8 +1,9 @@
 use super::*;
 use crate::{
     model::ProjectKind,
+    terminal_ipc::ServerMessage,
     work::{Removal, Request, Response},
-    workspace_model::ModelEdit,
+    workspace_model::{ModelEdit, delta::ViewRevision, views},
     worktree_content::Verdict,
 };
 use std::{os::unix::fs::PermissionsExt, process::Command, sync::Arc};
@@ -325,6 +326,27 @@ fn a_landed_worktree_goes_with_its_branch() {
     };
     let fixture = Fixture::new(&root);
     let landed = fixture.repository.join(".worktrees/landed");
+    let scope = views::Scope::Worktree {
+        repository: fixture.repository.clone(),
+        path: landed.clone(),
+    };
+    let registry = agent_execution::registry(&fixture.host).unwrap();
+    let seeded = registry
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: Vec::new(),
+            closed: Vec::new(),
+        })
+        .unwrap();
+    let revision = seeded.effects.views[0].after.unwrap();
+    let watcher = {
+        let mut host = fixture.host.lock().unwrap();
+        let delivery = host.register_client(1);
+        host.subscribe_model(1);
+        delivery
+    };
     // A packed branch below a ref directory has no loose directory to lock.
     git(&landed, &["branch", "-m", "team/landed"]);
     git(&fixture.repository, &["pack-refs", "--all"]);
@@ -346,6 +368,10 @@ fn a_landed_worktree_goes_with_its_branch() {
         .remove("team/landed", &token, Keep::Nothing, true)
         .unwrap_err();
     assert_eq!(error, CHANGED);
+    assert_eq!(
+        registry.lock().unwrap().view_revision(&scope).unwrap(),
+        revision
+    );
     std::fs::remove_file(landed.join("late")).unwrap();
 
     let removed = fixture
@@ -355,6 +381,32 @@ fn a_landed_worktree_goes_with_its_branch() {
     assert_eq!(removed.branch_error, None);
     assert!(removed.snapshot.is_none());
     assert!(!landed.exists());
+    let sequence = seeded.sequence + 1;
+    assert_eq!(
+        registry.lock().unwrap().view_snapshot(&scope).unwrap(),
+        (None, sequence),
+    );
+    watcher.close_after_drain();
+    let ServerMessage::WorkspaceModelEdited {
+        sequence: announced,
+        effects,
+        ..
+    } = watcher
+        .pop()
+        .expect("compacted view was not announced")
+        .message
+    else {
+        panic!("expected a workspace model edit");
+    };
+    assert_eq!(announced, sequence);
+    assert_eq!(
+        effects.views,
+        [ViewRevision {
+            scope,
+            before: Some(revision),
+            after: None,
+        }],
+    );
     assert!(
         git(&fixture.repository, &["for-each-ref", "refs/heads/team/"]).is_empty(),
         "the branch is deleted"

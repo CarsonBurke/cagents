@@ -4,7 +4,7 @@
 //! content is still what the accepted plan judged.
 use std::path::{Path, PathBuf};
 
-use super::{Handle, SharedHost};
+use super::{Handle, SharedHost, agent_execution};
 use crate::{
     repository::CancellationToken,
     work::{Item, Keep, Removal, RemovalPlan, Removed, SavedSnapshot, Scope},
@@ -110,6 +110,9 @@ impl Handle {
                 ),
                 None => error,
             });
+        }
+        if let Err(error) = compact_removed_view(host, &subject.item.project, &request.path) {
+            tracing::warn!(%error, path = %request.path.display(), "the removed worktree's view was not compacted");
         }
         drop(reservation);
         let mut removed = Removed {
@@ -238,6 +241,18 @@ impl Handle {
             .map(drop)
             .map_err(|error| format!("Fetching failed: {}", error.reported_detail()))
     }
+}
+
+fn compact_removed_view(host: &SharedHost, repository: &Path, path: &Path) -> Result<(), String> {
+    // Rechecking Git registration must leave the execution connection free.
+    let connection = agent_execution::registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_connection()?;
+    if let Some((sequence, effects)) = connection.compact_worktree_view(repository, path)? {
+        super::super::announce_compacted_views(host, sequence, &effects);
+    }
+    Ok(())
 }
 
 impl Subject {

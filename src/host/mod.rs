@@ -346,7 +346,6 @@ fn collect_runtime_directory(
         Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
         Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
     }
-    drop(host);
     // Its own connection, so a batch never waits on or holds the host lock.
     if let Some(model) = model {
         match service::attempt("pane change collection", || model.collect_view_operations()) {
@@ -354,7 +353,35 @@ fn collect_runtime_directory(
             Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
             Err(error) => tracing::warn!(%error, "applied pane changes were not collected"),
         }
+        match service::attempt("worktree view compaction", || {
+            model.compact_worktree_views()
+        }) {
+            Ok(Some((sequence, effects))) => {
+                announce_compacted_views(&host, sequence, &effects);
+                tracing::info!(
+                    rows = effects.views.len(),
+                    "compacted empty views of missing worktrees"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "worktree view compaction did not finish"),
+        }
     }
+}
+
+fn announce_compacted_views(
+    host: &SharedHost,
+    sequence: u64,
+    effects: &crate::workspace_model::delta::EditEffects,
+) {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .announce_model_edit(
+            agent_execution::EXECUTION_CLIENT,
+            sequence,
+            &crate::workspace_model::ModelEdit::AgentsChanged,
+            effects,
+        );
 }
 
 /// Reserve and configure the serving socket before restore can take ownership
@@ -663,7 +690,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             .and_then(|connection| match connection {
                 Ok(connection) => Some(connection),
                 Err(error) => {
-                    tracing::warn!(%error, "applied pane changes will not be collected");
+                    tracing::warn!(%error, "workspace view maintenance will not run periodically");
                     None
                 }
             });
