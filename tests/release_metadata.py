@@ -153,8 +153,12 @@ class ReleaseMetadata(unittest.TestCase):
         feed = self.root / "feed"
         self.assertIn("now offers 1.2.3", run("feed", "--dir", str(self.release), "--feed", str(feed)).stdout)
         latest = feed / "latest/download"
-        self.assertEqual((latest / "release-metadata.json").read_bytes(),
-                         (self.release / "release-metadata.json").read_bytes())
+        for name in ("release-metadata.json", "release-metadata-2.json"):
+            self.assertEqual((latest / name).read_bytes(),
+                             (self.release / "release-metadata.json").read_bytes())
+            self.assertEqual((feed / "download/v1.2.3" / name).read_bytes(),
+                             (self.release / "release-metadata.json").read_bytes())
+        self.assertEqual((latest / "release-metadata-2.json.sig").read_text(), "signature")
         self.assertEqual((feed / "download/v1.2.3" / ARCHIVE).read_bytes(), b"archive")
         self.assertIn("never replaces", run("feed", "--dir", str(self.release), "--feed", str(feed),
                                             check=False).stderr)
@@ -169,6 +173,29 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertIn("now offers 1.2.3", run("feed", "--dir", str(older), "--feed", str(feed)).stdout)
         self.assertEqual(json.loads((latest / "release-metadata.json").read_bytes())["version"], VERSION)
         self.assertTrue((feed / "download/v1.2.0" / old_archive).is_file())
+
+    def test_feed_after_the_bridge_release_keeps_its_metadata_under_the_old_names(self):
+        bridge = self.root / "bridge"
+        bridge.mkdir()
+        bridge_archive = ARCHIVE.replace(VERSION, "1.2.0")
+        for name in (bridge_archive, "install.sh", "SHA256SUMS"):
+            (bridge / name).write_bytes(b"bridge")
+        run("write", "--dir", str(bridge), "--version", "1.2.0", "--source-commit", COMMIT, "--protocol", "190")
+        (bridge / "release-metadata.json.sig").write_text("old key")
+        self.write()
+        (self.release / "release-metadata.json.sig").write_text("new key")
+        feed = self.root / "feed"
+        run("feed", "--dir", str(self.release), "--feed", str(feed), "--bridge", str(bridge))
+        for directory in (feed / "latest/download", feed / "download/v1.2.3"):
+            self.assertEqual(json.loads((directory / "release-metadata-2.json").read_bytes())["version"], VERSION)
+            self.assertEqual((directory / "release-metadata-2.json.sig").read_text(), "new key")
+            self.assertEqual((directory / "release-metadata.json").read_bytes(),
+                             (bridge / "release-metadata.json").read_bytes())
+            self.assertEqual((directory / "release-metadata.json.sig").read_text(), "old key")
+        # A bridge is always older than the release that carries it.
+        result = run("feed", "--dir", str(bridge), "--feed", str(self.root / "other"),
+                     "--bridge", str(self.release), check=False)
+        self.assertIn("not older than", result.stderr)
 
     def test_feed_refuses_unsigned_metadata(self):
         self.write()

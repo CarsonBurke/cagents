@@ -7,6 +7,10 @@ cagents-release`). The metadata names every other file of the release with
 its size and SHA-256, so the signature covers them all, the installer
 included. See docs/releasing.md#signing.
 
+A bundle holds them under those names. Published, they are
+`release-metadata-2.json` and its signature, which builds from 0.2.4 on read;
+the old names carry what builds up to 0.2.3 read (see BRIDGE_VERSION).
+
   write --dir DIR --version V --source-commit SHA --protocol N [--notes FILE]
         write DIR/release-metadata.json for the files in DIR
   check --dir DIR [--version V] [--source-commit SHA]
@@ -15,9 +19,12 @@ included. See docs/releasing.md#signing.
   notes --repository PATH --to REF [--from TAG]
         print release notes from the Conventional Commit subjects in FROM..TO:
         features and fixes, with their pull request numbers
-  feed --dir DIR --feed FEED
+  feed --dir DIR --feed FEED [--bridge BRIDGE]
         lay out DIR as a file feed: FEED/download/vV/* and, when V is the
-        newest there, FEED/latest/download/* (copies; DIR is unchanged)
+        newest there, FEED/latest/download/* (copies; DIR is unchanged). The
+        metadata appears under both published names; with BRIDGE, a signed
+        bundle of an older release, its metadata takes the old names, as a
+        published release after the bridge release carries it
 """
 
 import argparse
@@ -36,6 +43,14 @@ REPOSITORY = "CarsonBurke/cagents"
 TARGET = "x86_64-unknown-linux-gnu"
 METADATA = "release-metadata.json"
 SIGNATURE = "release-metadata.json.sig"
+# The published names of a release's own metadata, read by builds from 0.2.4
+# on. Releases after 0.2.4 carry 0.2.4's signed metadata under the old names,
+# the only ones 0.2.3 reads, so a 0.2.3 build, which trusts only the key 0.2.4
+# is signed with, updates to 0.2.4 and from there to the newest release.
+GENERATION_2_METADATA = "release-metadata-2.json"
+GENERATION_2_SIGNATURE = "release-metadata-2.json.sig"
+BRIDGE_VERSION = "0.2.4"
+METADATA_NAMES = (METADATA, SIGNATURE, GENERATION_2_METADATA, GENERATION_2_SIGNATURE)
 VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 NAME = re.compile(r"^[-A-Za-z0-9_.]+$")
@@ -63,7 +78,7 @@ def payloads(directory: Path) -> list[Path]:
     """Every file of the release other than its metadata and signature."""
     found = []
     for path in sorted(directory.iterdir()):
-        if path.name in (METADATA, SIGNATURE):
+        if path.name in METADATA_NAMES:
             continue
         if path.is_symlink() or not path.is_file() or not NAME.match(path.name):
             raise Refused(f"release file is not a plainly named regular file: {path.name}")
@@ -181,12 +196,21 @@ def notes(repository: Path, start: str | None, end: str) -> str:
     return "\n".join(lines).strip() + "\n" if lines else ""
 
 
-def feed(directory: Path, destination: Path) -> None:
+def feed(directory: Path, destination: Path, bridge: Path | None) -> None:
     metadata = json.loads((directory / METADATA).read_bytes())
     check(directory, None, None)
     if not (directory / SIGNATURE).is_file():
         raise Refused(f"{SIGNATURE} is missing; sign the metadata first")
     version = metadata["version"]
+    # The old names: this release's own metadata, or the bridge release's.
+    legacy = (directory / METADATA, directory / SIGNATURE)
+    if bridge is not None:
+        bridged = json.loads((bridge / METADATA).read_bytes())["version"]
+        if not (bridge / SIGNATURE).is_file():
+            raise Refused(f"the bridge has no {SIGNATURE}")
+        if version_key(bridged) >= version_key(version):
+            raise Refused(f"the bridge release {bridged} is not older than {version}")
+        legacy = (bridge / METADATA, bridge / SIGNATURE)
     downloads = destination / "download"
     release = downloads / f"v{version}"
     if release.exists():
@@ -194,8 +218,16 @@ def feed(directory: Path, destination: Path) -> None:
     downloads.mkdir(parents=True, exist_ok=True)
     # Each directory appears whole, so a reader never sees half a release.
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=downloads))
-    for path in [*payloads(directory), directory / METADATA, directory / SIGNATURE]:
+    for path in payloads(directory):
         shutil.copyfile(path, staging / path.name)
+    published_names = {
+        GENERATION_2_METADATA: directory / METADATA,
+        GENERATION_2_SIGNATURE: directory / SIGNATURE,
+        METADATA: legacy[0],
+        SIGNATURE: legacy[1],
+    }
+    for name, path in published_names.items():
+        shutil.copyfile(path, staging / name)
     staging.chmod(0o755)
     staging.rename(release)
     published = sorted(
@@ -207,7 +239,7 @@ def feed(directory: Path, destination: Path) -> None:
         latest = destination / "latest"
         latest.mkdir(exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=latest))
-        for name in (METADATA, SIGNATURE):
+        for name in METADATA_NAMES:
             shutil.copyfile(release / name, staging / name)
         staging.chmod(0o755)
         previous = latest / "download"
@@ -241,6 +273,7 @@ def main() -> int:
     feed_parser = commands.add_parser("feed")
     feed_parser.add_argument("--dir", type=Path, required=True)
     feed_parser.add_argument("--feed", type=Path, required=True)
+    feed_parser.add_argument("--bridge", type=Path)
     arguments = parser.parse_args()
     try:
         if arguments.command == "write":
@@ -256,7 +289,7 @@ def main() -> int:
         elif arguments.command == "notes":
             sys.stdout.write(notes(arguments.repository, arguments.start, arguments.to))
         else:
-            feed(arguments.dir, arguments.feed)
+            feed(arguments.dir, arguments.feed, arguments.bridge)
     except Refused as error:
         print(f"release-metadata: {error}", file=sys.stderr)
         return 1

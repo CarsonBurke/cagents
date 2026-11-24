@@ -75,9 +75,14 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
-- `release-metadata.json`: the version, source commit, daemon protocol,
+- `release-metadata-2.json`: the version, source commit, daemon protocol,
   release notes, and every other asset's size and SHA-256 (schema 2)
-- `release-metadata.json.sig`: its signature (see [Signing](#signing))
+- `release-metadata-2.json.sig`: its signature (see [Signing](#signing))
+- `release-metadata.json` and `release-metadata.json.sig`: what builds up to
+  0.2.3 read (see [The 0.2.4 bridge](#the-024-bridge))
+
+A bundle holds its metadata as `release-metadata.json` and its signature as
+`release-metadata.json.sig`; the publisher gives them their published names.
 
 Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
 supported build and package lane today. Windows and macOS need their own native
@@ -230,12 +235,37 @@ Prefer a security key: hosted agents run as the same user and can read a key
 file, but cannot touch a security key. Do not load a release key into a
 long-lived `ssh-agent`, which would sign for any process of the user.
 
+`release-metadata.json.sig` may hold several signatures, one after another
+(at most four, nothing else), as when a release is signed by an outgoing and an
+incoming key. Builds from 0.2.4 on accept it when one is by a key they trust;
+`publish-release` checks the signatures against the tagged source's keys and
+the previous release's the same way.
+
 To replace a key, publish a release signed by the old key whose
-`release-keys.pub` lists the new one. To withdraw a compromised key, publish a
+`release-keys.pub` lists the new one. To replace it without stranding builds
+that have not installed that release yet, sign the following releases with
+both keys until those builds are expected to have updated. To withdraw a compromised key, publish a
 release, signed by a remaining key, that no longer lists it. A build trusts
 exactly the keys it was built with, so builds that have not yet installed that
 release keep trusting the withdrawn key, and its holder can still sign updates
 for them until they do.
+
+### The 0.2.4 bridge
+
+Builds up to 0.2.3 read only `release-metadata.json`, accept exactly one
+signature, and trust only the security key. Builds from 0.2.4 on read
+`release-metadata-2.json`, and fall back to `release-metadata.json` for a
+release from before it. 0.2.4 publishes its metadata under both names, signed
+once by the security key. Every later release carries, under the old names,
+0.2.4's own metadata and signature byte for byte, so a 0.2.3 build is offered
+0.2.4, installs it from `download/v0.2.4/`, and from there finds the current
+release, whatever key 0.2.3 lacks signs it. Never delete the 0.2.4 release.
+`publish-release` downloads its metadata (or reads it from `--bridge DIR`,
+which `--verify-only` requires for a later release) and checks that it is
+0.2.4's, signed once by a key 0.2.3 trusts. `cagents upgrade VERSION` run on
+0.2.3 for a version after 0.2.4 reads the bridge metadata and refuses it; it
+updates to 0.2.4 first. `release-metadata feed --bridge DIR` lays out a file
+feed the same way, for rehearsing the two-step update.
 
 A signature proves who made a release, not that it is the newest. Whoever can
 publish on GitHub can point `latest` at an older signed release: installed

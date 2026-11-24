@@ -6,6 +6,10 @@
 //! Plain `ssh-ed25519` keys and `sk-ssh-ed25519@openssh.com` security keys are
 //! accepted. A security-key signature must assert that a person touched the
 //! key.
+//!
+//! A signature file may hold several signatures, one after another, so that a
+//! release can be signed by an outgoing and an incoming key while installed
+//! builds still trust only one of them. One by a trusted key is enough.
 use super::{UpdateError, invalid};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -71,13 +75,51 @@ pub(crate) fn rehearsal_build() -> bool {
     option_env!("CAGENTS_UPDATE_REHEARSAL_KEYS").is_some_and(|keys| !keys.trim().is_empty())
 }
 
-/// Accepts `message` only when `armored` is a `cagents-release` signature of
-/// it by one of `trusted`.
+/// At most this many signatures in one file: an overlap of keys needs two.
+const MAX_SIGNATURES: usize = 4;
+
+/// Accepts `message` only when `armored` holds a `cagents-release` signature
+/// of it by one of `trusted`. Its other signatures, as by a key this build
+/// does not know yet, are not needed. When none is, the first one's reason
+/// says why.
 pub(crate) fn verify(
     message: &[u8],
     armored: &str,
     trusted: &[TrustedKey],
 ) -> Result<(), UpdateError> {
+    let blocks = split_armor(armored)?;
+    let mut refusal = None;
+    for block in blocks {
+        match verify_one(message, block, trusted) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                refusal.get_or_insert(error);
+            }
+        }
+    }
+    Err(refusal.unwrap_or_else(malformed))
+}
+
+/// The armored signatures in `armored`, in order. Text between or around
+/// them is refused, so a file is exactly a sequence of signatures.
+fn split_armor(armored: &str) -> Result<Vec<&str>, UpdateError> {
+    let mut blocks = Vec::new();
+    let mut rest = armored.trim();
+    while !rest.is_empty() {
+        let end = rest.find(ARMOR_END).ok_or_else(malformed)? + ARMOR_END.len();
+        if blocks.len() == MAX_SIGNATURES {
+            return Err(invalid("the release signature holds too many signatures"));
+        }
+        blocks.push(&rest[..end]);
+        rest = rest[end..].trim_start();
+    }
+    if blocks.is_empty() {
+        return Err(malformed());
+    }
+    Ok(blocks)
+}
+
+fn verify_one(message: &[u8], armored: &str, trusted: &[TrustedKey]) -> Result<(), UpdateError> {
     let blob = dearmor(armored)?;
     let mut wire = Wire(&blob);
     if wire.take(MAGIC.len())? != MAGIC || wire.u32()? != VERSION {
@@ -295,6 +337,50 @@ C3NzaC1lZDI1NTE5AAAAQN78ij9Uzlbw0snfB4xB3nG/5JxHYL+AGf36GrJFJIbn9j7/wU
         let damaged = OPENSSH_SIGNATURE.replace("QN78", "QN79");
         assert!(verify(OPENSSH_MESSAGE, &damaged, &key()).is_err());
         assert!(verify(OPENSSH_MESSAGE, "not a signature", &key()).is_err());
+    }
+
+    #[test]
+    fn one_trusted_signature_among_several_is_enough() {
+        let outgoing = SigningKey::from_bytes(&[11; 32]);
+        let incoming = SigningKey::from_bytes(&[12; 32]);
+        let message = b"metadata";
+        let both = format!(
+            "{}{}",
+            sign(&outgoing, message, NAMESPACE),
+            sign(&incoming, message, NAMESPACE)
+        );
+        for signer in [&outgoing, &incoming] {
+            verify(message, &both, &[TrustedKey(ed25519_blob(signer))]).unwrap();
+        }
+        let stranger = TrustedKey(ed25519_blob(&SigningKey::from_bytes(&[13; 32])));
+        assert!(
+            verify(message, &both, &[stranger])
+                .unwrap_err()
+                .to_string()
+                .contains("does not trust")
+        );
+        // A damaged or foreign block beside a good one does not matter; the
+        // good one is what is trusted.
+        let trusted = [TrustedKey(ed25519_blob(&incoming))];
+        let damaged = sign(&outgoing, b"other", NAMESPACE);
+        verify(
+            message,
+            &format!("{damaged}\n{}", sign(&incoming, message, NAMESPACE)),
+            &trusted,
+        )
+        .unwrap();
+        // Only signatures: no other text, and not too many of them.
+        let good = sign(&incoming, message, NAMESPACE);
+        assert!(verify(message, &format!("{good}trailing text"), &trusted).is_err());
+        assert!(verify(message, &format!("{good}{}", &good[..40]), &trusted).is_err());
+        assert!(verify(message, &good.repeat(MAX_SIGNATURES), &trusted).is_ok());
+        assert!(
+            verify(message, &good.repeat(MAX_SIGNATURES + 1), &trusted)
+                .unwrap_err()
+                .to_string()
+                .contains("too many")
+        );
+        assert!(verify(message, "", &trusted).is_err());
     }
 
     #[test]
