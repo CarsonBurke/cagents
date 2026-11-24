@@ -3580,10 +3580,18 @@ mod tests {
             }
             let child = Self(command.spawn().unwrap());
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            // A window publishes its owner just after it takes the lease, and
+            // Darwin, with no kernel lock index, proves the owner from that.
+            let published = || {
+                File::open(runtime.join(slot_lock_name(slot))).is_ok_and(|lease| {
+                    daemon_admission::recorded_owner(&lease) == Some(child.0.id())
+                })
+            };
             while !running_window_slots(runtime)
                 .unwrap()
                 .iter()
                 .any(|live| live == slot)
+                || !published()
                 || (answers && !runtime.join(slot_socket_name(slot)).exists())
             {
                 assert!(
@@ -3630,7 +3638,7 @@ mod tests {
             // it could be refused: bind apart and move it into place.
             let mut binding = socket.clone();
             binding.push(".binding");
-            let listener = std::os::unix::net::UnixListener::bind(&binding).unwrap();
+            let listener = crate::descriptor::bind(&binding).unwrap();
             fs::rename(&binding, &socket).unwrap();
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
@@ -4462,13 +4470,12 @@ mod tests {
             let lease =
                 owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap();
             let listener =
-                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
-                    .unwrap();
+                crate::descriptor::bind(runtime.path().join(slot_socket_name(slot))).unwrap();
             workers.push(std::thread::spawn(move || {
                 let _lease = lease;
                 let mut actions = Vec::new();
                 for _ in 0..2 {
-                    let (stream, _) = listener.accept().unwrap();
+                    let (stream, _) = crate::descriptor::accept(&listener).unwrap();
                     let action = read_capped_line(&stream).unwrap();
                     let response = if veto && action == "update-prepare" {
                         "error: unsaved editor"
@@ -4521,8 +4528,7 @@ mod tests {
             let lease =
                 owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap();
             let listener =
-                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
-                    .unwrap();
+                crate::descriptor::bind(runtime.path().join(slot_socket_name(slot))).unwrap();
             listener.set_nonblocking(true).unwrap();
             let (finished, completion) = std::sync::mpsc::sync_channel(1);
             let worker = std::thread::spawn(move || {
@@ -4604,8 +4610,7 @@ mod tests {
                 owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap(),
             );
             let listener =
-                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
-                    .unwrap();
+                crate::descriptor::bind(runtime.path().join(slot_socket_name(slot))).unwrap();
             listener.set_nonblocking(true).unwrap();
             workers.push(std::thread::spawn(move || {
                 let mut actions = Vec::new();
@@ -5095,7 +5100,8 @@ mod tests {
     #[test]
     fn activation_replaces_a_stale_socket_and_rejects_a_symlink() {
         let runtime = tempdir().unwrap();
-        let leftover = UnixListener::bind(runtime.path().join(ACTIVATION_SOCKET_FILE)).unwrap();
+        let leftover =
+            crate::descriptor::bind(runtime.path().join(ACTIVATION_SOCKET_FILE)).unwrap();
         drop(leftover);
         let (sender, receiver) = async_channel::unbounded();
         let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();

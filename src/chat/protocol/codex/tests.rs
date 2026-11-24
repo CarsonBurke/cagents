@@ -89,7 +89,7 @@ fn shared_long_listener_keeps_its_existing_verified_alias_and_never_launches() {
     use std::os::unix::fs::{MetadataExt, symlink};
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("s");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _listener = crate::descriptor::bind(&socket).unwrap();
     let original = std::fs::metadata(&socket).unwrap();
     let long = home
         .path()
@@ -1853,7 +1853,7 @@ fn an_explicit_default_remote_starts_new_threads_on_the_shared_server() {
     let directory = home.path().join("app-server-control");
     std::fs::create_dir(&directory).unwrap();
     let socket = directory.join("app-server-control.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _listener = crate::descriptor::bind(&socket).unwrap();
     let launch = Launch {
         provider: crate::agent::Provider::Codex,
         session_id: None,
@@ -4502,7 +4502,7 @@ fn account_notifications_are_forwarded_as_reports() {
 fn joins_exact_thread_without_settings_or_history_overrides() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("shared.sock");
-    let _server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _server = crate::descriptor::bind(&socket).unwrap();
     let launch = Launch {
         provider: crate::agent::Provider::Codex,
         session_id: Some("thread-exact".into()),

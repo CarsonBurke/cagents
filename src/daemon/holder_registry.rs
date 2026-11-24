@@ -307,7 +307,7 @@ pub fn with_socket_address<T>(
 
 #[cfg(feature = "host")]
 pub fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
-    with_socket_address(path, crate::descriptor::bind)
+    with_socket_address(path, |path| crate::descriptor::bind(path))
 }
 
 #[cfg(feature = "host")]
@@ -1112,7 +1112,7 @@ mod tests {
                 &fs::symlink_metadata(&endpoint).unwrap().file_type()
             ));
             let client = connect(&endpoint).unwrap();
-            let (server, _) = listener.accept().unwrap();
+            let (server, _) = crate::descriptor::accept(&listener).unwrap();
             assert!(client.peer_addr().unwrap().as_pathname().is_some());
             drop((client, server, listener));
             let mut proof = record();

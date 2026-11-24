@@ -927,13 +927,10 @@ else: raise AssertionError(sys.argv)
                 StartupState, read_frame, write_frame,
             },
         };
-        use std::{
-            collections::VecDeque,
-            os::unix::net::{UnixListener, UnixStream},
-        };
+        use std::{collections::VecDeque, os::unix::net::UnixStream};
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("cagentsd.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let mut proof = HostSessionProof {
             host_session_id: HostSessionId::new("startup-probe"),
             boot_id: crate::daemon::read_boot_id().unwrap(),
@@ -957,7 +954,7 @@ else: raise AssertionError(sys.argv)
         }
         let lease_path = root.path().join("cagentsd.lock");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();

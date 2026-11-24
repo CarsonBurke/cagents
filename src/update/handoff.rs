@@ -538,7 +538,6 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, read_frame, write_frame,
         };
-        use std::os::unix::net::UnixListener;
 
         for matches_source in [true, false] {
             let root = tempfile::tempdir().unwrap();
@@ -589,7 +588,7 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
             };
             let server_lock = lock.try_clone().unwrap();
             let (release_server_lock, release_lock) = std::sync::mpsc::channel();
-            let listener = UnixListener::bind(&paths.socket).unwrap();
+            let listener = crate::descriptor::bind(&paths.socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let server = thread::spawn(move || {
                 // Source discovery and its fresh authenticated handshake are
@@ -597,7 +596,7 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
                 for _ in 0..2 {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     let mut stream = loop {
-                        match listener.accept() {
+                        match crate::descriptor::accept(&listener) {
                             Ok((stream, _)) => break stream,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 assert!(Instant::now() < deadline, "source probe never connected");

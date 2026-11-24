@@ -1680,7 +1680,7 @@ mod tests {
             let observed_tool = tool_identity.clone();
             if orphan {
                 let path = directory.path().join("control.sock");
-                let listener = UnixListener::bind(&path).unwrap();
+                let listener = crate::descriptor::bind(&path).unwrap();
                 let connector = std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(500));
                     let reaped = !observed_tool.is_current();
@@ -1690,7 +1690,7 @@ mod tests {
                 });
                 wait_for_control(listener.as_raw_fd(), &server, &child_events).unwrap();
                 let _peer = connector.join().unwrap();
-                let _accepted = listener.accept().unwrap();
+                let _accepted = crate::descriptor::accept(&listener).unwrap();
             } else {
                 let (reader, mut writer) = UnixStream::pair().unwrap();
                 let sender = std::thread::spawn(move || {
@@ -1874,7 +1874,7 @@ exec /bin/sleep 60
             };
             let reaped = if orphan {
                 let path = directory.path().join("control.sock");
-                let listener = UnixListener::bind(&path).unwrap();
+                let listener = crate::descriptor::bind(&path).unwrap();
                 let connector = std::thread::spawn(move || {
                     let reaped = release_and_observe();
                     // Always wake the real wait path, even on a failed oracle.
@@ -1883,7 +1883,7 @@ exec /bin/sleep 60
                 });
                 wait_for_control(listener.as_raw_fd(), &server, &child_events).unwrap();
                 let (_peer, reaped) = connector.join().unwrap();
-                let _accepted = listener.accept().unwrap();
+                let _accepted = crate::descriptor::accept(&listener).unwrap();
                 reaped
             } else {
                 let (reader, mut writer) = UnixStream::pair().unwrap();
@@ -2010,8 +2010,8 @@ exec /bin/sleep 60
             // Clear setup notifications before inducing the exact child-exit
             // boundary. The short tool still waits for this original pipe.
             child_events.drain().unwrap();
-            let listener =
-                orphan.then(|| UnixListener::bind(directory.path().join("control.sock")).unwrap());
+            let listener = orphan
+                .then(|| crate::descriptor::bind(directory.path().join("control.sock")).unwrap());
             let (reader, peer) = if let Some(listener) = &listener {
                 (
                     None,
@@ -2094,7 +2094,7 @@ exec /bin/sleep 60
             );
             assert_eq!(calls, 2, "fault must occur after the real SIGCHLD wake");
             let control = if let Some(listener) = listener {
-                listener.accept().unwrap().0
+                crate::descriptor::accept(&listener).unwrap().0
             } else {
                 reader.unwrap()
             };

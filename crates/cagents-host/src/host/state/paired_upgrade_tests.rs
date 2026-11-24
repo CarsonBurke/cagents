@@ -9,7 +9,7 @@ use crate::{
     upgrade::handoff::Store,
 };
 use std::{
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::fs::PermissionsExt,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -100,7 +100,7 @@ struct Peer {
 
 impl Peer {
     fn start(socket: &Path, home: PathBuf, cwd: PathBuf) -> Self {
-        let listener = UnixListener::bind(socket).unwrap();
+        let listener = crate::descriptor::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -114,7 +114,7 @@ impl Peer {
                     Instant::now() < deadline,
                     "paired Codex peer exceeded its deadline"
                 );
-                match listener.accept() {
+                match crate::descriptor::accept(&listener) {
                     Ok((stream, _)) => {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(1)))

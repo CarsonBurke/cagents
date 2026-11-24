@@ -160,7 +160,7 @@ impl Peer {
     fn finished(mut self) {
         let listener = self.worker.take().unwrap().join().unwrap();
         assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
             "legacy command must not open a retry/fallback connection"
         );
     }

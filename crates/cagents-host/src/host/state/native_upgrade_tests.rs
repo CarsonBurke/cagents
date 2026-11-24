@@ -1653,7 +1653,7 @@ fn provider() {
     let version =
         std::env::var("CAGENTS_UPGRADE_CODEX_VERSION").unwrap_or_else(|_| "0.157.1".into());
     let socket = std::env::var_os("CAGENTS_UPGRADE_SOCKET").unwrap();
-    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let listener = crate::descriptor::bind(socket).unwrap();
     // The retained server remains alive after the actor disconnects. Only an
     // explicit holder release should terminate this process.
     for stream in listener.incoming() {

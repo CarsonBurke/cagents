@@ -160,7 +160,7 @@ fn serve_until(
         if cancelled() {
             return;
         }
-        match listener.accept() {
+        match crate::descriptor::accept(&listener) {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream
@@ -280,7 +280,7 @@ fn a_reopened_codex_thread_nothing_serves_starts_on_its_own_listener() {
                 ]
             );
             serve(
-                UnixListener::bind(&socket).unwrap(),
+                crate::descriptor::bind(&socket).unwrap(),
                 root.join("home/.codex"),
                 methods,
             );
@@ -354,7 +354,7 @@ fn a_reopened_codex_thread_joins_the_shared_daemon_serving_it() {
     let _writer = ThreadWriter::hold(&home);
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
-    let listener = UnixListener::bind(control.join("app-server-control.sock")).unwrap();
+    let listener = crate::descriptor::bind(control.join("app-server-control.sock")).unwrap();
     let (methods, received) = mpsc::channel();
     let server = thread::spawn(move || serve(listener, home, methods));
     host.lock().unwrap().register_client(1);
@@ -435,7 +435,7 @@ fn a_reopened_codex_thread_joins_a_long_published_shared_endpoint() {
     assert!(published.as_os_str().as_encoded_bytes().len() >= 108);
     let actual = tempfile::tempdir_in("/tmp").unwrap();
     let socket = actual.path().join("server.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     std::os::unix::fs::symlink(&socket, &published).unwrap();
     let before = std::fs::symlink_metadata(&published).unwrap();
     let before_target = std::fs::metadata(&published).unwrap();
@@ -528,7 +528,7 @@ fn long_stale_shared_endpoint_waits_for_writer(name: &str, missing_row: bool) {
     assert!(published.as_os_str().as_encoded_bytes().len() >= 108);
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let stale = runtime.path().join("stale.sock");
-    drop(UnixListener::bind(&stale).unwrap());
+    drop(crate::descriptor::bind(&stale).unwrap());
     std::os::unix::fs::symlink(&stale, &published).unwrap();
     let entry = std::fs::symlink_metadata(&published).unwrap();
     let target = std::fs::metadata(&published).unwrap();
@@ -640,7 +640,11 @@ fn long_stale_shared_endpoint_waits_for_writer(name: &str, missing_row: bool) {
             .unwrap()
             .strip_prefix("unix://")
             .unwrap();
-        serve(UnixListener::bind(socket).unwrap(), server_home, methods);
+        serve(
+            crate::descriptor::bind(socket).unwrap(),
+            server_home,
+            methods,
+        );
     });
     let session = started(
         process(
@@ -783,7 +787,7 @@ fn codex_constructor_io_is_retryable_but_recipe_conflicts_remain_blocked() {
     );
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
-    let _listener = UnixListener::bind(control.join("app-server-control.sock")).unwrap();
+    let _listener = crate::descriptor::bind(control.join("app-server-control.sock")).unwrap();
     assert!(
         chat::protocol::codex::create_for_start(&source.launch).is_ok(),
         "repairing the same home/endpoint permits the same constructor"
@@ -814,9 +818,9 @@ fn a_replaced_shared_endpoint_remains_unknown() {
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
     let shared = control.join("app-server-control.sock");
-    let _original = UnixListener::bind(&shared).unwrap();
+    let _original = crate::descriptor::bind(&shared).unwrap();
     let replacement = control.join("replacement.sock");
-    drop(UnixListener::bind(&replacement).unwrap());
+    drop(crate::descriptor::bind(&replacement).unwrap());
     let mut source = reopened(root);
     source
         .launch
@@ -851,7 +855,7 @@ fn a_prepared_codex_resume_rechecks_the_shared_service_before_starting() {
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
     let shared = control.join("app-server-control.sock");
-    let listener = UnixListener::bind(&shared).unwrap();
+    let listener = crate::descriptor::bind(&shared).unwrap();
     host.lock().unwrap().register_client(1);
     let requested = reopened(&root);
     let ServerResponse::ChatResumePrepared { session: prepared } = process(
@@ -941,7 +945,7 @@ fn a_reopened_codex_thread_another_process_has_open_is_refused() {
     // A shared daemon that stopped without removing its endpoint.
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
-    drop(UnixListener::bind(control.join("app-server-control.sock")).unwrap());
+    drop(crate::descriptor::bind(control.join("app-server-control.sock")).unwrap());
     let sessions = home.join("sessions/2026/11/08");
     std::fs::create_dir_all(&sessions).unwrap();
     let rollout = sessions.join(format!("rollout-2026-11-08T12-00-00-{}.jsonl", thread_id()));
@@ -1067,7 +1071,7 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     std::fs::create_dir(&allocation).unwrap();
     std::fs::set_permissions(&allocation, std::fs::Permissions::from_mode(0o700)).unwrap();
     let allocated_socket = allocation.join("control.sock");
-    drop(UnixListener::bind(&allocated_socket).unwrap());
+    drop(crate::descriptor::bind(&allocated_socket).unwrap());
     let before = std::fs::symlink_metadata(&allocated_socket).unwrap();
     // A writer-gate counterfactual must reach the explicit no-launch/inode
     // assertion, rather than time out connecting to its mistaken new server.
@@ -1086,12 +1090,17 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
                 }
                 if record.exists() {
                     let (methods, _received) = mpsc::channel();
-                    serve_until(UnixListener::bind(socket).unwrap(), home, methods, || {
-                        matches!(
-                            fallback_cancelled.try_recv(),
-                            Ok(()) | Err(mpsc::TryRecvError::Disconnected)
-                        )
-                    });
+                    serve_until(
+                        crate::descriptor::bind(socket).unwrap(),
+                        home,
+                        methods,
+                        || {
+                            matches!(
+                                fallback_cancelled.try_recv(),
+                                Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+                            )
+                        },
+                    );
                     break;
                 }
             }

@@ -7544,7 +7544,7 @@ mod tests {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             }
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
             );
             let after = std::fs::symlink_metadata(&socket).unwrap();
             assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -8148,7 +8148,7 @@ mod tests {
     fn saturated_control_listener(
         path: &Path,
     ) -> (std::os::unix::net::UnixListener, Vec<UnixStream>) {
-        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let listener = crate::descriptor::bind(path).unwrap();
         assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
         let pending = (0..2)
             .map(|_| connect_control_socket(path, Duration::from_millis(100)).unwrap())
@@ -8200,7 +8200,7 @@ mod tests {
                     1,
                     "owned fixture connection must arrive"
                 );
-                listener.accept().unwrap()
+                crate::descriptor::accept(&listener).unwrap()
             };
             for _ in 0..pending.len() {
                 drop(accept());
@@ -8239,7 +8239,7 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         // A forked child can retain this socket description until it execs.
         // Keep that interleaving present while checking the refused endpoint.
         let inherited_listener = listener.try_clone().unwrap();

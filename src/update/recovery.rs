@@ -2768,10 +2768,10 @@ mod tests {
             let mut live = serving;
             live.boot_id = crate::daemon::read_boot_id().unwrap();
             let _lease = crate::daemon::HostLease::acquire(&paths, &live).unwrap();
-            let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let listener = crate::descriptor::bind(&paths.socket).unwrap();
             let executable = std::env::current_exe().unwrap();
             source::Peer::confirm_serving(&paths.socket, &executable, &live).unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             let mut frames = Vec::new();
             stream.read_to_end(&mut frames).unwrap();
             assert!(frames.is_empty(), "the worker sent a protocol request");

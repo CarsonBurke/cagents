@@ -4450,11 +4450,11 @@ impl Adapter for WebSocketFixture {
 
 #[test]
 fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_close() {
-    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    use std::os::unix::fs::MetadataExt;
     use tungstenite::Message;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = crate::descriptor::bind(&path).unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
@@ -4475,7 +4475,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
     };
     let (pong, pong_received) = crossbeam_channel::bounded(1);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -4589,10 +4589,10 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
 
 #[test]
 fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
-    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    use std::os::unix::fs::MetadataExt;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = crate::descriptor::bind(&path).unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
@@ -4612,7 +4612,7 @@ fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
     };
     let (release, released) = crossbeam_channel::bounded(1);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

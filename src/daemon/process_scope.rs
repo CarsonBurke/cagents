@@ -985,12 +985,11 @@ pub(crate) mod tests {
 
     #[test]
     fn private_peer_connection_is_nonblocking_without_a_manager_request() {
-        use std::os::unix::net::UnixListener;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fixture.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         let connection = connect_nonblocking(&path).unwrap();
-        let (_accepted, _) = listener.accept().unwrap();
+        let (_accepted, _) = crate::descriptor::accept(&listener).unwrap();
         // SAFETY: F_GETFL only observes the owned socket's status flags.
         let flags = unsafe { libc::fcntl(connection.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(flags, -1);

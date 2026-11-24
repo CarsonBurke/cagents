@@ -524,7 +524,7 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
     let journal_directory = root.path().join("journal");
     std::fs::create_dir(&journal_directory).unwrap();
     let socket = root.path().join("fixture.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let metadata = std::fs::symlink_metadata(&socket).unwrap();
     (
         Server {
@@ -1043,7 +1043,7 @@ fn helper_control_rejects_regular_files_and_unconnected_listeners() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let file = File::create(root.path().join("ordinary-file")).unwrap();
     assert!(validate_control_descriptor(file.as_raw_fd()).is_err());
-    let listener = UnixListener::bind(root.path().join("listener.sock")).unwrap();
+    let listener = crate::descriptor::bind(root.path().join("listener.sock")).unwrap();
     assert!(validate_control_descriptor(listener.as_raw_fd()).is_err());
     let (client, server) = UnixStream::pair().unwrap();
     assert!(validate_control_descriptor(client.as_raw_fd()).is_ok());
@@ -1771,7 +1771,7 @@ fn source_resolution_refuses_stale_cleanup_pending_and_process_completion() {
 fn source_resolution_uses_one_deadline_and_never_returns_a_cached_final_snapshot() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("resolve.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let mut actor = RemoteActor::fixture();
     Arc::get_mut(&mut actor.0).unwrap().socket = socket;
     let source = actor.0.source.clone();
@@ -1782,7 +1782,7 @@ fn source_resolution_uses_one_deadline_and_never_returns_a_cached_final_snapshot
     }));
     let (release, wait) = crossbeam_channel::bounded(1);
     let peer = thread::spawn(move || {
-        let (control, _) = listener.accept().unwrap();
+        let (control, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&control, TIMEOUT).unwrap();
         assert_eq!(request.method, "resolve_source");
         assert_eq!(request.epoch, Some(epoch));
@@ -1907,10 +1907,10 @@ fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_c
         .capabilities
         .push(CAPABILITY.into());
     let socket = fixture._root.path().join("deadline-inspect.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let (release, wait) = crossbeam_channel::bounded(1);
     let peer = thread::spawn(move || {
-        let (control, _) = listener.accept().unwrap();
+        let (control, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&control, TIMEOUT).unwrap();
         assert_eq!(request.method, "inspect");
         assert!(request.epoch.is_none());
@@ -2241,7 +2241,7 @@ fn missing_install_commit_cannot_advertise_durable_continuity() {
 fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("install.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let mut actor = RemoteActor::fixture();
     Arc::get_mut(&mut actor.0).unwrap().socket = socket;
     actor.0.installed.store(false, Ordering::Release);
@@ -2255,7 +2255,7 @@ fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation(
     let proof = actor.0.proof.clone();
     let epoch = actor.0.epoch;
     let peer = thread::spawn(move || {
-        let (control, _) = listener.accept().unwrap();
+        let (control, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&control, TIMEOUT).unwrap();
         assert_eq!(request.method, "commit");
         assert_eq!(request.proof, proof);
@@ -2369,7 +2369,7 @@ fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
 fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("refresh.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let fixture = RemoteActor::fixture();
     let mut old = fixture.state().as_ref().clone();
     old.ready = false;
@@ -2430,17 +2430,17 @@ fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_
     let (stop, stopped) = crossbeam_channel::bounded(1);
     let peer = thread::spawn(move || {
         // This ordering fixture models an older helper without readiness.
-        let (watch, _) = listener.accept().unwrap();
+        let (watch, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&watch, TIMEOUT).unwrap();
         assert_eq!(request.method, "watch");
         send(&watch, &Err::<Value, _>(UNKNOWN_METHOD.to_owned()), TIMEOUT).unwrap();
         // Hold the observer's response to force refresh_state to publish
         // the new resident before that observer returns an unchanged poll.
-        let (observer, _) = listener.accept().unwrap();
+        let (observer, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&observer, TIMEOUT).unwrap();
         assert_eq!(request.method, "state");
         observed_poll.send(()).unwrap();
-        let (refresh, _) = listener.accept().unwrap();
+        let (refresh, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&refresh, TIMEOUT).unwrap();
         assert_eq!(request.method, "state");
         send(
@@ -2456,7 +2456,7 @@ fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_
             TIMEOUT,
         )
         .unwrap();
-        let (observer, _) = listener.accept().unwrap();
+        let (observer, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&observer, TIMEOUT).unwrap();
         assert_eq!(request.method, "state");
         send(&observer, &Ok::<Value, String>(Value::Null), TIMEOUT).unwrap();
@@ -2513,7 +2513,7 @@ fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_
 fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("outcome-read.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let actor = RemoteActor::fixture_at(socket);
     let unconfirmed = actor.state().as_ref().clone();
     assert!(unconfirmed.confirmed_session.is_none());
@@ -2537,7 +2537,7 @@ fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
     let peer = thread::spawn(move || {
         let mut published = false;
         for _ in 0..4 {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             let request: Invocation = receive(&stream, TIMEOUT).unwrap();
             let reply = match request.method.as_str() {
                 "state" => {
@@ -2574,7 +2574,7 @@ fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
 fn a_closed_refresh_overtaken_by_a_newer_one_is_stale_not_a_failure() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("closed-refresh.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let actor = RemoteActor::fixture_at(socket);
     let mut older = actor.state().as_ref().clone();
     older.completed = true;
@@ -2596,7 +2596,7 @@ fn a_closed_refresh_overtaken_by_a_newer_one_is_stale_not_a_failure() {
     let replies = [older, contradictory];
     let peer = thread::spawn(move || {
         for reply in replies {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             let request: Invocation = receive(&stream, TIMEOUT).unwrap();
             assert_eq!(request.method, "state");
             send(
@@ -2664,18 +2664,18 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
     };
     let (next, delay) = retransmit(&actor).expect("a failed call schedules retransmission");
     assert!(next > Instant::now() && delay > RETRANSMIT_DELAY);
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     actor.resolve_uncertain_input();
     assert_eq!(
-        listener.accept().unwrap_err().kind(),
+        crate::descriptor::accept(&listener).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
         "nothing is retransmitted before its backoff elapses"
     );
     listener.set_nonblocking(false).unwrap();
     let expected = identity.clone();
     let helper = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&stream, TIMEOUT).unwrap();
         assert_eq!(request.method, "input");
         let (identity, payload): (InputIdentity, Value) =
@@ -2729,10 +2729,10 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
         .as_mut()
         .unwrap()
         .acknowledgement_deadline = Instant::now();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let settle =
         |listener: &UnixListener, expected: &InputIdentity, answer: Result<Value, String>| {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(listener).unwrap();
             let request: Invocation = receive(&stream, TIMEOUT).unwrap();
             assert_eq!(request.method, "abandon_input", "never the input itself");
             let (identity, reason): (InputIdentity, String) =
@@ -2790,7 +2790,7 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
         .as_mut()
         .unwrap()
         .acknowledgement_deadline = Instant::now();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     thread::scope(|scope| {
         let helper = scope.spawn(|| settle(&listener, &expected, Err(UNKNOWN_METHOD.into())));
         actor.resolve_uncertain_input();
@@ -2823,7 +2823,7 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
     // its journal gives for good, as for an input it retired, ends the
     // asking at once, and new input is refused for the conversation.
     std::fs::remove_file(&socket).unwrap();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let refuse = |actor: &RemoteActor, refusal: &str| {
         backdate(actor);
         {
@@ -2923,12 +2923,12 @@ fn new_input_stops_waiting_on_a_helper_that_never_answers() {
         );
     }
     // A wedged helper takes the request and never answers it.
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let accept = |listener: &UnixListener| {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            match listener.accept() {
+            match crate::descriptor::accept(listener) {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false).unwrap();
                     return stream;
@@ -3048,7 +3048,7 @@ impl ServedHelper {
                 while !stop.load(Ordering::Acquire) {
                     let mut fixture = fixture.lock().unwrap();
                     fixture.server.finish_inputs();
-                    let control = match fixture.server.listener.accept() {
+                    let control = match crate::descriptor::accept(&fixture.server.listener) {
                         Ok((control, _)) => control,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             drop(fixture);

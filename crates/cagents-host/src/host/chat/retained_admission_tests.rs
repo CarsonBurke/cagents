@@ -671,7 +671,7 @@ impl HostClientWire {
         };
         use std::sync::atomic::{AtomicBool, Ordering};
         let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let listener = crate::descriptor::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -683,7 +683,7 @@ impl HostClientWire {
             let mut workers = Vec::new();
             let mut next_client = 1;
             while !stopped.load(Ordering::Acquire) {
-                let (mut stream, _) = match listener.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&listener) {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -845,7 +845,7 @@ fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
         "discovery must fence recipe execution"
     );
     assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "unsupported protocol must refuse before RPC"
     );
     assert_eq!(

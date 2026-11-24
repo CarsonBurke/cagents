@@ -375,7 +375,7 @@ fn a_listener_still_being_served_keeps_the_refusal() {
         return;
     };
     let fixture = Fixture::new(&root);
-    let _server = std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap();
+    let _server = crate::descriptor::bind(fixture.socket()).unwrap();
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().exists());
 }
@@ -925,7 +925,7 @@ fn a_conversation_whose_listener_is_served_does_not_reopen() {
         return;
     };
     let fixture = Fixture::new(&root);
-    let _server = std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap();
+    let _server = crate::descriptor::bind(fixture.socket()).unwrap();
     process_inner(
         &fixture.host,
         0,
@@ -1542,7 +1542,7 @@ fn codex_start_refuses_a_bound_unlinked_published_target() {
     };
     let fixture = codex_start_fixture(&root);
     let target = root.join("published.sock");
-    let _server = std::os::unix::net::UnixListener::bind(&target).unwrap();
+    let _server = crate::descriptor::bind(&target).unwrap();
     std::os::unix::fs::symlink(&target, fixture.socket()).unwrap();
     std::fs::remove_file(&target).unwrap();
     let failure = codex_start(&fixture).unwrap_err();
@@ -1570,7 +1570,7 @@ fn codex_start_joins_a_served_listener_without_launching() {
     };
     let mut fixture = codex_start_fixture(&root);
     let target = root.join("published.sock");
-    let _server = std::os::unix::net::UnixListener::bind(&target).unwrap();
+    let _server = crate::descriptor::bind(&target).unwrap();
     std::os::unix::fs::symlink(&target, fixture.socket()).unwrap();
     // Missing old ownership evidence must not block an existing attachment.
     fixture.source.owned_codex_listener = None;

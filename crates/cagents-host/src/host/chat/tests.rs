@@ -223,7 +223,7 @@ fn hidden_completion_wakes_parked_daemon_after_rearm_is_consumed_and_fences_old_
     }
     let directory = tempfile::tempdir().unwrap();
     let listener_path = directory.path().join("idle.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+    let listener = crate::descriptor::bind(&listener_path).unwrap();
     let host = completion_wake_host();
     let id = TerminalId::new();
     let instance = uuid::Uuid::new_v4();
@@ -506,7 +506,7 @@ IFS= read -r finish < finish
         }
     };
     let listener_path = directory.path().join("idle.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+    let listener = crate::descriptor::bind(&listener_path).unwrap();
     crate::daemon::wake();
     crate::daemon::wait_for_activity(&listener).unwrap();
     let parked = listener.try_clone().unwrap();
@@ -2259,10 +2259,9 @@ fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread
         );
         return;
     }
-    use std::os::unix::net::UnixListener;
     let (directory, host, mut saved) = upgrade_fixture();
     let socket = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let home = directory.path().join("codex-home");
     std::fs::create_dir(&home).unwrap();
     let identity = saved.launch.session_id.clone().unwrap();
@@ -2273,7 +2272,7 @@ fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(12);
         let stream = loop {
-            match listener.accept() {
+            match crate::descriptor::accept(&listener) {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(
@@ -3343,10 +3342,10 @@ fn control_client_closes_chat_as(slow: bool, return_terminal: bool, provider: Pr
         },
     );
     let socket = directory.path().join("cagentsd.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let server_host = Arc::clone(&host);
     let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         super::super::client::serve(stream, 1, server_host);
     });
 

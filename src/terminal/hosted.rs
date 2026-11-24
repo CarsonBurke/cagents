@@ -3430,7 +3430,7 @@ mod tests {
         let socket = directory.path().join("daemon.sock");
         let timeout = Duration::from_secs(35);
         assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
-        let _listener = UnixListener::bind(&socket).unwrap();
+        let _listener = crate::descriptor::bind(&socket).unwrap();
         assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
     }
 
@@ -3490,9 +3490,9 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(2));
 
             for compatible in [true, false] {
-                let listener = UnixListener::bind(&socket).unwrap();
+                let listener = crate::descriptor::bind(&socket).unwrap();
                 let server = thread::spawn(move || {
-                    let (mut stream, _) = listener.accept().unwrap();
+                    let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
                     let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                     assert!(matches!(request.request, ClientRequest::Connect { .. }));
                     let proof = proof("serving-during-review");
@@ -3605,11 +3605,11 @@ mod tests {
                 .join(crate::instance::runtime_subdirectory())
                 .join(crate::terminal_ipc::SOCKET_FILE_NAME);
             std::fs::create_dir(socket.parent().unwrap()).unwrap();
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             for answer in [false, true] {
                 let server = thread::scope(|scope| {
                     let server = scope.spawn(|| {
-                        let (mut stream, _) = listener.accept().unwrap();
+                        let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
                         let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                         if !answer {
                             // Held, as a hung daemon holds it, until the
@@ -3697,7 +3697,7 @@ mod tests {
                         return Err(io::Error::from(io::ErrorKind::NotFound));
                     }
                     if !scoped {
-                        listener = Some(UnixListener::bind(&socket).unwrap());
+                        listener = Some(crate::descriptor::bind(&socket).unwrap());
                     }
                     Command::new("false").spawn()
                 },
@@ -3757,7 +3757,7 @@ mod tests {
         for version in [PROTOCOL_VERSION, PROTOCOL_VERSION - 1] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             let server = thread::spawn(move || {
                 let mut stream = accept_connection(&listener);
                 let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
@@ -3852,7 +3852,7 @@ mod tests {
         let restore = crate::control::ordinary_budget::QUICK + Duration::from_millis(600);
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let consume = (checkpoint == "consumed").then(|| checkpoint_path.clone());
         let server = thread::spawn(move || {
             let mut stream = accept_connection(&listener);
@@ -3911,7 +3911,7 @@ mod tests {
     ) -> impl FnMut(bool) -> io::Result<Child> + use<> {
         let socket = socket.to_owned();
         move |_scoped| {
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             thread::spawn(move || {
                 thread::sleep(restore);
                 // Readiness probes connect and close; answer the handshake.
@@ -3979,7 +3979,7 @@ mod tests {
             Path::new("fixture-daemon"),
             false,
             move |_scoped| {
-                let listener = UnixListener::bind(&path).unwrap();
+                let listener = crate::descriptor::bind(&path).unwrap();
                 let served_tx = served_tx.clone();
                 thread::spawn(move || {
                     let proof = proof("ready");
@@ -4048,7 +4048,7 @@ mod tests {
             Path::new("fixture-daemon"),
             false,
             move |_scoped| {
-                let listener = UnixListener::bind(&path).unwrap();
+                let listener = crate::descriptor::bind(&path).unwrap();
                 thread::spawn(move || {
                     thread::sleep(Duration::from_millis(200));
                     drop(listener);
@@ -4103,7 +4103,7 @@ mod tests {
         );
         command.env("PATH", root.path()).args([
             "-c",
-            "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199",
+            "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /dev/fd/199",
         ]);
         unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
         lease.inherit(&mut command).unwrap();
@@ -4216,7 +4216,7 @@ mod tests {
         // inventory throughout; even incomplete lease metadata is not failure.
         assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(30), loser).unwrap());
         assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(60), loser).unwrap());
-        let _listener = UnixListener::bind(&socket).unwrap();
+        let _listener = crate::descriptor::bind(&socket).unwrap();
         assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(61), loser).unwrap());
     }
 
@@ -4607,7 +4607,7 @@ mod tests {
         for spawn in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             let session = session();
             let pinned = proof("confirmed");
             let handle = if spawn {
@@ -4703,7 +4703,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let session = session();
         let pinned = proof("split-handshake");
         let handle = HostedTerminalHandle::attach_or_spawn_at(
@@ -4770,7 +4770,7 @@ mod tests {
     fn rejected_spawn_wakes_attachment_waiter_without_consuming_failure_event() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let pinned = proof("rejected");
         let handle = HostedTerminalHandle::attach_or_spawn_at(
             socket,
@@ -4833,7 +4833,7 @@ mod tests {
     fn assert_handshake_stops(message: ServerMessage) {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let pinned = proof("old");
         let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
         let handle = HostedTerminalHandle::attach_or_spawn_at(
@@ -4884,7 +4884,7 @@ mod tests {
         // Not even the queued input or original spawn intent crossed the fence.
         assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
         assert!(matches!(
-            listener.accept(),
+            crate::descriptor::accept(&listener),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock
         ));
     }
@@ -4922,7 +4922,7 @@ mod tests {
         for during_attach in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             let pinned = proof("old");
             let session = session();
             let handle =
@@ -5074,7 +5074,7 @@ mod tests {
     fn transient_disconnect_and_retryable_handshake_preserve_same_host_reconnect() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let pinned = proof("same");
         let terminal_id = TerminalId::new();
         let handle =
@@ -5516,7 +5516,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let session = session();
         let terminal_id = session.id;
         let pinned = proof("progressive");

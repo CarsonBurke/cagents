@@ -1478,7 +1478,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let transport = fixture_transport(context.device.clone(), directory.path().to_path_buf());
         let path = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let owned = transport.clone();
         let worker = thread::spawn(move || run_bridge(listener, owned));
@@ -1510,7 +1510,7 @@ mod tests {
             directory.path().to_path_buf(),
         );
         let path = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
         let mut failures = 3;
@@ -1523,7 +1523,7 @@ mod tests {
                 }
                 // Counted rather than forwarded, so no SSH starts; the loop
                 // goes straight back to accepting.
-                let (stream, _) = listener.accept()?;
+                let (stream, _) = crate::descriptor::accept(listener)?;
                 drop(stream);
                 accepted_tx.send(()).unwrap();
                 Err(io::ErrorKind::Interrupted.into())
@@ -1551,7 +1551,7 @@ mod tests {
             });
             let transport = fixture_transport(context.device.clone(), root.path().to_path_buf());
             let stopped = root.path().join("daemon.sock");
-            let listener = UnixListener::bind(&stopped).unwrap();
+            let listener = crate::descriptor::bind(&stopped).unwrap();
             listener.set_nonblocking(true).unwrap();
             let owned = transport.clone();
             let worker = thread::spawn(move || {

@@ -7023,7 +7023,7 @@ fn starting_a_chat_connects_to_the_daemon_once() {
             .mode(0o700)
             .create(&paths.directory)
             .unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let listener = crate::descriptor::bind(&paths.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let returned = Arc::new(AtomicBool::new(false));
         let chat_returned = returned.clone();
@@ -7031,7 +7031,7 @@ fn starting_a_chat_connects_to_the_daemon_once() {
             // Every connection the chat made, read until it closed each.
             let mut connections: Vec<thread::JoinHandle<_>> = Vec::new();
             loop {
-                match listener.accept() {
+                match crate::descriptor::accept(&listener) {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
                         let live = host_proof("current");

@@ -241,7 +241,7 @@ fn begin(
 ) {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("host.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let proof = proof("explicit-caller");
     let session = session();
@@ -355,7 +355,7 @@ fn explicit_authority_precedes_spawn_input_paste_and_close_without_environment_f
         );
         assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
         assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
         );
         stop(&handle);
         return;
@@ -574,7 +574,9 @@ fn explicit_authority_reauthenticates_on_reconnect_without_replaying_started_inp
     );
     assert!(read_frame::<ClientEnvelope>(&mut third).unwrap().is_none());
     stop(&handle);
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(
+        matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+    );
 }
 
 #[test]
@@ -877,7 +879,7 @@ fn explicit_authority_rejects_changed_source_and_uncorrelated_or_stale_proof_bef
         }
         stop(&handle);
         assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
         );
     }
 }

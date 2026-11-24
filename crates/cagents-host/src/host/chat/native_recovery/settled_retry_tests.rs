@@ -682,14 +682,14 @@ fn start_ordinary_terminal(
 
 fn with_private_socket<T>(fixture: &Fixture, operation: impl FnOnce() -> T) -> T {
     let socket = crate::daemon::RuntimePaths::discover().unwrap().socket;
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let host = fixture.host().clone();
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server_stopped = stopped.clone();
     let server = thread::spawn(move || {
         let mut readers = Vec::new();
         for client in 17.. {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             if server_stopped.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }

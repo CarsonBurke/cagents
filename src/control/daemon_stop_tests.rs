@@ -2,7 +2,7 @@
 //! Barriers keep each drain phase live until the test explicitly releases it.
 use super::*;
 use crate::daemon::{HostLease, RuntimePaths};
-use std::{fs, io::BufRead, os::unix::net::UnixListener, process::Child};
+use std::{fs, io::BufRead, process::Child};
 
 const PEER_ROOT: &str = "CAGENTS_TEST_STOP_PEER_ROOT";
 const PEER_TEST: &str = "control::daemon_stop_tests::shutdown_peer";
@@ -24,9 +24,9 @@ fn shutdown_peer() {
         host_incarnation: crate::model::HostIncarnation::new("stop-fixture"),
     };
     let lease = HostLease::acquire(&paths, &proof).unwrap();
-    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let listener = crate::descriptor::bind(&paths.socket).unwrap();
     fs::write(root.join("ready"), b"").unwrap();
-    let (mut stream, _) = listener.accept().unwrap();
+    let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
