@@ -256,7 +256,9 @@ signed with a key the build taking it already trusts. 0.2.4 begins generation
 2: every later release carries 0.2.4's metadata as `release-metadata.json`.
 Never delete a release that began a generation.
 
-`publish-release` refuses a release that would strand anyone:
+`publish-release` refuses a release that would strand anyone. It counts the
+releases published on GitHub, read from their tags in the checkout;
+`--verify-only` counts every release tag in the tagged history.
 
 - Its signature must verify with the keys of its tagged source, and with those
   of every earlier release tag of its generation.
@@ -275,8 +277,12 @@ bridge, reads the bridge's metadata and refuses it; it updates to the bridge
 first. `release-metadata feed --generation G --bridge DIR` lays out a file
 feed the same way, for rehearsing the two-step update.
 
-To add a key, list it in a release signed by a key every build of the
-generation trusts; later releases may then be signed by either. To drop a key,
+Within a generation, every release must carry a signature by a key that
+every earlier release of the generation trusts. A key added partway through a
+generation is therefore only a co-signer: releases must still also be signed
+by an older key. A key is a sole signer only from the start of a generation,
+so the Actions key is listed from 0.2.4, the first release of generation 2.
+To drop a key,
 including a compromised one, begin a new generation: raise `GENERATION`, add
 its name to `GENERATIONS`, and remove the key from `release-keys.pub`. Sign
 that release with a key that every build of the current generation trusts,

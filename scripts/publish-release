@@ -146,15 +146,28 @@ version_after() {
     [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
 }
 
-# The release tags before this one in its history whose builds check
-# updates, oldest first, as `TAG GENERATION` lines.
+# The releases before this one whose builds check for updates, oldest first,
+# as `TAG GENERATION` lines. Publication takes them from GitHub: a tag pushed
+# but never published is no one's build, and no bridge. Every one must be in
+# this checkout, where its keys and generation are read. --verify-only, which
+# works offline, takes every release tag in the tagged history.
 EARLIER=()
+if "$VERIFY_ONLY"; then
+    candidates=$(checkout_git tag --merged "$SOURCE_COMMIT" --list 'v[0-9]*') || fail 'cannot list the release tags here'
+else
+    command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
+    candidates=$(GH_HOST=github.com GH_PROMPT_DISABLED=1 gh api --hostname github.com --paginate \
+        "repos/$REPOSITORY/releases?per_page=100" | jq -rs '.[][] | select(.draft == false) | .tag_name') \
+        || fail 'cannot list the published releases'
+fi
 while IFS= read -r earlier; do
     [[ $earlier =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
     version_after "$VERSION" "${earlier#v}" || continue
+    checkout_git merge-base --is-ancestor "refs/tags/$earlier" "$SOURCE_COMMIT" 2>/dev/null \
+        || fail "the published $earlier is not in $TAG's history here; fetch the release tags"
     checkout_git cat-file -e "$earlier:src/update/release-keys.pub" 2>/dev/null || continue
     EARLIER+=("$earlier $(generation_at "$earlier")")
-done < <(checkout_git tag --merged "$SOURCE_COMMIT" --list 'v[0-9]*' | sort -V)
+done < <(sort -uV <<< "$candidates")
 PREVIOUS_GENERATION=1
 if ((${#EARLIER[@]})); then PREVIOUS_GENERATION=${EARLIER[-1]##* }; fi
 ((GENERATION >= PREVIOUS_GENERATION && GENERATION <= PREVIOUS_GENERATION + 1)) \
@@ -290,6 +303,9 @@ check_metadata() {
     mapfile -t readers < <(tags_of_generation "$GENERATION")
     if ((${#readers[@]} == 0 && GENERATION > 1)); then
         mapfile -t readers < <(tags_of_generation "$((GENERATION - 1))")
+        # A release cannot begin generation 2 or later with no builds
+        # before it; finding none means the releases were not found.
+        ((${#readers[@]})) || fail "no release of generation $GENERATION or $((GENERATION - 1)) comes before $TAG here; fetch the release tags"
     fi
     for reader in "${readers[@]}"; do
         tagged_signers "$reader" "$WORK_DIR/reader-signers" || fail "$reader trusts no release signing key"
@@ -401,11 +417,14 @@ check_bridge() {
         [[ $(split_signatures "$directory/$name.sig" "$WORK_DIR/bridge-signatures") == 1 ]] \
             || fail "the bridge signature $name.sig must be exactly one signature, the only form generation 1 reads"
     fi
-    while IFS= read -r reader; do
+    local readers=()
+    mapfile -t readers < <(tags_of_generation "$generation")
+    ((${#readers[@]})) || fail "no release of generation $generation is found to check $bridge's metadata against"
+    for reader in "${readers[@]}"; do
         tagged_signers "$reader" "$WORK_DIR/bridge-signers" || fail "$reader trusts no release signing key"
         verify_signature "$directory/$name" "$directory/$name.sig" "$WORK_DIR/bridge-signers" \
             || fail "the bridge metadata $name is not signed by a key $reader trusts"
-    done < <(tags_of_generation "$generation")
+    done
 }
 
 check_asset_set "$DIST_DIR"
@@ -585,7 +604,7 @@ assert_owned_draft() {
     jq -e --arg tag "$TAG" --arg marker "$RELEASE_MARKER" --arg bundle "$BUNDLE_MARKER" '
         .tag_name == $tag and .draft == true and
         (.body | split("\n") | index($marker) != null and index($bundle) != null)
-    ' <<< "$1" >/dev/null || fail 'refusing to modify a published release or a draft not owned by this local publisher for this exact bundle'
+    ' <<< "$1" >/dev/null || fail "refusing to modify a published release or a draft not owned by this local publisher for this exact bundle; to publish this bundle instead of an unpublished draft of $TAG, delete that draft on GitHub first"
 }
 
 releases=$(release_for_tag)

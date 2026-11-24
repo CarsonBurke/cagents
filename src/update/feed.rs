@@ -29,8 +29,6 @@ const GENERATIONS: [(&str, &str); GENERATION] = [
     ("release-metadata.json", "release-metadata.json.sig"),
     ("release-metadata-2.json", "release-metadata-2.json.sig"),
 ];
-const METADATA: &str = GENERATIONS[GENERATION - 1].0;
-const SIGNATURE: &str = GENERATIONS[GENERATION - 1].1;
 const SCHEMA: u32 = 2;
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const PRODUCT: &str = "cagents";
@@ -376,6 +374,24 @@ fn curl_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// This build's own generation's names.
+    const METADATA: &str = GENERATIONS[GENERATION - 1].0;
+    const SIGNATURE: &str = GENERATIONS[GENERATION - 1].1;
+
+    /// The release scripts publish generation G's metadata as
+    /// `release-metadata.json` for 1 and `release-metadata-G.json` after; a
+    /// build that spelled its own name otherwise would never find it.
+    #[test]
+    fn each_generation_reads_the_name_the_release_scripts_publish() {
+        for (index, (metadata, signature)) in GENERATIONS.into_iter().enumerate() {
+            let expected = match index + 1 {
+                1 => "release-metadata.json".to_owned(),
+                generation => format!("release-metadata-{generation}.json"),
+            };
+            assert_eq!(metadata, expected);
+            assert_eq!(signature, format!("{expected}.sig"));
+        }
+    }
 
     fn feed() -> Feed {
         Feed {

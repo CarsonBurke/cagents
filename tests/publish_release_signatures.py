@@ -119,9 +119,11 @@ if arguments[:2] == ["release", "download"]:
     directory.mkdir(parents=True, exist_ok=True)
     patterns = [arguments[index + 1] for index, value in enumerate(arguments) if value == "--pattern"]
     assets = state / "releases" / arguments[2] / "assets"
-    for asset in assets.iterdir():
-        if not patterns or asset.name in patterns:
-            shutil.copyfile(asset, directory / asset.name)
+    matched = [asset for asset in assets.iterdir() if not patterns or asset.name in patterns]
+    if not matched:
+        raise SystemExit("no assets match")
+    for asset in matched:
+        shutil.copyfile(asset, directory / asset.name)
 elif arguments[:2] == ["release", "upload"]:
     files = [value for value in arguments[3:] if value.startswith("/")]
     for path in files:
@@ -377,6 +379,7 @@ class PublisherSignatures(unittest.TestCase):
         self.assertRefused(self.verify("0.2.7", self.bundle("0.2.7", ["new"])), "follows the one before")
 
     def test_publication_carries_the_bridge_as_the_bridge_release_serves_it(self):
+        self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         bridge = self.bundle("0.2.4", ["old"])
         self.published("0.2.4", bridge, {"release-metadata.json": "release-metadata.json",
                                          "release-metadata.json.sig": "release-metadata.json.sig"})
@@ -394,6 +397,7 @@ class PublisherSignatures(unittest.TestCase):
         self.assertIn('"draft": false', (self.directory / "github/releases/v0.2.5/release.json").read_text())
 
     def test_publication_never_puts_a_release_above_a_newer_one(self):
+        self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         bridge = self.bundle("0.2.4", ["old"])
         self.published("0.2.4", bridge, {"release-metadata.json": "release-metadata.json",
                                          "release-metadata.json.sig": "release-metadata.json.sig"})
@@ -401,6 +405,27 @@ class PublisherSignatures(unittest.TestCase):
         result = self.publish("0.2.5", self.bundle("0.2.5", ["new"]))
         self.assertRefused(result, "0.2.6 is published already")
         self.assertIn('"draft": true', (self.directory / "github/releases/v0.2.5/release.json").read_text())
+
+    def test_publication_reads_the_published_releases_not_every_tag(self):
+        # v0.2.4 was pushed but never published, so 0.2.5 begins generation 2:
+        # it carries itself for 0.2.3, and 0.2.4's builds do not exist.
+        self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
+        result = self.publish("0.2.5", self.bundle("0.2.5", ["old"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        served = self.directory / "github/releases/v0.2.5/assets"
+        self.assertEqual((served / "release-metadata.json").read_bytes(),
+                         (served / "release-metadata-2.json").read_bytes())
+
+    def test_publication_refuses_when_published_releases_are_missing_here(self):
+        self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
+        self.published("0.2.4", self.bundle("0.2.4", ["old"]), {})
+        self.git("tag", "-d", "v0.2.4")
+        self.assertRefused(self.publish("0.2.5", self.bundle("0.2.5", ["new"])),
+                           "the published v0.2.4 is not in v0.2.5's history here")
+        # With no release before it found at all, nothing would check its
+        # signature, so it is refused rather than taken to begin generation 2.
+        self.git("tag", "-d", "v0.2.3")
+        self.assertRefused(self.verify("0.2.5", self.bundle("0.2.5", ["new"])), "fetch the release tags")
 
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])
