@@ -1089,7 +1089,7 @@ pub(in crate::host) fn release(
             ));
         }
         state.inventory_generation += 1;
-        let retired = state.chats.remove(&proof.session.id);
+        let retired = state.remove_chat(proof.session.id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(proof.session.id);
         }

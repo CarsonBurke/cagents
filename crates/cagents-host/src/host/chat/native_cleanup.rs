@@ -389,7 +389,7 @@ fn close_retained_inner(
                         .into(),
                 );
             }
-            state.chats.remove(&source.id);
+            state.remove_chat(source.id);
         }
         state.native_closing.remove(&source.id);
         state.native_adoption_failures.clear(source.id);

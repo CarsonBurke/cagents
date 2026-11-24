@@ -710,6 +710,7 @@ fn changed_for_instance(
     }
     drop(state);
     if wake_completed {
+        super::agent_execution::mailbox::wake(&host);
         crate::daemon::wake();
     }
 }
@@ -5080,7 +5081,7 @@ pub(super) fn close_captured(
             ));
         }
         state.inventory_generation += 1;
-        let record = state.chats.remove(&chat_id);
+        let record = state.remove_chat(chat_id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(chat_id);
         }
@@ -5644,7 +5645,7 @@ pub(super) fn stop_failed_upgrade_restore(
     let record = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_current(&state)?;
-        let record = state.chats.remove(&id);
+        let record = state.remove_chat(id);
         if record.is_some() {
             state.inventory_generation += 1;
             if let Some(notifications) = &state.notifications {

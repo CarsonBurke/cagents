@@ -1384,7 +1384,7 @@ impl Store {
         )
     }
 
-    fn path(&self) -> PathBuf {
+    pub(crate) fn path(&self) -> PathBuf {
         self.directory.join(FILE_NAME)
     }
 

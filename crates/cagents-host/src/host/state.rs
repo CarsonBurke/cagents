@@ -504,6 +504,17 @@ impl HostState {
         if let Some(titles) = &self.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
         }
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
+    }
+
+    pub(super) fn remove_chat(&mut self, id: TerminalId) -> Option<super::chat::Record> {
+        let record = self.chats.remove(&id)?;
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
+        Some(record)
     }
 
     pub(super) fn enable_holder_recovery(&mut self) {
@@ -1567,6 +1578,9 @@ impl HostState {
         if let Some(notifications) = &self.notifications {
             notifications.retire(terminal_id);
         }
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
         let clients: Vec<_> = self
             .subscriptions
             .by_terminal
@@ -2520,6 +2534,11 @@ impl HostState {
         }
         // A late startup result cannot revoke already-owned ordinary exit.
         if !self.ordinary_exit_cleanup_pending {
+            if self.shutting_down
+                && let Some(courier) = &self.mailbox
+            {
+                courier.wake();
+            }
             self.shutting_down = false;
             self.shutdown_requested = false;
         }
@@ -5460,6 +5479,7 @@ fn start_terminal_view_owned_reserved(
             return Err(error);
         }
     };
+    super::agent_execution::mailbox::wake(shared);
     Ok((descriptor, redraw_handle))
 }
 
@@ -6207,6 +6227,15 @@ fn record_event_from(
         let wake_exit = state.ordinary_exit_cleanup_pending
             && worker.is_some()
             && matches!(wire_event, WireTerminalEvent::Completed { .. });
+        // The exact worker's provider can now receive inbox attention, or
+        // its departure can leave a single live member of a lineage.
+        if matches!(
+            wire_event,
+            WireTerminalEvent::AgentActivityChanged { .. } | WireTerminalEvent::Completed { .. }
+        ) && let Some(courier) = &state.mailbox
+        {
+            courier.wake();
+        }
         (proof, sequence, deliveries, wake_exit)
     };
     if wake_exit {

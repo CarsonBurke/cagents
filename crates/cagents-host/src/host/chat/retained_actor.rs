@@ -2820,7 +2820,7 @@ fn remove_closed_resident(
         if let Some((terminal, _)) = paired {
             state.retire_terminal(terminal.id);
         }
-        let removed = state.chats.remove(&source.id);
+        let removed = state.remove_chat(source.id);
         // Ordinary Close may finish a previously failed initialization too.
         // Clear only the startup captured by this fully retired attachment;
         // a replacement owner or an unproved teardown retains its reservation.
