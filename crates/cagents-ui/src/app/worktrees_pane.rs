@@ -144,18 +144,28 @@ impl Cagents {
             // Where the sidebar files the pane: its matched owner or its
             // explicit scope first, so a pane reached through a symlink or
             // scoped to a checkout lists there too, then its directory.
-            let root = match self
+            // A pane in a folder project, outside every repository, works in
+            // its folder's row.
+            let directory = self
                 .worktree_owners
                 .get(&card.id)
                 .or_else(|| self.durable.card_scopes.get(&card.id))
-            {
-                Some(scope) => Some(index.resolve(scope).unwrap_or(scope.as_path())),
-                None => card_directory(card).and_then(|directory| index.resolve(directory)),
-            };
-            let Some(root) = root else {
+                .map(PathBuf::as_path)
+                .or_else(|| card_directory(card));
+            let Some(directory) = directory else {
                 continue;
             };
-            let rows = index.rows(root);
+            let folder;
+            let rows = match index.resolve(directory) {
+                Some(root) => index.rows(root),
+                None => match index.folder_row(directory) {
+                    Some(row) => {
+                        folder = [row];
+                        &folder[..]
+                    }
+                    None => continue,
+                },
+            };
             if rows.is_empty() {
                 continue;
             }
@@ -307,6 +317,62 @@ mod tests {
         drop(app.project_workspace(false));
         assert_ne!(app.workspace.focused(), Some(shell));
         assert_eq!(app.worktrees_current(), Some((project, main)));
+    }
+
+    #[test]
+    fn a_pane_in_a_folder_project_lists_under_its_folder_not_a_repository_inside() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let folder = SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "notes".into(),
+            "/notes".into(),
+            vec![],
+            vec![],
+        )
+        .with_kind(crate::model::ProjectKind::Folder);
+        let key = folder.folder_key().unwrap();
+        let root = (key.project_id, key.worktree_id);
+        let nested = ProjectId::new();
+        let nested_main = WorktreeId::new();
+        app.sidebar_model.projects.push(folder);
+        app.sidebar_model.projects.push(SidebarProject::new(
+            nested,
+            RepositoryId::new(),
+            "site".into(),
+            "/notes/site".into(),
+            vec![SidebarWorktree::from_durable(
+                nested_main,
+                "/notes/site".into(),
+                Some("main".into()),
+            )],
+            vec![],
+        ));
+        let shell = app.durable.cards[0].id;
+        let work_in = |app: &mut Cagents, directory: &str| {
+            if let CardKind::Terminal(session) = &mut app.card_state_mut(shell).unwrap().kind {
+                session.launch.working_directory = directory.into();
+            }
+            drop(app.project_workspace(false));
+        };
+        drop(app.open_worktrees());
+
+        work_in(&mut app, "/notes/drafts");
+        let agents = app.worktrees_ui.agents();
+        assert_eq!(agents[&root][0].card, shell, "{agents:?}");
+        assert!(!agents.contains_key(&(nested, nested_main)));
+        assert_eq!(app.worktrees_ui.current([shell]), Some(root));
+
+        work_in(&mut app, "/notes/site/src");
+        let agents = app.worktrees_ui.agents();
+        assert_eq!(agents[&(nested, nested_main)][0].card, shell);
+        assert!(
+            !agents.contains_key(&root),
+            "a repository inside the folder holds its own panes"
+        );
+
+        work_in(&mut app, "/elsewhere");
+        assert!(app.worktrees_ui.agents().is_empty());
     }
 
     #[test]

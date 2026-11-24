@@ -421,6 +421,18 @@ impl WorktreePathIndex {
     pub(super) fn rows(&self, path: &Path) -> &[(ProjectId, WorktreeId)] {
         self.rows.get(path).map_or(&[], Vec::as_slice)
     }
+
+    /// The project folder's row holding `directory`, for a directory no
+    /// worktree or known root holds: one inside a Git repository belongs to
+    /// that repository, not to a folder around it.
+    pub(super) fn folder_row(&self, directory: &Path) -> Option<(ProjectId, WorktreeId)> {
+        if self.resolve(directory).is_some() {
+            return None;
+        }
+        directory
+            .ancestors()
+            .find_map(|ancestor| self.first_row(ancestor))
+    }
 }
 
 impl<'a> ResolveRoot<'a> for &'a WorktreePathIndex {

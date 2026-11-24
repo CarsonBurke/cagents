@@ -6986,7 +6986,9 @@ fn project_identity_row(
 }
 
 /// The primary action for a project row, shared by pointer and keyboard
-/// activation. An unreadable project offers retry rather than navigation.
+/// activation: it folds the project, a folder as a repository, whose root
+/// opens from its row in the Worktrees pane. An unreadable project offers
+/// retry rather than navigation.
 pub fn project_primary_action(project: &SidebarProject) -> Option<SidebarAction> {
     if project.unreachable.is_some() {
         return (!project.reloading).then(|| SidebarAction::RefreshProject {
@@ -6994,14 +6996,7 @@ pub fn project_primary_action(project: &SidebarProject) -> Option<SidebarAction>
             repository: project.repository.clone(),
         });
     }
-    Some(if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(SidebarAction::ToggleProject(project.id))
 }
 
 /// The project's name, on one line, fading rather than wrapping so a long

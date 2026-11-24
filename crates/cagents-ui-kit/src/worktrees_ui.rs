@@ -134,7 +134,13 @@ enum Entry {
         worktree: usize,
         worktree_id: WorktreeId,
     },
-    /// A project with no checkout to list: a folder, or one still loading.
+    /// A folder project's root, the one place in it to open.
+    Folder {
+        project: usize,
+        id: ProjectId,
+    },
+    /// A Git project with no checkout to list yet, or a project that could
+    /// not be read.
     Empty {
         project: usize,
         id: ProjectId,
@@ -155,6 +161,7 @@ impl Entry {
                 id, worktree_id, ..
             } => (2u8, id, worktree_id).hash(&mut hasher),
             Self::Empty { id, .. } => (3u8, id).hash(&mut hasher),
+            Self::Folder { id, .. } => (4u8, id).hash(&mut hasher),
         }
         hasher.finish()
     }
@@ -368,7 +375,15 @@ fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
         }
         entries.push(Entry::Project { project, id });
         if lines.is_empty() {
-            entries.push(Entry::Empty { project, id });
+            // A folder that cannot be read says why, as a Git project does,
+            // rather than offering to open what is not there.
+            entries.push(
+                if entity.kind == ProjectKind::Folder && entity.unreachable.is_none() {
+                    Entry::Folder { project, id }
+                } else {
+                    Entry::Empty { project, id }
+                },
+            );
             continue;
         }
         // Stable, so creations keep the order they were started in.
@@ -417,14 +432,19 @@ fn row_name(
             name.push_str(", review requested");
         }
     }
+    push_panes(&mut name, panes);
+    name
+}
+
+/// How many panes are open in a checkout, for its accessible name: every one,
+/// idle ones too, as the heading's counts are the ones that say who is
+/// working.
+fn push_panes(name: &mut String, panes: usize) {
     match panes {
         0 => {}
-        // Every pane in the checkout, idle ones too: the heading's counts are
-        // the ones that say who is working.
         1 => name.push_str(", 1 pane open in it"),
         panes => name.push_str(&format!(", {panes} panes open in it")),
     }
-    name
 }
 
 #[derive(Clone, Copy)]
@@ -582,14 +602,14 @@ impl<'a> View<'a> {
                     Some(self.worktree(project, worktree))
                 })
                 .unwrap_or_else(skipped),
+            Entry::Folder { project, id } => self
+                .project(project, id)
+                .map_or_else(skipped, |project| self.folder(project)),
             Entry::Empty { project, id } => self.project(project, id).map_or_else(skipped, |p| {
-                design::caption(match (&p.unreachable, p.kind) {
-                    (Some(reason), _) => format!("This project could not be read: {reason}"),
-                    (None, ProjectKind::Folder) => {
-                        "A folder, not a Git repository: it has no worktrees.".to_owned()
-                    }
-                    (None, ProjectKind::Git) if p.reloading => "Reading checkouts…".to_owned(),
-                    (None, ProjectKind::Git) => "No checkouts listed yet.".to_owned(),
+                design::caption(match &p.unreachable {
+                    Some(reason) => format!("This project could not be read: {reason}"),
+                    None if p.reloading => "Reading checkouts…".to_owned(),
+                    None => "No checkouts listed yet.".to_owned(),
                 })
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
@@ -866,6 +886,83 @@ impl<'a> View<'a> {
         .padding([space::XS, space::S])
         .width(Length::Fill)
         .into()
+    }
+
+    /// A folder project's root, drawn as a checkout is: not a Git
+    /// repository, it has no worktrees, so this is the one place in it to
+    /// open, with the panes working there. Pressing it opens it.
+    fn folder(&self, project: &'a SidebarProject) -> Element<'a, Action> {
+        let row = project
+            .folder_key()
+            .map(|key| (key.project_id, key.worktree_id));
+        let current = row.is_some() && self.current == row;
+        let agents = row
+            .and_then(|row| self.state.agents.get(&row))
+            .map_or(&[][..], Vec::as_slice);
+        let mut title = vec![
+            widget::icon(Icon::Folder.handle())
+                .size(design::ROW_ICON_SIZE)
+                .into(),
+            design::heading("Project folder")
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        ];
+        if current {
+            title.push(crate::interaction::tooltip(
+                badge("Current", Tone::Themed(design::accent_color)),
+                "The folder of the pane you were last in",
+            ));
+        }
+        title.push(widget::Space::new().width(Length::Fill).into());
+        let mut details = vec![
+            design::caption("Not a Git repository, so it has no worktrees")
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .width(Length::Fill)
+                .into(),
+        ];
+        if !agents.is_empty() {
+            details.push(
+                widget::row::with_children(agents.iter().map(|agent| self.agent(agent)))
+                    .spacing(space::XXS)
+                    .align_y(Alignment::Center)
+                    .wrap()
+                    .into(),
+            );
+        }
+        let lines = widget::column::with_children(vec![
+            widget::row::with_children(title)
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+            widget::container(widget::column::with_children(details).spacing(space::XXS))
+                .padding(Padding {
+                    left: f32::from(design::ROW_ICON_SIZE) + space::S,
+                    ..Padding::ZERO
+                })
+                .into(),
+        ])
+        .spacing(space::XS);
+        let mut name = format!("Open {}, project folder", project.name);
+        if current {
+            name.push_str(", current");
+        }
+        push_panes(&mut name, agents.len());
+        let menu = Menu::Project(project.id);
+        let button = widget::button::custom(lines)
+            .name(name)
+            .class(crate::work_ui::card_style(current))
+            .padding([space::XS + space::XXS, space::S])
+            .width(Length::Fill)
+            .on_press_maybe(self.sidebar(SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }));
+        let row = widget::mouse_area(crate::interaction::hover(button));
+        if self.modal_open {
+            row.into()
+        } else {
+            row.on_right_press(Action::Menu(Some(menu))).into()
+        }
     }
 
     /// A checkout: its name and the facts about it, then its path and the
@@ -1334,6 +1431,7 @@ mod tests {
                     project, worktree, ..
                 } => projects[project].worktrees[worktree].label().to_owned(),
                 Entry::Operation { .. } => "operation".to_owned(),
+                Entry::Folder { .. } => "folder".to_owned(),
                 Entry::Empty { .. } => "empty".to_owned(),
             })
             .collect()
@@ -1504,20 +1602,23 @@ mod tests {
 
     /// The accessible names a project's header publishes, in tree order.
     fn heading_names(project: &SidebarProject) -> Vec<String> {
-        use cosmic::iced::Size;
-        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
-
-        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let state = State::default();
-        let projects = std::slice::from_ref(project);
         let view = View {
             state: &state,
-            projects,
+            projects: std::slice::from_ref(project),
             editors: &[],
             current: None,
             modal_open: false,
         };
-        let mut element = view.project_heading(project, true);
+        names(view.project_heading(project, true))
+    }
+
+    /// The accessible names an element publishes, in tree order.
+    fn names(mut element: Element<'_, Action>) -> Vec<String> {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
             &mut tree,
@@ -1552,5 +1653,53 @@ mod tests {
         assert!(lists(&cagents), "{:?}", heading_names(&cagents));
         cagents.unreachable = Some("Missing folder".into());
         assert!(!lists(&cagents), "not for a folder that cannot be read");
+    }
+
+    /// A folder has no checkouts, so its root is a row of its own, pressed
+    /// to open it and listing the panes working there; a folder that cannot
+    /// be read says why instead.
+    #[test]
+    fn a_folder_projects_root_is_a_row_that_opens_it() {
+        let mut notes = project("notes", vec![]).with_kind(ProjectKind::Folder);
+        let mut state = State::default();
+        let projects = vec![notes.clone()];
+        state.refresh(1, &projects);
+        assert_eq!(worktree_labels(&state, &projects), ["# notes", "folder"]);
+
+        let key = notes.folder_key().unwrap();
+        let card = CardId::new();
+        state.set_agents(Agents::from([(
+            (key.project_id, key.worktree_id),
+            vec![Agent {
+                card,
+                title: "Draft the release notes".into(),
+                provider: None,
+                state: AgentState::Shell,
+                channel: None,
+            }],
+        )]));
+        let view = View {
+            state: &state,
+            projects: &projects,
+            editors: &[],
+            current: Some((key.project_id, key.worktree_id)),
+            modal_open: false,
+        };
+        let row = names(view.folder(&projects[0]));
+        assert_eq!(
+            row.first().map(String::as_str),
+            Some("Open notes, project folder, current, 1 pane open in it"),
+            "{row:?}"
+        );
+        assert!(
+            row.iter()
+                .any(|name| name.contains("Draft the release notes")),
+            "{row:?}"
+        );
+
+        notes.unreachable = Some("Missing folder".into());
+        let projects = vec![notes];
+        state.refresh(2, &projects);
+        assert_eq!(worktree_labels(&state, &projects), ["# notes", "empty"]);
     }
 }

@@ -124,13 +124,12 @@ pub(in crate::app) mod tests {
             app.sidebar_navigation_action(row),
             Some(SidebarAction::ToggleProject(project))
         );
+        // A folder folds as a repository does; its root opens from its row
+        // in the Worktrees pane.
         app.sidebar_model.projects[0].kind = ProjectKind::Folder;
         assert_eq!(
             app.sidebar_navigation_action(row),
-            Some(SidebarAction::OpenRepository {
-                project_id: project,
-                repository: "/selection-project".into(),
-            })
+            Some(SidebarAction::ToggleProject(project))
         );
         app.sidebar_model.projects[0].kind = ProjectKind::Git;
         // A GitHub project's pull requests open from its Worktrees pane
