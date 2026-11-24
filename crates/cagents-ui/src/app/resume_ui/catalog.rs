@@ -12,7 +12,7 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const ENTRY_LIMIT: usize = 262_144;
 /// Transcripts remembered across openings of the picker.
 const CACHE_LIMIT: usize = 131_072;
-/// A saved catalog larger than this is not one this build wrote.
+/// The maximum bytes in the reconstructible catalog on disk.
 const STORE_LIMIT: u64 = 256 << 20;
 /// Changes when what a saved catalog holds changes meaning, so an older one
 /// is read again from the transcripts rather than misread.
@@ -107,6 +107,62 @@ struct Entry {
 struct Stored {
     format: u32,
     entries: Vec<(PathBuf, Entry)>,
+}
+
+impl Stored {
+    fn save(mut self, path: &Path, limit: u64) -> io::Result<()> {
+        self.entries
+            .sort_unstable_by(|(left_path, left), (right_path, right)| {
+                right
+                    .version
+                    .modified
+                    .cmp(&left.version.modified)
+                    .then_with(|| left_path.cmp(right_path))
+            });
+        // Postcard stores a format number and sequence length before the
+        // entries. Dropping entries can only make that prefix shorter.
+        let size = |result: Result<usize, postcard::Error>| {
+            result.map(|bytes| bytes as u64).map_err(io::Error::other)
+        };
+        let header = size(postcard::experimental::serialized_size(&(
+            self.format,
+            self.entries.len(),
+        )))?;
+        let mut remaining = limit.checked_sub(header).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Catalog byte limit is too small",
+            )
+        })?;
+        let mut keep = 0;
+        for entry in &self.entries {
+            let bytes = size(postcard::experimental::serialized_size(entry))?;
+            let Some(after) = remaining.checked_sub(bytes) else {
+                break;
+            };
+            remaining = after;
+            keep += 1;
+        }
+        self.entries.truncate(keep);
+
+        let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".resume-catalog.")
+            .tempfile_in(parent)?;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        postcard::to_io(&self, BufWriter::new(&mut temporary))
+            .map_err(io::Error::other)?
+            .flush()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
 }
 
 /// Transcript summaries by exact file version, retained across picker
@@ -280,18 +336,35 @@ impl Cache {
         if self.restored.swap(true, Ordering::Relaxed) {
             return;
         }
-        let Some(stored) = std::fs::File::open(path)
-            .ok()
-            .filter(|file| file.metadata().is_ok_and(|meta| meta.len() <= STORE_LIMIT))
-            .and_then(|file| {
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::BufReader::new(file), &mut bytes).ok()?;
-                postcard::from_bytes::<Stored>(&bytes).ok()
-            })
-            .filter(|stored| stored.format == STORE_FORMAT)
-        else {
+        let Ok(file) = std::fs::File::open(path) else {
             return;
         };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        if !metadata.is_file() {
+            return;
+        }
+        if metadata.len() > STORE_LIMIT {
+            // Replace an oversized legacy catalog even when the scan finds
+            // nothing to save. The original transcripts need no changes.
+            self.changed.store(true, Ordering::Relaxed);
+            return;
+        }
+        let mut bytes = Vec::new();
+        if file.take(STORE_LIMIT + 1).read_to_end(&mut bytes).is_err() {
+            return;
+        }
+        if bytes.len() as u64 > STORE_LIMIT {
+            self.changed.store(true, Ordering::Relaxed);
+            return;
+        }
+        let Ok(stored) = postcard::from_bytes::<Stored>(&bytes) else {
+            return;
+        };
+        if stored.format != STORE_FORMAT {
+            return;
+        }
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
@@ -302,7 +375,7 @@ impl Cache {
 
     /// Saves the catalog for the next run when it changed, keeping only the
     /// transcripts in `live` when every one was looked at.
-    pub fn save(&self, path: &Path, live: Option<&HashSet<&Path>>) -> std::io::Result<()> {
+    pub fn save(&self, path: &Path, live: Option<&HashSet<&Path>>) -> io::Result<()> {
         let stored = {
             let Ok(mut entries) = self.entries.lock() else {
                 return Ok(());
@@ -325,22 +398,11 @@ impl Cache {
                     .collect(),
             }
         };
-        let bytes = postcard::to_allocvec(&stored).map_err(std::io::Error::other)?;
-        let parent = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-        let mut temporary = tempfile::Builder::new()
-            .prefix(".resume-catalog.")
-            .tempfile_in(parent)?;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        temporary.write_all(&bytes)?;
-        temporary.persist(path).map_err(|error| error.error)?;
-        Ok(())
+        let result = stored.save(path, STORE_LIMIT);
+        if result.is_err() {
+            self.changed.store(true, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -1148,5 +1210,64 @@ mod tests {
         let damaged = Cache::default();
         damaged.restore(&store);
         assert!(damaged.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_disk_budget_keeps_the_newest_catalog_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resume-catalog");
+        let entry = |name, modified| {
+            (
+                PathBuf::from(name),
+                Entry {
+                    version: FileVersion {
+                        device: 0,
+                        inode: 0,
+                        len: 0,
+                        modified: (modified, 0),
+                        changed: (modified, 0),
+                    },
+                    scan: Arc::new(Scan::default()),
+                },
+            )
+        };
+        let newest = entry("newest", 3);
+        let limit = postcard::experimental::serialized_size(&Stored {
+            format: STORE_FORMAT,
+            entries: vec![newest.clone()],
+        })
+        .unwrap() as u64;
+        Stored {
+            format: STORE_FORMAT,
+            entries: vec![entry("oldest", 1), entry("middle", 2), newest],
+        }
+        .save(&path, limit)
+        .unwrap();
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), limit);
+        let cache = Cache::default();
+        cache.restore(&path);
+        let entries = cache.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key(Path::new("newest")));
+    }
+
+    #[test]
+    fn an_oversized_legacy_catalog_is_replaced_even_without_transcripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resume-catalog");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(STORE_LIMIT + 1)
+            .unwrap();
+
+        let cache = Cache::default();
+        cache.restore(&path);
+        cache.save(&path, None).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let stored = postcard::from_bytes::<Stored>(&bytes).unwrap();
+        assert_eq!(stored.format, STORE_FORMAT);
+        assert!(stored.entries.is_empty());
     }
 }
