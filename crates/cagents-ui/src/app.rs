@@ -5731,12 +5731,13 @@ impl PullRequestPane {
 }
 
 /// Whether a pull request card `width` wide hides its side panel: the
-/// person's choice, or else whether a narrow card needs the room for an open
-/// review. Until one is open the panel holds the list to choose from and the
-/// rest of the card is empty, so it is never folded away unasked.
+/// person's choice, or else whether a narrow card needs the room for a file's
+/// diff. Until a file is chosen the panel holds what to choose from, the
+/// pull requests or the review's files, and the rest of the card is empty, so
+/// it is never folded away unasked.
 fn review_files_collapsed(pane: &PullRequestPane, width: f32) -> bool {
     pane.file_panel_collapsed
-        .unwrap_or(width < 640.0 && pane.review.is_open())
+        .unwrap_or(width < 640.0 && pane.review.selected().is_some())
 }
 
 /// Static chrome strings for a card kind.
