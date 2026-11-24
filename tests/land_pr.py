@@ -227,6 +227,58 @@ class LandTests(unittest.TestCase):
         self.assertEqual(self.remote_head(), head)
         self.assertIn("landed #7", self.output)
 
+    def squash_onto_moved_main(self):
+        """Squash with `reset --soft` onto a main that moved since the branch began.
+
+        The index keeps the branch's older tree, so the one commit also carries
+        the older copy of everything main changed meanwhile (#3875).
+        """
+        self.advance_main("shared.txt", "two\n")
+        self.advance_main("added.txt", "main's new file\n")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "reset", "-q", "--soft", "origin/main")
+        self.commit("feat: add a feature")
+        self.git(self.repo, "push", "-q", "-f", "origin", "feature")
+
+    def test_a_branch_squashed_onto_a_moved_main_is_refused_for_what_it_reverts(self):
+        self.squash_onto_moved_main()
+        self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertIn("would undo work already on main", self.output)
+        self.assertIn("shared.txt returns to its content before", self.output)
+        self.assertIn("(chore: move main)", self.output)
+        self.assertIn("added.txt is deleted", self.output)
+        self.assertNotIn("feature.txt", self.output)
+        self.assertIsNone(self.merged())
+        self.assertEqual(self.run_land("--dry-run"), land.REFUSED, self.output)
+
+    def test_an_intended_revert_lands_with_allow_restore(self):
+        self.squash_onto_moved_main()
+        head = self.remote_head()
+        self.assertEqual(self.run_land("--allow-restore"), 0, self.output)
+        self.assertEqual(self.merged()["sha"], head)
+
+    def test_moving_a_file_main_recently_added_is_not_a_deletion(self):
+        self.advance_main("added.txt", "main's new file\nwith enough lines\nto be recognised\n")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "merge", "-q", "--no-edit", "origin/main")
+        (self.repo / "moved").mkdir()
+        self.git(self.repo, "mv", "added.txt", "moved/added.txt")
+        self.commit("refactor: move the new file")
+        self.git(self.repo, "push", "-q", "origin", "feature")
+        self.assertEqual(self.run_land(), 0, self.output)
+
+    def test_new_content_for_a_file_main_changed_is_not_a_restore(self):
+        self.advance_main("shared.txt", "two\n")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.git(self.repo, "merge", "-q", "--no-edit", "origin/main")
+        (self.repo / "shared.txt").write_text("three\n")
+        (self.repo / "obsolete.txt").write_text("x\n")
+        self.commit("feat: change shared")
+        (self.repo / "obsolete.txt").unlink()
+        self.commit("chore: drop a file this branch added")
+        self.git(self.repo, "push", "-q", "origin", "feature")
+        self.assertEqual(self.run_land(), 0, self.output)
+
     def test_a_protocol_bump_on_main_after_ci_refuses_the_landing(self):
         self.protocol_feature()
         head = self.remote_head()
