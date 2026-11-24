@@ -784,7 +784,9 @@ mod tests {
         assert!(!app.settings.show_mentioned_pull_requests);
         assert!(!app.tracks_mentions(chat));
         let unexpanded = |height: conversation::Height| height.content - height.expanded;
-        let row = design::list::TWO_LINE_HEIGHT;
+        // Pull requests whose state is not read yet are named by their
+        // number alone, in one line.
+        let row = design::ROW_HEIGHT;
         let summary = app.work_summary(chat);
         assert_eq!((summary.count, summary.mentioned), (1, 0));
         assert_eq!(unexpanded(summary.height), row);
