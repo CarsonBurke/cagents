@@ -304,8 +304,14 @@ This option cannot be combined with restart, relaunch, uninstall or purge option
 
 #### Withdraw or re-select a staged build
 
-Every installed version stays under `versions/`. To change which one `current`
-serves without applying it, add `--select VERSION` to `--stage-only`:
+After a successful install or stage, cagents keeps the version served by
+`current`, the version it replaced, and any version still used by a running
+process or the installation's runtime owner. A recovered or abandoned retry
+candidate can be removed after two weeks, once a standalone install has
+verified recovery is settled. Unrecognized files and directories are left alone.
+
+To change which retained version `current` serves without applying it, add
+`--select VERSION` to `--stage-only`.
 
 ```sh
 CAGENTS_ARCHIVE=dist/cagents-RELEASE-x86_64-unknown-linux-gnu.tar.gz \
