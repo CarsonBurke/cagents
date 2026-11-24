@@ -1549,9 +1549,9 @@ class PreflightCancellation(unittest.TestCase):
             for path in self.root.glob(pattern):
                 path.unlink()
 
-    def start(self, *, environment=None, pass_fds=()):
+    def start(self, *arguments, environment=None, pass_fds=()):
         process = subprocess.Popen(
-            [str(self.root / "cargo-gate"), "test", "--locked", "--no-run"],
+            [str(self.root / "cargo-gate"), *(arguments or ("test", "--locked", "--no-run"))],
             cwd=self.root, env=self.env if environment is None else environment,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True, pass_fds=pass_fds,
@@ -1702,6 +1702,50 @@ class PreflightCancellation(unittest.TestCase):
                                  ["metadata", "compiler", "compiler-stdin"])
                 self.assert_preflight_unslotted(self.calls())
                 self.assertTrue(self.slot_is_free())
+
+    def install_offload(self):
+        # The real router, with the helper it reads beside itself.
+        for name in ("cargo-offload", "git_ancestry.py"):
+            shutil.copy2(ROOT / "scripts" / name, self.root / name)
+
+    def test_read_only_cargo_queries_skip_build_preflight_and_admission(self):
+        self.install_offload()
+        self.configure(guard_exit=2)
+        with self.lock.open("a") as slot:
+            fcntl.flock(slot, fcntl.LOCK_EX)
+            for arguments in (("metadata", "--format-version=1"), ("+stable", "tree", "--locked"),
+                              ("--version",)):
+                with self.subTest(arguments=arguments):
+                    self.clear()
+                    process = self.start("cargo", *arguments)
+                    _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
+                    self.assertEqual(process.returncode, 0, stderr)
+                    calls = [event for event in self.calls() if "arguments" in event]
+                    self.assertEqual([event["arguments"] for event in calls], [list(arguments)])
+                    self.assertTrue(calls[0]["held"], calls)
+                    self.assertFalse(calls[0]["marker"], calls)
+
+    def test_other_local_cargo_commands_keep_build_preflight(self):
+        self.install_offload()
+        self.configure(guard_exit=2)
+        for arguments in (("clean",), ("fmt",), ("build-alias",), ("--offline", "metadata")):
+            with self.subTest(arguments=arguments):
+                self.clear()
+                process = self.start(*arguments)
+                _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
+                self.assertEqual(process.returncode, 2, stderr)
+                self.assertEqual([event["phase"] for event in self.calls()], ["metadata", "guard"])
+
+    def test_local_cargo_queries_use_real_cargo_inside_gate_exec(self):
+        self.install_offload()
+        process = self.start("exec", "sh", "-c", "cargo metadata --format-version=1",
+                             environment=self.env | {"CAGENTS_BUILD_SHARES": "1"})
+        _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 0, stderr)
+        calls = self.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard", "seed", "metadata"])
+        self.assertEqual(calls[-1]["arguments"], ["metadata", "--format-version=1"])
+        self.assertTrue(calls[-1]["held"], calls)
 
 
 class TestsUnderAMemoryLimit(unittest.TestCase):
