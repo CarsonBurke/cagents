@@ -1026,25 +1026,39 @@ impl<'a> View<'a> {
     }
 
     /// What is true of the checkout now: its changes, conflicts, how far it
-    /// is from its upstream, and its pull request's checks and review.
+    /// is from its upstream, and its pull request's checks and review. Its
+    /// pull request's state is the leading glyph's to say.
     fn facts(
         &self,
         worktree: &'a SidebarWorktree,
         indicators: &crate::sidebar::WorktreeIndicators<'a>,
     ) -> Vec<Element<'a, Action>> {
+        // Changes and conflicts are glyphs that say their counts on hover, as
+        // the Work board and a conversation's Work rows mark them.
         let mut facts = Vec::new();
         if let Some(dirty) = &worktree.dirty
             && dirty.conflicted > 0
         {
-            facts.push(badge(
-                format!("{} conflicted", dirty.conflicted),
-                Tone::Themed(design::destructive_color),
+            facts.push(crate::interaction::tooltip(
+                crate::sidebar::toned_icon_sized(
+                    Icon::Warning,
+                    crate::sidebar::BadgeTone::Danger,
+                    design::COMPACT_ICON_SIZE,
+                ),
+                match dirty.conflicted {
+                    1 => "1 conflicted file".to_owned(),
+                    count => format!("{count} conflicted files"),
+                },
             ));
         }
-        if let Some(label) = indicators.dirty {
-            facts.push(crate::interaction::tooltip(
-                badge(label, Tone::Themed(design::muted_icon_color)),
-                "Uncommitted changes in the checkout",
+        if let Some(count) = indicators.dirty_count {
+            let mut label = crate::ui_controls::uncommitted_label(count, "");
+            if worktree.untracked_omitted {
+                label.push_str(", untracked files not counted");
+            }
+            facts.push(crate::ui_controls::uncommitted_glyph(
+                label,
+                design::COMPACT_ICON_SIZE,
             ));
         }
         if let (Some(ahead), Some(behind)) = (worktree.ahead, worktree.behind)
@@ -1075,9 +1089,6 @@ impl<'a> View<'a> {
             }
             if let Some(checks) = pr.active_checks() {
                 facts.push(crate::sidebar::check_indicator(checks));
-            }
-            if let Some(state) = pr.state {
-                facts.push(badge(state.label(), Tone::Themed(state.tone())));
             }
         }
         facts

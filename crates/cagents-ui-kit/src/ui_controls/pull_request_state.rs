@@ -257,6 +257,39 @@ pub fn pull_request_review_glyph<'a, Message: 'a>(
     named_glyph(icon, tone, size, review_label(review).to_owned())
 }
 
+/// How a worktree's uncommitted changes are said on hover and to assistive
+/// technology: `1 uncommitted change`, `4 uncommitted changes, +8 −17`.
+/// `lines` is what [`crate::repository::line_change_counts`] says of them,
+/// empty when nothing measured them.
+pub fn uncommitted_label(count: u64, lines: &str) -> String {
+    let noun = if count == 1 { "change" } else { "changes" };
+    if lines.is_empty() {
+        format!("{count} uncommitted {noun}")
+    } else {
+        format!("{count} uncommitted {noun}, {lines}")
+    }
+}
+
+/// A worktree with uncommitted changes, as Projects marks one, with `label`
+/// (see [`uncommitted_label`]) on hover. A clean worktree has no mark.
+pub fn uncommitted_glyph<'a, Message: 'a>(label: String, size: u16) -> Element<'a, Message> {
+    named_glyph(Icon::Changes, design::muted_icon_color, size, label)
+}
+
+/// A worktree holding commits its pull request does not have yet: the push
+/// glyph, since pushing them is what brings the two together.
+pub fn unpushed_glyph<'a, Message: 'a>(size: u16) -> Element<'a, Message> {
+    named_glyph(
+        Icon::Push,
+        design::muted_icon_color,
+        size,
+        UNPUSHED_LABEL.to_owned(),
+    )
+}
+
+/// What [`unpushed_glyph`] says.
+pub const UNPUSHED_LABEL: &str = "Commits not pushed to the pull request";
+
 #[cfg(test)]
 mod tests {
     use super::*;
