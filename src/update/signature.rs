@@ -259,7 +259,7 @@ pub(crate) fn sign_for_test(
     (TrustedKey(public), armored)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};

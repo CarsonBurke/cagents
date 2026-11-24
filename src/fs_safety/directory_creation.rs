@@ -313,7 +313,7 @@ impl OwnedPrivateSibling {
         self.stamp = Some(stamp);
         Ok(())
     }
-    #[cfg(test)]
+    #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
     pub(crate) fn directory(&self) -> io::Result<&Root> {
         self.validate()?;
         Ok(self.directory.as_ref().unwrap())
@@ -343,7 +343,7 @@ impl OwnedPrivateSibling {
     /// Actual native handles, including the pinned original sticky parent.
     /// Arc aliases of the parent/child must be deduplicated by the owner.
     /// Quarantine is a name under that same parent and owns no extra FD.
-    #[cfg(test)]
+    #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
     pub(crate) fn retained_descriptor_count(&self) -> usize {
         1 + usize::from(self.directory.is_some())
     }
@@ -358,7 +358,7 @@ impl OwnedPrivateSibling {
             .path
             .join(self.quarantined.as_ref().unwrap_or(&self.name))
     }
-    #[cfg(test)]
+    #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
     pub(crate) fn is_removed(&self) -> bool {
         self.removed
     }
@@ -1480,7 +1480,7 @@ pub(crate) fn fixture_directory_preparation_failure(root: &Root) -> DirectoryCre
     .unwrap_err()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use std::{

@@ -117,7 +117,7 @@ pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

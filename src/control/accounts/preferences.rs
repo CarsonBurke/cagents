@@ -92,7 +92,7 @@ fn output(provider: Provider, selection: &DefaultSelection, revision: u64) -> Co
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use clap::Parser;

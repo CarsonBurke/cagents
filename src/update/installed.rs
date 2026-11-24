@@ -745,7 +745,7 @@ fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool
     invalid(parts.join(" "))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

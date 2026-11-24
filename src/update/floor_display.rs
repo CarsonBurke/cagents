@@ -169,7 +169,7 @@ fn identity(value: &impl Serialize) -> String {
 
 /// `--yes` accepts only the ordinary review. A person at a terminal must type
 /// this word, even when every other update choice has already been approved.
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 pub(super) fn read_stop_choice(
     input: &mut impl io::BufRead,
     is_terminal: bool,
@@ -422,7 +422,7 @@ fn foreground(root: &Path, pid: u32) -> Option<Foreground> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use crate::{agent::Provider, chat, model::LaunchRecipe};

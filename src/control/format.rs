@@ -277,7 +277,7 @@ pub(super) fn relative_time(at_ms: u64, now_ms: u64) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

@@ -553,7 +553,7 @@ fn poll_with(
     Ok((pending, idle))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use crate::{

@@ -501,6 +501,6 @@ fn appended(held: &api::Item, current: &api::Item) -> Option<api::TextAppend> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 #[path = "translate_tests.rs"]
 mod tests;

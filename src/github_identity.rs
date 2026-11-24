@@ -206,7 +206,7 @@ pub(crate) fn pull_request_path_segment(value: &str) -> Result<String, String> {
     String::from_utf8(decoded).map_err(|_| "The repository URL is not UTF-8".into())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

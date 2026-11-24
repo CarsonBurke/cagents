@@ -54,7 +54,7 @@ pub fn joined<L: AsRef<str>, C: AsRef<str>>(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

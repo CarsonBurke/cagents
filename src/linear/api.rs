@@ -500,7 +500,7 @@ fn http_date_ms(value: &str) -> Option<u64> {
     u64::try_from(seconds).ok()?.checked_mul(1000)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

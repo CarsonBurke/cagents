@@ -181,7 +181,7 @@ pub fn remove(workspace: Option<&str>) -> Result<(), Error> {
     helper(&["clear"], workspace, None).map(|_| ())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 
