@@ -843,6 +843,8 @@ struct Residence {
     /// This holder's divided cgroup scope, when the user manager gave one.
     /// The commands of the confirmed server are kept apart from it.
     scope: Option<crate::daemon::process_scope::ProviderScope>,
+    // The holder, which outlives daemon handoffs, owns this directory.
+    temp: Option<crate::daemon::codex_temp::PrivateDir>,
 }
 
 impl Residence {
@@ -878,12 +880,19 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let socket = registry::socket(&directory, spawn.recovery.source.id);
         let listener = Listener::bind(socket)?;
-        let child = match spawn.command().spawn() {
+        let inherited = spawn.environment.get("TMPDIR").map(std::ffi::OsStr::new);
+        let mut temp =
+            crate::daemon::codex_temp::PrivateDir::create(inherited, Some(&spawn.directory))
+                .map_err(|error| {
+                    format!("Cannot create private Codex temporary directory: {error}")
+                })?;
+        let child = match spawn.command().env("TMPDIR", temp.path()).spawn() {
             Ok(child) => Server(crate::daemon::owned_children::OwnedChildren::new(child)),
             Err(error) => {
                 return Err(error.to_string());
             }
         };
+        temp.launched();
         let record = Record {
             version: 4,
             build: Some(registry::BuildIdentity::current(Kind::Native)),
@@ -907,6 +916,7 @@ impl Residence {
             child_events,
             released: false,
             _working_directory: working_directory,
+            temp: Some(temp),
         };
         residence
             .record
@@ -935,6 +945,19 @@ impl Residence {
                 "Provider descendants are still stopping; ownership remains with the native holder"
                     .into(),
             );
+        }
+        if let Some(temp) = self.temp.take() {
+            if self.child.0.reap().unwrap_or(false) {
+                let path = temp.path().to_path_buf();
+                if let Err(error) = temp.close_after_teardown() {
+                    eprintln!(
+                        "Could not remove Codex temporary directory {}: {error}",
+                        path.display()
+                    );
+                }
+            } else {
+                temp.keep();
+            }
         }
         if let Some(owned) = &self.recovery.source.owned_codex_listener {
             let _ = std::fs::remove_file(&owned.socket);
@@ -2149,9 +2172,11 @@ exec /bin/sleep 60
 
     #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
+        use std::os::unix::ffi::OsStrExt;
+
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST";
         if std::env::var_os(STAGE).is_none() {
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = tempfile::tempdir().unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "chat::native_holder::transport::tests::spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close", "--nocapture"])
                 .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
@@ -2174,7 +2199,7 @@ exec /bin/sleep 60
             .allocator
             .boot_id = boot;
         let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
-        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let working = tempfile::tempdir().unwrap();
         let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
             std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
         )));
@@ -2189,7 +2214,10 @@ exec /bin/sleep 60
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), "/bin/sleep 60 & exec /bin/sleep 60".into()],
             working_directory: working.path().to_owned(),
-            environment: Default::default(),
+            environment: BTreeMap::from([(
+                "TMPDIR".into(),
+                working.path().to_str().unwrap().into(),
+            )]),
             unset_environment: Default::default(),
         };
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
@@ -2209,6 +2237,18 @@ exec /bin/sleep 60
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        let environment = std::fs::read(format!("/proc/{}/environ", record.root.pid)).unwrap();
+        let temp = environment
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(b"TMPDIR="))
+            .map(|path| std::path::Path::new(std::ffi::OsStr::from_bytes(path)))
+            .unwrap();
+        assert_eq!(
+            temp.parent().unwrap(),
+            working.path().canonicalize().unwrap()
+        );
+        assert_eq!(std::fs::metadata(temp).unwrap().mode() & 0o777, 0o700);
+        std::fs::create_dir(temp.join(".git")).unwrap();
         crate::host::descriptor_limit::tests::assert_process_limit(record.root.pid as u32, &limit);
         crate::host::descriptor_limit::tests::assert_process_limit(
             record.holder.pid as u32,
@@ -2261,6 +2301,11 @@ exec /bin/sleep 60
         assert!(record.root.is_current());
         let (adopted, saved) = adopt(&record, &source, &successor).unwrap();
         assert_eq!(saved.confirmed_thread.as_ref(), Some(&thread));
+        assert!(temp.join(".git").is_dir());
+        assert_eq!(
+            saved.execution_environment.0["TMPDIR"],
+            working.path().to_str().unwrap()
+        );
         let detached = adopted.preserve();
         assert!(record.root.is_current());
         let mut stale = detached.clone();
@@ -2269,6 +2314,7 @@ exec /bin/sleep 60
         assert!(record.root.is_current());
         detached.close().unwrap();
         assert!(!record.root.is_current());
+        assert!(!temp.exists());
         assert!(
             registry::discover(
                 &registry::directory(Kind::Native).unwrap(),

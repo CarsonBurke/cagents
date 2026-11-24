@@ -124,7 +124,7 @@ fn killed_report(test: &str) -> String {
 /// not a pipe: a descendant that outlives a killed supervisor would hold a
 /// pipe open and stall this test until it exited.
 fn supervise(mut command: Command) -> io::Result<(ExitStatus, String)> {
-    let mut output = tempfile::tempfile_in("/var/tmp")?;
+    let mut output = tempfile::tempfile()?;
     let status = command
         .stdout(output.try_clone()?)
         .stderr(output.try_clone()?)

@@ -3006,7 +3006,7 @@ fn identity_only_context_never_recaptures_a_replacement_directory() {
         environment: BTreeMap::new(),
         unset_environment: Default::default(),
     };
-    assert!(spawn_provider(&spec, &AtomicBool::new(false), None).is_err());
+    assert!(spawn_provider(&spec, &AtomicBool::new(false), None, false).is_err());
 }
 
 struct Echo;
@@ -5806,6 +5806,42 @@ fn direct_provider_non_reaping_observation_preserves_exit_status() {
 }
 
 #[test]
+fn codex_stdio_replaces_tmpdir_and_cleans_it_after_exit() {
+    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+
+    let working = tempfile::tempdir().unwrap();
+    let recipe = crate::model::LaunchRecipe {
+        program: "/usr/bin/printenv".into(),
+        arguments: vec!["TMPDIR".into()],
+        working_directory: working.path().to_path_buf(),
+        environment: BTreeMap::from([(
+            "TMPDIR".into(),
+            working.path().to_str().unwrap().to_owned(),
+        )]),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let mut child = spawn_provider(&spec, &AtomicBool::new(false), None, true)
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut child.child.stdout.take().unwrap(), &mut bytes).unwrap();
+    assert_eq!(bytes.pop(), Some(b'\n'));
+    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    assert_eq!(
+        temp.parent(),
+        Some(working.path().canonicalize().unwrap().as_path())
+    );
+    assert_eq!(
+        std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    std::fs::create_dir(temp.join(".git")).unwrap();
+    drop(child);
+    assert!(!temp.exists());
+}
+
+#[test]
 fn a_provider_is_never_handed_a_parent_session() {
     use std::io::Read;
     let spec = ProcessSpec {
@@ -5828,7 +5864,7 @@ fn a_provider_is_never_handed_a_parent_session() {
         .into(),
         unset_environment: Default::default(),
     };
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
         .unwrap()
         .unwrap();
     let mut output = String::new();
@@ -5865,7 +5901,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
         environment: Default::default(),
         unset_environment: Default::default(),
     };
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
         .unwrap()
         .unwrap();
     let pid = provider.child.id();
@@ -5948,7 +5984,7 @@ fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
         unset_environment: Default::default(),
     };
     let (wake, mut woken) = UnixStream::pair().unwrap();
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake))
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake), false)
         .unwrap()
         .unwrap();
     let root = provider.child.id();
@@ -6145,7 +6181,7 @@ fn a_detached_command_outlives_a_closed_or_finished_provider() {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
             .unwrap()
             .unwrap();
         if !provider

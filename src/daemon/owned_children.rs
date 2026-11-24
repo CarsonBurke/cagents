@@ -299,7 +299,7 @@ impl OwnedChildren {
     }
 
     /// Reaps every child that has exited, and whether none remain.
-    fn reap(&mut self) -> io::Result<bool> {
+    pub(crate) fn reap(&mut self) -> io::Result<bool> {
         loop {
             let mut status = 0;
             match unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) } {
