@@ -320,11 +320,26 @@ tip=$2
 scripts/prebuild-release --repository "$PWD" request "$tip" >/dev/null
 scripts/main-build-sentinel --repository "$PWD" --require-tests "$tip" > /dev/null 2>&1 </dev/null &
 tests=$!
-scripts/prebuild-release --repository "$PWD" wait "$tip" </dev/null
+scripts/prebuild-release --repository "$PWD" wait "$tip" </dev/null &
+bundle=$!
+first=
 status=0
-wait "$tests" || status=$?
+wait -n -p first "$tests" "$bundle" || status=$?
+if [[ ${first:-} == "$bundle" ]] && ((status)); then
+    exit "$status"
+fi
+if [[ ${first:-} != "$tests" ]]; then
+    status=0
+    wait "$tests" || status=$?
+fi
+if ((status)); then
+    # An unavailable verdict cannot be detected by the bundle waiter. Stop
+    # waiting without cancelling the service's potentially useful prebuild.
+    kill -TERM "$bundle" 2>/dev/null || :
+    wait "$bundle" || :
+fi
 case $status in
-    0) ;;
+    0) [[ ${first:-} == "$bundle" ]] || wait "$bundle" ;;
     1) echo "release: $tip fails its tests; see ~/.local/state/cagents-main-sentinel/logs on the build host" >&2; exit 1 ;;
     *) echo "release: the sentinel gave $tip no verdict (status $status); run the release again" >&2; exit 1 ;;
 esac

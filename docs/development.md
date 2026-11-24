@@ -910,16 +910,9 @@ the one main is held to. Its logs hold Cargo's rendered diagnostics, and
 `logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
 compiled, the issue shows those rather than the log's tail.
 
-Once the newest commit it checked, the tip it last saw, compiles, warnings or not, the sentinel also
-builds the three executables [native evidence](#native-evidence) runs for that
-commit and keeps
-them under `builds/` in its state directory, for the six newest such commits,
-about 0.6 GiB each. Evidence of main then copies them instead of compiling. A
-build that fails is logged to `logs/SHA-evidence.log` and not retried; evidence
-of that commit compiles it as before.
-
-Then it runs every lane's tests on that same commit, once, in the ordinary
-test profile on the sentinel's warm build directory:
+Once the newest checked commit compiles, the sentinel starts its release
+prebuild and runs every lane's tests on that commit in the ordinary test
+profile on the sentinel's warm build directory:
 `scripts/cargo-gate test --locked --all-targets --no-fail-fast` for the CLI,
 `--features host`, the shared library and application with `ui`, the same
 with the integrated browser (`cagents-ui/browser-protocol-fixture`, which
@@ -946,11 +939,21 @@ because of a `.git` outside the checkout, such as a stray `/var/tmp/.git`.
 That fails every fixture test in every lane, whatever the commit. The
 sentinel's log names the marker to remove.
 
+After the test lanes finish, the sentinel builds the three executables
+[native evidence](#native-evidence) runs and keeps them under `builds/` for the
+six newest built commits, about 0.6 GiB each. Native evidence copies these
+executables when available. A build that fails is logged to
+`logs/SHA-evidence.log`, and native evidence builds that commit when needed.
+The sentinel builds this evidence and bisects check failures before sending
+test notifications to GitHub.
+
 `scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
 commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a
 lane stopped outside the code and 4 if it could not get a verdict at all. A commit without a verdict, such as a version
 bump that main moved past before it was tested, is tested first, after any
 running check finishes, fetching main first if fw16 does not have it yet.
+When the watcher records that SHA's verdict, a waiting release can read it
+while the watcher still holds the checkout for native evidence.
 A failing verdict is not retested on its own: to test a commit again, such as
 after a flaky failure, remove its `verdicts/SHA.json`. If that commit is the
 newest one tested, the watcher tests it again on its next run.
@@ -1026,18 +1029,20 @@ A release signs and publishes a bundle fw16 has already built and checked
 ([Releasing](releasing.md)). `scripts/prebuild-release`, run as the
 `cagents-prebuild` user service, makes those bundles. The sentinel starts the
 service, without waiting for it, before it runs a commit's tests and again at
-every tick. The service bundles the newest main commit that compiled, unless
-that commit's tests failed or the version it declares is already tagged on
-origin (between a release and main's version bump; `status` shows it as
-skipped, and a request still builds it). Each bundle is exactly what
+every tick. The service bundles the newest main commit that compiled. If that
+commit's tests fail, it looks for a passing first-parent commit of the same
+version. It skips versions already tagged on origin, as happens between a
+release and main's version bump. A request can still build an already released
+version with a passing or pending verdict. Each bundle is exactly what
 `scripts/build-release-linux` makes of the commit with the commit's own scripts,
 including the artifact smoke checks and the metadata that lists every file's
 size and digest. It is built in a `.partial` directory and renamed into
 `~/.local/state/cagents-prebuilt/bundles/SHA` only once it is complete. The
-three newest bundles are kept (`--keep N`), plus any that a release has pinned
-in the past day. Its build cache and smoke runtime image
-are under `~/.cache/cagents-prebuild`, separate from the ones
-`scripts/release build` uses.
+store keeps three bundles (`--keep N`), plus any that a release has pinned in
+the past day. It retains a passing bundle of the current version when
+available and there is room for both it and a newer build. The build cache and
+smoke runtime image live under `~/.cache/cagents-prebuild`. The manual
+`scripts/release build` command uses its own caches.
 
 A background prebuild never delays the sentinel's verdicts or anyone else's
 build:
@@ -1077,12 +1082,14 @@ build:
   is how long that build then took.
 
 `prebuild-release request SHA` builds a commit next at normal priority,
-interrupting a background prebuild of another commit; requests build in the
-order they were made. `wait SHA [--timeout S]` blocks until the commit is
-bundled, and `status` lists bundles, the build running, requests and
-failures. A failed build is tried once more an hour later, in case the host
-rather than the commit failed; after that, or once its tests fail, only a
-request builds it again. Its log is under `failures/` in the store.
+interrupting a background prebuild of another commit. Requests build in the
+order they were made. An already starved build can finish the same commit
+without giving up its build slot. `wait SHA [--timeout S]` blocks until the
+commit is bundled or fails. `status` lists bundles, the build running,
+requests and failures. A failed build is tried once more an hour later, in case the host
+rather than the commit failed. After that, only a request builds it again.
+Both commands refuse a commit with a failing test verdict. Build failure logs
+are under `failures/` in the store.
 
 Install the service on fw16 beside the sentinel, in
 `~/.config/systemd/user/cagents-prebuild.service`:

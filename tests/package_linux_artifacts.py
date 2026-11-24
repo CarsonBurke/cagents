@@ -32,12 +32,14 @@ class PackageLinuxArtifacts(unittest.TestCase):
         self.checkout = self.directory / "checkout"
         for leaf in ("scripts", "packaging"):
             (self.checkout / leaf).mkdir(parents=True)
-        for name in ("package-linux.sh", "build-ceditor-product", "cargo_artifacts.py"):
+        for name in ("package-linux.sh", "package-ceditor-linux.sh", "package-release-linux",
+                     "build-ceditor-product", "cargo_artifacts.py"):
             shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
         for name in ("dev.cagents.Cagents.desktop", "dev.cagents.Cagents.Daemon.desktop",
                      "dev.cagents.Cagents.svg", "dev.cagents.Cagents.png",
                      "dev.cagents.Cagents.metainfo.xml", "cagents-package-lifecycle",
-                     "cagents-uninstall", "THIRD-PARTY-NOTICES"):
+                     "cagents-uninstall", "THIRD-PARTY-NOTICES",
+                     "io.github.cagents.ceditor.desktop", "io.github.cagents.ceditor.svg"):
             shutil.copy2(ROOT / "packaging" / name, self.checkout / "packaging" / name)
         # Never downloads: names the fixture libraries and records the cache.
         self.sherpa = self.directory / "sherpa-onnx libraries"
@@ -70,20 +72,39 @@ args = sys.argv[1:]
 if args[0] == 'tree':
     print('fixture v1')
     sys.exit(0)
+if args[0] == 'metadata':
+    print(json.dumps({'packages': [{'name': name, 'version': os.environ['VERSION']}
+        for name in ('cagents', 'ceditor')]}))
+    sys.exit(0)
 assert args[0] == 'build', args
+name = args[args.index('--bin') + 1] if '--bin' in args else 'ceditor'
 # Only the verified libraries may reach the helper's link.
-assert os.environ.get('SHERPA_ONNX_LIB_DIR') == os.environ['MOCK_SHERPA_LIB_DIR'], os.environ.get('SHERPA_ONNX_LIB_DIR')
+if 'MOCK_RELEASE_PIPELINE' not in os.environ or name == 'cagents-dictate':
+    assert os.environ.get('SHERPA_ONNX_LIB_DIR') == os.environ['MOCK_SHERPA_LIB_DIR'], os.environ.get('SHERPA_ONNX_LIB_DIR')
 if 'MOCK_EXPECTED_BUILD_METADATA' in os.environ:
     assert os.environ.get('CAGENTS_BUILD_METADATA') == os.environ['MOCK_EXPECTED_BUILD_METADATA']
-name = args[args.index('--bin') + 1]
 if os.environ.get('MOCK_BUILD_FAILURE') == name:
     print('fixture compiler failure: ' + name, file=sys.stderr)
     sys.exit(101)
-config = tomllib.loads((Path.cwd() / '.cargo/config.toml').read_text())
+if name == 'cagents' and '--no-default-features' in args and 'MOCK_PACKAGING_READY' in os.environ:
+    assert Path(os.environ['MOCK_PACKAGING_READY']).read_text() == 'ready\n'
+    print('fixture browserless compiler failure during full packaging', file=sys.stderr)
+    sys.exit(101)
+config_path = Path.cwd() / '.cargo/config.toml'
+if not config_path.is_file():
+    config_path = Path.cwd().parent / '.cargo/config.toml'
+config = tomllib.loads(config_path.read_text())
 triple = args[args.index('--target') + 1] if '--target' in args else config['build']['target']
 product = Path(os.environ['MOCK_PRODUCTS']) / name / triple / name
 product.parent.mkdir(parents=True, exist_ok=True)
 body = '#!/bin/sh\n# fresh:' + name + ':' + triple + '\n'
+variant = 'shared'
+if name in ('cagents', 'cagentsd'):
+    variant = 'browserless' if '--no-default-features' in args else 'full'
+if name == 'cagents-ui':
+    variant = 'full' if 'integrated-browser' in args else 'browserless'
+body += '# variant: ' + variant + '\n'
+body += '[ "$*" != "--version" ] || { printf "%s\\n" "' + name + ' ' + os.environ['VERSION'] + '"; exit 0; }\n'
 if name == 'cagents':
     body += '[ "$*" = "daemon protocol-version" ] || exit 92\n'
     body += 'printf "fresh\\n" >> "$MOCK_PROTOCOL"\nprintf "127\\n"\n'
@@ -101,6 +122,11 @@ if os.environ.get('MOCK_AMBIGUOUS_ARTIFACT') == name:
     other.chmod(0o755)
     print(json.dumps(dict(message, executable=str(other))))
 ''')
+        self.tool("jq", """
+metadata = json.load(sys.stdin)
+name = 'ceditor' if 'ceditor' in sys.argv[-1] else 'cagents'
+print(next(package['version'] for package in metadata['packages'] if package['name'] == name))
+""")
         self.tool("zig", "print(json.dumps({'zig_exe': str(Path(sys.argv[0]).resolve())}, indent=2))\n")
         self.tool("strip", "pass\n")
         self.tool("uname", "print('Linux' if sys.argv[1] == '-s' else 'x86_64')\n")
@@ -185,6 +211,13 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
             ["/bin/sh", str(self.checkout / "scripts/package-linux.sh"), "--variant", variant,
              *arguments],
             cwd=self.directory, env=self.environment | overrides,
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+
+    def package_release(self, **overrides):
+        return subprocess.run(
+            ["/bin/bash", "scripts/package-release-linux"], cwd=self.checkout,
+            env=self.environment | {"MOCK_RELEASE_PIPELINE": "1"} | overrides,
             capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
@@ -316,6 +349,63 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     ])
                     for path, original in self.decoys.items():
                         self.assertEqual(path.read_bytes(), original)
+
+    def test_release_reuses_shared_products_without_overwriting_variant_bytes(self):
+        result = self.package_release()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        products = [args[args.index("--bin") + 1] if "--bin" in args else "ceditor"
+                    for args in self.builds()]
+        self.assertEqual(products, [*PRODUCTS, *PRODUCTS[:-1], "ceditor"])
+        self.assertEqual((self.directory / "sherpa-calls").read_text().splitlines(),
+                         [str(self.target / "sherpa-onnx")])
+
+        def archive_bytes(product, prefix, names):
+            path = self.dist / f"{product}-{VERSION}-{NATIVE}.tar.gz"
+            with tarfile.open(path, "r:gz") as archive:
+                return {name: archive.extractfile(f"{product}-{VERSION}/{prefix}{name}").read()
+                        for name in names}
+
+        full = archive_bytes("cagents", "bin/", PRODUCTS)
+        browserless = archive_bytes("cagents-browserless", "bin/", PRODUCTS)
+        editor = archive_bytes("ceditor", f"lib/ceditor/releases/{VERSION}/bin/",
+                               ("cagents", "cagentsd", "ceditor"))
+        for product in PRODUCTS[:-1]:
+            self.assertIn(b"# variant: full\n", full[product])
+            self.assertIn(b"# variant: browserless\n", browserless[product])
+        self.assertEqual(full["cagents-dictate"], browserless["cagents-dictate"])
+        for product in ("cagents", "cagentsd"):
+            self.assertEqual(browserless[product], editor[product])
+        for package in ("cagents", "cagents-browserless"):
+            self.assertRegex((self.dist / f"{package}-{VERSION}-sizes.txt").read_text(),
+                             r"(?m)^build_seconds=[0-9]+$")
+
+    def test_release_reports_a_failed_archive_worker(self):
+        result = self.package_release(MOCK_UI_DYNSYM_EXIT="7")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("cannot inspect full UI dynamic symbols", result.stderr)
+        self.assertEqual(len(self.builds()), 7)
+        self.assertFalse(self.dist.exists())
+
+    def test_release_stops_the_overlapping_compressor_when_the_build_fails(self):
+        ready = self.directory / "packaging-ready"
+        stopped = self.directory / "compressor-stopped"
+        os.mkfifo(ready)
+        self.tool("gzip", r'''
+import signal
+assert len(os.sched_getaffinity(0)) == 1
+def stop(*_):
+    Path(os.environ['MOCK_COMPRESSOR_STOPPED']).touch()
+    sys.exit(143)
+signal.signal(signal.SIGTERM, stop)
+signal.alarm(10)  # Keep the fixture bounded even if the caller leaks its worker.
+Path(os.environ['MOCK_PACKAGING_READY']).write_text('ready\n')
+signal.pause()
+''')
+        result = self.package_release(MOCK_PACKAGING_READY=str(ready),
+                                      MOCK_COMPRESSOR_STOPPED=str(stopped))
+        self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
+        self.assertIn("fixture browserless compiler failure during full packaging", result.stderr)
+        self.assertTrue(stopped.is_file())
 
     def test_local_profile_archive_only_builds_and_checksums_just_the_archive(self):
         result = self.package("full", "--archive-only", CAGENTS_CARGO_PROFILE="local")
