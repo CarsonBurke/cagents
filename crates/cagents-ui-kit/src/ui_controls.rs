@@ -57,9 +57,9 @@ pub use popover::{
     SCROLLING_FRAME, popover, popover_item, popover_scroll, scrolling_popover, scrolling_width,
 };
 pub use pull_request_state::{
-    ChecksSummary, WorktreePullRequestState, check_state_glyph, check_state_label,
+    ChecksSummary, UNPUSHED_LABEL, WorktreePullRequestState, check_state_glyph, check_state_label,
     check_state_look, checks_glyph, pull_request_review_glyph, pull_request_state_glyph,
-    review_label, review_look,
+    review_label, review_look, uncommitted_glyph, uncommitted_label, unpushed_glyph,
 };
 pub use reserved::reserved;
 pub use responsive::responsive;
