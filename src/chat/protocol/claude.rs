@@ -3711,15 +3711,12 @@ impl Adapter for Claude {
             ).map_err(super::SetupError::Invalid)?
         };
         if let Some(error) = self.history_error.take() {
-            step.events.push(Event::History {
-                items: vec![history_notice(
-                    "Earlier messages in this conversation could not be shown",
-                    format!(
-                        "cagents could not read this conversation's saved transcript, so its earlier messages are not shown here. Claude Code reads the transcript itself when it resumes, so it may still have the earlier context.\n\nDetails: {error}"
-                    ),
-                )],
-                has_earlier: false,
-            });
+            step.events.push(Event::Item(history_notice(
+                "Earlier messages in this conversation could not be shown",
+                format!(
+                    "cagents could not read this conversation's saved transcript, so its earlier messages are not shown here. Claude Code reads the transcript itself when it resumes, so it may still have the earlier context.\n\nDetails: {error}"
+                ),
+            )));
         }
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
@@ -3729,10 +3726,10 @@ impl Adapter for Claude {
                 history.marked,
                 !self.history_only,
             ) {
-                step.events.push(Event::History {
-                    items: vec![history_notice("Some saved messages are not shown", body)],
-                    has_earlier: false,
-                });
+                step.events.push(Event::Item(history_notice(
+                    "Some saved messages are not shown",
+                    body,
+                )));
             }
             self.history_outcomes = std::mem::take(&mut history.call_outcomes);
             self.background_agents.extend(
@@ -4363,6 +4360,7 @@ impl Claude {
                 step.events.push(Event::Reset {
                     reason: "Claude reset the conversation".into(),
                 });
+                step.events.push(Event::OpeningHistoryComplete);
             }
             "control_response" => {
                 let response = &frame["response"];
@@ -4459,6 +4457,8 @@ impl Claude {
                             }
                             if self.resumed {
                                 self.observe_title(&mut step);
+                            } else {
+                                step.events.push(Event::OpeningHistoryComplete);
                             }
                             self.metadata(&response["response"], &mut step);
                             self.fast_mode_metadata(&response["response"], &mut step);

@@ -122,6 +122,9 @@ struct Omp {
     /// turn invalidates the outer option so a late page cannot restore an older
     /// turn's error.
     history_error: Option<Option<String>>,
+    /// The opening found while replaying OMP's oldest-first history. A
+    /// missing outer option means a page could not establish coverage.
+    history_opening: Option<Option<chat::OpeningTitle>>,
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
     dropped_chunks: HashMap<String, (usize, usize)>,
@@ -425,6 +428,7 @@ impl Omp {
     fn history_page(&mut self, cursor: Option<&str>) -> Value {
         if cursor.is_none() {
             self.history_error = Some(None);
+            self.history_opening = Some(None);
         }
         let mut request = self.request("get_messages_page");
         request["limit"] = 100.into();
@@ -1167,6 +1171,7 @@ impl Adapter for Omp {
                             self.ready = false;
                             self.history_request = None;
                             self.history_error = None;
+                            self.history_opening = None;
                             self.turn_error = TurnError::default();
                             self.requests.clear();
                             self.calls.clear();
@@ -1365,7 +1370,12 @@ impl Adapter for Omp {
                     }
                     "get_available_commands" => step.events.extend(commands(data)),
                     "get_messages_page" => {
-                        for message in data["messages"].as_array().into_iter().flatten() {
+                        let messages = data["messages"].as_array();
+                        let cursor = &data["nextCursor"];
+                        if messages.is_none() || !(cursor.is_string() || cursor.is_null()) {
+                            self.history_opening = None;
+                        }
+                        for message in messages.into_iter().flatten() {
                             // A later prompt starts a new exchange, so an
                             // earlier failure no longer explains the last one.
                             if matches!(text(message, "role"), "assistant" | "user")
@@ -1373,12 +1383,23 @@ impl Adapter for Omp {
                             {
                                 *error = assistant_error(message);
                             }
-                            step.events
-                                .extend(self.message_items(message).into_iter().map(Event::Item));
+                            let items = self.message_items(message);
+                            if let Some(opening) = &mut self.history_opening {
+                                for item in &items {
+                                    chat::OpeningTitle::observe(opening, item);
+                                }
+                            }
+                            step.events.extend(items.into_iter().map(Event::Item));
                         }
-                        if let Some(cursor) = data["nextCursor"].as_str() {
+                        if let Some(cursor) = cursor.as_str() {
                             step.writes.push(self.history_page(Some(cursor)));
                         } else {
+                            if let Some(opening) = self.history_opening.take() {
+                                if let Some(title) = opening {
+                                    step.events.push(Event::OpeningTitle(title));
+                                }
+                                step.events.push(Event::OpeningHistoryComplete);
+                            }
                             let error = self.history_error.take().flatten();
                             if !self.busy
                                 && let Some(message) = error
@@ -3801,6 +3822,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_history_confirms_the_opening_only_after_valid_pages() {
+        for (messages, expected) in [(json!([]), true), (Value::Null, false)] {
+            let mut adapter = Omp::default();
+            let first = adapter.history_page(None);
+            let partial = adapter
+                .receive(json!({
+                    "type":"response","id":first["id"],"command":"get_messages_page","success":true,
+                    "data":{"messages":messages,"nextCursor":"next"}
+                }))
+                .unwrap();
+            assert!(!partial.events.contains(&Event::OpeningHistoryComplete));
+            let finished = adapter
+                .receive(json!({
+                    "type":"response","id":partial.writes[0]["id"],"command":"get_messages_page","success":true,
+                    "data":{"messages":[]}
+                }))
+                .unwrap();
+            assert_eq!(
+                finished.events.contains(&Event::OpeningHistoryComplete),
+                expected
+            );
+            assert!(
+                !finished
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::OpeningTitle(_)))
+            );
+        }
+    }
+
+    #[test]
     fn asynchronous_local_session_switch_reloads_history_and_rejects_old_pages() {
         let mut adapter = Omp {
             session_id: Some("old".into()),
@@ -3864,10 +3916,31 @@ mod tests {
             .receive(page_reply(page, "New conversation", Some("new-cursor")))
             .unwrap();
         assert!(loaded.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Text {text,..},..}) if text=="New conversation")));
+        assert!(!loaded.events.iter().any(|event| matches!(
+            event,
+            Event::OpeningTitle(_) | Event::OpeningHistoryComplete
+        )));
         assert_eq!(loaded.writes[0]["cursor"], "new-cursor");
         let finished = adapter
             .receive(page_reply(&loaded.writes[0], "Second page", None))
             .unwrap();
+        let naming_events = finished
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::OpeningTitle(_) | Event::OpeningHistoryComplete
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            naming_events,
+            [
+                &Event::OpeningTitle(chat::OpeningTitle::Prompt("New conversation".into())),
+                &Event::OpeningHistoryComplete,
+            ]
+        );
         assert!(
             finished
                 .events

@@ -950,6 +950,8 @@ impl HostState {
     }
 
     /// Checks the resident chat metadata that authorizes an inferred title.
+    /// Returns whether the provider explicitly removed its own title, allowing
+    /// the canonical fallback to replace that source.
     ///
     /// The workspace writer calls this while it holds SQL writer admission,
     /// after it acquired that admission off the host lock. Keep it free of
@@ -960,10 +962,11 @@ impl HostState {
         expected: crate::chat::Session,
         title: &str,
         source: crate::model::ChannelTitleSource,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<bool, ProtocolError> {
         let naming = self.title_conversation(&expected)?;
+        let cleared = naming.provider_cleared && source == crate::model::ChannelTitleSource::Prompt;
         match naming.title() {
-            Some((current, kind)) if current == title && kind == source => Ok(()),
+            Some((current, kind)) if current == title && kind == source => Ok(cleared),
             // Older retained helpers and window transcript readers may know an
             // opening the resident hasn't read. A real opening supersedes the
             // provisional title of a conversation without a meaningful prompt yet.
@@ -974,9 +977,11 @@ impl HostState {
                         .as_ref()
                         .is_some_and(crate::chat::OpeningTitle::provisional) =>
             {
-                Ok(())
+                Ok(false)
             }
-            None if source == crate::model::ChannelTitleSource::Prompt => Ok(()),
+            None if source == crate::model::ChannelTitleSource::Prompt => {
+                Ok(cleared && title.is_empty())
+            }
             _ => Err(Self::stale_title()),
         }
     }

@@ -416,22 +416,25 @@ impl Registry {
         edit: &ModelEdit,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
     ) -> Result<DeltaApplied, String> {
-        self.commit_delta(edit, guard, true)
+        self.commit_delta(
+            edit,
+            |seen, sql| guard(seen, sql).map(|guard| (guard, false)),
+            true,
+        )
     }
 
     /// Like [`Registry::apply_delta_guarded`], but preserves a caller's
-    /// structured resident-admission refusal.  The workspace writer uses this
-    /// for title inference, whose chat guard runs only after SQLite admitted
-    /// the transaction.
-    pub(crate) fn apply_delta_guarded_with<G, E>(
+    /// structured resident-admission refusal. The chat guard can authorize a
+    /// fallback when the provider explicitly cleared its title.
+    pub(crate) fn apply_title_delta<G, E>(
         &mut self,
         edit: &ModelEdit,
-        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, E>,
+        guard: impl FnOnce(&rusqlite::Connection) -> Result<(G, bool), E>,
     ) -> Result<DeltaApplied, E>
     where
         E: From<String>,
     {
-        self.commit_delta(edit, guard, true)
+        self.commit_delta(edit, |_, sql| guard(sql), true)
     }
 
     #[cfg(test)]
@@ -449,7 +452,7 @@ impl Registry {
     fn commit_delta<G, E>(
         &mut self,
         edit: &ModelEdit,
-        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, E>,
+        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<(G, bool), E>,
         check_schema: bool,
     ) -> Result<DeltaApplied, E>
     where
@@ -468,7 +471,7 @@ impl Registry {
             }
             _ => false,
         };
-        let resident_guard = guard(seen, &transaction)?;
+        let (resident_guard, provider_title_cleared) = guard(seen, &transaction)?;
         let mut recorder = views::Recorder::default();
         let mut removed_channels = Vec::new();
         let changed = match edit {
@@ -647,7 +650,7 @@ impl Registry {
                 ).map_err(|error| error.to_string())? > 0
             }
             ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } => {
-                if *source == ChannelTitleSource::Manual || title.is_empty() {
+                if *source == ChannelTitleSource::Manual || (title.is_empty() && !provider_title_cleared) {
                     return Err("channel title suggestions require a nonempty inferred title"
                         .to_owned()
                         .into());
@@ -661,8 +664,10 @@ impl Registry {
                     );
                 }
                 let retitled = transaction.execute(
-                    "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source <= ?3) AND (title <> ?2 OR title_source <> ?3)",
-                    params![id.to_string(), title, *source as i64],
+                    "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 \
+                       AND (title = '' OR title_source <= ?3 OR (?4 AND title_source = ?5)) \
+                       AND (?2 <> '' OR title_source = ?5) AND (title <> ?2 OR title_source <> ?3)",
+                    params![id.to_string(), title, *source as i64, provider_title_cleared, ChannelTitleSource::Provider as i64],
                 ).map_err(|error| error.to_string())? > 0;
                 if retitled {
                     recorder.retitled(*id);
@@ -1639,6 +1644,27 @@ mod tests {
                 .changed
         );
         assert_eq!(registry.model().unwrap().sequence, before);
+        let fallback = |title: &str| ModelEdit::SuggestConversationTitle {
+            id,
+            card: a.id,
+            expected_revision: revision,
+            title: title.into(),
+            source: ChannelTitleSource::Prompt,
+        };
+        assert!(
+            !registry
+                .apply(&fallback("Unproven fallback"))
+                .unwrap()
+                .changed
+        );
+        assert!(registry.apply(&fallback("")).is_err());
+        let removed = registry
+            .apply_title_delta::<_, String>(&fallback(""), |_| Ok(((), true)))
+            .unwrap();
+        assert!(removed.changed);
+        let channel = &removed.receipt.effects.channels[0];
+        assert!(channel.title.is_empty());
+        assert_eq!(channel.title_source, ChannelTitleSource::Prompt);
         assert!(
             registry
                 .apply(&suggest(b.id, revision, "Sibling must not rename"))

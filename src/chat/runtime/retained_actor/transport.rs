@@ -981,6 +981,7 @@ impl RemoteActor {
         Ok(super::super::ConversationNaming {
             session: state.session_id.clone(),
             provider: state.title.clone(),
+            provider_cleared: false,
             opening: state.opening_title.clone(),
         })
     }

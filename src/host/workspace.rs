@@ -251,14 +251,14 @@ fn apply_title(
     // Get SQLite writer admission before borrowing HostState. The same guard
     // keeps resident identity stable through commit, for window and daemon edits.
     registry
-        .apply_delta_guarded_with(edit, |_, sql| {
+        .apply_title_delta(edit, |sql| {
             let expected = Registry::title_conversation_at(sql, *id, *card, *expected_revision)
                 .map_err(TitleAdmission::from)?;
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            state
+            let provider_title_cleared = state
                 .validate_title_conversation(expected, title, *source)
                 .map_err(TitleAdmission)?;
-            Ok::<_, TitleAdmission>(state)
+            Ok::<_, TitleAdmission>((state, provider_title_cleared))
         })
         .map_err(|error| error.0)
 }

@@ -433,7 +433,11 @@ fn notification_title_matches_resident_session_identity_across_metadata_only_fra
                     session("native-b", Some("Provider B")),
                     session("native-b", None),
                 ],
-                4 => vec![
+                4 => vec![Event::ProviderTitleCleared {
+                    id: "native-b".into(),
+                }],
+                5 => vec![
+                    session("native-b", Some("Provider B again")),
                     Event::Reset {
                         reason: "Explicit new conversation".into(),
                     },
@@ -458,16 +462,16 @@ fn notification_title_matches_resident_session_identity_across_metadata_only_fra
     // frame before the next command, then retires its actual cat child.
     let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
         Box::new(Names),
-        (0..5).map(|index| serde_json::json!(index)).collect(),
+        (0..6).map(|index| serde_json::json!(index)).collect(),
         false,
     );
-    assert_eq!(receipts.len(), 5);
+    assert_eq!(receipts.len(), 6);
     assert_eq!(
         receipts
             .iter()
             .map(|(_, content)| content.conversation.as_str())
             .collect::<Vec<_>>(),
-        ["Provider A", "Provider A", "", "Provider B", ""]
+        ["Provider A", "Provider A", "", "Provider B", "", ""]
     );
     assert_eq!(snapshot.session_id.as_deref(), Some("native-b"));
     assert_eq!(snapshot.title, None);
