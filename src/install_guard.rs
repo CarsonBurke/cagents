@@ -27,12 +27,12 @@ pub(crate) use companions::{editor_companions, trusted_executable_owner};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SourceInspectionRequest {
-    pub(crate) protocol: u16,
-    pub(crate) proof: Option<crate::model::HostSessionProof>,
-    pub(crate) require_resumable: bool,
+pub struct SourceInspectionRequest {
+    pub protocol: u16,
+    pub proof: Option<crate::model::HostSessionProof>,
+    pub require_resumable: bool,
     #[serde(default)]
-    pub(crate) reconcile_retained: bool,
+    pub reconcile_retained: bool,
 }
 
 pub(crate) fn preflight_source_panes(

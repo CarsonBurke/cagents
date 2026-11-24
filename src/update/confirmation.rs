@@ -6,11 +6,13 @@ const CONFIRMATION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 /// conversations it would stop again. Half a second is too short for a
 /// person answering a prompt to notice; tests answer at once, so a pause
 /// would only slow them.
-const DECISION_POLL: Duration = if cfg!(test) {
-    Duration::from_millis(10)
-} else {
-    Duration::from_millis(500)
-};
+fn decision_poll() -> Duration {
+    if crate::test_binary::is_test_binary() {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(500)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
@@ -478,7 +480,7 @@ fn wait_for(
             // Ctrl-C still cancels while windows are saving and closing.
             return Ok(preview);
         }
-        thread::sleep(DECISION_POLL);
+        thread::sleep(decision_poll());
     }
 }
 
@@ -649,7 +651,7 @@ pub(super) fn wait_stop(
         }
         preview = current;
         list = current_list;
-        thread::sleep(DECISION_POLL);
+        thread::sleep(decision_poll());
     }
 }
 

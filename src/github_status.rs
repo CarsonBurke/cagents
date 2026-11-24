@@ -541,7 +541,7 @@ pub(crate) fn state_root() -> Result<PathBuf, String> {
 /// Scope cached private data to gh's credential context, without probing the
 /// network or retaining credentials. Stored-account switches change hosts.yml;
 /// explicit token environments are distinct even with the same configuration.
-pub(crate) fn credential_fingerprint() -> Result<String, String> {
+pub fn credential_fingerprint() -> Result<String, String> {
     let configuration = std::env::var_os("GH_CONFIG_DIR")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)

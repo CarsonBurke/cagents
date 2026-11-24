@@ -342,7 +342,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     message = ["--message-format=json-render-diagnostics"]
                     self.assertEqual(self.builds(), [
                         common + defaults + ["--bin", "cagents"] + message,
-                        common + defaults + ["--features", "host", "--bin", "cagentsd"] + message,
+                        common + defaults + ["-p", "cagents-host", "--bin", "cagentsd"] + message,
                         common + ["-p", "cagents-ui"] + ui + ["--bin", "cagents-ui"] + message,
                         common + ["-p", "cagents-dictate", "--features", "engine",
                                   "--bin", "cagents-dictate"] + message,

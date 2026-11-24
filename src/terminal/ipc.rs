@@ -362,7 +362,7 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
-pub(crate) use older_clients::{
+pub use older_clients::{
     ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH, ENDED_TOOL_STATUS,
     PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT, WAIT_KINDS,
     WAITING_TOOL_STATUS, WithoutTrailing, before_send_queued_now, decoding_before, decoding_from,
@@ -993,7 +993,7 @@ pub struct ServerEnvelope {
 // Never stored: delivery unpacks each reply at once, so boxing would only add an allocation.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub(crate) enum PreparedResponse {
+pub enum PreparedResponse {
     Decoded(ServerResponse),
     EncodedChat { chat_id: TerminalId, bytes: Vec<u8> },
 }
@@ -1005,7 +1005,7 @@ impl From<ServerResponse> for PreparedResponse {
 }
 #[cfg(feature = "host")]
 impl PreparedResponse {
-    pub(crate) fn decode(self) -> Result<ServerResponse, String> {
+    pub fn decode(self) -> Result<ServerResponse, String> {
         match self {
             Self::Decoded(response) => Ok(response),
             Self::EncodedChat { bytes, .. } => {
@@ -2479,7 +2479,7 @@ impl FrameCodec {
 
     /// Append an already encoded response after the ordinary envelope header.
     #[cfg(feature = "host")]
-    pub(crate) fn write_encoded_response(
+    pub fn write_encoded_response(
         &mut self,
         writer: &mut impl Write,
         version: u16,
@@ -2554,7 +2554,7 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<Option<
     read_frame_with_limit(reader, MAX_FRAME_BYTES)
 }
 
-pub(crate) fn read_frame_with_limit<T: DeserializeOwned>(
+pub fn read_frame_with_limit<T: DeserializeOwned>(
     reader: &mut impl Read,
     maximum: usize,
 ) -> Result<Option<T>, FrameError> {

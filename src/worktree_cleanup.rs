@@ -33,7 +33,7 @@ pub struct RemovedWorktree {
 }
 
 #[cfg(feature = "host")]
-pub(crate) struct PreparedRemoval {
+pub struct PreparedRemoval {
     request: RemovalRequest,
     target: FencedTarget,
 }
@@ -41,7 +41,7 @@ pub(crate) struct PreparedRemoval {
 /// A worktree identified before a fenced removal takes its fences, which the
 /// removal confirms again once it holds them.
 #[cfg(feature = "host")]
-pub(crate) struct FencedTarget {
+pub struct FencedTarget {
     pub(crate) repository: PathBuf,
     pub(crate) path: PathBuf,
     /// The checked-out branch's short name; `None` when detached.
@@ -55,11 +55,7 @@ pub(crate) struct FencedTarget {
 impl FencedTarget {
     /// Identifies the worktree at `path`, a canonical directory registered
     /// with `repository`, as it is now.
-    pub(crate) fn capture(
-        repository: &Path,
-        path: &Path,
-        branch: Option<String>,
-    ) -> Result<Self, String> {
+    pub fn capture(repository: &Path, path: &Path, branch: Option<String>) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
         let cancellation = crate::process::CancellationToken::new();
         let service = crate::repository::RepositoryService::system("git");
@@ -232,7 +228,7 @@ fn cleanup_removal_command(
 impl PreparedRemoval {
     /// GitHub is read afresh before taking exclusive lifecycle fences. Sidebar
     /// branch badges and cached archived PRs never authorize removal.
-    pub(crate) fn prepare(request: RemovalRequest) -> Result<Self, String> {
+    pub fn prepare(request: RemovalRequest) -> Result<Self, String> {
         checked_record(&request)?;
         let cancellation = crate::process::CancellationToken::new();
         let pr = crate::github::GitHubService::system("gh")
@@ -254,7 +250,7 @@ impl PreparedRemoval {
     /// Caller retains the daemon's exclusive admission gate through this call.
     /// Advisory leases cannot fence later writes by unrelated programs.
     /// Automatic cleanup retains the checkout for explicit confirmation.
-    pub(crate) fn remove(
+    pub fn remove(
         self,
         _check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
     ) -> Result<crate::repository::RemovedWorktree, String> {
@@ -270,7 +266,7 @@ impl PreparedRemoval {
 /// established directory protection, so none can show the worktree unfenced.
 #[cfg(feature = "host")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WindowPolicy {
+pub enum WindowPolicy {
     /// At least one window, as for a removal a window asked for.
     RequireOne,
     /// Any number, none included, as for the command line.
@@ -292,7 +288,7 @@ pub(crate) enum WindowPolicy {
 /// reservation fences holds no control admission, so a long inspection and
 /// deletion hold off no other request.
 #[cfg(feature = "host")]
-pub(crate) fn remove_fenced(
+pub fn remove_fenced(
     target: FencedTarget,
     windows: WindowPolicy,
     admit: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,

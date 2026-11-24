@@ -138,24 +138,24 @@ const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// out lowers it for its own threads with [`ordinary_budget::quick`]; nothing
 /// else can change it.
 fn io_timeout() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         ordinary_budget::current()
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         IO_TIMEOUT
     }
 }
 
-#[cfg(test)]
-pub(crate) mod ordinary_budget {
+#[cfg(any(test, feature = "test-support"))]
+pub mod ordinary_budget {
     use std::cell::Cell;
     use std::time::Duration;
 
     /// Short enough that waiting one out costs little, and still long beside
     /// an in-process exchange.
-    pub(crate) const QUICK: Duration = Duration::from_secs(1);
+    pub const QUICK: Duration = Duration::from_secs(1);
 
     thread_local! {
         static BUDGET: Cell<Duration> = const { Cell::new(super::IO_TIMEOUT) };
@@ -168,7 +168,7 @@ pub(crate) mod ordinary_budget {
     /// Lower the ordinary budget on this thread to [`QUICK`] until the guard
     /// drops. A client must be created and used on a thread holding it.
     #[must_use = "the budget is restored when the guard drops"]
-    pub(crate) fn quick() -> impl Drop {
+    pub fn quick() -> impl Drop {
         struct Restore(Duration);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -1057,7 +1057,7 @@ impl std::fmt::Debug for ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
-pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -1335,11 +1335,11 @@ impl ControlClient {
     }
 
     /// Release a native-to-terminal replay receipt after its replacement is durable.
-    #[cfg(any(feature = "ui", all(test, feature = "host")))]
-    pub(crate) fn commit_terminal_handoff(
-        &mut self,
-        terminal_id: TerminalId,
-    ) -> Result<(), ControlError> {
+    #[cfg(any(
+        feature = "ui",
+        all(any(test, feature = "test-support"), feature = "host")
+    ))]
+    pub fn commit_terminal_handoff(&mut self, terminal_id: TerminalId) -> Result<(), ControlError> {
         match self.request_strict(ClientRequest::ChatCommitTerminal { terminal_id })? {
             ServerResponse::Accepted => Ok(()),
             response => Err(unexpected_response(
@@ -2876,8 +2876,8 @@ impl ControlClient {
     }
 
     /// Exercises the public control wire in host integration fixtures.
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn fixture_request(
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn fixture_request(
         &mut self,
         request: ClientRequest,
     ) -> Result<ServerResponse, ControlError> {

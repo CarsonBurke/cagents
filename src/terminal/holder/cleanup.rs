@@ -97,8 +97,8 @@ pub(crate) fn authorize(proof: &HostSessionProof) -> Result<(), String> {
 
 /// Absence is not a receipt. A new daemon must present an exact authenticated
 /// source alias and own this installation's current exclusive lease.
-#[cfg(test)]
-pub(crate) fn confirmed(
+#[cfg(any(test, feature = "test-support"))]
+pub fn confirmed(
     source: &TerminalSession,
     expected: &Record,
     proof: &HostSessionProof,
@@ -111,7 +111,7 @@ pub(crate) fn confirmed(
 
 /// The worker retains this exact-record capability from live authenticated
 /// adoption; public source descriptors alone cannot authorize another role.
-pub(crate) fn confirmed_with_role(
+pub fn confirmed_with_role(
     source: &TerminalSession,
     expected: &Record,
     proof: &HostSessionProof,
@@ -125,14 +125,14 @@ pub(crate) fn confirmed_with_role(
 
 /// Used only when another authenticated owner (the native holder) retained this
 /// exact private Record. Public terminal IDs or launch recipes are insufficient.
-#[cfg(test)]
-pub(crate) fn confirmed_owner(expected: &Record, proof: &HostSessionProof) -> Result<bool, String> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn confirmed_owner(expected: &Record, proof: &HostSessionProof) -> Result<bool, String> {
     confirmed_receipt(expected, proof, None, None)
 }
 
 /// The parent native holder authenticated this exact paired Record. Its
 /// retained role capability remains necessary even after the terminal exits.
-pub(crate) fn confirmed_owner_with_role(
+pub fn confirmed_owner_with_role(
     expected: &Record,
     proof: &HostSessionProof,
     role: Option<&crate::daemon::holder_registry::OriginalRole>,

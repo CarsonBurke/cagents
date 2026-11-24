@@ -21,10 +21,13 @@ pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::fro
 
 #[cfg(feature = "host")]
 pub(crate) mod claude_metadata;
-#[cfg(any(feature = "ui", all(test, feature = "host")))]
+#[cfg(any(
+    feature = "ui",
+    all(any(test, feature = "test-support"), feature = "host")
+))]
 pub mod client;
 #[cfg(feature = "host")]
-pub(crate) mod native_holder;
+pub mod native_holder;
 #[cfg(feature = "host")]
 pub mod protocol;
 #[cfg(feature = "host")]
@@ -1310,7 +1313,7 @@ fn set_codex_remote(arguments: &mut [String], index: usize, address: String) {
 
 /// The local endpoint recorded by a Codex launch recipe. This is execution
 /// evidence only; ownership and replacement admission are checked separately.
-pub(crate) fn recorded_codex_socket(recipe: &LaunchRecipe) -> Option<std::path::PathBuf> {
+pub fn recorded_codex_socket(recipe: &LaunchRecipe) -> Option<std::path::PathBuf> {
     let (_, address) = codex_remote_argument(&recipe.arguments)?;
     let path = address
         .strip_prefix("unix://")
@@ -1348,7 +1351,7 @@ impl Session {
 
     /// The endpoint in the saved launch, including panes predating allocator
     /// records. Reading it grants no authority to replace an external server.
-    pub(crate) fn recorded_codex_socket(&self) -> Option<std::path::PathBuf> {
+    pub fn recorded_codex_socket(&self) -> Option<std::path::PathBuf> {
         if self.launch.provider != Provider::Codex {
             return None;
         }
@@ -1357,7 +1360,7 @@ impl Session {
 
     /// A typed descriptor shape, never proof of an authenticated live helper.
     /// Adoption and persistence callers must also resolve its exact actor owner.
-    pub(crate) fn has_unnamed_retained_claude_actor(&self) -> bool {
+    pub fn has_unnamed_retained_claude_actor(&self) -> bool {
         self.launch.session_id.is_none()
             && matches!(
                 self.native_continuity,
@@ -1719,11 +1722,11 @@ pub struct Snapshot {
     /// Whether the current conversation's provider explicitly cleared its name.
     #[cfg(feature = "host")]
     #[serde(skip)]
-    pub(crate) provider_title_cleared: bool,
+    pub provider_title_cleared: bool,
     /// The first meaningful user prompt, kept independently of loaded pages.
     #[cfg(feature = "host")]
     #[serde(skip)]
-    pub(crate) opening_title: Option<OpeningTitle>,
+    pub opening_title: Option<OpeningTitle>,
     pub error: Option<String>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
@@ -2032,7 +2035,10 @@ impl Snapshot {
     /// Drop renderable history while retaining provider continuity, controls,
     /// activity and pending interactions. Only the UI client's disposable copy
     /// uses this: the daemon still owns paging and the authoritative transcript.
-    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    #[cfg(any(
+        feature = "ui",
+        all(any(test, feature = "test-support"), feature = "host")
+    ))]
     pub fn evict_transcript(&mut self) {
         self.items = Vec::new();
         for child in &mut self.subagents {
@@ -2042,7 +2048,10 @@ impl Snapshot {
 
     /// Logical body bytes referenced by this owner, not unique heap bytes:
     /// immutable items can be Arc-shared with other snapshots and caches.
-    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    #[cfg(any(
+        feature = "ui",
+        all(any(test, feature = "test-support"), feature = "host")
+    ))]
     pub fn transcript_bytes(&self) -> usize {
         self.items
             .iter()
@@ -3130,7 +3139,7 @@ impl Item {
     /// Whether this is a later part of an item too long for one, which is still
     /// a single thing the provider did or said.
     #[cfg(feature = "host")]
-    pub(crate) fn continues_paged_item(&self) -> bool {
+    pub fn continues_paged_item(&self) -> bool {
         TranscriptPart::parse(&self.id).is_some()
     }
 
@@ -3826,7 +3835,7 @@ pub enum OpeningTitle {
 
 #[cfg(feature = "host")]
 impl OpeningTitle {
-    pub(crate) fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         match self {
             Self::Conversation => "Conversation",
             Self::Image => "Image conversation",
@@ -3834,7 +3843,7 @@ impl OpeningTitle {
         }
     }
 
-    pub(crate) fn provisional(&self) -> bool {
+    pub fn provisional(&self) -> bool {
         !matches!(self, Self::Prompt(_))
     }
 

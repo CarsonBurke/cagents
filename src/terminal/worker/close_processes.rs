@@ -16,19 +16,19 @@ use std::{
 const MAX_CENSUS_PASSES: usize = 16;
 const MAX_PROCESSES: usize = 65_536;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static FAIL_NEXT_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DELAY_NEXT_CENSUS: std::cell::RefCell<Option<crossbeam_channel::Sender<Instant>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
-pub(super) fn fail_next_census_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_next_census_for_test() {
     FAIL_NEXT_CENSUS.set(true);
 }
 
-#[cfg(test)]
-pub(super) fn delay_next_census_for_test(finished: crossbeam_channel::Sender<Instant>) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn delay_next_census_for_test(finished: crossbeam_channel::Sender<Instant>) {
     DELAY_NEXT_CENSUS.set(Some(finished));
 }
 
@@ -483,14 +483,14 @@ fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
     })
 }
 fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(finished) = DELAY_NEXT_CENSUS.take() {
         // Exercise capture's deadline without a real uninterruptible process.
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
         let _ = finished.send(Instant::now());
         check_deadline(deadline)?;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if FAIL_NEXT_CENSUS.replace(false) {
         return Err("injected terminal process census failure".into());
     }

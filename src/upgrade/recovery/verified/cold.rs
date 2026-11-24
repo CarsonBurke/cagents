@@ -295,7 +295,7 @@ impl ColdView {
 /// historical work is an honest negative observation, not a new paused owner
 /// and not a reason to prevent the remaining real service from becoming Ready.
 #[cfg(feature = "host")]
-pub(crate) fn publish(
+pub fn publish(
     checkpoint: &Path,
     target: &Path,
     settled: &AlreadyRecovered,

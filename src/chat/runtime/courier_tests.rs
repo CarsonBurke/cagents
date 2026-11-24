@@ -1,6 +1,8 @@
 //! Real local actor admission with a deterministic adapter barrier. This
 //! exercises command dequeue, event reduction and actual `/bin/cat` pipe I/O;
 //! it does not claim native Codex or Claude protocol qualification.
+// The host crate's tests share these fixtures; no single build uses each.
+#![cfg_attr(not(test), allow(dead_code))]
 use super::*;
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{Value, json};
@@ -118,8 +120,8 @@ impl Adapter for GatedAdapter {
 
 /// Reusable by the HOST mailbox fixture. The fixture owns only its own
 /// Compact/idle-command workers; callers must retain their mailbox worker.
-pub(crate) struct RequestRaceFixture {
-    pub(crate) handle: Handle,
+pub struct RequestRaceFixture {
+    pub handle: Handle,
     entered: Receiver<()>,
     release: Sender<()>,
     request: Option<JoinHandle<Result<(), String>>>,
@@ -129,11 +131,15 @@ pub(crate) struct RequestRaceFixture {
 }
 
 impl RequestRaceFixture {
-    pub(crate) fn new() -> Self {
+    #[allow(
+        clippy::new_without_default,
+        reason = "it starts request threads and a directory, which is no default value"
+    )]
+    pub fn new() -> Self {
         Self::with_input_failure(false)
     }
 
-    pub(crate) fn with_input_failure(fail_after_input: bool) -> Self {
+    pub fn with_input_failure(fail_after_input: bool) -> Self {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
@@ -192,7 +198,7 @@ impl RequestRaceFixture {
     /// Return only once Compact is dequeued and blocked inside the adapter.
     /// The Request event is emitted by its Step after release, not by a test
     /// mutating a resident snapshot.
-    pub(crate) fn begin_request(&mut self) {
+    pub fn begin_request(&mut self) {
         assert!(self.request.is_none());
         let handle = self.handle.clone();
         self.request = Some(thread::spawn(move || handle.command(Command::Compact)));
@@ -203,7 +209,7 @@ impl RequestRaceFixture {
 
     /// Under the held Compact gate, the actor cannot consume another command.
     /// This observes the actual queue after the courier caller submitted work.
-    pub(crate) fn wait_for_queued_prompt(&self) {
+    pub fn wait_for_queued_prompt(&self) {
         assert!(self.request.is_some(), "request barrier must be held");
         let deadline = Instant::now() + TIMEOUT;
         while self.handle.local_command_queue_is_empty() {
@@ -212,7 +218,7 @@ impl RequestRaceFixture {
         }
     }
 
-    pub(crate) fn release_request(&mut self) {
+    pub fn release_request(&mut self) {
         self.release.try_send(()).unwrap();
         self.request
             .take()
@@ -224,7 +230,7 @@ impl RequestRaceFixture {
         assert!(!self.handle.is_idle());
     }
 
-    pub(crate) fn clear_request(&self) {
+    pub fn clear_request(&self) {
         self.resolve_request("resolve");
     }
 
@@ -239,7 +245,7 @@ impl RequestRaceFixture {
         assert!(self.handle.requests().is_empty());
     }
 
-    pub(crate) fn prompt_count(&self) -> usize {
+    pub fn prompt_count(&self) -> usize {
         self.observed.prompts.lock().unwrap().len()
     }
 
@@ -251,7 +257,7 @@ impl RequestRaceFixture {
         self.observed.echoed.lock().unwrap().len()
     }
 
-    pub(crate) fn close(&mut self) {
+    pub fn close(&mut self) {
         assert!(self.request.is_none(), "release the request barrier first");
         self.handle.close().unwrap();
         for attempt in self.attempts.drain(..) {

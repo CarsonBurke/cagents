@@ -16,7 +16,7 @@ const MAX_ARGV_BYTES: usize = 8 * 1024;
 /// Host-only activity evidence, separate from normalized recovery authority.
 #[cfg(feature = "host")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentProcess {
+pub struct AgentProcess {
     pub pid: i32,
     pub start: u64,
     pub provider: Provider,
@@ -560,7 +560,7 @@ fn omp_terminal_identity(
 /// Absence of a saved file alone is never evidence of a fresh conversation.
 /// Only the exact, current controlling-terminal marker can authorize this path.
 #[cfg(feature = "host")]
-pub(crate) fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::PathBuf> {
+pub fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::PathBuf> {
     if process.provider != Provider::Omp {
         return None;
     }
@@ -803,7 +803,7 @@ fn persistable_environment_entry(name: &str, value: &str) -> bool {
 /// A fresh native process uses the selected provider's configuration, never the
 /// launching harness's tool bridge, artifact scope, or terminal/session identity.
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn fresh_environment_key(
+pub fn fresh_environment_key(
     provider: Provider,
     name: &str,
     value: &str,
@@ -1045,7 +1045,7 @@ fn check_environment_removals(bytes: &[u8], recipe: &LaunchRecipe) -> Result<(),
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn native_environment(
+pub fn native_environment(
     process: &AgentProcess,
     explicit: &std::collections::BTreeMap<String, String>,
     transient: Option<&std::collections::BTreeMap<String, String>>,

@@ -165,7 +165,7 @@ enum Fill {
     Unanswered,
 }
 
-pub(crate) struct Store {
+pub struct Store {
     db: Connection,
     pub(super) diagnostics: super::child_diagnostics::Backing,
     copy_cache: uuid::Uuid,
@@ -381,12 +381,15 @@ impl Store {
         Self::with_budget(true)
     }
     fn with_budget(diagnostic: bool) -> Result<Self, String> {
-        #[cfg(test)]
-        let root = std::env::temp_dir();
-        #[cfg(not(test))]
-        let root = crate::daemon::RuntimePaths::discover()
-            .map_err(|e| e.to_string())?
-            .directory;
+        // Tests, including the daemon crate's, keep their stores out of the
+        // person's runtime directory.
+        let root = if crate::test_binary::is_test_binary() {
+            std::env::temp_dir()
+        } else {
+            crate::daemon::RuntimePaths::discover()
+                .map_err(|e| e.to_string())?
+                .directory
+        };
         Self::at_with_budget(root, diagnostic)
     }
     #[cfg(test)]

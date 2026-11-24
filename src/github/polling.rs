@@ -9,7 +9,7 @@ thread_local! {
     static RESOURCE: RefCell<String> = RefCell::new("graphql".into());
 }
 
-pub(crate) fn with_scope<T>(scope: &str, read: impl FnOnce() -> T) -> T {
+pub fn with_scope<T>(scope: &str, read: impl FnOnce() -> T) -> T {
     struct Restore(Option<String>);
     impl Drop for Restore {
         fn drop(&mut self) {

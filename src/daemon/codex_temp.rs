@@ -172,7 +172,7 @@ fn boot_ticks() -> io::Result<u64> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn sweep() -> io::Result<()> {
+pub fn sweep() -> io::Result<()> {
     sweep_base(
         &base(std::env::var_os("TMPDIR").as_deref(), None)?,
         pid_namespace()?,

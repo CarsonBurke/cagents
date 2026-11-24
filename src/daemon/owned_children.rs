@@ -10,7 +10,7 @@ use std::{
 /// What closing a provider does with the work it leaves behind, such as a
 /// server a command started with `nohup` or `setsid`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum DetachedWork {
+pub enum DetachedWork {
     /// Stop everything the provider started. Forced kills and unattended
     /// executions do, and so does every close that has not decided otherwise.
     #[default]
@@ -98,7 +98,7 @@ impl Pinned {
 
 /// Used only in the dedicated, single-threaded subreaper process. It owns every
 /// child of that process; this cleanup must never run inside the daemon.
-pub(crate) struct OwnedChildren {
+pub struct OwnedChildren {
     child: Option<Child>,
     group_signalled: bool,
     detached: DetachedWork,
@@ -114,7 +114,7 @@ pub(crate) struct OwnedChildren {
 impl OwnedChildren {
     /// The caller must be the sole child reaper in a dedicated subreaper process.
     /// No other thread or signal handler may reap this child or descendants.
-    pub(crate) fn new(child: Child) -> Self {
+    pub fn new(child: Child) -> Self {
         Self {
             child: Some(child),
             group_signalled: false,
@@ -227,7 +227,7 @@ impl OwnedChildren {
         Ok(())
     }
 
-    pub(crate) fn terminate(&mut self, timeout: Duration) -> io::Result<bool> {
+    pub fn terminate(&mut self, timeout: Duration) -> io::Result<bool> {
         if !self.group_signalled {
             if self.detached == DetachedWork::Spare {
                 // Let the provider end its own session, as quitting its CLI

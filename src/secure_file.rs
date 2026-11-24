@@ -30,7 +30,7 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-pub(crate) fn reject_symlink_components(path: &Path) -> io::Result<()> {
+pub fn reject_symlink_components(path: &Path) -> io::Result<()> {
     let mut ancestors = path
         .ancestors()
         .filter(|path| !path.as_os_str().is_empty())
@@ -67,7 +67,7 @@ pub fn validate_owned_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_private_directory(path: &Path) -> io::Result<()> {
+pub fn prepare_private_directory(path: &Path) -> io::Result<()> {
     let path = if path.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -143,7 +143,7 @@ pub(crate) fn open_existing_private_file(path: &Path) -> io::Result<File> {
 /// Inspection must not repair permissions or change the receipt's metadata.
 /// An unsafe or multiply linked file is unavailable, never silently migrated.
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn open_existing_private_file_readonly(path: &Path) -> io::Result<File> {
+pub fn open_existing_private_file_readonly(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK | libc::O_CLOEXEC)
@@ -160,7 +160,7 @@ pub(crate) fn open_existing_private_file_readonly(path: &Path) -> io::Result<Fil
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn open_private_append_file(path: &Path) -> io::Result<File> {
+pub fn open_private_append_file(path: &Path) -> io::Result<File> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

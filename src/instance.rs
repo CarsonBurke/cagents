@@ -31,12 +31,11 @@ mod daemon_admission;
 pub mod ui_options;
 #[cfg(any(feature = "host", test))]
 pub(crate) use daemon_admission::AdmissionFence;
+pub use daemon_admission::DAEMON_FENCE_ENV;
 #[cfg(feature = "host")]
-pub(crate) use daemon_admission::DaemonAdmissionGuard;
+pub use daemon_admission::DaemonAdmissionGuard;
 pub use daemon_admission::DaemonStillStarting;
-pub(crate) use daemon_admission::{
-    DAEMON_FENCE_ENV, LaunchFence, daemon_launch_is_updating, inherit_daemon_fence,
-};
+pub(crate) use daemon_admission::{LaunchFence, daemon_launch_is_updating, inherit_daemon_fence};
 
 use directories::ProjectDirs;
 use thiserror::Error;
@@ -244,7 +243,7 @@ impl OwnedLock {
 
     /// Hand this description to a process that already inherited its own copy.
     /// Closing the returned file preserves that recipient's lock ownership.
-    pub(crate) fn into_file(mut self) -> File {
+    pub fn into_file(mut self) -> File {
         self.0.take().expect("owned lock file")
     }
 }
@@ -279,7 +278,7 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
 
 /// Acquire the existing drop-safe advisory lock on a file a confined storage
 /// caller has already opened and validated through its retained directory.
-pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLock> {
+pub fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLock> {
     // SAFETY: the descriptor remains owned by the returned file.
     if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
         return Err(io::Error::last_os_error());
@@ -1009,7 +1008,7 @@ pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
     AdmissionFence::acquire()
 }
 
-pub(crate) struct VerifiedWindow {
+pub struct VerifiedWindow {
     pub executable: PathBuf,
     pidfd: File,
     pid: u32,
@@ -1043,7 +1042,7 @@ impl VerifiedWindow {
     }
 
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn pid(&self) -> u32 {
+    pub fn pid(&self) -> u32 {
         self.pid
     }
     pub fn still_owns_lease(&self) -> io::Result<bool> {
@@ -2076,7 +2075,7 @@ pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
         .join("; ")
 }
 
-pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+pub const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
 #[cfg(feature = "host")]
 pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_directory()?;
@@ -2094,7 +2093,7 @@ pub(crate) fn validate_install_guard() -> io::Result<()> {
 }
 
 /// Staging owns the same authenticated launch fence without closing modern windows.
-pub(crate) fn validate_stage_guard() -> io::Result<()> {
+pub fn validate_stage_guard() -> io::Result<()> {
     validate_install_fence(false)
 }
 
@@ -3004,7 +3003,7 @@ fn current_uid() -> u32 {
 
 // Source-tree debug builds are development instances by default. The explicit
 // feature keeps the same isolation available to optimized development builds.
-pub(crate) const IS_DEVELOPMENT: bool = cfg!(any(debug_assertions, feature = "development"));
+pub const IS_DEVELOPMENT: bool = cfg!(any(debug_assertions, feature = "development"));
 
 pub const NAME: &str = if IS_DEVELOPMENT {
     "development"

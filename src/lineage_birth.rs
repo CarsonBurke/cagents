@@ -385,7 +385,7 @@ pub(crate) fn launch_containment() -> Option<String> {
 /// Opens this boot's epoch for the instance, when `first`. A failure leaves the
 /// records proving nothing, which costs only the ruling out they allow.
 #[cfg(feature = "host")]
-pub(crate) fn open_instance_epoch(boot: &BootId, first: bool) {
+pub fn open_instance_epoch(boot: &BootId, first: bool) {
     if let Err(error) = Ledger::of_instance().and_then(|ledger| ledger.open_epoch(boot, first)) {
         tracing::warn!(%error, "terminal launches on this boot won't rule out unreadable processes");
     }
@@ -398,7 +398,7 @@ pub(crate) fn open_instance_epoch(boot: &BootId, first: bool) {
 pub(crate) fn record_instance_launch(
     session: &crate::model::TerminalSession,
 ) -> Result<(), String> {
-    if cfg!(test) {
+    if crate::test_binary::is_test_binary() {
         // Unit tests launch terminals without an instance of their own.
         return Ok(());
     }

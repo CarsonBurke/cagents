@@ -202,11 +202,11 @@ elif [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     # use Cargo's exact executable paths, including configured output layouts.
     if [ "$VARIANT" = browserless ]; then
         CLI_BINARY=$(build_target cagents --no-default-features --bin cagents)
-        HOST_BINARY=$(build_target cagentsd --no-default-features --features host --bin cagentsd)
+        HOST_BINARY=$(build_target cagentsd --no-default-features -p cagents-host --bin cagentsd)
         UI_BINARY=$(build_target cagents-ui -p cagents-ui --bin cagents-ui)
     else
         CLI_BINARY=$(build_target cagents --bin cagents)
-        HOST_BINARY=$(build_target cagentsd --features host --bin cagentsd)
+        HOST_BINARY=$(build_target cagentsd -p cagents-host --bin cagentsd)
         UI_BINARY=$(build_target cagents-ui -p cagents-ui --features integrated-browser --bin cagents-ui)
     fi
     # Both variants ship the same helper: it has no browser.

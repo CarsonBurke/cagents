@@ -15,7 +15,7 @@ use std::{
 /// How long a test waits for something that must eventually happen. It is
 /// not a performance budget: correct code finishes far sooner, even on a
 /// heavily loaded host.
-pub(crate) const EVENTUALLY: Duration = Duration::from_secs(60);
+pub const EVENTUALLY: Duration = Duration::from_secs(60);
 
 /// Run `operation` on its own thread and return its result, failing the test
 /// if it has not returned within [`EVENTUALLY`]. A hung operation is left
@@ -49,7 +49,7 @@ pub fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
 /// Poll until `poll` returns a value and return it, failing the test after
 /// [`EVENTUALLY`]. The same caveat as [`eventually`] applies.
 #[track_caller]
-pub(crate) fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
+pub fn wait_for<T>(what: &str, mut poll: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + EVENTUALLY;
     loop {
         if let Some(value) = poll() {

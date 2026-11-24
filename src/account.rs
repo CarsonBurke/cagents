@@ -48,7 +48,7 @@ pub mod remote;
 pub mod routing;
 pub mod schedule;
 #[cfg(feature = "host")]
-pub(crate) mod scope;
+pub mod scope;
 
 /// A used fraction past which an account is reported as approaching its
 /// limit. It is the same point past which the shell draws a budget in its
@@ -449,7 +449,7 @@ pub unsafe fn detach_inherited_selections() {
 /// Effective spawn policy also protects recipes saved before explicit removals
 /// existed. Do not rewrite a live descriptor: its identity is daemon evidence.
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn launch_credential_overrides(
+pub fn launch_credential_overrides(
     recipe: &crate::model::LaunchRecipe,
 ) -> std::collections::BTreeSet<String> {
     let mut names = recipe.unset_environment.clone();

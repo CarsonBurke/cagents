@@ -6,8 +6,8 @@ use super::{
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
 use crate::daemon::owned_children::DetachedWork;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+#[cfg(any(test, feature = "test-support"))]
+pub use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
@@ -25,36 +25,34 @@ use std::{
 };
 mod child_diagnostics;
 mod child_text_copy;
-#[cfg(test)]
-pub(crate) mod courier_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod courier_tests;
 mod delivery;
 use crate::chat::DeliveryKey;
-pub(crate) use delivery::Deliveries;
+pub use delivery::Deliveries;
 mod execution;
 mod handle;
 pub use handle::Handle;
-pub(crate) use handle::ReadFailure;
-#[cfg(test)]
-pub(crate) use handle::RetainedInputOutcome;
+pub use handle::ReadFailure;
+#[cfg(any(test, feature = "test-support"))]
+pub use handle::RetainedInputOutcome;
 /// Process evidence only, without the reader lease: no retirement authority.
-pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
-pub(crate) use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
-#[cfg(test)]
-pub(crate) use retained_actor::journal::ContinuityLoss;
-pub(crate) use retained_actor::journal::OutboxEntry;
-#[cfg(test)]
-pub(crate) use retained_actor::transport::scripted_helper::{Script, ScriptedHelper};
-pub(crate) use retained_actor::transport::{
-    ActorIdentity, RetirementInspection, VerifiedRetirement,
-};
+pub use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
+pub use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
+#[cfg(any(test, feature = "test-support"))]
+pub use retained_actor::journal::ContinuityLoss;
+pub use retained_actor::journal::OutboxEntry;
+#[cfg(any(test, feature = "test-support"))]
+pub use retained_actor::transport::scripted_helper::{Script, ScriptedHelper};
+pub use retained_actor::transport::{ActorIdentity, RetirementInspection, VerifiedRetirement};
 mod retained_actor;
 /// Synthetic retained-actor receipts for the daemon's collection tests.
-#[cfg(test)]
-pub(crate) use retained_actor::receipt_fixture as retained_receipt_fixture;
+#[cfg(any(test, feature = "test-support"))]
+pub use retained_actor::receipt_fixture as retained_receipt_fixture;
 mod store;
 pub use store::Unread;
 mod websocket;
-pub(crate) use store::Store;
+pub use store::Store;
 
 /// How long a caller waits for the actor to acknowledge a command before its
 /// outcome is unknown.
@@ -92,14 +90,14 @@ const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 /// Start returns once the worker is running, before it applies that frame, so
 /// a caller can observe a reader with nothing applied yet. Holding one makes
 /// that interleaving certain rather than occasional.
-#[cfg(test)]
-static HELD_HISTORY_READERS: Mutex<Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>> =
+#[cfg(any(test, feature = "test-support"))]
+pub static HELD_HISTORY_READERS: Mutex<Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>> =
     Mutex::new(Vec::new());
 
 /// Hold the next history reader started in `directory` before it applies its
 /// initial frame, until the returned sender sends or is dropped.
-#[cfg(test)]
-pub(crate) fn hold_history_reader(directory: &std::path::Path) -> std::sync::mpsc::Sender<()> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_history_reader(directory: &std::path::Path) -> std::sync::mpsc::Sender<()> {
     let (release, held) = std::sync::mpsc::channel();
     HELD_HISTORY_READERS
         .lock()
@@ -108,8 +106,8 @@ pub(crate) fn hold_history_reader(directory: &std::path::Path) -> std::sync::mps
     release
 }
 
-#[cfg(test)]
-fn await_history_release(directory: &std::path::Path) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn await_history_release(directory: &std::path::Path) {
     let held = {
         let mut held = HELD_HISTORY_READERS
             .lock()
@@ -125,7 +123,7 @@ fn await_history_release(directory: &std::path::Path) {
 
 /// The refusal of a decline-only answer whose action the provider doesn't
 /// read as turning the request down, or whose request is no longer pending.
-pub(crate) const NOT_A_DECLINE: &str = "A settled run may only decline a current pending request";
+pub const NOT_A_DECLINE: &str = "A settled run may only decline a current pending request";
 
 enum ActorCommand {
     RetainedProvider {
@@ -200,7 +198,7 @@ type CommandRequest = (
 
 /// Why a provider command may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Rejection {
+pub enum Rejection {
     /// The actor never took the command, or refused it before effects were possible.
     Refused(String),
     /// The actor did not answer in time, or failed after effects became possible;
@@ -217,14 +215,14 @@ impl From<Rejection> for String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum UpdateReadiness {
+pub enum UpdateReadiness {
     Idle,
     Busy,
     Unready,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Update {
+pub enum Update {
     /// Helper outbox has uncommitted semantic evidence; wake the host broker.
     RetainedOutcomes,
     Execution {
@@ -269,7 +267,7 @@ pub(crate) enum Update {
     ConversationNameChanged,
 }
 
-pub(crate) struct ConversationNaming {
+pub struct ConversationNaming {
     pub session: Option<String>,
     pub provider: Option<String>,
     pub provider_cleared: bool,
@@ -277,7 +275,7 @@ pub(crate) struct ConversationNaming {
 }
 
 impl ConversationNaming {
-    pub(crate) fn title(&self) -> Option<(String, crate::model::ChannelTitleSource)> {
+    pub fn title(&self) -> Option<(String, crate::model::ChannelTitleSource)> {
         use crate::model::ChannelTitleSource::{Prompt, Provider};
         self.provider
             .as_deref()
@@ -340,7 +338,7 @@ impl LocalHandle {
     }
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TitleUnavailable {
+pub enum TitleUnavailable {
     Busy,
     Poisoned,
 }
@@ -408,7 +406,8 @@ struct Inner {
     /// file lock before accepting. See [`Handle::startup_lock_wait`].
     startup_lock_wait: Arc<AtomicU64>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
 
@@ -443,8 +442,8 @@ impl LocalHandle {
         self.0.idle_frame_buffer_capacity.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
-    pub(crate) fn start(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
@@ -457,8 +456,8 @@ impl LocalHandle {
 
     /// Retain an actual native holder after closing the fixture's local actor.
     /// Cleanup still requires the real holder protocol and receipt.
-    #[cfg(test)]
-    pub(crate) fn fixture_retained_native_holder(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_retained_native_holder(
         &self,
         holder: super::native_holder::Holder,
         reason: String,
@@ -655,7 +654,7 @@ impl LocalHandle {
         let provider_process = Arc::new(Mutex::new(None));
         let startup_lock_wait = Arc::new(AtomicU64::new(0));
         let startup_budget = StartupBudget::current();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(usize::MAX));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
@@ -725,7 +724,7 @@ impl LocalHandle {
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             idle_frame_buffer_capacity: idle_frame_buffer_capacity.clone(),
         });
         let launch_context = spec.execution.clone();
@@ -787,7 +786,7 @@ impl LocalHandle {
                     started: Instant::now(),
                     startup: startup_budget,
                     write_started: None,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     idle_frame_buffer_capacity,
                 };
                 let result = {
@@ -825,7 +824,7 @@ impl LocalHandle {
                         actor.child = child?;
                         match spec.transport {
                             TransportSpec::History => {
-                                #[cfg(test)]
+                                #[cfg(any(test, feature = "test-support"))]
                                 await_history_release(&spec.working_directory);
                                 actor.run_history(initial)
                             }
@@ -1804,7 +1803,7 @@ impl LocalHandle {
     }
     /// A coherent resident naming projection. Never opens the transcript Store,
     /// pages history or touches the filesystem; safe at host admission points.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
@@ -1834,8 +1833,8 @@ impl LocalHandle {
             .title
             .clone()
     }
-    #[cfg(test)]
-    pub(crate) fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
         let inner = Arc::downgrade(&self.0);
         move || inner.upgrade().is_some()
     }
@@ -1962,21 +1961,18 @@ impl LocalHandle {
 }
 
 /// Validate local launch and adapter initialization before stopping an existing CLI.
-pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+pub fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
     preflight_for_start(spec, initial).map_err(|error| error.to_string())
 }
 
-pub(crate) fn preflight_for_start(
-    spec: &ProcessSpec,
-    initial: &mut Step,
-) -> Result<Store, SetupError> {
+pub fn preflight_for_start(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, SetupError> {
     preflight_inner(spec, initial, false)
 }
 
 /// Only an authenticated retained server can restore its read-only connection
 /// after the original directory was removed. Authorizing commands still check
 /// the retained execution policy in the actor before any provider write.
-pub(crate) fn preflight_retained_for_start(
+pub fn preflight_retained_for_start(
     spec: &ProcessSpec,
     initial: &mut Step,
 ) -> Result<Store, SetupError> {
@@ -2162,7 +2158,7 @@ fn spawn_provider(
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
         .process_group(0);
-    crate::host::descriptor_limit::inherit(&mut process);
+    crate::descriptor_limit::inherit(&mut process);
     let original = spec
         .execution
         .as_ref()
@@ -2595,7 +2591,7 @@ struct Actor {
     started: Instant,
     startup: StartupBudget,
     write_started: Option<Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
 
@@ -2645,7 +2641,7 @@ impl StartupBudget {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_STARTUP_BUDGET: std::cell::Cell<StartupBudget> =
         const { std::cell::Cell::new(StartupBudget::PRODUCTION) };
@@ -4293,7 +4289,7 @@ impl Actor {
             // Do not call process-wide malloc_trim here: ordinary ACP/OMP
             // actors share cagentsd's allocator and would serialize its
             // unrelated arenas.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.idle_frame_buffer_capacity
                 .store(self.output.capacity(), Ordering::Release);
         }
@@ -5248,6 +5244,6 @@ pub(crate) fn notification_frames_with_probe_for_test<R>(
 mod tests;
 
 /// Explicit retained-helper dispatch after Rust runtime initialization.
-pub(crate) fn run_retained_helper_if_requested() -> Option<Result<(), String>> {
+pub fn run_retained_helper_if_requested() -> Option<Result<(), String>> {
     retained_actor::transport::run_helper_if_requested()
 }

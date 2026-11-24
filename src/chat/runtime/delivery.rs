@@ -54,13 +54,13 @@ struct Ledger {
     _lock: Option<OwnedLock>,
 }
 
-pub(crate) struct Deliveries {
+pub struct Deliveries {
     ledger: Mutex<Ledger>,
     pending: Mutex<HashMap<Key, Pending>>,
 }
 
 impl Deliveries {
-    pub(crate) fn open() -> Result<Self, String> {
+    pub fn open() -> Result<Self, String> {
         Self::at(&ledger_path()?)
     }
 
@@ -68,7 +68,7 @@ impl Deliveries {
         Ledger::at(path).map(Self::new)
     }
 
-    pub(crate) fn in_memory() -> Result<Self, String> {
+    pub fn in_memory() -> Result<Self, String> {
         let db = Connection::open_in_memory().map_err(|error| error.to_string())?;
         initialize(&db).map_err(|error| error.to_string())?;
         Ok(Self::new(Ledger { db, _lock: None }))
@@ -81,7 +81,7 @@ impl Deliveries {
         }
     }
 
-    pub(crate) fn restore_persistence(&self) -> Result<(), String> {
+    pub fn restore_persistence(&self) -> Result<(), String> {
         self.restore_at(&ledger_path()?)
     }
 

@@ -10,7 +10,7 @@ pub(super) mod execution_exit;
 mod final_snapshot;
 #[cfg(debug_assertions)]
 mod fixture_refusal;
-#[cfg(test)]
-pub(crate) use final_snapshot::fixture as receipt_fixture;
+#[cfg(any(test, feature = "test-support"))]
+pub use final_snapshot::fixture as receipt_fixture;
 pub(super) mod journal;
 pub(super) mod transport;

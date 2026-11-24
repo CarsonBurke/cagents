@@ -421,7 +421,7 @@ const COLLECTABLE_AFTER: Duration = Duration::from_secs(60);
 /// couldn't withdraw, under a user manager too slow to answer in time, and
 /// those earlier versions left. Returns how many were stopped; a scope with a
 /// process, a queued job or a recent start is left alone.
-pub(crate) fn collect_empty_scopes() -> io::Result<usize> {
+pub fn collect_empty_scopes() -> io::Result<usize> {
     collect_empty_scopes_after(COLLECTABLE_AFTER)
 }
 

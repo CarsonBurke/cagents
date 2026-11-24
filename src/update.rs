@@ -13,12 +13,12 @@ mod handoff;
 pub mod in_flight;
 mod installed;
 mod pending_recovery;
-pub(crate) mod recovery;
+pub mod recovery;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
 mod review_fixture;
 pub use recovery::TargetRecoveryRequired;
-pub(crate) mod source;
+pub mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
 mod review;

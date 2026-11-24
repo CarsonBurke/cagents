@@ -14,12 +14,12 @@ use std::{
 
 /// Why an exact Codex endpoint was not joined.
 #[derive(Debug)]
-pub(crate) struct JoinError {
+pub struct JoinError {
     message: String,
     /// Nothing is accepting connections there. A server that is still
     /// starting binds its socket before it listens, so this is not final
     /// for a listener whose launch is being awaited.
-    pub(crate) not_listening: bool,
+    pub not_listening: bool,
 }
 
 impl From<String> for JoinError {
@@ -60,7 +60,7 @@ fn verify_socket(path: &Path, device: u64, inode: u64) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn connect(path: &Path, device: u64, inode: u64) -> Result<UnixStream, JoinError> {
+pub fn connect(path: &Path, device: u64, inode: u64) -> Result<UnixStream, JoinError> {
     verify_socket(path, device, inode)?;
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;

@@ -12,7 +12,7 @@ mod attention;
 mod claude;
 mod codex;
 mod rollout;
-pub(crate) mod socket;
+pub mod socket;
 
 /// How long a census, or a failure to take one, answers without checking.
 const TTL: Duration = Duration::from_secs(2);
@@ -26,7 +26,7 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 type Census = BTreeMap<PathBuf, ActivityState>;
 
 /// Public provider inventory keyed by the actual foreground PID, never cwd.
-pub(crate) fn exact_session(
+pub fn exact_session(
     process: &crate::model::agent_recovery::AgentProcess,
 ) -> Result<Option<String>, String> {
     match process.provider {
@@ -36,14 +36,14 @@ pub(crate) fn exact_session(
     }
 }
 
-pub(crate) fn codex_preview(recipe: &LaunchRecipe, id: &str) -> Result<(String, PathBuf), String> {
+pub fn codex_preview(recipe: &LaunchRecipe, id: &str) -> Result<(String, PathBuf), String> {
     let key = key(Provider::Codex, recipe)
         .map_err(|_| "Cannot verify this Codex account and local endpoint.")?;
     codex::preview(&key, id).map_err(|_| "The exact thread is not loaded on this account's shared Codex server, or its metadata could not be verified. Copy the full ID from the intended live CLI and retry.".into())
 }
 
 /// Read-only enumeration for user selection; grants no attach authority.
-pub(crate) fn codex_candidates(
+pub fn codex_candidates(
     recipe: &LaunchRecipe,
 ) -> Result<Vec<crate::chat::BindingCandidate>, String> {
     let key = key(Provider::Codex, recipe)
@@ -101,7 +101,8 @@ impl Entry {
 }
 
 /// Shared account census cache used by the daemon's bounded activity workers.
-pub(crate) struct Observer {
+#[derive(Default)]
+pub struct Observer {
     accounts: Mutex<BTreeMap<Key, Arc<Mutex<Entry>>>>,
     rollouts: rollout::Rollouts,
     attention: Mutex<attention::Tails>,
@@ -109,28 +110,23 @@ pub(crate) struct Observer {
 }
 
 #[derive(Default)]
-pub(crate) struct Observation {
+pub struct Observation {
     pub activity: Option<Activity>,
     pub title: Option<String>,
     pub attention: Option<crate::notifications::Evidence>,
 }
 
-pub(crate) enum ObserveError {
+pub enum ObserveError {
     Busy,
     Unavailable,
 }
 
 impl Observer {
     pub fn new() -> Self {
-        Self {
-            accounts: Mutex::new(BTreeMap::new()),
-            rollouts: rollout::Rollouts::default(),
-            attention: Mutex::default(),
-            waiting: Mutex::default(),
-        }
+        Self::default()
     }
 
-    pub(crate) fn try_observe(
+    pub fn try_observe(
         &self,
         process: &crate::model::agent_recovery::AgentProcess,
     ) -> Result<Observation, ObserveError> {

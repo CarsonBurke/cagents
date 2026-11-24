@@ -75,16 +75,16 @@ impl ServiceInitializer {
 /// may still publish late custody; only new spawn admission is closed. Dropping
 /// or cloning this observer never reopens admission or discards an owner.
 #[derive(Clone)]
-pub(crate) struct ExitDrain {
+pub struct ExitDrain {
     service: Option<Arc<Service>>,
 }
 
-pub(crate) fn begin_exit_drain() -> ExitDrain {
+pub fn begin_exit_drain() -> ExitDrain {
     SERVICE.begin_exit_drain()
 }
 
 impl ExitDrain {
-    pub(crate) fn try_seal_absence(&self) -> bool {
+    pub fn try_seal_absence(&self) -> bool {
         let Some(service) = &self.service else {
             return true;
         };
@@ -95,7 +95,7 @@ impl ExitDrain {
         state.exit_sealed
     }
 
-    pub(crate) fn pending_description(&self) -> String {
+    pub fn pending_description(&self) -> String {
         let Some(service) = &self.service else {
             return "Exact-child spawn admission closed; no service ownership".into();
         };
@@ -121,7 +121,7 @@ impl ExitDrain {
 
     /// Read BEFORE checking absence. Used only if the host listener is unusable;
     /// normal drain progress uses the existing daemon wake/listener path.
-    pub(crate) fn progress_epoch(&self) -> u64 {
+    pub fn progress_epoch(&self) -> u64 {
         self.service.as_ref().map_or(0, |service| {
             service
                 .state
@@ -133,7 +133,7 @@ impl ExitDrain {
 
     /// Lost-wake safe: a settlement between the caller's absence check and this
     /// wait changes the epoch under the SAME mutex. No retry timer or new worker.
-    pub(crate) fn wait_for_progress(&self, observed: u64) {
+    pub fn wait_for_progress(&self, observed: u64) {
         let Some(service) = &self.service else {
             return;
         };
@@ -149,7 +149,7 @@ impl ExitDrain {
 
 /// A spawn-time credit. Hold this alongside the original Child until normal
 /// reaping or transfer. Dropping an unused reservation returns its credit.
-pub(crate) struct Reservation {
+pub struct Reservation {
     service: Arc<Service>,
     slot: Option<usize>,
     ticket: u64,
@@ -163,7 +163,7 @@ impl std::fmt::Debug for Reservation {
     }
 }
 
-pub(crate) fn reserve() -> io::Result<Reservation> {
+pub fn reserve() -> io::Result<Reservation> {
     let service =
         SERVICE.get_or_start(|| Service::start(CAPACITY).map(|(service, _worker)| service))?;
     service.reserve()
@@ -173,11 +173,11 @@ pub(crate) fn reserve() -> io::Result<Reservation> {
 /// suspended, using only retained original ownership; it never opens a new
 /// pidfd by a remembered numeric PID.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RetryReport {
-    pub(crate) rearmed: usize,
-    pub(crate) retained: usize,
+pub struct RetryReport {
+    pub rearmed: usize,
+    pub retained: usize,
 }
-pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
+pub fn retry_preserved() -> io::Result<RetryReport> {
     match SERVICE.get() {
         None => Ok(RetryReport {
             rearmed: 0,
@@ -187,7 +187,7 @@ pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
     }
 }
 
-pub(crate) fn has_suspended_custody() -> bool {
+pub fn has_suspended_custody() -> bool {
     SERVICE
         .get()
         .is_some_and(|service| service.has_suspended_custody())
@@ -196,7 +196,7 @@ pub(crate) fn has_suspended_custody() -> bool {
 /// Pending spawn credits and retained original children are ownership even
 /// before a helper publishes its registry record. Empty-daemon cleanup must
 /// not discard them just because filesystem discovery found no helper.
-pub(crate) fn has_outstanding_ownership() -> bool {
+pub fn has_outstanding_ownership() -> bool {
     match SERVICE.get() {
         Some(service) => service.has_outstanding_ownership(),
         // Initialization failure cannot have handed out a spawn credit.
@@ -207,7 +207,7 @@ pub(crate) fn has_outstanding_ownership() -> bool {
 /// Preserved originals can outlive their former terminal record. This excludes
 /// ordinary caller-held spawn reservations, which remain covered by the normal
 /// terminal inventory and its explicit shutdown confirmation contract.
-pub(crate) fn has_retained_ownership() -> bool {
+pub fn has_retained_ownership() -> bool {
     match SERVICE.get() {
         Some(service) => service.has_retained_ownership(),
         None => false,
@@ -217,7 +217,7 @@ pub(crate) fn has_retained_ownership() -> bool {
 /// Report only retained ownership faults. This observes an existing service;
 /// healthy preservation and initialization failures with no children are not
 /// shutdown errors, and this query never initializes, retries or waits.
-pub(crate) fn retained_custody_error() -> Option<String> {
+pub fn retained_custody_error() -> Option<String> {
     match SERVICE.get() {
         Some(service) => service.retained_custody_error(),
         None => None,
@@ -229,7 +229,7 @@ impl Reservation {
     /// Final cleanup may hold the original Child outside this service's map.
     /// Mark that ownership before publishing the handoff or cancelling the
     /// spawn reservation. Its preallocated slot stays fenced through rollback.
-    pub(crate) fn quarantine(&self) {
+    pub fn quarantine(&self) {
         let slot = self.slot.expect("a live reservation owns one credit");
         let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
         debug_assert!(state.quarantined[slot].is_none_or(|ticket| ticket == self.ticket));
@@ -239,7 +239,7 @@ impl Reservation {
 
     /// Failure returns every ownership object intact. Insertion and wakeup are
     /// atomic to the worker: it cannot observe a transfer that is rolled back.
-    pub(crate) fn retain(self, child: Child, pidfd: File) -> Result<(), RetainError> {
+    pub fn retain(self, child: Child, pidfd: File) -> Result<(), RetainError> {
         self.retain_with_recovery(child, pidfd, false)
     }
 
@@ -315,7 +315,7 @@ impl Reservation {
     /// successful wake. No descriptor in this suspended entry authorizes a
     /// wait or signal. Admission stops until this ownership fault is repaired;
     /// the original Child and credit remain owned even if the worker stopped.
-    pub(crate) fn preserve_suspended(mut self, child: Child, pidfd: Option<File>, reason: &str) {
+    pub fn preserve_suspended(mut self, child: Child, pidfd: Option<File>, reason: &str) {
         let service = self.service.clone();
         let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
         let slot = self

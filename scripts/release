@@ -19,7 +19,7 @@ REHEARSAL_ROOT=${CAGENTS_RELEASE_REHEARSAL_ROOT:-}
 REHEARSAL_PARENTS=${CAGENTS_RELEASE_REHEARSAL_PARENTS:-/var/tmp/cr:/dev/shm/cr}
 VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 # Workspace members that carry the product version.
-MANIFESTS=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
+MANIFESTS=(Cargo.toml crates/cagents-host/Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -589,7 +589,7 @@ start_next_version() {
         body=$(printf '%s\n' \
             "$TAG is published, so main now declares the next patch version, $next. Release bundles are prebuilt from main commits with the version those commits declare, so until this lands every main commit declares the already-tagged $VERSION and gets no usable bundle." \
             "" \
-            "This is the change \`scripts/release bump $next\` makes: the four product manifests and the workspace's own \`Cargo.lock\` entries. \`release publish\` opens and lands this pull request after each release.")
+            "This is the change \`scripts/release bump $next\` makes: the five product manifests and the workspace's own \`Cargo.lock\` entries. \`release publish\` opens and lands this pull request after each release.")
         number=$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$branch" \
             --title "chore(release): start $next after $TAG" --body "$body" | sed -n 's#.*/pull/\([0-9]*\)$#\1#p') \
             || fail "cannot open the pull request from $branch"

@@ -97,10 +97,10 @@ const WORK_BOARD_MESSAGES: &[&str] = &["work_board"];
 
 /// The first protocol with `ToolStatus::Waiting`. An older client is told such
 /// an agent is running, which is what it was before: it hasn't finished.
-pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
+pub const WAITING_TOOL_STATUS: u16 = 166;
 
 /// Earlier runs are shown as stopped to clients that cannot name Ended.
-pub(crate) const ENDED_TOOL_STATUS: u16 = 177;
+pub const ENDED_TOOL_STATUS: u16 = 177;
 
 /// Earlier clients receive retryable Internal errors for store contention.
 pub(super) const STORE_BUSY_ERROR: u16 = 179;
@@ -113,48 +113,48 @@ pub(super) const NOT_ADMITTED_ERROR: u16 = 188;
 /// before it recognised neither, so its clients were never told of them; a
 /// message naming one is refused or withheld for them (see
 /// [`OlderClient::admits_message`]).
-pub(crate) const ANTIGRAVITY_AND_MUSE: u16 = 191;
+pub const ANTIGRAVITY_AND_MUSE: u16 = 191;
 
 /// The first protocol whose account usage readings carry reset inventories and
 /// reported plan details. An earlier client is sent the reading without them.
-pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
+pub const PLAN_AND_RESET_READINGS: u16 = 184;
 
 /// The first protocol whose file changes say what their line numbers count
 /// from. A client before it is sent them without; one from a source before it
 /// is read as an excerpt, whose numbers place nothing.
-pub(crate) const PATCH_LINE_ORIGIN: u16 = 195;
+pub const PATCH_LINE_ORIGIN: u16 = 195;
 
 /// The first protocol whose agent activity says what a waiting agent waits
 /// for. An older client is told it waits, as it was before.
-pub(crate) const WAIT_KINDS: u16 = 199;
+pub const WAIT_KINDS: u16 = 199;
 
 /// The first protocol whose channels name the checkout they work in. A client
 /// before it is sent channels without one, and a channel it creates works in
 /// the main checkout.
-pub(crate) const CHANNEL_CHECKOUT: u16 = 200;
+pub const CHANNEL_CHECKOUT: u16 = 200;
 
 /// The first protocol whose usage says where the provider auto-compacts the
 /// conversation. A client before it is sent the usage without; one from a
 /// source before it is read as compacting nowhere short of the whole window.
-pub(crate) const USAGE_COMPACT_LIMIT: u16 = 201;
+pub const USAGE_COMPACT_LIMIT: u16 = 201;
 
 /// The first protocol whose chat launches carry the model and effort chosen
 /// for a draft. A client before it is sent launches without them, and its
 /// requests are read without them; a source before it chose none and is sent
 /// none.
-pub(crate) const DRAFT_MODEL_IN_LAUNCH: u16 = 202;
+pub const DRAFT_MODEL_IN_LAUNCH: u16 = 202;
 
 /// The first protocol whose chat snapshots say whether the provider can send
 /// what is queued early, and how a request to do so stands. A client from
 /// before it is sent both without; one read from a source before it has
 /// neither (see [`WithoutTrailing`]).
-pub(crate) const SEND_QUEUED_NOW: u16 = 205;
+pub const SEND_QUEUED_NOW: u16 = 205;
 
 /// Whether a field [`SEND_QUEUED_NOW`] added is left out of the value being
 /// encoded, as `skip_serializing_if` asks. It is only ever a struct's last
 /// field, since postcard's positional encoding then leaves the fields before
 /// it as the older client reads them.
-pub(crate) fn before_send_queued_now<T>(_: &T) -> bool {
+pub fn before_send_queued_now<T>(_: &T) -> bool {
     encoding_before(SEND_QUEUED_NOW)
 }
 
@@ -163,7 +163,7 @@ pub(crate) fn before_send_queued_now<T>(_: &T) -> bool {
 /// of its fields, so the struct is read as a tuple of the fields that source
 /// did encode, and its derived visitor gives the rest their defaults: each
 /// omitted field must be `#[serde(default)]`.
-pub(crate) struct WithoutTrailing<D> {
+pub struct WithoutTrailing<D> {
     inner: D,
     omitted: usize,
 }
@@ -346,7 +346,7 @@ thread_local! {
 /// another thread, is sent in the current protocol's encoding, so every
 /// write to a client must serialize inside this scope (as
 /// `ServerEnvelopeRef::serialize` does).
-pub(crate) fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
+pub fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
     struct Restore(Option<u16>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -359,7 +359,7 @@ pub(crate) fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
 }
 
 /// Whether the value being encoded goes to a client from before `protocol`.
-pub(crate) fn encoding_before(protocol: u16) -> bool {
+pub fn encoding_before(protocol: u16) -> bool {
     ENCODING_FOR.get().is_some_and(|older| older < protocol)
 }
 
@@ -374,7 +374,7 @@ thread_local! {
 /// serves, so that values a later protocol added a field to decode as that
 /// peer encoded them. The decode scope ends with `decode`, however it returns
 /// or unwinds.
-pub(crate) fn decoding_from<R>(protocol: u16, decode: impl FnOnce() -> R) -> R {
+pub fn decoding_from<R>(protocol: u16, decode: impl FnOnce() -> R) -> R {
     struct Restore(Option<u16>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -387,7 +387,7 @@ pub(crate) fn decoding_from<R>(protocol: u16, decode: impl FnOnce() -> R) -> R {
 }
 
 /// Whether the value being decoded comes from a peer before `protocol`.
-pub(crate) fn decoding_before(protocol: u16) -> bool {
+pub fn decoding_before(protocol: u16) -> bool {
     DECODING_FROM.get().is_some_and(|older| older < protocol)
 }
 
@@ -406,8 +406,8 @@ pub fn older_client(protocol: u16) -> Option<OlderClient> {
 impl OlderClient {
     /// A client that knows only the first `server_messages` messages and
     /// `server_responses` replies.
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn knowing(protocol: u16, server_messages: u32, server_responses: u32) -> Self {
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn knowing(protocol: u16, server_messages: u32, server_responses: u32) -> Self {
         Self {
             protocol,
             proven_at: PROTOCOL_VERSION,

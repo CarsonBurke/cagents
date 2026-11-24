@@ -272,7 +272,7 @@ build_shares() {
         case ,$names, in
             # A feature may be named with its package, as in cagents/ui.
             *[,\ /]ui[,\ ]*|*integrated-browser*|*cagents-ui*) lane=ui ;;
-            *[,\ /]host[,\ ]*|*cagentsd*) [ "$lane" = ui ] || lane=host ;;
+            *[,\ /]host[,\ ]*|*cagentsd*|*cagents-host*) [ "$lane" = ui ] || lane=host ;;
         esac
     done
     case $1:$lane in
