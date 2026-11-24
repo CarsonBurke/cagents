@@ -16,12 +16,17 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = "x86_64-unknown-linux-gnu"
-PRODUCTS = ("cagents", "cagentsd", "cagents-ui", "cagents-dictate")
+PRODUCTS = ("cagents", "cagentsd", "cagents-ui", "cagents-dictate", "ceditor")
 # The order the packager probes prebuilt versions and inspects glibc needs.
-INSPECTED = ("cagents", "cagents-ui", "cagentsd", "cagents-dictate")
+INSPECTED = ("cagents", "cagents-ui", "cagentsd", "cagents-dictate", "ceditor")
+EDITOR_ID = "io.github.cagents.ceditor"
 VERSION = "9.9.9"
 # Bounds only a hang; a passing run returns as soon as its process exits.
 HANG_GUARD = 60
+
+
+def for_variant(variant, products):
+    return products if variant == "full" else products[:-1]
 
 
 class PackageLinuxArtifacts(unittest.TestCase):
@@ -39,7 +44,7 @@ class PackageLinuxArtifacts(unittest.TestCase):
                      "dev.cagents.Cagents.svg", "dev.cagents.Cagents.png",
                      "dev.cagents.Cagents.metainfo.xml", "cagents-package-lifecycle",
                      "cagents-uninstall", "THIRD-PARTY-NOTICES",
-                     "io.github.cagents.ceditor.desktop", "io.github.cagents.ceditor.svg"):
+                     f"{EDITOR_ID}.desktop", f"{EDITOR_ID}.svg"):
             shutil.copy2(ROOT / "packaging" / name, self.checkout / "packaging" / name)
         # Never downloads: names the fixture libraries and records the cache.
         self.sherpa = self.directory / "sherpa-onnx libraries"
@@ -165,7 +170,8 @@ if sys.argv[1:3] == ['--wide', '--dyn-syms']:
     sys.exit(int(os.environ.get('MOCK_UI_DYNSYM_EXIT', '0')))
 assert sys.argv[1:3] == ['--wide', '--version-info'], sys.argv
 name = Path(sys.argv[3]).name
-version = {'cagents': '2.2.5', 'cagentsd': '2.36', 'cagents-ui': '2.39', 'cagents-dictate': '2.34'}[name]
+version = {'cagents': '2.2.5', 'cagentsd': '2.36', 'cagents-ui': '2.39',
+           'cagents-dictate': '2.34', 'ceditor': '2.35'}[name]
 print("Version definition section '.gnu.version_d' contains 1 entry:")
 print('  0x0000: Rev: 1 Flags: none Index: 2 Cnt: 1 Name: GLIBC_999.0')
 print("Version needs section '.gnu.version_r' contains 1 entry:")
@@ -279,7 +285,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                                               env=self.environment, timeout=HANG_GUARD)
         with tarfile.open(archive, "r:gz") as portable, \
                 tarfile.open(fileobj=io.BytesIO(deb_payload), mode="r:") as debian:
-            for product in PRODUCTS:
+            for product in for_variant(variant, PRODUCTS):
                 expected = ((self.reported / product / NATIVE / product).read_bytes() if fresh
                             else (self.target / profile / product).read_bytes())
                 for payload, prefix in ((portable, f"{name}-{version}/bin/"),
@@ -288,6 +294,22 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                         member = payload.getmember(prefix + product)
                         self.assertEqual(member.mode, 0o755)
                         self.assertEqual(payload.extractfile(member).read(), expected)
+            editor_entry = f"share/applications/{EDITOR_ID}.desktop"
+            editor_icon = f"share/icons/hicolor/scalable/apps/{EDITOR_ID}.svg"
+            if variant == "full":
+                self.assertEqual(debian.getmember("./usr/bin/ceditor").linkname,
+                                 "../libexec/cagents/ceditor")
+                self.assertIn(b"Exec=ceditor %F\n", portable.extractfile(
+                    f"{name}-{version}/{editor_entry}").read())
+                self.assertIn(b"Exec=/usr/bin/ceditor %F\n", debian.extractfile(
+                    f"./usr/{editor_entry}").read())
+                expected_icon = (ROOT / f"packaging/{EDITOR_ID}.svg").read_bytes()
+                self.assertEqual(portable.extractfile(f"{name}-{version}/{editor_icon}").read(), expected_icon)
+                self.assertEqual(debian.extractfile(f"./usr/{editor_icon}").read(), expected_icon)
+            else:
+                self.assertNotIn("./usr/bin/ceditor", debian.getnames())
+                self.assertNotIn(f"./usr/{editor_entry}", debian.getnames())
+                self.assertNotIn(f"{name}-{version}/bin/ceditor", portable.getnames())
             daemon = ((self.reported / "cagentsd" / NATIVE / "cagentsd").read_bytes() if fresh
                       else (self.target / profile / "cagentsd").read_bytes())
             notices = (ROOT / "packaging/THIRD-PARTY-NOTICES").read_bytes()
@@ -322,7 +344,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
             self.assertEqual(Path(inspections[0][2]).name, "cagents-ui")
             inspections = inspections[1:]
         self.assertTrue(all(args[:2] == ["--wide", "--version-info"] for args in inspections))
-        self.assertEqual([Path(args[2]).name for args in inspections], list(INSPECTED))
+        self.assertEqual([Path(args[2]).name for args in inspections], list(for_variant(variant, INSPECTED)))
 
     def test_native_build_uses_exact_artifacts_for_both_variants_and_configured_targets(self):
         for variant in ("full", "browserless"):
@@ -340,13 +362,16 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                     defaults = ["--no-default-features"] if variant == "browserless" else []
                     ui = [] if variant == "browserless" else ["--features", "integrated-browser"]
                     message = ["--message-format=json-render-diagnostics"]
-                    self.assertEqual(self.builds(), [
+                    expected = [
                         common + defaults + ["--bin", "cagents"] + message,
                         common + defaults + ["-p", "cagents-host", "--bin", "cagentsd"] + message,
                         common + ["-p", "cagents-ui"] + ui + ["--bin", "cagents-ui"] + message,
                         common + ["-p", "cagents-dictate", "--features", "engine",
                                   "--bin", "cagents-dictate"] + message,
-                    ])
+                    ]
+                    if variant == "full":
+                        expected.append(common + ["--package", "ceditor", "--bin", "ceditor"] + message)
+                    self.assertEqual(self.builds(), expected)
                     for path, original in self.decoys.items():
                         self.assertEqual(path.read_bytes(), original)
 
@@ -355,7 +380,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         products = [args[args.index("--bin") + 1] if "--bin" in args else "ceditor"
                     for args in self.builds()]
-        self.assertEqual(products, [*PRODUCTS, *PRODUCTS[:-1], "ceditor"])
+        self.assertEqual(products, [*PRODUCTS, *PRODUCTS[:3]])
         self.assertEqual((self.directory / "sherpa-calls").read_text().splitlines(),
                          [str(self.target / "sherpa-onnx")])
 
@@ -366,24 +391,29 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                         for name in names}
 
         full = archive_bytes("cagents", "bin/", PRODUCTS)
-        browserless = archive_bytes("cagents-browserless", "bin/", PRODUCTS)
+        browserless = archive_bytes("cagents-browserless", "bin/", PRODUCTS[:-1])
         editor = archive_bytes("ceditor", f"lib/ceditor/releases/{VERSION}/bin/",
                                ("cagents", "cagentsd", "ceditor"))
-        for product in PRODUCTS[:-1]:
+        for product in PRODUCTS[:3]:
             self.assertIn(b"# variant: full\n", full[product])
             self.assertIn(b"# variant: browserless\n", browserless[product])
         self.assertEqual(full["cagents-dictate"], browserless["cagents-dictate"])
+        self.assertEqual(full["ceditor"], editor["ceditor"])
+        deb = self.dist / f"cagents_{VERSION}_amd64.deb"
+        with tarfile.open(deb) as debian:
+            self.assertEqual(full["ceditor"], debian.extractfile("./usr/libexec/cagents/ceditor").read())
         for product in ("cagents", "cagentsd"):
             self.assertEqual(browserless[product], editor[product])
         for package in ("cagents", "cagents-browserless"):
-            self.assertRegex((self.dist / f"{package}-{VERSION}-sizes.txt").read_text(),
-                             r"(?m)^build_seconds=[0-9]+$")
+            report = (self.dist / f"{package}-{VERSION}-sizes.txt").read_text()
+            self.assertRegex(report, r"(?m)^build_seconds=[0-9]+$")
+            self.assertRegex(report, r"(?m)^editor_build_seconds=[0-9]+$")
 
     def test_release_reports_a_failed_archive_worker(self):
         result = self.package_release(MOCK_UI_DYNSYM_EXIT="7")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("cannot inspect full UI dynamic symbols", result.stderr)
-        self.assertEqual(len(self.builds()), 7)
+        self.assertEqual(len(self.builds()), 8)
         self.assertFalse(self.dist.exists())
 
     def test_release_stops_the_overlapping_compressor_when_the_build_fails(self):
@@ -432,7 +462,7 @@ signal.pause()
 
     def test_each_build_failure_preserves_101_before_protocol_or_package_output(self):
         for variant in ("full", "browserless"):
-            for count, product in enumerate(PRODUCTS, 1):
+            for count, product in enumerate(for_variant(variant, PRODUCTS), 1):
                 with self.subTest(variant=variant, product=product):
                     self.reset_outputs()
                     result = self.package(variant, MOCK_BUILD_FAILURE=product)
@@ -446,7 +476,7 @@ signal.pause()
     def test_missing_or_ambiguous_artifact_refuses_before_protocol_or_package_output(self):
         for variant in ("full", "browserless"):
             for variable in ("MOCK_MISSING_ARTIFACT", "MOCK_AMBIGUOUS_ARTIFACT"):
-                for count, product in enumerate(PRODUCTS, 1):
+                for count, product in enumerate(for_variant(variant, PRODUCTS), 1):
                     with self.subTest(variant=variant, variable=variable, product=product):
                         self.reset_outputs()
                         result = self.package(variant, **{variable: product})
@@ -549,7 +579,7 @@ signal.pause()
                 result = self.package(variant, CAGENTS_SKIP_BUILD="1", PATH=str(self.tools))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.builds(), [])
-                self.assertEqual(self.version_probes(), list(INSPECTED))
+                self.assertEqual(self.version_probes(), list(for_variant(variant, INSPECTED)))
                 self.assert_packages(variant, fresh=False)
 
     def test_matching_prebuilt_full_versions_package_exact_bytes(self):
@@ -562,7 +592,7 @@ signal.pause()
                     result = self.package(variant, CAGENTS_SKIP_BUILD="1", VERSION=version)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(self.builds(), [])
-                    self.assertEqual(self.version_probes(), list(INSPECTED))
+                    self.assertEqual(self.version_probes(), list(for_variant(variant, INSPECTED)))
                     self.assert_packages(variant, fresh=False, version=version)
                     for path, original in self.prebuilt_bytes.items():
                         self.assertEqual(path.read_bytes(), original)
@@ -571,7 +601,7 @@ signal.pause()
         self.forbid_packaging_after_version_failure()
         version = VERSION + "+local.1234567"
         for variant in ("full", "browserless"):
-            for product in PRODUCTS:
+            for product in for_variant(variant, PRODUCTS):
                 for output in (f"other-product {version}\n", f"{product} 9.9.8\n",
                                f"{product} {VERSION}\n", f"{product} {VERSION}+local.other\n", "",
                                f" {product} {version}\n", f"{product} {version} \n",
@@ -591,7 +621,7 @@ signal.pause()
     def test_each_prebuilt_product_requires_success_even_with_matching_output(self):
         self.forbid_packaging_after_version_failure()
         for variant in ("full", "browserless"):
-            for product in PRODUCTS:
+            for product in for_variant(variant, PRODUCTS):
                 with self.subTest(variant=variant, product=product):
                     self.reset_outputs()
                     for companion in PRODUCTS:
@@ -613,7 +643,7 @@ signal.pause()
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.builds(), [])
                 self.assertEqual(self.events("cargo"), [])
-                self.assertEqual(self.version_probes(), list(INSPECTED))
+                self.assertEqual(self.version_probes(), list(for_variant(variant, INSPECTED)))
                 name = "cagents" if variant == "full" else "cagents-browserless"
                 archive = f"{name}-{version}-{NATIVE}.tar.gz"
                 checksum = "SHA256SUMS" if variant == "full" else "SHA256SUMS-browserless"
@@ -621,7 +651,7 @@ signal.pause()
                 digest = hashlib.sha256((self.dist / archive).read_bytes()).hexdigest()
                 self.assertEqual((self.dist / checksum).read_text(), f"{digest}  {archive}\n")
                 with tarfile.open(self.dist / archive, "r:gz") as portable:
-                    for product in PRODUCTS:
+                    for product in for_variant(variant, PRODUCTS):
                         self.assertEqual(portable.extractfile(f"{name}-{version}/bin/{product}").read(),
                                          self.prebuilt_bytes[self.target / "local" / product])
         self.reset_outputs()

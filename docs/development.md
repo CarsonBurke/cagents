@@ -2942,7 +2942,7 @@ data. It does not signal the host daemon or install anything on the host.
 mise run install -- --build-host fw16
 ```
 
-It builds the three matched executables with the `local` Cargo profile,
+It builds the matched application set with the `local` Cargo profile,
 versioned `<version>+local.<short sha>`. That profile keeps release identity
 and optimization but skips link-time optimization and single-unit code
 generation. Each build is incremental, so after the first one only changed
@@ -3068,7 +3068,15 @@ with `REHEARSE_UPDATE_TEST_PARENT=/dev/shm`.
 
 Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch
 that build with its matched `cagents` and `cagentsd`, in the same private runtime.
-The scenario verifies its mapped window too. The default seed includes Claude
+The scenario verifies its mapped window too. To verify the editor shipped with
+NEW, use `--bundled-ceditor`. After the successful update and any requested
+restart, the scenario opens the private user's installed `ceditor` command. It
+checks that the editor paints a window from the selected release, the public
+CLI reports the same version, and the matched daemon is still serving.
+It saves the result in `records/after/bundled-ceditor.json` and the window in
+`shots/after-ceditor.webp`.
+
+The default seed includes Claude
 chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
 Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
@@ -3332,16 +3340,22 @@ behind the active window. The existing-window X11 path does not yet propagate an
 X11 startup-notification ID; granted foreground activation on this combination
 remains unverified. Focus remains subject to the compositor's policy.
 
-Standalone Ceditor review alerts use the shared daemon notification broker. The
-`--review-alerts` runner builds the CLI, daemon, and editor in separate feature
-lanes; the daemon starts lazily when GitHub review requests are scanned. Ordinary
-editing does not require a running daemon. Release archives include these three
-matched executables in a private `lib/ceditor` tree. The source installer switches
-that private tree atomically and exposes only `bin/ceditor`, leaving a separate
-Cagents installation untouched. Existing private builds remain available to
-running windows and daemons; update Ceditor with its original installer, not the
-Cagents self-updater. Opening an alert for the other application requires that
-application to be installed alongside the daemon or in an absolute PATH directory.
+Standalone Ceditor review alerts use the daemon notification broker. The full
+Cagents release installs Ceditor beside its matched CLI and daemon, so both
+applications use the same per-user service and update together. Ordinary
+editing works without a running daemon.
+
+The editor-only archive and `scripts/install-ceditor` still support development
+and editor-only installations. They keep their matched companions in a private
+`lib/ceditor` tree and expose `bin/ceditor`. At the default prefix,
+`scripts/install-ceditor` keeps the source build selected across later signed
+Cagents updates. See
+[what the installer does](installation.md#what-the-installer-does) to switch
+back to the bundled editor. The `--review-alerts` development
+runner builds the CLI, daemon, and editor in separate feature lanes. The daemon
+starts lazily when GitHub review requests are scanned. Opening an alert for the
+other application requires that application alongside the daemon or in an
+absolute `PATH` directory.
 
 ## macOS
 

@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = "9.9.9"
 JOB = "00000000-0000-4000-8000-000000000001"
 TOP = f"cagents-{VERSION}"
-ARCHIVE_NAME = f"{TOP}-x86_64-unknown-linux-gnu.tar.gz"
+SOURCE_EDITOR_LINK = "../lib/ceditor/current/bin/ceditor"
 EDITOR_MEMBERS = (
     "bin/ceditor",
     "share/applications/io.github.cagents.ceditor.desktop",
@@ -90,6 +90,9 @@ elif args[0] == 'select-install':
     switch = prefix / '.select-fixture'
     switch.symlink_to(selected.relative_to(prefix))
     switch.replace(prefix / 'current')
+elif args[0] == 'settle-editor-install':
+    assert len(args) == 2 and os.environ.get('FIXTURE_COMPATIBLE_WORKER')
+    record('settle-editor-install', previous=args[1])
 elif args[:2] == ['daemon', 'capture-update-census']:
     assert args[2] == '--output' and args[4] == '--candidate-cli' and len(args) == 6
     assert pathlib.Path(args[5]).is_file()
@@ -127,7 +130,10 @@ elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update
     elif '--validate-only' in flags:
         state, accepted = 'unverified', True
     elif '--require-original' in flags:
-        state, accepted = ('no_source', True) if not ready and '--allow-absent' in flags else ('unverified', False)
+        if ready and os.environ.get('FIXTURE_COMPATIBLE_WORKER'):
+            state, accepted = 'usable', True
+        else:
+            state, accepted = ('no_source', True) if not ready and '--allow-absent' in flags else ('unverified', False)
     elif ready and not os.environ.get('FIXTURE_CENSUS_VERIFICATION_FAILS'):
         state, accepted = 'usable', True
     elif '--allow-absent' in flags:
@@ -294,17 +300,18 @@ class InstallerCoordinator(unittest.TestCase):
             path = self.payload / "share" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / source, path)
-        self.archive = self.directory / ARCHIVE_NAME
         self.checksums = self.directory / "SHA256SUMS"
         self.package()
-        self.environment.update(CAGENTS_ARCHIVE=str(self.archive), CAGENTS_CHECKSUMS=str(self.checksums))
 
-    def package(self, *, exclude=()):
-        excluded = {f"{TOP}/{member}" for member in ((exclude,) if isinstance(exclude, str) else exclude)}
+    def package(self, *, exclude=(), version=VERSION):
+        top = f"cagents-{version}"
+        self.archive = self.directory / f"{top}-x86_64-unknown-linux-gnu.tar.gz"
+        excluded = {f"{top}/{member}" for member in ((exclude,) if isinstance(exclude, str) else exclude)}
         with tarfile.open(self.archive, "w:gz") as archive:
-            archive.add(self.payload, arcname=TOP,
+            archive.add(self.payload, arcname=top,
                         filter=lambda entry: None if entry.name in excluded else entry)
-        self.checksums.write_text(f"{hashlib.sha256(self.archive.read_bytes()).hexdigest()}  {ARCHIVE_NAME}\n")
+        self.checksums.write_text(f"{hashlib.sha256(self.archive.read_bytes()).hexdigest()}  {self.archive.name}\n")
+        self.environment.update(CAGENTS_ARCHIVE=str(self.archive), CAGENTS_CHECKSUMS=str(self.checksums))
 
     @staticmethod
     def write(path, text):
@@ -318,8 +325,8 @@ class InstallerCoordinator(unittest.TestCase):
     def python(self, path, body):
         self.executable(path, f"#!{sys.executable}\n" + body)
 
-    def install(self, *options):
-        command = ["/bin/sh", str(ROOT / "install.sh"), "--version", VERSION, "--prefix", str(self.prefix),
+    def install(self, *options, version=VERSION):
+        command = ["/bin/sh", str(ROOT / "install.sh"), "--version", version, "--prefix", str(self.prefix),
                    *options]
         with subprocess.Popen(command, env=self.environment, cwd=self.directory,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -642,7 +649,7 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         (private / "current").symlink_to("releases/build.fixture")
         launcher = self.managed_link("bin/ceditor")
         launcher.parent.mkdir(parents=True, exist_ok=True)
-        launcher.symlink_to("../lib/ceditor/current/bin/ceditor")
+        launcher.symlink_to(SOURCE_EDITOR_LINK)
         return product
 
     def assert_editor_launches(self, edition, launcher=None):
@@ -698,6 +705,45 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assert_editor_launches("bundled")
         self.assertTrue(source.is_file())
 
+    def test_withdrawal_retires_editor_links_and_reselection_restores_them(self):
+        self.installed_cli(guarded=True, version="9.9.8")
+        self.add_editor_to_archive()
+        staged = self.install("--stage-only")
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        withdrawn = self.install("--stage-only", "--select", "9.9.8")
+        self.assertEqual(withdrawn.returncode, 0, withdrawn.stdout + withdrawn.stderr)
+        self.assertFalse((self.prefix / ".ceditor-launcher").exists())
+        for member in EDITOR_MEMBERS:
+            self.assertFalse(self.managed_link(member).is_symlink())
+
+        selected = self.install("--stage-only", "--select", VERSION)
+        self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
+        self.assert_editor_launches("bundled")
+        for asset in EDITOR_MEMBERS[1:]:
+            self.assertEqual(self.managed_link(asset).readlink(), self.prefix / "current" / asset)
+
+    def test_first_bundled_editor_schedules_cleanup_for_compatible_update_worker(self):
+        previous = self.installed_cli(guarded=True).parent
+        self.add_editor_to_archive()
+        census = self.prefix / ".update" / f"{JOB}.census.json"
+        self.write(census, json.dumps({"version": 1, "transaction": JOB, "source": None,
+                                       "terminals": [], "chats": [], "checkpoint_before": None}))
+        census.chmod(0o600)
+        Path(self.environment["FIXTURE_DAEMON_STATE"]).touch()
+        self.environment.update(
+            CAGENTS_UI_UPDATE_GUARD_FD="fixture-only",
+            CAGENTS_INSTALL_CENSUS_PATH=str(census),
+            CAGENTS_INSTALL_OUTCOME_PATH=str(census.with_suffix(".outcome.json")),
+            FIXTURE_COMPATIBLE_WORKER="1",
+            FIXTURE_STATUS_REPLY='{"ok":true,"command":"daemon.status","data":'
+                                 '{"running":true,"daemon_version":"old"}}',
+        )
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_editor_launches("bundled")
+        self.assertEqual([event["previous"] for event in self.events()
+                          if event["event"] == "settle-editor-install"], [str(previous)])
+
     def test_source_launcher_and_data_survive_failed_update_and_uninstall(self):
         source = self.install_source_editor()
         self.installed_cli(guarded=True)
@@ -730,6 +776,92 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertEqual(desktop.read_text(), "source desktop configuration\n")
         for item in (config, state):
             self.assertEqual(item.read_text(), "editor data\n")
+
+    def test_explicit_source_reinstall_survives_signed_updates(self):
+        source = self.install_source_editor()
+        self.add_editor_to_archive()
+        self.assert_installed(self.install(), "candidate")
+        self.assert_editor_launches("bundled")
+        public = self.managed_link("bin/ceditor")
+        managed = self.prefix / ".ceditor-launcher"
+        self.assertEqual(public.readlink(), managed)
+
+        # A source reinstall selects a private build with a preference marker.
+        # A managed desktop entry in XDG_DATA_HOME still calls the same script.
+        preference = source.parent.parent / ".prefer-source"
+        preference.touch()
+        public.unlink()
+        public.symlink_to(SOURCE_EDITOR_LINK)
+        self.package(version="9.10.0")
+        result = self.install("--stage-only", version="9.10.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(public.readlink(), Path(SOURCE_EDITOR_LINK))
+        self.assert_editor_launches("source")
+        self.assert_editor_launches("source", managed)
+
+        preference.unlink()
+        self.package(version="9.10.1")
+        result = self.install("--stage-only", version="9.10.1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(public.readlink(), managed)
+        self.assert_editor_launches("bundled")
+
+    def test_managed_launcher_upgrade_is_atomic_and_rolls_back_on_failure(self):
+        self.installed_cli(guarded=True)
+        self.add_editor_to_archive()
+        managed = self.prefix / ".ceditor-launcher"
+        v1 = '#!/bin/sh\n# cagents managed ceditor launcher v1\nprintf "%s\\n" old "$@"\n'
+        self.executable(managed, v1)
+        public = self.managed_link("bin/ceditor")
+        public.parent.mkdir(parents=True, exist_ok=True)
+        public.symlink_to(managed)
+        inode = managed.stat().st_ino
+
+        self.environment.update(FIXTURE_DAEMON_START_FAILS="1", FIXTURE_CHECKPOINT_BEFORE="a" * 64)
+        failed = self.install("--restart-daemon")
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertIn("replacement daemon startup failed", failed.stderr)
+        self.assertEqual(managed.stat().st_ino, inode)
+        self.assertEqual(managed.read_text(), v1)
+        self.assert_editor_launches("old")
+        self.assertEqual(list(self.prefix.glob(".ceditor-launcher.*")), [])
+
+        del self.environment["FIXTURE_DAEMON_START_FAILS"], self.environment["FIXTURE_CHECKPOINT_BEFORE"]
+        result = self.install("--stage-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(managed.stat().st_ino, inode)
+        self.assertEqual(managed.read_text().splitlines()[1:3], [
+            "# cagents managed ceditor launcher v1", "# cagents ceditor launcher revision 2",
+        ])
+        self.assertEqual(public.readlink(), managed)
+        self.assert_editor_launches("bundled")
+        self.assertEqual(list(self.prefix.glob(".ceditor-launcher.*")), [])
+
+    def test_installer_keeps_newer_managed_launcher_and_uninstaller_recognizes_it(self):
+        self.installed_cli(guarded=True)
+        self.add_editor_to_archive()
+        managed = self.prefix / ".ceditor-launcher"
+        future = '#!/bin/sh\n# cagents managed ceditor launcher v1\n# cagents ceditor launcher revision 3\nprintf "%s\\n" future "$@"\n'
+        self.executable(managed, future)
+        self.assert_installed(self.install(), "installed")
+        self.assertEqual(managed.read_text(), future)
+        self.assert_editor_launches("future")
+
+        result = self.uninstall("packaged helper")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(managed.exists())
+        self.assertFalse(self.managed_link("bin/ceditor").is_symlink())
+
+    def test_installer_refuses_an_unowned_file_at_managed_launcher_path(self):
+        self.installed_cli(guarded=True)
+        self.add_editor_to_archive()
+        managed = self.prefix / ".ceditor-launcher"
+        content = "#!/bin/sh\n# cagents managed ceditor launcher v1 unrelated\nexit 1\n"
+        self.executable(managed, content)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"refusing to replace existing file {managed}", result.stderr)
+        self.assertEqual(managed.read_text(), content)
 
     def test_bundled_editor_preserves_an_unrelated_public_launcher(self):
         self.add_editor_to_archive()

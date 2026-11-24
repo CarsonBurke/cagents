@@ -1,3 +1,4 @@
+use crate::companion::Product;
 #[cfg(all(test, target_os = "linux"))]
 use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
 #[cfg(target_os = "linux")]
@@ -2718,7 +2719,6 @@ pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
 }
 
 pub const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
-#[cfg(any(feature = "host", target_os = "macos"))]
 pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_directory()?;
     Ok((
@@ -3271,9 +3271,24 @@ pub const CEDITOR_NOTIFICATION_ARGUMENT: &str = "--ceditor-notifications";
 const CEDITOR_COMPANIONS_MARKER: &str = ".ceditor-companions";
 const CEDITOR_COMPANIONS_CONTENT: &[u8] = b"ceditor companions v1\n";
 
+/// An open editor can finish its work after `current` changes. If its alerts
+/// need to start a daemon, only an editor from the selected version may do so.
+#[doc(hidden)]
+pub fn validate_editor_daemon_version(executable: &Path) -> io::Result<()> {
+    if let Ok(layout) = crate::update::locate(executable)
+        && layout.prefix.join("current").canonicalize()? != layout.version_root
+    {
+        return Err(io::Error::other(
+            "Ceditor has been updated. Reopen Ceditor to reconnect review alerts.",
+        ));
+    }
+    Ok(())
+}
+
 /// A fixed local install marker preserves desktop identity when the private
-/// CLI restarts its daemon. Development launches use the explicit fixed flag.
-/// Neither path permits a caller-supplied desktop ID or executable path.
+/// CLI restarts its daemon. The editor development runner registers its own
+/// desktop entry. A shared release uses the Cagents desktop ID from either
+/// launcher.
 pub fn notification_daemon_application(
     executable: &Path,
     editor_requested: bool,
@@ -3300,14 +3315,16 @@ pub fn notification_daemon_application(
     if installed || editor_requested {
         // A flag is accepted only with an owned co-installed editor, never a
         // PATH lookup which could silently select another installation.
-        resolve_notification_executable(
-            &crate::companion::Product::Editor.beside(executable)?,
-            std::iter::empty(),
-        )?;
-        Ok(crate::notifications::Application::Ceditor)
-    } else {
-        Ok(crate::notifications::Application::Cagents)
+        resolve_notification_executable(Product::Editor, [Product::Editor.beside(executable)?])?;
+        if installed
+            || cfg!(feature = "development")
+            || resolve_notification_executable(Product::Ui, [Product::Ui.beside(executable)?])
+                .is_err()
+        {
+            return Ok(crate::notifications::Application::Ceditor);
+        }
     }
+    Ok(crate::notifications::Application::Cagents)
 }
 
 pub fn notification_desktop_id(application: crate::notifications::Application) -> &'static str {
@@ -3320,24 +3337,38 @@ pub fn notification_desktop_id(application: crate::notifications::Application) -
     }
 }
 
-// The editor's daemon is a private matched companion. The other shell may be
-// installed separately, so resolve only these fixed application names, never a
-// path carried by an alert. Relative PATH entries cannot redirect activation.
-fn notification_executable(product: crate::companion::Product) -> io::Result<PathBuf> {
-    let current = crate::process::current_executable()?;
-    let sibling = product.beside(&current)?;
+fn notification_executable(product: Product) -> io::Result<PathBuf> {
+    let daemon = crate::process::current_executable()?;
     let search = env::var_os("PATH").unwrap_or_default();
-    resolve_notification_executable(
-        &sibling,
+    resolve_notification_launch(
+        product,
+        &daemon,
         env::split_paths(&search).map(|p| p.join(product.file_name())),
     )
 }
 
-fn resolve_notification_executable(
-    sibling: &Path,
+fn resolve_notification_launch(
+    product: Product,
+    daemon: &Path,
     alternatives: impl IntoIterator<Item = PathBuf>,
 ) -> io::Result<PathBuf> {
-    for candidate in std::iter::once(sibling.to_owned()).chain(alternatives) {
+    let primary = if product == Product::Editor
+        && let Ok(layout) = crate::update::locate(daemon)
+    {
+        // The installed launcher follows the selected release and honors a
+        // source override even when this daemon still runs from an older tree.
+        layout.prefix.join(".ceditor-launcher")
+    } else {
+        product.beside(daemon)?
+    };
+    resolve_notification_executable(product, std::iter::once(primary).chain(alternatives))
+}
+
+fn resolve_notification_executable(
+    product: Product,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> io::Result<PathBuf> {
+    for candidate in candidates {
         if !candidate.is_absolute() {
             continue;
         }
@@ -3359,7 +3390,7 @@ fn resolve_notification_executable(
         io::ErrorKind::NotFound,
         format!(
             "{} is not installed beside the notification service or in an absolute PATH directory; install that application to open this alert",
-            sibling.file_name().unwrap_or_default().to_string_lossy()
+            product.file_name().to_string_lossy()
         ),
     ))
 }
@@ -3372,8 +3403,7 @@ pub fn launch_notification_destination(
     if destination.application == crate::notifications::Application::Cagents {
         return launch_notification_window(&destination.window, token);
     }
-    let mut command =
-        process::Command::new(notification_executable(crate::companion::Product::Editor)?);
+    let mut command = process::Command::new(notification_executable(Product::Editor)?);
     command.args(["--notification-window", &destination.window]);
     command.env_remove("XDG_ACTIVATION_TOKEN");
     if let Some(token) = token.filter(|token| valid_activation_token(token)) {
@@ -3384,8 +3414,7 @@ pub fn launch_notification_destination(
 
 pub fn launch_notification_window(slot: &str, token: Option<&str>) -> io::Result<()> {
     validate_window_slot(slot)?;
-    let mut command =
-        process::Command::new(notification_executable(crate::companion::Product::Ui)?);
+    let mut command = process::Command::new(notification_executable(Product::Ui)?);
     command.args(["--window", slot]);
     command.env_remove("XDG_ACTIVATION_TOKEN");
     if let Some(token) = token.filter(|token| valid_activation_token(token)) {
@@ -6030,6 +6059,27 @@ mod tests {
             notification_daemon_application(&daemon, true).unwrap(),
             crate::notifications::Application::Ceditor
         );
+        let ui = root.path().join("cagents-ui");
+        fs::write(&ui, "fixture executable").unwrap();
+        fs::set_permissions(&ui, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            notification_daemon_application(&daemon, true).unwrap(),
+            crate::notifications::Application::Ceditor
+        );
+        fs::set_permissions(&ui, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            notification_daemon_application(&daemon, false).unwrap(),
+            crate::notifications::Application::Cagents
+        );
+        let expected = if cfg!(feature = "development") {
+            crate::notifications::Application::Ceditor
+        } else {
+            crate::notifications::Application::Cagents
+        };
+        assert_eq!(
+            notification_daemon_application(&daemon, true).unwrap(),
+            expected
+        );
         let marker = root.path().join(CEDITOR_COMPANIONS_MARKER);
         fs::write(&marker, CEDITOR_COMPANIONS_CONTENT).unwrap();
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
@@ -6045,32 +6095,105 @@ mod tests {
     }
 
     #[test]
+    fn only_the_current_managed_editor_can_start_its_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        let old = prefix.join("versions/old/bin");
+        let new = prefix.join("versions/new/bin");
+        let private = prefix.join("lib/ceditor/releases/build.123/bin");
+        for bin in [&old, &new, &private] {
+            fs::create_dir_all(bin).unwrap();
+            for binary in ["ceditor", "cagents", "cagentsd"] {
+                fs::write(bin.join(binary), "fixture executable").unwrap();
+            }
+        }
+        for bin in [&old, &new] {
+            fs::write(bin.join("cagents-ui"), "fixture executable").unwrap();
+        }
+        let current = prefix.join("current");
+        symlink("versions/old", &current).unwrap();
+        assert!(validate_editor_daemon_version(&old.join("ceditor")).is_ok());
+        fs::remove_file(&current).unwrap();
+        symlink("versions/new", &current).unwrap();
+
+        assert!(validate_editor_daemon_version(&new.join("ceditor")).is_ok());
+        assert!(validate_editor_daemon_version(&private.join("ceditor")).is_ok());
+        for binary in ["ceditor", "cagentsd"] {
+            let error = validate_editor_daemon_version(&old.join(binary)).unwrap_err();
+            assert!(error.to_string().contains("Reopen Ceditor"));
+        }
+    }
+
+    #[test]
     fn notification_launch_resolves_private_siblings_then_safe_installed_shells() {
         let temporary = tempfile::tempdir().unwrap();
         // Resolution answers canonical paths, which differ from the temporary
         // one where that path crosses a link, as on Darwin.
         let root = fs::canonicalize(temporary.path()).unwrap();
         let sibling = root.join("private/ceditor");
+        let daemon = sibling.with_file_name("cagentsd");
         let installed = root.join("bin/ceditor");
         fs::create_dir_all(sibling.parent().unwrap()).unwrap();
         fs::create_dir_all(installed.parent().unwrap()).unwrap();
         fs::write(&installed, "installed").unwrap();
         fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            resolve_notification_executable(&sibling, [installed.clone()]).unwrap(),
+            resolve_notification_launch(Product::Editor, &daemon, [installed.clone()]).unwrap(),
             installed
         );
         fs::write(&sibling, "matched").unwrap();
         fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            resolve_notification_executable(&sibling, [installed.clone()]).unwrap(),
+            resolve_notification_launch(Product::Editor, &daemon, [installed.clone()]).unwrap(),
             sibling
         );
         fs::set_permissions(&sibling, fs::Permissions::from_mode(0o777)).unwrap();
         fs::set_permissions(&installed, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(
-            resolve_notification_executable(&sibling, [installed, PathBuf::from("ceditor")])
-                .is_err()
+            resolve_notification_launch(
+                Product::Editor,
+                &daemon,
+                [installed, PathBuf::from("ceditor")],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn notification_launch_uses_managed_editor_launcher_instead_of_daemon_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        let bin = prefix.join("versions/older/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let launcher = prefix.join(".ceditor-launcher");
+        let daemon = bin.join("cagentsd");
+        let installed = prefix.join("ceditor-from-path");
+        for executable in ["cagents", "cagents-ui", "ceditor", "cagentsd"] {
+            fs::write(bin.join(executable), "fixture executable").unwrap();
+        }
+        for path in [bin.join("ceditor"), launcher.clone(), installed.clone()] {
+            fs::write(&path, "fixture executable").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert_eq!(
+            resolve_notification_launch(Product::Editor, &daemon, [installed.clone()]).unwrap(),
+            launcher
+        );
+        fs::remove_file(&launcher).unwrap();
+        assert_eq!(
+            resolve_notification_launch(Product::Editor, &daemon, [installed.clone()]).unwrap(),
+            installed
         );
     }
 

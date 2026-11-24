@@ -31,7 +31,9 @@ CASES = (
 
 class InstallerDesktopEntries(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="installer-desktop-", dir="/var/tmp")
+        temporary = tempfile.TemporaryDirectory(
+            prefix="installer-desktop-", dir=os.environ.get("TMPDIR") or "/var/tmp",
+        )
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         installer = (ROOT / "install.sh").read_text()

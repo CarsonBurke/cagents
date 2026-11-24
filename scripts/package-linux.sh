@@ -10,6 +10,8 @@ VARIANT=full
 # Cargo profile for the packaged executables; `local` keeps release identity.
 PROFILE=${CAGENTS_CARGO_PROFILE:-release}
 ARCHIVE_ONLY=0
+EDITOR_DESKTOP_ID=io.github.cagents.ceditor
+BINARIES='cagents cagents-ui cagentsd cagents-dictate'
 STAGE=
 PACKAGE_STAGE=
 REUSE_DICTATE=
@@ -96,6 +98,7 @@ case $VARIANT in
         SIZE_NAME=cagents-$VERSION-sizes.txt
         EXTRA_DEPENDS=', libegl1'
         OTHER_PACKAGE=cagents-browserless
+        BINARIES="$BINARIES ceditor"
         ;;
     browserless)
         TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT_DIR/target/browserless"}
@@ -127,11 +130,19 @@ else
 fi
 
 BUILD_SECONDS=skipped
+EDITOR_BUILD_SECONDS=0
 if [ -n "$PACKAGE_STAGE" ]; then
     CLI_BINARY=$PACKAGE_STAGE/cagents
     HOST_BINARY=$PACKAGE_STAGE/cagentsd
     UI_BINARY=$PACKAGE_STAGE/cagents-ui
     DICTATE_BINARY=$PACKAGE_STAGE/cagents-dictate
+    if [ "$VARIANT" = full ]; then
+        EDITOR_BINARY=$PACKAGE_STAGE/ceditor
+        EDITOR_BUILD_SECONDS=$(cat "$PACKAGE_STAGE/editor-build-seconds")
+        case $EDITOR_BUILD_SECONDS in
+            ''|*[!0-9]*) fail 'invalid staged editor build time' ;;
+        esac
+    fi
     BUILD_SECONDS=$(cat "$PACKAGE_STAGE/build-seconds")
     RESOLVED_PACKAGE_IDS=$(cat "$PACKAGE_STAGE/resolved-package-ids")
     case $BUILD_SECONDS in
@@ -214,6 +225,11 @@ elif [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     if [ -z "$DICTATE_BINARY" ]; then
         DICTATE_BINARY=$(build_target cagents-dictate -p cagents-dictate --features engine --bin cagents-dictate)
     fi
+    if [ "$VARIANT" = full ]; then
+        EDITOR_BUILD_STARTED=$(date +%s)
+        EDITOR_BINARY=$(build_target ceditor --package ceditor --bin ceditor)
+        EDITOR_BUILD_SECONDS=$(($(date +%s) - EDITOR_BUILD_STARTED))
+    fi
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
 else
@@ -222,6 +238,10 @@ else
     HOST_BINARY=$TARGET_DIR/$PROFILE/cagentsd
     UI_BINARY=$TARGET_DIR/$PROFILE/cagents-ui
     DICTATE_BINARY=$TARGET_DIR/$PROFILE/cagents-dictate
+    EDITOR_BINARY=$TARGET_DIR/$PROFILE/ceditor
+    if [ "$VARIANT" = full ]; then
+        EDITOR_BUILD_SECONDS=skipped
+    fi
 fi
 
 # Only the release size report reads this.
@@ -243,7 +263,7 @@ if [ "$ARCHIVE_ONLY" = 0 ] && [ -z "$PACKAGE_STAGE" ]; then
     else
         RESOLVED_PACKAGE_IDS=$(
             cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-                -p cagents -p cagents-ui -p cagents-dictate \
+                -p cagents -p cagents-ui -p cagents-dictate -p ceditor \
                 --features cagents/host,cagents-ui/integrated-browser,cagents-dictate/engine \
                 --edges normal --prefix none |
                 sed -e 's/ (\*)$//' -e '/^$/d' |
@@ -257,6 +277,9 @@ fi
 for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY" "$DICTATE_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
+if [ "$VARIANT" = full ]; then
+    [ -x "$EDITOR_BINARY" ] || fail "missing release binary: $EDITOR_BINARY"
+fi
 if [ -n "$STAGE" ]; then
     mkdir -- "$STAGE"
     # Cargo may overwrite a reported executable the next time its name
@@ -265,6 +288,10 @@ if [ -n "$STAGE" ]; then
     cp --reflink=auto -- "$HOST_BINARY" "$STAGE/cagentsd"
     cp --reflink=auto -- "$UI_BINARY" "$STAGE/cagents-ui"
     cp --reflink=auto -- "$DICTATE_BINARY" "$STAGE/cagents-dictate"
+    if [ "$VARIANT" = full ]; then
+        cp --reflink=auto -- "$EDITOR_BINARY" "$STAGE/ceditor"
+        printf '%s\n' "$EDITOR_BUILD_SECONDS" > "$STAGE/editor-build-seconds"
+    fi
     printf '%s\n' "$BUILD_SECONDS" > "$STAGE/build-seconds"
     printf '%s\n' "$RESOLVED_PACKAGE_IDS" > "$STAGE/resolved-package-ids"
     exit 0
@@ -284,6 +311,9 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ] || [ -n "$PACKAGE_STAGE" ]; then
     require_prebuilt_version cagents-ui "$UI_BINARY"
     require_prebuilt_version cagentsd "$HOST_BINARY"
     require_prebuilt_version cagents-dictate "$DICTATE_BINARY"
+    if [ "$VARIANT" = full ]; then
+        require_prebuilt_version ceditor "$EDITOR_BINARY"
+    fi
 fi
 
 PROTOCOL_VERSION=$("$CLI_BINARY" daemon protocol-version) \
@@ -318,13 +348,16 @@ install -m 0755 "$DICTATE_BINARY" "$BIN_DIR/cagents-dictate"
 install -m 0644 /dev/null "$BIN_DIR/.cagents-ui-lease-v1"
 if [ "$VARIANT" = full ]; then
     install -m 0755 "$ROOT_DIR/packaging/cagents-uninstall" "$BIN_DIR/cagents-uninstall"
+    install -m 0755 "$EDITOR_BINARY" "$BIN_DIR/ceditor"
+    install -m 0644 "$ROOT_DIR/packaging/$EDITOR_DESKTOP_ID.desktop" "$SHARE_DIR/applications/$EDITOR_DESKTOP_ID.desktop"
+    install -m 0644 "$ROOT_DIR/packaging/$EDITOR_DESKTOP_ID.svg" "$SHARE_DIR/icons/hicolor/scalable/apps/$EDITOR_DESKTOP_ID.svg"
 else
     ln -s cagents "$BIN_DIR/cagents-browserless"
 fi
 # Opt in when repacking already-qualified executable bytes. Skipping the build
 # alone must retain the normal release stripping behavior.
 if [ "${CAGENTS_SKIP_STRIP:-0}" != 1 ]; then
-    strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd" "$BIN_DIR/cagents-dictate"
+    (cd "$BIN_DIR" && strip --strip-unneeded $BINARIES)
 fi
 
 # Inspect the exact bytes about to enter both package formats, including
@@ -394,7 +427,7 @@ fi
 # packager host version or unrelated exported version definitions.
 GLIBC_REQUIREMENTS=$WORK_DIR/glibc-requirements
 printf '%s\n' 2.35 > "$GLIBC_REQUIREMENTS"
-for binary in cagents cagents-ui cagentsd cagents-dictate; do
+for binary in $BINARIES; do
     VERSION_INFO=$WORK_DIR/$binary-version-info
     VERSION_ERRORS=$WORK_DIR/$binary-version-errors
     LC_ALL=C readelf --wide --version-info "$BIN_DIR/$binary" \
@@ -491,16 +524,23 @@ install -d -m 0755 \
     "$DEB_ROOT/usr/share/icons/hicolor/128x128/apps" \
     "$DEB_ROOT/usr/share/metainfo" \
     "$DEB_ROOT/usr/share/doc/$PACKAGE_NAME"
-install -m 0755 "$BIN_DIR/cagents" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents"
-install -m 0755 "$BIN_DIR/cagents-ui" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents-ui"
-install -m 0755 "$BIN_DIR/cagentsd" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagentsd"
-install -m 0755 "$BIN_DIR/cagents-dictate" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents-dictate"
+for binary in $BINARIES; do
+    install -m 0755 "$BIN_DIR/$binary" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/$binary"
+done
 install -m 0644 "$BIN_DIR/.cagents-ui-lease-v1" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-ui-lease-v1"
 DAEMON_DIGEST=$(sha256sum "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagentsd")
 DAEMON_DIGEST=${DAEMON_DIGEST%% *}
 printf '%s %s\n' "$PROTOCOL_VERSION" "$DAEMON_DIGEST" > "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-daemon-protocol"
 chmod 0644 "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-daemon-protocol"
 ln -s "../libexec/$PACKAGE_NAME/cagents" "$DEB_ROOT/usr/bin/$COMMAND_NAME"
+if [ "$VARIANT" = full ]; then
+    ln -s "../libexec/$PACKAGE_NAME/ceditor" "$DEB_ROOT/usr/bin/ceditor"
+    sed 's|^Exec=ceditor |Exec=/usr/bin/ceditor |' "$SHARE_DIR/applications/$EDITOR_DESKTOP_ID.desktop" \
+        > "$DEB_ROOT/usr/share/applications/$EDITOR_DESKTOP_ID.desktop"
+    chmod 0644 "$DEB_ROOT/usr/share/applications/$EDITOR_DESKTOP_ID.desktop"
+    install -m 0644 "$SHARE_DIR/icons/hicolor/scalable/apps/$EDITOR_DESKTOP_ID.svg" \
+        "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/$EDITOR_DESKTOP_ID.svg"
+fi
 sed \
     -e "s|^Exec=.*|Exec=/usr/bin/$COMMAND_NAME ui|" \
     -e "s|^TryExec=.*|TryExec=/usr/bin/$COMMAND_NAME|" \
@@ -551,7 +591,7 @@ find "$DEB_ROOT" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH dpkg-deb --root-owner-group --build "$DEB_ROOT" "$DIST_DIR/$DEB_NAME"
 
 INSTALLED_BYTES=0
-for binary in cagents cagents-ui cagentsd cagents-dictate; do
+for binary in $BINARIES; do
     binary_bytes=$(wc -c < "$BIN_DIR/$binary")
     INSTALLED_BYTES=$((INSTALLED_BYTES + binary_bytes))
 done
@@ -562,6 +602,7 @@ variant=$VARIANT
 target=$RELEASE_TARGET
 resolved_package_ids=$RESOLVED_PACKAGE_IDS
 build_seconds=$BUILD_SECONDS
+editor_build_seconds=$EDITOR_BUILD_SECONDS
 installed_binary_bytes=$INSTALLED_BYTES
 portable_archive_bytes=$ARCHIVE_BYTES
 debian_package_bytes=$DEB_BYTES

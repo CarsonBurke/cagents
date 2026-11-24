@@ -19,11 +19,15 @@ VERSION = "9.9.9"
 # Bounds only a hang; a passing run returns as soon as its process exits.
 HANG_GUARD = 60
 # Every executable a package ships, in the order the packager inspects them.
-PACKAGED = ("cagents", "cagents-ui", "cagentsd", "cagents-dictate")
+PACKAGED = ("cagents", "cagents-ui", "cagentsd", "cagents-dictate", "ceditor")
 
 
 # Runtime-image packages that provide a dependency under another name.
 RUNTIME_PROVIDERS = {"libasound2": "libasound2t64"}
+
+
+def packaged_binaries(variant):
+    return PACKAGED if variant == "full" else PACKAGED[:-1]
 
 
 def provisioned_runtime_packages():
@@ -129,7 +133,7 @@ class PackageDependencies(unittest.TestCase):
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(
-            dir="/var/tmp", prefix="cagents-package-deps-",
+            dir=os.environ.get("TMPDIR") or "/var/tmp", prefix="cagents-package-deps-",
         )
         self.addCleanup(self.temporary.cleanup)
         self.work = Path(self.temporary.name)
@@ -151,6 +155,8 @@ class PackageDependencies(unittest.TestCase):
             f'printf "cagentsd {VERSION}\\n"\n',
             self.binaries / "cagents-dictate": '#!/bin/sh\n[ "$*" = --version ] || exit 98\n'
             f'printf "cagents-dictate {VERSION}\\n"\n',
+            self.binaries / "ceditor": '#!/bin/sh\n[ "$*" = --version ] || exit 99\n'
+            f'printf "ceditor {VERSION}\\n"\n',
         }
         for path, contents in fixtures.items():
             path.write_text(contents)
@@ -242,7 +248,7 @@ class PackageDependencies(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             self.invocations.read_text().splitlines(),
-            list(PACKAGED),
+            list(packaged_binaries(variant)),
         )
         name = "cagents" if variant == "full" else "cagents-browserless"
         metadata = subprocess.check_output(
@@ -288,21 +294,19 @@ class PackageDependencies(unittest.TestCase):
                 )
 
     def test_explicit_strip_opt_out_preserves_all_executable_payloads(self):
-        originals = {
-            binary: (self.binaries / binary).read_bytes()
-            for binary in PACKAGED
-        }
         strip_calls = self.work / "strip-calls"
         marker = b"# fixture strip mutation\n"
         # A real byte change makes both an ignored opt-out and accidentally
         # disabled default stripping observable in the generated artifacts.
         (self.tools / "strip").write_text(
-            '#!/bin/sh\n[ "$#" = 5 ] && [ "$1" = --strip-unneeded ] || exit 97\n'
+            '#!/bin/sh\n[ "$1" = --strip-unneeded ] || exit 97\n'
             'shift\nfor binary in "$@"; do\n'
             f'  printf "%s\\n" "${{binary##*/}}" >> {shlex.quote(str(strip_calls))}\n'
             '  printf "# fixture strip mutation\\n" >> "$binary"\ndone\n'
         )
         for variant in ("full", "browserless"):
+            originals = {binary: (self.binaries / binary).read_bytes()
+                         for binary in packaged_binaries(variant)}
             for preserve in (False, True):
                 with self.subTest(variant=variant, preserve=preserve):
                     strip_calls.unlink(missing_ok=True)
@@ -334,14 +338,14 @@ class PackageDependencies(unittest.TestCase):
                                     self.assertEqual(payload.extractfile(member).read(), expected)
                             self.assertEqual((self.binaries / binary).read_bytes(), original)
 
-    def test_newer_requirement_from_each_packaged_elf_raises_both_variants(self):
+    def test_newer_requirement_from_each_packaged_elf_raises_its_variants(self):
         for newer in PACKAGED:
             self.readelf({newer: self.version_info("GLIBC_2.2.5", "GLIBC_2.39")})
             for variant in ("full", "browserless"):
                 with self.subTest(binary=newer, variant=variant):
                     dependencies = self.dependencies(variant)
-                    self.assertIn("libc6 (>= 2.39)", dependencies)
-                    self.assertNotIn("libc6 (>= 2.35)", dependencies)
+                    expected = "2.39" if newer in packaged_binaries(variant) else "2.35"
+                    self.assertIn(f"libc6 (>= {expected})", dependencies)
 
     def test_numeric_maximum_preserves_baseline_and_orders_double_and_patch_versions(self):
         for versions, expected in [
@@ -358,9 +362,9 @@ class PackageDependencies(unittest.TestCase):
                     self.assertIn(f"libc6 (>= {expected})", self.dependencies(variant))
 
     def test_failed_inspection_is_not_hidden_by_valid_stdout_or_later_binaries(self):
-        for binary in PACKAGED:
-            self.readelf({}, failures={binary: 7})
-            for variant in ("full", "browserless"):
+        for variant in ("full", "browserless"):
+            for binary in packaged_binaries(variant):
+                self.readelf({}, failures={binary: 7})
                 with self.subTest(binary=binary, variant=variant):
                     self.refused(variant, f"cannot inspect glibc requirements for {binary}")
 

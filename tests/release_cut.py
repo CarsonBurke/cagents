@@ -617,6 +617,20 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(self.release("rehearse", "0.2.4").returncode, 0)
         self.assertEqual(sum(line.startswith("release download") for line in self.log("gh.log")), 1)
 
+    def test_release_rehearsal_launches_the_editor_when_the_cut_bundles_it(self):
+        (self.repo / "crates/ceditor/build.rs").touch()
+        bundled = self.commit("ship the bundled editor")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(bundled)
+        cut = self.release("cut", "--key", str(self.root / "key"))
+        self.assertEqual(cut.returncode, 0, cut.stderr)
+        for mode in ((), ("--staged",)):
+            with self.subTest(mode=mode):
+                result = self.release("rehearse", "0.2.4", *mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                run = [line for line in self.log("rehearse.log") if " run " in line][-1]
+                self.assertIn("--bundled-ceditor", run.split())
+
     def test_the_default_root_and_a_harness_at_another_commit(self):
         self.cut_signed()
         self.env.pop("CAGENTS_RELEASE_REHEARSAL_ROOT")
@@ -1185,13 +1199,15 @@ printf '%s\n' '{pinned / "zig"}'
         self.assertIn("published already", result.stdout)
         self.assertIn("land-pr 77 -R CarsonBurke/cagents", self.log("calls.log"))
 
-    def drafted(self):
+    def drafted(self, *, bundled_editor=False):
         """Tags a commit of trust generation 2 for Actions, pushes the tag as
         publish --actions does, and leaves the release the workflow would
         have signed as its draft, every file under its published name."""
         feed = self.repo / "src/update/feed.rs"
         feed.parent.mkdir(parents=True, exist_ok=True)
         feed.write_text("const GENERATION: usize = 2;\n")
+        if bundled_editor:
+            (self.repo / "crates/ceditor/build.rs").touch()
         sha = self.commit("feat(update): trust generations")
         self.git("push", "-q", "origin", "main")
         dist = self.bundle(sha)
@@ -1211,10 +1227,12 @@ printf '%s\n' '{pinned / "zig"}'
         return draft
 
     def test_a_draft_is_rehearsed_as_github_serves_it_and_its_pass_names_its_metadata(self):
-        draft = self.drafted()
+        draft = self.drafted(bundled_editor=True)
         result = self.release("rehearse", "0.2.4", "--from-draft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Rehearsing the in-app update from 0.2.3 to 0.2.4 as drafted on GitHub", result.stdout)
+        run = [line for line in self.log("rehearse.log") if " run " in line][-1]
+        self.assertIn("--bundled-ceditor", run.split())
         # The host fetched what the updater reads of the draft; nothing went from here.
         self.assertIn("release download v0.2.4 -R CarsonBurke/cagents", "\n".join(self.log("gh.log")))
         self.assertEqual((self.root / "rehearsed-archive").read_bytes(),

@@ -18,7 +18,9 @@ HANG_GUARD = 60
 
 class CeditorArtifacts(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="ceditor-artifacts-", dir="/var/tmp")
+        temporary = tempfile.TemporaryDirectory(
+            prefix="ceditor-artifacts-", dir=os.environ.get("TMPDIR") or "/var/tmp",
+        )
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         self.checkout = self.directory / "checkout"
@@ -254,11 +256,16 @@ sys.exit(101 if mode == "failed" else 0)
         self.assert_success(self.run_script("install-ceditor", "--prefix", str(self.prefix)))
         installed = self.prefix / "bin/ceditor"
         original = installed.resolve()
+        preference = self.prefix / "lib/ceditor/current/.prefer-source"
+        self.assertEqual(preference.resolve(), original.parent.parent / ".prefer-source")
+        self.assertTrue(preference.is_file())
         for name in ("ceditor", "cagents", "cagentsd"):
             self.assertIn("'first'", original.with_name(name).read_text())
         self.environment["MOCK_GENERATION"] = "second"
         self.assert_success(self.run_script("install-ceditor", "--prefix", str(self.prefix)))
         self.assertNotEqual(installed.resolve(), original)
+        self.assertEqual(preference.resolve(), installed.resolve().parent.parent / ".prefer-source")
+        self.assertTrue(preference.is_file())
         self.assertTrue(original.exists())
         self.assertIn("'second'", installed.read_text())
         self.assertEqual(public_cli.read_text(), "unrelated installed CLI\n")

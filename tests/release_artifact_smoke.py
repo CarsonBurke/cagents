@@ -44,6 +44,7 @@ ARTIFACTS = (
     f"cagents-browserless-{VERSION}-x86_64-unknown-linux-gnu.tar.gz",
     f"ceditor-{VERSION}-x86_64-unknown-linux-gnu.tar.gz",
 )
+EDITOR_ARTIFACTS = (ARTIFACTS[0], ARTIFACTS[2], ARTIFACTS[4])
 
 
 class SmokeBoundary(unittest.TestCase):
@@ -64,7 +65,15 @@ class SmokeBoundary(unittest.TestCase):
             "if os.environ.get('SMOKE_CONTRACT_HANG'):\n"
             "    pathlib.Path(os.environ['SMOKE_CONTRACT_HANG'], str(os.getpid())).touch()\n"
             "    import time; time.sleep(600)\n"
-            "sys.exit(17 if sys.argv[-2]==os.environ.get('SMOKE_CONTRACT_FAIL_ARTIFACT') else 0)\n"
+            "artifact=sys.argv[-2]\n"
+            "bundled=sys.argv[sys.argv.index('CAGENTS_SMOKE_BUNDLED_EDITOR')+1]=='1'\n"
+            f"has_editor=artifact=={ARTIFACTS[4]!r} or bundled and artifact in {EDITOR_ARTIFACTS!r}\n"
+            "if has_editor and artifact!=os.environ.get('SMOKE_CONTRACT_NO_DIGEST'):\n"
+            "    scratch=next(sys.argv[i + 1] for i, arg in enumerate(sys.argv)\n"
+            "                 if arg=='--bind' and sys.argv[i + 2]=='/tmp')\n"
+            "    letter='b' if artifact==os.environ.get('SMOKE_CONTRACT_OTHER_EDITOR') else 'a'\n"
+            "    pathlib.Path(scratch, 'ceditor.sha256').write_text(letter*64+'\\n')\n"
+            "sys.exit(17 if artifact==os.environ.get('SMOKE_CONTRACT_FAIL_ARTIFACT') else 0)\n"
         )
         boundary.chmod(0o755)
         downloader = self.bin / "curl"
@@ -125,7 +134,8 @@ class SmokeBoundary(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, "the smokes did not all start")
             time.sleep(0.05)
         smoke.send_signal(signal.SIGTERM)
-        self.assertNotEqual(smoke.wait(timeout=HANG_GUARD), 0)
+        _, stderr = smoke.communicate(timeout=HANG_GUARD)
+        self.assertNotEqual(smoke.returncode, 0, stderr)
         for pid in (int(path.name) for path in running.iterdir()):
             try:
                 os.kill(pid, 0)
@@ -170,6 +180,7 @@ class SmokeBoundary(unittest.TestCase):
             self.assertNotIn("SSH_AUTH_SOCK", forwarded)
             self.assertNotIn("CAGENTS_AGENT_CAPABILITY", forwarded)
             self.assertEqual(forwarded["XDG_RUNTIME_DIR"], "/run/fixture")
+            self.assertEqual(forwarded["CAGENTS_SMOKE_BUNDLED_EDITOR"], "1")
             self.assertEqual(arguments[-4:], ["/bin/bash", "/smoke", artifact, VERSION])
         self.assert_clean()
 
@@ -193,6 +204,32 @@ class SmokeBoundary(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.recorded(), [])
         self.assert_clean()
+
+    def test_missing_editor_digest_fails_the_release_smoke(self):
+        result = self.invoke(SMOKE_CONTRACT_NO_DIGEST=ARTIFACTS[2])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{ARTIFACTS[2]} produced no valid editor digest", result.stderr)
+        self.assertNotIn(f"Artifact smoke passed: {ARTIFACTS[2]}\n", result.stdout)
+        self.assert_clean()
+
+    def test_legacy_layout_smokes_all_artifacts_without_full_package_editor_digests(self):
+        result = self.invoke(arguments=["--dist", str(self.dist), "--version", VERSION,
+                                        "--rootfs", str(self.base), "--legacy-editor-layout"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for artifact in ARTIFACTS:
+            self.assertIn(f"Artifact smoke passed: {artifact}\n", result.stdout)
+        for arguments in self.recorded():
+            self.assertEqual(arguments[arguments.index("CAGENTS_SMOKE_BUNDLED_EDITOR") + 1], "0")
+        self.assert_clean()
+
+    def test_same_version_editor_with_different_bytes_fails_the_release_smoke(self):
+        for artifact in EDITOR_ARTIFACTS[1:]:
+            with self.subTest(artifact=artifact):
+                result = self.invoke(SMOKE_CONTRACT_OTHER_EDITOR=artifact)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{artifact} ships different editor bytes from {ARTIFACTS[0]}", result.stderr)
+                self.assertNotIn(f"Artifact smoke passed: {artifact}\n", result.stdout)
+                self.assert_clean()
 
     def test_wrong_distribution_rootfs_rejects_before_execution(self):
         for release in ('ID=debian\nVERSION_ID="24.04"\n', 'ID=ubuntu\nVERSION_ID="22.04"\n'):

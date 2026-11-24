@@ -910,6 +910,7 @@ fn initialize_serving_host(
     paths: &RuntimePaths,
     first_this_boot: bool,
     require_durable_workspace: bool,
+    notification_application: crate::notifications::Application,
 ) -> Result<(Option<notifications::Broker>, activity::Monitor, bool), HostError> {
     // Before anything is launched, so the epoch precedes every launch.
     let proof = host
@@ -1016,11 +1017,6 @@ fn initialize_serving_host(
     workspace::titles::install(host);
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("workspace model opened", None);
-    let notification_application = crate::instance::notification_daemon_application(
-        &crate::process::current_executable()?,
-        std::env::args_os()
-            .any(|argument| argument == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT),
-    )?;
     let notification_broker = match notifications::Broker::start(host, notification_application) {
         Ok(broker) => Some(broker),
         Err(error) => {
@@ -1059,6 +1055,15 @@ fn initialize_serving_host(
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("host run entered", None);
+    let executable = crate::process::current_executable()?;
+    let editor_requested =
+        std::env::args_os().any(|arg| arg == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT);
+    // Admission holds the launch fence through startup.
+    if editor_requested {
+        crate::instance::validate_editor_daemon_version(&executable)?;
+    }
+    let notification_application =
+        crate::instance::notification_daemon_application(&executable, editor_requested)?;
     daemon::install_signal_handlers()?;
     crate::descriptor_limit::raise();
     // Holders start from this image; pin it before an update replaces the
@@ -1222,8 +1227,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     };
     #[cfg(not(target_os = "macos"))]
     let require_durable_workspace = false;
-    let (_notification_broker, _agent_activity, _durable_workspace) =
-        initialize_serving_host(&host, &paths, first_this_boot, require_durable_workspace)?;
+    let (_notification_broker, _agent_activity, _durable_workspace) = initialize_serving_host(
+        &host,
+        &paths,
+        first_this_boot,
+        require_durable_workspace,
+        notification_application,
+    )?;
     #[cfg(target_os = "macos")]
     if _durable_workspace && let Some(ready) = &ready_admission {
         ready.finish_workspace_initialization()?;

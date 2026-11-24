@@ -10,23 +10,25 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "1.2.3"
+TEMP_BASE = os.environ.get("TMPDIR") or "/var/tmp"
 # Bounds only a hang; a passing run returns as soon as its process exits.
 HANG_GUARD = 60
+# Run the production function unchanged, with only its caller inputs.
+ARCHIVE_VALIDATOR = (ROOT / "scripts/publish-release").read_text().split(
+    "check_archive() {", 1
+)[1].split("\n}\n", 1)[0]
 
 
 class EditorArchive(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp", prefix="ceditor-archive-contract-")
+        self.temp = tempfile.TemporaryDirectory(dir=TEMP_BASE, prefix="ceditor-archive-contract-")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
-        source = (ROOT / "scripts/publish-release").read_text()
-        # Run the production function unchanged, with only its caller inputs.
-        function = source.split("check_archive() {", 1)[1].split("\n}\n", 1)[0]
         self.validator = self.work / "validate"
         self.validator.write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\nexport LC_ALL=C\n'
             'VERSION=$1\nWORK_DIR=$2\nfail() { printf "%s\\n" "$*" >&2; exit 1; }\n'
-            'check_archive() {' + function + '\n}\n'
+            'check_archive() {' + ARCHIVE_VALIDATOR + '\n}\n'
             'check_archive "$3" "$4" ceditor io.github.cagents.ceditor\n'
         )
         self.root = self.work / f"ceditor-{VERSION}"
@@ -123,24 +125,28 @@ class EditorArchive(unittest.TestCase):
 
 
 class CagentsArchive(unittest.TestCase):
-    """The same validator on the cagents archives, which carry the dictation
-    helper and its notices exactly when the tagged source has the helper."""
+    """Cagents full archives use the layout expected from the tagged source."""
+
+    editor_members = (
+        "bin/ceditor",
+        "share/applications/io.github.cagents.ceditor.desktop",
+        "share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg",
+    )
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp", prefix="cagents-archive-contract-")
+        self.temp = tempfile.TemporaryDirectory(dir=TEMP_BASE, prefix="cagents-archive-contract-")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
-        source = (ROOT / "scripts/publish-release").read_text()
-        function = source.split("check_archive() {", 1)[1].split("\n}\n", 1)[0]
         self.validator = self.work / "validate"
         self.validator.write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\nexport LC_ALL=C\n'
-            'VERSION=$1\nWORK_DIR=$2\nDICTATE=$5\nfail() { printf "%s\\n" "$*" >&2; exit 1; }\n'
-            'check_archive() {' + function + '\n}\n'
+            'VERSION=$1\nWORK_DIR=$2\nDICTATE=$5\nBUNDLED_EDITOR=$6\n'
+            'fail() { printf "%s\\n" "$*" >&2; exit 1; }\n'
+            'check_archive() {' + ARCHIVE_VALIDATOR + '\n}\n'
             'check_archive "$3" "$4" cagents dev.cagents.Cagents\n'
         )
         self.root = self.work / f"cagents-{VERSION}"
-        for name in ("cagents", "cagents-ui", "cagentsd", "cagents-uninstall", "cagents-dictate"):
+        for name in ("cagents", "cagents-ui", "cagentsd", "cagents-uninstall", "cagents-dictate", "ceditor"):
             self.write(f"bin/{name}", 0o755)
         self.write("bin/.cagents-ui-lease-v1", 0o644, "")
         for relative in (
@@ -151,6 +157,7 @@ class CagentsArchive(unittest.TestCase):
             "share/metainfo/dev.cagents.Cagents.metainfo.xml",
             "share/doc/cagents/LICENSE",
             "share/doc/cagents/THIRD-PARTY-NOTICES",
+            *self.editor_members[1:],
         ):
             self.write(relative, 0o644)
 
@@ -160,13 +167,13 @@ class CagentsArchive(unittest.TestCase):
         path.write_text(text)
         path.chmod(mode)
 
-    def validate(self, dictate):
+    def validate(self, dictate, bundled_editor=True):
         archive = self.work / "cagents.tar.gz"
         with tarfile.open(archive, "w:gz", format=tarfile.GNU_FORMAT) as output:
             output.add(self.root, arcname=self.root.name)
         return subprocess.run(
             ["bash", str(self.validator), VERSION, str(self.work), str(self.work), archive.name,
-             str(int(dictate))],
+             str(int(dictate)), str(int(bundled_editor))],
             capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
@@ -192,6 +199,24 @@ class CagentsArchive(unittest.TestCase):
         (self.root / "share/doc/cagents/THIRD-PARTY-NOTICES").unlink()
         result = self.validate(dictate=False)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_release_from_before_bundling_the_editor_has_no_editor_members(self):
+        self.assertIn("unexpected", self.validate(dictate=True, bundled_editor=False).stderr)
+        for member in self.editor_members:
+            (self.root / member).unlink()
+        result = self.validate(dictate=True, bundled_editor=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("missing", self.validate(dictate=True).stderr)
+
+    def test_full_release_requires_a_regular_executable_editor(self):
+        editor = self.root / "bin/ceditor"
+        editor.unlink()
+        self.assertIn("missing", self.validate(dictate=True).stderr)
+        editor.symlink_to("cagents-ui")
+        self.assertIn("non-regular file member", self.validate(dictate=True).stderr)
+        editor.unlink()
+        self.write("bin/ceditor", 0o644)
+        self.assertIn("missing executable permissions", self.validate(dictate=True).stderr)
 
 if __name__ == "__main__":
     unittest.main()

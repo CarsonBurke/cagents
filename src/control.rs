@@ -1,10 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{OsStr, OsString},
+    fs,
     io::{self, IsTerminal, Read, Write},
     os::{
         fd::{AsFd, AsRawFd},
-        unix::{fs::OpenOptionsExt, net::UnixStream, process::CommandExt},
+        unix::{
+            fs::{MetadataExt as _, OpenOptionsExt},
+            net::UnixStream,
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::{ChildStdout, Command, ExitCode, Stdio},
@@ -482,6 +487,15 @@ pub enum TopCommand {
         #[arg(long, requires = "stage_only")]
         #[arg(help = "Directory containing the staged executable version.")]
         version_root: Option<PathBuf>,
+    },
+    /// Settle launcher changes after an older update worker exits.
+    #[command(hide = true)]
+    SettleEditorInstall {
+        /// Installed version the older update worker can restore.
+        previous: PathBuf,
+        /// Update job whose exit allows launcher cleanup.
+        #[arg(long)]
+        job: Option<String>,
     },
     /// Serve an installed version while preserving running windows and daemon.
     #[command(hide = true)]
@@ -4179,6 +4193,7 @@ where
         } => Some(crate::daemon::hosting::LIFECYCLE_REFUSAL.into()),
         TopCommand::CoordinateInstall { .. }
         | TopCommand::SelectInstall { .. }
+        | TopCommand::SettleEditorInstall { .. }
         | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
         }
@@ -4227,6 +4242,7 @@ where
                     | DaemonCommand::DowngradeStore { .. },
             } | TopCommand::CoordinateInstall { .. }
                 | TopCommand::SelectInstall { .. }
+                | TopCommand::SettleEditorInstall { .. }
                 | TopCommand::RestartWindows { .. }
         )
     {
@@ -4592,6 +4608,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
+            | TopCommand::SettleEditorInstall { .. }
             | TopCommand::SelectInstall { .. }
             | TopCommand::UpdateWorker { .. }
             | TopCommand::RestartWindows { .. }
@@ -4629,6 +4646,45 @@ pub fn staged_ui_executable(
         ready_launch,
     )
     .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
+}
+
+/// Keep the bundled editor matched to the runtime preserved by staging.
+/// The first editor-bearing release can still edit files when the old
+/// installation has no editor to open.
+pub fn staged_editor_executable() -> io::Result<Option<PathBuf>> {
+    let executable = crate::process::current_executable()?;
+    let Some(bin) = crate::install_guard::staged_owner_bin(
+        &executable,
+        false,
+        #[cfg(target_os = "macos")]
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    let editor = bin.join(crate::companion::Product::Editor.file_name());
+    match fs::symlink_metadata(&editor) {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.mode() & 0o111 != 0
+                && metadata.mode() & 0o022 == 0
+                && crate::install_guard::trusted_executable_owner(metadata.uid()) => {}
+        Ok(_) => return Err(io::Error::other("invalid staged Ceditor executable")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    match crate::install_guard::staged_owner_bin(
+        &executable,
+        true,
+        #[cfg(target_os = "macos")]
+        None,
+    )? {
+        Some(owner) if owner == bin => Ok(Some(editor)),
+        Some(_) => Err(io::Error::other(
+            "the staged runtime owner changed; reopen Ceditor",
+        )),
+        None => Ok(None),
+    }
 }
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
@@ -4758,6 +4814,15 @@ fn execute_with_model_context(
                 command: "update.record_deferred_install",
                 data: json!({"deferred":true}),
                 human: "Daemon replacement deferred".into(),
+            })
+        }
+        TopCommand::SettleEditorInstall { previous, job } => {
+            crate::update::settle_editor_install(&previous, job.as_deref())
+                .map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.settle_editor_install",
+                data: json!({}),
+                human: String::new(),
             })
         }
         TopCommand::SelectInstall {

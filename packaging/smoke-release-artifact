@@ -56,12 +56,24 @@ if [[ $product == ceditor ]]; then
     [[ -f $marker && ! -L $marker && $(stat -c %a "$marker") == 644 && $(stat -c %s "$marker") == 22 ]] || fail 'invalid editor companion marker'
     cmp -- "$marker" <(printf 'ceditor companions v1\n') || fail 'wrong editor companion marker'
     executables=(ceditor cagents cagentsd)
+    editor_command=$public_command
 else
     executables=(cagents cagents-ui cagentsd)
     # The release build and the publisher require the dictation helper of
     # every release that has one; here it must also load and run offline.
     if [[ -e $binaries/cagents-dictate || -L $binaries/cagents-dictate ]]; then
         executables+=(cagents-dictate)
+    fi
+    if [[ $product == cagents && $CAGENTS_SMOKE_BUNDLED_EDITOR == 1 ]]; then
+        executables+=(ceditor)
+        editor_command=$binaries/ceditor
+        if [[ $artifact == *.deb ]]; then
+            editor_command=/usr/bin/ceditor
+            [[ -L $editor_command && $(readlink -f "$editor_command") == "$binaries/ceditor" ]] \
+                || fail 'editor entrypoint does not select the packaged sibling'
+        fi
+        [[ ! -e $binaries/.ceditor-companions && ! -L $binaries/.ceditor-companions ]] \
+            || fail 'bundled editor must use the shared daemon'
     fi
 fi
 for executable in "${executables[@]}"; do
@@ -71,6 +83,13 @@ for executable in "${executables[@]}"; do
     "$binaries/$executable" --help > /tmp/help
     [[ -s /tmp/help ]] || fail "empty help: $executable"
 done
+if [[ -n ${editor_command:-} ]]; then
+    [[ $("$editor_command" --version) == "ceditor $version" ]] || fail 'editor public command version mismatch'
+    [[ $("$editor_command" --settings-path) == "$XDG_CONFIG_HOME/ceditor/settings.toml" ]] \
+        || fail 'editor settings path changed'
+    digest=$(sha256sum -- "$binaries/ceditor")
+    printf '%s\n' "${digest%% *}" > /tmp/ceditor.sha256
+fi
 if [[ ${executables[*]} == *cagents-dictate* ]]; then
     # Lists the speech models from the empty data directory: no download.
     "$binaries/cagents-dictate" models > /tmp/models || fail 'the dictation helper does not run'

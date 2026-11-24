@@ -9,9 +9,7 @@ TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT_DIR/target"}
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
 RELEASE_TARGET=${CAGENTS_RELEASE_TARGET:-x86_64-unknown-linux-gnu}
 DESKTOP_ID=io.github.cagents.ceditor
-STAGE=
 PACKAGE_STAGE=
-REUSE_COMPANIONS=
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -27,26 +25,16 @@ while [ "$#" -gt 0 ]; do
                 'SOURCE_DATE_EPOCH, CAGENTS_SKIP_BUILD=1 (package an existing release binary).'
             exit 0
             ;;
-        --stage|--package-stage|--reuse-companions)
-            [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$1 requires a directory"
-            case $1 in
-                --stage) STAGE=$2 ;;
-                --package-stage) PACKAGE_STAGE=$2 ;;
-                --reuse-companions) REUSE_COMPANIONS=$2 ;;
-            esac
+        --package-stage)
+            [ "$#" -eq 2 ] && [ -n "$2" ] || fail "$1 requires one directory"
+            PACKAGE_STAGE=$2
             shift 2
             ;;
         *) fail 'usage: package-ceditor-linux.sh [--help]' ;;
     esac
 done
-if [ -n "$STAGE$PACKAGE_STAGE" ]; then
+if [ -n "$PACKAGE_STAGE" ]; then
     [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ] || fail 'invalid staged release options'
-    [ -z "$STAGE" ] || [ -z "$PACKAGE_STAGE" ] || fail 'select one release stage'
-fi
-if [ -n "$REUSE_COMPANIONS" ]; then
-    [ -n "$STAGE" ] && [ -x "$REUSE_COMPANIONS/cagents" ] &&
-        [ -x "$REUSE_COMPANIONS/cagentsd" ] ||
-        fail 'reusing companions requires an editor build stage and both executables'
 fi
 
 [ "$(uname -s)" = Linux ] || fail 'packaging is supported only on Linux'
@@ -87,17 +75,12 @@ elif [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     # The package is native-only. Override config build.target with the validated
     # release target, and consume each exact Cargo executable instead of guessing
     # whether it lives below a target-triple directory.
-    if [ -n "$REUSE_COMPANIONS" ]; then
-        CLI_BINARY=$REUSE_COMPANIONS/cagents
-        HOST_BINARY=$REUSE_COMPANIONS/cagentsd
-    else
-        CLI_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagents \
-            --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
-            --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --bin cagents)
-        HOST_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
-            --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
-            --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features -p cagents-host --bin cagentsd)
-    fi
+    CLI_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagents \
+        --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
+        --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features --bin cagents)
+    HOST_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" cagentsd \
+        --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
+        --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --no-default-features -p cagents-host --bin cagentsd)
     EDITOR_BINARY=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" ceditor \
         --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --target "$RELEASE_TARGET" --package ceditor)
@@ -110,13 +93,6 @@ fi
 for binary in "$EDITOR_BINARY" "$CLI_BINARY" "$HOST_BINARY"; do
     [ -x "$binary" ] || fail "missing release binary: $binary"
 done
-if [ -n "$STAGE" ]; then
-    mkdir -- "$STAGE"
-    cp --reflink=auto -- "$CLI_BINARY" "$STAGE/cagents"
-    cp --reflink=auto -- "$HOST_BINARY" "$STAGE/cagentsd"
-    cp --reflink=auto -- "$EDITOR_BINARY" "$STAGE/ceditor"
-    exit 0
-fi
 if [ "${CAGENTS_SKIP_BUILD:-0}" = 1 ] || [ -n "$PACKAGE_STAGE" ]; then
     require_prebuilt_version() {
         # Preserve output through command substitution so extra lines cannot
