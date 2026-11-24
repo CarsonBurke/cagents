@@ -956,6 +956,8 @@ pub fn create_directory_beneath(
 /// from the owner. There the owner grants itself search through the same fresh
 /// name the resolution already relies on, opens it, and restores the observed
 /// mode through the descriptor, so creation keeps exactly the requested mode.
+/// A failure after the grant withdraws it by name, and only while that name
+/// still holds the observed directory.
 #[cfg(target_os = "linux")]
 fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveError> {
     resolve_directory(parent, name)
@@ -1000,30 +1002,59 @@ fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveEr
     if granted != 0 {
         return Err(ResolveError::io(&reported, &io::Error::last_os_error()));
     }
-    let directory = resolve_directory(parent, name).inspect_err(|_| {
-        // Best effort: withdraw the grant from the entry that received it.
+    // Withdraws the grant by name, only from the entry that was observed: a
+    // replacement swapped in since keeps whatever mode it has.
+    let withdraw = || {
+        let mut current = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: as above.
-        unsafe {
-            libc::fchmodat(
+        let still_observed = unsafe {
+            libc::fstatat(
                 parent.descriptor(),
                 leaf.as_ptr(),
-                permissions,
+                current.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
-        };
-    })?;
-    let metadata = directory
-        .metadata()
-        .map_err(|error| ResolveError::io(&reported, &error))?;
+        } == 0
+            && {
+                // SAFETY: fstatat succeeded, so the buffer is initialized.
+                let current = unsafe { current.assume_init() };
+                (current.st_dev, current.st_ino) == (observed.st_dev, observed.st_ino)
+            };
+        if still_observed {
+            // Best effort: the caller reports the failure that led here.
+            // SAFETY: as above.
+            unsafe {
+                libc::fchmodat(
+                    parent.descriptor(),
+                    leaf.as_ptr(),
+                    permissions,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+        }
+    };
+    let directory = resolve_directory(parent, name).inspect_err(|_| withdraw())?;
+    let metadata = match directory.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            withdraw();
+            return Err(ResolveError::io(&reported, &error));
+        }
+    };
     // The standard library widens Darwin's signed `dev_t` the same way.
     if metadata.dev() != observed.st_dev as u64 || metadata.ino() != observed.st_ino {
+        withdraw();
         return Err(ResolveError::message(
             &reported,
             "the fresh directory was replaced while it was being opened",
         ));
     }
-    set_directory_permissions(&directory, u32::from(permissions))
-        .map_err(|error| ResolveError::io(&reported, &error))?;
+    // The descriptor holds the observed directory, so restoring through it
+    // cannot reach a replacement.
+    set_directory_permissions(&directory, u32::from(permissions)).map_err(|error| {
+        withdraw();
+        ResolveError::io(&reported, &error)
+    })?;
     Ok(directory)
 }
 

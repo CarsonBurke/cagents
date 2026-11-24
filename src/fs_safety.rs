@@ -378,9 +378,11 @@ pub fn open_beneath_writable(root: &Root, relative: &Path) -> Result<Option<File
 /// The metadata of `relative` beneath `root`, describing a final symlink as the
 /// link itself rather than its target.
 ///
-/// This is `symlink_metadata` without its hazard: the final component is opened
-/// `O_PATH | O_NOFOLLOW`, which grants no access to the object at all, and
-/// every component above it is still refused if it is a symlink.
+/// This is `symlink_metadata` without its hazard: every component above the
+/// final one is still refused if it is a symlink, and the final one is never
+/// opened for access. Linux opens it `O_PATH | O_NOFOLLOW`; Darwin, which has
+/// no `O_PATH`, reads it with `fstatat(AT_SYMLINK_NOFOLLOW)` beneath the
+/// pinned parent and checks the identity of what it describes.
 ///
 /// # Errors
 ///
@@ -1935,7 +1937,8 @@ fn metadata_of_descriptor(descriptor: &OwnedFd) -> io::Result<Metadata> {
 }
 
 /// The components of a relative path, or `None` when it is not usable beneath a
-/// root at all: empty, absolute, or containing `.` or `..`.
+/// root at all: empty, absolute, or containing `.`, `..` or, on Darwin, a
+/// [`named_fork`] name.
 ///
 /// `openat2` would refuse an escape by itself, but the walk would not, and both
 /// resolvers must agree on what a valid input is.
@@ -1943,6 +1946,7 @@ fn components(relative: &Path) -> Option<Vec<&OsStr>> {
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {
+            Component::Normal(part) if named_fork(part.as_bytes()) => return None,
             Component::Normal(part) => parts.push(part),
             Component::RootDir
             | Component::CurDir
@@ -1955,6 +1959,13 @@ fn components(relative: &Path) -> Option<Vec<&OsStr>> {
     if parts.is_empty() { None } else { Some(parts) }
 }
 
+/// Whether Darwin would resolve `name` after a file to one of its named forks,
+/// such as `notes.txt/..namedfork/rsrc`, rather than refuse it as Linux does.
+/// The comparison ignores case, as an APFS volume may.
+fn named_fork(name: &[u8]) -> bool {
+    cfg!(target_os = "macos") && name.eq_ignore_ascii_case(b"..namedfork")
+}
+
 /// A whole path as a C string.
 fn c_path(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
@@ -1965,7 +1976,12 @@ fn c_path(path: &Path) -> io::Result<CString> {
 /// `openat` resolve more than one name.
 fn c_name(name: &OsStr) -> io::Result<CString> {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+    if bytes.is_empty()
+        || bytes.contains(&b'/')
+        || bytes == b"."
+        || bytes == b".."
+        || named_fork(bytes)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a single path component",
@@ -2254,6 +2270,31 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// Darwin opens a file's resource fork through `..namedfork`, where Linux
+    /// finds no directory; both refuse it as no path beneath the root.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_named_fork_is_rejected_as_on_linux() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        fs::write(directory.path().join("notes.txt"), b"notes\n").expect("write");
+        let root = Root::open(directory.path()).expect("root");
+
+        for resolver in RESOLVERS {
+            for relative in ["notes.txt/..namedfork/rsrc", "notes.txt/..NamedFork/rsrc"] {
+                let error = resolve(&root, Path::new(relative), libc::O_RDONLY, resolver)
+                    .expect_err("must be refused");
+                assert!(
+                    matches!(error, ResolveError::Escaped { .. }),
+                    "{resolver:?} {relative}: {error:?}"
+                );
+            }
+        }
+        assert!(matches!(
+            open_beneath_writable(&root, Path::new("notes.txt/..namedfork/rsrc")),
+            Err(ResolveError::Escaped { .. })
+        ));
     }
 
     #[test]
