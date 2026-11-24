@@ -4518,15 +4518,7 @@ fn save_workspace_transaction(
     )?;
     let next = next_generation(base.workspace, "workspace", state.id)?;
     let timestamp = now_unix_ms();
-    let focused = state
-        .focused
-        .filter(|focused| {
-            state
-                .cards
-                .iter()
-                .any(|card| card.id == *focused && card.existence.is_open())
-        })
-        .map(|id| id.to_string());
+    let focused = state.focused.map(|id| id.to_string());
 
     transaction
         .prepare_cached(UPSERT_WORKSPACE)?
@@ -6031,7 +6023,7 @@ fn replace_terminal_identity_transaction(
 
 /// What every workspace snapshot has to satisfy before any of it is written.
 pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
-    let mut ids = BTreeSet::new();
+    let mut cards = HashMap::with_capacity(state.cards.len());
     for card in &state.cards {
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {
             return Err(invalid_state!(
@@ -6040,7 +6032,7 @@ pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
                 card.width_fraction
             ));
         }
-        if !ids.insert(card.id) {
+        if cards.insert(card.id, (card, None)).is_some() {
             return Err(invalid_state!(
                 "workspace {} contains duplicate card {}",
                 state.id,
@@ -6049,10 +6041,9 @@ pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
         }
     }
     if let Some(focused) = state.focused
-        && !state
-            .cards
-            .iter()
-            .any(|card| card.id == focused && card.existence.is_open())
+        && !cards
+            .get(&focused)
+            .is_some_and(|(card, _)| card.existence.is_open())
     {
         return Err(invalid_state!(
             "workspace {} focuses missing or closed card {}",
@@ -6061,25 +6052,25 @@ pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
         ));
     }
     let mut channel_ids = BTreeSet::new();
-    let mut owned = BTreeSet::new();
     for channel in &state.channels {
         if !channel_ids.insert(channel.id) {
             return Err(invalid_state!("duplicate channel {}", channel.id));
         }
         for id in &channel.cards {
-            if !ids.contains(id) || !owned.insert(*id) {
-                return Err(invalid_state!(
-                    "channel {} references missing or multiply owned card {id}",
-                    channel.id
-                ));
+            match cards.get_mut(id) {
+                Some((_, owner)) if owner.is_none() => *owner = Some(channel.id),
+                _ => {
+                    return Err(invalid_state!(
+                        "channel {} references missing or multiply owned card {id}",
+                        channel.id
+                    ));
+                }
             }
         }
         if channel.focused.is_some_and(|id| {
-            !channel.cards.contains(&id)
-                || !state
-                    .cards
-                    .iter()
-                    .any(|card| card.id == id && card.existence.is_open())
+            !cards
+                .get(&id)
+                .is_some_and(|(card, owner)| *owner == Some(channel.id) && card.existence.is_open())
         }) {
             return Err(invalid_state!("channel {} has invalid focus", channel.id));
         }
@@ -10227,6 +10218,7 @@ mod tests {
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.channels, workspace.channels);
         assert_eq!(restored.active_channel, Some(id));
+        assert_eq!(restored.focused, Some(card));
         assert_eq!(restored.workspace_model_identity, Some(identity));
         assert_eq!(
             restored
@@ -10248,10 +10240,33 @@ mod tests {
             checkout: None,
         });
         workspace.active_channel = None;
-        assert!(matches!(
-            lane.save(&store, &workspace),
-            Err(StoreError::InvalidState(_))
-        ));
+        let refuses = |lane: &mut SaveLane, workspace: &WorkspaceState, check| {
+            let error = lane.save(&store, workspace).unwrap_err();
+            assert!(
+                matches!(&error, StoreError::InvalidState(violation) if violation.check() == check),
+                "{error}"
+            );
+        };
+        refuses(
+            &mut lane,
+            &workspace,
+            "channel {} references missing or multiply owned card {id}",
+        );
+        workspace.channels[1].cards = vec![unrelated_id];
+        refuses(&mut lane, &workspace, "channel {} has invalid focus");
+
+        workspace.channels[1].focused = Some(unrelated_id);
+        workspace.cards[1].existence = Existence::Closing {
+            operation_id: OperationId::new(),
+        };
+        refuses(&mut lane, &workspace, "channel {} has invalid focus");
+
+        workspace.focused = Some(unrelated_id);
+        refuses(
+            &mut lane,
+            &workspace,
+            "workspace {} focuses missing or closed card {}",
+        );
         let after = store
             .load_workspace_manifest(workspace.id)
             .unwrap()
