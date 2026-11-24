@@ -7,8 +7,9 @@
 - [Signing](#signing)
 - [Comparing package variants](#comparing-package-variants)
 
-Release builds and publication run **locally**, never in GitHub Actions.
-Pushing a tag does not start a hosted build.
+GitHub Actions builds and signs eligible releases. The release operator
+publishes the draft after rehearsing the update on fw16. Releases that need
+the recovery key are built and signed on the local release path.
 
 ## Building a release
 
@@ -153,8 +154,8 @@ contract remain Linux-specific until a qualified target has its own contract.
 
 ## Publishing
 
-A release signs and publishes a bundle the build host has already built and
-smoke-tested: fw16 prebuilds main's newest compiled commit in the background
+For the local signing path, fw16 prebuilds and smoke-tests main's newest
+compiled commit in the background
 ([Prebuilding release bundles](development.md#prebuilding-release-bundles)).
 Main always declares the next version: publishing a release opens and lands the
 pull request that starts the next patch version. A release goes out in three
@@ -358,9 +359,13 @@ recovery key, and signs locally whatever Actions may not:
 1. `mise run release -- cut --actions` picks the commit as above and tags it
    `vVERSION` locally. It copies and signs nothing.
 2. `mise run release -- publish VERSION --actions` checks the tag as the
-   workflow's admission will, and pushes it only if Actions would sign it.
-   That starts the workflow, and the command prints the run's page and what
-   to run next. It exits non-zero until the release is published.
+   workflow's admission will. If eligible, it requires the tagged commit's
+   passing test verdict on fw16 and records it as the `cagents/fw16-tests`
+   commit status before pushing the tag. The publishing account needs write
+   access to commit statuses. The push starts the workflow, and the command
+   prints its page and what to run next. It exits non-zero until the release
+   is published. If a pushed tag is missing its passing status, run this
+   command again to record it, then rerun the failed Release workflow.
 3. Once the workflow has left the draft, `mise run release -- rehearse
    VERSION --from-draft` rehearses the in-app update to it, as
    [Publishing](#publishing) describes. It refuses while the tag's workflow
@@ -387,17 +392,16 @@ The workflow's jobs:
 
 - **admit** proceeds only for a tag on a commit on main whose manifests declare
   the tag's version, which is newer than every published release and not
-  published itself. It signs in Actions only when all of these hold:
+  published itself. It admits the tag for signing only when all of these hold:
   - the tag does not begin a trust generation;
   - every published release of its generation trusts the Actions key, as
     `publish-release` requires;
   - the tagged `release-keys.pub` lists exactly the repository variable
-    `RELEASE_TRUSTED_KEYS`.
+    `RELEASE_TRUSTED_KEYS`;
+  - the exact tagged commit has a passing `cagents/fw16-tests` status.
 
-  Otherwise it stops and says why, and the release is cut, signed and
-  published locally as above, under the same tag. That is the case for 0.2.4,
-  for any change of trusted keys or generation, and when no Actions key is
-  configured.
+  The release is cut, signed and published locally for 0.2.4, for any change
+  of trusted keys or generation, and when no Actions key is configured.
 - **build** has no secrets. It builds, packages and smoke-tests the tagged
   source with `scripts/build-release-linux`, as fw16 does.
 - **sign** is the only job that can read the key: the environment secret
