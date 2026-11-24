@@ -496,6 +496,11 @@ either one or its Linear issue, copies the branch, and pins or unpins the card.
 A pin shows at once. A card's sessions are buttons that focus the session in
 whichever window shows it.
 
+Below the toolbar, one line counts the cards and says what the board could not
+read. A problem many projects share, such as GitHub's rate limit, which is the
+account's, reads once with how many projects it affects; clicking it lists
+each problem, its exact reason and the projects it affects.
+
 ```sh
 cagents work                      # this project, the newest 10 cards of each column
 cagents work --all                # every open project

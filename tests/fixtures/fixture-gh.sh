@@ -15,6 +15,10 @@
 #       order. An optional fixtureReviewRequests counts the times the viewer
 #       was asked to review it.
 #   home/.config/fixture-forge-delay  Seconds every answer waits first.
+#   home/.config/fixture-forge-rate-limited  GraphQL answers as GitHub does
+#       once the account's GraphQL quota is spent, until the Unix time the
+#       file holds (empty: an hour after the file was last written). REST,
+#       a separate quota, still answers.
 #   avatars/OWNER.image  Copied into the app's avatar cache, with a fresh
 #       modification time, whenever the app resolves a repository. Any PNG,
 #       JPEG, GIF or WebP up to 1 MiB and 1024x1024 pixels.
@@ -84,20 +88,46 @@ unsupported() {
     exit 1
 }
 
-# gh --include prints the status line, then headers ending in CRLF.
+# gh --include prints the status line, then headers ending in CRLF. A spent
+# quota passes its remaining requests and reset time.
 headers() {
-    status=$1 resource=$2
+    status=$1 resource=$2 remaining=${3:-4999} reset=${4:-$(($(date +%s) + 3600))}
     printf 'HTTP/2.0 %s\n' "$status"
     printf '%s\r\n' \
         "Date: $(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
         'Content-Type: application/json; charset=utf-8' \
         'X-Github-Media-Type: github.v3; format=json' \
         'X-Ratelimit-Limit: 5000' \
-        'X-Ratelimit-Remaining: 4999' \
-        "X-Ratelimit-Reset: $(($(date +%s) + 3600))" \
+        "X-Ratelimit-Remaining: $remaining" \
+        "X-Ratelimit-Reset: $reset" \
         "X-Ratelimit-Resource: $resource" \
-        'X-Ratelimit-Used: 1' \
+        "X-Ratelimit-Used: $((5000 - remaining))" \
         ''
+}
+
+# Opt-in spent GraphQL quota: home/.config/fixture-forge-rate-limited holds
+# the Unix time it resets, or nothing for an hour after it was written. Until
+# then every GraphQL request fails as GitHub's does, whatever it asks, and
+# the app's other reads, over REST, still answer. Read on every call.
+rate_limit_file=$config/fixture-forge-rate-limited
+graphql_rate_limited() {
+    [ -e "$rate_limit_file" ] || return 0
+    reset=$(head -n 1 -- "$rate_limit_file" 2>/dev/null || :)
+    if [ -z "$reset" ]; then
+        reset=$(($(stat -c %Y -- "$rate_limit_file") + 3600))
+    elif ! printf '%s\n' "$reset" | grep -Eqx '[0-9]+'; then
+        printf 'gh: %s must hold the Unix time the quota resets, or nothing, not "%s"\n' \
+            "$rate_limit_file" "$reset" >&2
+        exit 1
+    fi
+    [ "$(date +%s)" -lt "$reset" ] || return 0
+    trace "api graphql rate-limited"
+    # GitHub answers a spent GraphQL quota with 200 and a RATE_LIMITED
+    # error; gh prints the error and fails.
+    ! "$include" || headers '200 OK' graphql 0 "$reset"
+    printf '%s\n' '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit already exceeded for user ID 1."}]}'
+    printf '%s\n' 'gh: GraphQL: API rate limit already exceeded for user ID 1.' >&2
+    exit 1
 }
 
 # OWNER/NAME of a github.com remote URL, or nothing for any other host.
@@ -373,6 +403,7 @@ api() {
     if [ -z "$method" ]; then
         if "$fields"; then method=POST; else method=GET; fi
     fi
+    [ "$endpoint" != graphql ] || graphql_rate_limited
     if [ "$endpoint" = graphql ] && [ -n "$search_all" ]; then
         # The Work board's authored listing: both searches name the
         # repository as repo:OWNER/NAME and the viewer as @me.

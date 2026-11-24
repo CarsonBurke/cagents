@@ -754,7 +754,7 @@ fn note<'a>(list: &ConversationPullRequests) -> Option<Element<'a, Action>> {
     let mut lines = Vec::new();
     if let Some(error) = &list.forge_error {
         lines.push(crate::interaction::tooltip(
-            line("GitHub could not be reached; states may be out of date.".to_owned()),
+            line("GitHub could not be read; states may be out of date.".to_owned()),
             error.clone(),
         ));
     }

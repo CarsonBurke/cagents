@@ -17,6 +17,7 @@ person.
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
 | A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat, or an Antigravity or Muse chat prompted with `work` |
+| A Work board of fourteen GitHub projects, optionally with the account's GraphQL quota spent | [`tests/fixtures/work-board-projects.py`](#many-projects-on-the-work-board), run through `scripts/native-evidence env python3 ...` |
 | A pull request review read from cache while GitHub is unavailable, with a restored draft line comment | [`tests/fixtures/offline-review-cache.py`](#an-offline-cached-review), run through `scripts/native-evidence env python3 ...` once the app has started |
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
@@ -239,6 +240,42 @@ rejected synthetic caller, not the permissions of a valid hosted session.
 It uses the same offline providers and isolated provider homes as other
 native-evidence scenes.
 
+## Many projects on the Work board
+
+A long-lived installation has many projects open, most of them on GitHub
+under one account. [`tests/fixtures/work-board-projects.py`](../tests/fixtures/work-board-projects.py)
+makes fourteen under the fixture's `projects/`, each with the remote
+`https://github.com/octo-org/NAME` and a worktree on a pushed branch, and
+turns the [forge](#an-offline-github) on with an open pull request, the
+viewer's, for every other one. It prints the projects' paths as JSON; open
+each, and the board fills its In progress and In review columns. Running it
+again keeps the projects and rewrites their seeds, keeping any other
+repository's.
+
+`work-board-projects.py rate-limit` spends the account's GraphQL quota
+through the forge's `fixture-forge-rate-limited` switch, as many agents
+sharing one GitHub account do, until the start of the hour after next, so a
+Before and an After session in the same hour show the same reset time.
+`rate-limit off` gives it back. The board reports it once it reads GitHub
+again: press its refresh button, run `cagents work --all --fresh`, or wait
+for its next reread. Projects read
+before the limit keep their pull requests and say they may be out of date.
+
+```sh
+tool_projects=$(evidence env python3 "$tool/tests/fixtures/work-board-projects.py" |
+    python3 -c 'import json, sys; print("\n".join(json.load(sys.stdin)["projects"]))')
+for project in $tool_projects; do evidence cli project open "$project" >/dev/null; done
+evidence drive key ctrl+shift+p >/dev/null
+evidence drive type 'Open Work board' >/dev/null
+evidence drive key Return >/dev/null
+evidence drive wait 'In review' --timeout 30 >/dev/null
+sleep 10    # the first poll of every project
+evidence env python3 "$tool/tests/fixtures/work-board-projects.py" rate-limit >/dev/null
+evidence cli work --all --fresh >/dev/null
+sleep 5
+evidence shot work-board-rate-limited
+```
+
 ## An offline GitHub
 
 The app shows GitHub state, including a project's owner avatar in the sidebar,
@@ -278,6 +315,14 @@ it. The open query computes the aggregate check state from the seed's
 search lists a hundred checks per pull request with their total and a cursor,
 and its `CagentsPullRequestChecks` reads the next hundred from there. This exercises the native sidebar's
 actual query and decoder without a GitHub account.
+
+To spend the account's GraphQL quota, write the Unix time it resets to
+`home/.config/fixture-forge-rate-limited`, or leave the file empty for an hour
+after it was written. Until then every `gh api graphql` fails as GitHub's
+does: `X-Ratelimit-Remaining: 0` and the reset in its headers, a
+`RATE_LIMITED` error in its body, and gh's message on stderr. REST, a quota of
+its own, still answers, as does `gh auth status`. Remove the file, or let the
+time pass, to give it back.
 
 For polling evidence, create `home/.config/fixture-forge-trace`. The forge then
 appends epoch time, parent PID and operation label to
