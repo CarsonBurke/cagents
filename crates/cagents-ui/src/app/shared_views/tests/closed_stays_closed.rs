@@ -124,6 +124,17 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
             app.publish_view_changes();
         }
 
+        // A draft is named for its channel while it is open there. Closed,
+        // it is in no channel, yet the notice names it as its tab did.
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|candidate| candidate.id == channel)
+            .unwrap()
+            .title = "Release notes".into();
+        let shown = app.pane_notice_title(card).expect("the draft is named");
+        assert_eq!(shown, "Release notes", "{refusal}");
+
         // Closed while its Insert is unanswered.
         drop(app.begin_chat_close(card));
         app.publish_view_changes();
@@ -199,9 +210,7 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
         );
         assert_eq!(
             told,
-            vec![super::super::pane_closed_here_kept_elsewhere(Some(
-                &app.pane_notice_title(card).expect("the draft is named"),
-            ))],
+            vec![super::super::pane_closed_here_kept_elsewhere(Some(&shown))],
             "{refusal}"
         );
         app.persist();
