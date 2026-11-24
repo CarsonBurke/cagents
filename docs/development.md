@@ -2766,6 +2766,27 @@ with `--stop stop`, as a person would type. Extra upgrade flags use
 `--upgrade-arg=--interrupt`; the harness adds no policy automatically. Refusals are measured outcomes: even
 a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
+That staged path is how `scripts/install-local` updates, and NEW's own worker
+runs it. A person updates from the app instead, and there OLD's installed worker
+runs the whole update, including the checks after NEW starts. Add `--feed DIR`
+to rehearse that path: DIR is a file feed holding NEW's signed bundle
+(`scripts/release feed`), and the feed's archive must match `--new-dir`. OLD's
+own `cagents daemon upgrade --version NEW` then finds NEW in the feed and starts
+the same update worker as the app's Update button. A rehearsal or development
+build reads the feed as `CAGENTS_UPDATE_FEED`. An unmodified published build
+ignores that variable and asks github.com, and the private user's curl answers
+those release URLs from the feed, so the published previous release can be the
+OLD side when NEW's bundle carries a signature from a key in
+`src/update/release-keys.pub`; a published build ignores rehearsal keys. Whichever path it takes, an update that exits 0 passes only when its
+status ends `Complete` for NEW with no refusal, because anything else shows a
+failure banner when the windows reopen.
+
+`init` refuses a root with a `.git` in its ancestry, as recovery storage does.
+A sandbox that masks `.git` in its writable roots (Codex's does) leaves an empty
+`/tmp/.git` or `/var/tmp/.git` behind. When the refusal names one, use a
+`/dev/shm` root and clean it up when the run ends, and run the harness tests
+with `REHEARSE_UPDATE_TEST_PARENT=/dev/shm`.
+
 Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch
 that build with its matched `cagents` and `cagentsd`, in the same private runtime.
 The scenario verifies its mapped window too. The default seed includes Claude

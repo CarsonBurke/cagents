@@ -260,6 +260,25 @@ def active_working_contract(before, agents, serving, events, agent_id):
     return {'agent_id':agent_id,'run':old['run'],'serving':serving,'parent':started,'observed_at':time.time()}
 
 
+def update_completed(root, version):
+    """What reopened windows would show about an update that exited 0.
+
+    A failed or refused job reads "Update failed" or "Update not installed"
+    there even when NEW is serving (#3877), so a clean exit alone is no pass.
+    """
+    path = Path(root)/'home/.local/share/cagents-install/.update/status.json'
+    try:
+        status = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        return [f'the update left no readable status: {error}']
+    errors = []
+    if status.get('phase') != 'Complete' or status.get('version') != version:
+        errors.append(f'the update status is {status.get("phase")} for {status.get("version")}, not Complete for {version}: {status.get("message")}')
+    if status.get('refusal'):
+        errors.append(f'the update status carries a refusal: {status["refusal"]}')
+    return errors
+
+
 def candidate_namespace_contract(evidence, old_version, new_version):
     source=evidence['source']
     expected=source.get('data',{})
@@ -275,17 +294,28 @@ def candidate_namespace_contract(evidence, old_version, new_version):
     receipt=evidence['receipt']
     proof=snapshot.get('serving')
     outcome=receipt.get('outcome',{})
-    if (source.get('ok') is not True or expected.get('running') is not True
+    serving_proof = isinstance(proof,dict) and all(isinstance(proof.get(field),str) and proof[field]
+                                                   for field in ('host_session_id','boot_id','host_incarnation'))
+    checks = {
+        'the installed CLI does not report OLD serving the production socket':
+            source.get('ok') is not True or expected.get('running') is not True
             or expected.get('instance')!='production' or expected.get('daemon_version')!=old_version
-            or expected.get('socket')!=str(root/'rt/cagents/cagentsd.sock')
-            or evidence['candidate_version'].strip()!=f'cagents {new_version}'
-            or snapshot['errors'] or len(owner)!=1 or daemons!=owner
-            or not isinstance(proof,dict) or any(not isinstance(proof.get(field),str) or not proof[field]
-                for field in ('host_session_id','boot_id','host_incarnation'))
-            or census.get('source')!=proof or outcome.get('state')!='usable' or outcome.get('serving')!=proof
+            or expected.get('socket')!=str(root/'rt/cagents/cagentsd.sock'),
+        f'the candidate CLI reports {evidence["candidate_version"].strip()!r}, not {"cagents "+new_version!r}'
+        ' (a bare release version needs a build from its tag or a source export)':
+            evidence['candidate_version'].strip()!=f'cagents {new_version}',
+        f'the process snapshot has errors: {snapshot["errors"]}': bool(snapshot['errors']),
+        'exactly one daemon, OLD\'s, is not running': len(owner)!=1 or daemons!=owner,
+        'the snapshot has no serving proof': not serving_proof,
+        'the candidate census or its usable receipt does not bind that serving proof':
+            census.get('source')!=proof or outcome.get('state')!='usable' or outcome.get('serving')!=proof
             or census.get('transaction')!=receipt.get('transaction')
-            or evidence['census_digest']!=receipt.get('census_digest')):
-        raise RuntimeError('candidate does not observe the serving production baseline in the same namespace')
+            or evidence['census_digest']!=receipt.get('census_digest'),
+    }
+    failed = [reason for reason, wrong in checks.items() if wrong]
+    if failed:
+        raise RuntimeError('candidate does not observe the serving production baseline in the same namespace: '
+                           + '; '.join(failed))
     # A strict current-protocol status may reject a qualified frozen source.
     # It proves neither absence nor presence; the successful read-only census
     # and require-original verification above bind the actual Ready socket.
@@ -1774,6 +1804,8 @@ class Rehearsal:
         failure = None
         try:
             self.call('init')
+            if args.feed:
+                self.call('feed', args.feed)
             settings = {'pause': args.codex_pause,
                         'never_confirm_interrupt': args.codex_never_confirm_interrupt,
                         'never_confirm_close': args.codex_never_confirm_close}
@@ -1814,7 +1846,8 @@ class Rehearsal:
             candidate_namespace_contract(evidence,args.old_version,args.new_version)
             if current.resolve()!=original_current:
                 raise RuntimeError('read-only candidate namespace probe changed current')
-            if not args.fail_new_daemon:
+            # The in-app update downloads and installs NEW itself.
+            if not args.fail_new_daemon and not args.feed:
                 self.call('stage',args.new_dir,args.new_version,args.new_installer,timeout=180)
             self.call('desktop','start','--limit','900', timeout=None)
             self.open_windows(['main','second'])
@@ -1836,6 +1869,8 @@ class Rehearsal:
             update_args += ['--working',args.working,'--stop',args.stop]
             if args.fail_new_daemon:
                 update_args.append('--fail-new-daemon')
+            elif args.feed:
+                update_args.append('--in-app')
             else:
                 update_args.append('--use-staged')
             for flag in args.upgrade_arg:
@@ -1900,6 +1935,8 @@ class Rehearsal:
                     self.errors.append('expected refusal did not return a normal nonzero result')
             elif code:
                 self.errors.append(f'update exited {code}')
+            else:
+                self.errors.extend(update_completed(self.root,args.new_version))
             try:
                 self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon or args.expect_refusal else args.new_version if code==0 else None)
             except RuntimeError as exc:
@@ -2052,6 +2089,7 @@ def main():
         for field in ('dir','version','installer'):
             run.add_argument('--'+prefix+'-'+field,required=True)
     run.add_argument('--ceditor',metavar='BIN_DIR')
+    run.add_argument('--feed',metavar='DIR',help="update in the app, as a person does, instead of through NEW's staged CLI: OLD's own `daemon upgrade --version NEW` finds NEW in this file feed (scripts/release feed), and OLD's update worker runs the update. The feed must serve the archive in --new-dir")
     run.add_argument('--answer',default='yes')
     run.add_argument('--yes',action='store_true')
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
@@ -2120,6 +2158,8 @@ def main():
         parser.error('--expect-terminal-restart-failure requires --new-terminal-after-restore')
     if args.command in ('run','seed') and args.ended_provider and args.no_codex:
         parser.error('--ended-provider opens a Codex chat; it cannot be combined with --no-codex')
+    if args.command == 'run' and args.feed and args.fail_new_daemon:
+        parser.error('--feed installs the published archive; it cannot inject a startup failure with --fail-new-daemon')
     if args.command == 'run' and args.require_working and args.no_codex:
         parser.error('--require-working requires the seeded Codex chat')
     rehearsal=Rehearsal(args.root,args.shell)
