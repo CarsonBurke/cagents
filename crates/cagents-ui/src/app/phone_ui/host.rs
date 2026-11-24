@@ -24,7 +24,7 @@ mod firewall;
 const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Tailscale {
+pub enum Tailscale {
     Connected {
         /// The MagicDNS name, when it has one.
         name: Option<String>,
@@ -36,7 +36,7 @@ pub(crate) enum Tailscale {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Route {
+pub enum Route {
     Tailscale,
     Lan,
     Other,
@@ -44,7 +44,7 @@ pub(crate) enum Route {
 
 /// A phone connected now.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Connection {
+pub struct Connection {
     /// The phone's address.
     pub from: String,
     pub route: Route,
@@ -52,7 +52,7 @@ pub(crate) struct Connection {
 
 /// How a phone reaches this computer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Network {
+pub struct Network {
     pub name: String,
     pub user: String,
     pub port: u16,
@@ -97,7 +97,7 @@ impl Network {
 
 /// What the status bar and the popover show.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Status {
+pub struct Status {
     pub phones: Result<Vec<Phone>, String>,
     /// Why pairing can't change `authorized_keys`, if it can't.
     pub unwritable: Option<String>,
