@@ -38,10 +38,11 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --expect-terminal-restart-failure (before example).
                        See run --help.
   feed DIR             Serve updates from the file feed DIR (see
-                       scripts/release feed): CAGENTS_UPDATE_FEED names it,
-                       and the private user's curl refuses most other URLs.
-                       Only rehearsal builds (CAGENTS_UPDATE_REHEARSAL_KEYS)
-                       and development builds read that variable.
+                       scripts/release feed). Rehearsal builds
+                       (CAGENTS_UPDATE_REHEARSAL_KEYS) and development builds
+                       read it as CAGENTS_UPDATE_FEED; for a published build
+                       the private user's curl answers github.com's release
+                       URLs from it. That curl refuses other URLs.
   compare A B          Compare record names, directories or snapshot JSON.
   cleanup              Stop everything and remove this marked root.
   launch [--restore-existing-only] [main|NAME]
@@ -52,7 +53,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        console, named and untitled) and terminals through the
                        installed CLI.
   update DIR VERSION INSTALLER [--answer TEXT] [--working TEXT] [--stop TEXT]
-         [--use-staged] [--require-working|--require-idle] [UPGRADE-ARGS...]
+         [--use-staged|--in-app] [--require-working|--require-idle] [UPGRADE-ARGS...]
                        What scripts/install-local does after its build: stage
                        the archive with --stage-only, then run the staged
                        `cagents daemon upgrade` in a terminal (inside the
@@ -61,7 +62,12 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        choice (empty waits for them) and --stop at the stop
                        list (empty cancels it).
                        --use-staged verifies the exact earlier stage receipt
-                       without running the installer again. --require-working
+                       without running the installer again. --in-app updates
+                       as a person does from the app instead: the installed
+                       build's own `cagents daemon upgrade --version VERSION`
+                       finds VERSION in the feed (see `feed`), and that
+                       installed build's worker runs the whole update. DIR
+                       must hold the archive the feed serves. --require-working
                        declines an ordinary review before any consent.
                        --require-idle checks the natural-idle receipt against
                        the actual published Resumes (1) review before consent.
@@ -187,7 +193,12 @@ cmd_init() {
     # Recovery storage refuses to live inside a Git checkout.
     local ancestor=$root
     while [ "$ancestor" != / ]; do
-        [ ! -e "$ancestor/.git" ] || die "root must be outside Git ancestry; found $ancestor/.git" 2
+        if [ -e "$ancestor/.git" ] || [ -L "$ancestor/.git" ]; then
+            # Sandboxes that mask .git in writable roots leave empty mountpoints behind.
+            [ -n "$(ls -A -- "$ancestor/.git" 2>/dev/null)" ] || [ ! -d "$ancestor/.git" ] ||
+                die "root must be outside Git ancestry; found $ancestor/.git (empty: likely a sandbox's .git mountpoint; choose another root)" 2
+            die "root must be outside Git ancestry; found $ancestor/.git" 2
+        fi
         ancestor=$(dirname -- "$ancestor")
     done
     mkdir -p -- "$root"
@@ -220,32 +231,59 @@ cmd_init() {
 }
 
 # Points the private user's curl at one file feed, so the in-app updater finds
-# and downloads releases there as it would on GitHub. It refuses the URLs and
-# options that would reach anything else; it is a guard against mistakes in a
-# rehearsal, not a sandbox.
+# and downloads releases there as it would on GitHub. A rehearsal or
+# development build reads it as CAGENTS_UPDATE_FEED; a published build, which
+# ignores that variable, still asks github.com, and this curl answers its
+# release URLs from the same directory. It refuses the URLs and options that
+# would reach anything else; it is a guard against mistakes in a rehearsal,
+# not a sandbox.
 cmd_feed() {
     require_init
     local feed
     feed=$(realpath -e -- "${1:?feed needs a directory}") || die 'feed directory not found' 2
     [ -d "$feed/latest/download" ] || die "not a release feed (no latest/download): $feed" 2
     [[ $feed =~ ^/[A-Za-z0-9._/-]+$ ]] || die "feed path has unsupported characters: $feed" 2
+    # The updater refuses a release whose SHA256SUMS omits the installer, as
+    # an --archive-only package's does; say so before the rehearsal installs.
+    local latest sums
+    latest=$(/usr/bin/python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' \
+        "$feed/latest/download/release-metadata.json" 2>/dev/null) ||
+        die "the feed's latest/download/release-metadata.json names no version" 2
+    [[ $latest =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "the feed's latest version is not a version name: $latest" 2
+    sums=$feed/download/v$latest/SHA256SUMS
+    [ -f "$sums" ] || die "the feed's latest release $latest has no SHA256SUMS" 2
+    grep -q '  install\.sh$' "$sums" ||
+        die "$sums does not cover install.sh; package the release without --archive-only" 2
     printf '%s\n' "$feed" >"$root/feed"
-    cat >"$bin/curl" <<CURL
-#!/bin/sh
-# Only file:///$feed/... URLs; anything else has no network here.
+    { printf '#!/bin/bash\nfeed=%s\n' "$feed"; cat <<'CURL'
+# Only this feed's file:// URLs, and github.com's release URLs it stands in for.
+github=https://github.com/CarsonBurke/cagents/releases/
+arguments=() remote=0
 for argument do
-    case \$argument in
+    case $argument in
         *..*|-K|--config|--config=*) refused=1 ;;
-        file://$feed/*) continue ;;
+        # curl decodes %2e%2e in a file path; release URLs need no escapes or queries.
+        "file://$feed/"*[%?#]* | "$github"*[%?#]*) refused=1 ;;
+        "file://$feed/"*) ;;
+        "$github"*) remote=1; argument=file://$feed/${argument#"$github"} ;;
+        # A published build allows only https; its URL is now a file. This mirrors
+        # the argv src/update/feed.rs builds, which passes --proto and =https apart.
+        =https) [ "${previous-}" = --proto ] && argument==file ;;
         *:*|*/*) refused=1 ;;
     esac
-    if [ -n "\${refused-}" ]; then
-        echo "curl: (7) the rehearsal reads only file://$feed/: \$argument" >&2
+    if [ -n "${refused-}" ]; then
+        echo "curl: (7) the rehearsal reads only file://$feed/ and $github: $argument" >&2
         exit 7
     fi
+    arguments+=("$argument") previous=$argument
 done
-exec /usr/bin/curl "\$@"
+/usr/bin/curl "${arguments[@]}"
+status=$?
+# GitHub answers a missing asset with HTTP 404, which --fail reports as 22.
+[ "$remote" -eq 1 ] && [ "$status" -eq 37 ] && exit 22
+exit "$status"
 CURL
+    } >"$bin/curl"
     chmod 755 "$bin/curl"
     printf 'updates now come from %s\n' "$feed"
 }
@@ -300,11 +338,12 @@ cmd_update() {
     require_init
     local archive_dir=${1:?update needs the archive directory} version=${2:?update needs a version} installer=${3:?update needs an install.sh}
     shift 3
-    local answer= working= stop= fail_new_daemon=0 use_staged=0 upgrade_args=() pty_args=()
+    local answer= working= stop= fail_new_daemon=0 use_staged=0 in_app=0 upgrade_args=() pty_args=()
     while [ "$#" -gt 0 ]; do
         case $1 in
             --fail-new-daemon) fail_new_daemon=1; shift ;;
             --use-staged) use_staged=1; shift ;;
+            --in-app) in_app=1; shift ;;
             --require-working) pty_args+=(--require-working); shift ;;
             --require-idle) pty_args+=(--require-idle --review-root "$root" --review-output "$root/reviews/natural-idle"); shift ;;
             --answer) answer=${2?}; shift 2 ;;
@@ -319,6 +358,8 @@ cmd_update() {
             case $arg in --yes | --yes=*) die 'required review forbids --yes' 2 ;; esac
         done
     fi
+    [ "$in_app" -eq 0 ] || { [ "$use_staged" -eq 0 ] && [ "$fail_new_daemon" -eq 0 ]; } ||
+        die '--in-app cannot combine with --use-staged or --fail-new-daemon' 2
     local started=$SECONDS status=0 transcript
     transcript=$logs/update-$(date +%H%M%S).log
     local prefix=$user_home/.local/share/cagents-install
@@ -339,7 +380,26 @@ cmd_update() {
         archive_dir=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" \
             "$root" "$version" --archive-dir "$archive_dir")
     fi
-    if [ "$use_staged" -eq 1 ]; then
+    if [ "$in_app" -eq 1 ]; then
+        [[ $version =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die '--in-app needs a single version name' 2
+        archive_dir=$(realpath -e -- "$archive_dir") || die "--in-app archive directory not found" 2
+        local arg
+        for arg in "${upgrade_args[@]}"; do
+            case $arg in --version | --version=*) die '--in-app already selects VERSION' 2 ;; esac
+        done
+        [ -f "$root/feed" ] || die '--in-app reads the release from a feed; run feed DIR first' 2
+        local served name=cagents-$version-x86_64-unknown-linux-gnu.tar.gz
+        served=$(cat -- "$root/feed")/download/v$version/$name
+        [ -f "$served" ] && [ -f "$archive_dir/$name" ] || die "--in-app needs $name in both DIR and the feed" 2
+        # What the feed serves is what this rehearsal reports on.
+        [ "$(sha256sum <"$served")" = "$(sha256sum <"$archive_dir/$name")" ] ||
+            die "the feed serves a different $name than DIR" 2
+        [ ! -e "$prefix/versions/$version" ] && [ ! -L "$prefix/versions/$version" ] ||
+            die "$prefix/versions/$version exists; the in-app update installs it" 2
+        staged_cli=cagents
+        upgrade_args=(--version "$version" "${upgrade_args[@]}")
+        printf 'updating in the app from the feed to %s\n' "$version" | tee -a "$transcript"
+    elif [ "$use_staged" -eq 1 ]; then
         printf '%s verified against the early stage receipt.\n' "$version" | tee -a "$transcript"
     elif [[ $prefix/current -ef $prefix/versions/$version ]]; then
         printf '%s is already current; skipping staging.\n' "$version"

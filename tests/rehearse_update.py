@@ -1195,6 +1195,24 @@ class ChatViews(unittest.TestCase):
                     rehearsal.capture_chats('before')
 
 
+class UpdateCompleted(unittest.TestCase):
+    def test_only_a_complete_status_for_the_target_without_refusal_passes(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "home/.local/share/cagents-install/.update"
+            self.assertIn("no readable status", run.update_completed(directory, "2.0.0")[0])
+            state.mkdir(parents=True)
+            status = state / "status.json"
+            for phase, version, refusal, failures in (("Complete", "2.0.0", None, 0),
+                                                      ("Failed", "2.0.0", None, 1),
+                                                      ("Complete", "1.0.0", None, 1),
+                                                      ("Complete", "2.0.0", {"reason": "x"}, 1)):
+                with self.subTest(phase=phase, version=version, refusal=refusal):
+                    status.write_text(json.dumps({"phase": phase, "version": version, "refusal": refusal,
+                                                  "message": "could not configure the daemon connection"}))
+                    self.assertEqual(len(run.update_completed(directory, "2.0.0")), failures)
+
+
 class CandidateNamespace(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('candidate_namespace_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
@@ -1226,6 +1244,17 @@ class CandidateNamespace(unittest.TestCase):
                 changed['candidate_status']['payload']['data'][field]=value
                 with self.assertRaisesRegex(RuntimeError,'disagrees'):
                     scenario.candidate_namespace_contract(changed,'old','new')
+
+    def test_a_refused_probe_names_what_it_found(self):
+        scenario=self.module()
+        evidence=self.evidence()
+        evidence['candidate_version']='cagents new+local.0123abc\n'
+        with self.assertRaisesRegex(RuntimeError,"reports 'cagents new\\+local.0123abc', not 'cagents new'"):
+            scenario.candidate_namespace_contract(evidence,'old','new')
+        evidence=self.evidence()
+        evidence['receipt']['outcome']['state']='unverified'
+        with self.assertRaisesRegex(RuntimeError,'does not bind that serving proof'):
+            scenario.candidate_namespace_contract(evidence,'old','new')
 
     def test_protocol_rejected_status_requires_exact_ready_source_and_kernel_owner(self):
         scenario=self.module()
@@ -2267,7 +2296,10 @@ class Arguments(unittest.TestCase):
                  "harness actions require a genuine user shell; never strip authority")
 class PrivateRoot(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="ru-contract-", dir="/var/tmp")
+        # A sandbox that masks .git in /var/tmp leaves an empty /var/tmp/.git,
+        # which init rightly refuses; REHEARSE_UPDATE_TEST_PARENT=/dev/shm moves the roots.
+        parent = os.environ.get("REHEARSE_UPDATE_TEST_PARENT", "/var/tmp")
+        self.temporary = tempfile.TemporaryDirectory(prefix="ru-contract-", dir=parent)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
@@ -2341,6 +2373,106 @@ else:sys.exit(2)
         result = self.call("update", "/missing", "new", "/missing/install.sh")
         self.assertIn("already current; skipping staging", result.stdout)
         self.assertNotIn("exists but is not current", result.stderr)
+
+    def feed(self, version="2.0.0"):
+        """A file feed serving VERSION's archive, as scripts/release feed lays it out."""
+        # `ROOT/feed` is where the harness records the feed it serves.
+        feed = self.root / "releases"
+        (feed / "latest/download").mkdir(parents=True)
+        (feed / "latest/download/release-metadata.json").write_text('{"version":"%s"}' % version)
+        release = feed / f"download/v{version}"
+        release.mkdir(parents=True)
+        name = f"cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"
+        (release / name).write_bytes(b"archive")
+        (release / "SHA256SUMS").write_text(f"{'0' * 64}  {name}\n{'1' * 64}  install.sh\n")
+        self.assertEqual(self.call("feed", str(feed)).returncode, 0)
+        return feed, name
+
+    def test_feed_refuses_a_release_whose_checksums_omit_the_installer(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        feed, _ = self.feed()
+        sums = feed / "download/v2.0.0/SHA256SUMS"
+        sums.write_text(sums.read_text().splitlines()[0] + "\n")
+        refused = self.call("feed", str(feed))
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("does not cover install.sh", refused.stderr)
+        # Only the release the feed offers matters; an older archive-only one is fine.
+        (feed / "latest/download/release-metadata.json").write_text('{"version":"3.0.0"}')
+        (feed / "download/v3.0.0").mkdir()
+        refused = self.call("feed", str(feed))
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("latest release 3.0.0 has no SHA256SUMS", refused.stderr)
+        (feed / "download/v3.0.0/SHA256SUMS").write_text(f"{'1' * 64}  install.sh\n")
+        self.assertEqual(self.call("feed", str(feed)).returncode, 0)
+
+    def test_feed_answers_a_published_builds_github_requests_from_the_feed(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        feed, name = self.feed()
+        curl = self.root / "bin/curl"
+        github = "https://github.com/CarsonBurke/cagents/releases"
+        # The exact request a published build's updater makes.
+        published = ["--disable", "--silent", "--fail", "--location", "--max-redirs", "10",
+                     "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "30",
+                     "--user-agent", "cagents-updater", "--max-filesize", "1000", "--"]
+        fetched = subprocess.run([curl, *published, f"{github}/latest/download/release-metadata.json"],
+                                 capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual((fetched.returncode, fetched.stdout), (0, '{"version":"2.0.0"}'), fetched.stderr)
+        fetched = subprocess.run([curl, *published, f"{github}/download/v2.0.0/{name}"],
+                                 capture_output=True, timeout=HANG_GUARD)
+        self.assertEqual((fetched.returncode, fetched.stdout), (0, b"archive"))
+        # A missing asset reads as GitHub's 404, which the updater treats as absent.
+        missing = subprocess.run([curl, *published, f"{github}/download/v9.0.0/{name}"],
+                                 capture_output=True, timeout=HANG_GUARD)
+        self.assertEqual(missing.returncode, 22)
+        local = [argument if argument != "=https" else "=file" for argument in published]
+        fetched = subprocess.run([curl, *local, f"file://{feed}/download/v2.0.0/{name}"],
+                                 capture_output=True, timeout=HANG_GUARD)
+        self.assertEqual((fetched.returncode, fetched.stdout), (0, b"archive"))
+        for url in ("https://github.com/someone/else/releases/x", "https://example.com/x",
+                    f"{github}/download/../../etc/passwd", "file:///etc/passwd",
+                    # curl decodes these in a file path, which would leave the feed.
+                    f"{github}/download/%2e%2e/%2e%2e/etc/passwd", f"file://{feed}/%2e%2e/x",
+                    f"{github}/download/v2.0.0/{name}?x=1", f"{github}/download/v2.0.0/{name}#x"):
+            with self.subTest(url=url):
+                refused = subprocess.run([curl, *published, url], capture_output=True, text=True,
+                                         timeout=HANG_GUARD)
+                self.assertEqual(refused.returncode, 7, refused.stderr)
+
+    def test_in_app_update_runs_the_installed_builds_upgrade_to_the_feeds_release(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        prefix = self.root / "home/.local/share/cagents-install"
+        cli = prefix / "versions/1.0.0/bin/cagents"
+        cli.parent.mkdir(parents=True)
+        cli.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >"$CAGENTS_REHEARSAL_ROOT/logs/upgrade-argv"\n')
+        cli.chmod(0o755)
+        (prefix / "current").symlink_to("versions/1.0.0")
+        (self.root / "home/.local/bin/cagents").symlink_to(prefix / "current/bin/cagents")
+        archives = self.root / "archives"
+        archives.mkdir()
+        refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("run feed DIR first", refused.stderr)
+        feed, name = self.feed()
+        (archives / name).write_bytes(b"another archive")
+        refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("serves a different", refused.stderr)
+        (archives / name).write_bytes(b"archive")
+        for extra, reason in ((["--use-staged"], "cannot combine"), (["--fail-new-daemon"], "cannot combine"),
+                              (["--version", "3.0.0"], "already selects VERSION")):
+            with self.subTest(extra=extra):
+                refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app", *extra)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn(reason, refused.stderr)
+        (prefix / "versions/2.0.0").symlink_to("missing")
+        refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("the in-app update installs it", refused.stderr)
+        (prefix / "versions/2.0.0").unlink()
+        result = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "logs/upgrade-argv").read_text(), "daemon upgrade --version 2.0.0 --yes\n")
+        self.assertFalse((prefix / "versions/2.0.0").exists(), "the in-app update stages nothing itself")
 
     def test_existing_only_launch_executes_the_ui_directly_with_private_environment(self):
         self.assertEqual(self.call('init').returncode,0)
