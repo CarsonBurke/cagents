@@ -546,7 +546,7 @@ fn retry_retirement_close(
     }
 }
 
-fn retention_client_host(
+pub(in crate::host) fn retention_client_host(
     name: &str,
 ) -> (
     SharedHost,

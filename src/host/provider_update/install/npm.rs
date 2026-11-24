@@ -11,14 +11,16 @@ use tokio::process::Command;
 
 use super::{
     CommandContext, EntryStamp, NPM_IN_USE, Preparation, PreparedUpdate, Replacement,
-    SelectedInstall, fs_error, npm_running_in, run_update, stage_in,
+    SelectedInstall, Stage, fs_error, npm_running_in, run_update, stage_in,
 };
-use crate::account::{
-    probe::find_executable,
-    provider_install::{ProviderStatus, read_version},
+use crate::{
+    account::{
+        probe::find_executable,
+        provider_install::{ProviderStatus, read_version},
+    },
+    agent::Provider,
 };
 
-const REGISTRY: &str = "https://registry.npmjs.org/";
 const PACKAGE: &str = "@openai/codex";
 const SCOPE_DIRECTORY: &str = "lib/node_modules/@openai";
 const WRAPPER: &str = "bin/codex.js";
@@ -57,6 +59,7 @@ pub(super) async fn prepare(
     status: &ProviderStatus,
     prefix: &Path,
     context: &CommandContext<'_>,
+    automatic: bool,
 ) -> Result<Preparation, String> {
     let Some(platform) = Platform::current() else {
         return Ok(Preparation::Skipped(
@@ -71,6 +74,15 @@ pub(super) async fn prepare(
         || fs::metadata(&scope).map_err(fs_error)?.uid() != uid
     {
         return Err("Codex's npm package directory is not owned by this user".into());
+    }
+    super::reap_stages(&scope);
+    if automatic {
+        // npm records the installed version but no version constraint for a
+        // global install, so an install pinned with @VERSION looks the same.
+        return Ok(Preparation::Skipped(
+            "npm cannot identify pinned installations. Run cagents provider update codex to update."
+                .into(),
+        ));
     }
     let relative_target = installation
         .resolved
@@ -89,17 +101,22 @@ pub(super) async fn prepare(
     let npm = find_executable("npm", context.search_path)
         .ok_or("npm was not found on the provider search path")?;
     let stage = stage_in(&scope)?;
+    // npm derives its default global npmrc from --prefix. Preserve that
+    // layer while leaving npm to handle userconfig and globalconfig overrides.
+    fs::create_dir(stage.path().join("etc")).map_err(fs_error)?;
+    symlink(prefix.join("etc/npmrc"), stage.path().join("etc/npmrc")).map_err(fs_error)?;
     let mut view = command(context, &npm, stage.path());
+    stage.protect(&mut view);
     view.args([
         "--fetch-timeout=15000",
         "--fetch-retry-mintimeout=1000",
         "view",
-        "@openai/codex@latest",
+        PACKAGE,
         "version",
         "--json",
     ]);
     let output = run_update(view).await?;
-    let latest: Version = serde_json::from_slice::<String>(&output)
+    let release: Version = serde_json::from_slice::<String>(&output)
         .ok()
         .and_then(|version| Version::parse(&version).ok())
         .ok_or("npm did not report a Codex release version")?;
@@ -112,7 +129,7 @@ pub(super) async fn prepare(
     let top_version = package_version(&platform_top, Some(platform.tag))?;
     let nested_version = package_version(&platform_nested, Some(platform.tag))?;
     if let Some(installed) = &installed
-        && installed > &latest
+        && installed > &release
     {
         installation.check(context.search_path)?;
         return Ok(Preparation::Current(installed.to_string()));
@@ -124,10 +141,10 @@ pub(super) async fn prepare(
     ]
     .into_iter()
     .flatten()
-    .any(|version| version > &latest)
+    .any(|version| version > &release)
     {
         return Ok(Preparation::Skipped(
-            "This npm prefix already contains a Codex release newer than the latest stable release"
+            "This npm prefix already contains a Codex release newer than the configured release"
                 .into(),
         ));
     }
@@ -135,34 +152,34 @@ pub(super) async fn prepare(
     let launcher = wrapper.join(WRAPPER);
     let top_binary = platform_top.join(platform.binary());
     let replace_top = top_version.is_some()
-        && (top_version.as_ref() != Some(&latest)
-            || verify(&top_binary, &latest, context, status).await.is_err());
+        && (top_version.as_ref() != Some(&release)
+            || verify(&top_binary, &release, context, None).await.is_err());
 
     // An npm install may hoist its platform package beside the wrapper. A
     // current wrapper can keep using that path while we repair the alias.
     let hoisted = nested_version.is_none() && top_version.is_some();
-    let keep_wrapper = if wrapper_version.as_ref() != Some(&latest) {
+    let keep_wrapper = if wrapper_version.as_ref() != Some(&release) {
         false
     } else {
         match (nested_version.as_ref(), top_version.as_ref()) {
-            (None, Some(version)) => verify(&launcher, version, context, status).await.is_ok(),
-            (Some(version), _) if version == &latest => {
+            (None, Some(version)) => verify(&launcher, version, context, None).await.is_ok(),
+            (Some(version), _) if version == &release => {
                 verify(
                     &platform_nested.join(platform.binary()),
-                    &latest,
+                    &release,
                     context,
-                    status,
+                    None,
                 )
                 .await
                 .is_ok()
-                    && verify(&launcher, &latest, context, status).await.is_ok()
+                    && verify(&launcher, &release, context, None).await.is_ok()
             }
             _ => false,
         }
     };
-    if keep_wrapper && !replace_top && installed.as_ref() == Some(&latest) {
+    if keep_wrapper && !replace_top && installed.as_ref() == Some(&release) {
         installation.check(context.search_path)?;
-        return Ok(Preparation::Current(latest.to_string()));
+        return Ok(Preparation::Current(release.to_string()));
     }
     let keep_wrapper = keep_wrapper && replace_top;
     let affected_roots: Vec<_> = [
@@ -177,16 +194,17 @@ pub(super) async fn prepare(
     }
 
     let mut install = command(context, &npm, stage.path());
+    stage.protect(&mut install);
     install
         .args(["install", "--include=optional"])
-        .arg(format!("{PACKAGE}@{latest}"));
+        .arg(format!("{PACKAGE}@{release}"));
     run_update(install).await?;
 
     let staged_scope = stage.path().join(SCOPE_DIRECTORY);
     let staged_wrapper = staged_scope.join("codex");
     let staged_top = staged_scope.join(&platform.alias);
     let staged_nested = staged_wrapper.join(NESTED_SCOPE).join(&platform.alias);
-    if package_version(&staged_wrapper, None)?.as_ref() != Some(&latest) {
+    if package_version(&staged_wrapper, None)?.as_ref() != Some(&release) {
         return Err("npm did not stage the requested Codex wrapper release".into());
     }
 
@@ -198,13 +216,13 @@ pub(super) async fn prepare(
         fs::create_dir_all(nested_scope).map_err(fs_error)?;
         fs::rename(&staged_top, &staged_nested).map_err(fs_error)?;
     }
-    if package_version(&staged_nested, Some(platform.tag))?.as_ref() != Some(&latest) {
+    if package_version(&staged_nested, Some(platform.tag))?.as_ref() != Some(&release) {
         return Err("npm did not stage the matching Codex platform package".into());
     }
     let staged_native = staged_nested.join(platform.binary());
-    verify(&staged_native, &latest, context, status).await?;
+    verify(&staged_native, &release, context, Some(&stage)).await?;
     let staged_launcher = staged_wrapper.join(WRAPPER);
-    verify(&staged_launcher, &latest, context, status).await?;
+    verify(&staged_launcher, &release, context, Some(&stage)).await?;
 
     // Keep direct links to older package layouts resolving through the
     // vendor directory without copying the new binary to a different location.
@@ -216,27 +234,29 @@ pub(super) async fn prepare(
             copy.args(["-al", "--"])
                 .arg(&staged_nested)
                 .arg(&staged_top);
+            stage.protect(&mut copy);
             run_update(copy).await?;
         }
-        if package_version(&staged_top, Some(platform.tag))?.as_ref() != Some(&latest) {
+        if package_version(&staged_top, Some(platform.tag))?.as_ref() != Some(&release) {
             return Err("npm did not stage the matching top-level Codex platform package".into());
         }
         verify(
             &staged_top.join(platform.binary()),
-            &latest,
+            &release,
             context,
-            status,
+            Some(&stage),
         )
         .await?;
         preserve_legacy_binary(&platform_top, &staged_top, &platform)?;
     }
 
-    let executable = if relative_target.starts_with(&platform.alias) && !replace_top {
-        installation.resolved.clone()
-    } else {
-        staged_scope.join(relative_target)
-    };
-    let expected_version = verify(&executable, &latest, context, status).await?;
+    let (executable, verification_stage) =
+        if relative_target.starts_with(&platform.alias) && !replace_top {
+            (installation.resolved.clone(), None)
+        } else {
+            (staged_scope.join(relative_target), Some(&stage))
+        };
+    let expected_version = verify(&executable, &release, context, verification_stage).await?;
     let mut replacements = Vec::new();
     if replace_top {
         replacements.push(Replacement::new(staged_top, platform_top.clone())?);
@@ -265,15 +285,6 @@ pub(super) async fn prepare(
 
 fn command(context: &CommandContext<'_>, npm: &Path, stage: &Path) -> Command {
     let mut command = context.command(npm);
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with("npm_config_")
-        {
-            command.env_remove(key);
-        }
-    }
     command
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
@@ -281,13 +292,10 @@ fn command(context: &CommandContext<'_>, npm: &Path, stage: &Path) -> Command {
         .arg("--global")
         .arg("--prefix")
         .arg(stage)
-        .arg("--userconfig")
-        .arg(stage.join("npm-userconfig"))
-        .arg("--globalconfig")
-        .arg(stage.join("npm-globalconfig"))
         .arg("--cache")
         .arg(stage.join("npm-cache"))
-        .arg(format!("--registry={REGISTRY}"))
+        .arg("--logs-dir")
+        .arg(stage.join("npm-logs"))
         .args([
             "--ignore-scripts",
             "--no-audit",
@@ -384,9 +392,16 @@ async fn verify(
     executable: &Path,
     version: &Version,
     context: &CommandContext<'_>,
-    status: &ProviderStatus,
+    stage: Option<&Stage>,
 ) -> Result<String, String> {
-    let actual = read_version(status.provider, executable, context.search_path).await?;
+    let actual = match stage {
+        Some(stage) => {
+            stage
+                .version(Provider::Codex, executable, context.search_path)
+                .await?
+        }
+        None => read_version(Provider::Codex, executable, context.search_path).await?,
+    };
     if !Version::parse(&actual).is_ok_and(|actual| &actual == version) {
         return Err(format!(
             "Staged Codex executable reports {actual}; expected {version}"
@@ -403,7 +418,7 @@ mod tests {
 
     use super::super::Applied;
     use super::*;
-    use crate::{account::provider_install::ProviderInstallMethod, agent::Provider};
+    use crate::account::provider_install::ProviderInstallMethod;
 
     struct Fixture {
         _root: TempDir,
@@ -463,24 +478,38 @@ mod tests {
         }
 
         fn fake_npm(&self, platform: &Platform, candidate_version: &str) {
-            let bin = self.status.executable.as_deref().unwrap().parent().unwrap();
             let script = format!(
                 r#"#!/bin/sh
 set -eu
+: >"$0.invoked"
 prefix=""
-registry=""
+cache=""
+logs=""
+global=""
+ignore_scripts=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --prefix) prefix="$2"; shift 2 ;;
-        --registry=*) registry="${{1#*=}}"; shift ;;
+        --cache) cache="$2"; shift 2 ;;
+        --logs-dir) logs="$2"; shift 2 ;;
+        --global) global=1; shift ;;
+        --ignore-scripts) ignore_scripts=1; shift ;;
+        --registry|--registry=*|--userconfig|--userconfig=*|--globalconfig|--globalconfig=*) exit 1 ;;
         view|install) action="$1"; shift; break ;;
         *) shift ;;
     esac
 done
-[ "$registry" = "{REGISTRY}" ]
 case "$prefix" in */.cagents-provider-update-*) ;; *) exit 1 ;; esac
+[ "$cache" = "$prefix/npm-cache" ]
+[ "$logs" = "$prefix/npm-logs" ]
+[ "$global" = 1 ]
+[ "$ignore_scripts" = 1 ]
+[ "$(readlink "$prefix/etc/npmrc")" = "{global_config}" ]
+if [ -f "$prefix/etc/npmrc" ]; then
+    cat "$prefix/etc/npmrc" >"$0.$action.npmrc"
+fi
 if [ "$action" = view ]; then
-    [ "$1" = "@openai/codex@latest" ]
+    [ "$1" = "@openai/codex" ]
     echo '"2.0.0"'
     exit 0
 fi
@@ -501,18 +530,24 @@ chmod +x "$wrapper/{WRAPPER}" "$platform/{binary}"
                 binary_parent = platform.binary().parent().unwrap().display(),
                 binary = platform.binary().display(),
                 tag = platform.tag,
+                global_config = self.prefix.join("etc/npmrc").display(),
                 wrapper_script = wrapper_script(platform),
             );
-            write_executable(&bin.join("npm"), &script);
+            write_executable(&self.bin().join("npm"), &script);
         }
 
-        async fn prepare(&self) -> Result<Preparation, String> {
+        fn bin(&self) -> &Path {
+            self.status.executable.as_deref().unwrap().parent().unwrap()
+        }
+
+        async fn prepare(&self, automatic: bool) -> Result<Preparation, String> {
             prepare(
                 &self.status,
                 &self.prefix,
                 &CommandContext {
                     search_path: Some(&self.path),
                 },
+                automatic,
             )
             .await
         }
@@ -557,6 +592,57 @@ chmod +x "$wrapper/{WRAPPER}" "$platform/{binary}"
     }
 
     #[tokio::test]
+    async fn a_pinned_global_package_changes_only_on_explicit_request() {
+        let Some(platform) = Platform::current() else {
+            return;
+        };
+        let mut fixture = Fixture::new(&platform, false);
+        let wrapper = fixture.prefix.join(SCOPE_DIRECTORY).join("codex");
+        let nested = wrapper.join(NESTED_SCOPE).join(&platform.alias);
+        write_package(&wrapper, "1.0.0");
+        write_package(&nested, &format!("1.0.0-{}", platform.tag));
+        write_executable(
+            &nested.join(platform.binary()),
+            "#!/bin/sh\necho codex-cli 1.0.0\n",
+        );
+        fixture.status.version = Some("1.0.0".into());
+        fixture.fake_npm(&platform, "2.0.0");
+
+        let result = fixture.prepare(true).await.unwrap();
+        assert!(matches!(result, Preparation::Skipped(reason) if reason.contains("pinned")));
+        assert!(!fixture.bin().join("npm.invoked").exists());
+        assert_eq!(fixture.read_live().await, "1.0.0");
+
+        let Preparation::Ready(mut update) = fixture.prepare(false).await.unwrap() else {
+            panic!("expected an explicit update");
+        };
+        let result = update.apply(Some(&fixture.path)).await.unwrap();
+        assert!(matches!(result, Applied::Updated(version) if version == "2.0.0"));
+        assert_eq!(fixture.read_live().await, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn manual_update_preserves_the_default_global_npmrc_for_both_commands() {
+        let Some(platform) = Platform::current() else {
+            return;
+        };
+        let fixture = Fixture::new(&platform, true);
+        fixture.fake_npm(&platform, "2.0.0");
+        let config = "@openai:registry=https://npm.example.test/\ncafile=/private/npm-ca.pem\n";
+        fs::create_dir(fixture.prefix.join("etc")).unwrap();
+        fs::write(fixture.prefix.join("etc/npmrc"), config).unwrap();
+
+        let prepared = fixture.prepare(false).await.unwrap();
+        assert!(matches!(prepared, Preparation::Ready(_)));
+        for action in ["view", "install"] {
+            assert_eq!(
+                fs::read_to_string(fixture.bin().join(format!("npm.{action}.npmrc"))).unwrap(),
+                config,
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn updates_stale_top_level_platform_even_when_wrapper_was_already_current() {
         let Some(platform) = Platform::current() else {
             return;
@@ -566,12 +652,12 @@ chmod +x "$wrapper/{WRAPPER}" "$platform/{binary}"
         let wrapper = fixture.prefix.join(SCOPE_DIRECTORY).join("codex");
         let wrapper_inode = fs::metadata(&wrapper).unwrap().ino();
 
-        let prepared = fixture.prepare().await.unwrap();
-        let Preparation::Ready(update) = prepared else {
+        let prepared = fixture.prepare(false).await.unwrap();
+        let Preparation::Ready(mut update) = prepared else {
             panic!("expected an update")
         };
         assert_eq!(fixture.read_live().await, "1.0.0");
-        let result = update.apply(Some(&fixture.path), || false).await.unwrap();
+        let result = update.apply(Some(&fixture.path)).await.unwrap();
         assert!(matches!(result, Applied::Updated(version) if version == "2.0.0"));
         assert_eq!(fixture.read_live().await, "2.0.0");
 
@@ -594,12 +680,12 @@ chmod +x "$wrapper/{WRAPPER}" "$platform/{binary}"
         let fixture = Fixture::new(&platform, false);
         fixture.fake_npm(&platform, "2.0.0");
 
-        let prepared = fixture.prepare().await.unwrap();
-        let Preparation::Ready(update) = prepared else {
+        let prepared = fixture.prepare(false).await.unwrap();
+        let Preparation::Ready(mut update) = prepared else {
             panic!("expected a repair")
         };
         assert_eq!(fixture.read_live().await, "2.0.0");
-        let result = update.apply(Some(&fixture.path), || false).await.unwrap();
+        let result = update.apply(Some(&fixture.path)).await.unwrap();
         assert!(matches!(result, Applied::Updated(version) if version == "2.0.0"));
 
         let top = fixture
@@ -628,11 +714,11 @@ chmod +x "$wrapper/{WRAPPER}" "$platform/{binary}"
         fixture.status.version = Some("1.0.0".into());
 
         assert_eq!(fixture.read_live().await, "1.0.0");
-        let prepared = fixture.prepare().await.unwrap();
-        let Preparation::Ready(update) = prepared else {
+        let prepared = fixture.prepare(false).await.unwrap();
+        let Preparation::Ready(mut update) = prepared else {
             panic!("expected a repair")
         };
-        let result = update.apply(Some(&fixture.path), || false).await.unwrap();
+        let result = update.apply(Some(&fixture.path)).await.unwrap();
         assert!(matches!(result, Applied::Updated(version) if version == "2.0.0"));
         assert_eq!(fixture.read_live().await, "2.0.0");
         assert_eq!(fs::metadata(&wrapper).unwrap().ino(), wrapper_inode);
@@ -654,11 +740,11 @@ chmod +x "$wrapper/{WRAPPER}" "$platform/{binary}"
             .join(platform.binary());
         write_executable(&binary, "#!/bin/sh\necho codex-cli 1.0.0\n");
 
-        let prepared = fixture.prepare().await.unwrap();
-        let Preparation::Ready(update) = prepared else {
+        let prepared = fixture.prepare(false).await.unwrap();
+        let Preparation::Ready(mut update) = prepared else {
             panic!("expected a repair")
         };
-        let result = update.apply(Some(&fixture.path), || false).await.unwrap();
+        let result = update.apply(Some(&fixture.path)).await.unwrap();
         assert!(matches!(result, Applied::Updated(version) if version == "2.0.0"));
         assert_ne!(fs::metadata(&wrapper).unwrap().ino(), wrapper_inode);
         assert_eq!(
@@ -677,7 +763,7 @@ chmod +x "$wrapper/{WRAPPER}" "$platform/{binary}"
         let fixture = Fixture::new(&platform, true);
         fixture.fake_npm(&platform, "1.0.0");
 
-        let result = fixture.prepare().await;
+        let result = fixture.prepare(false).await;
         assert!(matches!(result, Err(error) if error.contains("expected 2.0.0")));
         assert_eq!(fixture.read_live().await, "1.0.0");
     }

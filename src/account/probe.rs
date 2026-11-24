@@ -584,13 +584,7 @@ async fn omp_catalog(
 ) -> Result<Option<Catalog>, String> {
     let mut command = command_with_path(account, program, search_path);
     command.args(["models", "--json", "--no-extensions"]);
-    let (status, json) = run_provider_command_with(
-        command,
-        TIMEOUT,
-        OUTPUT_LIMIT as usize,
-        None::<fn() -> bool>,
-    )
-    .await?;
+    let (status, json) = run_provider_command_with(command, TIMEOUT, OUTPUT_LIMIT as usize).await?;
     if !status.success() {
         return Err(format!("Listing Omp's models exited with {status}"));
     }
@@ -871,6 +865,16 @@ pub async fn provider_version(
     program: &Path,
     search_path: Option<&OsStr>,
 ) -> Result<String, String> {
+    provider_version_with(provider, program, search_path, |_| {}).await
+}
+
+#[cfg(feature = "host")]
+pub(crate) async fn provider_version_with(
+    provider: Provider,
+    program: &Path,
+    search_path: Option<&OsStr>,
+    configure: impl FnOnce(&mut Command),
+) -> Result<String, String> {
     let mut command = command_with_path(&Account::system(provider), program, search_path);
     command.arg("--version");
     match provider {
@@ -885,6 +889,7 @@ pub async fn provider_version(
         }
         Provider::Omp | Provider::Codex | Provider::Antigravity => {}
     }
+    configure(&mut command);
     let (status, output) = run_provider_command(command, Duration::from_secs(5)).await?;
     if !status.success() {
         return Err(format!("--version exited with {status}"));
@@ -918,18 +923,7 @@ pub async fn run_provider_command(
     command: Command,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
-    run_provider_command_with(command, timeout, 32 * 1024, None::<fn() -> bool>).await
-}
-
-/// An installer may be cancelled while the daemon is stopping. Wait for the
-/// child to be reaped before returning so its caller can safely roll back.
-#[cfg(feature = "host")]
-pub(crate) async fn run_provider_command_cancellable(
-    command: Command,
-    timeout: Duration,
-    cancelled: impl Fn() -> bool,
-) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
-    run_provider_command_with(command, timeout, 32 * 1024, Some(cancelled)).await
+    run_provider_command_with(command, timeout, 32 * 1024).await
 }
 
 #[cfg(feature = "host")]
@@ -937,7 +931,6 @@ async fn run_provider_command_with(
     mut command: Command,
     timeout: Duration,
     capture_limit: usize,
-    cancelled: Option<impl Fn() -> bool>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     scrub(&mut command, SHELL_SCRUBBED_ENVIRONMENT);
     command
@@ -981,16 +974,15 @@ async fn run_provider_command_with(
         }
         Ok::<_, String>(captured)
     };
-    let captured = tokio::select! {
-        result = tokio::time::timeout(timeout, read) => result.map_err(|_| {
-            format!("The CLI did not finish within {} seconds", timeout.as_secs())
-        }).and_then(|result| result),
-        () = async {
-            while !cancelled.as_ref().is_some_and(|cancelled| cancelled()) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }, if cancelled.is_some() => Err("The daemon interrupted the provider update".into()),
-    };
+    let captured = tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| {
+            format!(
+                "The CLI did not finish within {} seconds",
+                timeout.as_secs()
+            )
+        })
+        .and_then(|result| result);
     group.kill();
     let status = group
         .child

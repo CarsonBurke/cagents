@@ -975,8 +975,12 @@ on that device.
 
 The daemon uses each supported installer's official update channel. Use your
 system package manager or version manager for installations they own.
-The daemon defers an update while a launch is starting or while an installer
-needs to replace files a running provider still uses.
+Claude's automatic update settings also apply to scheduled checks. A global
+npm installation of Codex is updated only when you run the command, since
+npm cannot tell the daemon whether you installed a specific version.
+Downloads run while providers are available. The daemon defers activation
+while a launch is starting or while a running provider still needs the files
+being replaced.
 
 ### Resume a saved conversation
 

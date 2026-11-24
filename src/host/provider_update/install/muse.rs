@@ -1,19 +1,18 @@
 //! Meta's launcher selects an adjacent versioned binary using a small state file.
 
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions, Permissions},
-    io::{ErrorKind, Read},
+    io::{self, ErrorKind, Read},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
-use tempfile::TempDir;
-
-use crate::account::provider_install::{ProviderStatus, is_muse_launcher, read_version};
+use crate::account::provider_install::{ProviderStatus, is_muse_launcher};
 
 use super::{
-    CommandContext, Preparation, PreparedUpdate, Replacement, SelectedInstall, rename, run_update,
-    stage_in,
+    CommandContext, EntryStamp, Preparation, PreparedUpdate, Replacement, SelectedInstall, Stage,
+    can_run_provider_script, command_references_packages, rename, run_update, stage_in,
 };
 
 const LAUNCHER_LIMIT: u64 = 64 * 1024;
@@ -24,7 +23,13 @@ const UPDATE_LOCK: &str = ".muse-update-lock";
 pub(super) async fn prepare(
     status: &ProviderStatus,
     context: &CommandContext<'_>,
+    automatic: bool,
 ) -> Result<Preparation, String> {
+    if automatic && std::env::var_os("MUSE_NO_AUTO_UPDATE").is_some_and(|value| value == "1") {
+        return Ok(Preparation::Skipped(
+            "Automatic updates are disabled in Muse".into(),
+        ));
+    }
     let installation = SelectedInstall::capture(status, context.search_path)?;
     let launcher = &installation.resolved;
     let directory = launcher.parent().ok_or("Muse has no install directory")?;
@@ -69,15 +74,23 @@ pub(super) async fn prepare(
         .env("MUSE_LAUNCHER_INSTALL", "1")
         .env("MUSE_NO_AUTO_UPDATE", "1")
         .env("MUSE_LOGIN", "0");
+    stage.protect(&mut command);
     run_update(command)
         .await
         .map_err(|error| format!("The Muse launcher could not check for an update ({error})"))?;
 
     let next = selected_release(stage.path())?;
-    let version = read_version(status.provider, &staged_launcher, context.search_path).await?;
+    let version = stage
+        .version(status.provider, &staged_launcher, context.search_path)
+        .await?;
     installation.check(context.search_path)?;
     if next == release {
         ensure_active_release(directory, &release)?;
+        // A predecessor kept for a live process can be retired at the next
+        // check once that process exits, even when there is no newer release.
+        if let Err(error) = retire_on_current(directory, &release) {
+            tracing::debug!(%error, "Could not retire previous Muse releases");
+        }
         return Ok(Preparation::Current(version));
     }
 
@@ -119,7 +132,7 @@ fn ensure_active_release(directory: &Path, release: &str) -> Result<(), String> 
 /// while cagents publishes and verifies a staged update.
 pub(super) struct LiveLock {
     live: PathBuf,
-    private: TempDir,
+    private: Stage,
     identity: (u64, u64),
 }
 
@@ -146,6 +159,18 @@ impl LiveLock {
             identity: (metadata.dev(), metadata.ino()),
         })
     }
+
+    pub(super) fn retire_previous(&self) {
+        let result = || {
+            let directory = self.live.parent().ok_or("Muse has no install directory")?;
+            let active = selected_release(directory)?;
+            let candidates = retired_binaries(directory, &active)?;
+            retire_unoccupied(directory, &active, candidates)
+        };
+        if let Err(error) = result() {
+            tracing::debug!(%error, "Could not retire previous Muse releases");
+        }
+    }
 }
 
 impl Drop for LiveLock {
@@ -161,6 +186,126 @@ impl Drop for LiveLock {
             tracing::warn!(%error, "Could not release the Muse update lock");
         }
     }
+}
+
+fn retire_on_current(directory: &Path, active: &str) -> Result<(), String> {
+    let candidates = retired_binaries(directory, active)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let _lock = LiveLock::acquire(directory)?;
+    retire_unoccupied(directory, active, candidates)
+}
+
+fn retired_binaries(directory: &Path, active: &str) -> Result<Vec<(PathBuf, EntryStamp)>, String> {
+    let active = release_key(active).ok_or("The active Muse version has an invalid format")?;
+    let entries = fs::read_dir(directory).map_err(|error| error.to_string())?;
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let Some(release) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("muse-bin-"))
+            .and_then(release_key)
+        else {
+            continue;
+        };
+        if release >= active {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(metadata) =
+            owned_file(&path).and_then(|file| file.metadata().map_err(|error| error.to_string()))
+            && let Some(stamp) = EntryStamp::read(&path).map_err(|error| error.to_string())?
+            && stamp.mode & libc::S_IFMT == libc::S_IFREG
+            && stamp.mode & 0o111 != 0
+            && (stamp.device, stamp.inode) == (metadata.dev(), metadata.ino())
+        {
+            candidates.push((path, stamp));
+        }
+    }
+    Ok(candidates)
+}
+
+fn retire_unoccupied(
+    directory: &Path,
+    active: &str,
+    candidates: Vec<(PathBuf, EntryStamp)>,
+) -> Result<(), String> {
+    ensure_active_release(directory, active)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let in_use = running_binaries(directory, &candidates).map_err(|error| error.to_string())?;
+    for (binary, stamp) in candidates {
+        if !in_use.contains(&(stamp.device, stamp.inode))
+            && EntryStamp::read(&binary).map_err(|error| error.to_string())? == Some(stamp)
+        {
+            fs::remove_file(&binary).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn running_binaries(
+    directory: &Path,
+    candidates: &[(PathBuf, EntryStamp)],
+) -> io::Result<HashSet<(u64, u64)>> {
+    let mut in_use = HashSet::new();
+    let launcher = directory.join("muse");
+    let upstream = directory.join("muse-upstream");
+    let launchers = [launcher.as_path(), upstream.as_path()];
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let process = entry.path();
+        match fs::metadata(process.join("exe")) {
+            Ok(_)
+                if fs::read_link(process.join("exe"))
+                    .is_ok_and(|path| can_run_provider_script(&path))
+                    && command_references_packages(&process, &launchers) =>
+            {
+                // A launcher may have read the previous release before
+                // publication and still be about to exec it.
+                return Ok(candidates
+                    .iter()
+                    .map(|(_, stamp)| (stamp.device, stamp.inode))
+                    .collect());
+            }
+            Ok(executable) => {
+                in_use.insert((executable.dev(), executable.ino()));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied
+                ) =>
+            {
+                // procfs can hide the executable of a running process from
+                // this user. Preserve matching task names too.
+                if let Ok(name) = fs::read(process.join("comm")) {
+                    let name = name.strip_suffix(b"\n").unwrap_or(&name);
+                    for (path, stamp) in candidates {
+                        let binary = path.file_name().unwrap_or_default().as_encoded_bytes();
+                        // Linux task names contain at most 15 bytes.
+                        if name == &binary[..binary.len().min(15)] {
+                            in_use.insert((stamp.device, stamp.inode));
+                        }
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(in_use)
 }
 
 fn owned_file(path: &Path) -> Result<File, String> {
@@ -196,24 +341,37 @@ fn selected_release(directory: &Path) -> Result<String, String> {
         .read_to_string(&mut contents)
         .map_err(|error| format!("Could not read the active Muse version ({error})"))?;
     let release = contents.trim_end_matches('\n');
-    // The launcher requires a numeric release and an -R build number.
-    let valid = |value: &str, lengths: std::ops::RangeInclusive<usize>| {
-        let mut parts = value.split('.');
-        lengths.contains(&parts.clone().count())
-            && parts.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-    };
-    if contents.len() > 128
-        || !release
-            .split_once("-R")
-            .is_some_and(|(version, build)| valid(version, 3..=3) && valid(build, 1..=2))
-    {
+    if contents.len() > 128 || release_key(release).is_none() {
         return Err("The active Muse version has an invalid format".into());
     }
     Ok(release.to_owned())
 }
 
+fn release_key(release: &str) -> Option<[(usize, &str); 5]> {
+    // The launcher requires a numeric release and an -R build number.
+    let (version, build) = release.split_once("-R")?;
+    let mut version = version.split('.');
+    let (major, minor, patch) = (version.next()?, version.next()?, version.next()?);
+    if version.next().is_some() {
+        return None;
+    }
+    let (build, revision) = build.split_once('.').unwrap_or((build, "0"));
+    let mut key = [(0, ""); 5];
+    for (slot, part) in key.iter_mut().zip([major, minor, patch, build, revision]) {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let digits = part.trim_start_matches('0');
+        *slot = (digits.len(), digits);
+    }
+    Some(key)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::process::Stdio;
+    use tempfile::TempDir;
+
     use crate::{account::provider_install::ProviderInstallMethod, agent::Provider};
 
     use super::{super::Applied, *};
@@ -231,6 +389,7 @@ before=$(cat "$state")
 if [ "${MUSE_LAUNCHER_INSTALL:-0}" = 1 ]; then
     [ "${MUSE_LOGIN:-1}" = 0 ]
     [ -f "$CURL_HOME/.curlrc" ]
+    if [ "$before" = "1.3.0-R1.2" ]; then exit 0; fi
     cat > "$dir/muse-bin-1.3.0-R1.2" <<'BINARY'
 #!/bin/sh
 case "$1" in
@@ -307,12 +466,13 @@ exec "$dir/muse-bin-$before" "$@"
     async fn selects_a_working_version_after_staging() {
         let fixture = Fixture::new();
         let old_binary = fixture.directory.join(format!("muse-bin-{OLD_RELEASE}"));
-        let inode = fs::metadata(&old_binary).unwrap().ino();
         let search = fixture.search_path();
         let context = CommandContext {
             search_path: Some(search.as_os_str()),
         };
-        let Preparation::Ready(update) = prepare(&fixture.status, &context).await.unwrap() else {
+        let Preparation::Ready(mut update) =
+            prepare(&fixture.status, &context, false).await.unwrap()
+        else {
             panic!("expected a staged update");
         };
 
@@ -323,21 +483,57 @@ exec "$dir/muse-bin-$before" "$@"
                 .join(format!("muse-bin-{NEW_RELEASE}"))
                 .exists()
         );
-        let Applied::Updated(version) = update
-            .apply(Some(search.as_os_str()), || false)
-            .await
-            .unwrap()
+        let Applied::Updated(version) = update.apply(Some(search.as_os_str())).await.unwrap()
         else {
             panic!("expected an installed update");
         };
         assert_eq!(version, "1.3.0");
         assert_eq!(selected_release(&fixture.directory).unwrap(), NEW_RELEASE);
-        assert_eq!(fs::metadata(old_binary).unwrap().ino(), inode);
+        update.retire_previous();
+        assert!(!old_binary.exists());
+        drop(update);
         assert!(!fixture.directory.join(UPDATE_LOCK).exists());
         assert_eq!(
             fs::read_to_string(fixture.status.executable.unwrap()).unwrap(),
             LAUNCHER
         );
+    }
+
+    #[tokio::test]
+    async fn retires_the_running_previous_release_after_it_exits() {
+        let fixture = Fixture::new();
+        let previous = fixture.directory.join(format!("muse-bin-{OLD_RELEASE}"));
+        fs::copy("/usr/bin/cat", &previous).unwrap();
+        let mut child = tokio::process::Command::new(&previous)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let search = fixture.search_path();
+        let context = CommandContext {
+            search_path: Some(search.as_os_str()),
+        };
+        let Preparation::Ready(mut update) =
+            prepare(&fixture.status, &context, false).await.unwrap()
+        else {
+            panic!("expected a staged update");
+        };
+        assert!(matches!(
+            update.apply(Some(search.as_os_str())).await.unwrap(),
+            Applied::Updated(_)
+        ));
+        update.retire_previous();
+        drop(update);
+        assert!(previous.exists());
+
+        drop(child.stdin.take());
+        assert!(child.wait().await.unwrap().success());
+        assert!(matches!(
+            prepare(&fixture.status, &context, false).await.unwrap(),
+            Preparation::Current(version) if version == "1.3.0"
+        ));
+        assert!(!previous.exists());
     }
 
     #[tokio::test]
@@ -348,7 +544,7 @@ exec "$dir/muse-bin-$before" "$@"
         let context = CommandContext {
             search_path: Some(search.as_os_str()),
         };
-        let result = prepare(&fixture.status, &context).await;
+        let result = prepare(&fixture.status, &context, false).await;
         assert!(matches!(result, Err(error) if error.contains("already holds")));
         assert_eq!(selected_release(&fixture.directory).unwrap(), OLD_RELEASE);
         assert!(fixture.directory.join(UPDATE_LOCK).exists());
@@ -364,16 +560,13 @@ exec "$dir/muse-bin-$before" "$@"
         let context = CommandContext {
             search_path: Some(search.as_os_str()),
         };
-        let Preparation::Ready(update) = prepare(&fixture.status, &context).await.unwrap() else {
+        let Preparation::Ready(mut update) =
+            prepare(&fixture.status, &context, false).await.unwrap()
+        else {
             panic!("expected a staged update");
         };
 
-        assert!(
-            update
-                .apply(Some(search.as_os_str()), || false)
-                .await
-                .is_err()
-        );
+        assert!(update.apply(Some(search.as_os_str())).await.is_err());
         assert_eq!(selected_release(&fixture.directory).unwrap(), OLD_RELEASE);
         assert_eq!(
             fs::read_to_string(fixture.directory.join(RELEASE_INFO)).unwrap(),

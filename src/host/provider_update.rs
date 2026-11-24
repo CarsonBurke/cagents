@@ -311,10 +311,10 @@ async fn perform_update(
         return (Deferred, Some("A provider launch is starting".into()));
     }
     let preparation = tokio::select! {
-        preparation = install::prepare(status, search_path) => preparation,
+        preparation = install::prepare(status, search_path, automatic) => preparation,
         () = wait_for_shutdown(host) => return (Deferred, Some("The daemon is shutting down".into())),
     };
-    let prepared = match preparation {
+    let mut prepared = match preparation {
         Ok(install::Preparation::Current(version)) => {
             status.version = Some(version);
             return (Current, None);
@@ -327,6 +327,11 @@ async fn perform_update(
     // A settings change during staging takes effect before publication.
     if automatic && !automatic_updates_enabled() {
         return (Skipped, Some("Automatic updates are turned off".into()));
+    }
+    match prepared.opt_out(automatic) {
+        Ok(Some(reason)) => return (Skipped, Some(reason)),
+        Ok(None) => {}
+        Err(error) => return (Failed, Some(error)),
     }
     let applied = {
         let control = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
@@ -348,21 +353,15 @@ async fn perform_update(
                 return (Deferred, Some("A provider launch is starting".into()));
             }
         }
-        prepared
-            .apply(search_path, || {
-                crate::daemon::termination_requested() || control.exclusive_queued()
-            })
-            .await
+        prepared.apply(search_path).await
     };
     let version = match applied {
-        Ok(install::Applied::Current(version)) => {
-            status.version = Some(version);
-            return (Current, None);
-        }
         Ok(install::Applied::Updated(version)) => version,
         Ok(install::Applied::Deferred(reason)) => return (Deferred, Some(reason)),
         Err(error) => return (Failed, Some(error)),
     };
+    prepared.retire_previous();
+    drop(prepared);
     let new_install = ProviderStatus::detect(status.provider, search_path);
     status.version = Some(version);
     status.executable = new_install.executable;
@@ -521,6 +520,167 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_claude_download_allows_provider_launch_and_terminal_close() {
+        use std::{
+            fs,
+            io::ErrorKind,
+            os::unix::{
+                fs::{DirBuilderExt, PermissionsExt, symlink},
+                net::UnixListener,
+            },
+            path::Path,
+            process::Command,
+        };
+
+        use crate::terminal_ipc::{ClientRequest, ServerResponse, TerminalCloseResult};
+
+        use super::super::client::{process_request, tests::retention_client_host};
+
+        const HOME_FIXTURE: &str = "CAGENTS_TEST_CLAUDE_DOWNLOAD_HOME";
+        let Some(home) = std::env::var_os(HOME_FIXTURE) else {
+            // Isolate native install discovery without changing this test
+            // binary's HOME or the account settings other tests rely on.
+            let home = tempfile::Builder::new()
+                .prefix("cagents-cu-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let runtime = home.path().join("runtime");
+            fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::provider_update::tests::a_claude_download_allows_provider_launch_and_terminal_close", "--nocapture"])
+                .env(HOME_FIXTURE, home.path())
+                .env("HOME", home.path())
+                .env("XDG_DATA_HOME", home.path().join(".local/share"))
+                .env("XDG_STATE_HOME", home.path().join(".local/state"))
+                .env("XDG_CACHE_HOME", home.path().join(".cache"))
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("DISABLE_UPDATES")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        };
+        let home = Path::new(&home);
+        let bin = home.join(".local/bin");
+        let versions = home.join(".local/share/claude/versions");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&versions).unwrap();
+        let launcher = bin.join("claude");
+        let installed = versions.join("1.0.0");
+        let socket = home.join("download.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let executable = |path: &Path, script: &str| {
+            fs::write(path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        executable(&bin.join("curl"), "#!/bin/sh\nprintf '2.0.0\\n'\n");
+        executable(
+            &installed,
+            &format!(
+                r#"#!/bin/sh
+case "$1" in
+    --version) printf '1.0.0 (Claude Code)\n' ;;
+    --fixture-session) exit 0 ;;
+    install|update)
+        /usr/bin/python3 - '{}' <<'PY'
+import socket
+import sys
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.settimeout(30)
+    connection.connect(sys.argv[1])
+    connection.recv(1)
+PY
+        exit 42
+        ;;
+    *) exit 2 ;;
+esac
+"#,
+                socket.display()
+            ),
+        );
+        symlink(&installed, &launcher).unwrap();
+        let search_path =
+            std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .unwrap();
+        let (host, _work, terminal, _handle) = retention_client_host("claude-update");
+        let worker = {
+            let host = Arc::clone(&host);
+            thread::spawn(move || {
+                runtime().unwrap().block_on(check_providers(
+                    &host,
+                    &[Provider::Claude],
+                    Some(&search_path),
+                    false,
+                ))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let connection = loop {
+            match listener.accept() {
+                Ok((connection, _)) => break connection,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if worker.is_finished() {
+                        panic!(
+                            "Claude's download did not start: {:?}",
+                            worker.join().unwrap()
+                        );
+                    }
+                    assert!(Instant::now() < deadline, "Claude's download did not start");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("Could not accept fixture installer connection: {error}"),
+            }
+        };
+
+        let mut claude = terminal.clone();
+        claude.id = crate::model::TerminalId::new();
+        claude.launch.program = launcher.to_str().unwrap().into();
+        claude.launch.arguments = vec!["--fixture-session".into()];
+        claude.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: claude.launch.clone(),
+            last_exit: None,
+        };
+        let launched = process_request(
+            &host,
+            1,
+            ClientRequest::Spawn {
+                session: claude,
+                options: Default::default(),
+            },
+        );
+        let closed = process_request(
+            &host,
+            1,
+            ClientRequest::CloseTerminalChecked {
+                terminal_id: terminal.id,
+                allow_active: false,
+            },
+        );
+        assert!(
+            !worker.is_finished(),
+            "Claude finished before both operations"
+        );
+        drop(connection);
+        let status = worker.join().unwrap();
+        assert!(matches!(
+            launched.unwrap().0,
+            ServerResponse::Spawned { .. }
+        ));
+        assert!(matches!(
+            closed.unwrap().0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: TerminalCloseResult::Closed,
+                ..
+            }
+        ));
+        assert_eq!(status[0].last_result, Some(ProviderUpdateResult::Failed));
+        assert!(status[0].error.as_ref().unwrap().contains("42"));
+    }
+
+    #[test]
     fn automatic_updates_default_on_and_preserve_an_explicit_opt_out() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -614,30 +774,6 @@ mod tests {
         assert_eq!(current.version.as_deref(), Some("2.0.0"));
         assert_eq!(current.last_checked_at, Some(42));
         assert_eq!(current.last_result, Some(ProviderUpdateResult::Current));
-    }
-
-    #[tokio::test]
-    async fn shutting_down_reaps_the_update_command_before_rollback() {
-        let directory = tempfile::tempdir().unwrap();
-        let started = directory.path().join("started");
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(r#"printf '%s' "$$" > "$1"; exec /bin/sleep 30"#)
-            .arg("fixture")
-            .arg(&started)
-            .current_dir(directory.path());
-        let result =
-            probe::run_provider_command_cancellable(command, Duration::from_secs(5), || {
-                std::fs::metadata(&started).is_ok_and(|file| file.len() != 0)
-            })
-            .await;
-        assert_eq!(
-            result.unwrap_err(),
-            "The daemon interrupted the provider update"
-        );
-        let pid = std::fs::read_to_string(started).unwrap();
-        assert!(!std::path::Path::new("/proc").join(pid).exists());
     }
 
     #[test]
