@@ -20673,16 +20673,8 @@ fn load_repository(
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
-        .map(|worktree| {
-            let status = (!worktree.bare)
-                .then(|| {
-                    service
-                        .status_with_untracked(&worktree.path, false, &cancellation)
-                        .ok()
-                })
-                .flatten();
-            (worktree, status)
-        })
+        // The local Git worker reads status once the watcher is registered.
+        .map(|worktree| (worktree, None))
         .collect::<Vec<_>>();
     let head_repositories = worktrees
         .iter()
