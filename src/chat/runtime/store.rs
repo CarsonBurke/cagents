@@ -1216,6 +1216,8 @@ impl Store {
                     self.pending_text = Some((id, role, thinking, delta));
                 }
                 self.dirty = true;
+                // `append` checks the WAL when buffered text reaches SQLite.
+                return Ok(out);
             }
             Event::ItemsRemoved { ids } => {
                 self.files_removed(&ids)?;
@@ -1344,7 +1346,9 @@ impl Store {
             )?;
             self.copy_remove(&[id.to_owned()])?;
             if !self.exists(id)? {
-                // The identity itself could not be cached; the delta has nowhere to go.
+                // The item could not be cached. Removing its copy source can
+                // still leave a checkpoint due.
+                self.trim_wal();
                 return Ok(warning);
             }
         }
@@ -2429,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn large_commit_wal_held_by_a_reader_is_trimmed_by_the_next_write() {
+    fn large_commit_wal_held_by_a_reader_is_trimmed_when_buffered_text_flushes() {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::at(root.path().to_owned()).unwrap();
         let large = "large 🦀\n".repeat(1024 * 1024);
@@ -2445,16 +2449,25 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        let pinned = "p".repeat(2 * 1024 * 1024);
+        let mut pinned = "p".repeat(2 * 1024 * 1024);
         store
             .apply(Event::Item(history_item("pinned", &pinned)))
             .unwrap();
-        assert!(wal_bytes(&store) > WAL_LIMIT);
+        let held = wal_bytes(&store);
+        assert!(held > WAL_LIMIT);
         drop(reader);
         store
-            .apply(Event::Item(history_item("next", "next")))
+            .apply(Event::TextDelta {
+                id: "pinned".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " more".into(),
+            })
             .unwrap();
+        assert_eq!(wal_bytes(&store), held);
+        assert_eq!(store.flush_text().unwrap(), None);
         assert!(wal_bytes(&store) <= WAL_LIMIT);
+        pinned.push_str(" more");
         assert_copy(&store, "large", &large);
         assert_copy(&store, "pinned", &pinned);
     }
