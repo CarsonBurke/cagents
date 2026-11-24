@@ -27,6 +27,8 @@ pub(super) struct Scale {
     pub chats: usize,
     pub loose_terminals: usize,
     pub closed_cards: usize,
+    /// Empty shared views of worktrees visited once, beyond the channels'.
+    pub historical_views: usize,
 }
 
 impl Scale {
@@ -36,6 +38,7 @@ impl Scale {
         chats: 45,
         loose_terminals: 20,
         closed_cards: 1680,
+        historical_views: 1850,
     };
 }
 
@@ -276,7 +279,7 @@ pub(super) fn large_workspace(scale: &Scale) -> (Cagents, Vec<ChannelId>, tempfi
             });
         }
     }
-    views.truncate(scale.channels + 1850);
+    views.truncate(scale.channels + scale.historical_views);
     app.workspace_model.views = views;
     app.workspace_model.identity = uuid::Uuid::new_v4();
     for view in &app.workspace_model.views {
@@ -336,6 +339,53 @@ fn timed_frame(
     )
 }
 
+/// The user-space instructions this thread retires, from a Linux hardware
+/// counter. Unlike wall time, the count does not depend on what else the host
+/// is running.
+struct RetiredInstructions(std::fs::File);
+
+impl RetiredInstructions {
+    fn open() -> Option<Self> {
+        // `perf_event_attr` in its first, 64-byte layout: the type
+        // (PERF_TYPE_HARDWARE, 0) and size share the first word, the config
+        // (PERF_COUNT_HW_INSTRUCTIONS, 1) is the second, and the flag word at
+        // byte 40 pins the counter to the PMU (bit 2), so a read fails rather
+        // than undercounting while it is multiplexed, and excludes the kernel
+        // (bit 5) and the hypervisor (bit 6).
+        let mut attr = [0u64; 8];
+        attr[0] = 64 << 32;
+        attr[1] = 1;
+        attr[5] = 1 << 2 | 1 << 5 | 1 << 6;
+        // SAFETY: `attr` is a valid, fully initialized perf_event_attr of the
+        // size it declares, and outlives the call. The counter follows this
+        // thread (pid 0) on any CPU (-1), in no group (-1), with no flags.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                attr.as_ptr(),
+                0 as libc::pid_t,
+                -1 as libc::c_int,
+                -1 as libc::c_int,
+                0 as libc::c_ulong,
+            )
+        };
+        let fd = libc::c_int::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+        // SAFETY: the kernel just returned `fd`, and nothing else owns it.
+        Some(Self(std::fs::File::from(unsafe {
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        })))
+    }
+
+    fn read(&self) -> u64 {
+        use std::io::Read;
+        let mut count = [0; 8];
+        (&self.0)
+            .read_exact(&mut count)
+            .expect("read the instruction counter");
+        u64::from_ne_bytes(count)
+    }
+}
+
 fn summary(label: &str, durations: &mut [Duration]) {
     let summary = crate::performance::LatencySummary::from_durations(durations).unwrap();
     eprintln!(
@@ -352,6 +402,7 @@ fn the_workload_opens_each_channel_with_its_own_panes() {
         chats: 5,
         loose_terminals: 3,
         closed_cards: 30,
+        historical_views: 1850,
     };
     let (mut app, channels, _directory) = large_workspace(&scale);
     for (index, channel) in channels.iter().enumerate() {
@@ -390,6 +441,7 @@ fn opening_a_channel_while_a_save_is_in_flight_copies_no_card() {
         chats: 5,
         loose_terminals: 3,
         closed_cards: 30,
+        historical_views: 1850,
     };
     let (mut app, channels, _directory) = large_workspace(&scale);
     drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
@@ -1221,7 +1273,25 @@ fn observed_edge_burst_timing() {
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn changing_edge_timing() {
     super::projection_oracle::disable();
-    let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
+    // `CAGENTS_WORKLOAD_HISTORY=N` multiplies the workspace's history - closed
+    // cards, worktrees and their empty views - leaving what is open alone, so
+    // runs at two sizes show which work grows with history.
+    let history = std::env::var("CAGENTS_WORKLOAD_HISTORY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let scale = Scale {
+        worktrees: Scale::LARGE.worktrees * history,
+        closed_cards: Scale::LARGE.closed_cards * history,
+        historical_views: Scale::LARGE.historical_views * history,
+        ..Scale::LARGE
+    };
+    let (mut app, channels, directory) = large_workspace(&scale);
+    eprintln!(
+        "history x{history}: {} cards, {} views",
+        app.durable.cards.len(),
+        app.workspace_model.views.len()
+    );
     app.shared_views.skip_rediscovery_check();
     settle_seeds(&mut app);
     answer_view_edits(&mut app);
@@ -1254,12 +1324,30 @@ fn changing_edge_timing() {
             .collect::<Vec<_>>()
     };
     let mut apart = Vec::new();
+    let counter = RetiredInstructions::open();
+    let mut instructions = Vec::new();
     for edge in edges(&app, 12) {
+        let before = counter.as_ref().map(RetiredInstructions::read);
         let started = Instant::now();
         drop(app.update(Message::WorkspaceModelObserved(edge)));
         apart.push(started.elapsed());
+        if let (Some(counter), Some(before)) = (&counter, before) {
+            instructions.push(counter.read() - before);
+        }
     }
     summary("update per changing edge", &mut apart);
+    if instructions.is_empty() {
+        eprintln!("instructions per changing edge: no hardware counter here");
+    } else {
+        instructions.sort_unstable();
+        eprintln!(
+            "instructions per changing edge n={:<4} median {:>12}  min {:>12}  max {:>12}",
+            instructions.len(),
+            instructions[instructions.len() / 2],
+            instructions[0],
+            instructions[instructions.len() - 1]
+        );
+    }
     let batch = edges(&app, 12);
     let phases = save_phases(&directory, || {
         for edge in batch {
