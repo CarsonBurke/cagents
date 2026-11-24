@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=41
+gate_version=42
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -358,11 +358,13 @@ inherits_slot() {
         path=$(readlink "$descriptor") || continue
         is_slot "$path" || continue
         inherited=${descriptor##*/}
-        # Probe on a descriptor this process does not already use.
+        # Probe on a descriptor this process does not already use, opened
+        # for reading: flock needs no more, and a sandbox may mount the
+        # lock's directory read-only.
         probe=3
         while [ -e /proc/$$/fd/$probe ]; do probe=$((probe + 1)); done
         [ "$probe" -le 9 ] || continue
-        eval "exec $probe>>\"\$path\""
+        { eval "command exec $probe<\"\$path\""; } 2>/dev/null || continue
         if flock -n "$probe"; then
             eval "exec $probe>&-"
             continue

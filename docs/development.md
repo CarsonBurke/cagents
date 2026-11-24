@@ -737,7 +737,11 @@ shares free starts at once. Waiting builds line up behind a queue lock, and
 the one at its head takes shares as they free, so a build that needs two is
 not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
-the first), and builds offloaded to the host take them too.
+the first), and builds offloaded to the host take them too. A caller that may
+not write there, such as a Codex job whose sandbox mounts `/var/tmp`
+read-only, locks the existing files read-only instead: flock needs no write
+access, so it still excludes every other build. It cannot create a missing
+one, and says which; any build run outside the sandbox creates it.
 
 Builds rarely reach their peaks together: with every share on fw16 held,
 builds' anonymous memory came to about a third of their shares' on average and
