@@ -80,24 +80,34 @@ channel() {
 }
 
 # Start a Claude conversation in channel $1 with prompt $2, then show that
-# channel by its title $3 from the command palette.
+# channel by its title $3.
 converse() {
     evidence cli --json agent spawn --provider claude --model haiku --surface chat \
         --repository "$fixture/project" --channel "$1" --prompt "$2" >/dev/null
-    local opened=false
-    # A session that has only just started can miss the first shortcut.
-    for _ in 1 2 3; do
-        evidence drive key ctrl+shift+p >/dev/null
-        if evidence drive wait 'Search commands' --timeout 5 >/dev/null 2>&1; then
-            opened=true
-            break
-        fi
-        evidence drive key Escape >/dev/null
-        sleep 1
+    # The channel's sidebar row opens it; the command palette is the
+    # fallback, since a session that has only just started can miss a
+    # shortcut.
+    local tries=0
+    until evidence drive click "$3" >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 15 ] || break
+        sleep 2
     done
-    [ "$opened" = true ] || { log 'the command palette did not open'; exit 1; }
-    evidence drive type "# $3" >/dev/null
-    evidence drive key Return >/dev/null
+    if [ "$tries" -ge 15 ]; then
+        local opened=false
+        for _ in 1 2 3; do
+            evidence drive key ctrl+shift+p >/dev/null
+            if evidence drive wait 'Search commands' --timeout 5 >/dev/null 2>&1; then
+                opened=true
+                break
+            fi
+            evidence drive key Escape >/dev/null
+            sleep 1
+        done
+        [ "$opened" = true ] || { log "could not open $3"; exit 1; }
+        evidence drive type "# $3" >/dev/null
+        evidence drive key Return >/dev/null
+    fi
     sleep 2
 }
 
@@ -116,8 +126,9 @@ if [ "$scene" = cli-send ]; then
     await 'what they need|sessions have' 120
     # Either row, before or after the change, by the part of it the change
     # leaves alone.
-    await 'Fix the sidebar' 10
-    await 'Reply to' 10
+    # The screen reading splits a row's runs where it likes ("Replyto").
+    await 'sidebar' 10
+    await 'Repl' 10
     shot cli-send-rows
     # Later conversations in this fixture replay nothing.
     rm -f "$config/fixture-frames.jsonl"
@@ -157,6 +168,7 @@ await 'Scheduled work requested' 90
 # The button's label, through the accessibility tree; the screen reading may
 # read it as two words.
 evidence drive click 'Review request' >/dev/null 2>&1 || evidence drive click 'Review' >/dev/null
-await 'Approve scheduled work' 15
+# The dialog's buttons read whole where its heading may not.
+await 'Not now|Approve and|Approve scheduled' 15
 shot approval-dialog
 evidence drive key Escape >/dev/null
