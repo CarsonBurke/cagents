@@ -67,11 +67,19 @@ It needs JDK 21 (Gradle provisions it when missing) and the Android SDK, at
 ```sh
 mise run mobile:test      # protocol and unit tests
 mise run mobile:build     # debug APK in mobile/androidApp/build/outputs/apk/debug
-mise run mobile:install   # build and install on the connected phone
+mise run mobile:install   # build the preview and install it on the connected phone
+mise run mobile:install-debug  # the debuggable build instead
 ```
 
-A debug build installs beside a release build as `dev.cagents.mobile.debug`.
-It leaves its public key where adb can read it:
+Both builds install beside a release build as `dev.cagents.mobile.debug`, and
+either replaces the other, keeping the phone's key and trusted hosts.
+
+- The preview is release code: minified by R8, not debuggable, and signed with
+  the debug key until release signing exists. Use it on a phone. On a Pixel 8,
+  scrolling a list of real sessions had 0.1% janky frames with it, against
+  11–25% with the debug build, whose 90th-percentile frame was 32–48 ms.
+- The debug build is for `run-as` and the debugger. It leaves its public key
+  where adb can read it:
 
 ```sh
 adb shell run-as dev.cagents.mobile.debug cat files/cagents-phone.pub

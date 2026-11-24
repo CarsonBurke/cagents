@@ -22,9 +22,20 @@ android {
             versionNameSuffix = "-debug"
         }
         release {
-            // sshj and BouncyCastle reach much of their code by reflection;
-            // shrinking stays off until keep rules are written and tested.
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+        // Release code, signed with the debug key until release signing
+        // exists. It installs over the debug build, keeping that build's
+        // phone key and trusted hosts. Use it on a phone: a debuggable build
+        // runs Compose several times slower, and its lists stutter.
+        create("preview") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-preview"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += "release"
         }
     }
 
