@@ -445,6 +445,77 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
             self.tick()
         self.assertEqual(len(self.recorded()), len(sentinel.LANES))
 
+    def test_retention_preserves_pending_reports_and_published_verdicts(self):
+        logs = self.state / "logs"
+        logs.mkdir(parents=True)
+        verdicts = self.state / "verdicts"
+        verdicts.mkdir()
+        pending, tests_pending, bisecting, obsolete = (digit * 40 for digit in "1234")
+        self.now = 2 * sentinel.LOG_RETENTION_SECONDS
+        state = {"github_repository": "fixture/repository", "checked": self.first,
+                 "pending": {"sha": pending}, "tests_pending": tests_pending,
+                 "bisect": {"commits": [bisecting]}, "retry_after": self.now + 1}
+        (self.state / "state.json").write_text(json.dumps(state))
+        fresh = self.now - sentinel.LOG_RETENTION_SECONDS
+        expired = fresh - 1
+        awaiting_report = logs / f"{pending}-cli-warnings.log"
+        keep = [logs / f"{self.first}-evidence.log", awaiting_report,
+                logs / f"{tests_pending}-test-ui.log", logs / f"{bisecting}-app.log",
+                logs / f"{obsolete}-custom.log", verdicts / f"{obsolete}.json"]
+        remove = [logs / f"{obsolete}-host.log", verdicts / f"{obsolete}.new"]
+        for path in [*keep, *remove]:
+            path.write_text("evidence")
+            os.utime(path, (expired, expired))
+        recent = logs / f"{obsolete}-test-cli.log"
+        recent.touch()
+        os.utime(recent, (fresh, fresh))
+        symlink = logs / f"{obsolete}-browser.log"
+        symlink.symlink_to(keep[-1])
+        hardlink = logs / f"{obsolete}-ui.log"
+        hardlink.hardlink_to(keep[-1])
+        self.tick()
+        for path in [*keep, recent, symlink, hardlink]:
+            self.assertTrue(path.exists(), path)
+        for path in remove:
+            self.assertFalse(path.exists(), path)
+
+        state_path = self.state / "state.json"
+        state = json.loads(state_path.read_text())
+        del state["pending"]
+        state["retry_after"] = self.now + 2 * sentinel.EVIDENCE_SWEEP_SECONDS
+        state_path.write_text(json.dumps(state))
+        self.now += sentinel.EVIDENCE_SWEEP_SECONDS - 1
+        self.tick()
+        self.assertTrue(awaiting_report.exists())
+        self.now += 1
+        self.tick()
+        self.assertFalse(awaiting_report.exists())
+        self.assertFalse(self.calls.exists())
+
+    def test_retention_skips_a_redirected_log_directory(self):
+        self.state.mkdir()
+        outside = self.root / "other-logs"
+        outside.mkdir()
+        log = outside / f"{self.first}-cli.log"
+        log.write_text("external evidence")
+        os.utime(log, (0, 0))
+        (self.state / "logs").symlink_to(outside, target_is_directory=True)
+        self.now = 2 * sentinel.LOG_RETENTION_SECONDS
+        (self.state / "state.json").write_text(json.dumps({"retry_after": self.now + 1}))
+        self.tick()
+        self.assertEqual(log.read_text(), "external evidence")
+
+    def test_remembered_failure_can_be_reported_after_its_log_expires(self):
+        self.state.mkdir()
+        state = {"github_repository": "fixture/repository"}
+        verdict = {"sha": self.first, "passed": False,
+                   "lanes": {"cli": {"status": 101, "seconds": 5}}}
+        sentinel.report_tests(self.state, state, verdict)
+        body = (self.state / "test-issue.md").read_text()
+        self.assertIn("cli: exit 101 in 5 s", body)
+        self.assertIn("log unavailable on fw16", body)
+        self.assertTrue(state["tests_failing"])
+
 
     def tested(self):
         path = self.root / "tests"
