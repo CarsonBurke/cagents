@@ -323,67 +323,77 @@ mod tests {
 
     #[test]
     fn realistic_migration_and_downgrades_preserve_current_workspace_and_receipts() {
+        // The upgrade and the writes made after it are the same for every
+        // target, so they run once; each downgrade starts from a page-exact
+        // copy of that closed store.
+        let directory = tempfile::tempdir().unwrap();
+        let upgraded = directory.path().join("workspace-model.sqlite3");
+        let (scope, empty_channel) = published_26(&upgraded);
+        let before = rows(&Connection::open(&upgraded).unwrap());
+        let mut registry = Registry::at(&upgraded).unwrap();
+        schema::require_current(&registry.db).unwrap();
+        assert_eq!(
+            rows_without_checkouts(&registry.db),
+            before,
+            "only channel work is removed"
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'channel_work*'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let mut updated = views::read(&registry.db, &scope).unwrap().panes[0].clone();
+        let previous = updated.clone();
+        updated.title = "Written after schema 27 upgrade".into();
+        assert!(
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: registry.view_revision(&scope).unwrap(),
+                    operation: Uuid::new_v4(),
+                    change: Change::Update {
+                        before: previous,
+                        pane: updated
+                    },
+                })
+                .unwrap()
+                .changed
+        );
+        let model = registry.model().unwrap();
+        let empty = ModelEdit::RetireEmptyChannel {
+            home: crate::workspace_model::ChannelIncarnation {
+                registry: model.identity,
+                channel: empty_channel,
+                creation_ordinal: 76,
+            },
+            expected_view_revision: registry
+                .view_revision(&Scope::Channel(empty_channel))
+                .unwrap(),
+        };
+        assert!(
+            registry.apply(&empty).unwrap().changed,
+            "old history must not retain an empty channel"
+        );
+        registry.db.execute("UPDATE native_actor_retirements SET receipt='receipt written after upgrade' WHERE actor='actor'",[]).unwrap();
+        let current = rows_without_checkouts(&registry.db);
+        let views = sorted(views::all(&registry.db).unwrap());
+        let mut model = registry.model().unwrap();
+        model.views = sorted(model.views);
+        let busy: i64 = registry
+            .db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 0, "the copies need every committed page");
+        drop(registry);
         for target in [26, 23, 22] {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("workspace-model.sqlite3");
-            let (scope, empty_channel) = published_26(&path);
-            let before = rows(&Connection::open(&path).unwrap());
-            let mut registry = Registry::at(&path).unwrap();
-            schema::require_current(&registry.db).unwrap();
-            assert_eq!(
-                rows_without_checkouts(&registry.db),
-                before,
-                "only channel work is removed"
-            );
-            assert_eq!(
-                registry
-                    .db
-                    .query_row(
-                        "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'channel_work*'",
-                        [],
-                        |row| row.get::<_, i64>(0)
-                    )
-                    .unwrap(),
-                0
-            );
-            let mut updated = views::read(&registry.db, &scope).unwrap().panes[0].clone();
-            let previous = updated.clone();
-            updated.title = "Written after schema 27 upgrade".into();
-            assert!(
-                registry
-                    .apply(&ModelEdit::ChangeView {
-                        scope: scope.clone(),
-                        expected_revision: registry.view_revision(&scope).unwrap(),
-                        operation: Uuid::new_v4(),
-                        change: Change::Update {
-                            before: previous,
-                            pane: updated
-                        },
-                    })
-                    .unwrap()
-                    .changed
-            );
-            let model = registry.model().unwrap();
-            let empty = ModelEdit::RetireEmptyChannel {
-                home: crate::workspace_model::ChannelIncarnation {
-                    registry: model.identity,
-                    channel: empty_channel,
-                    creation_ordinal: 76,
-                },
-                expected_view_revision: registry
-                    .view_revision(&Scope::Channel(empty_channel))
-                    .unwrap(),
-            };
-            assert!(
-                registry.apply(&empty).unwrap().changed,
-                "old history must not retain an empty channel"
-            );
-            registry.db.execute("UPDATE native_actor_retirements SET receipt='receipt written after upgrade' WHERE actor='actor'",[]).unwrap();
-            let current = rows_without_checkouts(&registry.db);
-            let views = views::all(&registry.db).unwrap();
-            let mut model = registry.model().unwrap();
-            model.views = sorted(model.views);
-            drop(registry);
+            let path = directory.path().join(format!("downgrade-{target}.sqlite3"));
+            std::fs::copy(&upgraded, &path).unwrap();
             assert_eq!(
                 Registry::downgrade_at(&path, target).unwrap(),
                 Some(SCHEMA_VERSION)
@@ -397,7 +407,8 @@ mod tests {
                     |row| row.get::<_, String>(0)
                 )
                 .unwrap(),
-                "receipt written after upgrade"
+                "receipt written after upgrade",
+                "downgrade to {target}"
             );
             if target == 26 {
                 assert_eq!(
@@ -412,8 +423,12 @@ mod tests {
             let reopened = Registry::at(&path).unwrap();
             let mut restored_model = reopened.model().unwrap();
             restored_model.views = sorted(restored_model.views);
-            assert_eq!(restored_model, model);
-            assert_eq!(sorted(views::all(&reopened.db).unwrap()), sorted(views));
+            assert_eq!(restored_model, model, "downgrade to {target}");
+            assert_eq!(
+                sorted(views::all(&reopened.db).unwrap()),
+                views,
+                "downgrade to {target}"
+            );
             schema::require_current(&reopened.db).unwrap();
         }
     }
