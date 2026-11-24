@@ -20,12 +20,19 @@
 //! command allocated before it moved stays charged to the provider leaf,
 //! because cgroup v2 does not move charges, so the sweeper is woken early
 //! whenever the provider reports activity. Command leaves are checked for
-//! memory kills and collected once they empty every [`SLOW`].
+//! memory kills and collected once they empty, on the kernel's word: it
+//! reports a changed `cgroup.events` or `memory.events.local` through inotify,
+//! so a provider that leaves dozens of background commands running costs
+//! nothing until one of them ends or is killed. Should inotify fail, or a
+//! leaf's watch, as when the user's watches run out, leaves are read every
+//! [`SLOW`] until that leaf is collected.
 //!
-//! cgroup v2 reports no process creation, so this polls. A provider whose
-//! owner reports all its activity, its output and the input it is sent, does
-//! not start commands unannounced: once it has been quiet for a while with no
-//! command running, sweeps slow towards [`QUIET`]. A provider idle for hours
+//! cgroup v2 reports no process creation, so finding new commands polls. A
+//! provider whose owner reports all its activity, its output and the input it
+//! is sent, does not start commands unannounced, and a running command's own
+//! children start in its leaf: once the provider has been quiet for a while,
+//! with no command left that only a timer would notice ending, sweeps slow
+//! towards [`QUIET`]. A provider idle for hours
 //! then wakes this thread rarely instead of every second. What it might still
 //! start unannounced while quiet, such as an idle-time hook, moves within
 //! [`QUIET`].
@@ -45,7 +52,7 @@ use std::{
     io::Write,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{fs::DirBuilderExt, net::UnixStream},
+        unix::{ffi::OsStrExt, fs::DirBuilderExt, net::UnixStream},
     },
     path::{Path, PathBuf},
     sync::{
@@ -180,12 +187,14 @@ impl ProviderScope {
             return Ok(());
         }
         let leaves = Leaves {
+            events: LeafEvents::new(),
             scope: layout.scope.clone(),
             scope_membership: layout.scope_membership.clone(),
             provider: self.provider.try_clone()?,
             provider_membership: layout.provider_membership.clone(),
             root,
             kept,
+            created: false,
             next: 0,
             by_head: HashMap::new(),
         };
@@ -529,7 +538,8 @@ impl Shared {
     }
 
     /// How long to wait before the next sweep. `commands` is whether any
-    /// command leaf remains to watch for memory kills and collection.
+    /// command leaf remains whose memory kills and end only a timer would
+    /// notice, because its changes are not watched.
     fn interval(&self, commands: bool) -> Duration {
         let now = self.epoch.elapsed().as_millis() as u64;
         let fast_until = self.fast_until.load(Ordering::Acquire);
@@ -547,6 +557,9 @@ impl Shared {
 
 struct Sweeper {
     shared: Arc<Shared>,
+    /// An eventfd counted up to wake the sweeper early; its counter merges
+    /// pokes the sweeper has yet to read.
+    poke: Arc<OwnedFd>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -561,17 +574,37 @@ impl Sweeper {
             stops: Mutex::new(Vec::new()),
             wake: Mutex::new(wake),
         });
+        // SAFETY: eventfd takes only an initial count and flags.
+        let poke = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if poke < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: eventfd returned a new descriptor that we own.
+        let poke = Arc::new(unsafe { OwnedFd::from_raw_fd(poke) });
+        let poked = poke.clone();
         let sweep = shared.clone();
         let thread = thread::Builder::new()
             .name("cagents-commands".into())
             .spawn(move || {
                 let mut last_collect = Instant::now();
+                // Nothing has been read yet.
+                let mut changed = true;
                 while !sweep.stop.load(Ordering::Acquire) {
                     let moved = leaves.sweep();
                     // Moving a new command is urgent; noticing one that
-                    // ended is not, and reads every leaf.
-                    let stops = if last_collect.elapsed() >= SLOW {
+                    // ended is not, and reads every leaf. A watched leaf is
+                    // read once one changed. A new one, which a move may
+                    // never have reached, is read within SLOW, as unwatched
+                    // leaves are: an empty leaf never changes.
+                    let slow = last_collect.elapsed() >= SLOW;
+                    let due = if leaves.watched() {
+                        changed || (leaves.created && slow)
+                    } else {
+                        slow
+                    };
+                    let stops = if due {
                         last_collect = Instant::now();
+                        leaves.created = false;
                         leaves.collect()
                     } else {
                         Vec::new()
@@ -594,30 +627,148 @@ impl Sweeper {
                             let _ = wake.write(&[1]);
                         }
                     }
-                    thread::park_timeout(sweep.interval(!leaves.by_head.is_empty()));
+                    let timed = !leaves.by_head.is_empty() && (!leaves.watched() || leaves.created);
+                    changed = wait(&poked, leaves.events.as_ref(), sweep.interval(timed));
                 }
             })?;
         Ok(Self {
             shared,
+            poke,
             thread: Some(thread),
         })
     }
 
     fn poke(&self) {
-        if self.shared.hasten()
-            && let Some(thread) = &self.thread
-        {
-            thread.thread().unpark();
+        if self.shared.hasten() {
+            poke(&self.poke);
         }
     }
+}
+
+/// Count an eventfd up by one, waking whoever polls it.
+fn poke(eventfd: &OwnedFd) {
+    let one = 1u64.to_ne_bytes();
+    // SAFETY: the descriptor is live and the write reads at most `one`. A
+    // counter that cannot take more already holds a wakeup.
+    unsafe { libc::write(eventfd.as_raw_fd(), one.as_ptr().cast(), one.len()) };
 }
 
 impl Drop for Sweeper {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
+            poke(&self.poke);
             let _ = thread.join();
+        }
+    }
+}
+
+/// Wait up to `timeout` for a poke or a watched leaf change. Returns whether
+/// a leaf may have changed, which also covers an unreadable watch.
+fn wait(poked: &OwnedFd, events: Option<&LeafEvents>, timeout: Duration) -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: poked.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: events.map_or(-1, |events| events.fd.as_raw_fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let milliseconds = i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX);
+    // SAFETY: both pollfds are initialized; a negative fd is ignored.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, milliseconds) };
+    if ready <= 0 {
+        // A timeout, or an interrupted wait the next sweep covers.
+        return false;
+    }
+    if fds[0].revents != 0 {
+        drain(poked.as_raw_fd());
+    }
+    if fds[1].revents != 0
+        && let Some(events) = events
+    {
+        drain(events.fd.as_raw_fd());
+        return true;
+    }
+    false
+}
+
+/// Read a nonblocking descriptor empty.
+fn drain(fd: std::os::fd::RawFd) {
+    let mut buffer = [0u8; 4096];
+    // SAFETY: the buffer outlives each read of at most its length.
+    while unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) } > 0 {}
+}
+
+/// inotify on each command leaf's `cgroup.events`, whose `populated` turns
+/// to 0 once the command ends, and `memory.events.local`, whose `oom_kill`
+/// counts its kernel OOM kills. cgroup v2 reports changes to both as
+/// modifications (cgroup-v2.rst). An oomd kill also empties the leaf.
+///
+/// Removing a leaf ends its watches, as the kernel then reports. A leaf
+/// dropped without removal, or only half watched, has its watches removed
+/// here, so none outlives its leaf against the user's shared
+/// `fs.inotify.max_user_watches`.
+struct LeafEvents {
+    fd: OwnedFd,
+}
+
+impl LeafEvents {
+    fn new() -> Option<Self> {
+        // SAFETY: inotify_init1 takes only flags.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            tracing::debug!(error = %io::Error::last_os_error(), "command leaves are polled");
+            return None;
+        }
+        Some(Self {
+            // SAFETY: inotify_init1 returned a new descriptor that we own.
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    /// Watch a leaf's files. None leaves the leaf to be polled, as when the
+    /// user's watches are exhausted. Without the memory controller a leaf has
+    /// no `memory.events.local`, and no kernel kill to report.
+    fn watch(&self, leaf: &Path) -> Option<[i32; 2]> {
+        let mut watches = [-1; 2];
+        for (index, name) in ["cgroup.events", "memory.events.local"]
+            .into_iter()
+            .enumerate()
+        {
+            let error = match CString::new(leaf.join(name).as_os_str().as_bytes()) {
+                Ok(path) => {
+                    // SAFETY: the descriptor and the NUL-terminated path are live.
+                    let added = unsafe {
+                        libc::inotify_add_watch(self.fd.as_raw_fd(), path.as_ptr(), libc::IN_MODIFY)
+                    };
+                    if added >= 0 {
+                        watches[index] = added;
+                        continue;
+                    }
+                    io::Error::last_os_error()
+                }
+                Err(error) => error.into(),
+            };
+            if index == 1 && error.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            tracing::debug!(%error, "command leaf is polled");
+            self.unwatch(watches);
+            return None;
+        }
+        Some(watches)
+    }
+
+    fn unwatch(&self, watches: [i32; 2]) {
+        for watch in watches.into_iter().filter(|watch| *watch >= 0) {
+            // SAFETY: the descriptor is live. A watch the kernel already
+            // ended fails with EINVAL, harmlessly.
+            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), watch) };
         }
     }
 }
@@ -628,9 +779,16 @@ struct Leaf {
     membership: String,
     /// Kernel OOM kills already reported.
     kernel_kills: u64,
+    /// The leaf's inotify watches, if its changes are reported.
+    watches: Option<[i32; 2]>,
 }
 
 struct Leaves {
+    /// Reports when a command leaf changes, if inotify is available.
+    events: Option<LeafEvents>,
+    /// Whether a leaf was created since the last collection: one a move
+    /// never reached stays empty, and no change would report it.
+    created: bool,
     scope: PathBuf,
     /// Membership paths are relative to the cgroup2 root, as /proc reports.
     scope_membership: String,
@@ -645,6 +803,12 @@ struct Leaves {
 }
 
 impl Leaves {
+    /// Whether every leaf's changes are reported, so none needs a timer.
+    /// One that could not be watched is polled until it is collected.
+    fn watched(&self) -> bool {
+        self.events.is_some() && self.by_head.values().all(|leaf| leaf.watches.is_some())
+    }
+
     /// Move every process other than the provider out of its leaf. Returns
     /// whether any moved.
     fn sweep(&mut self) -> bool {
@@ -721,12 +885,15 @@ impl Leaves {
             match fs::DirBuilder::new().mode(0o755).create(&path) {
                 Ok(()) => {
                     let directory = open_directory(&path)?;
+                    let watches = self.events.as_ref().and_then(|events| events.watch(&path));
+                    self.created = true;
                     let membership = format!("{}/{name}", self.scope_membership);
                     return Ok(Leaf {
                         directory,
                         path,
                         membership,
                         kernel_kills: 0,
+                        watches,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -738,6 +905,7 @@ impl Leaves {
     /// Remove command leaves that emptied, reporting memory kills first.
     fn collect(&mut self) -> Vec<CommandStop> {
         let mut stops = Vec::new();
+        let events = self.events.as_ref();
         self.by_head.retain(|_, leaf| {
             let populated = read_at(&leaf.directory, "cgroup.events")
                 .map(|events| events.lines().any(|line| line == "populated 1"))
@@ -762,12 +930,16 @@ impl Leaves {
             if populated {
                 return true;
             }
-            match fs::remove_dir(&leaf.path) {
+            let kept = match fs::remove_dir(&leaf.path) {
                 Ok(()) => false,
                 // Repopulated meanwhile: keep it.
                 Err(error) if error.raw_os_error() == Some(libc::EBUSY) => true,
                 Err(_) => false,
+            };
+            if !kept && let (Some(events), Some(watches)) = (events, leaf.watches) {
+                events.unwatch(watches);
             }
+            kept
         });
         stops
     }
@@ -824,11 +996,80 @@ mod tests {
     }
 
     #[test]
+    fn a_watched_leaf_change_wakes_the_sweeper_and_a_poke_reports_none() {
+        let leaf = tempfile::tempdir().unwrap();
+        for name in ["cgroup.events", "memory.events.local"] {
+            fs::write(leaf.path().join(name), "populated 1\n").unwrap();
+        }
+        let events = LeafEvents::new().expect("inotify");
+        events.watch(leaf.path()).expect("both files are watched");
+        // SAFETY: eventfd takes only an initial count and flags.
+        let poked = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(poked >= 0);
+        // SAFETY: eventfd returned a new descriptor that we own.
+        let poked = unsafe { OwnedFd::from_raw_fd(poked) };
+        let started = Instant::now();
+        assert!(!wait(&poked, Some(&events), Duration::from_millis(30)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "nothing woke it"
+        );
+        poke(&poked);
+        poke(&poked);
+        assert!(
+            !wait(&poked, Some(&events), Duration::from_secs(5)),
+            "a poke wakes it but changes no leaf"
+        );
+        fs::write(leaf.path().join("cgroup.events"), "populated 0\n").unwrap();
+        assert!(wait(&poked, Some(&events), Duration::from_secs(5)));
+        // Both wakeups were consumed.
+        assert!(!wait(&poked, Some(&events), Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn a_leaf_watch_is_all_or_nothing_and_removed_with_the_leaf() {
+        let events = LeafEvents::new().expect("inotify");
+        let watches = || {
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", events.fd.as_raw_fd()))
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("inotify wd:"))
+                .count()
+        };
+        let leaf = tempfile::tempdir().unwrap();
+        for name in ["cgroup.events", "memory.events.local"] {
+            fs::write(leaf.path().join(name), "").unwrap();
+        }
+        let watched = events.watch(leaf.path()).expect("both files are watched");
+        assert_eq!(watches(), 2);
+        events.unwatch(watched);
+        assert_eq!(watches(), 0, "a collected leaf keeps no watch");
+        // Without the memory controller, only cgroup.events exists.
+        let unmetered = tempfile::tempdir().unwrap();
+        fs::write(unmetered.path().join("cgroup.events"), "").unwrap();
+        let watched = events.watch(unmetered.path()).expect("its end is watched");
+        assert_eq!(watches(), 1);
+        events.unwatch(watched);
+        // The first file is watched and the second cannot be: the first
+        // watch must not outlive the failure.
+        let half = tempfile::tempdir().unwrap();
+        fs::write(half.path().join("cgroup.events"), "").unwrap();
+        let looped = half.path().join("memory.events.local");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(events.watch(half.path()).is_none(), "the leaf is polled");
+        assert_eq!(watches(), 0, "a failed leaf keeps no watch");
+    }
+
+    #[test]
     fn sweeps_slow_only_for_a_quiet_reported_provider_with_no_command() {
         // Quiet for a minute: a long while, but not enough to stop sweeping.
         let quiet = shared(Duration::from_secs(60), true);
         assert_eq!(quiet.interval(false), QUIET);
-        assert_eq!(quiet.interval(true), SLOW, "a running command is watched");
+        assert_eq!(
+            quiet.interval(true),
+            SLOW,
+            "a running command whose changes are not watched is polled"
+        );
         let unreported = shared(Duration::from_secs(60), false);
         assert_eq!(
             unreported.interval(false),
