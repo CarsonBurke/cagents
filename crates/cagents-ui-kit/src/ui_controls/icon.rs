@@ -121,6 +121,7 @@ icons! {
     OpenFile => "open-file",
     OpenFolder => "open-folder",
     Permission => "permission",
+    Phone => "phone",
     Plus => "plus",
     PopOut => "pop-out",
     Preview => "preview",
