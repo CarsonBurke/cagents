@@ -1023,14 +1023,13 @@ python3 tests/fixtures/native-retired-ownership.py \
     ~/.local/state/cev/TASK/fixture CONVERSATION_UUID --restore
 ```
 
-The helper recognizes only schema 22 shared views or schema 23 to 30
-normalized panes with descriptor format 1. Schemas 24 to 30 add tables, or
-columns of other tables, beside those panes without changing their columns. It requires one current committed Claude pane
-for that exact thread, matching ownership source and proof, and a completed
-retirement. It appends one `--fixture-recipe-mismatch` argument to that retired
-ownership row using SQLite compare-and-swap. The card, transcript, provider
-home and retirement receipt stay as they were. This is synthetic database
-fault injection, not a claim that a provider produced the conflicting recipe.
+The helper recognizes only schema 22 shared views or schema 23 to 31
+normalized panes with descriptor format 1. It requires one current committed
+Claude pane for that exact thread, matching ownership source and proof, and a
+completed retirement. It appends one `--fixture-recipe-mismatch` argument to
+that retired ownership row using SQLite compare-and-swap. The card, transcript,
+provider home and retirement receipt stay as they were. This is synthetic
+database fault injection, not a claim that a provider produced the conflicting recipe.
 
 Before changing the row, it exclusively creates a private mode-0600
 `fixture/original-retired-ownership.json` backup. Restore accepts only that
