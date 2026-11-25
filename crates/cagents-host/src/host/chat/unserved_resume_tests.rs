@@ -503,6 +503,9 @@ fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+// This case suppresses the Linux /proc/locks writer row. Darwin's real
+// writer release still runs through the preceding long-endpoint test.
 fn a_missing_writer_row_cannot_start_a_private_server_until_kernel_release() {
     long_stale_shared_endpoint_waits_for_writer(
         "host::chat::unserved_resume_tests::a_missing_writer_row_cannot_start_a_private_server_until_kernel_release",
