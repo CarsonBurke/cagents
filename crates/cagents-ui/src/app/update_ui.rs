@@ -24,6 +24,9 @@ pub(super) struct State {
     restarting: bool,
     pub(super) confirmation: Option<crate::update::UpdateConfirmation>,
     submitted_confirmation: Option<String>,
+    /// The waiting chip's label and its shaped width, measured as the wait
+    /// changes rather than on every layout of the tab strip.
+    waiting_chip: Option<(String, f32)>,
     /// The job whose review was set aside to go and deal with a session that
     /// blocks it. Its dialog stays away until nothing blocks any more, or
     /// until the update control asks for it again.
@@ -885,11 +888,12 @@ impl Cagents {
         }
         match self.idle_wait() {
             Some(wait) => {
-                design::ROW_ICON_SIZE as f32
-                    + space::XS
-                    + 2.0 * space::S
-                    + super::chrome_ui::measure_tab_title(&wait.label())
-                    + 4.0
+                let label = wait.label();
+                let text = match &self.update_ui.waiting_chip {
+                    Some((measured, width)) if *measured == label => *width,
+                    _ => super::chrome_ui::measure_tab_title(&label),
+                };
+                design::ROW_ICON_SIZE as f32 + space::XS + 2.0 * space::S + text + 4.0
             }
             None => design::PRIMARY_CONTROL_SIZE + 4.0,
         }
@@ -1266,6 +1270,13 @@ impl Cagents {
         let task = self.apply_update_action(action);
         // A wait that ended, or a review that came up, takes the popover.
         let task = Task::batch([task, self.reconcile_update_popup()]);
+        let label = self.idle_wait().map(|wait| wait.label());
+        if label.as_ref() != self.update_ui.waiting_chip.as_ref().map(|(label, _)| label) {
+            self.update_ui.waiting_chip = label.map(|label| {
+                let width = super::chrome_ui::measure_tab_title(&label);
+                (label, width)
+            });
+        }
         if asked || self.update_ui.confirmation.is_none() {
             return task;
         }
@@ -1411,6 +1422,12 @@ impl Cagents {
                 }
                 if let Err(error) = result {
                     self.update_ui.submitted_confirmation = None;
+                    // The next poll clears the header's error and may bring
+                    // back the review the choice was made on, so a notice is
+                    // what tells the person it didn't take.
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The update didn't take that choice: {error}"
+                    )));
                     self.update_ui.error = Some(error);
                 }
                 self.apply_update_action(Action::Poll)
@@ -1552,11 +1569,16 @@ impl Cagents {
                         {
                             self.update_ui.set_aside = None;
                         }
-                        let confirmation = job.active_confirmation().filter(|confirmation| {
-                            self.update_ui.submitted_confirmation.as_ref()
-                                != Some(&confirmation.nonce)
-                                && self.update_ui.set_aside.is_none()
-                        });
+                        // A confirmed wait is the header's chip in every
+                        // window, never a review over the work.
+                        let confirmation = job
+                            .active_confirmation()
+                            .filter(|_| job.phase == UpdatePhase::AwaitingConfirmation)
+                            .filter(|confirmation| {
+                                self.update_ui.submitted_confirmation.as_ref()
+                                    != Some(&confirmation.nonce)
+                                    && self.update_ui.set_aside.is_none()
+                            });
                         self.update_ui.review_deferred =
                             confirmation.is_some() && self.other_modal_is_open();
                         self.update_ui.confirmation = confirmation
@@ -2480,6 +2502,14 @@ pub(in crate::app) mod tests {
             app.update_ui.confirmation.is_none(),
             "the confirmed review stays away"
         );
+        // Another window, or this one reopened, finds the wait confirmed
+        // already: it shows the same chip, not the review over its work.
+        let mut other = crate::app::tests::context_inspector_test_app(true);
+        let poll_other = review_ready(&mut other, job.clone());
+        drop(other.update(poll_other));
+        assert!(other.update_ui.confirmation.is_none());
+        assert!(!other.modal_is_open());
+        assert_eq!(other.idle_wait().unwrap().label(), "Update waiting for 2");
         assert_eq!(app.idle_wait().unwrap().label(), "Update waiting for 2");
         let ids = custom_widget_ids(&mut app.view());
         assert_eq!(
@@ -2529,6 +2559,20 @@ pub(in crate::app) mod tests {
             Some(&confirmation.nonce)
         );
         assert!(app.update_ui.confirmation.is_none());
+        // A choice the worker refuses says so rather than vanishing with the
+        // next poll.
+        drop(app.update_update_ui(Action::Decided {
+            job: job.id.clone(),
+            nonce: confirmation.nonce.clone(),
+            result: Err("This review expired".into()),
+        }));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.contains("This review expired")),
+            "{:?}",
+            app.status.as_ref().map(|notice| &notice.message)
+        );
 
         // The interruption review that follows updates now: its button
         // doesn't promise a wait, even for a delivery still on its way.
