@@ -116,20 +116,27 @@ impl std::fmt::Display for StateInUse {
                 write!(
                     formatter,
                     "Another cagents daemon{process} is already using this cagents data{runtime}. \
-                     Two daemons on the same data overwrite each other's chats, so this one did \
-                     not start."
+                     Two daemons on the same data overwrite each other's chats, so cagents did \
+                     not start another one here."
                 )?;
                 // The runtime directory is the session's XDG_RUNTIME_DIR
-                // with the instance's own directory below it.
+                // with the instance's own directory below it. Pointing a
+                // launch here at it would also move its display, so the
+                // session comes first.
                 match self.runtime.as_deref().and_then(Path::parent) {
                     Some(session) => write!(
                         formatter,
-                        " To use that daemon, start cagents with XDG_RUNTIME_DIR={}; to start one \
-                         here instead, stop {holder} first.",
+                        " Use cagents in the session that started it (XDG_RUNTIME_DIR={}), or \
+                         stop that daemon there to use cagents here.",
                         session.display()
-                    ),
-                    None => write!(formatter, " Stop {holder} first."),
+                    )?,
+                    None => write!(formatter, " Stop {holder} to use cagents here.")?,
                 }
+                if self.pid.is_none() {
+                    // Its process is gone: most likely it is being updated.
+                    write!(formatter, " If it is updating, try again in a moment.")?;
+                }
+                Ok(())
             }
             Claimant::Maintenance => write!(
                 formatter,
@@ -315,9 +322,26 @@ fn acquire(
 fn refusal(claimant: Claimant, record: Option<&Record>) -> StateInUse {
     StateInUse {
         claimant,
-        pid: record.map(|record| record.pid),
+        // During an update the recorded daemon has exited and the updater
+        // holds its lease, so naming that process would send people after one
+        // that isn't there.
+        pid: record
+            .map(|record| record.pid)
+            .filter(|&pid| process_exists(pid)),
         runtime: record.map(|record| record.runtime.clone()),
     }
+}
+
+/// Whether `pid` names a process, as far as this PID namespace can see. One
+/// that can't be signalled for lack of permission still exists.
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 checks for the process without signalling it.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
 }
 
 /// Whether somebody holds the runtime lock at `guard`, or takes it before
@@ -353,7 +377,7 @@ fn guard_held(path: &Path) -> bool {
         return false;
     }
     #[cfg(target_os = "linux")]
-    match listed_flock(&metadata) {
+    match listed_flock(&lock, &metadata) {
         Listed::Held => return true,
         Listed::Free => return false,
         Listed::Unknown => {}
@@ -366,26 +390,55 @@ fn guard_held(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
 enum Listed {
     Held,
     Free,
-    /// The list can't be read, or names only a file on another device with
-    /// this inode number, which may be this one under another device number.
+    /// The list can't be read, names only a file on another device with this
+    /// inode number, which may be this one under another device number, or
+    /// leaves out a file it may list under another device and inode.
     Unknown,
 }
 
-/// Whether `/proc/locks` lists a flock held on the file `metadata` describes.
+/// Whether `/proc/locks` lists a flock held on `lock`, which `metadata`
+/// describes.
 #[cfg(target_os = "linux")]
-fn listed_flock(metadata: &fs::Metadata) -> Listed {
+fn listed_flock(lock: &File, metadata: &fs::Metadata) -> Listed {
     let Ok(locks) = fs::read_to_string("/proc/locks") else {
         return Listed::Unknown;
     };
+    match parse_locks(&locks, metadata.dev(), metadata.ino()) {
+        // The list names a file by the device and inode of the filesystem
+        // underneath, which overlayfs, for one, reports differently. A
+        // runtime directory is normally tmpfs, which reports the same ones.
+        Listed::Free if !on_tmpfs(lock) => Listed::Unknown,
+        listed => listed,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn on_tmpfs(file: &File) -> bool {
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    let mut status = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs fills the buffer for a descriptor this function borrows.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: fstatfs succeeded, so it filled the buffer.
+    #[allow(clippy::unnecessary_cast)]
+    let kind = unsafe { status.assume_init() }.f_type as i64;
+    kind == TMPFS_MAGIC
+}
+
+/// What `locks`, in the format of `/proc/locks`, says about a flock on the
+/// file with `device` and `inode`.
+#[cfg(target_os = "linux")]
+fn parse_locks(locks: &str, device: u64, inode: u64) -> Listed {
     // The kernel prints a device's major and minor numbers in hex.
-    let device = metadata.dev();
     let major = ((device >> 8) & 0xfff) | ((device >> 32) & !0xfff);
     let minor = (device & 0xff) | ((device >> 12) & !0xff);
     let device = format!("{major:02x}:{minor:02x}");
-    let inode = metadata.ino().to_string();
+    let inode = inode.to_string();
     let mut listed = Listed::Free;
     for line in locks.lines() {
         // "1: FLOCK  ADVISORY  WRITE 1234 00:1a:5678 0 EOF"; a process waiting
@@ -590,6 +643,68 @@ mod tests {
         assert!(guard_held(&runtime.lock));
         drop(lease);
         assert!(!guard_held(&runtime.lock));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_lock_list_shows_a_held_runtime_lock_and_not_a_released_one() {
+        let runtime = Runtime::new();
+        let lease = runtime.hold();
+        let listed = || {
+            let file = File::open(&runtime.lock).unwrap();
+            let metadata = file.metadata().unwrap();
+            listed_flock(&file, &metadata)
+        };
+        assert_ne!(listed(), Listed::Free);
+        drop(lease);
+        assert_ne!(listed(), Listed::Held);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_lock_list_counts_only_a_flock_held_on_the_same_file() {
+        // Device 0x1a is major 0, minor 0x1a.
+        let held = "1: FLOCK  ADVISORY  WRITE 1234 00:1a:5678 0 EOF\n";
+        assert_eq!(parse_locks(held, 0x1a, 5678), Listed::Held);
+        assert_eq!(parse_locks(held, 0x1a, 5679), Listed::Free);
+        assert_eq!(parse_locks("", 0x1a, 5678), Listed::Free);
+
+        let waiting = "1: FLOCK  ADVISORY  WRITE 1234 00:1a:9 0 EOF\n\
+                       1: -> FLOCK  ADVISORY  WRITE 4321 00:1a:5678 0 EOF\n";
+        assert_eq!(parse_locks(waiting, 0x1a, 5678), Listed::Free);
+
+        let posix = "1: POSIX  ADVISORY  WRITE 1234 00:1a:5678 0 EOF\n";
+        assert_eq!(parse_locks(posix, 0x1a, 5678), Listed::Free);
+
+        let elsewhere = "1: FLOCK  ADVISORY  WRITE 1234 00:2b:5678 0 EOF\n";
+        assert_eq!(parse_locks(elsewhere, 0x1a, 5678), Listed::Unknown);
+        let also_here = format!("{elsewhere}2: FLOCK  ADVISORY  WRITE 99 00:1a:5678 0 EOF\n");
+        assert_eq!(parse_locks(&also_here, 0x1a, 5678), Listed::Held);
+
+        // A major number past 0xff, as for device-mapper volumes, in hex.
+        let mapped = libc::makedev(0x103, 2);
+        let line = "1: FLOCK  ADVISORY  WRITE 1234 103:02:77 0 EOF\n";
+        assert_eq!(parse_locks(line, mapped, 77), Listed::Held);
+    }
+
+    #[test]
+    fn a_refusal_names_only_a_process_that_still_exists() {
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let gone = exited.id();
+        exited.wait().unwrap();
+        let record = |pid| Record {
+            format: FORMAT,
+            guard: PathBuf::from("/nonexistent/cagentsd.lock"),
+            runtime: PathBuf::from("/nonexistent"),
+            pid,
+            host_session: None,
+        };
+        assert_eq!(refusal(Claimant::Daemon, Some(&record(gone))).pid, None);
+        let serving = std::process::id();
+        assert_eq!(
+            refusal(Claimant::Daemon, Some(&record(serving))).pid,
+            Some(serving)
+        );
     }
 
     #[test]

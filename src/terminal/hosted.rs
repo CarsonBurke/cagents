@@ -1582,7 +1582,9 @@ fn ensure_daemon_ready_at(
     // However the start failed, as a daemon that exited or, under a service
     // manager, one that never became ready.
     .or_else(|error| {
-        refuse_state_served_elsewhere(socket)?;
+        refuse_state_served_elsewhere(socket).inspect_err(|_| {
+            tracing::warn!(%error, "the daemon did not start; another one serves this data");
+        })?;
         Err(error)
     })
 }
