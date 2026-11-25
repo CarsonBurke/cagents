@@ -24,7 +24,7 @@ pub use backend::collect_empty_scopes;
 #[cfg(test)]
 pub(crate) use backend::tests;
 pub(crate) use backend::{
-    ProviderScope, enroll_dividing_holder, enroll_holder, enroll_provider,
+    ProviderScope, enroll_current_process, enroll_dividing_holder, enroll_provider,
     warn_if_bootstrap_shared, warn_if_shared,
 };
 

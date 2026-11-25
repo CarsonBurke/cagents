@@ -18,6 +18,9 @@ pub mod lost_processes;
 pub mod owned_children;
 #[cfg(feature = "host")]
 pub mod process_scope;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod standby;
 
 use std::{
     env,
