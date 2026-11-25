@@ -467,6 +467,33 @@ pub(crate) fn wake() -> io::Result<Wake> {
     })
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn set_read_timeout_or_hangup(
+    stream: &std::os::unix::net::UnixStream,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
+    let result = stream.set_read_timeout(timeout);
+    #[cfg(target_os = "macos")]
+    if matches!(&result, Err(error) if error.raw_os_error() == Some(libc::EINVAL)) {
+        // XNU refuses new socket options after a full shutdown. The peer
+        // might have closed after its final reply. Let the reader consume
+        // any remaining bytes and EOF without changing the prior timeout.
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            // XNU only registers the read filter when a read or hangup
+            // event is requested.
+            events: libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: descriptor is writable and contains a live borrowed fd.
+        let ready = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+        if ready > 0 && descriptor.revents & libc::POLLHUP != 0 {
+            return Ok(());
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -585,31 +612,4 @@ mod tests {
         assert!(started.elapsed() >= super::REFUSAL_WINDOW);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
-}
-
-#[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn set_read_timeout_or_hangup(
-    stream: &std::os::unix::net::UnixStream,
-    timeout: Option<std::time::Duration>,
-) -> io::Result<()> {
-    let result = stream.set_read_timeout(timeout);
-    #[cfg(target_os = "macos")]
-    if matches!(&result, Err(error) if error.raw_os_error() == Some(libc::EINVAL)) {
-        // XNU refuses new socket options after a full shutdown. The peer
-        // might have closed after its final reply. Let the reader consume
-        // any remaining bytes and EOF without changing the prior timeout.
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            // XNU only registers the read filter when a read or hangup
-            // event is requested.
-            events: libc::POLLHUP,
-            revents: 0,
-        };
-        // SAFETY: descriptor is writable and contains a live borrowed fd.
-        let ready = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
-        if ready > 0 && descriptor.revents & libc::POLLHUP != 0 {
-            return Ok(());
-        }
-    }
-    result
 }
