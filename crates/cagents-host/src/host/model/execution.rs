@@ -319,22 +319,33 @@ impl Registry {
     /// is no terminal/chat to project yet. Call outside HostState; final update
     /// admission also holds the control write gate to exclude new acceptance.
     ///
-    /// An accepted run is never redispatched after a restart, so each hold
+    /// A claimed run is never redispatched after a restart, so each hold
     /// fences the update until its work is delivered. A hold whose agent is
-    /// bound to a session and owes nothing but queued messages names that
-    /// session: the update waits for that conversation rather than for an
-    /// anonymous agent, and the hold's identity does not depend on how many
-    /// messages are queued.
+    /// bound to a session and owes nothing but a delivery in flight names
+    /// that session: the update waits for that conversation rather than for
+    /// an anonymous agent, and the hold's identity does not depend on how
+    /// many messages are in flight.
+    ///
+    /// A run still queued unsent for a bound agent holds nothing. It is
+    /// durable, belongs to the agent rather than to its process, and the
+    /// successor daemon's courier delivers it once the resumed conversation
+    /// is idle, as after any restart. Holding the update for it would wait on
+    /// a busy conversation under either policy, and a lead whose team keeps
+    /// messaging it might never let the update start.
     pub(crate) fn agent_update_holds(&self) -> Result<Vec<AgentUpdateHold>, String> {
-        let mut query = self.db.prepare(
-            "SELECT a.record, a.session_id,
+        let mut query = self
+            .db
+            .prepare(&format!(
+                "SELECT a.record, a.session_id,
                  EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
              FROM agents a WHERE a.closed = 0 AND (
                  EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
                  OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id AND
-                     (r.state = 'accepted' OR (a.session_id IS NULL AND r.state IN ('running', 'waiting'))))
-             ) ORDER BY a.id LIMIT ?1",
-        ).map_err(|error| error.to_string())?;
+                     ((r.state = 'accepted' AND (a.session_id IS NULL OR NOT ({UNSENT})))
+                      OR (a.session_id IS NULL AND r.state IN ('running', 'waiting'))))
+             ) ORDER BY a.id LIMIT ?1"
+            ))
+            .map_err(|error| error.to_string())?;
         let records = query
             .query_map([MAX_RUNNING as u64 + 1], |row| {
                 Ok((
@@ -5709,7 +5720,8 @@ mod tests {
             .unwrap();
         assert!(registry.agent_update_holds().unwrap().is_empty());
 
-        // A message queued behind the running turn waits on that session.
+        // A message queued unsent behind the running turn is durable and
+        // follows the agent to the successor daemon, so it holds nothing.
         let follow_up = Submit {
             name: None,
             destination: Destination::Existing(accepted.agent.id),
@@ -5718,10 +5730,18 @@ mod tests {
         };
         let queued = registry.submit_agent(&Origin::User, &follow_up, 4).unwrap();
         assert_eq!(queued.run.state, State::Accepted);
+        assert!(registry.agent_run_is_queued(queued.run.id).unwrap());
+        assert!(registry.agent_update_holds().unwrap().is_empty());
+        // Once a dispatcher claims it, its delivery is in flight and is
+        // never redispatched after a restart: the session waits for it.
+        assert!(registry.claim_agent_dispatch(&queued, 5).unwrap());
         assert_held(&registry, Some(session.id()));
+        // A dispatcher that finds the provider busy returns it to the queue.
+        assert!(registry.release_agent_dispatch(queued.run.id).unwrap());
+        assert!(registry.agent_update_holds().unwrap().is_empty());
 
         request.idempotency_key = "unbound-provider".into();
-        let unbound = registry.submit_agent(&Origin::User, &request, 5).unwrap();
+        let unbound = registry.submit_agent(&Origin::User, &request, 6).unwrap();
         registry
             .update_agent_run(
                 unbound.run.id,
@@ -5729,7 +5749,7 @@ mod tests {
                 Update::Started {
                     provider_key: "unbound".into(),
                 },
-                6,
+                7,
             )
             .unwrap();
         let holds = registry.agent_update_holds().unwrap();
@@ -5737,7 +5757,7 @@ mod tests {
             .iter()
             .find(|hold| hold.blocker.contains(&unbound.agent.id.to_string()))
             .unwrap();
-        assert_eq!(holds.len(), 2);
+        assert_eq!(holds.len(), 1);
         assert_eq!(unbound_hold.session, None);
     }
 

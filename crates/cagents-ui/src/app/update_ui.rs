@@ -24,6 +24,9 @@ pub(super) struct State {
     restarting: bool,
     pub(super) confirmation: Option<crate::update::UpdateConfirmation>,
     submitted_confirmation: Option<String>,
+    /// The waiting chip's label and its shaped width, measured as the wait
+    /// changes rather than on every layout of the tab strip.
+    waiting_chip: Option<(String, f32)>,
     /// The job whose review was set aside to go and deal with a session that
     /// blocks it. Its dialog stays away until nothing blocks any more, or
     /// until the update control asks for it again.
@@ -130,6 +133,11 @@ pub enum Action {
     ShowSession(crate::model::TerminalId),
     CopyDetails,
     CancelApply,
+    /// From the waiting update's popover: review interrupting the
+    /// conversations it still waits for, to update now.
+    InterruptWaiting,
+    /// From the waiting update's popover: give up on the update.
+    CancelWaiting,
     StartApply,
     Applied(Result<UpdateJob, String>),
     ProgressWatch(String, bool),
@@ -291,6 +299,21 @@ fn disposition_tone(disposition: crate::update::impact::Disposition) -> design::
     tone.into()
 }
 
+/// Whether confirming `preview` waits for conversations to become idle, so
+/// its button says so. Only an idle-wait review waits for turns to end: under
+/// interruption a conversation can still wait for a message already on its
+/// way, which takes moments, and confirming updates now.
+fn waits_for_idle(preview: &crate::update::impact::Preview) -> bool {
+    use crate::update::impact::{Disposition, Policy};
+    preview.daemon.as_ref().is_some_and(|daemon| {
+        daemon.policy == Policy::WhenIdle
+            && daemon
+                .sessions
+                .iter()
+                .any(|session| session.disposition == Disposition::WaitsForIdle)
+    })
+}
+
 /// The other way to treat conversations that are mid-turn, when any are.
 fn policy_choice(
     daemon: &crate::update::impact::DaemonImpact,
@@ -336,6 +359,84 @@ fn preview_details(preview: &crate::update::impact::Preview) -> String {
         }
     }
     details
+}
+
+/// The waiting update's header control and the popover it opens.
+pub(super) const WAITING_CONTROL_ID: &str = "application-update";
+const WAITING_CLOSE_ID: &str = "update.waiting.close";
+const WAITING_CANCEL_ID: &str = "update.waiting.cancel";
+pub(super) const WAITING_NOW_ID: &str = "update.waiting.now";
+
+fn waiting_show_id(id: crate::model::TerminalId) -> String {
+    format!("update.waiting.show.{id}")
+}
+
+/// An update the person confirmed that now waits for conversations to finish
+/// their current work: the worker republishes who remains twice a second
+/// while it waits, and each poll brings that here.
+pub(super) struct IdleWait<'a> {
+    pub job: &'a UpdateJob,
+    pub confirmation: &'a crate::update::UpdateConfirmation,
+}
+
+impl IdleWait<'_> {
+    /// Each conversation still waited for, as the review names it, with why.
+    fn remaining(&self) -> Vec<(crate::model::TerminalId, String, String)> {
+        let preview = &self.confirmation.preview;
+        preview
+            .daemon
+            .iter()
+            .flat_map(|daemon| &daemon.sessions)
+            .filter(|session| {
+                session.disposition == crate::update::impact::Disposition::WaitsForIdle
+            })
+            .map(|session| {
+                let review = session.review();
+                (
+                    session.id,
+                    preview
+                        .labels
+                        .names
+                        .get(&session.id)
+                        .cloned()
+                        .unwrap_or(review.title),
+                    review.reason,
+                )
+            })
+            .collect()
+    }
+
+    /// Whether interrupting is a choice still open: the wait is for idle,
+    /// not for a delivery that interrupting cannot hurry.
+    fn can_interrupt(&self) -> bool {
+        self.confirmation.stop.is_none()
+            && self
+                .confirmation
+                .preview
+                .daemon
+                .as_ref()
+                .is_some_and(|daemon| daemon.policy == crate::update::impact::Policy::WhenIdle)
+    }
+
+    /// The header's compact account, which stays readable at a glance.
+    fn label(&self) -> String {
+        match self.remaining().len() {
+            0 => "Update starting".into(),
+            count => format!("Update waiting for {count}"),
+        }
+    }
+
+    /// When the worker stops waiting and gives the update up, as `14:32`.
+    fn gives_up_at(&self) -> Option<String> {
+        // A wait never lasts a day; a clock that says otherwise says nothing.
+        let now = crate::chat::now_ms()?;
+        let expires = self.confirmation.expires_at_unix_ms;
+        if expires <= now || expires - now > 24 * 60 * 60 * 1000 {
+            return None;
+        }
+        let seconds = i64::try_from(expires / 1000).ok()?;
+        crate::chat::local_time(seconds).map(|time| time.clock())
+    }
 }
 
 impl State {
@@ -528,12 +629,7 @@ impl Cagents {
                     .into(),
             );
         }
-        let waits_for_idle = preview.daemon.as_ref().is_some_and(|daemon| {
-            daemon
-                .sessions
-                .iter()
-                .any(|session| session.disposition == Disposition::WaitsForIdle)
-        });
+        let waits_for_idle = waits_for_idle(preview);
         // While something holds the update back, the warning above the list
         // says what, and the update waits until a poll finds it resolved.
         let confirm = crate::ui_controls::button::primary("Update and reopen")
@@ -770,7 +866,231 @@ impl Cagents {
         self.update_update_ui(Action::InspectInstallation)
     }
 
+    /// The update this window watches waiting for conversations to become
+    /// idle, once the person has confirmed it and its review is away.
+    pub(super) fn idle_wait(&self) -> Option<IdleWait<'_>> {
+        let job = self.update_ui.job.as_ref()?;
+        let confirmation = job
+            .active_confirmation()
+            .filter(|_| job.phase == UpdatePhase::WaitingForIdle)?;
+        // A review this window is showing again speaks for itself.
+        if self.update_ui.confirmation.is_some() {
+            return None;
+        }
+        Some(IdleWait { job, confirmation })
+    }
+
+    /// How wide the header's update control is, for the tab strip to leave
+    /// room for it: an icon, or the waiting update's labelled chip.
+    pub(super) fn update_control_width(&self) -> f32 {
+        if !self.has_update_control() {
+            return 0.0;
+        }
+        match self.idle_wait() {
+            Some(wait) => {
+                let label = wait.label();
+                let text = match &self.update_ui.waiting_chip {
+                    Some((measured, width)) if *measured == label => *width,
+                    _ => super::chrome_ui::measure_tab_title(&label),
+                };
+                design::ROW_ICON_SIZE as f32 + space::XS + 2.0 * space::S + text + 4.0
+            }
+            None => design::PRIMARY_CONTROL_SIZE + 4.0,
+        }
+    }
+
+    /// The waiting update's header chip: what it waits for at a glance,
+    /// opening the list and the ways out of the wait.
+    fn waiting_control(&self, wait: &IdleWait<'_>, open: bool) -> Element<'_, Message> {
+        let label = wait.label();
+        let remaining = wait.remaining();
+        let tooltip = if remaining.is_empty() {
+            format!("Updating to {}", wait.job.version)
+        } else {
+            format!(
+                "Updating to {} once these finish their current work:\n{}",
+                wait.job.version,
+                remaining
+                    .iter()
+                    .map(|(_, title, _)| title.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let content = widget::row::with_children(vec![
+            widget::icon(Icon::Update.into())
+                .size(design::ROW_ICON_SIZE)
+                .into(),
+            widget::text(label)
+                .size(design::TEXT_BODY)
+                .line_height(iced::widget::text::LineHeight::Absolute(
+                    design::LINE_BODY.into(),
+                ))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
+        let enabled = !self.modal_is_open();
+        let button = widget::button::custom(
+            widget::container(content)
+                .class(design::transparent())
+                .center_y(Length::Fill),
+        )
+        .name(tooltip.clone())
+        .selected(open)
+        .class(crate::ui_controls::control_style(open, None))
+        .height(design::PRIMARY_CONTROL_SIZE)
+        .padding([0.0, space::S])
+        .id(widget::Id::new(WAITING_CONTROL_ID))
+        .on_press_maybe(enabled.then_some(Message::ChromeUi(chrome_ui::Action::ToggleUpdate)));
+        let button: Element<'_, Message> = if enabled {
+            crate::interaction::hover(button)
+        } else {
+            button.into()
+        };
+        let anchor = if open {
+            button
+        } else {
+            crate::interaction::tooltip(button, tooltip)
+        };
+        crate::ui_controls::popover(
+            anchor,
+            (open && enabled).then(|| self.waiting_popover(wait)),
+            widget::popover::Position::Bottom,
+            Message::ChromeUi(chrome_ui::Action::Close),
+        )
+    }
+
+    /// Who the update still waits for, live, and the two ways out of the
+    /// wait: review interrupting them to update now, or give the update up.
+    fn waiting_popover(&self, wait: &IdleWait<'_>) -> Element<'_, Message> {
+        let remaining = wait.remaining();
+        let heading = widget::row::with_children(vec![
+            design::heading(format!("Update to {} is waiting", wait.job.version))
+                .width(Length::Fill)
+                .into(),
+            crate::ui_controls::icon_button(Icon::Close, "Close")
+                .id(widget::Id::new(WAITING_CLOSE_ID))
+                .on_press(Message::ChromeUi(chrome_ui::Action::Close))
+                .into(),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::S);
+        let summary = match remaining.len() {
+            0 => "Nothing is left to wait for; the update is starting.".to_owned(),
+            1 => "It starts as soon as this conversation finishes its current work. Nothing has been interrupted.".to_owned(),
+            count => format!(
+                "It starts as soon as these {count} conversations finish their current work. Nothing has been interrupted."
+            ),
+        };
+        let mut body = vec![heading.into(), notice_body(summary)];
+        if !remaining.is_empty() {
+            let rows: Vec<Element<'_, Message>> = remaining
+                .into_iter()
+                .map(|(id, title, reason)| -> Element<'_, Message> {
+                    let mut header: Vec<Element<'_, Message>> = vec![
+                        widget::text(title)
+                            .size(design::TEXT_BODY)
+                            .font(design::heading_font())
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                            .width(Length::Fill)
+                            .into(),
+                    ];
+                    if self.session_card(id).is_some() {
+                        header.push(
+                            crate::ui_controls::button::quiet("Show")
+                                .id(widget::Id::new(waiting_show_id(id)))
+                                .on_press(Message::UpdateUi(Action::ShowSession(id)))
+                                .into(),
+                        );
+                    }
+                    widget::column::with_children(vec![
+                        widget::row::with_children(header)
+                            .align_y(Alignment::Center)
+                            .spacing(space::S)
+                            .into(),
+                        notice_detail(reason),
+                    ])
+                    .spacing(space::XXS)
+                    .into()
+                })
+                .collect();
+            body.push(dialog_ui::scrolled_region(
+                widget::column::with_children(rows).spacing(space::S),
+                240.0,
+            ));
+        }
+        if let Some(time) = wait.gives_up_at() {
+            body.push(notice_detail(format!(
+                "If any are still working at {time}, the update stops without installing anything."
+            )));
+        }
+        let mut actions = vec![
+            crate::ui_controls::button::secondary("Cancel update")
+                .id(widget::Id::new(WAITING_CANCEL_ID))
+                .on_press(Message::UpdateUi(Action::CancelWaiting))
+                .into(),
+            iced::widget::Space::new().width(Length::Fill).into(),
+        ];
+        if wait.can_interrupt() && !wait.remaining().is_empty() {
+            // The interruption review that follows names what stops; nothing
+            // is interrupted until it is confirmed there.
+            actions.push(
+                crate::ui_controls::button::primary("Update now…")
+                    .id(widget::Id::new(WAITING_NOW_ID))
+                    .on_press(Message::UpdateUi(Action::InterruptWaiting))
+                    .into(),
+            );
+        }
+        body.push(
+            widget::row::with_children(actions)
+                .align_y(Alignment::Center)
+                .spacing(space::S)
+                .into(),
+        );
+        widget::container(widget::column::with_children(body).spacing(space::M))
+            .padding(6.0)
+            .width(design::NOTICE_POPOVER_WIDTH)
+            .into()
+    }
+
+    /// The waiting popover's controls in the order it draws them.
+    pub(super) fn waiting_focus_ring(&self) -> Vec<std::borrow::Cow<'static, str>> {
+        use std::borrow::Cow;
+        let Some(wait) = self.idle_wait() else {
+            return vec![Cow::Borrowed(WAITING_CONTROL_ID)];
+        };
+        let remaining = wait.remaining();
+        let mut ring = vec![Cow::Borrowed(WAITING_CLOSE_ID)];
+        ring.extend(
+            remaining
+                .iter()
+                .filter(|(id, _, _)| self.session_card(*id).is_some())
+                .map(|(id, _, _)| Cow::Owned(waiting_show_id(*id))),
+        );
+        ring.push(Cow::Borrowed(WAITING_CANCEL_ID));
+        if wait.can_interrupt() && !remaining.is_empty() {
+            ring.push(Cow::Borrowed(WAITING_NOW_ID));
+        }
+        ring
+    }
+
+    /// Answers the waiting update's popover with `choice`, against the
+    /// review the person already confirmed.
+    fn decide_waiting(&mut self, choice: crate::update::UpdateChoice) -> Task<Message> {
+        let Some(confirmation) = self.idle_wait().map(|wait| wait.confirmation.clone()) else {
+            return Task::none();
+        };
+        self.chrome_ui.close();
+        self.update_ui.confirmation = Some(confirmation);
+        self.decide_update(choice)
+    }
+
     pub(super) fn update_control(&self) -> Option<Element<'_, Message>> {
+        if let Some(wait) = self.idle_wait() {
+            return Some(self.waiting_control(&wait, self.update_popup_is_open()));
+        }
         let state = &self.update_ui;
         let mut held_back = None;
         let (icon, label, action) = if state.updating() {
@@ -948,6 +1268,15 @@ impl Cagents {
     pub(super) fn update_update_ui(&mut self, action: Action) -> Task<Message> {
         let asked = self.update_ui.confirmation.is_some();
         let task = self.apply_update_action(action);
+        // A wait that ended, or a review that came up, takes the popover.
+        let task = Task::batch([task, self.reconcile_update_popup()]);
+        let label = self.idle_wait().map(|wait| wait.label());
+        if label.as_ref() != self.update_ui.waiting_chip.as_ref().map(|(label, _)| label) {
+            self.update_ui.waiting_chip = label.map(|label| {
+                let width = super::chrome_ui::measure_tab_title(&label);
+                (label, width)
+            });
+        }
         if asked || self.update_ui.confirmation.is_none() {
             return task;
         }
@@ -1035,6 +1364,7 @@ impl Cagents {
                 // one tab. The job keeps waiting; only its dialog steps aside.
                 self.update_ui.set_aside = self.update_ui.job.as_ref().map(|job| job.id.clone());
                 self.update_ui.confirmation = None;
+                self.chrome_ui.close();
                 let selected =
                     channel.map_or_else(Task::none, |channel| self.navigate_to_channel(channel));
                 Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
@@ -1076,6 +1406,10 @@ impl Cagents {
                 self.decide_update(crate::update::UpdateChoice::Confirm)
             }
             Action::CancelApply => self.decide_update(crate::update::UpdateChoice::Cancel),
+            Action::InterruptWaiting => self.decide_waiting(crate::update::UpdateChoice::Policy(
+                crate::update::impact::Policy::Interrupt,
+            )),
+            Action::CancelWaiting => self.decide_waiting(crate::update::UpdateChoice::Cancel),
             Action::Decided { job, nonce, result } => {
                 if self
                     .update_ui
@@ -1088,6 +1422,12 @@ impl Cagents {
                 }
                 if let Err(error) = result {
                     self.update_ui.submitted_confirmation = None;
+                    // The next poll clears the header's error and may bring
+                    // back the review the choice was made on, so a notice is
+                    // what tells the person it didn't take.
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The update didn't take that choice: {error}"
+                    )));
                     self.update_ui.error = Some(error);
                 }
                 self.apply_update_action(Action::Poll)
@@ -1229,11 +1569,16 @@ impl Cagents {
                         {
                             self.update_ui.set_aside = None;
                         }
-                        let confirmation = job.active_confirmation().filter(|confirmation| {
-                            self.update_ui.submitted_confirmation.as_ref()
-                                != Some(&confirmation.nonce)
-                                && self.update_ui.set_aside.is_none()
-                        });
+                        // A confirmed wait is the header's chip in every
+                        // window, never a review over the work.
+                        let confirmation = job
+                            .active_confirmation()
+                            .filter(|_| job.phase == UpdatePhase::AwaitingConfirmation)
+                            .filter(|confirmation| {
+                                self.update_ui.submitted_confirmation.as_ref()
+                                    != Some(&confirmation.nonce)
+                                    && self.update_ui.set_aside.is_none()
+                            });
                         self.update_ui.review_deferred =
                             confirmation.is_some() && self.other_modal_is_open();
                         self.update_ui.confirmation = confirmation
@@ -2124,6 +2469,129 @@ pub(in crate::app) mod tests {
             in_flight: Vec::new(),
             recorded_by: None,
         }
+    }
+
+    /// After "Update when idle" the review goes away, and the header says the
+    /// update is waiting and for how many. Its popover lists who remains,
+    /// shrinking as each goes idle, and offers updating now through the
+    /// interruption review or cancelling, without a modal over the work.
+    #[test]
+    fn a_confirmed_idle_wait_stays_visible_and_offers_a_way_out() {
+        use crate::update::impact::{Disposition, Policy};
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let confirmation = daemon_preview(vec![
+            session("lead", Disposition::WaitsForIdle),
+            session("ci", Disposition::WaitsForIdle),
+            session("notes", Disposition::Resumes),
+        ]);
+        assert!(waits_for_idle(&confirmation.preview));
+        let mut job = awaiting(&confirmation);
+        let poll = review_ready(&mut app, job.clone());
+        drop(app.update(poll));
+        assert!(app.idle_wait().is_none(), "the review speaks for itself");
+        drop(app.update_update_ui(Action::ConfirmApply(confirmation.nonce.clone())));
+        job.phase = UpdatePhase::WaitingForIdle;
+        let poll = |app: &mut Cagents, job: &UpdateJob| {
+            drop(app.update(Message::UpdateUi(Action::Polled(
+                Some(job.id.clone()),
+                Ok(Some(job.clone())),
+            ))));
+        };
+        poll(&mut app, &job);
+        assert!(
+            app.update_ui.confirmation.is_none(),
+            "the confirmed review stays away"
+        );
+        // Another window, or this one reopened, finds the wait confirmed
+        // already: it shows the same chip, not the review over its work.
+        let mut other = crate::app::tests::context_inspector_test_app(true);
+        let poll_other = review_ready(&mut other, job.clone());
+        drop(other.update(poll_other));
+        assert!(other.update_ui.confirmation.is_none());
+        assert!(!other.modal_is_open());
+        assert_eq!(other.idle_wait().unwrap().label(), "Update waiting for 2");
+        assert_eq!(app.idle_wait().unwrap().label(), "Update waiting for 2");
+        let ids = custom_widget_ids(&mut app.view());
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.as_str() == WAITING_CONTROL_ID)
+                .count(),
+            1,
+            "{ids:?}"
+        );
+
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleUpdate)));
+        assert!(app.update_popup_is_open());
+        assert!(!app.modal_is_open(), "waiting blocks no work");
+        assert_eq!(
+            app.waiting_focus_ring(),
+            [WAITING_CLOSE_ID, WAITING_CANCEL_ID, WAITING_NOW_ID]
+        );
+
+        // One finishes its turn: the list shrinks where the person is looking.
+        job.confirmation
+            .as_mut()
+            .unwrap()
+            .preview
+            .daemon
+            .as_mut()
+            .unwrap()
+            .sessions[0]
+            .disposition = Disposition::Resumes;
+        poll(&mut app, &job);
+        assert!(app.update_popup_is_open());
+        let wait = app.idle_wait().unwrap();
+        assert_eq!(wait.label(), "Update waiting for 1");
+        assert_eq!(
+            wait.remaining()
+                .into_iter()
+                .map(|(_, title, _)| title)
+                .collect::<Vec<_>>(),
+            ["ci"]
+        );
+
+        // Updating now asks the worker for the interruption review, against
+        // the review already confirmed, and leaves the popover for it.
+        drop(app.update(Message::UpdateUi(Action::InterruptWaiting)));
+        assert!(!app.update_popup_is_open());
+        assert_eq!(
+            app.update_ui.submitted_confirmation.as_ref(),
+            Some(&confirmation.nonce)
+        );
+        assert!(app.update_ui.confirmation.is_none());
+        // A choice the worker refuses says so rather than vanishing with the
+        // next poll.
+        drop(app.update_update_ui(Action::Decided {
+            job: job.id.clone(),
+            nonce: confirmation.nonce.clone(),
+            result: Err("This review expired".into()),
+        }));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.contains("This review expired")),
+            "{:?}",
+            app.status.as_ref().map(|notice| &notice.message)
+        );
+
+        // The interruption review that follows updates now: its button
+        // doesn't promise a wait, even for a delivery still on its way.
+        let mut interrupt = job.confirmation.clone().unwrap();
+        interrupt.preview.daemon.as_mut().unwrap().policy = Policy::Interrupt;
+        assert!(!waits_for_idle(&interrupt.preview));
+
+        // A wait that moves on takes its popover with it.
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleUpdate)));
+        assert!(app.update_popup_is_open());
+        job.phase = UpdatePhase::ClosingWindows;
+        poll(&mut app, &job);
+        assert!(app.idle_wait().is_none());
+        assert!(!app.update_popup_is_open());
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleUpdate)));
+        assert!(
+            !app.update_popup_is_open(),
+            "nothing to open once it moved on"
+        );
     }
 
     /// A blocked review offers no update: confirming it from a window would

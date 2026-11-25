@@ -20,8 +20,11 @@ pub enum SessionKind {
     NativeChat,
 }
 
-/// A conversation has messages accepted for it but not yet delivered. They
-/// cannot be carried through an update, so it waits under either policy.
+/// A conversation has a delivery in flight: a run its dispatcher claimed but
+/// the provider hasn't started, which is never redispatched after a restart,
+/// so it waits under either policy. Daemons before the line that carries
+/// unsent runs also send it for runs still queued. The words stay as they are
+/// because those daemons send them; the review shows its own.
 pub const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
 /// A source refuses to carry a conversation whose provider stopped without
 /// confirming its work settled, and asks for it to be closed. Every source
@@ -172,7 +175,7 @@ impl SessionImpact {
             Disposition::WaitsForIdle => {
                 let tasks = self.interrupted_subagents.len();
                 if self.reason == SessionCause::PendingDelivery {
-                    "Messages sent to it are still waiting to be delivered; the update waits for them.".into()
+                    "Messages sent to it are still being delivered; the update waits for them.".into()
                 } else if tasks == 0 {
                     "Finishing its turn; the update waits.".into()
                 } else {
@@ -950,6 +953,26 @@ impl Preview {
             blockers: daemon.review_notices(),
             expired: false,
         })
+    }
+
+    /// The conversations an idle wait still waits for, each named as the
+    /// review names it, in the review's order.
+    pub fn waiting_for_idle(&self) -> Vec<(TerminalId, String)> {
+        self.daemon
+            .iter()
+            .flat_map(|daemon| &daemon.sessions)
+            .filter(|session| session.disposition == Disposition::WaitsForIdle)
+            .map(|session| {
+                (
+                    session.id,
+                    self.labels
+                        .names
+                        .get(&session.id)
+                        .unwrap_or(&session.title)
+                        .clone(),
+                )
+            })
+            .collect()
     }
 
     pub(super) fn with_inspection(

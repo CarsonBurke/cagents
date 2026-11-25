@@ -3517,7 +3517,8 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         handle.check_update_readiness().unwrap(),
         chat::runtime::UpdateReadiness::Busy
     );
-    let mut state = test_host();
+    let host = Arc::new(HostLock::new(test_host()));
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let session = chat::Session {
         id: TerminalId::new(),
         native_continuity: Default::default(),
@@ -3588,8 +3589,93 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         interrupt.sessions[0].identity
     );
     assert!(interrupt.preserves_consent(&elsewhere));
-    // Messages accepted for it but not yet delivered cannot survive a restart:
-    // the update waits for them under either policy, attributed to this
+    // A busy lead holds its team's messages queued unsent until its turn
+    // ends. They are durable and the successor's courier delivers them, so
+    // they hold nothing: interruption updates now, and an idle wait waits
+    // only for the turn, not for deliveries that start another one.
+    {
+        use crate::agent_execution::{
+            Destination, HostedSession, Origin, Spec, Submit, Surface, Target, Update,
+        };
+        let mut registry =
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let repository = directory.path().to_owned();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        let submit = |destination, key: &str| Submit {
+            name: None,
+            destination,
+            prompt: "fixture".into(),
+            idempotency_key: key.into(),
+        };
+        let lead = registry
+            .submit_agent(
+                &Origin::User,
+                &submit(
+                    Destination::New(Spec {
+                        provider: Provider::Claude,
+                        account: None,
+                        target: Target {
+                            repository: repository.clone(),
+                            directory: repository,
+                            placement: None,
+                        },
+                        surface: Surface::Chat,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    "lead",
+                ),
+                1,
+            )
+            .unwrap();
+        let hosted = HostedSession::Chat(state.chats[&interrupt.sessions[0].id].session.clone());
+        registry
+            .reserve_agent_launch(lead.agent.id, &hosted)
+            .unwrap();
+        registry.bind_agent(lead.agent.id, None, hosted).unwrap();
+        registry
+            .update_agent_run(
+                lead.run.id,
+                lead.run.revision,
+                Update::Started {
+                    provider_key: "turn".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let message = registry
+            .submit_agent(
+                &Origin::User,
+                &submit(Destination::Existing(lead.agent.id), "from-a-child"),
+                3,
+            )
+            .unwrap();
+        assert!(registry.agent_run_is_queued(message.run.id).unwrap());
+        state.install_model(registry);
+    }
+    drop(state);
+    for (policy, disposition) in [
+        (Policy::Interrupt, Disposition::Interrupted),
+        (Policy::WhenIdle, Disposition::WaitsForIdle),
+    ] {
+        let impact = update::inspect(&host, policy, false).unwrap();
+        assert!(impact.blockers.is_empty(), "{:?}", impact.blockers);
+        assert_eq!(impact.sessions[0].disposition, disposition);
+        assert_ne!(
+            impact.sessions[0].reason,
+            crate::update::impact::SessionCause::PendingDelivery
+        );
+    }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    // A delivery already in flight is never redispatched after a restart:
+    // the update waits for it under either policy, attributed to this
     // conversation rather than to an anonymous blocker.
     for policy in [Policy::WhenIdle, Policy::Interrupt] {
         let queued = state
@@ -3600,7 +3686,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         assert!(queued.sessions[0].interrupted_subagents.is_empty());
         // The review shows why it waits, not that it is finishing a turn.
         let shown = queued.sessions[0].review().reason;
-        assert!(shown.contains("still waiting to be delivered"), "{shown}");
+        assert!(shown.contains("still being delivered"), "{shown}");
     }
     let capability = state.shutdown_preflight(now).unwrap().capability;
     assert_eq!(capability.background_subagents, 1);

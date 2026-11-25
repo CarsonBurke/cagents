@@ -814,6 +814,56 @@ impl TerminalReview for NativeTerminalReview {
     }
 }
 
+/// What a terminal says as an idle wait progresses: the conversations it
+/// waits for when it starts, then each one as it becomes idle and how many
+/// remain, so a long wait shows it is still moving and on what.
+fn idle_wait_progress(
+    previous: Option<&Vec<(crate::model::TerminalId, String)>>,
+    current: &[(crate::model::TerminalId, String)],
+) -> Option<String> {
+    let names = |items: &[(crate::model::TerminalId, String)]| {
+        items
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
+    let Some(previous) = previous.filter(|previous| !previous.is_empty()) else {
+        return (!current.is_empty()).then(|| {
+            format!(
+                "Waiting for these conversations to finish their current work:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.\n",
+                names(current)
+            )
+        });
+    };
+    let held = |items: &[(crate::model::TerminalId, String)], id| {
+        items.iter().any(|(other, _)| *other == id)
+    };
+    let mut progress = String::new();
+    for (id, name) in previous {
+        if !held(current, *id) {
+            progress.push_str(&format!("{name} is idle.\n"));
+        }
+    }
+    let joined: Vec<_> = current
+        .iter()
+        .filter(|(id, _)| !held(previous, *id))
+        .cloned()
+        .collect();
+    if !joined.is_empty() {
+        progress.push_str(&format!("Also waiting for:\n  {}\n", names(&joined)));
+    }
+    if progress.is_empty() {
+        return None;
+    }
+    match current.len() {
+        0 => {}
+        1 => progress.push_str(&format!("Still waiting for {}.\n", current[0].1)),
+        count => progress.push_str(&format!("Still waiting for {count} conversations.\n")),
+    }
+    Some(progress)
+}
+
 fn drive_terminal_review_with(
     initial: UpdateJob,
     yes: bool,
@@ -878,30 +928,11 @@ fn drive_terminal_review_with(
             }
         } else if let Some(confirmation) = job.active_confirmation() {
             if job.phase == UpdatePhase::WaitingForIdle {
-                let labels: Vec<_> = confirmation
-                    .preview
-                    .daemon
-                    .iter()
-                    .flat_map(|daemon| &daemon.sessions)
-                    .filter(|item| item.disposition == impact::Disposition::WaitsForIdle)
-                    .map(|item| {
-                        confirmation
-                            .preview
-                            .labels
-                            .names
-                            .get(&item.id)
-                            .unwrap_or(&item.title)
-                            .clone()
-                    })
-                    .collect();
-                if !labels.is_empty() && waiting.as_ref() != Some(&labels) {
-                    writeln!(
-                        terminal,
-                        "Waiting for these conversations to finish their current work:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
-                        labels.join("\n  ")
-                    )?;
-                    waiting = Some(labels);
+                let labels = confirmation.preview.waiting_for_idle();
+                if let Some(progress) = idle_wait_progress(waiting.as_ref(), &labels) {
+                    write!(terminal, "{progress}")?;
                 }
+                waiting = Some(labels);
                 // Approval belongs to this review, even if a worker republishes
                 // it with a fresh nonce during its cancellable idle wait.
                 submitted.insert(confirmation.nonce.clone());
@@ -3780,6 +3811,45 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_idle_wait_names_each_conversation_as_it_becomes_idle() {
+        use crate::model::TerminalId;
+        let [lead, review, build] = [(); 3].map(|()| TerminalId::new());
+        let named = |items: &[(TerminalId, &str)]| {
+            items
+                .iter()
+                .map(|(id, name)| (*id, (*name).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let all = named(&[(lead, "lead"), (review, "review"), (build, "build")]);
+        let started = idle_wait_progress(None, &all).unwrap();
+        assert!(started.starts_with(
+            "Waiting for these conversations to finish their current work:\n  lead\n  review\n  build\n"
+        ));
+        assert!(started.contains("Ctrl-C cancels the update"));
+        // An unchanged list says nothing more.
+        assert_eq!(idle_wait_progress(Some(&all), &all), None);
+        let two = named(&[(lead, "lead"), (build, "build")]);
+        assert_eq!(
+            idle_wait_progress(Some(&all), &two).unwrap(),
+            "review is idle.\nStill waiting for 2 conversations.\n"
+        );
+        let one = named(&[(lead, "lead")]);
+        assert_eq!(
+            idle_wait_progress(Some(&two), &one).unwrap(),
+            "build is idle.\nStill waiting for lead.\n"
+        );
+        let joined = named(&[(lead, "lead"), (review, "review")]);
+        assert_eq!(
+            idle_wait_progress(Some(&one), &joined).unwrap(),
+            "Also waiting for:\n  review\nStill waiting for 2 conversations.\n"
+        );
+        assert_eq!(
+            idle_wait_progress(Some(&one), &[]).unwrap(),
+            "lead is idle.\n"
+        );
+    }
+
     #[test]
     fn only_an_update_that_kept_the_daemon_puts_the_previous_build_back() {
         // A daemon kept by earlier updates still runs from its own version.

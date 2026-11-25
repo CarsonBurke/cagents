@@ -11,15 +11,17 @@ pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
     // still holds it back: replacing a blocked review with one whose blocker
     // cleared shows the update becoming available. A review that has ended
     // has nothing left to decide.
-    let review = job.phase == UpdatePhase::AwaitingConfirmation
-        && job
-            .active_confirmation()
-            .is_some_and(|confirmation| confirmation.preview.daemon.is_some());
+    let review = matches!(
+        job.phase,
+        UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
+    ) && job
+        .active_confirmation()
+        .is_some_and(|confirmation| confirmation.preview.daemon.is_some());
     let status = (job.phase == UpdatePhase::Installing || job.phase.is_terminal())
         && job.confirmation.is_none();
     if job.id != "fixture-update-review" || !(review || status) {
         return Err(invalid(
-            "update fixture must show terminal service review, installation or completion, and be read-only",
+            "update fixture must show terminal service review, an idle wait, installation or completion, and be read-only",
         ));
     }
     Ok(Some(job))
@@ -130,6 +132,23 @@ mod tests {
             read(root.path()).unwrap().unwrap().phase,
             UpdatePhase::Installing
         );
+        // A confirmed update waiting for conversations to become idle, which
+        // the header shows, can no more decide anything than the review.
+        let waiting: UpdateJob =
+            serde_json::from_str(include_str!("../../tests/fixtures/update-waiting.json")).unwrap();
+        publish(&waiting);
+        let loaded = read(root.path()).unwrap().unwrap();
+        assert_eq!(loaded.phase, UpdatePhase::WaitingForIdle);
+        assert_eq!(
+            loaded
+                .active_confirmation()
+                .unwrap()
+                .preview
+                .waiting_for_idle()
+                .len(),
+            3
+        );
+        refuses_decisions(&loaded);
     }
 
     #[test]
