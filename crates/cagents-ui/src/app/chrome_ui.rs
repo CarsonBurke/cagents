@@ -1717,13 +1717,15 @@ mod tests {
                     }),
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                    Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+                    Event::Keyboard(keyboard::Event::ModifiersChanged(
+                        keyboard::Modifiers::COMMAND,
+                    )),
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Character("a".into()),
                         modified_key: keyboard::Key::Character("a".into()),
                         physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
                         location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::CTRL,
+                        modifiers: keyboard::Modifiers::COMMAND,
                         text: None,
                         repeat: false,
                     }),
@@ -3495,7 +3497,7 @@ impl Cagents {
             .density(cosmic::cosmic_theme::Density::Compact)
             .focused(focused)
             .maximized(self.core.window.is_maximized)
-            .sharp_corners(self.core.window.sharp_corners)
+            .sharp_corners(self.window_corners_sharp())
             .start(start)
             .on_drag(Message::NativeWindowAction(cosmic::app::Action::Drag))
             .on_double_click(Message::NativeWindowAction(cosmic::app::Action::Maximize))
@@ -3525,12 +3527,19 @@ impl Cagents {
         // resize border.
         let inset = if window_controls {
             self.trailing_edge_inset()
+                .max(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing))
         } else {
             0.0
         };
+        // The header starts where the traffic lights end, should they reach
+        // past the projects pane.
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
-            .padding(Padding::ZERO.right(inset))
+            .padding(
+                Padding::ZERO
+                    .left(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading))
+                    .right(inset),
+            )
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
             .into()
@@ -3565,6 +3574,8 @@ impl Cagents {
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
             - self.workspace_header_width()
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading)
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing)
             - design::PRIMARY_CONTROL_SIZE
             - space::XXS)
             .max(0.0);

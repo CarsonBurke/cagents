@@ -98,7 +98,7 @@ sha2 = "0.10"
 servo = { version = "=0.1.3", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", default-features = false, features = ["baked-in-resources", "js_jit"], optional = true }
 thiserror = "2.0"
 tempfile = "3.21"
-tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 toml = { version = "1.1.4", features = ["preserve_order"] }
@@ -112,9 +112,21 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c255
 # These system-backed protocols belong only to the integrated Linux browser.
 wayland-client = { version = "=0.31.15", features = ["system"], optional = true }
 wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
-# macOS has no XDG portal, so libcosmic's file dialogs use the native panels.
 [target.'cfg(target_os = "macos")'.dependencies]
+# macOS has no XDG portal, so libcosmic's file dialogs use the native panels.
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["rfd"] }
+# The main window's AppKit conventions: an application delegate that routes
+# Quit through the window, the Window menu, Control-click as a secondary click
+# and the traffic lights' measured place. winit already links these exact
+# versions and every AppKit class named here. winit leaves off app-kit's
+# `block2` feature, for the event monitor's handler, and the Quartz event
+# functions: AppKit numbers a mouse event's button only from its Quartz
+# event, so a Control-click becomes a secondary click there.
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-graphics", "NSApplication", "NSButton", "NSControl", "NSEvent", "NSGraphicsContext", "NSMenu", "NSMenuItem", "NSResponder", "NSView", "NSWindow"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSGeometry", "NSString"] }
 
 [dev-dependencies]
 # The shared library's test fixtures, which the UI's tests also use.

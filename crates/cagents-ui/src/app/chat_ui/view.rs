@@ -751,15 +751,21 @@ fn submit_control(
     enter_sends: bool,
     unsendable: Option<blocked_recovery::Unsendable>,
 ) -> (Icon, String) {
-    let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
+    let command = crate::settings::ModifierNames::CURRENT.primary;
+    let primary = if enter_sends {
+        "Enter".to_owned()
+    } else {
+        format!("{command}+Enter")
+    };
+    let alternate = format!("{command}+Shift+Enter");
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
         (PromptMode::Steer, 0) => (Icon::Send, "Steer the active turn", primary),
-        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", alternate),
         (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
-        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", alternate),
     };
-    let tail = unsendable.map_or(chord, |unsendable| unsendable.reason);
+    let tail = unsendable.map_or(chord.as_str(), |unsendable| unsendable.reason);
     (name, format!("{verb} — {tail}"))
 }
 /// The submit mode a composer key press asks for, or `None` when the press is
@@ -1125,29 +1131,19 @@ fn submit_chord(
 /// The editing binding for a word-wise delete chord, or `None` for any other
 /// press.
 ///
-/// The default bindings map Ctrl+Backspace to deleting one character, so the
-/// chord every other text field on the desktop uses to remove a word silently
-/// did the same thing as Backspace alone. Selecting the word first and then
-/// deleting the selection is how the editor already removes a range, so this
-/// needs no new editing primitive. Ctrl+Delete is included because the two
-/// directions are one habit.
+/// The default bindings map Ctrl+Backspace (Option+Backspace on macOS) to
+/// deleting one character, so the chord every other text field on the
+/// desktop uses to remove a word silently did the same thing as Backspace
+/// alone. Selecting the word first and then deleting the selection is how the
+/// editor already removes a range, so this needs no new editing primitive.
+/// Delete is included because the two directions are one habit, and on macOS
+/// Command deletes to the line's edge, as it does in every Mac text field.
 fn word_delete(press: &text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
-    if !matches!(press.status, text_editor::Status::Focused { .. })
-        || !press.modifiers.command()
-        || press.modifiers.alt()
-        || press.modifiers.shift()
-    {
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
     }
-    let motion = match press.key {
-        keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-            iced::advanced::text::editor::Motion::WordLeft
-        }
-        keyboard::Key::Named(keyboard::key::Named::Delete) => {
-            iced::advanced::text::editor::Motion::WordRight
-        }
-        _ => return None,
-    };
+    let motion =
+        crate::repository_widget::text_editor::deletion_motion(press.modifiers, &press.key)?;
     Some(text_editor::Binding::Sequence(vec![
         text_editor::Binding::Select(motion),
         text_editor::Binding::Backspace,

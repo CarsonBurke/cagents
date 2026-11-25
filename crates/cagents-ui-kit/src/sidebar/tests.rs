@@ -4989,7 +4989,7 @@ fn cached_sidebar_project_submenu_opens_over_expanded_rows_at_label_and_arrow() 
             false,
             navigation,
             &shortcuts,
-            false,
+            WindowCorner::default(),
         );
         let mut ui = UserInterface::build(
             widget::row::with_children(vec![
@@ -5193,7 +5193,7 @@ fn interface<'a>(
             false,
             navigation,
             &crate::settings::KeyboardShortcuts::default(),
-            false,
+            WindowCorner::default(),
         ),
         bounds,
         cache,
@@ -8557,6 +8557,65 @@ fn project_header_actions_are_independent_and_attention_can_be_cleared() {
 }
 
 #[test]
+fn the_first_row_leaves_the_window_controls_their_corner() {
+    use cosmic::iced::advanced::widget::Operation;
+    struct Find(widget::Id, Option<Rectangle>);
+    impl Operation for Find {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: Rectangle,
+            _: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+        ) {
+            if id == Some(&self.0) {
+                self.1 = Some(bounds);
+            }
+        }
+    }
+    let renderer = headless_renderer();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    // The row's first control: settings in the expanded row, and the
+    // projects toggle atop the rail.
+    let first = |compact: bool, controls: Option<WindowControls>| {
+        // Padded as the pane pads it.
+        let mut element = Element::from(
+            widget::container(utilities(compact, false, &shortcuts, controls))
+                .padding([0.0, space::XS]),
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(EXPANDED_WIDTH_MIN, 400.0)),
+        );
+        let id = if compact {
+            Id::new("command.toggle-projects")
+        } else {
+            stable_id("settings")
+        };
+        let mut found = Find(id, None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut found);
+        found.1.expect("the row's first control is laid out")
+    };
+    let controls = WindowControls {
+        width: 76.0,
+        height: 30.0,
+        edge: WindowControlsEdge::Leading,
+    };
+    let (bare, kept) = (first(false, None), first(false, Some(controls)));
+    assert!(bare.x < controls.width, "{bare:?}");
+    assert_eq!((kept.x, kept.y), (controls.width, bare.y));
+    let (bare, kept) = (first(true, None), first(true, Some(controls)));
+    assert!(bare.y < controls.height, "{bare:?}");
+    assert_eq!((kept.x, kept.y), (bare.x, controls.height));
+}
+
+#[test]
 fn projects_header_keeps_its_title_and_controls_within_the_minimum_width() {
     let renderer = headless_renderer();
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
@@ -8587,7 +8646,7 @@ fn projects_header_keeps_its_title_and_controls_within_the_minimum_width() {
             assert!(child.bounds().x + child.bounds().width <= width);
         }
         assert!(
-            accessible_names(&renderer, utilities(false, false, &shortcuts))
+            accessible_names(&renderer, utilities(false, false, &shortcuts, None))
                 .contains(&"Toggle Projects sidebar — Alt+B".to_owned())
         );
     }
@@ -12714,7 +12773,7 @@ fn sidebar_worktree_and_tab_headers_share_the_same_separator_baseline() {
             false,
             None,
             &shortcuts,
-            false,
+            WindowCorner::default(),
         ),
         file_panel(&model, &state, width, false),
         git_panel(&model, &state, width, false),

@@ -1552,7 +1552,11 @@ impl Gallery {
             command(
                 Icon::Copy,
                 "Copy",
-                "Copy image (Ctrl+C)",
+                if cfg!(target_os = "macos") {
+                    "Copy image (Cmd+C)"
+                } else {
+                    "Copy image (Ctrl+C)"
+                },
                 image.map(|image| Action::Image(image, ImageCommand::Copy)),
             ),
             command(
@@ -1614,10 +1618,15 @@ impl Gallery {
             toolbar.into(),
             label,
             canvas,
-            design::caption(if self.entries.len() > 1 {
-                "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
-            } else {
-                "Scroll to zoom · Drag to pan · Ctrl+C to copy"
+            design::caption(match (self.entries.len() > 1, cfg!(target_os = "macos")) {
+                (true, true) => {
+                    "Scroll to zoom · Drag to pan · Left / Right to browse · Cmd+C to copy"
+                }
+                (true, false) => {
+                    "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
+                }
+                (false, true) => "Scroll to zoom · Drag to pan · Cmd+C to copy",
+                (false, false) => "Scroll to zoom · Drag to pan · Ctrl+C to copy",
             })
             .into(),
         ]
@@ -1836,12 +1845,13 @@ impl Cagents {
                 // Stepping through the gallery changes only the viewer.
                 Some((read, Projection::Unchanged))
             }
-            // Layout-independent, like the other Ctrl chords.
+            // Layout-independent, like the other primary-modifier chords.
             Key::Character(_)
-                if modifiers.command()
-                    && !modifiers.shift()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
+                if crate::settings::primary_alone(
+                    modifiers.control(),
+                    modifiers.alt(),
+                    modifiers.logo(),
+                ) && !modifiers.shift()
                     && key
                         .to_latin(*physical_key)
                         .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>

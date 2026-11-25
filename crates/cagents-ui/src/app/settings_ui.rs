@@ -619,7 +619,11 @@ fn settings_category_controls<'a>(
                 vec![
                     crate::settings_widgets::toggle(
                         "Enter sends a chat message",
-                        "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
+                        if cfg!(target_os = "macos") {
+                            "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Cmd+Enter."
+                        } else {
+                            "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter."
+                        },
                         draft.chat_enter_sends,
                         |enabled| Message::SettingsChanged {
                             field: SettingsField::ChatEnterSends,
@@ -711,7 +715,11 @@ fn settings_category_controls<'a>(
         SettingsCategory::Editor => vec![
             settings_group(
                 "Font",
-                "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
+                if cfg!(target_os = "macos") {
+                            "Leave a field blank to follow the terminal font. Cmd+=, Cmd+− and Cmd+0 zoom the focused editor or terminal."
+                        } else {
+                            "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal."
+                        },
                 vec![
                     setting_input(
                         "Monospace font family, or blank to follow the terminal.",
@@ -992,7 +1000,11 @@ fn settings_category_controls<'a>(
                 .label_in_control(),
                 settings_choice(
                     "Open links in",
-                    "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it.",
+                    if cfg!(target_os = "macos") {
+                            "Regular clicks use this destination. Cmd+click and Cmd+Shift+click override it."
+                        } else {
+                            "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it."
+                        },
                     SettingsField::LinkOpenDestination,
                     [
                         (
@@ -1013,12 +1025,20 @@ fn settings_category_controls<'a>(
                     SettingsField::LinkOpenGesture,
                     [
                         (
-                            "Ctrl+Click",
+                            if cfg!(target_os = "macos") {
+                            "Cmd+Click"
+                        } else {
+                            "Ctrl+Click"
+                        },
                             LinkOpenGesture::ControlClick.as_str(),
                             draft.link_open_gesture == LinkOpenGesture::ControlClick,
                         ),
                         (
-                            "Ctrl+Shift+Click",
+                            if cfg!(target_os = "macos") {
+                            "Cmd+Shift+Click"
+                        } else {
+                            "Ctrl+Shift+Click"
+                        },
                             LinkOpenGesture::ControlShiftClick.as_str(),
                             draft.link_open_gesture == LinkOpenGesture::ControlShiftClick,
                         ),
@@ -2187,6 +2207,9 @@ mod keyboard_table_tests {
         }
     }
 
+    // Spelled from the Linux table.
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn key_filter_includes_fixed_rows_and_all_matching_registered_actions() {
         let mut draft = SettingsDraft::from_settings(&AppSettings::default());

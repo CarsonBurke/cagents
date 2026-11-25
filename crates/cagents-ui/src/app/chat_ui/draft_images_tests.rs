@@ -620,7 +620,7 @@ fn the_focused_composer_takes_undo_and_redo_chords() {
         text: None,
         repeat: false,
     };
-    let control = keyboard::Modifiers::CTRL;
+    let control = keyboard::Modifiers::COMMAND;
     let takes = |app: &Cagents, event, redo: bool| {
         let messages = composer_key_messages(app, card, 720.0, event, &renderer);
         assert!(
@@ -1046,9 +1046,9 @@ fn undo_and_redo_chords_reach_the_workspace_when_the_message_has_no_step() {
         physical_key: Physical::Code(Code::KeyZ),
         location: keyboard::Location::Standard,
         modifiers: if shift {
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT
         } else {
-            keyboard::Modifiers::CTRL
+            keyboard::Modifiers::COMMAND
         },
         text: None,
         repeat: false,
@@ -1088,7 +1088,7 @@ fn copy_and_cut_chords_note_what_the_composer_copies() {
                     modified_key: keyboard::Key::Character(character.into()),
                     physical_key: Physical::Code(code),
                     location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::CTRL,
+                    modifiers: keyboard::Modifiers::COMMAND,
                     text: None,
                     repeat: false,
                 },

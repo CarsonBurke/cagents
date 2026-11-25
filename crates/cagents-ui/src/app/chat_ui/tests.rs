@@ -616,7 +616,7 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
         modified_key: keyboard::Key::Character("с".into()),
         physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
         location: keyboard::Location::Standard,
-        modifiers: keyboard::Modifiers::CTRL,
+        modifiers: keyboard::Modifiers::COMMAND,
         text: None,
         repeat,
     };

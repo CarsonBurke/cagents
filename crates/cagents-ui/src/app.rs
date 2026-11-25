@@ -36,6 +36,8 @@ mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+#[cfg(target_os = "macos")]
+mod macos_window;
 mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
@@ -3031,10 +3033,8 @@ fn is_save_press(event: &keyboard::Event) -> bool {
             repeat: false,
             ..
         } if key.eq_ignore_ascii_case("s")
-            && modifiers.control()
-            && !modifiers.alt()
+            && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && !modifiers.shift()
-            && !modifiers.logo()
     )
 }
 
@@ -3051,10 +3051,10 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     else {
         return None;
     };
-    if modifiers.logo() || modifiers.shift() {
+    if modifiers.shift() {
         return None;
     }
-    if modifiers.control() && !modifiers.alt() {
+    if settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
         return match key
             .to_latin(*physical_key)
             .map(|key| key.to_ascii_lowercase())
@@ -3063,6 +3063,9 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
             Some('r') => Some(Message::BrowserReload(card)),
             _ => None,
         };
+    }
+    if modifiers.logo() {
+        return None;
     }
     match key.as_ref() {
         Key::Named(Named::ArrowLeft) if modifiers.alt() && !modifiers.control() => {
@@ -5174,6 +5177,9 @@ pub enum Message {
         result: Result<SettingsSaved, String>,
     },
     StartupWindowOpened(window::Id),
+    /// The traffic lights' extent in points, or `None` if AppKit drew none.
+    #[cfg(target_os = "macos")]
+    WindowControlsMeasured(Option<sidebar::WindowControls>),
     StartupReported(Result<(), String>),
     VerifyStartupPanes,
     StartupStateInspected(startup_gate::Inspection),
@@ -6154,6 +6160,10 @@ pub struct Cagents {
     /// Whether the compositor reports the main window's right edge as tiled,
     /// so the shell offers no resize border there.
     right_edge_tiled: bool,
+    /// Where macOS draws the traffic lights over the window's top-left
+    /// corner, in points, once measured. Other systems draw no controls
+    /// there.
+    window_controls_points: Option<sidebar::WindowControls>,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -7295,6 +7305,12 @@ impl Cagents {
         }
     }
 
+    /// Whether the window's outer corners are drawn square: always on macOS,
+    /// where AppKit rounds and clips a titled window itself.
+    pub(super) fn window_corners_sharp(&self) -> bool {
+        cfg!(target_os = "macos") || self.core.window.sharp_corners
+    }
+
     /// The trailing inset that keeps the interface out of the window's resize
     /// border.
     ///
@@ -7303,11 +7319,46 @@ impl Cagents {
     /// reaches a widget. Panes put their scrollbars at their right edge, so the
     /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
     /// fullscreen and right-tiled windows have no border there and stay flush.
+    ///
+    /// macOS has no such border: AppKit resizes the window from its frame.
     fn window_edge_inset(&self) -> f32 {
-        if self.window_filled || self.right_edge_tiled {
+        if cfg!(target_os = "macos") || self.window_filled || self.right_edge_tiled {
             0.0
         } else {
             design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
+        }
+    }
+
+    /// The traffic lights' extent in layout units, which interface scaling
+    /// makes larger than AppKit's points.
+    fn window_controls(&self) -> Option<sidebar::WindowControls> {
+        self.window_controls_points
+            .map(|controls| sidebar::WindowControls {
+                width: controls.width / self.settings.ui_scale,
+                height: controls.height / self.settings.ui_scale,
+                ..controls
+            })
+    }
+
+    /// How far the traffic lights reach into the header holding the window
+    /// controls from its `edge`: past the projects pane, as they do beside
+    /// the compact rail, from the leading edge, and their whole width from
+    /// the trailing edge, where a right-to-left system puts them.
+    pub(super) fn window_controls_reach(&self, edge: sidebar::WindowControlsEdge) -> f32 {
+        let Some(controls) = self
+            .window_controls()
+            .filter(|controls| controls.edge == edge)
+        else {
+            return 0.0;
+        };
+        match edge {
+            sidebar::WindowControlsEdge::Leading => (controls.width
+                - sidebar::effective_width(
+                    self.projects_sidebar_mode(),
+                    self.settings.sidebar_width,
+                ))
+            .max(0.0),
+            sidebar::WindowControlsEdge::Trailing => controls.width,
         }
     }
 
@@ -8120,6 +8171,10 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(_)) => workspace_widget::FocusedPane::Browser {
+                inspector: self.pane_has_inspector(card),
+            },
             _ if !self.pane_has_inspector(card) => workspace_widget::FocusedPane::NoInspector,
             _ => workspace_widget::FocusedPane::Other,
         }
@@ -8583,9 +8638,10 @@ impl Cagents {
     }
 
     fn open_clicked_link(&mut self, url: Url) -> Task<Message> {
+        // Ctrl+click on Linux, Command+click on macOS.
         let gesture =
             self.keyboard_modifiers
-                .control()
+                .command()
                 .then_some(if self.keyboard_modifiers.shift() {
                     LinkOpenGesture::ControlShiftClick
                 } else {
@@ -10899,10 +10955,8 @@ impl Cagents {
                 modifiers,
                 ..
             } = &event
-            && modifiers.control()
+            && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && modifiers.shift()
-            && !modifiers.alt()
-            && !modifiers.logo()
             && key.eq_ignore_ascii_case("s")
             && let Some(card) = self.workspace.focused()
             && !self.pane_content_inputs_blocked(card)
@@ -15342,6 +15396,8 @@ impl Cagents {
         // wait for its window anyway: the close is saved, so an answer it
         // does not hear is asked for again, and reported, at the next launch.
         let chats_closed = !self.chat_ui.closing_in_background();
+        #[cfg(target_os = "macos")]
+        macos_window::exit_began();
         self.exit = Some(ApplicationExit {
             closing: close.as_ref().map(|(window, _)| *window),
             servers_reaped: false,
@@ -16620,8 +16676,23 @@ impl Application for Cagents {
         std::thread::spawn(chat_ui::prune_pasted_images);
         // Before any system theme is applied, so none shows the stock warning.
         cosmic::theme::adjust_system_themes(crate::settings::attention_in_yellow);
+        // Before anything is shaped: no text may select a face swash cannot shape.
+        let unusable_faces = crate::terminal::drop_faces_without_advances();
+        if unusable_faces > 0 {
+            tracing::info!(
+                unusable_faces,
+                "Left out installed fonts that declare no advances"
+            );
+        }
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
+        // AppKit draws these as the traffic lights.
+        #[cfg(target_os = "macos")]
+        {
+            core.window.show_close = false;
+            core.window.show_maximize = false;
+            core.window.show_minimize = false;
+        }
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
         let Bootstrap {
@@ -16811,6 +16882,7 @@ impl Application for Cagents {
             window_filled: false,
             window_state_observed: false,
             right_edge_tiled: false,
+            window_controls_points: None,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -17634,7 +17706,10 @@ impl Application for Cagents {
             self.modal_is_open(),
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
-            !self.core.window.sharp_corners,
+            sidebar::WindowCorner {
+                rounded: !self.window_corners_sharp(),
+                controls: self.window_controls(),
+            },
         )
         .map(Message::Sidebar);
         drop(sidebar_part);
@@ -18839,7 +18914,22 @@ impl Cagents {
                 // opened yet. Initialize only after iced acknowledges this one.
                 #[cfg(feature = "integrated-browser")]
                 let report = Task::batch([report, self.browser_factory_task()]);
+                #[cfg(target_os = "macos")]
+                let report = Task::batch([
+                    report,
+                    macos_window::adopt(window).map(|controls| {
+                        cosmic::Action::App(Message::WindowControlsMeasured(controls))
+                    }),
+                ]);
                 report
+            }
+            #[cfg(target_os = "macos")]
+            Message::WindowControlsMeasured(controls) => {
+                // A live resize measures on every step; most change nothing.
+                if self.window_controls_points != controls {
+                    self.window_controls_points = controls;
+                }
+                Task::none()
             }
             Message::VerifyStartupPanes => self.verify_startup_gate(),
             Message::StartupStateInspected(state) => self.startup_state_inspected(state),
@@ -19523,7 +19613,17 @@ impl Cagents {
                 if size.width.is_finite() && size.width > 0.0 {
                     self.window_width = size.width;
                 }
-                self.query_window_filled()
+                // Full screen hides the traffic lights, and AppKit may move
+                // them as the titlebar changes.
+                let filled = self.query_window_filled();
+                #[cfg(target_os = "macos")]
+                let filled = Task::batch([
+                    filled,
+                    macos_window::measure_after_resize(window).map(|controls| {
+                        cosmic::Action::App(Message::WindowControlsMeasured(controls))
+                    }),
+                ]);
+                filled
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {

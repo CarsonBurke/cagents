@@ -1,3 +1,36 @@
+//! The daemon's status item: a StatusNotifierItem on Linux. macOS has none
+//! yet; a menu-bar item belongs to the signed application bundle, which can
+//! host AppKit, while the daemon stays free of Objective-C so that it can
+//! fork safely.
+
+/// Hosted agents by what they are doing, for the tray's status lines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentTally {
+    pub working: usize,
+    pub waiting: usize,
+}
+
+impl AgentTally {
+    /// "2 agents working · 1 waiting for you", or `None` when idle.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    fn summary(self) -> Option<String> {
+        let agents = |count: usize| match count {
+            1 => "1 agent".to_owned(),
+            count => format!("{count} agents"),
+        };
+        match (self.working, self.waiting) {
+            (0, 0) => None,
+            (working, 0) => Some(format!("{} working", agents(working))),
+            (0, waiting) => Some(format!("{} waiting for you", agents(waiting))),
+            (working, waiting) => Some(format!(
+                "{} working · {waiting} waiting for you",
+                agents(working)
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 mod service {
     use std::{
         os::unix::process::CommandExt,
@@ -10,6 +43,7 @@ mod service {
     use ksni::{TrayMethods, menu::StandardItem};
     use tokio::sync::{mpsc, oneshot};
 
+    use super::AgentTally;
     use crate::{
         control::{
             ControlClient, ControlError, STOP_REFUSED_BUSY, StopReport, shutdown_outcome_summary,
@@ -24,32 +58,6 @@ mod service {
     const FAILURE_TTL: Duration = Duration::from_secs(60);
     /// How often the agent counts are read from the daemon.
     const TALLY_INTERVAL: Duration = Duration::from_secs(3);
-
-    /// Hosted agents by what they are doing, for the tray's status lines.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub struct AgentTally {
-        pub working: usize,
-        pub waiting: usize,
-    }
-
-    impl AgentTally {
-        /// "2 agents working · 1 waiting for you", or `None` when idle.
-        fn summary(self) -> Option<String> {
-            let agents = |count: usize| match count {
-                1 => "1 agent".to_owned(),
-                count => format!("{count} agents"),
-            };
-            match (self.working, self.waiting) {
-                (0, 0) => None,
-                (working, 0) => Some(format!("{} working", agents(working))),
-                (0, waiting) => Some(format!("{} waiting for you", agents(waiting))),
-                (working, waiting) => Some(format!(
-                    "{} working · {waiting} waiting for you",
-                    agents(working)
-                )),
-            }
-        }
-    }
 
     /// What a finished tray action reports.
     type ActionResult = Result<String, String>;
@@ -666,4 +674,15 @@ mod service {
     }
 }
 
-pub use service::{AgentTally, TrayGuard, start};
+#[cfg(target_os = "linux")]
+pub use service::{TrayGuard, start};
+
+/// Holds nothing on macOS, which shows no status item.
+#[cfg(target_os = "macos")]
+pub struct TrayGuard;
+
+/// macOS shows no status item; see the module documentation.
+#[cfg(target_os = "macos")]
+pub fn start(_tally: impl Fn() -> Option<AgentTally> + Send + Sync + 'static) -> TrayGuard {
+    TrayGuard
+}

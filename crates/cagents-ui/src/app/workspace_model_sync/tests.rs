@@ -5212,7 +5212,7 @@ fn shared_folder_reopen_loads_new_rows_and_preserves_acknowledged_terminal_membe
                 false,
                 navigation,
                 &shortcuts,
-                false,
+                crate::sidebar::WindowCorner::default(),
             ),
             Size::new(280.0, 900.0),
             cache,
