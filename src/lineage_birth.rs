@@ -315,11 +315,17 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 /// The cgroup namespace this process sees cgroup paths through.
+///
+/// Darwin has no cgroups, so it has none: no launch is recorded as contained,
+/// and only a process's start time can rule it out of a lineage there.
 pub(crate) fn cgroup_namespace() -> Option<String> {
-    fs::read_link("/proc/self/ns/cgroup")
+    #[cfg(target_os = "linux")]
+    return fs::read_link("/proc/self/ns/cgroup")
         .ok()?
         .to_str()
-        .map(str::to_owned)
+        .map(str::to_owned);
+    #[cfg(target_os = "macos")]
+    return None;
 }
 
 /// The unified-hierarchy cgroup in a `/proc/<pid>/cgroup` listing. `None`
@@ -356,6 +362,7 @@ pub(crate) fn placement(cgroup: &str, uid: u32) -> Placement {
 }
 
 /// Where a launch from this process is born, for [`Ledger::record_launch`].
+/// Always `None` on Darwin, which has no cgroups; see [`cgroup_namespace`].
 #[cfg(feature = "host")]
 pub(crate) fn launch_containment() -> Option<String> {
     let listing = fs::read_to_string("/proc/self/cgroup").ok()?;

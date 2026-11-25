@@ -3865,6 +3865,44 @@ impl SessionHandle {
     }
 }
 
+/// How much memory the server process holds, or `None` when it can't be read.
+#[cfg(target_os = "linux")]
+async fn resident_bytes(pid: u32) -> Option<u64> {
+    let status = tokio::fs::read_to_string(format!("/proc/{pid}/status"))
+        .await
+        .ok()?;
+    Some(
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024,
+    )
+}
+
+/// How much memory the server process holds, or `None` when it can't be read.
+#[cfg(target_os = "macos")]
+#[allow(clippy::unused_async)]
+async fn resident_bytes(pid: u32) -> Option<u64> {
+    // SAFETY: all-zero bytes are a valid `proc_taskinfo`.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: the buffer is writable and exactly `size` bytes, and the kernel
+    // only writes it for the duration of the call.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::c_int::try_from(pid).ok()?,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info.pti_resident_size)
+}
+
 /// Requests idle/deleted-root shutdown while leaving the join handle in its
 /// manager-owned slot. A concurrent application exit can still await it.
 async fn retire_from_watchdog(handle: SessionHandle) {
@@ -5378,16 +5416,8 @@ impl LspManager {
                     }
                 };
                 if let Some(pid) = pid
-                    && let Ok(status) =
-                        tokio::fs::read_to_string(format!("/proc/{pid}/status")).await
+                    && let Some(rss) = resident_bytes(pid).await
                 {
-                    let rss = status
-                        .lines()
-                        .find_map(|line| line.strip_prefix("VmRSS:"))
-                        .and_then(|value| value.split_whitespace().next())
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0)
-                        * 1024;
                     watched.resident_bytes.store(rss, Ordering::Relaxed);
                 }
                 let doc = watched

@@ -352,6 +352,35 @@ pub(crate) fn wall_clock_start_of(pid: u32, ticks: u64) -> io::Result<std::time:
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process start is out of range"))
 }
 
+/// Whether the process that held `pid` from `ticks` (as [`started_ticks_of`]
+/// reads it) has exited, counting a zombie its parent has not reaped yet.
+/// XNU may stop answering for a process partway through its exit, slightly
+/// before it becomes a zombie; that counts as exited too.
+///
+/// # Errors
+///
+/// Returns the underlying error when the process cannot be inspected.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn exited_since(pid: u32, ticks: u64) -> io::Result<bool> {
+    let still_started = || match imp::start_of(pid) {
+        Ok(start) => Ok(start.ticks() == ticks),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    if !still_started()? {
+        return Ok(true);
+    }
+    // XNU keeps no BSD record for a zombie, though its usage still names it.
+    let zombie = match imp::bsd_info(pid) {
+        Ok(info) => info.pbi_status == libc::SZOMB,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
+    // A successor may have answered the record read if the process was reaped
+    // in between; its different start shows that.
+    Ok(zombie || !still_started()?)
+}
+
 /// How many of `pid`'s children have exited but not been reaped. XNU lists a
 /// zombie among its parent's children and still accepts a null signal for it,
 /// but keeps no process record for it.

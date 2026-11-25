@@ -436,13 +436,7 @@ fn holders_empty() -> bool {
 /// Absence observation must never repair permissions, parse away uncertainty,
 /// remove a stale holder's still-live root evidence, or contact a process.
 fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> {
-    use std::{
-        fs, io,
-        os::{
-            fd::AsRawFd,
-            unix::fs::{MetadataExt, OpenOptionsExt},
-        },
-    };
+    use std::{fs, io, os::unix::fs::MetadataExt};
     crate::secure_file::reject_symlink_components(directory)?;
     let private = |metadata: &fs::Metadata| {
         metadata.is_dir()
@@ -473,10 +467,7 @@ fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> 
             "unsafe holder directory",
         ));
     }
-    let held = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory)?;
+    let held = crate::fs_safety::Root::open(directory)?;
     let opened = held.metadata()?;
     if !private(&opened) || (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
         return Err(io::Error::other(
@@ -485,16 +476,18 @@ fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> 
     }
     // Readdir is bound to the already-validated directory, even if its public
     // name is replaced while scanning. No record bytes or targets are opened.
-    for (index, entry) in fs::read_dir(format!("/proc/self/fd/{}", held.as_raw_fd()))?.enumerate() {
-        if index >= 8192 {
-            return Err(io::Error::other("holder absence census limit exceeded"));
-        }
-        if std::path::Path::new(&entry?.file_name())
+    let (names, more) =
+        crate::fs_safety::first_entries_beneath(&held, std::path::Path::new(""), 8192)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    if names.iter().any(|name| {
+        std::path::Path::new(name)
             .extension()
             .is_some_and(|extension| extension == "json")
-        {
-            return Ok(false);
-        }
+    }) {
+        return Ok(false);
+    }
+    if more {
+        return Err(io::Error::other("holder absence census limit exceeded"));
     }
     let after = fs::symlink_metadata(directory)?;
     if !private(&after) || (after.dev(), after.ino()) != (opened.dev(), opened.ino()) {
