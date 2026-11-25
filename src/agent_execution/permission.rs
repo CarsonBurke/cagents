@@ -20,6 +20,9 @@ pub enum Tier {
     /// Edits apply without asking; risky commands still ask, or stay inside
     /// a sandbox.
     AutoEdit,
+    /// Edits and the commands the agent judges safe run without asking or a
+    /// sandbox; only irreversible ones still ask.
+    AutoRun,
     /// Nothing asks.
     Full,
 }
@@ -29,8 +32,10 @@ pub enum Tier {
 /// `dontAsk` runs only what the settings already allow and denies the rest
 /// where `default` would ask, so it allows no more than `default` without
 /// anyone approving it, and never asks. `auto` approves edits and the commands
-/// it judges safe, and still stops before irreversible ones, so it allows
-/// more than `acceptEdits` and less than `bypassPermissions`.
+/// it judges safe, outside any sandbox, and still stops before irreversible
+/// ones, so it allows more than `acceptEdits` and less than
+/// `bypassPermissions`. Muse's "Ask for approval only when the action
+/// requires it" is its `auto`: the agent, not a sandbox, decides what asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Claude {
     Plan,
@@ -208,7 +213,10 @@ impl Mode {
     /// rather than never asking or never needing to.
     fn asks(self) -> bool {
         match self {
-            Self::Codex(Approval::Never, _) => false,
+            // These deny what they would otherwise ask about.
+            Self::Codex(Approval::Never, _)
+            | Self::Claude(Claude::DontAsk)
+            | Self::Acp(Claude::DontAsk, _) => false,
             mode => mode.tier() < Tier::Full,
         }
     }
@@ -230,8 +238,9 @@ impl Mode {
             // What the settings allow runs unasked in both, and `dontAsk`
             // denies what `default` would ask about.
             Self::Claude(Claude::DontAsk | Claude::Default) => Tier::Ask,
+            Self::Claude(Claude::AcceptEdits) => Tier::AutoEdit,
             // Irreversible actions still stop in `auto`.
-            Self::Claude(Claude::AcceptEdits | Claude::Auto) => Tier::AutoEdit,
+            Self::Claude(Claude::Auto) => Tier::AutoRun,
             Self::Claude(Claude::BypassPermissions) => Tier::Full,
             // A read-only sandbox writes nothing, whoever would be asked.
             Self::Codex(_, Sandbox::ReadOnly) => Tier::ReadOnly,
@@ -612,10 +621,19 @@ fn launched_mode(
             Mode::parse(provider, &named)
         }
         Provider::Antigravity | Provider::Muse => {
-            // Its bypass is a switch beside the mode: nothing asks, whatever
-            // the mode says.
-            if switch(&["--dangerously-skip-permissions"]) {
-                return Some(Mode::Acp(Claude::BypassPermissions, BYPASS));
+            // Antigravity's bypass is a switch beside the mode: nothing asks,
+            // whatever the mode says. Its sandbox, which the switch can leave
+            // in place, is not established here, nor what Muse's switches
+            // that withhold writes or the shell leave of a mode.
+            match provider {
+                Provider::Antigravity if switch(&["--dangerously-skip-permissions"]) => {
+                    return (!switch(&["--sandbox"]))
+                        .then_some(Mode::Acp(Claude::BypassPermissions, BYPASS));
+                }
+                Provider::Muse if switch(&["--disable-write", "--disable-shell"]) => {
+                    return None;
+                }
+                _ => {}
             }
             let acp = provider.acp()?;
             let named = last(&[acp.mode_option]).flatten();
@@ -831,7 +849,7 @@ mod tests {
             (Provider::Claude, "default", Ask),
             (Provider::Claude, "manual", Ask),
             (Provider::Claude, "acceptEdits", AutoEdit),
-            (Provider::Claude, "auto", AutoEdit),
+            (Provider::Claude, "auto", AutoRun),
             (Provider::Claude, "bypassPermissions", Full),
             (Provider::Codex, "untrusted/read-only", ReadOnly),
             (Provider::Codex, "on-request/read-only", ReadOnly),
@@ -851,12 +869,12 @@ mod tests {
             (Provider::Antigravity, "default", Ask),
             (Provider::Antigravity, "acceptEdits", AutoEdit),
             (Provider::Antigravity, "accept-edits", AutoEdit),
-            (Provider::Antigravity, "auto", AutoEdit),
+            (Provider::Antigravity, "auto", AutoRun),
             (Provider::Muse, "dontAsk", Ask),
             (Provider::Muse, "manual", Ask),
             (Provider::Muse, "untrusted", Ask),
-            (Provider::Muse, "auto", AutoEdit),
-            (Provider::Muse, "on-request", AutoEdit),
+            (Provider::Muse, "auto", AutoRun),
+            (Provider::Muse, "on-request", AutoRun),
             (Provider::Muse, "bypassPermissions", Full),
             (Provider::Muse, "never", Full),
         ] {
@@ -924,7 +942,7 @@ mod tests {
             Ok("manual")
         );
         let claude = Ceiling::confirmed(Provider::Claude, Some("acceptEdits"));
-        assert_eq!(claude.child(Provider::Muse, None).as_deref(), Ok("auto"));
+        assert_eq!(claude.child(Provider::Muse, None).as_deref(), Ok("manual"));
         assert!(claude.child(Provider::Muse, Some("never")).is_err());
         assert_eq!(
             claude.child(Provider::Muse, Some("untrusted")).as_deref(),
@@ -949,7 +967,7 @@ mod tests {
             (Provider::Claude, Some("plan"), Tier::ReadOnly),
             (Provider::Claude, Some("acceptEdits"), Tier::AutoEdit),
             (Provider::Claude, Some("bypassPermissions"), Tier::Full),
-            (Provider::Claude, Some("auto"), Tier::AutoEdit),
+            (Provider::Claude, Some("auto"), Tier::AutoRun),
             (Provider::Claude, Some("dontAsk"), Tier::Ask),
             (Provider::Claude, Some("yolo"), Tier::Ask),
             (Provider::Claude, None, Tier::Ask),
@@ -958,10 +976,10 @@ mod tests {
             (Provider::Codex, Some("yolo"), Tier::Full),
             (Provider::Codex, None, Tier::Ask),
             (Provider::Antigravity, Some("acceptEdits"), Tier::AutoEdit),
-            (Provider::Antigravity, Some("auto"), Tier::AutoEdit),
+            (Provider::Antigravity, Some("auto"), Tier::AutoRun),
             (Provider::Antigravity, Some("yolo"), Tier::Ask),
             (Provider::Muse, Some("dontAsk"), Tier::Ask),
-            (Provider::Muse, Some("auto"), Tier::AutoEdit),
+            (Provider::Muse, Some("auto"), Tier::AutoRun),
         ] {
             assert_eq!(
                 Ceiling::confirmed(provider, mode).tier(),
@@ -1163,7 +1181,7 @@ mod tests {
     fn an_antigravity_lead_in_auto_keeps_its_children() {
         let lead = Ceiling::confirmed(Provider::Antigravity, Some("auto"));
         let accept = Ceiling::confirmed(Provider::Antigravity, Some("acceptEdits"));
-        assert_eq!(lead.tier(), Tier::AutoEdit);
+        assert_eq!(lead.tier(), Tier::AutoRun);
         for (provider, requested) in [
             (Provider::Antigravity, "plan"),
             (Provider::Antigravity, "default"),
@@ -1209,8 +1227,49 @@ mod tests {
             lead.child(Provider::Muse, Some("bypassPermissions"))
                 .is_err()
         );
-        assert!(accept.child(Provider::Antigravity, Some("auto")).is_err());
         assert!(!lead.may_approve());
+        // A mode that only accepts edits starts no agent that judges which
+        // commands to run unasked, of any provider.
+        for (provider, mode) in [
+            (Provider::Antigravity, "acceptEdits"),
+            (Provider::Claude, "acceptEdits"),
+        ] {
+            let accept = Ceiling::confirmed(provider, Some(mode));
+            for child in [Provider::Antigravity, Provider::Claude, Provider::Muse] {
+                assert!(
+                    accept.child(child, Some("auto")).is_err(),
+                    "{provider:?} {mode} starting {child:?} auto"
+                );
+            }
+        }
+        for mode in ["workspaceWrite", "readOnly"] {
+            assert!(
+                Ceiling::confirmed(Provider::Codex, Some(mode))
+                    .child(Provider::Claude, Some("auto"))
+                    .is_err()
+            );
+        }
+    }
+
+    /// A lead that denies what it isn't allowed asks no one, and its refusal
+    /// offers no person's approval for the mode it passes on.
+    #[test]
+    fn a_dont_ask_lead_passes_on_denial() {
+        let lead = Ceiling::confirmed(Provider::Claude, Some("dontAsk"));
+        assert_eq!(lead.tier(), Tier::Ask);
+        assert_eq!(
+            lead.child(Provider::Claude, Some("plan")).as_deref(),
+            Ok("plan")
+        );
+        assert_eq!(
+            lead.child(Provider::Claude, Some("default")),
+            Err("This agent runs in dontAsk mode, so it can't start a child in default. Without --permission-mode it starts in dontAsk. Only a person can start it in that mode.".into())
+        );
+        // Another provider's child is pinned to one that asks a person.
+        assert_eq!(
+            lead.child(Provider::Codex, None).as_deref(),
+            Ok("untrusted/workspace-write")
+        );
     }
 
     /// A mode the provider reported but cagents can't rank counts as asking,
@@ -1294,7 +1353,7 @@ mod tests {
             environment: [("CLAUDE_CODE_PERMISSION_MODE".into(), "plan".into())].into(),
             unset_environment: Default::default(),
         };
-        let cases: [(&str, &[&str], Tier); 26] = [
+        let cases: [(&str, &[&str], Tier); 28] = [
             ("claude", &["--dangerously-skip-permissions"], Tier::Full),
             (
                 "claude",
@@ -1307,9 +1366,9 @@ mod tests {
                 Tier::Full,
             ),
             ("claude", &[], Tier::ReadOnly),
-            ("claude", &["--permission-mode", "auto"], Tier::AutoEdit),
+            ("claude", &["--permission-mode", "auto"], Tier::AutoRun),
             ("claude", &["--permission-mode", "dontAsk"], Tier::Ask),
-            ("agy", &["--mode", "auto"], Tier::AutoEdit),
+            ("agy", &["--mode", "auto"], Tier::AutoRun),
             ("agy", &["--mode", "plan"], Tier::ReadOnly),
             // Nothing asks, whatever the mode says.
             (
@@ -1317,6 +1376,14 @@ mod tests {
                 &["--mode", "plan", "--dangerously-skip-permissions"],
                 Tier::Full,
             ),
+            // Its sandbox is not established here.
+            (
+                "agy",
+                &["--dangerously-skip-permissions", "--sandbox"],
+                Tier::Ask,
+            ),
+            // Nor what Muse withholding writes leaves of its mode.
+            ("muse", &["--disable-write"], Tier::Ask),
             ("codex", &["--yolo"], Tier::Full),
             ("codex", &["--full-auto"], Tier::AutoEdit),
             ("codex", &["-a", "never", "-s", "read-only"], Tier::ReadOnly),
