@@ -1304,6 +1304,11 @@ fn read_process_launch(
     let mut inherited = request.hint.map(|base| {
         let mut environment = base.environment.clone();
         environment.retain(|name, _| !crate::agent::is_session_variable(name));
+        if view.is_darwin() && environ.is_some() {
+            // Preserve the explicit account policy below, but the observed
+            // environment must also own the absence of runtime settings.
+            environment.retain(|name, _| !observation_environment_key(name));
+        }
         environment
     });
     // Recovery retains its existing fallback. Activity requires the actual
