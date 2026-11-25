@@ -148,17 +148,23 @@ cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
 
 The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
 the release's members, refuses links in the tree, and checks every signature in
-a staging directory before it moves the release into place. It holds a lock
-on the prefix while it works. It installs over a running daemon only of the
+a staging directory before it moves the release into place. It prepares the
+bundle and login item there too, checks that each program runs from its
+version tree, and only then moves `current`, the bundle, the links and the
+login item; a failure or interrupt before it records the version kept for
+rollback puts each back, leaving the previous installation as it was. It holds
+a lock on the prefix while it works. It installs over a running daemon only of the
 same version, asking the installed CLI, which speaks that daemon's protocol:
 the daemon cannot yet hand its sessions to another version on macOS, so it
 says how to stop it instead, and it refuses when it cannot tell. `--uninstall`
 removes the installation, its links, and the login item when that runs this
 installation; `--purge` also removes saved app data, and needs the installed
 CLI to check for a running daemon first. Only an installation in the account's
-own home registers `Cagents.app` with Launch Services or unloads its login
-item, so a test install under a private `HOME`, as the package's smoke test
-makes, leaves the account's own alone.
+own home registers `Cagents.app` with Launch Services or loads and unloads its
+login item, so a test install under a private `HOME`, as the package's smoke
+test makes, leaves the account's own alone. launchd would run that login item
+in the account's environment, serving the account's data, so such an install
+starts its daemon directly instead.
 
 Every executable and the bundle are signed ad hoc (`codesign --sign -`), which
 Apple Silicon requires to run anything. Files that `curl`, `tar` or
