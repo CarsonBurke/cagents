@@ -1122,6 +1122,16 @@ blocked. Both failures come back wrapped in `<tool_use_error>` tags, as
 Claude Code sends them. It captures the turn with the cards closed, then
 open.
 
+`narration` replays
+[`narration.jsonl`](../tests/fixtures/reasoning-row-scene/narration.jsonl):
+an empty thought, then two passages of progress prose, each followed by a
+command, then the answer. As some models send it, the prose arrives as
+thinking blocks whose server signature names them narration; the signatures
+are real ones and the text is invented. The first passage's frame also lists
+it in `narration_block_indexes`, and the second is known only by its
+signature. The scene captures the finished turn, where the prose should read
+as the agent's commentary rather than as thinking rows.
+
 `agents` has the lead start a background command and three background
 subagents, one of which finishes before the lead answers, so two subagents
 and the command are still working after the lead has finished. `plan` needs a session started with

@@ -15492,3 +15492,241 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         .unwrap();
     assert!(refused.events.is_empty(), "{:?}", refused.events);
 }
+
+/// Signatures the server wrote on Claude Code 2.1.325 with Opus 5.5: one on a
+/// block whose kind is narration, one on a reasoning block. Nothing checks
+/// them against the text, so the tests pair them with text of their own.
+const NARRATION_SIGNATURE: &str = "CAQSugYKEQgUGAI4AUIJbmFycmF0aW9uEgzmpqwj0KUbGt4S0h4aDGiZX39ePhkan6aiOiIwObAYlBhTbiWUWXCYRIPb9GP+9bexsVo3Q14s8cZXtX5kYijtjCzYayi1o6EFk7mpKtYF4uIXEXrghNnd16bu9d5kM6RziPxhbUpiRrVlxh39xrYgTVAaav2UDofPVvKlgNd20axPpgWkzOSbJ/1KDulmzm7sbm4KFvouy3LkIiKc0oDeJSHjkoFCZixiVRulPmtMHuDOIeMi6dvVWam8aES5I9HQMRCNsxthhbKPOpuieQ+lk1/ZMEjRJoyapLmFAxOJgbtDDM8PnQl4dPn26fVQTmGs/pxGLBlWd/keSRWaeZiGp9T69a2aAKMs2+FjmupP8oiU+GbLaUMo4NzLS75v6VRQAlsY2ZK5V0qNUQuT4drXHIC0H+TxsEhdOfshUM7j6WMybqByy1o+GkB+q0cHIwJSMdj9SP5AB/oBIsSrSpHRVbI5qJeKl+LxVkVKVLAd0QkgVTIaslTlsifPG8tfifSiok/Dg3qGmpHDER0evQfcOCfk0zHbCEl5cFi5ycqi7NN+XoRkjtn+2PSQJncq8zX5yRwG+UZUbL3U1m7O8E0jUjU7TgdBEC0ReuUIof2VUNs7+U0sdWnlUse1hTPaFT+Y3qv5CIRUlRB/buIz3rq3DK8Pr4nv7K8J5TZbGaSnMixLSKmiu7ECHHgtvh+JFTdZW1kjgjxP8ObLoBhG6erefVcpJk2QKmvxOfGaQzVCUY+dGVdFl9vGOVBRN38iuQgPZNMgaDiFP8866apxYj9QnbRXlW4AFWSqaw9TQ5Ev01rz80OpvHIyBlc8rHusaaiX0IEJmxrQXv6pfvZ2bcu76FC2X90OPTvuwvja4axbwe+Kqwltgq2bSWL8ZFXxqcI2rndEI3EfFFUbKoKax7EPcDS9fKbcAaPqgP2p1a/uitJx219BYcrYW2Plmoej8QEi3RK9tA77ixTJwtCdrqjJh7zecR2j4UdWZFsX81HS0EkLRjg9y/84QJlL5RrBfcSNvlDcwDEeh6Jh3Sq1VJf0o1IhBmjxnxM2FzOxoqlqXc4SbQSSGAE=";
+const THINKING_SIGNATURE: &str = "CAQSsgUKEAgUGAI4AUIIdGhpbmtpbmcSDHks+c19DrILYmviCxoMzICvZ/2LpvkiL4NXIjDZEkoepfzVZefKwGyfacQlDy84svlKrueAyqjiI3ysey8cdcXwcYi/ydBfZllwWCIqzwRaNGMbdguJRxQgQ0HlwKBa7M5p6VwFzVQVMJyZW95o8rC+mgmHc+uM0bu2Sr6Ow2kI18HpROaKY1NaqEWdimeDf9keghYe6t1ljIzU6J65pXm1/4yWEEd+AObNorGZbn5zHDzkyLtcBobqi1Zly0z9dNLL/kalnI1zSFO3dCeRzNYCx4GzVRyGOEG8SO4KMlp+ZSfvkmrXCW+HmhVTN0RgeGl3KNGyfghaxXMWaR8kwE3CSH7UatR0QOONRGUoKCLaxXbWACbpZRqIbf33ivkyG89Cd/xfpw40r6GaabOj4PKJoOSXqMJredmYYOBR/4Axscip4PyUfflbFJcWfrEkV1JHMf2JGb0cA2sAY7sfLwu7g291WcjxY7OZPSWpyf342iV956KHLS98ecBUhMUjAaZHPGXD7TvTIn04hoDTAbhsDdsK2OQN2HqsyltGTLURuBQQn6ROOhYCQjYPcP+dbhxnAFVvkijfJRjtxYS7IaDhG/DZ1JVJvNyr+NolgrJqz9XeUo86TmKG5lf8PgqO3bycgLLtPDGBF85aQ4mGOMjAJOJk1qdPssIAeW/W3FdMAJXWGjlHYYRqYqSBGhGZ+YPEjDDlnqH9LlEcPwVO+e0sVPupV/nOtXlqTa3m0/n2pah9GnXygNgDiZ654kD8LKpLhG6CZK7YC8zIAadW1cD2uTn+eobcEkQdGrQFve4/T+Ws/GJ77T27s5MUNmPpzN5U9dQz24l7DZJKvC7owIscS3NgA1bbWSgiMJskHEbyGvNewXJlCCz7ZMQEDusYAQ==";
+
+fn signed_thought(text: &str, signature: &str) -> Value {
+    json!({"type":"thinking","thinking":text,"signature":signature})
+}
+
+type Shown = (String, String, bool, Phase);
+
+/// A step's text items as (id, text, thinking, phase).
+fn texts(step: &Step) -> Vec<Shown> {
+    step.events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Item(Item {
+                id,
+                content:
+                    ItemContent::Text {
+                        text,
+                        thinking,
+                        phase,
+                    },
+                ..
+            }) => Some((id.clone(), text.clone(), *thinking, *phase)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn narrated(id: &str, text: &str) -> Shown {
+    (id.into(), text.into(), false, Phase::Commentary)
+}
+
+fn reasoned(id: &str, text: &str) -> Shown {
+    (id.into(), text.into(), true, Phase::Final)
+}
+
+fn answered(id: &str, text: &str) -> Shown {
+    (id.into(), text.into(), false, Phase::Final)
+}
+
+#[test]
+fn listed_narration_blocks_read_as_commentary_and_the_rest_as_thinking() {
+    let mut adapter = Claude::default();
+    // The frame's list decides alone: an unlisted block stays thinking
+    // whatever its signature says, and a listed one is narration even with
+    // a signature that can't be read.
+    let step = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a1","narration_block_indexes":[1, 2],
+            "message":{"id":"m1","content":[
+                signed_thought("Unlisted narration", NARRATION_SIGNATURE),
+                signed_thought("Checking the log next.", "unreadable"),
+                signed_thought("", NARRATION_SIGNATURE),
+                {"type":"text","text":"Done."},
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(
+        texts(&step),
+        [
+            reasoned("m1:0", "Unlisted narration"),
+            narrated("m1:1", "Checking the log next."),
+            // Narration with nothing to say is an empty thought, as Claude
+            // Code treats it.
+            reasoned("m1:2", ""),
+            answered("m1:3", "Done."),
+        ]
+    );
+}
+
+#[test]
+fn a_narration_signature_reads_as_commentary_without_a_list() {
+    let mut adapter = Claude::default();
+    let step = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                signed_thought("", THINKING_SIGNATURE),
+                signed_thought("Checking the log next.", NARRATION_SIGNATURE),
+                signed_thought("Weighing the two readings.", THINKING_SIGNATURE),
+                signed_thought("  \n", NARRATION_SIGNATURE),
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(
+        texts(&step),
+        [
+            reasoned("m1:0", ""),
+            narrated("m1:1", "Checking the log next."),
+            reasoned("m1:2", "Weighing the two readings."),
+            reasoned("m1:3", "  \n"),
+        ]
+    );
+}
+
+#[test]
+fn a_signature_that_does_not_read_as_narration_stays_thinking() {
+    let bytes = STANDARD.decode(NARRATION_SIGNATURE).unwrap();
+    // The kind's own field, without the envelope around it.
+    let bare = STANDARD.encode(b"B\x09narration");
+    // Cut short, so the envelope's length runs past the end.
+    let truncated = STANDARD.encode(&bytes[..bytes.len() / 2]);
+    // The envelope given twice.
+    let mut repeated = bytes.clone();
+    repeated.extend_from_slice(&bytes[2..]);
+    let repeated = STANDARD.encode(&repeated);
+    // A wire type that doesn't exist, after an intact envelope.
+    let mut invalid = bytes.clone();
+    invalid.push(0x0f);
+    let invalid = STANDARD.encode(&invalid);
+    let oversized = "A".repeat(128 * 1024);
+    for signature in [
+        "",
+        "not base64!",
+        // "narration" alone.
+        "bmFycmF0aW9u",
+        NARRATION_SIGNATURE.trim_end_matches('='),
+        &bare,
+        &truncated,
+        &repeated,
+        &invalid,
+        &oversized,
+    ] {
+        let mut adapter = Claude::default();
+        let step = adapter
+            .receive(
+                json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                    signed_thought("Weighing it.", signature),
+                ]}}),
+            )
+            .unwrap();
+        assert_eq!(
+            texts(&step),
+            [reasoned("m1:0", "Weighing it.")],
+            "{signature:.40}"
+        );
+    }
+    for block in [
+        json!({"type":"thinking","thinking":"Weighing it."}),
+        json!({"type":"thinking","thinking":"Weighing it.","signature":7}),
+    ] {
+        let mut adapter = Claude::default();
+        let step = adapter
+            .receive(
+                json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[block]}}),
+            )
+            .unwrap();
+        assert_eq!(texts(&step), [reasoned("m1:0", "Weighing it.")]);
+    }
+}
+
+#[test]
+fn a_streamed_thought_becomes_commentary_under_its_own_id_when_it_completes() {
+    let mut adapter = Claude::default();
+    adapter
+        .receive(stream(
+            json!({"type":"message_start","message":{"id":"msg-1"}}),
+        ))
+        .unwrap();
+    let started = adapter
+        .receive(stream(json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"thinking","thinking":"","signature":""}})))
+        .unwrap();
+    assert_eq!(texts(&started), [reasoned("msg-1:0", "")]);
+    for delta in [
+        json!({"type":"thinking_delta","thinking":"Checking the log next."}),
+        json!({"type":"signature_delta","signature":NARRATION_SIGNATURE}),
+    ] {
+        adapter
+            .receive(stream(
+                json!({"type":"content_block_delta","index":0,"delta":delta}),
+            ))
+            .unwrap();
+    }
+    let complete = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a1","narration_block_indexes":[0],
+            "message":{"id":"msg-1","content":[
+                signed_thought("Checking the log next.", NARRATION_SIGNATURE),
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(
+        texts(&complete),
+        [narrated("msg-1:0", "Checking the log next.")],
+        "the placeholder is replaced, not joined by a second item"
+    );
+    let stopped = adapter
+        .receive(stream(json!({"type":"content_block_stop","index":0})))
+        .unwrap();
+    assert!(texts(&stopped).is_empty(), "{:?}", stopped.events);
+    // The message's next block still takes the next place.
+    adapter
+        .receive(stream(json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"text","text":""}})))
+        .unwrap();
+    let answer = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a2","message":{"id":"msg-1","content":[
+                {"type":"text","text":"Done."},
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(texts(&answer), [answered("msg-1:1", "Done.")]);
+}
+
+#[test]
+fn a_reopened_narration_reads_as_commentary_from_its_signature() {
+    let id = "00000000-0000-4000-8000-000000000001";
+    let mut file = tempfile::tempfile().unwrap();
+    for value in [
+        json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":id,"message":{"content":"Check the log"}}),
+        json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":id,"message":{"id":"m1","content":[signed_thought("", THINKING_SIGNATURE)]}}),
+        json!({"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":id,"message":{"id":"m1","content":[signed_thought("Checking the log next.", NARRATION_SIGNATURE)]}}),
+        json!({"type":"assistant","uuid":"a3","parentUuid":"a2","sessionId":id,"message":{"id":"m1","content":[{"type":"text","text":"Done."}]}}),
+    ] {
+        writeln!(file, "{value}").unwrap();
+    }
+    file.rewind().unwrap();
+    let mut history = History::index(file, id).unwrap();
+    let mut step = Step::default();
+    let mut adapter = Claude::default();
+    for record in &history.page().unwrap() {
+        adapter.history_message(record, &mut step).unwrap();
+    }
+    assert_eq!(
+        texts(&step)[1..],
+        [
+            reasoned("m1:0", ""),
+            narrated("m1:1", "Checking the log next."),
+            answered("m1:2", "Done."),
+        ]
+    );
+}
