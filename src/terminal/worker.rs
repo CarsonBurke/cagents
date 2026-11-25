@@ -1832,7 +1832,7 @@ impl TerminalHandle {
             worker.run();
         });
         join_owner.install(worker);
-        if let Err(error) = initialized.recv_timeout(Duration::from_secs(5)) {
+        if let Err(error) = initialized.recv_timeout(crate::terminal::SPAWN_START_TIMEOUT) {
             published.request_shutdown();
             joins::request(&join_owner, true, true);
             panic!("test terminal initialization did not finish: {error}");
