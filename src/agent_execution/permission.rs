@@ -319,8 +319,9 @@ pub struct Ceiling {
     provider: Option<Provider>,
     /// The session's own mode, when it is known and rankable.
     mode: Option<Mode>,
-    /// The mode the provider reported when cagents can't rank it, so that a
-    /// refusal names what it saw.
+    /// The mode the provider reported, and why it counts as asking, when
+    /// cagents can't rank it as reported, so that a refusal names what it
+    /// saw, as in "auto mode, which cagents can't rank".
     reported: Option<String>,
 }
 
@@ -342,7 +343,9 @@ impl Ceiling {
         Self {
             provider: Some(provider),
             mode,
-            reported: reported.filter(|_| mode.is_none()).map(str::to_owned),
+            reported: reported
+                .filter(|_| mode.is_none())
+                .map(|mode| format!("{mode} mode, which cagents can't rank")),
         }
     }
 
@@ -390,7 +393,10 @@ impl Ceiling {
             if mode.tier() > Tier::Ask && withholds_tools(provider, &recipe.arguments) {
                 return Self {
                     mode: None,
-                    reported: Some(mode.name()),
+                    reported: Some(format!(
+                        "{} mode with writes or the shell withheld",
+                        mode.name()
+                    )),
                     ..confirmed
                 };
             }
@@ -423,7 +429,7 @@ impl Ceiling {
         match (self.mode, &self.reported) {
             (Some(mode), _) => format!("This agent runs in {} mode", mode.name()),
             (None, Some(reported)) => format!(
-                "This agent runs in {reported} mode, which cagents can't rank, so it counts as asking for approval"
+                "This agent runs in {reported}, so it counts as asking for approval"
             ),
             (None, None) => "This agent's own permission mode isn't confirmed, so it counts as asking for approval".into(),
         }
@@ -1612,7 +1618,7 @@ mod tests {
             assert_eq!(ceiling.tier(), Tier::Ask, "{withheld}");
             assert_eq!(
                 ceiling.child(Provider::Claude, Some("acceptEdits")),
-                Err("This agent runs in auto mode, which cagents can't rank, so it counts as asking for approval, and it can't start a Claude Code child in acceptEdits. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
+                Err("This agent runs in auto mode with writes or the shell withheld, so it counts as asking for approval, and it can't start a Claude Code child in acceptEdits. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
             );
             // A stricter confirmed mode keeps its own ceiling.
             assert_eq!(
