@@ -3848,6 +3848,14 @@ impl Worker {
             && self.pty_eof
             && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
         let shutdown_cleanup_confirmed = if (shutting_down || natural_census) && !self.carried {
+            #[cfg(target_os = "macos")]
+            if shutting_down {
+                // XNU drains the controlling tty before notifying the root's
+                // exit. This worker has published its final grid and no longer
+                // consumes the reader queue. Drain through that backpressure
+                // until process cleanup has finished and the wake pipe closes.
+                self.reader_discard_pending.store(true, Ordering::Release);
+            }
             let budget = self.published.shutdown_budget();
             if exited {
                 let cleanup = if self.checked_shutdown {
@@ -6745,6 +6753,8 @@ fn send_pty_message(
             if cancellation.revents != 0 {
                 return false;
             }
+            #[cfg(target_os = "macos")]
+            return true;
         }
         match sender.send_timeout(message, READER_SEND_POLL) {
             Ok(()) => return true,
