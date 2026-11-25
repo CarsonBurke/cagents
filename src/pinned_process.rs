@@ -394,6 +394,14 @@ impl PinnedProcess {
         self.while_running(imp::bsd_info(self.pid).map(|info| info.pbi_ppid))
     }
 
+    /// Foreground group of the expected controlling terminal of this root.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn terminal_foreground_group(&self, device: u64) -> Option<libc::pid_t> {
+        let info = self.while_running(imp::bsd_info(self.pid)).ok()?;
+        let group = libc::pid_t::try_from(info.e_tpgid).ok()?;
+        (u64::from(info.e_tdev) == device && group > 0).then_some(group)
+    }
+
     /// The files the pinned process holds open.
     ///
     /// # Errors

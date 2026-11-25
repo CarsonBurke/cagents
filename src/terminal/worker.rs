@@ -5451,11 +5451,9 @@ impl Worker {
             .as_ref()
             .ok_or("Child identity unavailable")?;
         let family = FrozenFamily::capture(root, deadline)?;
-        // SAFETY: this worker owns the live PTY throughout the frozen census.
-        let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        if foreground <= 0 {
-            return Err("Foreground process group unavailable".into());
-        }
+        let foreground = self
+            .foreground_group()
+            .ok_or("Foreground process group unavailable")?;
         // Process-only policy deliberately permits terminating shell builtins.
         // The original executable check still prevents an exec'd agent or
         // command from inheriting an idle shell's authority.
@@ -5480,9 +5478,14 @@ impl Worker {
     }
 
     fn foreground_group(&self) -> Option<libc::pid_t> {
-        // SAFETY: this worker owns the live master descriptor.
-        let group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        (group > 0).then_some(group)
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: this worker owns the live master descriptor.
+            let group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+            (group > 0).then_some(group)
+        }
+        #[cfg(target_os = "macos")]
+        self.child.foreground_group(&self.master)
     }
 
     fn observe_agent_process(&mut self) -> Option<&AgentProcess> {
