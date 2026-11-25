@@ -12,21 +12,7 @@ use std::{collections::BTreeSet, fs, io, path::Path};
 pub(crate) fn verify_inherited_exclusive(file: &fs::File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    // XNU exposes FWASLOCKED through F_GETFL. This history belongs to the
-    // supplied open description. A fresh unlocked description must not take
-    // over if a competing owner drops its lock between the two probes below.
-    // The flag survives LOCK_UN, so the sender must still preserve custody.
-    const FWASLOCKED: libc::c_int = 0x4000;
-    // SAFETY: F_GETFL reads flags on this live descriptor and takes no pointer.
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if flags & FWASLOCKED == 0 {
-        return Err(io::Error::other(
-            "inherited description has never held a flock",
-        ));
-    }
+    require_lock_history(file)?;
     let independent = crate::descriptor::reopen(file, 0)?;
     // SAFETY: both files are live. The independent probe never changes the
     // supplied description's lock. Neither probe waits on a competing owner.
@@ -41,6 +27,27 @@ pub(crate) fn verify_inherited_exclusive(file: &fs::File) -> io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::other(
             "exclusive flock belongs to another description",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject newly opened descriptions even if they name a contended inode.
+/// XNU's FWASLOCKED belongs to the open description. It survives LOCK_UN,
+/// so the private transfer must still preserve custody without unlocking.
+#[cfg(target_os = "macos")]
+pub(crate) fn require_lock_history(file: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    const FWASLOCKED: libc::c_int = 0x4000;
+    // SAFETY: F_GETFL reads flags on this live descriptor and takes no pointer.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & FWASLOCKED == 0 {
+        return Err(io::Error::other(
+            "inherited description has never held a flock",
         ));
     }
     Ok(())
