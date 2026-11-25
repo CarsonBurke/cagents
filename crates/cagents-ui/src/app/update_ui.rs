@@ -692,13 +692,12 @@ impl Cagents {
             let (attention, settled): (Vec<_>, Vec<_>) = daemon
                 .sessions
                 .iter()
-                .map(|session| session.review())
                 .partition(|session| session.disposition == Disposition::Blocked);
             rows.extend(
                 attention
                     .into_iter()
                     .chain(settled)
-                    .map(|session| self.update_session_row(session)),
+                    .map(|session| self.update_session_row(session, interruptions.is_some())),
             );
             rows.extend(daemon.review_notices().into_iter().map(notice_body));
         }
@@ -784,18 +783,27 @@ impl Cagents {
     /// window is the one holding its tab.
     fn update_session_row<'a>(
         &self,
-        session: crate::update::impact::SessionReview,
+        session: &crate::update::impact::SessionImpact,
+        choosing_when: bool,
     ) -> Element<'a, Message> {
-        use crate::update::impact::Disposition;
+        use crate::update::impact::{Disposition, SessionKind};
+        let working = choosing_when
+            && session.kind == SessionKind::NativeChat
+            && session.disposition == Disposition::WaitsForIdle;
+        let review = session.review();
         let mut header = vec![
-            widget::selectable_text(session.title.clone())
+            widget::selectable_text(review.title)
                 .size(design::TEXT_HEADING)
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .width(Length::Fill)
                 .into(),
             crate::ui_controls::badge(
-                session.disposition.label(),
+                if working {
+                    "Working"
+                } else {
+                    session.disposition.label()
+                },
                 disposition_tone(session.disposition),
             ),
         ];
@@ -807,15 +815,16 @@ impl Cagents {
                     .into(),
             );
         }
-        widget::column::with_children(vec![
+        let mut row = widget::column::with_children(vec![
             widget::row::with_children(header)
                 .align_y(Alignment::Center)
                 .spacing(space::S)
                 .into(),
-            notice_detail(session.reason),
-        ])
-        .spacing(space::XXS)
-        .into()
+        ]);
+        if !working || !session.interrupted_subagents.is_empty() {
+            row = row.push(notice_detail(review.reason));
+        }
+        row.spacing(space::XXS).into()
     }
 
     /// The open tab in this window that shows a daemon session, and the
