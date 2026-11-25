@@ -643,9 +643,16 @@ fn holding_process_in(directory: &Path, terminal: TerminalId) -> io::Result<Opti
 /// provider or tool of it runs on (see [`crate::daemon::lost_processes`]).
 #[cfg(feature = "host")]
 fn ended_with_holder(record: &Record) -> bool {
-    record.kind != Kind::Native
-        || crate::daemon::lost_processes::census(&record.holder, &record.root)
-            .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie))
+    if record.kind != Kind::Native {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    return crate::daemon::lost_processes::census(&record.holder, &record.root)
+        .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie));
+    // Darwin reparents escaped work to launchd. Keep the recorded
+    // boundaries for a later inspection, even when both are empty.
+    #[cfg(target_os = "macos")]
+    return false;
 }
 
 #[cfg(feature = "host")]

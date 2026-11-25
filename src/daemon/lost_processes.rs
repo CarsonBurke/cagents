@@ -23,16 +23,23 @@
 //! session or group is named and still holds the conversation, but is never
 //! signalled.
 //!
+//! The Linux census follows the membership rules above. Darwin census
+//! requires the recorded leader still to have its exact start time before
+//! authorizing signals. A reaped leader leaves a numeric ID whose generation
+//! cannot be checked, and a vanished session does not prove detached work
+//! never left that session.
+//!
 //! Ending signals only the processes the person was shown and chose to end,
 //! each as it was when shown: its PID and its start time. It pins each with
 //! a pidfd and reads it again before signalling it, so a PID that changed
 //! hands since fails that reading, and a pidfd can never signal another
-//! process. A process found since is shown before anything ends it.
+//! process on Linux. Darwin opens the recorded epoch with a kqueue pin and
+//! has the check-to-signal interval documented by `PinnedProcess`. A process
+//! found since is shown before anything ends it.
 use crate::{daemon::holder_registry::Process, pinned_process::PinnedProcess};
 use std::{
     io,
     os::fd::AsRawFd,
-    path::Path,
     time::{Duration, Instant},
 };
 
@@ -55,193 +62,23 @@ pub struct Survivor {
     pub proved: bool,
 }
 
-/// What `/proc/<pid>/stat` says of one process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stat {
-    zombie: bool,
-    group: i32,
-    session: i32,
-    start: u64,
-}
+#[cfg(target_os = "macos")]
+#[path = "lost_processes/darwin.rs"]
+mod platform;
+#[cfg(target_os = "linux")]
+#[path = "lost_processes/linux.rs"]
+mod platform;
 
-/// Reads one process's stat entry. `None` when it has gone.
-fn read_stat(process: &Path) -> Result<Option<Stat>, String> {
-    let pid = process.display();
-    let stat = match std::fs::read(process.join("stat")) {
-        Ok(stat) => stat,
-        // A process that exited during the scan holds no group: its entry is
-        // gone, or was reaped between opening and reading it.
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ESRCH) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(format!("Cannot read process {pid}: {error}")),
-    };
-    let Some(close) = stat.iter().rposition(|&byte| byte == b')') else {
-        return Err(format!("Process {pid} has an unreadable identity"));
-    };
-    let fields = String::from_utf8_lossy(&stat[close + 1..]);
-    let fields: Vec<&str> = fields.split_ascii_whitespace().collect();
-    let field = |index: usize| fields.get(index).copied();
-    let (Some(state), Some(group), Some(session)) = (
-        field(0),
-        field(2).and_then(|field| field.parse::<i32>().ok()),
-        field(3).and_then(|field| field.parse::<i32>().ok()),
-    ) else {
-        return Err(format!("Process {pid} has an unreadable group identity"));
-    };
-    Ok(Some(Stat {
-        zombie: state == "Z" || state == "X",
-        group,
-        session,
-        // A test's synthetic entry may stop after the session.
-        start: field(19)
-            .and_then(|field| field.parse().ok())
-            .unwrap_or_default(),
-    }))
-}
+pub use platform::{census, listener_census};
 
-/// Whether the ID `original.pid` names still belongs to `original`: it is
-/// still that process, or no process has that PID, so nothing has reused it.
-fn id_kept(proc: &Path, original: &Process) -> Result<bool, String> {
-    Ok(match read_stat(&proc.join(original.pid.to_string()))? {
-        None => true,
-        Some(stat) => stat.start == original.start,
-    })
-}
-
-/// Every process in `helper`'s session or `provider`'s group, proved or not.
-pub fn census(helper: &Process, provider: &Process) -> Result<Vec<Survivor>, String> {
-    census_in(Path::new("/proc"), helper, provider)
-}
-
-pub(crate) fn census_in(
-    proc: &Path,
-    helper: &Process,
-    provider: &Process,
-) -> Result<Vec<Survivor>, String> {
-    let session_kept = id_kept(proc, helper)?;
-    let group_kept = id_kept(proc, provider)?;
-    let uid = crate::daemon::current_uid();
-    scan(proc, |process, pid, stat| {
-        // A reused ID's session or group is its new owner's.
-        let in_session = session_kept && stat.session == helper.pid;
-        let in_group = group_kept && stat.group == provider.pid;
-        if !in_session && !in_group {
-            return Ok(None);
-        }
-        let proved = owned_by(process, uid)?
-            && ((in_session && stat.start >= helper.start)
-                || (in_group && stat.start >= provider.start));
-        Ok(Some(survivor(process, pid, stat, proved)))
-    })
-}
-
-/// Every process proved to be `pane`'s Codex provider because its arguments
-/// name the conversation's own listener directory, and the members of each
-/// one's process group when it leads it. `named` lists those providers.
-pub fn listener_census(named: &[Process]) -> Result<Vec<Survivor>, String> {
-    let proc = Path::new("/proc");
-    let uid = crate::daemon::current_uid();
-    scan(proc, |process, pid, stat| {
-        let provider = named
-            .iter()
-            .find(|named| named.pid == pid || named.pid == stat.group);
-        let Some(provider) = provider else {
-            return Ok(None);
-        };
-        let proved = owned_by(process, uid)?
-            && stat.start >= provider.start
-            && (pid != provider.pid || stat.start == provider.start)
-            && id_kept(proc, provider)?;
-        Ok(Some(survivor(process, pid, stat, proved)))
-    })
-}
-
-/// Whether `process` runs as `uid`, by its real user ID, which is what
-/// permits signalling it. Its `/proc` directory's owner is no proof: a
-/// process that made itself undumpable, as ssh does, shows root there.
-fn owned_by(process: &Path, uid: u32) -> Result<bool, String> {
-    let status = match std::fs::read_to_string(process.join("status")) {
-        Ok(status) => status,
-        // Gone since it was listed: nothing to prove or end.
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ESRCH) =>
-        {
-            return Ok(false);
-        }
-        Err(error) => {
-            return Err(format!(
-                "Cannot read process {}: {error}",
-                process.display()
-            ));
-        }
-    };
-    Ok(status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|ids| ids.split_ascii_whitespace().next())
-        .and_then(|real| real.parse::<u32>().ok())
-        == Some(uid))
-}
-
-fn scan(
-    proc: &Path,
-    mut member: impl FnMut(&Path, i32, Stat) -> Result<Option<Survivor>, String>,
-) -> Result<Vec<Survivor>, String> {
-    let entries = std::fs::read_dir(proc)
-        .map_err(|error| format!("Cannot enumerate processes for exact absence: {error}"))?;
-    let mut found = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let process = entry.path();
-        let Some(stat) = read_stat(&process)? else {
-            continue;
-        };
-        if let Some(survivor) = member(&process, pid, stat)? {
-            found.push(survivor);
-        }
-    }
-    found.sort_by_key(|survivor| survivor.pid);
-    Ok(found)
-}
-
-/// How much of a command line a person is shown.
-const COMMAND_CHARS: usize = 160;
-
-fn survivor(process: &Path, pid: i32, stat: Stat, proved: bool) -> Survivor {
-    let name = std::fs::read_to_string(process.join("comm"))
-        .map(|name| name.trim_end().to_owned())
-        .unwrap_or_default();
-    let command = std::fs::read(process.join("cmdline"))
-        .map(|argv| {
-            let argv = argv.strip_suffix(b"\0").unwrap_or(&argv);
-            let line = String::from_utf8_lossy(argv).replace('\0', " ");
-            match line.char_indices().nth(COMMAND_CHARS) {
-                Some((end, _)) => format!("{}\u{2026}", &line[..end]),
-                None => line,
-            }
-        })
-        .unwrap_or_default();
-    Survivor {
-        pid,
-        start: stat.start,
-        group: stat.group,
-        session: stat.session,
-        zombie: stat.zombie,
-        name,
-        command,
-        proved,
+/// Trim the command line to what can be shown in the close dialog.
+fn command_for_display(argv: &[u8]) -> String {
+    const COMMAND_CHARS: usize = 160;
+    let argv = argv.strip_suffix(b"\0").unwrap_or(argv);
+    let line = String::from_utf8_lossy(argv).replace('\0', " ");
+    match line.char_indices().nth(COMMAND_CHARS) {
+        Some((end, _)) => format!("{}\u{2026}", &line[..end]),
+        None => line,
     }
 }
 
@@ -303,8 +140,7 @@ pub fn end(
     }
 }
 
-/// A survivor held by a pin, so that signalling it can never reach another
-/// process that later takes its PID.
+/// A survivor held by a pin for its recorded start time.
 struct Pinned {
     process: PinnedProcess,
     pid: i32,
@@ -314,21 +150,7 @@ impl Pinned {
     /// Pins `survivor` if it is still the process the scan found, in the same
     /// group and session. `None` once it has gone or changed.
     fn open(survivor: &Survivor) -> Result<Option<Self>, String> {
-        let process = match PinnedProcess::open_unreaped(survivor.pid as u32) {
-            Ok(process) => process,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("Cannot hold process {}: {error}", survivor.pid)),
-        };
-        // Read after pinning: only the same process can still show the same
-        // start time under this PID, so the pin names the survivor.
-        let same =
-            read_stat(&Path::new("/proc").join(survivor.pid.to_string()))?.is_some_and(|stat| {
-                stat.start == survivor.start
-                    && stat.group == survivor.group
-                    && stat.session == survivor.session
-                    && !stat.zombie
-            });
-        Ok(same.then_some(Self {
+        Ok(platform::pin_matching(survivor)?.map(|process| Self {
             process,
             pid: survivor.pid,
         }))
@@ -394,9 +216,10 @@ fn wait_for_exit(mut pinned: Vec<Pinned>, limit: Duration) -> Result<Vec<Pinned>
     Ok(pinned)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::*;
+    use super::{platform::census_in, *};
+    use std::path::Path;
 
     fn stat(root: &Path, pid: i32, group: i32, session: i32, start: u64) {
         stat_as(
