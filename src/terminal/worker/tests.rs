@@ -523,7 +523,7 @@ fn a_shell_location_title_gives_way_to_the_foreground_command() {
     std::fs::create_dir(&working).unwrap();
     let (mut worker, events) = capture_worker_for(LaunchRecipe {
         unset_environment: Default::default(),
-        program: "/bin/true".into(),
+        program: "/usr/bin/true".into(),
         arguments: Vec::new(),
         working_directory: working.clone(),
         environment: BTreeMap::new(),
@@ -1496,7 +1496,7 @@ fn changing_parser_theme_preserves_truecolor_and_osc_overrides_and_queries() {
 fn capture_worker() -> (Worker, Receiver<TerminalEvent>) {
     let recipe = LaunchRecipe {
         unset_environment: Default::default(),
-        program: "/bin/true".into(),
+        program: "/usr/bin/true".into(),
         arguments: Vec::new(),
         working_directory: PathBuf::from("/"),
         environment: BTreeMap::new(),
@@ -4847,7 +4847,7 @@ fn scroll_run<const PHASES: usize>(phases: [Vec<isize>; PHASES]) -> [ScrollRun; 
     let (mut worker, _events) = capture_worker_with(
         LaunchRecipe {
             unset_environment: Default::default(),
-            program: "/bin/true".into(),
+            program: "/usr/bin/true".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/"),
             environment: BTreeMap::new(),

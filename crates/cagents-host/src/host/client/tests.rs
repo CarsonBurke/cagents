@@ -557,7 +557,7 @@ fn retention_client_host(
     let (_, host) = panic_test_host(name);
     let directory = tempfile::Builder::new().prefix("rp-").tempdir().unwrap();
     let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
-    recipe.program = "/bin/true".into();
+    recipe.program = "/usr/bin/true".into();
     recipe.arguments.clear();
     let session = crate::model::TerminalSession {
         id: TerminalId::new(),
@@ -2295,7 +2295,7 @@ fn assert_completed_native_confirmation_case(
         super::super::model::Registry::at(&model.path().join("model.sqlite3")).unwrap(),
     );
     let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
-    recipe.program = "/bin/true".into();
+    recipe.program = "/usr/bin/true".into();
     recipe.arguments.clear();
     let session = TerminalSession {
         id: TerminalId::new(),

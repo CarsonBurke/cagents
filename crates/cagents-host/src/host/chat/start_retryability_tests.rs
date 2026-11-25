@@ -1118,7 +1118,7 @@ fn publication_retries_transient_changes_and_blocks_a_lost_reservation() {
     drop(state.chats.remove(&source.id));
 
     let mut recipe = LaunchRecipe::shell(root.path().into()).unwrap();
-    recipe.program = "/bin/true".into();
+    recipe.program = "/usr/bin/true".into();
     recipe.arguments.clear();
     let terminal = crate::model::TerminalSession {
         id: source.id,
