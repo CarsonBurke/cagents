@@ -642,7 +642,9 @@ impl Registry {
         &mut self,
         saved: &crate::chat::Session,
     ) -> Result<bool, String> {
-        if saved.launch.session_id.is_none()
+        // Only a Codex thread's ID is restored to its pane.
+        if saved.launch.provider != crate::agent::Provider::Codex
+            || saved.launch.session_id.is_none()
             || !super::views::store::chat_pane_lacks_identity(&self.db, saved.id)?
         {
             return Ok(false);
@@ -1946,7 +1948,7 @@ impl Registry {
         expected: Option<&HostedSession>,
         mut session: HostedSession,
     ) -> Result<Agent, String> {
-        let tx = self
+        let mut tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
@@ -1982,9 +1984,18 @@ impl Registry {
         require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         // A pane written from the launch before its provider named the thread
         // learns the ID with the agent, in this transaction.
+        // It is a repair, so a pane that cannot be read or written leaves the
+        // binding to stand without it; the sequence advances below.
         if let HostedSession::Chat(bound) = &session {
-            // The sequence advances below.
-            super::views::learn_saved_chat_pane_identity(&tx, bound)?;
+            let pane = tx.savepoint().map_err(|error| error.to_string())?;
+            match super::views::learn_saved_chat_pane_identity(&pane, bound) {
+                Ok(_) => pane.commit().map_err(|error| error.to_string())?,
+                Err(error) => tracing::warn!(
+                    %error,
+                    chat = %bound.id,
+                    "cannot save the agent's conversation ID to its pane"
+                ),
+            }
         }
         agent.session = Some(session);
         tx.execute(

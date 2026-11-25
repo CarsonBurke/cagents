@@ -1054,7 +1054,7 @@ pub(super) fn learn_saved_chat_pane_identity(
     db: &Connection,
     saved: &crate::chat::Session,
 ) -> Result<bool, String> {
-    // Every run update asks; one indexed read answers almost all of them.
+    // One indexed read answers almost every caller.
     if saved.launch.session_id.is_none() || !store::chat_pane_lacks_identity(db, saved.id)? {
         return Ok(false);
     }

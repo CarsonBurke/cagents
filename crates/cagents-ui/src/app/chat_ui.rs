@@ -14038,8 +14038,10 @@ impl Cagents {
                 // The card never learned its conversation, but its open agent
                 // did: the provider named the thread after the card's
                 // descriptor was written. The card takes that exact ID and
-                // reopens the conversation instead of reporting it lost.
+                // reopens the conversation instead of reporting it lost. An
+                // account recovery's own start is not redirected.
                 if let Err(failure) = &result
+                    && account_source.is_none()
                     && failure.recovery == chat::Recovery::Fresh
                     && let Some(named) = self.open_agent_conversation(target.card, &attempt.session)
                 {
