@@ -2230,10 +2230,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn orphaned_terminal_process_blocks_recovery_without_being_killed() {
         use std::io::Read;
         use std::process::Stdio;
 
+        // This fixture links a real Linux procfs entry into the synthetic
+        // census. The planted-marker and unreadable-census tests below also
+        // run where process entries are not available through procfs.
         let directory = tempfile::tempdir().unwrap();
         let original = session(directory.path(), &proof("old"));
         for marker in [
