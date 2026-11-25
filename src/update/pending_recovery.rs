@@ -84,7 +84,7 @@ pub(crate) fn run(
     let paths = crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
     let handoff = LeaseHandoff::try_acquire(&paths).map_err(|e| invalid(e.to_string()))?
         .ok_or_else(|| invalid("A daemon is serving or starting. It was kept running; inspect `cagents --no-start daemon status` before repeating recovery"))?;
-    if std::os::unix::net::UnixStream::connect(&paths.socket).is_ok() {
+    if crate::descriptor::connect_settled(&paths.socket).is_ok() {
         return Err(invalid(
             "A daemon still answers on the socket; explicit recovery did not replace it",
         ));

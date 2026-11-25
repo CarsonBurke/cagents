@@ -172,6 +172,25 @@ pub(crate) fn connect(path: &std::path::Path) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// [`connect`] for a caller that takes a refusal to mean nothing listens at
+/// `path`. Linux makes one attempt, since its refusal is final. Darwin also
+/// refuses a full backlog, so a refusal is tried again until it has lasted
+/// [`REFUSAL_WINDOW`] and only then returned; see [`retry_refusal`].
+pub(crate) fn connect_settled(path: impl AsRef<std::path::Path>) -> io::Result<UnixStream> {
+    let path = path.as_ref();
+    let refusing_since = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(1);
+    loop {
+        match connect(path) {
+            Err(error) if retry_refusal(&error, refusing_since) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Binds a Unix-domain listener at `path` whose connections keep their
 /// socket options after shutdown; see [`keep_options_after_shutdown`]. XNU
 /// copies the setting from the listener to each connection as it queues, so
@@ -424,5 +443,34 @@ mod tests {
         }
         // SAFETY: as above.
         assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 1);
+    }
+
+    /// A full backlog is waited out, as Linux blocks on it, but a socket that
+    /// nobody listens on is still reported refused once the window has passed.
+    #[test]
+    fn a_settled_connect_waits_out_a_full_backlog_but_not_a_dead_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("listener.sock");
+        let listener = super::bind(&path).unwrap();
+        // SAFETY: listen takes the live listener descriptor and a scalar.
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), super::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let _pending = super::connect(&path).unwrap();
+        let accepter = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(20));
+            let accepted = listener.accept().unwrap();
+            (listener, accepted)
+        });
+        super::connect_settled(&path).unwrap();
+        drop(accepter.join().unwrap());
+
+        let started = std::time::Instant::now();
+        let error = super::connect_settled(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        #[cfg(target_os = "macos")]
+        assert!(started.elapsed() >= super::REFUSAL_WINDOW);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

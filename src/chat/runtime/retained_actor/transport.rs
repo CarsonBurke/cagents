@@ -1502,7 +1502,7 @@ impl RemoteActor {
                 1,
                 crate::descriptor_frame::FrameByteOrder::LittleEndian,
             )?;
-        verify_peer(&control, &self.0.identity.record)?;
+        verify_replied_peer(&control, &self.0.identity.record)?;
         match result {
             Err(error) if error == UNKNOWN_METHOD => Ok(None),
             Err(error) => Err(error),
@@ -1736,7 +1736,7 @@ impl RemoteActor {
                 1,
                 crate::descriptor_frame::FrameByteOrder::LittleEndian,
             )?;
-            verify_peer(&control, &self.0.identity.record)?;
+            verify_replied_peer(&control, &self.0.identity.record)?;
             Ok::<_, String>(received)
         })()
         .map_err(|error| interrupted_request("pinned_directory", error))?;
@@ -4208,6 +4208,20 @@ fn verify_peer(control: &UnixStream, record: &Record) -> Result<(), String> {
     let credentials = peer(control)?;
     if credentials.uid != crate::daemon::current_uid()
         || u32::try_from(record.holder.pid).ok() != Some(credentials.pid)
+        || !record.holder.is_current()
+    {
+        return Err("Retained actor socket peer identity changed".into());
+    }
+    Ok(())
+}
+/// [`verify_peer`] again once the helper has replied. A connected stream's
+/// peer cannot change, so the pid proved before the request still names it;
+/// what can change is whether that holder is still current. The pid is not
+/// read again: Darwin stops reporting it once the peer closes, which the
+/// helper may already have done after replying. The uid still answers.
+fn verify_replied_peer(control: &UnixStream, record: &Record) -> Result<(), String> {
+    if crate::pinned_process::peer_uid(control).map_err(|error| error.to_string())?
+        != crate::daemon::current_uid()
         || !record.holder.is_current()
     {
         return Err("Retained actor socket peer identity changed".into());

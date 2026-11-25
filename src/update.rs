@@ -3178,7 +3178,7 @@ fn finish_handoff(
     // dead. Preserve any listener rather than starting a competing daemon.
     let socket_has_listener = crate::terminal_ipc::daemon_socket_path()
         .ok()
-        .is_some_and(|p| std::os::unix::net::UnixStream::connect(p).is_ok());
+        .is_some_and(|p| crate::descriptor::connect_settled(p).is_ok());
     if verified.has_listener() || socket_has_listener {
         if let Err(error) = verified.save(&outcome_path) {
             eprintln!("Could not save recovery proof: {error}");

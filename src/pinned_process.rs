@@ -1612,4 +1612,20 @@ mod tests {
         assert!(gone.exited().unwrap() && gone.reaped().unwrap());
         assert!(!gone.signal(libc::SIGKILL).unwrap());
     }
+
+    /// A peer that has closed keeps its uid, which a check after its reply
+    /// relies on; only Darwin stops reporting its pid.
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_closed_peer_keeps_its_uid() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(peer_uid(&ours).unwrap(), unsafe { libc::geteuid() });
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            peer_credentials(&ours).unwrap_err().raw_os_error(),
+            Some(libc::ENOTCONN)
+        );
+    }
 }

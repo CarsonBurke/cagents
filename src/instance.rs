@@ -1419,7 +1419,7 @@ pub fn update_in_progress() -> bool {
 }
 
 fn update_window(runtime: &Path, slot: &str, action: &str, timeout: Duration) -> io::Result<()> {
-    let mut stream = crate::descriptor::connect(&runtime.join(slot_socket_name(slot)))?;
+    let mut stream = crate::descriptor::connect_settled(runtime.join(slot_socket_name(slot)))?;
     stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
     stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
     writeln!(stream, "{action}")?;
@@ -2578,7 +2578,8 @@ fn activate_window_session_in(
 ) -> io::Result<bool> {
     validate_window_slot(slot)?;
     require_owned_runtime_directory(runtime)?;
-    let mut stream = match crate::descriptor::connect(&runtime.join(slot_socket_name(slot))) {
+    let mut stream = match crate::descriptor::connect_settled(runtime.join(slot_socket_name(slot)))
+    {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -2762,7 +2763,7 @@ fn activate_socket_with_token(
 ) -> io::Result<bool> {
     require_owned_runtime_directory(runtime_directory)?;
     let socket_path = runtime_directory.join(socket);
-    let mut stream = match crate::descriptor::connect(&socket_path) {
+    let mut stream = match crate::descriptor::connect_settled(&socket_path) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
