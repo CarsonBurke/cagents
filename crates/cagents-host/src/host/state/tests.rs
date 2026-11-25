@@ -1085,8 +1085,33 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
     // A real foreground process, recognized by its provider argv. Its
     // executable is deliberately different from the recovery command, and
     // it ignores the resume picker selector a relaunch adds.
-    let executable = directory.path().join("claude");
-    fs::write(&executable, "#!/bin/bash\nexec -a \"$0\" /bin/cat\n").unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    let executable = cwd.join("claude");
+    #[cfg(target_os = "linux")]
+    let reader = "/bin/cat";
+    #[cfg(target_os = "macos")]
+    let reader = {
+        // The system cat's protected environment cannot establish the
+        // provider account. Keep the binary behavior with a local signature.
+        let reader = cwd.join("fixture-cat");
+        fs::copy("/bin/cat", &reader).unwrap();
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&reader)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        "./fixture-cat"
+    };
+    fs::write(
+        &executable,
+        format!("#!/bin/bash\nexec -a \"$0\" {reader}\n"),
+    )
+    .unwrap();
     fs::set_permissions(
         &executable,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1096,20 +1121,13 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
         unset_environment: Default::default(),
         program: executable.to_string_lossy().into_owned(),
         arguments: Vec::new(),
-        working_directory: directory.path().into(),
+        working_directory: cwd.clone(),
         environment: BTreeMap::from([
-            (
-                "HOME".into(),
-                directory.path().to_string_lossy().into_owned(),
-            ),
+            ("HOME".into(), cwd.to_string_lossy().into_owned()),
             // Keep Claude's account state in this fixture, not the real home.
             (
                 "CLAUDE_CONFIG_DIR".into(),
-                directory
-                    .path()
-                    .join(".claude")
-                    .to_string_lossy()
-                    .into_owned(),
+                cwd.join(".claude").to_string_lossy().into_owned(),
             ),
         ]),
     };
@@ -2359,6 +2377,7 @@ pub(super) fn restored_shell_links_exact_old_source_and_does_not_replay_consumed
     assert_eq!(descriptor.upgrade_sources, vec![source.clone()]);
     assert_eq!(descriptor.session.continuity.live_proof(), Some(expected));
     assert_eq!(descriptor.session.transcript_path, source.transcript_path);
+    let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
     restore_upgrade_from(
         &host,
         Store::open(directory.path()).unwrap(),
@@ -2369,85 +2388,102 @@ pub(super) fn restored_shell_links_exact_old_source_and_does_not_replay_consumed
     // Restore enqueues startup visibility controls; a descriptor and an
     // empty checkpoint read do not acknowledge their worker-side completion.
     // This existing synchronous observation follows them on the same FIFO.
-    let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
     restored.observe_agent().unwrap();
-    // A separate idle probe can resume the shell before host preparation
-    // observes it again. Retry only this exact fixture's active-shell
-    // refusal; success keeps the actual preparation snapshot frozen.
-    let expected_active = upgrade_error(upgrade_blockers_message(
-        &[describe_upgrade_blocker(&descriptor.session)],
-        false,
-    ));
-    let prepare_started = Instant::now();
-    let mut prepare_attempts = 0;
-    loop {
-        assert!(
-            // This waits on the passwd shell's own startup in a fresh HOME.
-            prepare_started.elapsed() < Duration::from_secs(60),
-            "restored shell never became eligible after {prepare_attempts} preparation attempts"
-        );
-        prepare_attempts += 1;
-        let capability = {
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            assert_eq!(state.terminals.len(), 1);
-            assert!(state.chats.is_empty());
-            assert!(state.terminals[&source.id].handle.same_worker(&restored));
-            state.shutdown_preflight(Instant::now()).unwrap().capability
-        };
-        match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
-            Ok(counts) => {
-                assert_eq!(counts, (1, 0));
-                break;
-            }
-            Err(error) if error == expected_active => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!(
-                "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
-            ),
-        }
-    }
-    finish_upgrade(&host).unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let second = store.load().unwrap().unwrap();
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0].id = TerminalId::new();
-    assert!(forged.validate().is_err());
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0]
-        .launch
-        .environment
-        .insert("UNRELATED".into(), "1".into());
-    assert!(forged.validate().is_err());
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0].continuity =
-        second.terminals[0].source.continuity.clone();
-    assert!(forged.validate().is_err());
-    let third = test_host_with_incarnation("third-incarnation");
-    let host = Arc::new(HostLock::new(third));
-    restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
-    let third = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .descriptor(0, source.id)
-        .unwrap();
-    assert_eq!(
-        third.upgrade_sources,
-        vec![source.clone(), second.terminals[0].source.clone()]
-    );
-    assert_ne!(
-        third.session.continuity.live_proof(),
-        descriptor.session.continuity.live_proof()
-    );
-    let handle = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let state = host.lock().unwrap();
         assert_eq!(state.terminals.len(), 1);
-        state.terminals[&source.id].handle.clone()
-    };
-    assert_eq!(
-        handle.close_checked(true),
-        crate::terminal_ipc::TerminalCloseResult::Closed
-    );
+        assert!(state.terminals[&source.id].handle.same_worker(&restored));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin can restore the checkpoint's authorized recipe. Repeating
+        // automatic shell retirement requires the mapped executable proof
+        // that the Linux implementation obtains from /proc/PID/exe.
+        assert_eq!(
+            restored.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // A separate idle probe can resume the shell before host preparation
+        // observes it again. Retry only this exact fixture's active-shell
+        // refusal; success keeps the actual preparation snapshot frozen.
+        let expected_active = upgrade_error(upgrade_blockers_message(
+            &[describe_upgrade_blocker(&descriptor.session)],
+            false,
+        ));
+        let prepare_started = Instant::now();
+        let mut prepare_attempts = 0;
+        loop {
+            assert!(
+                // This waits on the passwd shell's own startup in a fresh HOME.
+                prepare_started.elapsed() < Duration::from_secs(60),
+                "restored shell never became eligible after {prepare_attempts} preparation attempts"
+            );
+            prepare_attempts += 1;
+            let capability = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                assert_eq!(state.terminals.len(), 1);
+                assert!(state.chats.is_empty());
+                assert!(state.terminals[&source.id].handle.same_worker(&restored));
+                state.shutdown_preflight(Instant::now()).unwrap().capability
+            };
+            match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
+                Ok(counts) => {
+                    assert_eq!(counts, (1, 0));
+                    break;
+                }
+                Err(error) if error == expected_active => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
+                ),
+            }
+        }
+        finish_upgrade(&host).unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let second = store.load().unwrap().unwrap();
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].id = TerminalId::new();
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0]
+            .launch
+            .environment
+            .insert("UNRELATED".into(), "1".into());
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].continuity =
+            second.terminals[0].source.continuity.clone();
+        assert!(forged.validate().is_err());
+        let third = test_host_with_incarnation("third-incarnation");
+        let host = Arc::new(HostLock::new(third));
+        restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
+        let third = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .descriptor(0, source.id)
+            .unwrap();
+        assert_eq!(
+            third.upgrade_sources,
+            vec![source.clone(), second.terminals[0].source.clone()]
+        );
+        assert_ne!(
+            third.session.continuity.live_proof(),
+            descriptor.session.continuity.live_proof()
+        );
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(state.terminals.len(), 1);
+            state.terminals[&source.id].handle.clone()
+        };
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
 }
 
 #[test]
