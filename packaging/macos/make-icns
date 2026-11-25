@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Regenerates Cagents.icns from packaging/dev.cagents.Cagents.svg.
+#
+# Each size renders the SVG at 824/1024 of the canvas, centred, the body of
+# Apple's macOS icon grid, and the icns holds them as PNGs. Needs
+# rsvg-convert and ImageMagick; runs on Linux or macOS.
+set -euo pipefail
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+svg=$here/../dev.cagents.Cagents.svg
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+# icns type, pixel size
+types=(icp4:16 icp5:32 ic11:32 ic12:64 ic07:128 ic13:256 ic08:256 ic14:512 ic09:512 ic10:1024)
+for entry in "${types[@]}"; do
+    type=${entry%%:*} size=${entry#*:} body=$((${entry#*:} * 824 / 1024))
+    rsvg-convert -w "$body" -h "$body" "$svg" -o "$work/body.png"
+    magick "$work/body.png" -background none -gravity center -extent "${size}x${size}" \
+        -define png:exclude-chunks=date,time -strip "PNG32:$work/$type.png"
+done
+python3 -I - "$work" "$here/Cagents.icns" "${types[@]}" <<'PY'
+import struct, sys
+from pathlib import Path
+work, output, entries = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3:]
+chunks = b""
+for entry in entries:
+    kind = entry.split(":")[0]
+    data = (work / f"{kind}.png").read_bytes()
+    chunks += kind.encode() + struct.pack(">I", len(data) + 8) + data
+output.write_bytes(b"icns" + struct.pack(">I", len(chunks) + 8) + chunks)
+PY

@@ -11,8 +11,6 @@ set -eu
 
 PROGRAM=sherpa-onnx-libs
 RELEASE=v2.0.2
-STEM=sherpa-onnx-$RELEASE-linux-x64-static-lib
-SHA256=082743c80ec9d3fd739df174b9e46ab08ac77c9f57a1d2b09977a7fd5324727d
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -21,13 +19,25 @@ fail() {
 
 [ "$#" = 1 ] && [ -n "$1" ] || fail 'usage: sherpa-onnx-libs CACHE'
 case $(uname -s)/$(uname -m) in
-    Linux/x86_64) ;;
-    *) fail 'the pinned libraries are for Linux x86_64 only' ;;
+    Linux/x86_64)
+        STEM=sherpa-onnx-$RELEASE-linux-x64-static-lib
+        SHA256=082743c80ec9d3fd739df174b9e46ab08ac77c9f57a1d2b09977a7fd5324727d
+        ;;
+    Darwin/arm64)
+        STEM=sherpa-onnx-$RELEASE-osx-arm64-static-lib
+        SHA256=3e770a0062e9d0b7c16ca81c15098f08188540906a82a0f213ce3d8ee34b659c
+        ;;
+    *) fail 'the pinned libraries are for Linux x86_64 and macOS arm64 only' ;;
+esac
+# A newer macOS has a BSD sha256sum without GNU's options; shasum has them.
+case $(uname -s) in
+    Linux) check_digest() { sha256sum --check --strict --status; } ;;
+    *) check_digest() { shasum -a 256 --check --strict --status; } ;;
 esac
 # The digest names the directory, so a changed pin never reuses old bytes.
 DESTINATION=$1/$SHA256
 if [ ! -d "$DESTINATION/$STEM/lib" ]; then
-    for command in bzip2 curl mktemp sha256sum tar; do
+    for command in bzip2 curl mktemp tar; do
         command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
     done
     mkdir -p -- "$1"
@@ -38,14 +48,22 @@ if [ ! -d "$DESTINATION/$STEM/lib" ]; then
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/$RELEASE/$STEM.tar.bz2" \
         --output "$WORK/archive.tar.bz2" \
         || fail "could not download $STEM"
-    printf '%s  %s\n' "$SHA256" "$WORK/archive.tar.bz2" | sha256sum --check --strict --status \
+    printf '%s  %s\n' "$SHA256" "$WORK/archive.tar.bz2" | check_digest \
         || fail "$STEM does not match its pinned SHA-256"
     mkdir "$WORK/tree"
     tar -xjf "$WORK/archive.tar.bz2" -C "$WORK/tree" --no-same-owner "$STEM/lib" \
         || fail "could not unpack $STEM"
     chmod -R u+rwX,go+rX "$WORK/tree"
     # Another build may have finished first; its copy holds the same bytes.
-    mv -T -- "$WORK/tree" "$DESTINATION" 2>/dev/null || [ -d "$DESTINATION/$STEM/lib" ] \
+    # BSD mv has no -T, and would move the tree into an existing directory.
+    place_tree() {
+        if [ "$(uname -s)" = Linux ]; then
+            mv -T -- "$WORK/tree" "$DESTINATION"
+        else
+            [ ! -e "$DESTINATION" ] && mv -- "$WORK/tree" "$DESTINATION"
+        fi
+    }
+    place_tree 2>/dev/null || [ -d "$DESTINATION/$STEM/lib" ] \
         || fail "could not place $STEM in $1"
 fi
 printf '%s\n' "$DESTINATION/$STEM/lib"

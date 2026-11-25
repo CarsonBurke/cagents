@@ -1,0 +1,275 @@
+#!/bin/sh
+# Build the Apple Silicon macOS release archive on a Mac.
+#
+# The archive holds one version tree, laid out as on Linux so the updater,
+# install guard and companion lookup read it the same way:
+#
+#   cagents-VERSION/bin/{cagents,cagents-ui,cagentsd,cagents-dictate}
+#   cagents-VERSION/Cagents.app      stable launcher bundle (see launcher.c)
+#   cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
+#
+# Every executable and the bundle are signed ad hoc (`codesign -s -`): there
+# is no Developer ID yet. docs/releasing.md#macos says what notarization
+# would need.
+set -eu
+
+PROGRAM=package-macos
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT_DIR=$(dirname -- "$SCRIPT_DIR")
+DIST_DIR=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
+PROFILE=${CAGENTS_CARGO_PROFILE:-release}
+RELEASE_TARGET=aarch64-apple-darwin
+# The oldest macOS the release supports: Rust's own minimum for this target.
+MINIMUM_SYSTEM_VERSION=11.0
+PREBUILT=
+SMOKE=1
+# Archive times are SOURCE_DATE_EPOCH in UTC, whatever this Mac's zone.
+TZ=UTC
+export TZ
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/package-macos [--output DIR] [--prebuilt DIR] [--no-smoke]
+
+Builds cagents, cagentsd, cagents-ui and cagents-dictate for
+aarch64-apple-darwin with the release profile (CAGENTS_CARGO_PROFILE
+overrides it), signs them ad hoc with the Cagents.app launcher bundle, and
+writes to DIR (default CAGENTS_DIST_DIR or ./dist):
+
+  cagents-VERSION-aarch64-apple-darwin.tar.gz
+  install-macos.sh
+  SHA256SUMS-macos
+
+Then it installs the archive with install-macos.sh into a private HOME,
+checks the installed commands, LaunchAgent and bundle, and uninstalls it.
+
+  --prebuilt DIR  Package the four executables in DIR instead of building.
+                  Each must report VERSION, and cagents-ui and
+                  cagents-dictate must carry an embedded __info_plist.
+  --no-smoke      Skip the private install check.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --output|--prebuilt)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$1 requires a directory"
+            case $1 in
+                --output) DIST_DIR=$2 ;;
+                --prebuilt) PREBUILT=$2 ;;
+            esac
+            shift 2
+            ;;
+        --no-smoke) SMOKE=0; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "unknown argument: $1 (see --help)" ;;
+    esac
+done
+
+[ "$(uname -s)" = Darwin ] || fail 'the macOS package is built on macOS'
+[ "$(uname -m)" = arm64 ] || fail 'the macOS package is built on Apple Silicon'
+case $PROFILE in
+    ''|*[!0-9A-Za-z_-]*) fail "unsafe Cargo profile: $PROFILE" ;;
+esac
+[ -z "${CARGO_BUILD_TARGET:-}" ] || fail 'unset CARGO_BUILD_TARGET; this script selects the release target'
+for command in cc codesign gzip install mktemp otool plutil shasum sort strip tar touch; do
+    command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
+done
+
+if [ -z "${VERSION:-}" ]; then
+    VERSION=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' "$ROOT_DIR/Cargo.toml" | sed -n '1p')
+fi
+case $VERSION in
+    ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "unsafe package version: $VERSION" ;;
+esac
+# CFBundleVersion takes only dot-separated numbers.
+BUNDLE_VERSION=${VERSION%%+*}
+case $BUNDLE_VERSION in
+    *[!0-9.]*) fail "the version has no numeric release part: $VERSION" ;;
+esac
+
+TOP_LEVEL=cagents-$VERSION
+ARCHIVE_NAME=cagents-$VERSION-$RELEASE_TARGET.tar.gz
+CHECKSUM_NAME=SHA256SUMS-macos
+INSTALLER_NAME=install-macos.sh
+
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cagents-package-macos.XXXXXX")
+cleanup() {
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+# The Info.plist AppKit and the privacy prompts read for an executable that
+# runs outside a bundle, linked into it as __TEXT,__info_plist.
+embedded_plist() {
+    sed -e "s/@IDENTIFIER@/$1/" -e "s/@VERSION@/$BUNDLE_VERSION/" \
+        "$ROOT_DIR/packaging/macos/embedded-Info.plist" > "$WORK_DIR/$1.plist"
+    plutil -lint -s "$WORK_DIR/$1.plist" || fail "invalid embedded Info.plist for $1"
+    printf '%s\n' "$WORK_DIR/$1.plist"
+}
+
+# Builds one executable with `cargo rustc`, which passes LINK_ARGS to the
+# final link only, so dependencies keep the artifacts the other executables
+# share. Prints Cargo's reported executable path.
+build_executable() {
+    name=$1 plist=$2
+    shift 2
+    messages=$WORK_DIR/$name.cargo.json
+    set -- rustc --manifest-path "$ROOT_DIR/Cargo.toml" --locked --profile "$PROFILE" \
+        --target "$RELEASE_TARGET" "$@" --bin "$name" --message-format=json-render-diagnostics
+    if [ -n "$plist" ]; then
+        set -- "$@" -- -C "link-arg=-Wl,-sectcreate,__TEXT,__info_plist,$plist"
+    fi
+    cargo "$@" > "$messages" || fail "could not build $name"
+    /usr/bin/python3 -I -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from cargo_artifacts import CargoArtifacts
+artifacts = CargoArtifacts()
+with open(sys.argv[2], encoding="utf-8") as messages:
+    for line in messages:
+        artifacts.read(line, diagnostics=sys.stderr)
+print(artifacts.executable(sys.argv[3]))
+' "$SCRIPT_DIR" "$messages" "$name" || fail "Cargo did not report the $name executable"
+}
+
+if [ -n "$PREBUILT" ]; then
+    CLI_BINARY=$PREBUILT/cagents
+    HOST_BINARY=$PREBUILT/cagentsd
+    UI_BINARY=$PREBUILT/cagents-ui
+    DICTATE_BINARY=$PREBUILT/cagents-dictate
+else
+    command -v cargo >/dev/null 2>&1 || fail 'required command not found: cargo'
+    [ -x /usr/bin/python3 ] || fail 'required command not found: /usr/bin/python3'
+    # As in package-linux.sh: build metadata names the archive and what the
+    # binaries report, and a bare version takes the checkout's own.
+    if [ "${VERSION#*+}" != "$VERSION" ]; then
+        CAGENTS_BUILD_METADATA=${VERSION#*+}
+        export CAGENTS_BUILD_METADATA
+    else
+        unset CAGENTS_BUILD_METADATA
+    fi
+    unset CAGENTS_BUILD_METADATA_SUPPLIED
+    MACOSX_DEPLOYMENT_TARGET=$MINIMUM_SYSTEM_VERSION
+    export MACOSX_DEPLOYMENT_TARGET
+    if [ -z "${SHERPA_ONNX_LIB_DIR:-}" ]; then
+        TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT_DIR/target"}
+        SHERPA_ONNX_LIB_DIR=$("$SCRIPT_DIR/sherpa-onnx-libs" "$TARGET_DIR/sherpa-onnx") \
+            || fail 'could not provide the verified sherpa-onnx libraries'
+    fi
+    export SHERPA_ONNX_LIB_DIR
+
+    # macOS has one product, built with the `full` identity: it claims
+    # dev.cagents.Cagents and is the build self-update serves. Its UI has no
+    # integrated browser and opens saved browser cards in the system browser.
+    # Each executable builds alone, so the host and UI graphs never unify.
+    CLI_BINARY=$(build_executable cagents '')
+    HOST_BINARY=$(build_executable cagentsd '' -p cagents-host)
+    UI_BINARY=$(build_executable cagents-ui "$(embedded_plist dev.cagents.Cagents)" \
+        -p cagents-ui --features cagents/full)
+    DICTATE_BINARY=$(build_executable cagents-dictate "$(embedded_plist dev.cagents.Cagents.Dictate)" \
+        -p cagents-dictate --features engine)
+fi
+
+for binary in "$CLI_BINARY" "$HOST_BINARY" "$UI_BINARY" "$DICTATE_BINARY"; do
+    [ -f "$binary" ] && [ -x "$binary" ] || fail "missing release binary: $binary"
+done
+
+PACKAGE_ROOT=$WORK_DIR/stage/$TOP_LEVEL
+BIN_DIR=$PACKAGE_ROOT/bin
+APP_DIR=$PACKAGE_ROOT/Cagents.app
+install -d -m 0755 "$BIN_DIR" "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" \
+    "$PACKAGE_ROOT/share/doc/cagents"
+install -m 0755 "$CLI_BINARY" "$BIN_DIR/cagents"
+install -m 0755 "$HOST_BINARY" "$BIN_DIR/cagentsd"
+install -m 0755 "$UI_BINARY" "$BIN_DIR/cagents-ui"
+install -m 0755 "$DICTATE_BINARY" "$BIN_DIR/cagents-dictate"
+
+for binary in cagents cagentsd cagents-ui cagents-dictate; do
+    # Every executable has to describe this exact release; a stale or
+    # foreign one would break the matched set the updater relies on.
+    reported=$("$BIN_DIR/$binary" --version && printf '.') \
+        || fail "could not run the packaged $binary"
+    [ "$reported" = "$binary $VERSION." ] || [ "$reported" = "$(printf '%s %s\n.' "$binary" "$VERSION")" ] \
+        || fail "the packaged $binary does not report version $VERSION"
+    [ "${CAGENTS_SKIP_STRIP:-0}" = 1 ] || strip -x "$BIN_DIR/$binary"
+done
+for binary in cagents-ui cagents-dictate; do
+    otool -l "$BIN_DIR/$binary" | grep -q 'sectname __info_plist' \
+        || fail "$binary has no embedded Info.plist"
+done
+PROTOCOL_VERSION=$("$BIN_DIR/cagents" daemon protocol-version) \
+    || fail 'cannot inspect the packaged daemon protocol'
+case $PROTOCOL_VERSION in
+    ''|*[!0-9]*) fail 'the packaged CLI returned an invalid daemon protocol version' ;;
+esac
+
+# The launcher is part of the release, so it carries the same deployment
+# target and is signed with the bundle that names it.
+cc -O2 -Wall -Wextra -Werror -mmacosx-version-min="$MINIMUM_SYSTEM_VERSION" \
+    -o "$APP_DIR/Contents/MacOS/Cagents" "$ROOT_DIR/packaging/macos/launcher.c" \
+    || fail 'could not build the Cagents.app launcher'
+sed -e "s/@VERSION@/$BUNDLE_VERSION/g" -e "s/@MINIMUM_SYSTEM_VERSION@/$MINIMUM_SYSTEM_VERSION/" \
+    "$ROOT_DIR/packaging/macos/Info.plist" > "$APP_DIR/Contents/Info.plist"
+plutil -lint -s "$APP_DIR/Contents/Info.plist" || fail 'invalid Cagents.app Info.plist'
+printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
+install -m 0644 "$ROOT_DIR/packaging/macos/Cagents.icns" "$APP_DIR/Contents/Resources/Cagents.icns"
+install -m 0644 "$ROOT_DIR/LICENSE" "$PACKAGE_ROOT/share/doc/cagents/LICENSE"
+install -m 0644 "$ROOT_DIR/packaging/THIRD-PARTY-NOTICES" "$PACKAGE_ROOT/share/doc/cagents/THIRD-PARTY-NOTICES"
+
+# Ad hoc signatures name each executable's identifier; the linker's own
+# signature does not survive strip. Sign inside out, then check strictly.
+# sign PATH [IDENTIFIER]
+sign() {
+    path=$1
+    shift
+    codesign --force --sign - --timestamp=none ${1:+--identifier "$1"} "$path" 2> "$WORK_DIR/codesign.log" \
+        || { cat "$WORK_DIR/codesign.log" >&2; fail "could not sign $path"; }
+}
+sign "$BIN_DIR/cagents" dev.cagents.Cagents.cli
+sign "$BIN_DIR/cagentsd" dev.cagents.Cagents.daemon
+sign "$BIN_DIR/cagents-ui" dev.cagents.Cagents
+sign "$BIN_DIR/cagents-dictate" dev.cagents.Cagents.Dictate
+sign "$APP_DIR"
+for path in "$BIN_DIR/cagents" "$BIN_DIR/cagentsd" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagents-dictate" "$APP_DIR"; do
+    codesign --verify --strict "$path" || fail "signature check failed: $path"
+done
+
+# A reproducible archive: sorted members, fixed times and owners, and no
+# extended attributes or AppleDouble files.
+STAMP=$(date -u -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)
+find "$PACKAGE_ROOT" -exec touch -h -t "$STAMP" {} +
+(
+    cd "$WORK_DIR/stage"
+    find "$TOP_LEVEL" | LC_ALL=C sort > "$WORK_DIR/members"
+    COPYFILE_DISABLE=1 tar --no-recursion --no-xattrs --no-acls --no-fflags --no-mac-metadata \
+        --uid 0 --gid 0 --uname root --gname wheel --format ustar \
+        -cf "$WORK_DIR/archive.tar" -T "$WORK_DIR/members"
+)
+install -d -m 0755 "$DIST_DIR"
+gzip -n -9 -c "$WORK_DIR/archive.tar" > "$DIST_DIR/$ARCHIVE_NAME"
+sed "s|^DEFAULT_REPOSITORY='<OWNER>/<REPO>'\$|DEFAULT_REPOSITORY='CarsonBurke/cagents'|" \
+    "$ROOT_DIR/install-macos.sh" > "$DIST_DIR/$INSTALLER_NAME"
+grep -Fqx "DEFAULT_REPOSITORY='CarsonBurke/cagents'" "$DIST_DIR/$INSTALLER_NAME" \
+    || fail 'could not set the installer repository'
+chmod 0755 "$DIST_DIR/$INSTALLER_NAME"
+touch -t "$STAMP" "$DIST_DIR/$ARCHIVE_NAME" "$DIST_DIR/$INSTALLER_NAME"
+(
+    cd "$DIST_DIR"
+    shasum -a 256 "$ARCHIVE_NAME" "$INSTALLER_NAME" > "$CHECKSUM_NAME"
+)
+
+if [ "$SMOKE" = 1 ]; then
+    "$ROOT_DIR/packaging/macos/smoke" "$DIST_DIR" "$VERSION" "$PROTOCOL_VERSION" \
+        || fail 'the private install check failed'
+fi
+
+printf 'Created the macOS package (daemon protocol %s):\n  %s\n  %s\n  %s\n' "$PROTOCOL_VERSION" \
+    "$DIST_DIR/$ARCHIVE_NAME" "$DIST_DIR/$INSTALLER_NAME" "$DIST_DIR/$CHECKSUM_NAME"

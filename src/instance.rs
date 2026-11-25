@@ -80,7 +80,16 @@ const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` but without `integrated-browser` would claim them while running the
 // browserless code paths, so refuse the combination instead of shipping an
 // identity the binary cannot honour.
-#[cfg(all(feature = "ui", feature = "full", not(feature = "integrated-browser")))]
+//
+// macOS ships one product, `full`, whose UI has no integrated browser yet and
+// opens saved browser cards in the system browser: there is no browserless
+// peer package for it to be confused with.
+#[cfg(all(
+    target_os = "linux",
+    feature = "ui",
+    feature = "full",
+    not(feature = "integrated-browser")
+))]
 compile_error!(
     "a `full` UI must select `integrated-browser`; build the browserless UI with \
      --no-default-features --features ui"
