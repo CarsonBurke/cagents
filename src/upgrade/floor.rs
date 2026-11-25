@@ -334,19 +334,20 @@ impl Ledger {
     }
 }
 
-/// Drop allocations that are no longer in a saved pane. A resumed pane has a
-/// new allocation ID, so the old stop evidence cannot interfere with it. Keep
-/// the installed source's record while it serves: an aborted update may still
-/// have panes which its window has not flushed to disk yet.
+/// Drop allocations with no remaining pane or agent reference. Keep the
+/// installed source's record while its windows may still need to flush, and
+/// keep the source whose recovery is being verified by this startup.
 #[cfg(feature = "host")]
 pub fn prune_unreferenced(
     referenced: &std::collections::BTreeSet<TerminalId>,
+    recovering: Option<&HostSessionProof>,
 ) -> Result<(), String> {
     let paths = crate::daemon::RuntimePaths::discover().ok();
     prune_at(&directory()?, referenced, |source| {
-        paths
-            .as_ref()
-            .is_some_and(|paths| crate::daemon::lease_owner(&paths.lock, source).is_ok())
+        recovering == Some(source)
+            || paths
+                .as_ref()
+                .is_some_and(|paths| crate::daemon::lease_owner(&paths.lock, source).is_ok())
     })
 }
 
@@ -354,7 +355,7 @@ pub fn prune_unreferenced(
 fn prune_at(
     directory: &Path,
     referenced: &std::collections::BTreeSet<TerminalId>,
-    mut installed: impl FnMut(&HostSessionProof) -> bool,
+    mut keep_source: impl FnMut(&HostSessionProof) -> bool,
 ) -> Result<(), String> {
     let Some(root) = open_directory(directory)? else {
         return Ok(());
@@ -362,7 +363,7 @@ fn prune_at(
     for path in record_paths(directory)? {
         let path = path?;
         let mut record = read_record(&root, &path, true)?;
-        if installed(&record.source) {
+        if keep_source(&record.source) {
             continue;
         }
         record.prune_allocations(referenced);
