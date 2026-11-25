@@ -30,6 +30,8 @@ use std::{
 mod branch_census;
 pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
+#[cfg(target_os = "macos")]
+pub(crate) use complete_inventory::resolved_git_executable;
 mod pr_checkout;
 mod pr_creation;
 #[cfg(any(test, feature = "test-support"))]
