@@ -579,6 +579,10 @@ const DEGRADED_TEST: &str = "host::state::native_upgrade_tests::upgrade_restore_
 /// candidate daemon nor, after a rollback, its predecessor could then start at
 /// all, although every carried terminal was adoptable.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "its native holder needs a subreaper, which Darwin lacks (#4045)"
+)]
 fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
     let retained_failure = match std::env::var(MODE).as_deref() {
         Ok("provider") => return provider(),

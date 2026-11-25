@@ -2094,10 +2094,6 @@ impl Drop for SigkillCoordinator {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn slow_turn_survives_sigkill_of_the_host_owner_process() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -2107,10 +2103,6 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn semantic_retirement_precedes_original_parent_wait_after_host_sigkill() {
     if crate::retained_fixture::run_isolated() {
         return;
