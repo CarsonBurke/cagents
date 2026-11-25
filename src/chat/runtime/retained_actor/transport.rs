@@ -41,6 +41,8 @@ use std::{
 const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
+#[cfg(target_os = "macos")]
+const SCOPED_CLOSE: &str = "retained-close-scope-1";
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the serve loop checks admitted inputs for completion.
 const INPUT_COMPLETION_POLL: Duration = Duration::from_millis(20);
@@ -2475,8 +2477,34 @@ impl RemoteActor {
     }
     pub fn close_method(&self, method: &str, args: Value) -> Result<(), String> {
         let require_exact = method != "close" || args.get(0).and_then(Value::as_bool) != Some(true);
-        self.publish_close_result(self.call(method, args), require_exact)
+        self.publish_close_result(
+            self.call(method, self.close_args(args, require_exact)),
+            require_exact,
+        )
     }
+
+    fn close_args(&self, args: Value, require_exact: bool) -> Value {
+        #[cfg(target_os = "linux")]
+        let _ = require_exact;
+        #[cfg(target_os = "macos")]
+        let args = {
+            let mut args = args;
+            if !require_exact
+                && self.0.identity.record.build.as_ref().is_some_and(|build| {
+                    build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == SCOPED_CLOSE)
+                })
+                && let Value::Array(args) = &mut args
+            {
+                args.push(json!(SCOPED_CLOSE));
+            }
+            args
+        };
+        args
+    }
+
     pub fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
         self.try_close_if_idle_with(json!([generation]))
     }
@@ -2492,7 +2520,8 @@ impl RemoteActor {
     }
     fn try_close_if_idle_with(&self, args: Value) -> Result<bool, String> {
         let require_exact = args.get(1).and_then(Value::as_bool) != Some(true);
-        let publication = match self.call("try_close_if_idle", args) {
+        let publication = match self.call("try_close_if_idle", self.close_args(args, require_exact))
+        {
             Ok(ConditionalClosePublication::Changed) => return Ok(false),
             Ok(ConditionalClosePublication::Closed(publication)) => Ok(*publication),
             Err(error) => Err(error),
@@ -2899,6 +2928,8 @@ impl Server {
                 .map_err(|error| error.to_string())?;
             let mut build = registry::BuildIdentity::current(Kind::Native);
             build.capabilities.push(CAPABILITY.into());
+            #[cfg(target_os = "macos")]
+            build.capabilities.push(SCOPED_CLOSE.into());
             build
                 .capabilities
                 .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
@@ -3882,6 +3913,18 @@ impl Server {
                 // before this refuses the second argument, closing nothing.
                 let (generation, detached) = match request.args.as_array().map(Vec::as_slice) {
                     Some([generation]) => (generation.as_u64(), None),
+                    #[cfg(target_os = "macos")]
+                    Some([generation, Value::Bool(true), Value::String(scope)])
+                        if scope == SCOPED_CLOSE =>
+                    {
+                        (generation.as_u64(), Some(DetachedWork::Spare))
+                    }
+                    #[cfg(target_os = "macos")]
+                    Some([_, Value::Bool(true)]) => {
+                        return Err(
+                            "Sparing detached provider work requires a scoped close client".into(),
+                        );
+                    }
                     Some([generation, Value::Bool(spare)]) => (
                         generation.as_u64(),
                         Some(if *spare {
@@ -3906,7 +3949,16 @@ impl Server {
                     DetachedWork::Stop
                 };
                 #[cfg(target_os = "macos")]
-                self.ensure_close_scope(detached)?;
+                {
+                    if detached == DetachedWork::Spare
+                        && request.args.get(1).and_then(Value::as_str) != Some(SCOPED_CLOSE)
+                    {
+                        return Err(
+                            "Sparing detached provider work requires a scoped close client".into(),
+                        );
+                    }
+                    self.ensure_close_scope(detached)?;
+                }
                 if self.closed_snapshot.is_none() {
                     // The provider's scope holds what it detached, too.
                     self.actor.decide_detached_work(detached);

@@ -462,6 +462,10 @@ fn validate_retired_publication(
         &receipt.proof,
         &receipt.source,
     )?;
+    #[cfg(target_os = "macos")]
+    if final_receipt.detached_cleanup_proved != receipt.detached_cleanup_proved {
+        return Err("Retired helper changed its detached cleanup scope".into());
+    }
     if final_receipt.installed != receipt.installed
         || final_receipt.launch_account_scope != receipt.launch_account_scope
         || final_receipt.confirmed_session != receipt.confirmed_session
@@ -659,7 +663,7 @@ pub mod fixture {
             Some(&session),
             &snapshot,
             #[cfg(target_os = "macos")]
-            false,
+            true,
         )
         .unwrap();
         publish_retirement(RetirementReceipt {
@@ -1169,7 +1173,7 @@ os.waitpid(pid,0)
             source.launch.session_id.as_deref(),
             &snapshot,
             #[cfg(target_os = "macos")]
-            false,
+            true,
         )
         .unwrap();
         let receipt = RetirementReceipt {
