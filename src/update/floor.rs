@@ -1188,7 +1188,7 @@ fn floor_record_helper(
     mut record: crate::upgrade::floor::Record,
     capture: bool,
 ) -> Result<File, UpdateError> {
-    let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
+    let helper = crate::companion::Product::Daemon.beside(&crate::process::current_executable()?)?;
     let mut file = anonymous_file()?;
     file.write_all(&record.encode_capture().map_err(invalid)?)?;
     file.seek(SeekFrom::Start(0))?;

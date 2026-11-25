@@ -421,7 +421,7 @@ const SERVING_CLI: &str = "bin";
 
 /// The directory of this executable, when it holds the paired CLI.
 fn paired_directory() -> Option<std::path::PathBuf> {
-    let executable = std::env::current_exe().ok()?;
+    let executable = crate::process::current_executable().ok()?;
     let directory = executable.parent()?;
     directory
         .join("cagents")

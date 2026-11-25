@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 /// been handled. It supplies no launch recipes or renewed execution authority.
 pub(super) fn restore_settled(host: &SharedHost) -> Result<bool, String> {
     let store = Store::discover()?;
-    let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+    let daemon = crate::process::current_executable().map_err(|error| error.to_string())?;
     restore_settled_from(host, &store.path, &daemon)
 }
 
@@ -89,7 +89,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
             .collect::<Vec<_>>();
         (state.proof().clone(), state.list(0), chats)
     };
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = crate::process::current_executable().map_err(|error| error.to_string())?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
     crate::upgrade::recovery::verified::ready::publish(
@@ -150,7 +150,7 @@ fn settle_agents(
 fn publish_archived_proof(host: &SharedHost) {
     let result = (|| -> Result<(), String> {
         let store = Store::discover()?;
-        let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+        let daemon = crate::process::current_executable().map_err(|error| error.to_string())?;
         let Some(settled) = recovery::archived_discovery(&store.path, &daemon)? else {
             return Ok(());
         };

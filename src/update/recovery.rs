@@ -1011,12 +1011,14 @@ fn inspect_capture_source(
 ) -> Result<Option<HostSessionProof>, UpdateError> {
     match candidate_cli {
         Some(candidate) => inspect_pending_source_inner(candidate, None, false, busy),
-        None => inspect_pending_source_inner(&std::env::current_exe()?, None, true, busy),
+        None => {
+            inspect_pending_source_inner(&crate::process::current_executable()?, None, true, busy)
+        }
     }
 }
 
 pub(super) fn inspect_pending_current() -> Result<(), UpdateError> {
-    inspect_pending_caller(&std::env::current_exe()?)
+    inspect_pending_caller(&crate::process::current_executable()?)
 }
 
 pub(super) fn inspect_pending_caller(caller: &Path) -> Result<(), UpdateError> {
@@ -1302,7 +1304,7 @@ fn retire_service(
             // This is local mechanical evidence only. No socket self-query,
             // old census reconstruction, pause inspection or live-owner claim
             // is needed once the exact archive transaction has completed.
-            let target = std::env::current_exe()?;
+            let target = crate::process::current_executable()?;
             if let Some(status) = completed_cold_retirement(&store.path, &target)? {
                 return Ok(status);
             }

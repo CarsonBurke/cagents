@@ -203,7 +203,8 @@ mod service {
     }
 
     fn spawn_child(name: &str, arguments: &[String]) -> Result<Output, String> {
-        let mut executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let mut executable =
+            crate::process::current_executable().map_err(|error| error.to_string())?;
         executable.set_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         Command::new(&executable)
             .args(arguments)

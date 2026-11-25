@@ -24,9 +24,13 @@ mod sqlite_contracts;
 #[macro_export]
 macro_rules! refuse_filtered_test_run {
     () => {
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         #[used]
-        #[unsafe(link_section = ".init_array")]
+        #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+        #[cfg_attr(
+            target_os = "macos",
+            unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+        )]
         static REFUSE_FILTERED_TEST_RUN: extern "C" fn() = {
             extern "C" fn refuse() {
                 $crate::refuse_filtered_test_run(

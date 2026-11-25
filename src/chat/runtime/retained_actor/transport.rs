@@ -4521,7 +4521,7 @@ fn helper_executable() -> Result<PathBuf, String> {
     if crate::test_binary::is_test_binary() {
         return Err("Actual retained-helper tests require CAGENTS_TEST_RETAINED_ACTOR_HELPER pointing to the same-head cagentsd binary".into());
     }
-    std::env::current_exe().map_err(|error| error.to_string())
+    crate::process::current_executable().map_err(|error| error.to_string())
 }
 
 fn confirm_installed_snapshot(state: &mut Snapshot) {

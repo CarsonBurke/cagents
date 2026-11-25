@@ -75,7 +75,7 @@ pub(super) fn perform(
     survivors: &mut floor::Survivors,
     terminal: bool,
 ) -> Result<Completion, UpdateError> {
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
     let source_owner = installed_daemon_owner(&layout)?;

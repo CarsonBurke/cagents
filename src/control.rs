@@ -4066,7 +4066,10 @@ where
             .is_some_and(|context| context.scoped())
     {
         let recover = !no_start && staged_command_requires_daemon(&cli.command);
-        match staged_lookup(&std::env::current_exe().unwrap_or_default(), recover) {
+        match staged_lookup(
+            &crate::process::current_executable().unwrap_or_default(),
+            recover,
+        ) {
             Ok(Some(bin)) => {
                 use std::os::unix::process::CommandExt;
                 let mut command =
@@ -4226,7 +4229,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
 /// Desktop launches need the same matched owner as CLI launches while a staged
 /// update is pending. Internal helpers and remote devices do not use this route.
 pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
-    crate::install_guard::staged_owner_bin(&std::env::current_exe()?, true)
+    crate::install_guard::staged_owner_bin(&crate::process::current_executable()?, true)
         .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
 }
 

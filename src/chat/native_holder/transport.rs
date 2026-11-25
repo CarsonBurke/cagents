@@ -507,7 +507,9 @@ pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
     let control_peer =
         Process::read(std::process::id() as i32).map_err(|error| error.to_string())?;
     let fd = remote.as_raw_fd();
-    let mut holder = Command::new("/proc/self/exe");
+    // Held until the spawn below has executed it.
+    let image = crate::process::own_image().map_err(|error| error.to_string())?;
+    let mut holder = Command::new(image.path());
     holder
         .arg0("cagents-native")
         .arg(ARGUMENT)
@@ -1498,14 +1500,18 @@ fn read_exact(
 }
 
 #[used]
-#[unsafe(link_section = ".init_array")]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+)]
 static SERVE: extern "C" fn() = serve_if_requested;
 
 extern "C" fn serve_if_requested() {
-    let Ok(arguments) = std::fs::read("/proc/self/cmdline") else {
+    let Some(arguments) = crate::process::command_line() else {
         return;
     };
-    let mut arguments = arguments.split(|&byte| byte == 0).skip(1);
+    let mut arguments = arguments.iter().map(Vec::as_slice).skip(1);
     if arguments.next() != Some(ARGUMENT.as_bytes()) {
         return;
     }

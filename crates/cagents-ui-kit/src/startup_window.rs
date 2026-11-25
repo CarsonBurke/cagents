@@ -350,7 +350,7 @@ fn reopen(request: &Request) -> Result<(), &'static str> {
         return Ok(());
     }
     let executable = crate::update::superseding_ui()
-        .or_else(|| std::env::current_exe().ok())
+        .or_else(|| crate::process::current_executable().ok())
         .ok_or("The cagents executable could not be found.")?;
     reopen_command(&executable, request)
         .spawn()

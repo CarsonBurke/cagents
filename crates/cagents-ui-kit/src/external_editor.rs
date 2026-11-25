@@ -81,7 +81,10 @@ pub fn installed() -> Vec<Editor> {
             if id != "ceditor" {
                 return None;
             }
-            let sibling = env::current_exe().ok()?.parent()?.join("ceditor");
+            let sibling = crate::process::current_executable()
+                .ok()?
+                .parent()?
+                .join("ceditor");
             sibling
                 .metadata()
                 .is_ok_and(|metadata| {

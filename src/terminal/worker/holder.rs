@@ -305,7 +305,10 @@ pub(super) fn spawn_reserved(
     let (control, remote) =
         UnixStream::pair().map_err(|error| format!("create terminal holder socket: {error}"))?;
     let remote_fd = remote.as_raw_fd();
-    let mut process = Command::new("/proc/self/exe");
+    // Held until the spawn below has executed it.
+    let image = crate::process::own_image()
+        .map_err(|error| format!("prepare terminal holder image: {error}"))?;
+    let mut process = Command::new(image.path());
     #[cfg(test)]
     if let Some(runtime) = &fixture_runtime {
         process.env("XDG_RUNTIME_DIR", runtime);
@@ -332,8 +335,8 @@ pub(super) fn spawn_reserved(
     }
     // The root inherits the holder's limit.
     crate::descriptor_limit::inherit(&mut process);
-    // `/proc/self/exe` runs this image even after an upgrade has replaced the
-    // file it was loaded from, so a holder always matches its daemon.
+    // `own_image` runs this image even after an upgrade has replaced the file
+    // it was loaded from, so a holder always matches its daemon.
     let process = spawn_original(&mut process, reservation)
         .map_err(|error| format!("start terminal holder: {error}"))?;
     drop(remote);
@@ -1163,20 +1166,25 @@ pub(super) fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
 
 /// Serves as a holder when this image was executed as one.
 ///
-/// It runs from `.init_array`, before `main`, so every image that can start a
+/// It runs as an initializer (`.init_array`, Mach-O's `__mod_init_func`),
+/// before `main`, so every image that can start a
 /// holder can also be one: the daemon, and any test harness that links the
 /// host library. None of them needs a hook in its own `main`, and a holder
 /// never initializes anything it does not use. Any other invocation costs one
 /// read of its own command line.
 #[used]
-#[unsafe(link_section = ".init_array")]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+)]
 static SERVE: extern "C" fn() = serve_if_requested;
 
 extern "C" fn serve_if_requested() {
-    let Ok(command_line) = std::fs::read("/proc/self/cmdline") else {
+    let Some(command_line) = crate::process::command_line() else {
         return;
     };
-    let mut arguments = command_line.split(|&byte| byte == 0).skip(1);
+    let mut arguments = command_line.iter().map(Vec::as_slice).skip(1);
     if arguments.next() != Some(ARGUMENT.as_bytes()) {
         return;
     }

@@ -563,6 +563,11 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     observe_fixture_startup("host run entered", None);
     daemon::install_signal_handlers()?;
     crate::descriptor_limit::raise();
+    // Holders start from this image; pin it before an update replaces the
+    // installed daemon.
+    if let Err(error) = crate::process::pin_own_image() {
+        tracing::warn!(%error, "terminal and chat holders cannot be started");
+    }
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,
@@ -635,7 +640,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(
-        &std::env::current_exe()?,
+        &crate::process::current_executable()?,
         std::env::args_os()
             .any(|argument| argument == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT),
     )?;

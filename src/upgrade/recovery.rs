@@ -1243,8 +1243,9 @@ impl PendingRecovery {
         )?;
         let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
         let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
-        let cli = fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let cli =
+            fs::canonicalize(crate::process::current_executable().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
         if crate::update::locate(&cli)
             .map_err(|e| e.to_string())?
             .version_root
@@ -3925,7 +3926,7 @@ pub fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
     validate_host_context(&authority)?;
     if authority.version != 1
         || fs::canonicalize(&authority.target).map_err(|e| e.to_string())?
-            != fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
+            != fs::canonicalize(crate::process::current_executable().map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?
         || executable_hash(&authority.target)? != authority.target_hash
     {
@@ -3995,8 +3996,9 @@ pub fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
 
 #[cfg(feature = "host")]
 fn validate_host_context(authority: &Authority) -> Result<(), String> {
-    let layout = crate::update::locate(&std::env::current_exe().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let layout =
+        crate::update::locate(&crate::process::current_executable().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     let state = layout.prefix.join(".update");
     let metadata = fs::symlink_metadata(&state).map_err(|e| e.to_string())?;
     if !metadata.is_dir()

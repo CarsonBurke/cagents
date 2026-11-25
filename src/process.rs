@@ -3,7 +3,14 @@
 #[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) mod clock;
 pub(crate) mod identity;
+mod image;
 mod poll;
+
+pub use image::current_executable;
+#[cfg(feature = "host")]
+pub use image::pin_own_image;
+#[cfg(feature = "host")]
+pub(crate) use image::{command_line, own_image};
 
 use crate::descriptor::set_nonblocking;
 use identity::{child_exit_status, child_identity};

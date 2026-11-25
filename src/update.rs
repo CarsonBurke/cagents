@@ -357,7 +357,7 @@ impl Installation {
                 "browserless builds must be updated with their package manager or installer",
             ));
         }
-        Self::from_executable(&std::env::current_exe()?)
+        Self::from_executable(&crate::process::current_executable()?)
     }
 
     fn from_executable(executable: &Path) -> Result<Self, UpdateError> {
@@ -523,7 +523,7 @@ fn unmanaged_reason(error: UpdateError) -> String {
     if error.to_string() != unsupported_install().to_string() {
         return error.to_string();
     }
-    let executable = std::env::current_exe().and_then(|path| path.canonicalize());
+    let executable = crate::process::current_executable().and_then(|path| path.canonicalize());
     match executable {
         Ok(path) if path.components().any(|part| part.as_os_str() == "target") => {
             "This is a build from source. Install a release to receive updates.".into()
@@ -590,7 +590,7 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
 fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
     recovery::inspect_pending_current()?;
     let mut installation = running_installation()?;
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     let served = served_version_root(&layout)?;
     if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
         return Err(invalid(
@@ -682,7 +682,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
     // An interrupted preparation has its own immutable source census. Do not
     // route this retry through old `current` or construct a fresh empty source.
     recovery::inspect_pending_current()?;
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
     if cancellation::requested() {
         return Err(UpdateError::Cancelled);
@@ -1240,7 +1240,7 @@ fn source_client_for(daemon: &impact::DaemonImpact) -> Result<source::Client, Up
 }
 
 fn running_installation() -> Result<Installation, UpdateError> {
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     if layout.version != crate::version() {
         return Err(unsupported_install());
     }
@@ -1329,7 +1329,7 @@ fn start_job(
 
 /// Returns the latest operation, including retained failure diagnostics.
 pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
-    let executable = std::env::current_exe()?;
+    let executable = crate::process::current_executable()?;
     if executable
         .parent()
         .and_then(Path::parent)
@@ -1440,7 +1440,7 @@ enum Reconciled {
 
 #[cfg(feature = "ui")]
 fn reconcile_failure(job: &UpdateJob) -> Result<Reconciled, UpdateError> {
-    let window = locate(&std::env::current_exe()?)?;
+    let window = locate(&crate::process::current_executable()?)?;
     let served = served_version_root(&window)?;
     let daemon = installed_daemon_owner(&window)?;
     if job.version == window.version {
@@ -1796,7 +1796,7 @@ const SUCCESSOR_SETTLE_PATIENCE: Duration = Duration::from_secs(30 * 60);
 /// job complete. Anything else leaves the record as it is.
 #[cfg(feature = "host")]
 pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
-    let Ok(executable) = std::env::current_exe() else {
+    let Ok(executable) = crate::process::current_executable() else {
         return;
     };
     let Ok(layout) = locate(&executable) else {
@@ -1940,7 +1940,7 @@ fn failed_job_reached_its_target(
 /// `+local` builds a developer installs, since nothing here is downloaded: the
 /// bytes are already installed under a privately owned root.
 pub fn superseding_ui() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
+    let executable = crate::process::current_executable().ok()?;
     if let Some(replacement) = superseding_ui_from(&executable) {
         return Some(replacement);
     }
@@ -1956,7 +1956,7 @@ pub fn superseding_ui() -> Option<PathBuf> {
 /// install can leave it behind, so the only process [`superseding_ui`] can
 /// ever find a replacement for. A source build never is one.
 pub fn runs_from_installation() -> bool {
-    std::env::current_exe().is_ok_and(|executable| locate(&executable).is_ok())
+    crate::process::current_executable().is_ok_and(|executable| locate(&executable).is_ok())
 }
 
 fn daemon_protocol_mismatch() -> bool {
@@ -2040,7 +2040,7 @@ pub fn restart_windows(instance: &str) -> Result<(), UpdateError> {
             crate::instance::NAME
         )));
     }
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     if served_version_root(&layout)? != layout.version_root {
         return Err(invalid(
             "only the installed version may reopen saved windows",
@@ -2589,7 +2589,7 @@ impl ReviewContext {
     fn capture(installation: &Installation) -> Result<Self, UpdateError> {
         let guard = crate::instance::UiUpdateGuard::acquire()?;
         let windows = guard.verified_windows()?;
-        let layout = locate(&std::env::current_exe()?)?;
+        let layout = locate(&crate::process::current_executable()?)?;
         let from_version = installed_daemon_owner(&layout)?
             .map(|owner| owner.version)
             .or_else(|| {
@@ -2644,7 +2644,7 @@ fn inspect_source_panes_mode(
     reconcile_retained: bool,
 ) -> Result<source_inspection::SourceInspection, UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
-    let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
+    let helper = crate::companion::Product::Daemon.beside(&crate::process::current_executable()?)?;
     let before = fs::symlink_metadata(&helper)?;
     if !before.is_file()
         || !crate::install_guard::trusted_executable_owner(before.uid())

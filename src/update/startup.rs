@@ -236,7 +236,7 @@ impl Follow {
 
 pub fn observe() -> Snapshot {
     let installation_lock = crate::instance::update_fence_held().into();
-    let Ok(executable) = std::env::current_exe() else {
+    let Ok(executable) = crate::process::current_executable() else {
         return Snapshot {
             installation_lock,
             ..Snapshot::unavailable()

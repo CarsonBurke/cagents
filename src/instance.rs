@@ -2652,7 +2652,7 @@ pub fn notification_desktop_id(application: crate::notifications::Application) -
 // installed separately, so resolve only these fixed application names, never a
 // path carried by an alert. Relative PATH entries cannot redirect activation.
 fn notification_executable(product: crate::companion::Product) -> io::Result<PathBuf> {
-    let current = env::current_exe()?;
+    let current = crate::process::current_executable()?;
     let sibling = product.beside(&current)?;
     let search = env::var_os("PATH").unwrap_or_default();
     resolve_notification_executable(

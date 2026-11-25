@@ -37,7 +37,7 @@ fn main() -> std::process::ExitCode {
 
 fn restart_matched_daemon() -> Result<(), Box<dyn std::error::Error>> {
     use std::process::{Command, Stdio};
-    let cli = std::env::current_exe()?.with_file_name("cagents");
+    let cli = cagents::process::current_executable()?.with_file_name("cagents");
     let version = Command::new(&cli).arg("--version").output()?;
     if !version.status.success()
         || String::from_utf8(version.stdout)?.trim() != format!("cagents {}", cagents::version())

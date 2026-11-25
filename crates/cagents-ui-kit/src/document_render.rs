@@ -194,7 +194,7 @@ pub fn render_document_page(
     tone: PdfTone,
     zoom: PdfZoom,
 ) -> Result<DocumentPage, String> {
-    let helper = std::env::current_exe()
+    let helper = crate::process::current_executable()
         .map_err(|error| format!("This document could not be rendered: {error}."))?;
     render_with_helper(&helper, path, index, tone, zoom, RENDER_TIMEOUT)
 }
