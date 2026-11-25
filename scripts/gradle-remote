@@ -31,7 +31,17 @@ while [ $# -gt 0 ]; do
     case $1 in
         --fetch)
             [ $# -ge 2 ] || { echo "gradle-remote: --fetch needs a path" >&2; exit 2; }
-            fetch+=("$2")
+            # A path inside mobile/: it is mirrored with --delete, so an
+            # empty, absolute or upward one would wipe more than it names.
+            path=$2
+            while [ "${path%/}" != "$path" ]; do path=${path%/}; done
+            case /$path/ in
+                // | //* | */./* | */../* | *//*)
+                    echo "gradle-remote: --fetch takes a path inside mobile/, not '$2'" >&2
+                    exit 2
+                    ;;
+            esac
+            fetch+=("$path")
             shift 2
             ;;
         --)
@@ -100,8 +110,9 @@ rsync -a --prune-empty-dirs \
     "$remote:$base/mobile/" "$root/mobile/" || true
 if [ "$status" -eq 0 ]; then
     for path in "${fetch[@]}"; do
-        mkdir -p "$root/mobile/$path"
-        rsync -a --delete "$remote:$base/mobile/$path/" "$root/mobile/$path/"
+        # A directory or a single file, such as one a Gradle task regenerated.
+        mkdir -p "$(dirname "$root/mobile/$path")"
+        rsync -a --delete "$remote:$base/mobile/$path" "$(dirname "$root/mobile/$path")/"
     done
 fi
 exit "$status"
