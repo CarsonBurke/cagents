@@ -290,8 +290,16 @@ impl CommandSpec {
 
     /// Starts the child in a retained directory even if its pathname moves.
     /// Darwin's /dev/fd duplicates the descriptor but cannot traverse it.
+    /// Resolve the executable before changing cwd so relative PATH entries
+    /// cannot take a different program from the retained directory.
     #[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
     pub(crate) fn cwd_held(mut self, directory: Arc<std::fs::File>) -> io::Result<Self> {
+        if !self.program.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a retained working directory requires an absolute executable",
+            ));
+        }
         validate_inherited_fd(directory.as_raw_fd())?;
         self.current_dir = None;
         self.held_directory = Some(InheritedFile(directory));
