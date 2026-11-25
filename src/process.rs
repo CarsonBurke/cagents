@@ -26,6 +26,40 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Names this process for `ps` and `top`. Darwin names a process after its
+/// executable image and offers no way to rename it, so there this does nothing.
+#[cfg(feature = "host")]
+pub(crate) fn set_name(name: &std::ffi::CStr) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the name is NUL-terminated and outlives the call.
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+    }
+    #[cfg(target_os = "macos")]
+    let _ = name;
+}
+
+/// Makes this process the parent of every orphan among its descendants, so it
+/// can reap them and prove none is left. Darwin hands orphans to launchd and
+/// has no subreaper, so it refuses rather than let a holder claim a proof it
+/// cannot make; the descendant tracker replaces this there (#4045).
+#[cfg(feature = "host")]
+pub(crate) fn become_subreaper() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl takes scalar arguments.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "macOS has no subreaper to own a provider's orphans",
+    ))
+}
+
 /// How long a terminated process group is given to exit on SIGTERM before it
 /// is killed outright.
 ///

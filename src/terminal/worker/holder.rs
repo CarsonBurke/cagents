@@ -1299,8 +1299,8 @@ fn serve(control: UnixStream) -> i32 {
         // SIGCHLD disposition of "ignore" would do behind its back.
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
         libc::fcntl(control.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::prctl(libc::PR_SET_NAME, PROCESS_NAME.as_ptr());
     }
+    crate::process::set_name(PROCESS_NAME);
     let fail = |message: String| {
         let _ = send(&control, &Report::Failed(message), &[]);
         1

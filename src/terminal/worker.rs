@@ -5826,8 +5826,12 @@ impl Worker {
         let _admitted = if conventional_interrupt {
             // TIOCSIG targets the foreground group bound to this exact PTY.
             // Raw applications and extended key encodings retain their bytes.
-            let result =
-                unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
+            // Darwin declares the request narrower than `ioctl` takes it.
+            #[cfg(target_os = "linux")]
+            let request = libc::TIOCSIG;
+            #[cfg(target_os = "macos")]
+            let request = libc::c_ulong::from(libc::TIOCSIG);
+            let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), request, libc::SIGINT) };
             if result < 0 {
                 self.error(
                     "interrupt terminal",
@@ -5863,6 +5867,7 @@ impl Worker {
         boundary
     }
 
+    #[cfg(target_os = "linux")]
     fn cancel_kernel_input(&self) {
         // The peer ioctl opens this exact slave without a reusable path or a
         // controlling-terminal change. Flushing TCIFLUSH on the master would
@@ -5884,6 +5889,20 @@ impl Worker {
         // SAFETY: the successful ioctl returned a fresh owned descriptor.
         let peer = unsafe { OwnedFd::from_raw_fd(peer) };
         if unsafe { libc::tcflush(peer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
+            self.error(
+                "cancel terminal input",
+                std::io::Error::last_os_error().to_string(),
+            );
+        }
+    }
+
+    /// XNU's master and slave share one tty, whose input queue is the
+    /// slave's, so flushing input through the master discards exactly what
+    /// the child has not read and leaves its output alone.
+    #[cfg(target_os = "macos")]
+    fn cancel_kernel_input(&self) {
+        // SAFETY: tcflush takes the live master descriptor and a scalar.
+        if unsafe { libc::tcflush(self.writer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
             self.error(
                 "cancel terminal input",
                 std::io::Error::last_os_error().to_string(),
@@ -6578,16 +6597,7 @@ fn pty_size(size: TerminalSize) -> PtySize {
 /// to it: dropping the write end hangs the read end up, which is the one event
 /// a blocking reader can always observe.
 fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
-    let mut ends = [0 as libc::c_int; 2];
-    // SAFETY: `ends` is the two-element array `pipe2` writes into.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(format!(
-            "create PTY reader wake pipe: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `pipe2` filled both entries with fresh owned descriptors.
-    unsafe { Ok((OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1]))) }
+    crate::descriptor::pipe(false).map_err(|error| format!("create PTY reader wake pipe: {error}"))
 }
 
 enum Readiness {

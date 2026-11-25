@@ -68,7 +68,10 @@ impl NewHomeCreationReceipt {
         }
         // SAFETY: fstatat succeeded, so it wrote the whole structure.
         let named = unsafe { named.assume_init() };
-        if (named.st_dev, named.st_ino) != (held.dev(), held.ino()) {
+        // `dev_t` is signed on Darwin; std widens it the same way.
+        #[allow(clippy::unnecessary_cast)]
+        let named = (named.st_dev as u64, named.st_ino);
+        if named != (held.dev(), held.ino()) {
             return Err(io::Error::other(
                 "The newly created account directory changed; files were retained",
             ));

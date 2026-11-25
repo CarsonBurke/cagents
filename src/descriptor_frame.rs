@@ -11,6 +11,15 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
+/// Received rights arrive close-on-exec on Linux. Darwin has no such flag, so
+/// [`receive_part`] marks each one as soon as `recvmsg` returns. A child
+/// forked in between keeps it only if it skips
+/// [`crate::daemon::seal_inherited_descriptors`].
+#[cfg(target_os = "linux")]
+const RECEIVE_CLOEXEC: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(target_os = "macos")]
+const RECEIVE_CLOEXEC: libc::c_int = 0;
+
 // Linux's SCM_MAX_FD. Receive enough space to own and close excess rights even
 // when a caller permits fewer. MSG_CTRUNC is still an error, never a partial set.
 const MAX_RIGHTS: usize = 253;
@@ -162,7 +171,7 @@ pub(crate) fn send_json_with_fds_until(
             let space = unsafe { libc::CMSG_SPACE(bytes as _) } as usize;
             debug_assert!(space <= size_of_val(&ancillary));
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen = space;
+            message.msg_controllen = space as _;
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&message);
                 (*header).cmsg_level = libc::SOL_SOCKET;
@@ -206,7 +215,11 @@ pub(crate) fn send_json_with_fds_until(
 // checked before every header/payload read; unknown data is never treated as fds.
 fn take_rights(bytes: &[u8], descriptors: &mut Vec<OwnedFd>) -> Result<(), String> {
     let base_length = unsafe { libc::CMSG_LEN(0) } as usize;
+    // `CMSG_ALIGN`: Linux aligns ancillary records to a word, Darwin to 32 bits.
+    #[cfg(target_os = "linux")]
     let alignment = size_of::<usize>();
+    #[cfg(target_os = "macos")]
+    let alignment = size_of::<u32>();
     let mut offset = 0_usize;
     let mut invalid = false;
     while bytes.len().saturating_sub(offset) >= size_of::<libc::cmsghdr>() {
@@ -217,13 +230,18 @@ fn take_rights(bytes: &[u8], descriptors: &mut Vec<OwnedFd>) -> Result<(), Strin
                 .cast::<libc::cmsghdr>()
                 .read_unaligned()
         };
-        let length = header.cmsg_len;
+        // `socklen_t` on Darwin, `usize` on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let length = header.cmsg_len as usize;
         if length < base_length || length > bytes.len() - offset {
             return Err("malformed descriptor frame ancillary header".into());
         }
         let payload = &bytes[offset + base_length..offset + length];
         let rights = header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS;
-        let pidfd = header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == SCM_PIDFD;
+        // Darwin's type 4 is a timestamp, never a descriptor.
+        let pidfd = cfg!(target_os = "linux")
+            && header.cmsg_level == libc::SOL_SOCKET
+            && header.cmsg_type == SCM_PIDFD;
         if rights || pidfd {
             invalid |= !payload.len().is_multiple_of(size_of::<RawFd>()) || pidfd;
             for chunk in payload.chunks_exact(size_of::<RawFd>()) {
@@ -282,12 +300,12 @@ fn receive_part(
         message.msg_iov = &mut vector;
         message.msg_iovlen = 1;
         message.msg_control = ancillary.as_mut_ptr().cast();
-        message.msg_controllen = ancillary_capacity;
+        message.msg_controllen = ancillary_capacity as _;
         let count = unsafe {
             libc::recvmsg(
                 control.as_raw_fd(),
                 &mut message,
-                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+                libc::MSG_DONTWAIT | RECEIVE_CLOEXEC,
             )
         };
         if count < 0 {
@@ -302,11 +320,20 @@ fn receive_part(
             }
         }
         let before = descriptors.len();
-        let control_length = message.msg_controllen.min(ancillary_capacity);
+        // `socklen_t` on Darwin, `usize` on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let received = message.msg_controllen as usize;
+        let control_length = received.min(ancillary_capacity);
         let bytes =
             unsafe { std::slice::from_raw_parts(ancillary.as_ptr().cast::<u8>(), control_length) };
-        take_rights(bytes, descriptors)?;
-        if message.msg_controllen > ancillary_capacity {
+        let taken = take_rights(bytes, descriptors);
+        #[cfg(target_os = "macos")]
+        for descriptor in &descriptors[before..] {
+            crate::descriptor::set_close_on_exec(std::os::fd::AsFd::as_fd(descriptor))
+                .map_err(|error| format!("seal received descriptor: {error}"))?;
+        }
+        taken?;
+        if received > ancillary_capacity {
             return Err("oversized descriptor frame ancillary data".into());
         }
         if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
