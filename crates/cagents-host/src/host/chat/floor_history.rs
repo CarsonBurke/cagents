@@ -1,6 +1,7 @@
 //! A stopped update pane pages the reviewed transcript without a provider.
 use super::*;
 use crate::chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+use std::path::Path;
 
 /// Production recovery always inspects the real process table. Unit fixtures
 /// substitute only the proc filesystem, retaining the normal survivor parser.
@@ -215,62 +216,7 @@ pub(super) fn prepare_resume(
         .as_ref()
         .is_some_and(|old| old.boot_id == proof.boot_id)
     {
-        let recipe = source
-            .launch
-            .terminal_recipe()
-            .ok_or("The recorded conversation has no exact resume recipe")?;
-        let terminal = crate::model::TerminalSession {
-            id: source.id,
-            launch: recipe,
-            owned_codex_listener: source.owned_codex_listener.clone(),
-            recovery_origin: None,
-            predecessor: None,
-            transcript_path: None,
-            resume_hint: None,
-            continuity: crate::model::TerminalContinuity::Live {
-                host_session_id: proof.host_session_id.clone(),
-                boot_id: proof.boot_id.clone(),
-                host_incarnation: proof.host_incarnation.clone(),
-            },
-        };
-        if crate::upgrade::surviving_process(
-            &terminal,
-            std::process::id(),
-            &resume_process_root(),
-            &[],
-        )
-        .map_err(|error| error.to_string())?
-        .is_some()
-        {
-            return Err("This conversation is still running elsewhere; nothing was started".into());
-        }
-        if source.launch.provider == Provider::Codex {
-            let mut native = source.clone();
-            // A paired terminal has its own lifetime; prove it gone before
-            // using the standard native-listener/provider census.
-            if let Some(terminal) = &source.terminal {
-                if crate::upgrade::surviving_process(
-                    terminal,
-                    std::process::id(),
-                    &resume_process_root(),
-                    &[],
-                )
-                .map_err(|error| error.to_string())?
-                .is_some()
-                {
-                    return Err(
-                        "This conversation still has a running console; nothing was started".into(),
-                    );
-                }
-                native.terminal = None;
-            }
-            if !super::super::upgrade_inspect::codex_execution_ended(&native, &proof.boot_id) {
-                return Err(
-                    "The earlier Codex provider's end could not be proved; nothing was started"
-                        .into(),
-                );
-            }
-        }
+        verify_resume_processes(host, source, &proof)?;
         if matches!(
             source.native_continuity,
             chat::NativeContinuity::RetainedClaudeActor { .. }
@@ -306,6 +252,118 @@ pub(super) fn prepare_resume(
         )?;
     }
     Ok(Some(successor))
+}
+
+fn verify_resume_processes(
+    _host: &SharedHost,
+    source: &Session,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    let recipe = source
+        .launch
+        .terminal_recipe()
+        .ok_or("The recorded conversation has no exact resume recipe")?;
+    let process_root = resume_process_root();
+    #[cfg(target_os = "macos")]
+    if source.launch.provider == Provider::Codex && process_root == Path::new("/proc") {
+        if let Some(terminal) = &source.terminal {
+            verify_darwin_paired_close(_host, source, terminal, proof)?;
+        }
+        // Keep the exact issued pair in the descriptor used to match the
+        // native holder's receipt. Terminal cleanup was checked separately.
+        return require_ended_codex(source, proof);
+    }
+    verify_procfs_resume(source, proof, recipe, &process_root)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_darwin_paired_close(
+    host: &SharedHost,
+    source: &Session,
+    terminal: &crate::model::TerminalSession,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_live(&terminal.id)
+    {
+        return Err("This conversation still has a running console; nothing was started".into());
+    }
+    let (owner, _) = chat::native_holder::closed_source(source, proof)?
+        .filter(|(_, paired_closed)| *paired_closed)
+        .ok_or("The paired console has no confirmed close receipt")?;
+    let pair = chat::native_holder::closed_pair_holder(source, proof, &owner, false)?
+        .ok_or("The native close receipt does not identify its paired console")?;
+    let issuer = source
+        .proof
+        .as_ref()
+        .ok_or("The paired console has no issuing daemon proof")?;
+    let role = crate::daemon::holder_registry::OriginalRole::authenticated(&pair, issuer, proof)?;
+    if !crate::terminal::holder::cleanup::confirmed_with_role(
+        terminal,
+        &pair,
+        proof,
+        role.as_ref(),
+    )? {
+        return Err("The earlier console's end could not be proved; nothing was started".into());
+    }
+    Ok(())
+}
+
+fn require_ended_codex(source: &Session, proof: &HostSessionProof) -> Result<(), String> {
+    if !super::super::upgrade_inspect::codex_execution_ended(source, &proof.boot_id) {
+        return Err(
+            "The earlier Codex provider's end could not be proved; nothing was started".into(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_procfs_resume(
+    source: &Session,
+    proof: &HostSessionProof,
+    recipe: crate::model::LaunchRecipe,
+    process_root: &Path,
+) -> Result<(), String> {
+    let terminal = crate::model::TerminalSession {
+        id: source.id,
+        launch: recipe,
+        owned_codex_listener: source.owned_codex_listener.clone(),
+        recovery_origin: None,
+        predecessor: None,
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        },
+    };
+    if crate::upgrade::surviving_process(&terminal, std::process::id(), process_root, &[])
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("This conversation is still running elsewhere; nothing was started".into());
+    }
+    if source.launch.provider == Provider::Codex {
+        let mut native = source.clone();
+        // A paired terminal has its own lifetime; prove it gone before
+        // using the standard native-listener/provider census.
+        if let Some(terminal) = &source.terminal {
+            if crate::upgrade::surviving_process(terminal, std::process::id(), process_root, &[])
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Err(
+                    "This conversation still has a running console; nothing was started".into(),
+                );
+            }
+            native.terminal = None;
+        }
+        require_ended_codex(&native, proof)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -71,6 +71,66 @@ pub fn program_of(pid: u32) -> io::Result<(PathBuf, Vec<u8>)> {
     }
 }
 
+/// Independent observations of one pinned process in an account census.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub struct AccountProgram {
+    pub process: crate::daemon::holder_registry::Process,
+    pub executable: io::Result<PathBuf>,
+    pub arguments: Vec<u8>,
+}
+
+/// Observe a census candidate, reading arguments if the executable could
+/// match or its path is unreadable. Both reads refer to the same pinned PID.
+///
+/// # Errors
+///
+/// Returns the underlying error if the candidate might still run and cannot
+/// be pinned or its needed arguments cannot be read.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub fn inspect_account_program(
+    pid: u32,
+    uid: u32,
+    candidate_image: impl FnOnce(&Path) -> bool,
+) -> io::Result<Option<AccountProgram>> {
+    use crate::pinned_process::PinnedProcess;
+
+    let number = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    let pinned = match PinnedProcess::open(pid) {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            // A failed start-time read or pin cannot exclude a live writer.
+            // The short BSD record can still settle a zombie or a PID that
+            // no longer belongs to this account, without needing its image.
+            match table::short_bsd_info(number) {
+                Ok(row) if row.pbsi_status == libc::SZOMB || row.pbsi_uid != uid => {
+                    return Ok(None);
+                }
+                Err(probe) if probe.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+                _ => return Err(error),
+            }
+        }
+    };
+    let executable = pinned.executable();
+    if executable
+        .as_deref()
+        .is_ok_and(|path| !candidate_image(path))
+    {
+        return Ok(None);
+    }
+    let arguments = pinned.command_line();
+    if pinned.exited()? {
+        return Ok(None);
+    }
+    Ok(Some(AccountProgram {
+        process: crate::daemon::holder_registry::Process {
+            pid: number,
+            start: pinned.started_ticks(),
+        },
+        executable,
+        arguments: arguments?,
+    }))
+}
+
 /// The first process of this account, other than this one, that holds open
 /// a file `wanted` accepts.
 ///
