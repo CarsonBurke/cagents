@@ -2374,7 +2374,7 @@ fn perform_update(
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
-    let context = ReviewContext::capture(installation)?;
+    let context = ReviewContext::capture(&installation.version)?;
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
         Installation::detect()?;
@@ -2711,7 +2711,7 @@ struct ReviewContext {
 }
 
 impl ReviewContext {
-    fn capture(installation: &Installation) -> Result<Self, UpdateError> {
+    fn capture(selected_version: &str) -> Result<Self, UpdateError> {
         let guard = crate::instance::UiUpdateGuard::acquire()?;
         let windows = guard.verified_windows()?;
         let layout = locate(&crate::process::current_executable()?)?;
@@ -2722,7 +2722,7 @@ impl ReviewContext {
                     .first()
                     .and_then(|window| locate(&window.executable).ok().map(|layout| layout.version))
             })
-            .unwrap_or_else(|| installation.version.clone());
+            .unwrap_or_else(|| selected_version.to_owned());
         Ok(Self {
             from_version,
             windows: windows.len(),

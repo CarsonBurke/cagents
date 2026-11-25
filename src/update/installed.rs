@@ -244,7 +244,12 @@ pub(super) fn perform(
         .as_ref()
         .is_some_and(|owner| owner.version_root != root);
     let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
-    let context = ReviewContext::capture(installation)?;
+    let selected_version = selection
+        .current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(unsupported_install)?;
+    let context = ReviewContext::capture(selected_version)?;
     let confirmed = confirmation::wait(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
