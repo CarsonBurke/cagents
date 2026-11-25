@@ -62,7 +62,10 @@ fn observable_survivors(holder: &Process, root: &Process) -> Result<bool, String
     if !identity_absent(holder)? || !identity_absent(root)? {
         return Ok(false);
     }
-    if !crate::daemon::lost_processes::census(holder, root)?.is_empty() {
+    if crate::daemon::lost_processes::census(holder, root)?
+        .iter()
+        .any(|process| !process.zombie)
+    {
         return Ok(false);
     }
     // A missing holder leaves no tracker that could exclude detached work.

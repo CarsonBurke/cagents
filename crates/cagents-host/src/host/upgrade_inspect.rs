@@ -1590,6 +1590,7 @@ fn processes_serving_listener(
 
 /// Whether `argv` gives exactly `socket` to listen on, as `--listen
 /// unix://<socket>` or `--listen=unix://<socket>`.
+#[cfg(any(target_os = "linux", test))]
 fn serves_listener(socket: &Path, argv: &[u8]) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let mut endpoint = b"unix://".to_vec();
