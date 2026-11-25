@@ -7,9 +7,16 @@ use crate::{
         MAX_PARENT_DEPTH, MAX_PARENT_RUNNING, MAX_RUNNING, Origin, Placement, ResultSummary, Run,
         State, Submit, Update,
     },
-    model::{AgentId, ChannelId, RunId},
+    model::{AgentId, ChannelId, RunId, TerminalId},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use std::collections::BTreeMap;
+
+pub(in crate::host) struct AgentRunUpdateRisk {
+    pub session: crate::chat::Session,
+    pub queued_prompts: bool,
+    pub runs: Vec<RunId>,
+}
 
 /// Authorization refusals remain distinct from registry/record failures until
 /// the request dispatcher assigns a protocol error code.
@@ -382,6 +389,51 @@ impl Registry {
             });
         }
         Ok(holds)
+    }
+
+    /// Managed runs with a provider turn under way. An interruption may leave
+    /// these without a confirmed outcome. Unsent mailbox runs go back to the
+    /// conversation as messages, so only direct prompts count toward the queue.
+    pub(in crate::host) fn agent_runs_at_risk_on_restart(
+        &self,
+    ) -> Result<BTreeMap<TerminalId, AgentRunUpdateRisk>, String> {
+        let mut query = self
+            .db
+            .prepare(&format!(
+                "SELECT a.record, active.id, EXISTS(SELECT 1 FROM agent_runs r
+                   WHERE r.agent = a.id AND {UNSENT}
+                   AND substr(r.idempotency_key, 1, length(?1)) <> ?1)
+                 FROM agent_runs active JOIN agents a ON a.id = active.agent
+                 WHERE active.state IN ('running', 'waiting')
+                   AND a.closed = 0 AND a.session_id IS NOT NULL"
+            ))
+            .map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([crate::agent_execution::MESSAGE_RUN_KEY], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut risks = BTreeMap::new();
+        for record in records {
+            let (record, run, queued_prompts) = record.map_err(|error| error.to_string())?;
+            let agent: Agent = decode(&record)?;
+            if let Some(HostedSession::Chat(chat)) = agent.session {
+                risks
+                    .entry(chat.id)
+                    .or_insert_with(|| AgentRunUpdateRisk {
+                        session: chat,
+                        queued_prompts,
+                        runs: Vec::new(),
+                    })
+                    .runs
+                    .push(run.parse().map_err(|_| "Invalid stored run ID")?);
+            }
+        }
+        Ok(risks)
     }
 
     /// Caller has authenticated every retained descriptor with the actual

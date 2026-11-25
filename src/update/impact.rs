@@ -50,6 +50,12 @@ const TERMINAL_CANNOT_CARRY: &str = "This terminal cannot preserve its live proc
 const PAIRED_TERMINAL_CANNOT_CARRY: &str =
     "The paired console cannot preserve its live process through this update.";
 
+// These two values are encoded in the existing string slot. Reviews use
+// their own wording so they can describe either update choice.
+const AGENT_RUN_UNCONFIRMED: &str = "Updating now ends this agent's run with an unknown outcome.";
+const AGENT_RUN_UNCONFIRMED_WITH_QUEUE: &str =
+    "Updating now ends this agent's run with an unknown outcome and leaves queued prompts unsent.";
+
 /// The reason for an update disposition. The existing wire and on-disk review
 /// records store text, so their fixed messages are decoded at this boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -64,6 +70,7 @@ pub enum SessionCause {
     UnrecordedConversation,
     TerminalCannotCarry,
     PairedTerminalCannotCarry,
+    AgentRunUnconfirmed { queued_prompts: bool },
     Detail(String),
 }
 
@@ -79,7 +86,36 @@ impl SessionCause {
             Self::UnrecordedConversation => UNRECORDED_CONVERSATION,
             Self::TerminalCannotCarry => TERMINAL_CANNOT_CARRY,
             Self::PairedTerminalCannotCarry => PAIRED_TERMINAL_CANNOT_CARRY,
+            Self::AgentRunUnconfirmed {
+                queued_prompts: false,
+            } => AGENT_RUN_UNCONFIRMED,
+            Self::AgentRunUnconfirmed {
+                queued_prompts: true,
+            } => AGENT_RUN_UNCONFIRMED_WITH_QUEUE,
             Self::Detail(text) => text,
+        }
+    }
+
+    pub fn unconfirmed_agent_run(&self) -> bool {
+        matches!(self, Self::AgentRunUnconfirmed { .. })
+    }
+
+    fn permits_agent_run_warning(&self, observed: &Self) -> bool {
+        match observed {
+            Self::AgentRunUnconfirmed {
+                queued_prompts: true,
+            } => {
+                matches!(
+                    self,
+                    Self::AgentRunUnconfirmed {
+                        queued_prompts: true
+                    }
+                )
+            }
+            Self::AgentRunUnconfirmed {
+                queued_prompts: false,
+            } => self.unconfirmed_agent_run(),
+            _ => true,
         }
     }
 }
@@ -96,6 +132,12 @@ impl From<String> for SessionCause {
             UNRECORDED_CONVERSATION => Self::UnrecordedConversation,
             TERMINAL_CANNOT_CARRY => Self::TerminalCannotCarry,
             PAIRED_TERMINAL_CANNOT_CARRY => Self::PairedTerminalCannotCarry,
+            AGENT_RUN_UNCONFIRMED => Self::AgentRunUnconfirmed {
+                queued_prompts: false,
+            },
+            AGENT_RUN_UNCONFIRMED_WITH_QUEUE => Self::AgentRunUnconfirmed {
+                queued_prompts: true,
+            },
             _ => Self::Detail(text),
         }
     }
@@ -154,9 +196,22 @@ pub struct SessionReview {
     pub title: String,
     pub disposition: Disposition,
     pub reason: String,
+    pub warns_about_agent_run: bool,
 }
 
 impl SessionImpact {
+    fn permits_agent_run_warning(&self, observed: &Self, policy: Policy) -> bool {
+        match (policy, self.disposition, observed.disposition) {
+            // This risk is disclosed as a consequence of updating sooner.
+            (Policy::WhenIdle, _, Disposition::WaitsForIdle) => true,
+            // A wait never accepted this risk for the handoff itself.
+            (Policy::WhenIdle, Disposition::WaitsForIdle, _) => {
+                !observed.reason.unconfirmed_agent_run()
+            }
+            _ => self.reason.permits_agent_run_warning(&observed.reason),
+        }
+    }
+
     /// Whether the source's checkpoint must carry this owner. Only a
     /// conversation whose provider already ended is reviewed without one.
     pub fn checkpointed(&self) -> bool {
@@ -166,9 +221,19 @@ impl SessionImpact {
     }
 
     pub fn review(&self) -> SessionReview {
-        let reason = match self.disposition {
+        let warns_about_agent_run = self.kind == SessionKind::NativeChat
+            && matches!(
+                self.disposition,
+                Disposition::Continues
+                    | Disposition::Resumes
+                    | Disposition::WaitsForIdle
+                    | Disposition::Interrupted
+            )
+            && self.reason.unconfirmed_agent_run();
+        let mut reason: String = match self.disposition {
             Disposition::Continues => match self.kind {
                 SessionKind::Terminal => "The terminal and its running processes stay alive.".into(),
+                SessionKind::NativeChat if warns_about_agent_run => "Its conversation keeps running.".into(),
                 SessionKind::NativeChat => "The conversation and its running work stay alive.".into(),
             },
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
@@ -207,12 +272,27 @@ impl SessionImpact {
                 },
             },
         };
+        if warns_about_agent_run
+            && let SessionCause::AgentRunUnconfirmed { queued_prompts } = self.reason
+        {
+            reason.push_str(if self.disposition == Disposition::WaitsForIdle {
+                " Updating now"
+            } else {
+                " Updating"
+            });
+            reason.push_str(" can leave this agent’s run without a confirmed result. The agent may then stop taking new work");
+            if queued_prompts {
+                reason.push_str(", leaving its queued prompts unsent");
+            }
+            reason.push_str(". Messages can still reach the conversation.");
+        }
         SessionReview {
             id: self.id,
             kind: self.kind,
             title: self.title.clone(),
             disposition: self.disposition,
             reason,
+            warns_about_agent_run,
         }
     }
 }
@@ -320,6 +400,7 @@ impl DaemonImpact {
                         .map(String::as_str)
                         .collect();
                     previous.identity == current.identity
+                        && previous.permits_agent_run_warning(current, self.policy)
                         && current
                             .interrupted_subagents
                             .iter()
@@ -436,6 +517,18 @@ pub(super) mod tests {
             (QUEUED_MESSAGES, SessionCause::PendingDelivery),
             (PROVIDER_ENDED, SessionCause::ProviderEnded),
             (STOPPED_WITH_UNSETTLED_WORK, SessionCause::UnsettledProvider),
+            (
+                AGENT_RUN_UNCONFIRMED,
+                SessionCause::AgentRunUnconfirmed {
+                    queued_prompts: false,
+                },
+            ),
+            (
+                AGENT_RUN_UNCONFIRMED_WITH_QUEUE,
+                SessionCause::AgentRunUnconfirmed {
+                    queued_prompts: true,
+                },
+            ),
             (
                 "an old diagnostic",
                 SessionCause::Detail("an old diagnostic".into()),
@@ -568,6 +661,49 @@ pub(super) mod tests {
         );
         settled.sessions[0].identity.push_str(" replacement owner");
         assert!(!confirmed.preserves_consent(&settled));
+    }
+
+    #[test]
+    fn consent_covers_only_the_agent_run_warning_shown_for_update_now() {
+        let mut ordinary = waiting();
+        ordinary.policy = Policy::Interrupt;
+        ordinary.sessions[0].disposition = Disposition::Interrupted;
+        let mut run = ordinary.clone();
+        run.sessions[0].reason = SessionCause::AgentRunUnconfirmed {
+            queued_prompts: false,
+        };
+        let mut queued = run.clone();
+        queued.sessions[0].reason = SessionCause::AgentRunUnconfirmed {
+            queued_prompts: true,
+        };
+
+        let ordinary = preview_with_daemon(ordinary);
+        let run = preview_with_daemon(run);
+        let mut queued = preview_with_daemon(queued);
+        assert!(!ordinary.preserves_consent(&run));
+        assert!(!run.preserves_consent(&queued));
+        assert!(queued.preserves_consent(&run));
+        assert!(run.preserves_consent(&ordinary));
+
+        // A person who chose to wait can keep waiting after a prompt queues.
+        let mut still_working = run;
+        for preview in [&mut still_working, &mut queued] {
+            let daemon = preview.daemon.as_mut().unwrap();
+            daemon.policy = Policy::WhenIdle;
+            daemon.sessions[0].disposition = Disposition::WaitsForIdle;
+        }
+        assert!(still_working.preserves_consent(&queued));
+
+        // The warning shown on a waiting row was about updating sooner.
+        let waiting_with_queue = queued.clone();
+
+        // Carrying the conversation does not guarantee the agent's result.
+        for preview in [&mut still_working, &mut queued] {
+            preview.daemon.as_mut().unwrap().sessions[0].disposition = Disposition::Continues;
+        }
+        assert!(!still_working.preserves_consent(&queued));
+        assert!(!waiting_with_queue.preserves_consent(&queued));
+        assert!(queued.preserves_consent(&still_working));
     }
 
     fn preview_with_daemon(daemon: DaemonImpact) -> Preview {
@@ -1032,9 +1168,17 @@ impl Preview {
                 };
                 // The daemon comparison above proved these are the same owners
                 // and only permitted activity settlement or shrinking task sets.
-                // Keep all titles, source reasons, saved outcomes and notices so
-                // settling work cannot conceal any other change to the review.
+                // Keep titles, other source reasons, saved outcomes and notices
+                // so settling work cannot conceal any other change to the review.
                 session.disposition = now.disposition;
+                // A wait doesn't approve interruption. For work that will
+                // cross the handoff now, the daemon already rejected a wider warning.
+                if now.reason.unconfirmed_agent_run()
+                    || (session.reason.unconfirmed_agent_run()
+                        && now.reason != SessionCause::PendingDelivery)
+                {
+                    session.reason.clone_from(&now.reason);
+                }
                 session
                     .interrupted_subagents
                     .clone_from(&now.interrupted_subagents);

@@ -1459,6 +1459,22 @@ mod tests {
     }
 
     #[test]
+    fn update_now_uses_the_warning_already_shown_while_work_is_running() {
+        let mut before = working_preview();
+        before.daemon.as_mut().unwrap().sessions[0].reason =
+            impact::SessionCause::AgentRunUnconfirmed {
+                queued_prompts: false,
+            };
+        let mut after = super::super::review::interruption_review(&before);
+        assert!(interruption_preserves_review(&before, &after));
+        after.daemon.as_mut().unwrap().sessions[0].reason =
+            impact::SessionCause::AgentRunUnconfirmed {
+                queued_prompts: true,
+            };
+        assert!(!interruption_preserves_review(&before, &after));
+    }
+
+    #[test]
     fn a_delivery_becoming_a_turn_requires_new_interruption_consent() {
         let mut before = working_preview();
         before.daemon.as_mut().unwrap().sessions[0].reason = impact::SessionCause::PendingDelivery;
