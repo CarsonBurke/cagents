@@ -688,9 +688,12 @@ fn interruption_preserves_review(previous: &impact::Preview, current: &impact::P
                     && item.id == session.id
                     && item.identity == session.identity
                     && match item.disposition {
-                        impact::Disposition::Interrupted
-                        | impact::Disposition::Resumes
-                        | impact::Disposition::Continues => true,
+                        // A delivery in flight was not shown as interruptible.
+                        // The same owner starting a turn expands that choice.
+                        impact::Disposition::Interrupted => {
+                            session.reason != impact::SessionCause::PendingDelivery
+                        }
+                        impact::Disposition::Resumes | impact::Disposition::Continues => true,
                         // A conversation still receiving queued messages
                         // keeps waiting under either policy; interrupting
                         // would not deliver them. A typed service stop must
@@ -1453,6 +1456,19 @@ mod tests {
         );
         queued.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Blocked;
         assert!(!interruption_preserves_review(&previous, &queued));
+    }
+
+    #[test]
+    fn a_delivery_becoming_a_turn_requires_new_interruption_consent() {
+        let mut before = working_preview();
+        before.daemon.as_mut().unwrap().sessions[0].reason = impact::SessionCause::PendingDelivery;
+        let mut after = super::super::review::interruption_review(&before);
+        assert!(interruption_preserves_review(&before, &after));
+
+        let item = &mut after.daemon.as_mut().unwrap().sessions[0];
+        item.disposition = impact::Disposition::Interrupted;
+        item.reason = "The newly delivered turn can be interrupted".into();
+        assert!(!interruption_preserves_review(&before, &after));
     }
 
     #[test]

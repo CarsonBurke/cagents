@@ -132,6 +132,7 @@ pub enum Action {
         result: Result<(), String>,
     },
     ConfirmApply(String),
+    ConfirmInterrupt(String),
     ReviewJob,
     /// Leave the review to look at a session it names, keeping the update.
     ShowSession(crate::model::TerminalId),
@@ -325,6 +326,58 @@ fn waits_for_idle(preview: &crate::update::impact::Preview) -> bool {
                 .iter()
                 .any(|session| session.disposition == Disposition::WaitsForIdle)
     })
+}
+
+/// Conversations whose current turns can be interrupted by the choice now
+/// on screen. An already claimed delivery cannot be interrupted for update.
+fn interruptions_available(
+    confirmation: &crate::update::UpdateConfirmation,
+) -> Option<(usize, usize)> {
+    use crate::update::impact::{Disposition, Policy, SessionCause, SessionKind};
+
+    if confirmation.stop.is_some() {
+        return None;
+    }
+    let daemon = confirmation.preview.daemon.as_ref()?;
+    if daemon.policy != Policy::WhenIdle || daemon.blocked() {
+        return None;
+    }
+    let mut conversations = 0;
+    let mut subagents = 0;
+    for session in daemon.sessions.iter().filter(|session| {
+        session.kind == SessionKind::NativeChat && session.disposition == Disposition::WaitsForIdle
+    }) {
+        // A staged update can have started in an earlier worker. Its
+        // interruption approval must not be broader than these buttons say.
+        if session.reason == SessionCause::PendingDelivery
+            || confirmation
+                .preview
+                .stopped
+                .iter()
+                .any(|pane| pane.pane == session.id)
+        {
+            return None;
+        }
+        conversations += 1;
+        subagents += session.interrupted_subagents.len();
+    }
+    (conversations > 0).then_some((conversations, subagents))
+}
+
+fn interruption_choice_summary(conversations: usize, subagents: usize) -> String {
+    let mut summary = if conversations == 1 {
+        "Updating now interrupts one running conversation and then reopens it.".to_owned()
+    } else {
+        format!(
+            "Updating now interrupts {conversations} running conversations and then reopens them."
+        )
+    };
+    match subagents {
+        0 => {}
+        1 => summary.push_str(" One background agent will stop."),
+        count => summary.push_str(&format!(" {count} background agents will stop.")),
+    }
+    summary
 }
 
 /// The other way to treat conversations that are mid-turn, when any are.
@@ -561,6 +614,24 @@ impl Cagents {
         })
     }
 
+    fn confirm_update(
+        &mut self,
+        nonce: String,
+        choice: crate::update::UpdateChoice,
+    ) -> Task<Message> {
+        let Some(confirmation) = &self.update_ui.confirmation else {
+            return Task::none();
+        };
+        if confirmation.nonce != nonce
+            || !confirmable(confirmation)
+            || matches!(choice, crate::update::UpdateChoice::InterruptNow)
+                && interruptions_available(confirmation).is_none()
+        {
+            return Task::none();
+        }
+        self.decide_update(choice)
+    }
+
     pub(super) fn update_dialog(&self) -> Option<Element<'_, Message>> {
         use crate::update::impact::Disposition;
         let confirmation = self.update_ui.confirmation.as_ref()?;
@@ -583,6 +654,7 @@ impl Cagents {
             None => title,
         };
         let terminal_confirmation = confirmation.stop.is_some();
+        let interruptions = interruptions_available(confirmation);
         let mut body = vec![
             heading,
             notice_body(if terminal_confirmation {
@@ -591,6 +663,12 @@ impl Cagents {
                 preview_summary(preview)
             }),
         ];
+        if let Some((conversations, subagents)) = interruptions {
+            body.push(notice_body(interruption_choice_summary(
+                conversations,
+                subagents,
+            )));
+        }
         let mut rows = Vec::new();
         if terminal_confirmation {
             // The worker's list and command replace the old refusal details in
@@ -634,7 +712,8 @@ impl Cagents {
         if let Some(handoff) = terminal_handoff(confirmation) {
             body.push(notice_body(handoff));
         }
-        if !terminal_confirmation
+        if interruptions.is_none()
+            && !terminal_confirmation
             && let Some(daemon) = &preview.daemon
             && let Some((label, policy)) = policy_choice(daemon)
         {
@@ -644,18 +723,9 @@ impl Cagents {
                     .into(),
             );
         }
-        let waits_for_idle = waits_for_idle(preview);
-        // While something holds the update back, the warning above the list
-        // says what, and the update waits until a poll finds it resolved.
-        let confirm = crate::ui_controls::button::primary("Update and reopen")
-            .instead("Continue in terminal", terminal_confirmation)
-            .instead("Update when idle", waits_for_idle)
-            .id(confirm_id())
-            .on_press_maybe(
-                confirmable(confirmation)
-                    .then(|| Message::UpdateUi(Action::ConfirmApply(confirmation.nonce.clone()))),
-            );
-        let actions = widget::row::with_children(vec![
+        let confirm =
+            |action: fn(String) -> Action| Message::UpdateUi(action(confirmation.nonce.clone()));
+        let mut actions = vec![
             crate::ui_controls::button::quiet("Copy details")
                 .id(widget::Id::new("update.copy"))
                 .on_press(Message::UpdateUi(Action::CopyDetails))
@@ -665,12 +735,35 @@ impl Cagents {
                 .id(cancel_id())
                 .on_press(Message::UpdateUi(Action::CancelApply))
                 .into(),
-            // Choosing to wait for idle sessions renames the update, and
-            // Cancel beside it stays put.
-            confirm.into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(space::S);
+        ];
+        if interruptions.is_some() {
+            actions.push(
+                crate::ui_controls::button::secondary("Update when idle")
+                    .id(widget::Id::new("update.when-idle"))
+                    .on_press(confirm(Action::ConfirmApply))
+                    .into(),
+            );
+            actions.push(
+                crate::ui_controls::button::primary("Update now")
+                    .id(confirm_id())
+                    .on_press(confirm(Action::ConfirmInterrupt))
+                    .into(),
+            );
+        } else {
+            actions.push(
+                crate::ui_controls::button::primary("Update and reopen")
+                    .instead("Continue in terminal", terminal_confirmation)
+                    .instead("Update when idle", waits_for_idle(preview))
+                    .id(confirm_id())
+                    .on_press_maybe(
+                        confirmable(confirmation).then(|| confirm(Action::ConfirmApply)),
+                    )
+                    .into(),
+            );
+        }
+        let actions = widget::row::with_children(actions)
+            .align_y(Alignment::Center)
+            .spacing(space::S);
         // A short window scrolls what the update affects; Cancel and the
         // update stay in reach.
         Some(dialog_ui::overlay(
@@ -1421,17 +1514,10 @@ impl Cagents {
                 Task::none()
             }
             Action::ConfirmApply(nonce) => {
-                if self
-                    .update_ui
-                    .confirmation
-                    .as_ref()
-                    .is_none_or(|confirmation| {
-                        confirmation.nonce != nonce || !confirmable(confirmation)
-                    })
-                {
-                    return Task::none();
-                }
-                self.decide_update(crate::update::UpdateChoice::Confirm)
+                self.confirm_update(nonce, crate::update::UpdateChoice::Confirm)
+            }
+            Action::ConfirmInterrupt(nonce) => {
+                self.confirm_update(nonce, crate::update::UpdateChoice::InterruptNow)
             }
             Action::CancelApply => self.decide_update(crate::update::UpdateChoice::Cancel),
             Action::InterruptWaiting => self.decide_waiting(crate::update::UpdateChoice::Policy(
@@ -2503,6 +2589,52 @@ pub(in crate::app) mod tests {
             refusal: None,
             in_flight: Vec::new(),
             recorded_by: None,
+        }
+    }
+
+    #[test]
+    fn the_first_review_offers_either_update_decision() {
+        use crate::update::impact::{Disposition, SessionCause};
+
+        let mut awaiting_delivery = session("Delivery", Disposition::WaitsForIdle);
+        awaiting_delivery.reason = SessionCause::PendingDelivery;
+        let mut working = session("Lead", Disposition::WaitsForIdle);
+        working.interrupted_subagents.push("child".into());
+        let mixed = daemon_preview(vec![working.clone(), awaiting_delivery]);
+        assert_eq!(interruptions_available(&mixed), None);
+        let confirmation = daemon_preview(vec![working]);
+        assert_eq!(interruptions_available(&confirmation), Some((1, 1)));
+        assert_eq!(
+            interruption_choice_summary(1, 1),
+            "Updating now interrupts one running conversation and then reopens it. One background agent will stop."
+        );
+
+        for (id, now) in [
+            (confirm_id(), true),
+            (widget::Id::new("update.when-idle"), false),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let poll = review_ready(&mut app, awaiting(&confirmation));
+            drop(app.update(poll));
+            let (mut messages, _) = crate::app::dialog_ui::tests::key_control(
+                app.update_dialog().unwrap(),
+                id,
+                crate::app::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(match (&messages[0], now) {
+                (Message::UpdateUi(Action::ConfirmInterrupt(nonce)), true)
+                | (Message::UpdateUi(Action::ConfirmApply(nonce)), false) => {
+                    nonce == &confirmation.nonce
+                }
+                _ => false,
+            });
+            drop(app.update(messages.pop().unwrap()));
+            assert!(app.update_ui.confirmation.is_none());
+            assert_eq!(
+                app.update_ui.submitted_confirmation,
+                Some(confirmation.nonce.clone())
+            );
         }
     }
 
