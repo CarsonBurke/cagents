@@ -1,6 +1,7 @@
 package dev.cagents.mobile.android.ssh
 
 import com.hierynomus.sshj.key.KeyAlgorithms
+import com.hierynomus.sshj.userauth.certificate.Certificate
 import dev.cagents.mobile.android.data.ConnectionSettings
 import dev.cagents.mobile.client.AllFailed
 import dev.cagents.mobile.client.BridgeTransport
@@ -97,8 +98,17 @@ private class StoredHostKeys(private val store: HostKeyStore, private val target
         }
     }
 
-    override fun preferred(host: String) = store.pinnedType(target.hostKeyId(host))?.let(::listOf).orEmpty()
+    override fun preferred(host: String) = store.pinnedType(target.hostKeyId(host))?.let(::hostKeyAlgorithms).orEmpty()
 }
+
+/**
+ * The host key algorithms that present a key of [keyType]. An RSA key's
+ * type is `ssh-rsa`, but that algorithm signs with SHA-1, which OpenSSH
+ * 8.8 and later no longer offers; asked for it alone, the computer would
+ * present another of its keys instead.
+ */
+internal fun hostKeyAlgorithms(keyType: String): List<String> =
+    if (keyType == "ssh-rsa") listOf("rsa-sha2-512", "rsa-sha2-256", "ssh-rsa") else listOf(keyType)
 
 internal class SshTarget(
     /** What to call the computer in messages. */
@@ -264,13 +274,21 @@ internal class Ed25519PublicKey(private val raw: ByteArray) : PublicKey {
     }
 }
 
+/**
+ * The host key a computer presented, as `ssh-keygen -lf` fingerprints it on
+ * the computer: for a host certificate, the key it certifies. The key is
+ * what's trusted, whoever signed the certificate.
+ */
+internal fun presentedKey(key: PublicKey): PublicKey = (key as? Certificate<*>)?.key ?: key
+
 /** Asks the [HostKeyCheck] about the computer's host key, remembering why it refused one. */
 private class CheckingVerifier(private val hostKeys: HostKeyCheck) : HostKeyVerifier {
     @Volatile
     var failure: ConnectFailure? = null
 
     override fun verify(hostname: String, port: Int, key: PublicKey): Boolean {
-        failure = hostKeys.check(hostname, HostKeyStore.fingerprint(key), KeyType.fromKey(key).toString())
+        val plain = presentedKey(key)
+        failure = hostKeys.check(hostname, HostKeyStore.fingerprint(plain), KeyType.fromKey(plain).toString())
         return failure == null
     }
 

@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.ConnectionState
+import dev.cagents.mobile.client.hostKeyFile
 import dev.cagents.mobile.protocol.Activity
 
 /**
@@ -137,7 +138,8 @@ fun HostKeyDialogs(vm: MainViewModel, onPairAgain: () -> Unit) {
                         Text("This is the first connection to this computer. Check that its fingerprint matches before trusting it.")
                         Fingerprint(failure.fingerprint)
                         Text(
-                            "On the computer: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub",
+                            hostKeyFile(failure.keyType)?.let { "On the computer: ssh-keygen -lf $it" }
+                                ?: "On the computer: ssh-keygen -lf on its host key in /etc/ssh",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

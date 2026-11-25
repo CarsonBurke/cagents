@@ -1,21 +1,21 @@
 package dev.cagents.mobile.android.ssh
 
 import android.content.Context
-import android.util.Base64
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import net.schmizz.sshj.common.Buffer
 import java.security.MessageDigest
 import java.security.PublicKey
+import java.util.Base64
 
 /** A trusted host key's fingerprint and its [type], such as `ssh-ed25519`; null in a pin saved before types were. */
 data class PinnedKey(val fingerprint: String, val type: String?)
 
 /**
  * The host keys the phone trusts, one per computer address, shown as
- * OpenSSH's SHA-256 fingerprint so it can be compared with
- * `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the computer. A
+ * OpenSSH's SHA-256 fingerprint so it can be compared with `ssh-keygen -lf`
+ * on the computer's key of that type; see [dev.cagents.mobile.client.hostKeyFile]. A
  * pairing code pins its computer's key; a computer set up by hand is
  * trusted on first use.
  */
@@ -54,7 +54,7 @@ class HostKeyStore(context: Context) {
         /** OpenSSH's form: `SHA256:` and the unpadded base64 of the key blob's digest. */
         fun fingerprint(blob: ByteArray): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(blob)
-            return "SHA256:" + Base64.encodeToString(digest, Base64.NO_WRAP or Base64.NO_PADDING)
+            return "SHA256:" + Base64.getEncoder().withoutPadding().encodeToString(digest)
         }
     }
 }

@@ -69,10 +69,11 @@ by hand instead**:
    The command must be the absolute path of the installed `cagents`. With
    `command=` and `restrict`, the key can run the bridge and nothing else.
 3. Tap **Connect**. On first connection the app shows the computer's host key
-   fingerprint. Compare it with
-   `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the computer before
-   trusting it. A later change of key is refused until you forget the old one
-   in Settings. For a paired computer, pair again from the computer instead.
+   fingerprint and the command that prints it on the computer, such as
+   `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` for an Ed25519 key.
+   Compare the two before trusting it. A later change of key is refused until
+   you forget the old one in Settings. For a paired computer, pair again from
+   the computer instead.
 
 The phone and the computer must reach each other: on the same network, or
 over a VPN such as Tailscale when away.
@@ -144,3 +145,13 @@ scripts/mobile-pair-fixture stop
 
 The emulator reaches the fixture at 10.0.2.2. The code also comes as
 `code.png`, a QR code.
+
+To test a computer set up by hand, start the fixture with the host key to
+test, such as `--host-key ecdsa`, or `--certificate` for an Ed25519 host
+certificate. Set the app up with address 10.0.2.2 and port 2244. After
+trusting the key, authorize the phone with the key line from the app's
+Settings:
+
+```sh
+scripts/mobile-pair-fixture authorize 'ssh-ed25519 AAAA...'
+```
