@@ -194,16 +194,6 @@ pub enum HostError {
     StateInUse(crate::instance::state_claim::StateInUse),
 }
 
-impl HostError {
-    /// The claim's own refusal, rather than an I/O failure that wraps it.
-    fn from_claim(error: io::Error) -> Self {
-        match crate::instance::state_claim::state_in_use(&error) {
-            Some(refusal) => Self::StateInUse(refusal.clone()),
-            None => Self::Io(error),
-        }
-    }
-}
-
 impl From<PlatformError> for HostError {
     fn from(error: PlatformError) -> Self {
         Self::Platform(error.to_string())
@@ -489,7 +479,7 @@ fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, 
         )?;
     // A daemon in another runtime directory must not open the store while
     // this converts it. Released before the lease.
-    let _state = crate::instance::state_claim::claim_daemon_state(&paths.lock, None)
+    let _state = crate::instance::state_claim::claim_store_maintenance(&paths.lock)
         .map_err(|error| error.to_string())?;
     work()
 }
@@ -647,12 +637,22 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // The lease excludes daemons only in this runtime directory. Before this
     // daemon restores, publishes or saves anything, it also claims the saved
     // data, which a daemon in another runtime directory may already serve.
-    // Declared after the lease, it is released first.
-    let _state = crate::instance::state_claim::claim_daemon_state(
+    // Declared after the lease, it is released first. A claim that fails for
+    // any other reason than that daemon, such as a read-only data directory,
+    // leaves this daemon serving what it can, as it did before claims.
+    let _state = match crate::instance::state_claim::claim_daemon_state(
         &paths.lock,
-        Some(proof.host_session_id.as_str()),
-    )
-    .map_err(HostError::from_claim)?;
+        proof.host_session_id.as_str(),
+    ) {
+        Ok(claim) => Some(claim),
+        Err(error) => match crate::instance::state_claim::state_in_use(&error) {
+            Some(refusal) => return Err(HostError::StateInUse(refusal.clone())),
+            None => {
+                tracing::warn!(%error, "could not claim this instance's saved data; a daemon in another runtime directory is not kept away from it");
+                None
+            }
+        },
+    };
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("daemon lease acquired", None);
     // Before anything is launched, so the epoch precedes every launch.

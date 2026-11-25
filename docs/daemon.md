@@ -71,7 +71,9 @@ start while that lease is held, before it restores or saves anything, and its
 error names the serving daemon's process and runtime directory. A window that
 would have started such a daemon shows that error instead. An update keeps the
 claim for its successor without handing over another descriptor: the updater
-holds the outgoing daemon's lease, and the successor inherits it. A window
+holds the outgoing daemon's lease, and the successor inherits it. A daemon that
+can't take the claim for any other reason, such as a read-only data directory,
+starts without it and logs a warning. A window
 claims its own saved window the same way, so a window in another session cannot
 open it twice; a new window there takes the next free one.
 

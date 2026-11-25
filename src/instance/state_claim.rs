@@ -23,11 +23,16 @@
 //! itself. The successor daemon inherits that lease, so the claim it finds
 //! names its own runtime lock and it takes the claim at once.
 //!
-//! One narrow window remains: after the outgoing daemon releases its lease and
-//! before the updater has taken it, nothing holds either lock. A daemon from
-//! another runtime directory that starts exactly then is admitted, and the
-//! update's successor is the one refused. Only one daemon serves the data at a
-//! time either way.
+//! The updater takes the lease only after the outgoing daemon has let go of
+//! it, polling every 20 ms. So before taking over a claim that records
+//! another runtime lock, a claimant watches that lock for [`HANDOFF`] and is
+//! refused if anybody takes it meanwhile.
+//!
+//! Whether a runtime lock is held is read from `/proc/locks` on Linux, so a
+//! check from another session never takes a lock that session's daemon,
+//! updater or windows may be taking at that moment. That list leaves out
+//! locks held from another PID namespace; only the second rule, which
+//! matters during an update, depends on it.
 
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -50,6 +55,10 @@ struct Record {
 const FORMAT: u8 = 1;
 const MAX_RECORD_BYTES: u64 = 4096;
 const POLL: Duration = Duration::from_millis(20);
+/// How long a claimant watches the runtime lock a claim records before it
+/// takes over from another runtime directory: many times the interval at
+/// which an updater tries to take the lease of a daemon that is exiting.
+const HANDOFF: Duration = Duration::from_millis(250);
 /// How long a daemon waits for a predecessor in its own runtime directory to
 /// finish exiting. A daemon releases its claim before its lease, so this is
 /// only reached when a process dies holding both and its exit is slow.
@@ -59,10 +68,12 @@ const WINDOW_PATIENCE: Duration = Duration::from_secs(2);
 const CLAIMS_DIRECTORY: &str = "claims";
 const DAEMON_CLAIM: &str = "daemon.lock";
 
-/// What holds a claim.
+/// What wants a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claimant {
     Daemon,
+    /// Reading or converting the stopped daemon's store.
+    Maintenance,
     Window,
 }
 
@@ -87,30 +98,51 @@ impl StateInUse {
 
 impl std::fmt::Display for StateInUse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self.claimant {
-            Claimant::Daemon => "Another cagents daemon",
-            Claimant::Window => "This cagents window is already open in another session",
-        })?;
-        match (self.pid, &self.runtime) {
-            (Some(pid), Some(runtime)) => write!(
-                formatter,
-                " (process {pid}, runtime directory {})",
-                runtime.display()
-            )?,
-            (Some(pid), None) => write!(formatter, " (process {pid})")?,
-            (None, _) => {}
-        }
-        formatter.write_str(match self.claimant {
+        let holder = match self.pid {
+            Some(pid) => format!("process {pid}"),
+            None => "it".to_owned(),
+        };
+        let runtime = self
+            .runtime
+            .as_ref()
+            .map(|runtime| format!(", from the runtime directory {}", runtime.display()))
+            .unwrap_or_default();
+        let process = self
+            .pid
+            .map(|pid| format!(" (process {pid})"))
+            .unwrap_or_default();
+        match self.claimant {
             Claimant::Daemon => {
-                " is already using this cagents data. Two daemons on the same data overwrite \
-                 each other's chats, so this one did not start. To use the running daemon, \
-                 start cagents with the same XDG_RUNTIME_DIR; otherwise stop it first."
+                write!(
+                    formatter,
+                    "Another cagents daemon{process} is already using this cagents data{runtime}. \
+                     Two daemons on the same data overwrite each other's chats, so this one did \
+                     not start."
+                )?;
+                // The runtime directory is the session's XDG_RUNTIME_DIR
+                // with the instance's own directory below it.
+                match self.runtime.as_deref().and_then(Path::parent) {
+                    Some(session) => write!(
+                        formatter,
+                        " To use that daemon, start cagents with XDG_RUNTIME_DIR={}; to start one \
+                         here instead, stop {holder} first.",
+                        session.display()
+                    ),
+                    None => write!(formatter, " Stop {holder} first."),
+                }
             }
-            Claimant::Window => {
-                ". Two copies of one window overwrite each other's saved layout, so this one \
-                 did not open. Switch to the open window, or close it first."
-            }
-        })
+            Claimant::Maintenance => write!(
+                formatter,
+                "Another cagents daemon{process} is using this cagents data{runtime}, so its \
+                 saved data can't be changed now. Stop {holder} first."
+            ),
+            Claimant::Window => write!(
+                formatter,
+                "This cagents window is already open in another session{process}{runtime}. Two \
+                 copies of one window overwrite each other's saved layout, so this one did not \
+                 open. Use the open window, or close it first."
+            ),
+        }
     }
 }
 
@@ -146,22 +178,34 @@ pub fn claims_directory() -> io::Result<PathBuf> {
     Ok(dirs.data_dir().join(CLAIMS_DIRECTORY))
 }
 
-/// Claim this instance's daemon state for the daemon, or the maintenance,
-/// that holds the runtime lease `lock`. The caller must hold that lease.
-pub fn claim_daemon_state(lock: &Path, host_session: Option<&str>) -> io::Result<StateClaim> {
-    claim_daemon_state_in(&claims_directory()?, lock, host_session)
+/// Claim this instance's daemon state for the daemon that holds the runtime
+/// lease `lock`. The caller must hold that lease.
+pub fn claim_daemon_state(lock: &Path, host_session: &str) -> io::Result<StateClaim> {
+    claim_daemon_state_in(
+        &claims_directory()?,
+        lock,
+        Some(host_session),
+        Claimant::Daemon,
+    )
+}
+
+/// Claim this instance's daemon state for maintenance of the stopped daemon's
+/// store, which holds its runtime lease `lock`.
+pub fn claim_store_maintenance(lock: &Path) -> io::Result<StateClaim> {
+    claim_daemon_state_in(&claims_directory()?, lock, None, Claimant::Maintenance)
 }
 
 pub(crate) fn claim_daemon_state_in(
     claims: &Path,
     lock: &Path,
     host_session: Option<&str>,
+    claimant: Claimant,
 ) -> io::Result<StateClaim> {
     crate::secure_file::prepare_private_directory(claims)?;
     acquire(
         &claims.join(DAEMON_CLAIM),
         record(lock, host_session)?,
-        Claimant::Daemon,
+        claimant,
         DAEMON_PATIENCE,
     )
 }
@@ -177,8 +221,7 @@ pub(crate) fn served_elsewhere(claim: &Path, lock: &Path) -> io::Result<Option<S
     let Some(recorded) = read_path(claim)? else {
         return Ok(None);
     };
-    let ours = canonical_guard(lock);
-    if recorded.guard == ours || !guard_held(&recorded.guard)? {
+    if recorded.guard == canonical_guard(lock) || !guard_held(&recorded.guard) {
         return Ok(None);
     }
     Ok(Some(refusal(Claimant::Daemon, Some(&recorded))))
@@ -237,14 +280,14 @@ fn acquire(
     loop {
         let found = match owned_lock(path, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(mut lock) => {
-                let last = read(&lock);
-                if let Some(last) = &last
+                // The claim's last holder left it, but its runtime lock may
+                // still be held, by its updater or by store maintenance, or be
+                // about to be, by an updater that has not yet seen it free.
+                if let Some(last) = read(&lock)
                     && last.guard != ours.guard
-                    && guard_held(&last.guard)?
+                    && taken_within(&last.guard, HANDOFF)
                 {
-                    // The claim's last holder left it, but its runtime lock is
-                    // still held: by its updater, or by store maintenance.
-                    return Err(io::Error::other(refusal(claimant, Some(last))));
+                    return Err(io::Error::other(refusal(claimant, Some(&last))));
                 }
                 write(lock.file_mut(), &ours)?;
                 return Ok(StateClaim { _lock: lock });
@@ -254,7 +297,7 @@ fn acquire(
         };
         if let Some(found) = &found
             && found.guard != ours.guard
-            && guard_held(&found.guard)?
+            && guard_held(&found.guard)
         {
             return Err(io::Error::other(refusal(claimant, Some(found))));
         }
@@ -277,36 +320,91 @@ fn refusal(claimant: Claimant, record: Option<&Record>) -> StateInUse {
     }
 }
 
+/// Whether somebody holds the runtime lock at `guard`, or takes it before
+/// `within` has passed.
+fn taken_within(guard: &Path, within: Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if guard_held(guard) {
+            return true;
+        }
+        if started.elapsed() >= within {
+            return false;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Whether anybody holds the runtime lock at `path`. A lock that no longer
-/// exists, as after its runtime directory was removed, is free.
-fn guard_held(path: &Path) -> io::Result<bool> {
-    let lock = match OpenOptions::new()
+/// exists, as after its runtime directory was removed, or that is not this
+/// user's lock file, is nobody's runtime lock.
+fn guard_held(path: &Path) -> bool {
+    let Ok(lock) = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
-    {
-        Ok(lock) => lock,
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ENOTDIR) =>
-        {
-            return Ok(false);
-        }
-        Err(error) => return Err(error),
+    else {
+        return false;
     };
-    let metadata = lock.metadata()?;
+    let Ok(metadata) = lock.metadata() else {
+        return false;
+    };
     if !metadata.is_file() || metadata.uid() != current_uid() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} is not a lock file you own", path.display()),
-        ));
+        return false;
     }
-    match owned_file_lock(lock, libc::LOCK_EX | libc::LOCK_NB) {
-        // Dropping the probe releases it at once.
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
-        Err(error) => Err(error),
+    #[cfg(target_os = "linux")]
+    match listed_flock(&metadata) {
+        Listed::Held => return true,
+        Listed::Free => return false,
+        Listed::Unknown => {}
     }
+    // Only by trying it. Dropping the probe releases it at once.
+    matches!(
+        owned_file_lock(lock, libc::LOCK_EX | libc::LOCK_NB),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    )
+}
+
+#[cfg(target_os = "linux")]
+enum Listed {
+    Held,
+    Free,
+    /// The list can't be read, or names only a file on another device with
+    /// this inode number, which may be this one under another device number.
+    Unknown,
+}
+
+/// Whether `/proc/locks` lists a flock held on the file `metadata` describes.
+#[cfg(target_os = "linux")]
+fn listed_flock(metadata: &fs::Metadata) -> Listed {
+    let Ok(locks) = fs::read_to_string("/proc/locks") else {
+        return Listed::Unknown;
+    };
+    // The kernel prints a device's major and minor numbers in hex.
+    let device = metadata.dev();
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & !0xfff);
+    let minor = (device & 0xff) | ((device >> 12) & !0xff);
+    let device = format!("{major:02x}:{minor:02x}");
+    let inode = metadata.ino().to_string();
+    let mut listed = Listed::Free;
+    for line in locks.lines() {
+        // "1: FLOCK  ADVISORY  WRITE 1234 00:1a:5678 0 EOF"; a process waiting
+        // for the lock is listed as "1: -> FLOCK ...", and holds nothing.
+        let mut fields = line.split_whitespace().skip(1);
+        if fields.next() != Some("FLOCK") {
+            continue;
+        }
+        let Some((on, number)) = fields.nth(3).and_then(|file| file.rsplit_once(':')) else {
+            continue;
+        };
+        if number == inode {
+            if on == device {
+                return Listed::Held;
+            }
+            listed = Listed::Unknown;
+        }
+    }
+    listed
 }
 
 fn read(file: &File) -> Option<Record> {
@@ -374,9 +472,16 @@ mod tests {
         let claims = tempfile::tempdir().unwrap();
         let (first, second) = (Runtime::new(), Runtime::new());
         let _first_lease = first.hold();
-        let _claim = claim_daemon_state_in(claims.path(), &first.lock, Some("first")).unwrap();
+        let _claim =
+            claim_daemon_state_in(claims.path(), &first.lock, Some("first"), Claimant::Daemon)
+                .unwrap();
         let _second_lease = second.hold();
-        let refusal = refusal_of(claim_daemon_state_in(claims.path(), &second.lock, None));
+        let refusal = refusal_of(claim_daemon_state_in(
+            claims.path(),
+            &second.lock,
+            None,
+            Claimant::Daemon,
+        ));
         assert_eq!(refusal.pid(), Some(process::id()));
         assert_eq!(
             refusal.runtime(),
@@ -405,26 +510,97 @@ mod tests {
         let claims = tempfile::tempdir().unwrap();
         let (serving, other) = (Runtime::new(), Runtime::new());
         let lease = serving.hold();
-        drop(claim_daemon_state_in(claims.path(), &serving.lock, None).unwrap());
+        drop(claim_daemon_state_in(claims.path(), &serving.lock, None, Claimant::Daemon).unwrap());
         let _other_lease = other.hold();
-        refusal_of(claim_daemon_state_in(claims.path(), &other.lock, None));
+        refusal_of(claim_daemon_state_in(
+            claims.path(),
+            &other.lock,
+            None,
+            Claimant::Daemon,
+        ));
         // The successor inherits the same lease and takes the claim at once.
-        let successor = claim_daemon_state_in(claims.path(), &serving.lock, None).unwrap();
+        let successor =
+            claim_daemon_state_in(claims.path(), &serving.lock, None, Claimant::Daemon).unwrap();
         drop(successor);
         // With that lease released, the state is free to another directory.
         drop(lease);
-        claim_daemon_state_in(claims.path(), &other.lock, None).unwrap();
+        claim_daemon_state_in(claims.path(), &other.lock, None, Claimant::Daemon).unwrap();
+    }
+
+    #[test]
+    fn an_updater_taking_the_lease_just_after_its_daemon_left_keeps_the_state() {
+        // The outgoing daemon has let go of its claim and its lease, and the
+        // updater has not yet taken the lease.
+        let claims = tempfile::tempdir().unwrap();
+        let (serving, other) = (Runtime::new(), Runtime::new());
+        drop(claim_daemon_state_in(claims.path(), &serving.lock, None, Claimant::Daemon).unwrap());
+        let _other_lease = other.hold();
+        let (taken, release) = (
+            std::sync::mpsc::channel::<()>(),
+            std::sync::mpsc::channel::<()>(),
+        );
+        let lock = serving.lock.clone();
+        let updater = std::thread::spawn(move || {
+            std::thread::sleep(POLL * 2);
+            let _lease = owned_lock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+            taken.0.send(()).unwrap();
+            release.1.recv().unwrap();
+        });
+        let refusal = refusal_of(claim_daemon_state_in(
+            claims.path(),
+            &other.lock,
+            None,
+            Claimant::Daemon,
+        ));
+        taken.1.recv().unwrap();
+        assert_eq!(refusal.pid(), Some(process::id()));
+        release.0.send(()).unwrap();
+        updater.join().unwrap();
+    }
+
+    #[test]
+    fn maintenance_refused_by_a_serving_daemon_says_it_cannot_change_the_data() {
+        let claims = tempfile::tempdir().unwrap();
+        let (serving, other) = (Runtime::new(), Runtime::new());
+        let _lease = serving.hold();
+        let _claim = claim_daemon_state_in(
+            claims.path(),
+            &serving.lock,
+            Some("serving"),
+            Claimant::Daemon,
+        )
+        .unwrap();
+        let _other_lease = other.hold();
+        let refusal = refusal_of(claim_daemon_state_in(
+            claims.path(),
+            &other.lock,
+            None,
+            Claimant::Maintenance,
+        ));
+        let message = refusal.to_string();
+        assert!(message.contains("can't be changed now"), "{message}");
+        assert!(!message.contains("did not start"), "{message}");
+    }
+
+    #[test]
+    fn a_held_runtime_lock_is_seen_without_taking_it() {
+        let runtime = Runtime::new();
+        assert!(!guard_held(&runtime.lock), "a missing lock is free");
+        let lease = runtime.hold();
+        assert!(guard_held(&runtime.lock));
+        drop(lease);
+        assert!(!guard_held(&runtime.lock));
     }
 
     #[test]
     fn a_claim_whose_runtime_directory_is_gone_is_free() {
         let claims = tempfile::tempdir().unwrap();
         let gone = Runtime::new();
-        drop(claim_daemon_state_in(claims.path(), &gone.lock, None).unwrap());
+        drop(claim_daemon_state_in(claims.path(), &gone.lock, None, Claimant::Daemon).unwrap());
         drop(gone);
         let current = Runtime::new();
         let _lease = current.hold();
-        claim_daemon_state_in(claims.path(), &current.lock, None).unwrap();
+        claim_daemon_state_in(claims.path(), &current.lock, None, Claimant::Daemon).unwrap();
     }
 
     #[test]

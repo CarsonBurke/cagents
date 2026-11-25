@@ -1579,12 +1579,11 @@ fn ensure_daemon_ready_at(
     start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
         spawn_daemon(&daemon_binary, application, scoped)
     })
-    .or_else(|error| match error {
-        HostedTerminalStartError::HostExited { .. } => {
-            refuse_state_served_elsewhere(socket)?;
-            Err(error)
-        }
-        error => Err(error),
+    // However the start failed, as a daemon that exited or, under a service
+    // manager, one that never became ready.
+    .or_else(|error| {
+        refuse_state_served_elsewhere(socket)?;
+        Err(error)
     })
 }
 

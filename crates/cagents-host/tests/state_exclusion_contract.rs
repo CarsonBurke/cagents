@@ -17,7 +17,7 @@ use std::{
         unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -157,11 +157,35 @@ fn stop(mut daemon: Child) {
     daemon.wait().unwrap();
 }
 
-fn refused(output: Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+/// Starts a daemon in `runtime` and returns what it said as it refused. One
+/// that serves instead is stopped, and fails the test rather than hanging it.
+fn refused(instance: &Instance, runtime: &str) -> String {
+    let mut daemon = instance
+        .daemon(runtime)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + STARTUP;
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            daemon.kill().unwrap();
+            let output = daemon.wait_with_output().unwrap();
+            panic!(
+                "the daemon in {runtime} served the same data: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut daemon.stderr.take().unwrap(), &mut stderr).unwrap();
     assert!(
-        !output.status.success(),
-        "the second daemon served: {stderr}"
+        !status.success(),
+        "the daemon in {runtime} exited cleanly: {stderr}"
     );
     stderr
 }
@@ -180,8 +204,7 @@ fn a_daemon_in_another_runtime_directory_refuses_before_touching_the_saved_data(
         before.keys().collect::<Vec<_>>()
     );
 
-    let output = instance.daemon("run-b").output().unwrap();
-    let stderr = refused(output);
+    let stderr = refused(&instance, "run-b");
     assert!(
         stderr.contains(&format!("process {}", first.id())),
         "the refusal names the serving daemon: {stderr}"
@@ -233,7 +256,7 @@ fn an_update_keeps_the_saved_data_for_its_own_successor() {
     );
     // Nobody holds the claim now, but the lease its record names is held.
     let before = instance.settled();
-    refused(instance.daemon("run-b").output().unwrap());
+    refused(&instance, "run-b");
     assert_eq!(instance.saved(), before);
 
     // The successor inherits the lease and takes the claim through it.
@@ -257,7 +280,7 @@ fn an_update_keeps_the_saved_data_for_its_own_successor() {
     instance.wait_until_ready("run-a");
 
     // And keeps excluding the other runtime directory once it serves.
-    let stderr = refused(instance.daemon("run-b").output().unwrap());
+    let stderr = refused(&instance, "run-b");
     assert!(
         stderr.contains(&format!("process {}", successor.id())),
         "{stderr}"

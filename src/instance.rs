@@ -462,9 +462,25 @@ impl WindowLease {
         requested: Option<&str>,
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<Self> {
+        // A window here would need a daemon here, which would refuse to serve
+        // data a daemon in another runtime directory serves. Say so first:
+        // that daemon's session, not this window, is what is in the way.
+        if !crate::device::is_remote() {
+            match state_claim::daemon_served_elsewhere(&runtime_directory()?.join("cagentsd.lock"))
+            {
+                Ok(None) => {}
+                Ok(Some(refusal)) => return Err(io::Error::other(refusal)),
+                Err(error) => {
+                    tracing::warn!(%error, "could not read which daemon serves this instance's data");
+                }
+            }
+        }
+        let claims = state_claim::claims_directory()
+            .inspect_err(|error| tracing::warn!(%error, "window claims are unavailable"))
+            .ok();
         let (lease, slot) = Self::acquire_waiting_in(
             &runtime_directory()?,
-            Some(&state_claim::claims_directory()?),
+            claims.as_deref(),
             new_window,
             requested,
             daemon_admission::admission_wait_timeout(),
@@ -548,14 +564,19 @@ impl WindowLease {
                             Ok(claim) => Some(claim),
                             // Another session has this saved window open; a
                             // new window takes the next free one instead.
-                            Err(error)
-                                if new_window
-                                    && requested.is_none()
-                                    && state_claim::state_in_use(&error).is_some() =>
-                            {
-                                continue;
+                            Err(error) if state_claim::state_in_use(&error).is_some() => {
+                                if new_window && requested.is_none() {
+                                    continue;
+                                }
+                                return Err(error);
                             }
-                            Err(error) => return Err(error),
+                            // A claim that can't be taken for another reason,
+                            // such as a read-only data directory, leaves the
+                            // window as it was before claims.
+                            Err(error) => {
+                                tracing::warn!(%error, slot, "could not claim this window's saved state");
+                                None
+                            }
                         },
                         None => None,
                     };
