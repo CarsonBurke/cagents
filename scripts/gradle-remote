@@ -88,8 +88,10 @@ rsync -a --prune-empty-dirs \
     "$remote:$base/mobile/" "$root/mobile/" || true
 if [ "$status" -eq 0 ]; then
     for path in "${fetch[@]}"; do
-        mkdir -p "$root/mobile/$path"
-        rsync -a --delete "$remote:$base/mobile/$path/" "$root/mobile/$path/"
+        # A directory or a single file, such as one a Gradle task regenerated.
+        path=${path%/}
+        mkdir -p "$(dirname "$root/mobile/$path")"
+        rsync -a --delete "$remote:$base/mobile/$path" "$(dirname "$root/mobile/$path")/"
     done
 fi
 exit "$status"
