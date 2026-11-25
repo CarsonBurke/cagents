@@ -4042,15 +4042,8 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
         "This agent runs in default mode, so it can't start a child in bypassPermissions. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
     );
     assert_eq!(
-        spawn(
-            &agent,
-            "unranked",
-            Provider::Claude,
-            Some("dontAsk"),
-            "work"
-        )
-        .unwrap_err(),
-        "cagents can't compare Claude Code mode dontAsk with this agent's own, so an agent can't start a child in it; start it yourself."
+        spawn(&agent, "unranked", Provider::Omp, Some("write"), "work").unwrap_err(),
+        "cagents can't compare Oh My Pi mode write with this agent's own, so an agent can't start a child in it; start it yourself."
     );
     assert_eq!(
         spawn(
