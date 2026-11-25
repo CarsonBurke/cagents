@@ -2,6 +2,20 @@ use super::fixture::{host_proof, restore_with_lineage};
 use super::*;
 
 #[test]
+fn chat_read_timeout_reset_preserves_a_closed_peers_buffered_data() {
+    use std::io::{Read as _, Write as _};
+    let (mut client, mut peer) = UnixStream::pair().unwrap();
+    set_chat_timeouts(&client).unwrap();
+    peer.write_all(b"last frame").unwrap();
+    drop(peer);
+
+    clear_chat_read_timeout(&client).unwrap();
+    let mut bytes = Vec::new();
+    client.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"last frame");
+}
+
+#[test]
 fn active_model_sidechannel_survives_snapshots_patches_and_hidden_publications() {
     let publications = Publications::new(Snapshot {
         generation: 4,
