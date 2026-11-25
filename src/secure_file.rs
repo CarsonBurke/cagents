@@ -298,9 +298,12 @@ mod tests {
     #[test]
     fn sqlite_paths_pass_through_every_link_but_a_sealed_system_one() {
         let directory = tempfile::tempdir().unwrap();
-        let real = directory.path().join("real");
+        // Resolve the fixture root before adding the ordinary link. The
+        // temporary directory itself may be beneath a sealed system link.
+        let root = directory.path().canonicalize().unwrap();
+        let real = root.join("real");
         fs::create_dir(&real).unwrap();
-        let link = directory.path().join("link");
+        let link = root.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let store = link.join("store.sqlite3");
         // An ordinary link is SQLite's to refuse.
