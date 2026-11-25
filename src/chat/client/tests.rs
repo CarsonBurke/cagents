@@ -9,7 +9,7 @@ fn chat_read_timeout_reset_preserves_a_closed_peers_buffered_data() {
     peer.write_all(b"last frame").unwrap();
     drop(peer);
 
-    clear_chat_read_timeout(&client).unwrap();
+    crate::descriptor::set_read_timeout_or_hangup(&client, None).unwrap();
     let mut bytes = Vec::new();
     client.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"last frame");
