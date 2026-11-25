@@ -1993,7 +1993,7 @@ struct RetiredShortcutDefault {
 /// Revision 6 drops Shift from the chat model and permission pickers: their
 /// chords act only in a chat pane, so they never reach a shell, and neither
 /// `Ctrl+M` nor `Ctrl+O` edits the message.
-const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
+const LINUX_RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
         retired_in: 2,
@@ -2061,10 +2061,24 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     },
 ];
 
+/// macOS's table first shipped with revision 6, so no file holds an earlier
+/// macOS default to move off. A revision that changes it records the chords it
+/// replaces here, as Linux's history does.
+const MACOS_RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[];
+
+/// Every default a revision replaced on this platform, oldest revision first.
+const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = match ShortcutPlatform::CURRENT {
+    ShortcutPlatform::Linux => LINUX_RETIRED_SHORTCUT_DEFAULTS,
+    ShortcutPlatform::MacOs => MACOS_RETIRED_SHORTCUT_DEFAULTS,
+};
+
 /// Column navigation's defaults while each action took a single chord, before
-/// the arrow chords joined them. Only a version-2 file can hold these.
-const SINGLE_CHORD_DEFAULTS: [(&str, &[&str]); 2] =
-    [("previous_column", &["Alt+Q"]), ("next_column", &["Alt+W"])];
+/// the arrow chords joined them. Only a version-2 file can hold these, and
+/// only Linux ever wrote one.
+const SINGLE_CHORD_DEFAULTS: &[(&str, &[&str])] = match ShortcutPlatform::CURRENT {
+    ShortcutPlatform::Linux => &[("previous_column", &["Alt+Q"]), ("next_column", &["Alt+W"])],
+    ShortcutPlatform::MacOs => &[],
+};
 
 /// The default `action` had at `revision`, when a later revision replaced it.
 fn retired_default(action: &str, revision: u32) -> Option<&'static [&'static str]> {
@@ -2309,7 +2323,8 @@ where
         &mut shortcuts,
         FIRST_SHORTCUT_DEFAULTS_REVISION,
         &SINGLE_CHORD_DEFAULTS
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|(action, _)| scalar.iter().any(|name| name == action))
             .collect::<Vec<_>>(),
     );
@@ -4948,6 +4963,7 @@ mod tests {
     /// literal, so a key added to version 3 later cannot pass this test by
     /// simply not appearing in it: the writer has to strip the key here, which
     /// is where the migration decision gets stated.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn version_two_migration_preserves_custom_appearance() {
         let directory = tempfile::tempdir().unwrap();
@@ -4985,6 +5001,7 @@ cycle_pane_width = ["Alt+R"]
         );
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn version_two_scalar_shortcuts_migrate_without_losing_custom_bindings() {
         let directory = tempfile::tempdir().unwrap();
@@ -5018,6 +5035,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), migrated);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn separating_project_search_migrates_defaults_and_preserves_custom_chords() {
         for (search, occupied, expected_search, expected_find) in [
@@ -5054,6 +5072,7 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn revision_6_moves_chat_pickers_still_on_their_default_off_shift() {
         for (model, permissions, occupied, expected_model, expected_permissions) in [
@@ -5110,6 +5129,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), settings);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn introducing_pane_cycling_preserves_an_existing_binding_of_its_default() {
         let directory = tempfile::tempdir().unwrap();
@@ -5132,6 +5152,7 @@ next_column = ["Alt+W", "Alt+Right"]
     /// A current-schema document as a build before shortcut defaults
     /// revision 2 wrote it: every action on its default of the time, and no
     /// recorded revision.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     fn revision_one_document(path: &Path, extend: impl FnOnce(&mut toml::Table)) {
         let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
         document.remove("shortcut_defaults_revision");
@@ -5146,6 +5167,7 @@ next_column = ["Alt+W", "Alt+Right"]
         fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn shortcuts_on_retired_defaults_move_to_the_current_ones() {
         let directory = tempfile::tempdir().unwrap();
@@ -5172,6 +5194,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), desired);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn new_tab_default_upgrades_revision_two_without_overriding_user_bindings() {
         let directory = tempfile::tempdir().unwrap();
@@ -5204,6 +5227,7 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn pane_shortcuts_restore_revision_two_and_three_defaults_without_losing_choices() {
         let directory = tempfile::tempdir().unwrap();
@@ -5253,6 +5277,7 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn introduced_chat_shortcuts_preserve_existing_bindings_and_explicit_unbinding() {
         let directory = tempfile::tempdir().unwrap();
@@ -5273,6 +5298,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), loaded);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn restoring_pane_defaults_does_not_steal_another_actions_chords() {
         let directory = tempfile::tempdir().unwrap();
@@ -5298,6 +5324,7 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_shortcut_the_user_chose_survives_the_move_to_new_defaults() {
         let directory = tempfile::tempdir().unwrap();
@@ -5325,6 +5352,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), desired);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_new_default_another_action_already_binds_is_not_taken() {
         let directory = tempfile::tempdir().unwrap();
@@ -5345,6 +5373,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), loaded);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_version_two_file_on_old_defaults_moves_to_the_current_ones() {
         let directory = tempfile::tempdir().unwrap();
@@ -5382,6 +5411,7 @@ new_thread = "Alt+Shift+G"
 
     /// A table that leaves an action out had it on its old default, and a
     /// chord chosen around that default must not collide with the new one.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn an_action_an_old_table_leaves_out_takes_part_in_the_move() {
         let directory = tempfile::tempdir().unwrap();
@@ -5419,6 +5449,7 @@ new_thread = "Alt+Shift+G"
         );
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_newer_shortcut_defaults_revision_is_left_as_it_is() {
         let directory = tempfile::tempdir().unwrap();
@@ -5533,6 +5564,7 @@ new_thread = "Alt+Shift+G"
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn new_channel_migration_preserves_a_custom_chord_but_rejects_explicit_conflicts() {
         let directory = tempfile::tempdir().unwrap();
@@ -5559,6 +5591,7 @@ new_thread = "Alt+Shift+G"
         ));
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn clone_pane_migration_preserves_owned_chords_and_existing_channel_bindings() {
         let directory = tempfile::tempdir().unwrap();
@@ -5713,7 +5746,7 @@ new_thread = "Alt+Shift+G"
         alternate_conflict
             .keyboard_shortcuts
             .new_terminal
-            .push("Ctrl+PageUp".to_owned());
+            .push(alternate_conflict.keyboard_shortcuts.previous_column[0].clone());
         assert!(matches!(
             alternate_conflict.validate(),
             Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
@@ -5730,6 +5763,7 @@ new_thread = "Alt+Shift+G"
         assert!(AppSettings::default().validate().is_ok());
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn new_review_navigation_migration_preserves_existing_bindings() {
         let mut value = toml::Value::try_from(AppSettings::default()).unwrap();
@@ -5785,14 +5819,21 @@ new_thread = "Alt+Shift+G"
 
     #[test]
     fn native_fixed_chords_refuse_conflicting_actions_by_name() {
+        let (primary, copy) = match ShortcutPlatform::CURRENT {
+            ShortcutPlatform::Linux => ("Ctrl", "Ctrl+Shift+C"),
+            ShortcutPlatform::MacOs => ("Cmd", "Cmd+C"),
+        };
         for (chord, label) in [
-            ("Ctrl+Tab", "Cycle recent panes"),
-            ("Ctrl+=", "Increase font size"),
-            ("Ctrl+Shift+C", "Copy terminal selection"),
-            ("Ctrl+Shift+S", "Stage / unstage selected lines"),
+            ("Ctrl+Tab".to_owned(), "Cycle recent panes"),
+            (format!("{primary}+="), "Increase font size"),
+            (copy.to_owned(), "Copy terminal selection"),
+            (
+                format!("{primary}+Shift+S"),
+                "Stage / unstage selected lines",
+            ),
         ] {
             let mut settings = AppSettings::default();
-            settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
+            settings.keyboard_shortcuts.new_terminal = vec![chord.clone()];
             assert!(
                 matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)),
                 "{chord}"
@@ -6378,6 +6419,7 @@ new_thread = "Alt+Shift+G"
     /// A newer build that dropped an action may bind its chord elsewhere. This
     /// build binds the action it still has, and the file keeps the newer
     /// build's binding and never gains the dropped action.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_dropped_actions_chord_stays_where_the_newer_build_put_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -6408,6 +6450,7 @@ new_thread = "Alt+Shift+G"
     /// An action the file lacks whose default chord the file gave another is
     /// left unbound, and stays so once that chord is freed: the migration's
     /// choice is written, not the default it withheld.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_missing_action_left_unbound_stays_unbound() {
         let directory = tempfile::tempdir().unwrap();
@@ -6428,6 +6471,7 @@ new_thread = "Alt+Shift+G"
     /// A kept action that gives up its last chord is not kept, so the chords
     /// this build writes for it in turn cost the other kept actions; the file
     /// never binds a chord twice.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn an_unkept_action_never_leaves_a_chord_bound_twice() {
         let directory = tempfile::tempdir().unwrap();
