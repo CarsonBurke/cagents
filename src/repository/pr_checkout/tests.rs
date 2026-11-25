@@ -2000,19 +2000,23 @@ fn original_policy_is_chained_with_its_hook_configuration_and_aborted_effects_ar
 }
 
 #[test]
-fn native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_directory() {
+fn native_addition_guard_preserves_ignored_data_and_refuses_file_to_directory() {
     if isolated_fixture_case(concat!(
         module_path!(),
         "::",
-        stringify!(
-            native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_directory
-        )
+        stringify!(native_addition_guard_preserves_ignored_data_and_refuses_file_to_directory)
     )) {
         return;
     }
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStringExt;
     let fixture = Fixture::new(true);
+    #[cfg(target_os = "linux")]
     let odd = OsString::from_vec(b"odd\xff\n[] -entry".to_vec());
+    // APFS rejects invalid UTF-8 filenames. Keep literal matching of
+    // whitespace, glob metacharacters and non-ASCII text on macOS.
+    #[cfg(target_os = "macos")]
+    let odd = OsString::from("odd-雪\n[] -entry");
     let incoming = odd.clone();
     let new = fixture.advance(|root| {
         fs::create_dir(root.join("secret")).unwrap();
