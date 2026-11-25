@@ -137,25 +137,14 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     serve_with(stream, client_id, host, process_wire_request);
 }
 
+/// The connecting process, when it runs as this account. On Darwin the pid
+/// names the last process to use the client's socket, which for a client
+/// that connected itself is the client; see `daemon::peer_credentials`.
 fn peer_pid(stream: &UnixStream) -> Option<u32> {
-    use std::os::fd::AsRawFd;
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt writes into the initialized ucred-sized buffer.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    (result == 0
-        && length as usize == std::mem::size_of::<libc::ucred>()
-        && credentials.uid == unsafe { libc::geteuid() }
-        && credentials.pid > 0)
-        .then_some(credentials.pid as u32)
+    crate::daemon::peer_credentials(stream)
+        .ok()
+        .filter(|peer| peer.uid == crate::daemon::current_uid() && peer.pid > 0)
+        .map(|peer| peer.pid)
 }
 
 /// Lifecycle parks without a timer, so a request that removes a retention
@@ -202,13 +191,8 @@ fn may_release_retention(request: &ClientRequest) -> bool {
 /// Whether the peer process runs the `cagents` CLI, the only client this
 /// daemon serves at an older protocol.
 fn peer_runs_cli(pid: u32) -> bool {
-    let (Ok(executable), Ok(command_line)) = (
-        std::fs::read_link(format!("/proc/{pid}/exe")),
-        std::fs::read(format!("/proc/{pid}/cmdline")),
-    ) else {
-        return false;
-    };
-    is_cli_peer(&executable, &command_line)
+    crate::process::program_of(pid)
+        .is_ok_and(|(executable, command_line)| is_cli_peer(&executable, &command_line))
 }
 
 fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(

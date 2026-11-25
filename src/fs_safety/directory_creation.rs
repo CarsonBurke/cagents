@@ -359,11 +359,16 @@ impl OwnedPrivateSibling {
     pub(crate) fn retained_descriptor_count(&self) -> usize {
         1 + usize::from(self.directory.is_some())
     }
+    // This module's tests run in the CLI lane; the other lanes' callers are
+    // Linux-only save tests, so a Darwin UI or host test build leaves these
+    // unused.
     #[cfg(test)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn is_resolved(&self) -> bool {
         self.removed && self.synced
     }
     #[cfg(test)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn diagnostic_path(&self) -> PathBuf {
         self.parent
             .directory

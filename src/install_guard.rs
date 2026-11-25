@@ -598,18 +598,50 @@ fn selectable_root(prefix: &Path, version_root: &Path) -> io::Result<std::path::
 /// An unexpected link is restored before refusing. Supported writers hold the
 /// caller's launch fence; manual filesystem writes outside it are not serialized.
 fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let current = prefix.join("current");
-    let next = prefix.join(format!(".select.{}", std::process::id()));
-    match std::fs::remove_file(&next) {
-        Ok(()) => (),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-        Err(error) => return Err(error),
+    CurrentExchange::prepare(prefix, link, expected)?.commit()
+}
+
+/// Allocates the replacement pointer while the source is still available.
+/// The caller holds the launch fence through prepare and commit.
+pub(crate) struct CurrentExchange {
+    current: std::path::PathBuf,
+    next: std::path::PathBuf,
+    expected: std::path::PathBuf,
+    link: std::path::PathBuf,
+    keep_next: bool,
+}
+
+impl CurrentExchange {
+    pub(crate) fn prepare(prefix: &Path, link: &Path, expected: &Path) -> io::Result<Self> {
+        let current = prefix.join("current");
+        if std::fs::read_link(&current)? != expected {
+            return Err(io::Error::other(
+                "current installation changed independently",
+            ));
+        }
+        let next = prefix.join(format!(".select.{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(link, &next)?;
+        let prepared = Self {
+            current,
+            next,
+            expected: expected.to_owned(),
+            link: link.to_owned(),
+            keep_next: false,
+        };
+        // Detect filesystems without atomic exchange before releasing the
+        // source. Both test links name the same version.
+        let probe = prefix.join(format!(".select-probe.{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(link, &probe)?;
+        let tested = prepared.swap(&probe);
+        let cleanup = std::fs::remove_file(&probe);
+        tested.and(cleanup)?;
+        Ok(prepared)
     }
-    std::os::unix::fs::symlink(link, &next)?;
-    let exchange = || -> io::Result<()> {
-        let from = std::ffi::CString::new(next.as_os_str().as_bytes())?;
-        let to = std::ffi::CString::new(current.as_os_str().as_bytes())?;
+
+    fn swap(&self, with: &Path) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let from = std::ffi::CString::new(self.next.as_os_str().as_bytes())?;
+        let to = std::ffi::CString::new(with.as_os_str().as_bytes())?;
         // SAFETY: both paths are NUL-terminated and outlive the call.
         #[cfg(target_os = "linux")]
         let exchanged = unsafe {
@@ -636,39 +668,57 @@ fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<(
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    };
-    if let Err(error) = exchange() {
-        let _ = std::fs::remove_file(&next);
-        return Err(io::Error::new(
-            error.kind(),
-            format!("cannot atomically switch {}: {error}", current.display()),
-        ));
     }
-    // `next` now holds whatever `current` held at the instant of exchange.
-    if std::fs::read_link(&next).ok().as_deref() != Some(expected) {
-        let restored = exchange();
-        if restored.is_ok() {
-            let _ = std::fs::remove_file(&next);
+
+    pub(crate) fn commit(mut self) -> io::Result<()> {
+        if std::fs::read_link(&self.next)? != self.link {
+            return Err(io::Error::other(
+                "prepared installation pointer changed independently",
+            ));
         }
-        return Err(io::Error::other(match restored {
-            Ok(()) => "current installation changed independently; the link observed during selection was restored".into(),
-            Err(error) => format!(
-                "current installation changed independently, and restoring it failed ({error}); its replaced link is kept at {}",
-                next.display()
-            ),
-        }));
+        self.swap(&self.current).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot atomically switch {}: {error}",
+                    self.current.display()
+                ),
+            )
+        })?;
+        // The temporary name now holds the previous public pointer.
+        if std::fs::read_link(&self.next).ok().as_deref() != Some(self.expected.as_path())
+            || std::fs::read_link(&self.current).ok().as_deref() != Some(self.link.as_path())
+        {
+            return Err(io::Error::other(match self.swap(&self.current) {
+                Ok(()) => "current installation changed independently; the link observed during selection was restored".into(),
+                Err(error) => {
+                    self.keep_next = true;
+                    format!(
+                        "current installation changed independently, and restoring it failed ({error}); its replaced link is kept at {}",
+                        self.next.display()
+                    )
+                }
+            }));
+        }
+        // The new pointer is serving. A cleanup error cannot undo it.
+        if let Err(error) = std::fs::remove_file(&self.next)
+            .and_then(|()| File::open(self.current.parent().unwrap()))
+            .and_then(|directory| directory.sync_all())
+        {
+            eprintln!(
+                "cagents: selected the installed version; finalizing its pointer failed ({error})"
+            );
+        }
+        Ok(())
     }
-    // `current` already serves the selection; failing now would misreport it.
-    if let Err(error) = std::fs::remove_file(&next)
-        .and_then(|()| File::open(prefix))
-        .and_then(|directory| directory.sync_all())
-    {
-        eprintln!(
-            "cagents: selected the installed version, but could not finish cleanup ({error}); remove {} if it remains",
-            next.display()
-        );
+}
+
+impl Drop for CurrentExchange {
+    fn drop(&mut self) {
+        if !self.keep_next {
+            let _ = std::fs::remove_file(&self.next);
+        }
     }
-    Ok(())
 }
 
 /// A marker only selects a complete same-prefix tree while the kernel still
@@ -685,21 +735,7 @@ pub(crate) fn staged_owner_bin(
     if crate::daemon::lease_handoff::has_inherited_lease()? {
         return Ok(None);
     }
-    // Sealed update probes execute from anonymous FDs. Their kernel exe path
-    // has no filesystem entry to canonicalize and carries no install routing.
-    // Only an installed version shape can have our private ownership marker;
-    // locate() authenticates that tree after a marker has actually been found.
-    let Some(bin) = executable
-        .parent()
-        .filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))
-    else {
-        return Ok(None);
-    };
-    let Some(version_root) = bin.parent().filter(|root| {
-        root.parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "versions")
-    }) else {
+    let Some(version_root) = installed_version_root(executable) else {
         return Ok(None);
     };
     let Some(owner) = read_staged_owner(version_root)? else {
@@ -800,6 +836,67 @@ pub(crate) fn staged_owner_bin(
         ));
     }
     Ok(Some(expected))
+}
+
+fn installed_version_root(executable: &Path) -> Option<&Path> {
+    // Anonymous update probes and ordinary development executables have no
+    // installation marker. Inspect the layout before opening one.
+    let bin = executable
+        .parent()
+        .filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))?;
+    bin.parent().filter(|root| {
+        root.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "versions")
+    })
+}
+
+/// Resolve the live, matched CLI for a scoped Agent command on an installation
+/// that selected its legacy staged build early. This route only connects to
+/// an existing daemon. A staged marker alone authorizes no delegation.
+pub(crate) fn staged_agent_owner_cli(executable: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    let Some(root) = installed_version_root(executable) else {
+        return Ok(None);
+    };
+    let Some(owner) = read_staged_owner(root)? else {
+        return Ok(None);
+    };
+    let Some(version) = owner.owner_version.filter(|_| !owner.daemon_compatible) else {
+        return Ok(None);
+    };
+    let layout = crate::update::locate(executable).map_err(io::Error::other)?;
+    if layout.prefix.join("current").canonicalize()? != layout.version_root {
+        return Ok(None);
+    }
+    let expected = layout.prefix.join("versions").join(version).join("bin");
+    let socket = crate::terminal_ipc::local_daemon_socket_path()?;
+    let source = crate::update::source::Client::connect(&socket).map_err(io::Error::other)?;
+    let protocol = source.protocol();
+    // These released CLIs preserve Agent List and Spawn caller authority,
+    // including a present but invalid token. General upgrade admission also
+    // includes releases that predate those scoped requests.
+    if protocol >= crate::terminal_ipc::PROTOCOL_VERSION || !matches!(protocol, 198 | 203) {
+        return Ok(None);
+    }
+    let daemon = source.serving_executable().map_err(io::Error::other)?;
+    if running_owner_bin(&layout.prefix, &daemon)? != expected {
+        return Ok(None);
+    }
+    let cli = expected.join("cagents");
+    if cli.canonicalize()? != cli {
+        return Ok(None);
+    }
+    let cli_protocol = crate::update::owned_cli_protocol(
+        &cli,
+        "the serving build's CLI",
+        "serving CLI protocol check",
+    )
+    .map_err(io::Error::other)?;
+    if cli_protocol != protocol || source.serving_executable().map_err(io::Error::other)? != daemon
+    {
+        return Ok(None);
+    }
+    Ok(Some(cli))
 }
 
 /// The ownership marker a staging transaction recorded in `version_root`, if

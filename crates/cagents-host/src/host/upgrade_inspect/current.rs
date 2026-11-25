@@ -75,21 +75,11 @@ impl Client {
     fn verify_owner(&self, socket: &Path) -> Result<(), String> {
         let pid = crate::daemon::lease_owner(&socket.with_file_name("cagentsd.lock"), &self.proof)
             .map_err(|_| "Source service ownership cannot be verified")?;
-        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: initialized buffers have the exact kernel credential layout.
-        if unsafe {
-            libc::getsockopt(
-                self.stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut peer as *mut libc::ucred).cast(),
-                &mut length,
-            )
-        } != 0
-            || length as usize != std::mem::size_of::<libc::ucred>()
-            || peer.uid != crate::daemon::current_uid()
-            || u32::try_from(peer.pid).ok() != Some(pid)
+        // Darwin names the last process to use the source's end, which is the
+        // source either way: before it accepts, its end takes the pid from the
+        // listener it binds and serves alone. See `daemon::peer_credentials`.
+        if !crate::daemon::peer_credentials(&self.stream)
+            .is_ok_and(|peer| peer.uid == crate::daemon::current_uid() && peer.pid == pid)
         {
             return Err("Source connection does not belong to its authenticated service".into());
         }

@@ -112,6 +112,9 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c255
 # These system-backed protocols belong only to the integrated Linux browser.
 wayland-client = { version = "=0.31.15", features = ["system"], optional = true }
 wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
+# macOS has no XDG portal, so libcosmic's file dialogs use the native panels.
+[target.'cfg(target_os = "macos")'.dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["rfd"] }
 
 [dev-dependencies]
 # The shared library's test fixtures, which the UI's tests also use.

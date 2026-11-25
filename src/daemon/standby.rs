@@ -30,11 +30,13 @@ use std::{
 use {super::lease_handoff::DAEMON_LEASE_ENV, crate::upgrade::recovery::RECOVERY_FD_ENV};
 
 pub const ARGUMENT: &str = "--await-update-handoff";
+const LOCAL_PREVIOUS_CURRENT: &str = "CAGENTS_UPDATE_PREVIOUS_CURRENT";
 const FRAME_LIMIT: usize = 4096;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Activation {
+    Fresh,
     Lease,
     Checkpoint,
 }
@@ -42,6 +44,9 @@ enum Activation {
 #[cfg(any(feature = "host", test))]
 impl Activation {
     fn slots(&self) -> Vec<i32> {
+        if matches!(self, Self::Fresh) {
+            return Vec::new();
+        }
         let mut slots = vec![DAEMON_LEASE_FD];
         if matches!(self, Self::Checkpoint) {
             slots.extend(RECEIPT_DESCRIPTORS);
@@ -147,6 +152,7 @@ impl Parked {
         executable: &Path,
         expected: (u64, u64),
         guard: &UiUpdateGuard,
+        previous_current: Option<&Path>,
     ) -> io::Result<Self> {
         let (channel, receiver) = UnixStream::pair()?;
         let mut command = Command::new(executable);
@@ -159,6 +165,10 @@ impl Parked {
             .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV)
             .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV);
         crate::install_guard::sanitize_child_environment(&mut command);
+        command.env_remove(LOCAL_PREVIOUS_CURRENT);
+        if let Some(expected) = previous_current {
+            command.env(LOCAL_PREVIOUS_CURRENT, expected);
+        }
         // SAFETY: the hook marks unrelated descriptors close-on-exec.
         unsafe { command.pre_exec(super::seal_inherited_descriptors) };
         guard.inherit_for_install(&mut command)?;
@@ -211,20 +221,30 @@ impl Parked {
     pub(crate) fn activate(
         &mut self,
         executable: &Path,
-        lease: &LeaseHandoff,
+        lease: Option<&LeaseHandoff>,
         receipt: Option<&Receipt>,
         timeout: Duration,
         overdue: impl FnOnce(),
     ) -> io::Result<()> {
         self.check_running()?;
-        let mut descriptors = vec![lease.descriptor()];
+        let mut descriptors = lease
+            .into_iter()
+            .map(LeaseHandoff::descriptor)
+            .collect::<Vec<_>>();
         let request = if let Some(receipt) = receipt {
+            if lease.is_none() {
+                return Err(io::Error::other(
+                    "a checkpoint activation requires the source lease",
+                ));
+            }
             let files = receipt.files()?;
             crate::upgrade::recovery::validate_forward_target(executable, files[0])?;
             descriptors.extend(files.map(AsFd::as_fd));
             Activation::Checkpoint
-        } else {
+        } else if lease.is_some() {
             Activation::Lease
+        } else {
+            Activation::Fresh
         };
         // From the first transfer byte onward the child might receive
         // authority. Never kill it on loss of communication after this point.
@@ -266,21 +286,28 @@ impl Drop for Parked {
 }
 
 #[cfg(feature = "host")]
-pub struct Activated(UnixStream);
+pub struct Activated {
+    channel: UnixStream,
+    publication: Option<crate::update::LocalPublication>,
+}
 
 #[cfg(feature = "host")]
 impl Activated {
     /// The host accepted custody and can now answer its authenticated socket.
     pub fn started(self) -> io::Result<()> {
-        send_status(&self.0, Status::Started)
+        send_status(&self.channel, Status::Started)
     }
 
     pub fn failed(&self, reason: &impl std::fmt::Display) {
-        let mut stream = &self.0;
+        let mut stream = &self.channel;
         let reason: String = reason.to_string().chars().take(512).collect();
         let _ = stream
             .write_all(&[3])
             .and_then(|()| send(stream, &reason, &[]));
+    }
+
+    pub fn take_local_publication(&mut self) -> Option<crate::update::LocalPublication> {
+        self.publication.take()
     }
 }
 
@@ -295,6 +322,13 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     // scope enrollment must never inherit a copy across their own exec.
     super::seal_inherited_descriptors()?;
     crate::instance::validate_stage_guard()?;
+    let publication = std::env::var_os(LOCAL_PREVIOUS_CURRENT)
+        .map(|expected| {
+            crate::update::LocalPublication::prepare(Path::new(&expected)).map_err(io::Error::other)
+        })
+        .transpose()?;
+    // SAFETY: activation runs before the daemon starts any threads.
+    unsafe { std::env::remove_var(LOCAL_PREVIOUS_CURRENT) };
     let stdin = io::stdin();
     let mut control = UnixStream::from(stdin.as_fd().try_clone_to_owned()?);
     control.peer_addr()?;
@@ -317,16 +351,26 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         return Err(io::Error::other("invalid replacement daemon activation"));
     }
     let (request, descriptors) = receive_activation(&control)?;
+    if matches!(request, Activation::Fresh) && publication.is_none() {
+        return Err(io::Error::other(
+            "fresh standby activation requires a local update",
+        ));
+    }
     install_descriptors(descriptors, &request.slots())?;
     // SAFETY: the inherited authority readers run immediately afterward in
     // this same thread, consuming their normal authenticated descriptors.
     unsafe {
-        std::env::set_var(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
+        if !matches!(request, Activation::Fresh) {
+            std::env::set_var(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
+        }
         if matches!(request, Activation::Checkpoint) {
             std::env::set_var(RECOVERY_FD_ENV, RECEIPT_DESCRIPTORS[0].to_string());
         }
     }
-    Ok(Activated(control))
+    Ok(Activated {
+        channel: control,
+        publication,
+    })
 }
 
 #[cfg(any(feature = "host", test))]
@@ -378,6 +422,15 @@ fn install_descriptors(descriptors: Vec<OwnedFd>, slots: &[i32]) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fresh_activation_has_no_existing_daemon_lease() {
+        let (worker, daemon) = UnixStream::pair().unwrap();
+        send(&worker, &Activation::Fresh, &[]).unwrap();
+        let (activation, files) = receive_activation(&daemon).unwrap();
+        assert_eq!(activation, Activation::Fresh);
+        assert!(files.is_empty());
+    }
 
     #[test]
     fn accepting_the_checkpoint_requires_its_complete_custody() {

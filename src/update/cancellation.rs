@@ -241,8 +241,10 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    // Darwin declares these `*mut`; a `*mut` also coerces to
+                    // the `*const` Linux declares.
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0

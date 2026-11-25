@@ -12,6 +12,11 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
+#[cfg(all(target_os = "linux", feature = "host"))]
+mod publication;
+#[cfg(all(target_os = "linux", feature = "host"))]
+#[doc(hidden)]
+pub use publication::LocalPublication;
 mod pending_recovery;
 pub mod progress;
 pub mod recovery;
@@ -420,13 +425,17 @@ const PREPARED_CANDIDATE_MARKER: &str = ".cagents-prepared-candidate-v1.json";
 
 /// Whether `install.sh` left the version tree at `root` as a candidate it has
 /// not verified, such as one kept after a failed or rolled-back update. It
-/// removes both markers once it verifies a publication; a later install of that
+/// removes these markers once it verifies a publication; a later install of that
 /// release revalidates a marked tree. Releases before that removal left the
 /// prepared marker on trees they published, which are refused here too.
 pub(crate) fn is_unverified_candidate(root: &Path) -> bool {
-    [RETAINED_CANDIDATE_MARKER, PREPARED_CANDIDATE_MARKER]
-        .iter()
-        .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
+    [
+        RETAINED_CANDIDATE_MARKER,
+        PREPARED_CANDIDATE_MARKER,
+        installed::LOCAL_STAGE_MARKER,
+    ]
+    .iter()
+    .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
 }
 
 /// Whether `install.sh` would refuse to install `version` again because this
@@ -588,32 +597,38 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
 }
 
 pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
-    apply_installed_from(executable, false)
+    apply_installed_from(Some(executable))
 }
 
-fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
+fn apply_installed_from(window_candidate: Option<&Path>) -> Result<UpdateJob, UpdateError> {
     recovery::inspect_pending_current()?;
     let mut installation = running_installation()?;
     let layout = locate(&crate::process::current_executable()?)?;
     let served = served_version_root(&layout)?;
-    if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
-        return Err(invalid(
-            "the installed candidate changed; inspect the installation again",
-        ));
-    }
-    // The served build owns every update, including an older daemon's
-    // replacement and a remaining window-only replacement.
-    installation.version = installed_entry_worker(&layout, &served)?;
-    let version = served
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(unsupported_install)?
-        .to_owned();
+    let candidate = match window_candidate {
+        None => installed_terminal_candidate(&layout, &served)?,
+        Some(executable) => {
+            if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
+                return Err(invalid(
+                    "the installed candidate changed; inspect the installation again",
+                ));
+            }
+            served.clone()
+        }
+    };
+    // The candidate owns its update. For a privately staged CLI, compare
+    // against the public version so an absent daemon still permits the switch.
+    let source_layout = if candidate == served {
+        layout
+    } else {
+        locate(&served.join("bin/cagents-ui"))?
+    };
+    installation.version = installed_entry_worker(&source_layout, &candidate)?;
     start_job(
         &installation,
-        &version,
-        &if terminal {
-            UpdateRequest::InstalledFromTerminal { root: served }
+        &installation.version,
+        &if window_candidate.is_none() {
+            UpdateRequest::InstalledFromTerminal { root: candidate }
         } else {
             UpdateRequest::Installed { root: served }
         },
@@ -683,16 +698,28 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
-    // An interrupted preparation has its own immutable source census. Do not
-    // route this retry through old `current` or construct a fresh empty source.
-    recovery::inspect_pending_current()?;
-    let layout = locate(&crate::process::current_executable()?)?;
-    let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
     if cancellation::requested() {
         return Err(UpdateError::Cancelled);
     }
-    let initial = apply_installed_from(&candidate, true)?;
+    let initial = apply_installed_from(None)?;
     drive_terminal_review(initial, yes, interrupt)
+}
+
+fn installed_terminal_candidate(
+    caller: &InstallLayout,
+    served: &Path,
+) -> Result<PathBuf, UpdateError> {
+    if caller.version_root != served {
+        match fs::symlink_metadata(caller.version_root.join(installed::LOCAL_STAGE_MARKER)) {
+            Ok(_) => {
+                installed::Selection::capture(caller)?;
+                return Ok(caller.version_root.clone());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(served.to_owned())
 }
 
 pub fn upgrade_release(
@@ -1833,7 +1860,7 @@ fn completed_presentation(mut job: UpdateJob) -> UpdateJob {
 /// `protocol_check_could_have_failed_it`, for the build serving now, whose
 /// receipt shows `proof` serving. Whether `proof` is the daemon serving now
 /// is the caller's to establish. Returns whether the job is now complete.
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(feature = "ui")]
 fn settle_as_completed(
     state: &Path,
     judged: &UpdateJob,
@@ -1844,6 +1871,15 @@ fn settle_as_completed(
         Err(UpdateError::Busy) => return Ok(false),
         lock => lock?,
     };
+    settle_under_worker_lease(state, judged, proof)
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+fn settle_under_worker_lease(
+    state: &Path,
+    judged: &UpdateJob,
+    proof: &crate::model::HostSessionProof,
+) -> Result<bool, UpdateError> {
     let current: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
     if current.id != judged.id
@@ -1881,11 +1917,6 @@ fn settle_as_completed(
     Ok(true)
 }
 
-/// How long a daemon of an update's target waits for the worker that
-/// installed it to finish, before leaving its failure to a window.
-#[cfg(feature = "host")]
-const SUCCESSOR_SETTLE_PATIENCE: Duration = Duration::from_secs(30 * 60);
-
 /// Run once by a daemon that has finished starting, serving as `serving`.
 ///
 /// A 0.2.3 worker records its update failed after this build already took
@@ -1907,62 +1938,35 @@ pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
     if !state.is_dir() {
         return;
     }
-    let spawned = thread::Builder::new()
-        .name("update-settle".into())
-        .spawn(move || {
-            let deadline = Instant::now() + SUCCESSOR_SETTLE_PATIENCE;
-            loop {
-                match successor_settle_step(&layout, &state, &serving) {
-                    Ok(SettleStep::Wait) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(500));
-                    }
-                    Ok(SettleStep::Settled(job)) => {
-                        tracing::info!(job, "settled an older worker's update failure as complete");
-                        return;
-                    }
-                    Ok(_) => return,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not settle the last update's record");
-                        return;
-                    }
+    let spawned =
+        thread::Builder::new().name("update-settle".into()).spawn(
+            move || match settle_after_worker(&layout, &state, &serving) {
+                Ok(Some(job)) => {
+                    tracing::info!(job, "settled an older worker's update failure as complete");
                 }
-            }
-        });
+                Ok(None) => (),
+                Err(error) => tracing::warn!(%error, "could not settle the last update's record"),
+            },
+        );
     if let Err(error) = spawned {
         tracing::warn!(%error, "could not watch the last update's record");
     }
 }
 
 #[cfg(feature = "host")]
-#[derive(Debug, PartialEq, Eq)]
-enum SettleStep {
-    /// The worker is still running; look again.
-    Wait,
-    /// Nothing here for this daemon to settle.
-    Done,
-    Settled(String),
-}
-
-#[cfg(feature = "host")]
-fn successor_settle_step(
+fn settle_after_worker(
     layout: &InstallLayout,
     state: &Path,
     serving: &crate::model::HostSessionProof,
-) -> Result<SettleStep, UpdateError> {
-    // The lease first: a receipt read once its worker has gone is its last.
-    let worker_running = match acquire_lock(state) {
-        Ok(_lease) => false,
-        Err(UpdateError::Busy) => true,
-        Err(error) => return Err(error),
-    };
-    if worker_running {
-        return Ok(SettleStep::Wait);
-    }
+) -> Result<Option<String>, UpdateError> {
+    // The kernel wakes this thread when the original worker releases the
+    // lease, including on process exit. Keep it through the verdict so a new
+    // job cannot change status between reading and recording the outcome.
+    let file = open_worker_lock(state)?;
+    let _lease = crate::instance::owned_file_lock(file, libc::LOCK_EX)?;
     let job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(SettleStep::Done);
-        }
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     if job.phase != UpdatePhase::Failed
@@ -1970,13 +1974,9 @@ fn successor_settle_step(
         || !protocol_check_could_have_failed_it(&job)
         || served_version_root(layout)? != layout.version_root
     {
-        return Ok(SettleStep::Done);
+        return Ok(None);
     }
-    Ok(if settle_as_completed(state, &job, serving)? {
-        SettleStep::Settled(job.id)
-    } else {
-        SettleStep::Done
-    })
+    Ok(settle_under_worker_lease(state, &job, serving)?.then_some(job.id))
 }
 
 #[cfg(any(feature = "ui", test))]
@@ -2349,7 +2349,7 @@ fn perform_update(
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
-    let context = ReviewContext::capture(installation)?;
+    let context = ReviewContext::capture(&installation.version)?;
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
         Installation::detect()?;
@@ -2686,7 +2686,7 @@ struct ReviewContext {
 }
 
 impl ReviewContext {
-    fn capture(installation: &Installation) -> Result<Self, UpdateError> {
+    fn capture(selected_version: &str) -> Result<Self, UpdateError> {
         let guard = crate::instance::UiUpdateGuard::acquire()?;
         let windows = guard.verified_windows()?;
         let layout = locate(&crate::process::current_executable()?)?;
@@ -2697,7 +2697,7 @@ impl ReviewContext {
                     .first()
                     .and_then(|window| locate(&window.executable).ok().map(|layout| layout.version))
             })
-            .unwrap_or_else(|| installation.version.clone());
+            .unwrap_or_else(|| selected_version.to_owned());
         Ok(Self {
             from_version,
             windows: windows.len(),
@@ -2811,7 +2811,7 @@ pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> 
 
 const CEDITOR_COMPANION: &str = "Ceditor's companion";
 
-fn owned_cli_protocol(
+pub(crate) fn owned_cli_protocol(
     executable: &Path,
     subject: &str,
     operation: &'static str,
@@ -2885,6 +2885,7 @@ fn companion_read(
     }
     let mut command = Command::new(executable);
     crate::install_guard::sanitize_child_environment(&mut command);
+    command.env_remove(crate::agent_execution::AUTHORITY_ENV);
     command.args(arguments);
     if let Some(runtime) = runtime {
         command.env("XDG_RUNTIME_DIR", runtime);
@@ -3573,6 +3574,10 @@ fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
     Ok(())
 }
 fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
+    lock_file(open_worker_lock(state)?)
+}
+
+fn open_worker_lock(state: &Path) -> Result<File, UpdateError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3582,7 +3587,7 @@ fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError>
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(state.join("lock"))?;
     validate_lock(&file)?;
-    lock_file(file)
+    Ok(file)
 }
 
 fn lock_file(file: File) -> Result<crate::instance::OwnedLock, UpdateError> {
@@ -6282,7 +6287,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 // This fixture itself runs outside an installation. The public
                 // entry cannot guess a target from its supplied UI path; the
                 // managed old UI/CLI routes are exercised above.
-                apply_installed_from(&root.path().join("versions/new/bin/cagents-ui"), true),
+                apply_installed(&root.path().join("versions/new/bin/cagents-ui")),
                 Err(UpdateError::Invalid(_))
             ));
             let original = recovery::census_path(root.path(), &job.id);
@@ -7256,39 +7261,55 @@ mod reconciliation_tests {
         };
         write(recovery::outcome_path(&state, JOB), "pending.json");
 
-        // The old worker installed this daemon and is still running.
-        let worker = acquire_lock(&state).unwrap();
-        let step = || successor_settle_step(&layout, &state, &serving).unwrap();
-        assert_eq!(step(), SettleStep::Wait);
+        let step = || settle_after_worker(&layout, &state, &serving).unwrap();
         job.phase = UpdatePhase::Failed;
         job.message =
             "The confirmed successor does not serve this update's matched protocol".into();
         write_job(&state, &job).unwrap();
-        assert_eq!(step(), SettleStep::Wait);
-        drop(worker);
 
-        // It left its placeholder: nothing proved the service.
-        assert_eq!(step(), SettleStep::Done);
+        // The older worker left its placeholder: nothing proved the service.
+        assert_eq!(step(), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // Its receipt names a daemon that has since restarted.
         write(recovery::outcome_path(&state, JOB), "recovery.json");
         let mut restarted = serving.clone();
         restarted.host_incarnation = crate::model::HostIncarnation::new("restarted");
         assert_eq!(
-            successor_settle_step(&layout, &state, &restarted).unwrap(),
-            SettleStep::Done
+            settle_after_worker(&layout, &state, &restarted).unwrap(),
+            None
         );
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // A worker that records its release reports its own verdict.
         job.recorded_by = Some("0.2.4".into());
         write_job(&state, &job).unwrap();
-        assert_eq!(step(), SettleStep::Done);
+        assert_eq!(step(), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         job.recorded_by = None;
         write_job(&state, &job).unwrap();
 
-        // Its receipt names this daemon: the update completed.
-        assert_eq!(step(), SettleStep::Settled(JOB.into()));
+        // An active worker can replace its placeholder with the exact
+        // serving proof. The same waiter must use that final receipt.
+        thread::scope(|scope| {
+            let worker = acquire_lock(&state).unwrap();
+            write(recovery::outcome_path(&state, JOB), "pending.json");
+            let (waiting, started) = std::sync::mpsc::channel();
+            let (settled, verdict) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                waiting.send(()).unwrap();
+                settled.send(step()).unwrap();
+            });
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                verdict.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            write(recovery::outcome_path(&state, JOB), "recovery.json");
+            drop(worker);
+            assert_eq!(
+                verdict.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Some(JOB.into())
+            );
+        });
         let settled = recorded();
         assert_eq!(settled.phase, UpdatePhase::Complete);
         assert_eq!(settled.version, "0.2.4");
@@ -7307,8 +7328,8 @@ mod reconciliation_tests {
         assert!(state.join(format!("{JOB}.complete")).is_file());
         // Settled for good: a later daemon finds nothing to do.
         assert_eq!(
-            successor_settle_step(&layout, &state, &restarted).unwrap(),
-            SettleStep::Done
+            settle_after_worker(&layout, &state, &restarted).unwrap(),
+            None
         );
         assert_eq!(recorded().phase, UpdatePhase::Complete);
     }

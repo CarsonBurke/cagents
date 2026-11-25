@@ -4,7 +4,7 @@
 Run it in a session's fixture, then start a Claude chat in the project:
     scripts/native-evidence env python3 tests/fixtures/conversation-work.py
 
-It adds three worktrees of the fixture project under .worktrees/, gives the
+It adds four worktrees of the fixture project under .worktrees/, gives the
 project a github.com remote, seeds the offline forge with the pull requests
 they head and two others, and writes home/.claude/fixture-frames.jsonl from
 conversation-work/frames.jsonl. The next Claude turn in the fixture then
@@ -13,6 +13,8 @@ replays a conversation that
 - opened #41 (`gh pr create`) from fix/cache-key, whose checks are passing,
   running and failing, and left a test there uncommitted;
 - pushed feat/retry-budget, the branch of the open #38, all checks passing;
+- pushed feat/cache-metrics, whose #44 then merged after main was merged
+  into it on GitHub, so its head there is not the worktree's commit;
 - merged #35 (`gh pr merge`);
 - edited docs/locale-notes, a worktree with no pull request;
 - mentioned #12 by URL and #29 by number.
@@ -51,6 +53,8 @@ RETRY_ATTEMPTS = RETRY + "\npub fn attempts() -> u32 {\n    ATTEMPTS\n}\n"
 RETRY_BUDGET = RETRY_ATTEMPTS.replace(
     RETRY, "pub const ATTEMPTS: u32 = 3;\n"
     "pub const BUDGET: std::time::Duration = std::time::Duration::from_secs(20);\n")
+METRICS = "pub fn record_miss(path: &str) {\n    let _ = path;\n}\n"
+METRICS_LOCALE = "pub fn record_miss(path: &str, locale: &str) {\n    let _ = (path, locale);\n}\n"
 LOCALES = "# Locales\n\nResponses are cached per path.\n"
 LOCALES_NOTED = LOCALES.replace(
     "Responses are cached per path.",
@@ -86,7 +90,7 @@ def track(project, branch, oid):
 
 
 def prepare_worktrees(project):
-    """The project's three worktrees, made once. Returns their branches' oids."""
+    """The project's four worktrees, made once. Returns their branches' oids."""
     worktrees = project / ".worktrees"
     # The last step tracks the retry budget's branch; until then, nothing is.
     started = (worktrees / "cache-key").exists()
@@ -103,11 +107,12 @@ def prepare_worktrees(project):
         if ".worktrees/" not in excluded:
             with exclude.open("a") as file:
                 file.write(".worktrees/\n")
-        base = commit(project, {"src/cache.rs": CACHE, "src/retry.rs": RETRY, "docs/locales.md": LOCALES},
+        base = commit(project, {"src/cache.rs": CACHE, "src/retry.rs": RETRY, "src/metrics.rs": METRICS,
+                                "docs/locales.md": LOCALES},
                       "Add the cache, retry and locale modules", "2026-11-17T14:00:00Z")
         git(project, "update-ref", "refs/remotes/origin/main", base)
         for name, branch in (("cache-key", "fix/cache-key"), ("retry-budget", "feat/retry-budget"),
-                             ("locale-notes", "docs/locale-notes")):
+                             ("locale-notes", "docs/locale-notes"), ("cache-metrics", "feat/cache-metrics")):
             git(project, "worktree", "add", "--quiet", "-b", branch, str(worktrees / name), base)
         cache = commit(worktrees / "cache-key", {"src/cache.rs": CACHE_KEYED},
                        "Key the response cache by locale", "2026-11-17T15:18:00Z")
@@ -118,12 +123,16 @@ def prepare_worktrees(project):
         retry = commit(worktrees / "retry-budget", {"src/retry.rs": RETRY_BUDGET},
                        "Bound the retry budget", "2026-11-17T15:08:00Z")
         (worktrees / "locale-notes" / "docs/locales.md").write_text(LOCALES_NOTED)
+        metrics = commit(worktrees / "cache-metrics", {"src/metrics.rs": METRICS_LOCALE},
+                         "Count cache misses per locale", "2026-11-17T15:12:00Z")
+        track(project, "feat/cache-metrics", metrics)
         track(project, "feat/retry-budget", retry)
     return {
         "base": git(project, "rev-parse", "main"),
         "cache": git(project, "rev-parse", "fix/cache-key"),
         "retry_base": git(project, "rev-parse", "feat/retry-budget~1"),
         "retry": git(project, "rev-parse", "feat/retry-budget"),
+        "metrics": git(project, "rev-parse", "feat/cache-metrics"),
     }
 
 
@@ -160,6 +169,12 @@ def pull_requests(oids):
                  check_run("build", "COMPLETED", "SUCCESS", "2026-11-17T15:08:20Z", "2026-11-17T15:10:30Z"),
                  check_run("lint", "COMPLETED", "SUCCESS", "2026-11-17T15:08:20Z", "2026-11-17T15:09:10Z"),
                  check_run("test", "COMPLETED", "SUCCESS", "2026-11-17T15:08:20Z", "2026-11-17T15:12:50Z")]),
+        # Merged after main was merged into it on GitHub: its head there is
+        # a merge commit the worktree never fetched.
+        pull(44, "Count cache misses per locale", "MERGED", "feat/cache-metrics", "fixture",
+             "2026-11-17T15:40:00Z", head="44" * 20, additions=3, deletions=2, changedFiles=1,
+             mergedAt="2026-11-17T15:40:00Z", closedAt="2026-11-17T15:40:00Z",
+             reviewDecision="APPROVED", mergeable="UNKNOWN", mergeStateStatus="UNKNOWN"),
         pull(35, "Drop the legacy cache flag", "MERGED", "chore/legacy-cache-flag", "fixture",
              "2026-11-17T14:55:00Z", head="35" * 20, additions=2, deletions=14, changedFiles=3,
              reviewDecision="APPROVED", mergeable="UNKNOWN", mergeStateStatus="UNKNOWN"),
@@ -174,7 +189,8 @@ def pull_requests(oids):
 def frames(project, oids):
     template = (HERE / "conversation-work" / "frames.jsonl").read_text()
     replacements = {"@PROJECT@": str(project), "@RETRY_BASE@": oids["retry_base"][:7],
-                    "@RETRY_HEAD@": oids["retry"][:7]}
+                    "@RETRY_HEAD@": oids["retry"][:7],
+                    "@METRICS_BASE@": oids["base"][:7], "@METRICS_HEAD@": oids["metrics"][:7]}
     lines = []
     for line in template.splitlines():
         # Substituted in the decoded strings, so a path is escaped as JSON.

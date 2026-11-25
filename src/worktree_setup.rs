@@ -16,7 +16,6 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
-    os::fd::AsRawFd,
     os::unix::{
         ffi::OsStringExt,
         fs::{MetadataExt, PermissionsExt},
@@ -255,20 +254,19 @@ impl SetupCheckout {
         self.check()?;
         index.check(&self.admin)?;
         check_cancel(cancel)?;
+        let target = child_path(&self.target);
         let spec = RepositoryService::system("git")
-            .git_base(&self.target.process_path(), true)
-            .arg(format!("--git-dir={}", self.admin.process_path().display()))
-            .arg(format!(
-                "--work-tree={}",
-                self.target.process_path().display()
-            ))
+            .git_base(&target, true)
+            .arg(format!("--git-dir={}", child_path(&self.admin).display()))
+            .arg(format!("--work-tree={}", target.display()))
             .args(["-c", "core.hooksPath=/dev/null"])
-            .env("GIT_COMMON_DIR", self.common.process_path())
-            .env(
-                "GIT_INDEX_FILE",
-                format!("/proc/{}/fd/{}", std::process::id(), index.file.as_raw_fd()),
-            )
+            .env("GIT_COMMON_DIR", child_path(&self.common))
+            .env("GIT_INDEX_FILE", index.child_path(&self.admin))
             .args(args);
+        // Reading a sparse index can fetch missing trees, which runs a
+        // transport the configuration chooses; see `child_path`.
+        #[cfg(target_os = "macos")]
+        let spec = spec.env("GIT_NO_LAZY_FETCH", "1");
         let result = SystemProcessExecutor
             .execute(&spec, cancel)
             .map_err(error)?;
@@ -298,6 +296,25 @@ impl SetupIndex {
         Ok(result)
     }
 
+    /// How Git, run while this index is held, names it.
+    #[cfg(target_os = "linux")]
+    fn child_path(&self, _admin: &fs_safety::Root) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.file.as_raw_fd()
+        ))
+    }
+
+    /// Darwin can name the index only by its path; [`Self::check`], before
+    /// and after Git runs, confirms the path names this index then. See the
+    /// free `child_path` for what that leaves open.
+    #[cfg(target_os = "macos")]
+    fn child_path(&self, admin: &fs_safety::Root) -> PathBuf {
+        admin.path().join("index")
+    }
+
     fn check(&self, admin: &fs_safety::Root) -> Result<(), SetupError> {
         if source_fingerprint(&self.file.metadata().map_err(error)?) != self.fingerprint
             || source_fingerprint(&fs_safety::metadata_beneath(admin, Path::new("index"))?)
@@ -309,6 +326,24 @@ impl SetupIndex {
         }
         Ok(())
     }
+}
+
+/// How a child Git process, run while `root` is held, names that directory:
+/// through this process's descriptor on Linux.
+#[cfg(target_os = "linux")]
+fn child_path(root: &fs_safety::Root) -> PathBuf {
+    root.process_path()
+}
+
+/// Darwin offers no path to another process's descriptor, so Git gets the
+/// directory's path. [`SetupCheckout::check`], before and after Git runs,
+/// confirms each path names the held directory at those two moments, not in
+/// between: whoever can rename a parent could show Git another repository
+/// meanwhile, though they could as well edit this one's configuration. Git
+/// runs with hooks, the file-system monitor and lazy fetches disabled.
+#[cfg(target_os = "macos")]
+fn child_path(root: &fs_safety::Root) -> PathBuf {
+    root.path().to_path_buf()
 }
 
 fn same_directory(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -816,7 +851,7 @@ fn prepare_with_checkpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::symlink, process::Command};
+    use std::{os::fd::AsRawFd, os::unix::fs::symlink, process::Command};
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -931,6 +966,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn copy_only_preserves_modes_skips_missing_sources_and_never_overwrites_tracked_files() {
         let fixture = Fixture::new();
         let plan = fixture.config("copy = ['.env*', 'tracked', 'missing/local.toml']");
@@ -1082,6 +1121,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn literal_copy_works_without_enumerating_primary_directory() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
@@ -1097,6 +1140,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn anonymous_copy_publishes_the_owned_inode_and_never_cleans_foreign_names() {
         use std::os::unix::fs::FileExt;
         for collision in [false, true] {
@@ -1173,6 +1220,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn anonymous_copy_preserves_mode_under_restrictive_umask() {
         const CHILD: &str = "CAGENTS_SETUP_ANONYMOUS_UMASK_CHILD";
         if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
@@ -1299,6 +1350,9 @@ mod tests {
         assert!(!fixture.destination.join(".env").exists());
     }
 
+    // POSIX ACLs are Linux's `system.posix_acl_*` extended attributes; Darwin
+    // keeps ACLs outside xattrs, and its xattr calls take a position argument.
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_preserves_restrictive_access_acl_and_removes_inherited_acl() {
         use std::os::fd::AsRawFd;
@@ -1496,6 +1550,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn copy_preserves_bytes_mode_and_matching_source_group() {
         // This ordinary copy control does not exercise group restoration:
         // preserve_group returns before fchown when both groups already match.
@@ -1532,6 +1590,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn recursive_globs_are_bounded_to_real_directories_and_copy_nested_files() {
         let fixture = Fixture::new();
         fs::create_dir_all(fixture.primary.join("config/nested")).unwrap();
@@ -1574,6 +1636,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn broad_globs_do_not_copy_other_managed_worktrees_or_the_destination() {
         let fixture = Fixture::with_nested_destination(true);
         let other = fixture.primary.join(".worktrees/other");
@@ -1620,6 +1686,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn keeps_existing_untracked_and_dangling_symlink_destinations() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "source").unwrap();
@@ -1641,6 +1711,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn explicit_trust_is_project_local_and_exact_config_changes_revoke_it() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
@@ -1730,6 +1804,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn inherited_git_environment_cannot_redirect_setup() {
         const CHILD_PRIMARY: &str = "CAGENTS_SETUP_TEST_PRIMARY";
         const CHILD_DESTINATION: &str = "CAGENTS_SETUP_TEST_DESTINATION";

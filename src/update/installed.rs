@@ -3,6 +3,82 @@ use super::*;
 
 const DAEMON_BINARY: &str = "cagentsd";
 const BINARIES: [&str; 3] = ["cagents", "cagents-ui", DAEMON_BINARY];
+pub(super) const LOCAL_STAGE_MARKER: &str = ".cagents-local-candidate-v1";
+const LOCAL_SOURCE_MARKER: &str = ".cagents-local-source-v1";
+
+#[derive(PartialEq, Eq)]
+pub(super) struct Selection {
+    current: PathBuf,
+    previous_link: Option<PathBuf>,
+}
+
+impl Selection {
+    pub(super) fn previous_link(&self) -> Option<&Path> {
+        self.previous_link.as_deref()
+    }
+    pub(super) fn capture(candidate: &InstallLayout) -> Result<Self, UpdateError> {
+        let current = served_version_root(candidate)?;
+        if current == candidate.version_root {
+            return Ok(Self {
+                current,
+                previous_link: None,
+            });
+        }
+        let prior = read_private(&candidate.version_root.join(LOCAL_STAGE_MARKER), 256)?;
+        let previous_link = fs::read_link(candidate.prefix.join("current"))?;
+        if !current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| prior.strip_suffix(b"\n") == Some(name.as_bytes()))
+            || served_version_root(candidate)? != current
+        {
+            return Err(invalid(
+                "The public installation changed since this build was staged",
+            ));
+        }
+        Ok(Self {
+            current,
+            previous_link: Some(previous_link),
+        })
+    }
+
+    pub(super) fn prepare(
+        &self,
+        candidate: &InstallLayout,
+    ) -> Result<Option<crate::install_guard::CurrentExchange>, UpdateError> {
+        if *self != Self::capture(candidate)? {
+            return Err(invalid(
+                "The installed application changed; review the new build before updating",
+            ));
+        }
+        self.previous_link
+            .as_deref()
+            .map(|expected| {
+                let link = Path::new("versions").join(&candidate.version);
+                crate::install_guard::CurrentExchange::prepare(&candidate.prefix, &link, expected)
+                    .map_err(UpdateError::from)
+            })
+            .transpose()
+    }
+}
+
+pub(super) fn complete_selection(
+    switch: Option<crate::install_guard::CurrentExchange>,
+    candidate: &InstallLayout,
+) -> Result<(), UpdateError> {
+    if let Some(switch) = switch {
+        switch.commit()?;
+        match fs::rename(
+            candidate.version_root.join(LOCAL_STAGE_MARKER),
+            candidate.version_root.join(LOCAL_SOURCE_MARKER),
+        ) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => eprintln!("Could not retire the local staging marker: {error}"),
+        }
+    }
+    Ok(())
+}
 
 #[derive(PartialEq, Eq)]
 struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
@@ -92,11 +168,12 @@ pub(super) fn perform(
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
     let source_owner = installed_daemon_owner(&layout)?;
-    if served_version_root(&layout)? != root {
+    if layout.version_root != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
     }
+    let selection = Selection::capture(&layout)?;
     set_phase(
         state,
         job,
@@ -123,7 +200,7 @@ pub(super) fn perform(
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
-        if served_version_root(&layout)? != root || stamp(root)? != before {
+        if Selection::capture(&layout)? != selection || stamp(root)? != before {
             return Err(invalid(
                 "the installed application changed; review the new build before updating",
             ));
@@ -139,7 +216,12 @@ pub(super) fn perform(
         .as_ref()
         .is_some_and(|owner| owner.version_root != root);
     let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
-    let context = ReviewContext::capture(installation)?;
+    let selected_version = selection
+        .current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(unsupported_install)?;
+    let context = ReviewContext::capture(selected_version)?;
     let confirmed = confirmation::wait(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
@@ -181,13 +263,23 @@ pub(super) fn perform(
     }
     confirmation::check_cancelled(state, job)?;
     #[cfg(target_os = "linux")]
-    let mut standby = confirmed
-        .replaces_daemon
+    let parks_successor = confirmed.replaces_daemon
+        || (selection.previous_link.is_some() && confirmed.daemon.is_none());
+    #[cfg(not(target_os = "linux"))]
+    let parks_successor = false;
+    let switch = if parks_successor {
+        None
+    } else {
+        selection.prepare(&layout)?
+    };
+    #[cfg(target_os = "linux")]
+    let mut standby = parks_successor
         .then(|| {
             crate::daemon::standby::Parked::launch(
                 &root.join("bin").join(DAEMON_BINARY),
                 before.daemon_inode(),
                 &guard,
+                selection.previous_link.as_deref(),
             )
         })
         .transpose()
@@ -227,6 +319,9 @@ pub(super) fn perform(
         #[cfg(target_os = "linux")]
         if let Some(standby) = standby.as_mut() {
             standby.check_running()?;
+            if Selection::capture(&layout)? != selection {
+                return Err(invalid("The public installation changed before handoff"));
+            }
         }
         recovery.shutdown_requested = confirmed.replaces_daemon;
         floor::quiesce(
@@ -258,15 +353,17 @@ pub(super) fn perform(
         if let Some(standby) = standby.as_mut() {
             let pid = standby.pid();
             let daemon = root.join("bin").join(DAEMON_BINARY);
-            let lease = handoff.as_ref().ok_or_else(|| {
-                invalid("The replacement did not receive the terminal service lease")
-            })?;
+            if confirmed.daemon.is_some() && handoff.is_none() {
+                return Err(invalid(
+                    "The replacement did not receive the terminal service lease",
+                ));
+            }
             startup_attempted = true;
             startup_owned = true;
             standby
                 .activate(
                     &daemon,
-                    lease,
+                    handoff.as_ref(),
                     survivors.recovery_receipt(),
                     timeout,
                     || {
@@ -328,6 +425,9 @@ pub(super) fn perform(
         } else if candidate.may_own_runtime() {
             guard.set_fallback_executable(root.join("bin/cagents-ui"));
             guard.set_recovery_restore_only();
+            if selection.previous_link.is_some() {
+                guard.leave_launch_fence_with_successor();
+            }
             return Err(result.unwrap_err());
         }
     }
@@ -335,6 +435,11 @@ pub(super) fn perform(
     // unsuccessful transaction and reopening the old application.
     #[cfg(target_os = "linux")]
     drop(standby);
+    if result.is_ok() && parks_successor && selection.previous_link.is_some() {
+        result = selected_candidate(&layout.prefix, root);
+    } else if result.is_ok() {
+        result = complete_selection(switch, &layout);
+    }
     announce_primary_failure(&result);
     let mut restored_previous = false;
     if result.is_err()
@@ -342,8 +447,8 @@ pub(super) fn perform(
         && let Some(previous) = previous.as_ref()
     {
         match rollback_stopped_candidate(
-            &installation.prefix,
-            root,
+            &layout,
+            &selection,
             previous,
             original_schema,
             startup_owned,
@@ -439,20 +544,20 @@ fn stopped_store_schema(
 }
 
 fn rollback_stopped_candidate(
-    prefix: &Path,
-    candidate: &Path,
+    candidate: &InstallLayout,
+    selection: &Selection,
     previous: &Path,
     schema: Option<u32>,
     startup_spawned: bool,
     guard: &crate::instance::UiUpdateGuard,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<bool, UpdateError> {
-    selected_candidate(prefix, candidate)?;
     let paths =
         crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
     if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
         return Ok(false);
     }
+    selected_candidate(&candidate.prefix, &selection.current)?;
     if handoff.is_none() {
         *handoff = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
             .map_err(|error| invalid(error.to_string()))?;
@@ -473,13 +578,15 @@ fn rollback_stopped_candidate(
     if startup_spawned {
         let schema = schema.ok_or_else(|| invalid("The previous store schema was not captured"))?;
         candidate_maintenance(
-            candidate,
+            &candidate.version_root,
             &["daemon", "downgrade-store", &schema.to_string()],
             guard,
             lease,
         )?;
     }
-    restore_current(prefix, candidate, previous)?;
+    if selection.current != previous {
+        restore_current(&candidate.prefix, &selection.current, previous)?;
+    }
     Ok(true)
 }
 
@@ -517,7 +624,7 @@ pub(super) fn restore_current(
 
 /// Listening is not proof that startup restored the reviewed panes. Recovery
 /// deliberately serves inspection while ordinary conversation requests fail.
-fn confirm_daemon_ready(
+pub(super) fn confirm_daemon_ready(
     expected: &Path,
     pid: Option<u32>,
     timeout: Duration,
@@ -703,7 +810,7 @@ fn wait_for_daemon_start(
     })
 }
 
-fn report_overdue_startup(state: &Path, job: &mut UpdateJob) -> io::Result<()> {
+pub(super) fn report_overdue_startup(state: &Path, job: &mut UpdateJob) -> io::Result<()> {
     let persisted = set_phase(state, job, UpdatePhase::Installing, WAITING_FOR_STARTUP)
         .map_err(|error| io::Error::other(error.to_string()));
     // The captured stderr remains useful even if the status file cannot update.
@@ -844,6 +951,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_staged_selection_is_bound_to_the_public_source_until_it_commits() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().canonicalize().unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for version in ["source", "candidate", "other"] {
+            let bin = prefix.join("versions").join(version).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for binary in BINARIES {
+                fs::write(bin.join(binary), "").unwrap();
+            }
+        }
+        let current = prefix.join("current");
+        symlink("versions/source", &current).unwrap();
+        let candidate = locate(&prefix.join("versions/candidate/bin/cagents")).unwrap();
+        assert!(Selection::capture(&candidate).is_err());
+
+        let marker = candidate.version_root.join(LOCAL_STAGE_MARKER);
+        private_create(&marker)
+            .unwrap()
+            .write_all(b"source\n")
+            .unwrap();
+        let selection = Selection::capture(&candidate).unwrap();
+        drop(selection.prepare(&candidate).unwrap());
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            Path::new("versions/source")
+        );
+        assert!(marker.is_file());
+
+        let switch = selection.prepare(&candidate).unwrap();
+        fs::remove_file(&current).unwrap();
+        symlink("versions/other", &current).unwrap();
+        assert!(complete_selection(switch, &candidate).is_err());
+        assert!(Selection::capture(&candidate).is_err());
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            Path::new("versions/other")
+        );
+        assert!(marker.is_file());
+
+        fs::remove_file(&current).unwrap();
+        symlink("versions/source", &current).unwrap();
+        complete_selection(selection.prepare(&candidate).unwrap(), &candidate).unwrap();
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            Path::new("versions/candidate")
+        );
+        assert!(!marker.exists());
+        assert!(
+            Selection::capture(&candidate)
+                .unwrap()
+                .previous_link
+                .is_none()
+        );
+    }
+
+    #[test]
     #[cfg_attr(
         not(target_os = "linux"),
         ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
@@ -872,6 +1041,15 @@ mod tests {
         let root = PathBuf::from(root);
         let old = root.join("versions/old");
         let candidate = root.join("versions/candidate");
+        let layout = InstallLayout {
+            prefix: root.clone(),
+            version_root: candidate.clone(),
+            version: "candidate".into(),
+        };
+        let published = Selection {
+            current: candidate.clone(),
+            previous_link: None,
+        };
         for version in [&old, &candidate] {
             fs::create_dir_all(version.join("bin")).unwrap();
         }
@@ -924,8 +1102,8 @@ else: raise AssertionError(sys.argv)
         fs::write(root.join("fail-conversion"), "fail").unwrap();
         assert!(
             rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -938,7 +1116,7 @@ else: raise AssertionError(sys.argv)
         // A command that never spawned cannot have converted the store; old
         // recovery must not depend on invoking that unavailable candidate.
         assert!(
-            rollback_stopped_candidate(&root, &candidate, &old, None, false, &guard, &mut lease,)
+            rollback_stopped_candidate(&layout, &published, &old, None, false, &guard, &mut lease,)
                 .unwrap()
         );
         assert_eq!(root.join("current").canonicalize().unwrap(), old);
@@ -952,8 +1130,8 @@ else: raise AssertionError(sys.argv)
         lock.write_all(&metadata(std::process::id())).unwrap();
         assert!(
             !rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -970,8 +1148,8 @@ else: raise AssertionError(sys.argv)
         lock.write_all(&metadata(stopped_pid)).unwrap();
         assert!(
             rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -986,8 +1164,8 @@ else: raise AssertionError(sys.argv)
         // An independently changed current is rejected before store conversion.
         assert!(
             rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -997,6 +1175,24 @@ else: raise AssertionError(sys.argv)
             .is_err()
         );
         assert!(!root.join("converted").exists());
+        let private = Selection {
+            current: old.clone(),
+            previous_link: Some(PathBuf::from("versions/old")),
+        };
+        assert!(
+            rollback_stopped_candidate(
+                &layout,
+                &private,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .unwrap()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), old);
+        assert_eq!(fs::read_to_string(root.join("converted")).unwrap(), "23");
     }
 
     #[derive(Clone, Copy)]

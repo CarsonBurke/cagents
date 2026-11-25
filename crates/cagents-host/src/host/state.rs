@@ -302,6 +302,8 @@ pub(crate) struct HostState {
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
+    #[cfg(target_os = "linux")]
+    pub(super) publishing_startup: bool,
     publication_pending: BTreeMap<TerminalId, PendingPublication>,
     /// Missing original owners after an acknowledged incomplete update. Their
     /// saved pane recipes are evidence, never automatic execution authority.
@@ -523,6 +525,8 @@ impl HostState {
             spawning_terminals: BTreeMap::new(),
             handoff_terminals: BTreeMap::new(),
             startup_custody: BTreeSet::new(),
+            #[cfg(target_os = "linux")]
+            publishing_startup: false,
             publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
@@ -2486,6 +2490,15 @@ impl HostState {
     /// A retained failure outranks custody still awaiting its outcome: it is
     /// never cleared, so waiting on the remaining custody cannot finish startup.
     pub(super) fn startup_state(&self) -> StartupState {
+        let state = self.startup_state_before_publication();
+        #[cfg(target_os = "linux")]
+        if self.publishing_startup && state == StartupState::Ready {
+            return StartupState::Restoring { awaiting: 0 };
+        }
+        state
+    }
+
+    pub(super) fn startup_state_before_publication(&self) -> StartupState {
         #[cfg(debug_assertions)]
         if let Some(held) = super::fixture_startup_recovery::held() {
             return held.state();
@@ -2498,6 +2511,12 @@ impl HostState {
             None => StartupState::Restoring {
                 awaiting: self.startup_custody.len() as u64,
             },
+        }
+    }
+
+    fn settle_startup_custody(&mut self, id: &TerminalId) {
+        if self.startup_custody.remove(id) {
+            crate::daemon::wake();
         }
     }
 
@@ -2517,6 +2536,10 @@ impl HostState {
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
         if self.startup_recovery.is_none() {
             self.startup_recovery = Some(message);
+            #[cfg(target_os = "linux")]
+            if self.publishing_startup {
+                crate::daemon::wake();
+            }
         }
         // A late startup result cannot revoke already-owned ordinary exit.
         if !self.ordinary_exit_cleanup_pending {
@@ -2532,7 +2555,7 @@ impl HostState {
                 .get(&id)
                 .is_some_and(|record| record.handle.same_worker(handle))
         {
-            self.startup_custody.remove(&id);
+            self.settle_startup_custody(&id);
             if self
                 .publication_pending
                 .get(&id)
@@ -2565,6 +2588,10 @@ impl HostState {
     }
 
     pub(super) fn startup_blocks_shutdown(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.publishing_startup {
+            return true;
+        }
         !self.startup_custody.is_empty() || self.recovery_owns_work()
     }
 
@@ -5376,7 +5403,7 @@ fn start_terminal_view_owned_reserved(
         Err(error) => {
             let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
             if adopting {
-                state.startup_custody.remove(&terminal_id);
+                state.settle_startup_custody(&terminal_id);
                 state.terminals.remove(&terminal_id);
             }
             drop(state);
@@ -5560,7 +5587,7 @@ fn publish_installed_terminal(
         state.announce_model_edit(0, receipt.sequence, &edit, &receipt.effects);
     }
     state.publication_pending.remove(&id);
-    state.startup_custody.remove(&id);
+    state.settle_startup_custody(&id);
     // Spawn/attachment responses carry the initial grid. A persistence-only
     // retry returns Accepted and grants no new snapshot acknowledgement.
     if client.is_some() {

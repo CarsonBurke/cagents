@@ -163,6 +163,8 @@ struct Observed {
     /// What it changes and its head's checks, as last read with it.
     detail: Detail,
     observed_at_unix_ms: Option<u64>,
+    /// When it merged or closed, when GitHub said.
+    finished_at_unix_ms: Option<u64>,
     checked: Option<Instant>,
     /// GitHub says the number is an issue, or there is no such pull request.
     missing: bool,
@@ -490,22 +492,29 @@ impl ProjectFacts {
 
     /// Whether edits made on `branch` now are work on its pull request
     /// `key`: it is open, or a worktree still has `branch` at its head
-    /// commit. A branch name reused after its pull request merged or closed
-    /// is new work, not an edit of that pull request. `None` until GitHub
-    /// has described the pull request.
+    /// commit, or at one that is the pull request's own work though GitHub's
+    /// head has since moved past it. A branch name reused after its pull
+    /// request merged or closed is new work, not an edit of that pull
+    /// request. `None` until GitHub has described the pull request.
     fn edits_belong_to(
         &self,
         key: &PullRequestKeyOrd,
         branch: &str,
         observed: &BTreeMap<PullRequestKeyOrd, Observed>,
     ) -> Option<bool> {
-        let (open, head) = match self.listed(key) {
-            Some(found) => (found.state.0 == "OPEN", found.head_ref_oid.as_str()),
+        let (open, head, finished_at) = match self.listed(key) {
+            Some(found) => (
+                found.state.0 == "OPEN",
+                found.head_ref_oid.as_str(),
+                finished_at(found),
+            ),
             None => {
-                let found = observed.get(key)?.pull_request.as_ref()?;
+                let observation = observed.get(key)?;
+                let found = observation.pull_request.as_ref()?;
                 (
                     found.state == crate::work::PullRequestState::Open,
                     found.head_oid.as_str(),
+                    observation.finished_at_unix_ms,
                 )
             }
         };
@@ -513,13 +522,43 @@ impl ProjectFacts {
             open || self.local.as_deref().is_some_and(|local| {
                 local.worktrees.iter().any(|worktree| {
                     worktree.branch.as_deref() == Some(branch)
-                        && worktree
-                            .head
-                            .as_ref()
-                            .is_some_and(|found| found.oid == head)
+                        && worktree.head.as_ref().is_some_and(|found| {
+                            found.oid == head
+                                || Self::left_behind(local, worktree, found, head, finished_at)
+                        })
                 })
             }),
         )
+    }
+
+    /// Whether `worktree`, at `found` on the branch of a finished pull
+    /// request whose head is `head`, holds that pull request's work which
+    /// GitHub's head has moved past: the default branch merged into it there
+    /// before it landed, or a rebase pushed from elsewhere. Its commits must
+    /// be its own, beyond the default branch, so a name made again from the
+    /// default branch is new work; and either the pull request's head
+    /// contains them, or they were all made before it finished, which no
+    /// commit on a reused name can be.
+    fn left_behind(
+        local: &super::scan::Local,
+        worktree: &super::scan::Worktree,
+        found: &crate::work::Head,
+        head: &str,
+        finished_at_unix_ms: Option<u64>,
+    ) -> bool {
+        worktree
+            .comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.ahead > 0)
+            && (local
+                .ancestry
+                .get(&(found.oid.clone(), head.to_owned()))
+                .copied()
+                .unwrap_or(false)
+                || found
+                    .committed_at_unix_ms
+                    .zip(finished_at_unix_ms)
+                    .is_some_and(|(committed, finished)| committed < finished))
     }
 
     /// The worktree containing `directory`, the deepest when they nest.
@@ -1120,10 +1159,22 @@ fn observed_now(found: &crate::github::PullRequest) -> Observed {
         pull_request: Some(board::convert(found, false)),
         detail: Detail::of(found),
         observed_at_unix_ms: Some(now_unix_ms()),
+        finished_at_unix_ms: finished_at(found),
         checked: Some(Instant::now()),
         missing: false,
         failures: 0,
     }
+}
+
+/// When `found` merged or, not merged, closed.
+fn finished_at(found: &crate::github::PullRequest) -> Option<u64> {
+    let at = found
+        .merged_at
+        .as_deref()
+        .or(found.closed_at.as_deref())?
+        .parse::<jiff::Timestamp>()
+        .ok()?;
+    u64::try_from(at.as_millisecond()).ok()
 }
 
 /// GitHub answered that this number names no pull request: an issue, or
@@ -1424,7 +1475,8 @@ fn assemble(
         worktrees: facts
             .zip(project)
             .map_or_else(Vec::new, |(facts, project)| {
-                edited_worktrees(watched, project, |branch| {
+                edited_worktrees(watched, project, |worktree| {
+                    let branch = worktree.branch.as_deref()?;
                     let Resolved::Key(key) = resolve(
                         &Reference::Branch {
                             repository: None,
@@ -1456,11 +1508,12 @@ fn assemble(
 /// recently edited first. A directory outside every worktree, such as another
 /// project's, names none.
 ///
-/// `listed` names the worked-on pull request a branch heads, if any.
+/// `listed` names the worked-on pull request a worktree's branch heads, if
+/// any.
 fn edited_worktrees(
     watched: &Watched,
     project: &ProjectFacts,
-    listed: impl Fn(&str) -> Option<u64>,
+    listed: impl Fn(&super::scan::Worktree) -> Option<u64>,
 ) -> Vec<ConversationWorktree> {
     edited(watched, project)
         .into_iter()
@@ -1474,7 +1527,7 @@ fn edited_worktrees(
             changed_paths: worktree.dirty.as_ref().map(|dirty| dirty.paths),
             // Filled in from what was measured, which the scan does not hold.
             diff: None,
-            pull_request: worktree.branch.as_deref().and_then(&listed),
+            pull_request: listed(worktree),
         })
         .collect()
 }

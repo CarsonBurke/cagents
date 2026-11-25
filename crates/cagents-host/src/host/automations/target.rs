@@ -16,7 +16,7 @@ fn open(path: &Path) -> io::Result<File> {
     }
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::fs_safety::DIRECTORY_HANDLE | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
 }
 

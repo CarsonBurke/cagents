@@ -207,7 +207,7 @@ mod darwin {
         /// The device and inode of the file mapped at this function's code,
         /// which the executable links in: the image the kernel executed.
         pub(crate) fn mapped_identity() -> io::Result<(u64, u64)> {
-            let address = mapped_identity as usize as u64;
+            let address = mapped_identity as fn() -> io::Result<(u64, u64)> as usize as u64;
             // SAFETY: all-zero is a valid value of this plain C struct.
             let mut info: RegionWithPath = unsafe { std::mem::zeroed() };
             let size = std::mem::size_of::<RegionWithPath>() as libc::c_int;
