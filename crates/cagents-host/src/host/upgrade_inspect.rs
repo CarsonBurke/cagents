@@ -2288,26 +2288,35 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn darwin_finds_a_live_codex_writer_without_a_listener_node() {
+        use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
 
         let directory = tempfile::Builder::new()
             .prefix("codex-writer-")
             .tempdir()
             .unwrap();
-        let executable = directory.path().join("codex");
-        std::fs::copy("/bin/sh", &executable).unwrap();
+        let script = directory.path().join("codex");
+        std::fs::write(&script, "printf 'ready\\n'\nIFS= read -r line || true\n").unwrap();
         let pane = crate::model::TerminalId::new();
         let marker = format!("cagents-codex-{pane}");
         let socket = directory.path().join("listener");
-        let mut child = Command::new(executable)
-            .args(["-c", "read line || true", &marker])
+        let mut child = Command::new("/bin/bash")
+            .arg(script)
+            .arg(&marker)
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
             .unwrap();
         let observed = darwin_codex_execution(pane, None, &[&socket], None);
         let pid = child.id();
         drop(child.stdin.take());
-        assert!(child.wait().unwrap().success());
+        let status = child.wait().unwrap();
+        assert!(status.success(), "fixture shell exited with {status}");
+        assert_eq!(ready, "ready\n");
         assert_eq!(
             observed.unwrap(),
             CodexExecution::Running {
