@@ -140,6 +140,8 @@ impl ScriptedDaemon {
                     }
                     Err(error) => panic!("scripted daemon accept: {error}"),
                 };
+                // Darwin accepts connections with the listener's nonblocking flag.
+                stream.set_nonblocking(false).unwrap();
                 // Register cancellation under the same lock used by Drop.
                 // A successful attachment stays alive until the test ends.
                 let mut held = sockets.lock().unwrap();
