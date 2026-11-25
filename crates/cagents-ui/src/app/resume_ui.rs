@@ -3219,8 +3219,9 @@ mod tests {
     #[test]
     fn closed_conversation_resumes_exact_identity_in_its_original_project() {
         let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let entry = saved(directory.path());
+        let entry = saved(root.as_path());
         let original = entry.session.clone();
         let _ = app.resume_saved_conversation(entry);
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
@@ -3231,7 +3232,7 @@ mod tests {
         assert_eq!(session.launch, original.launch);
         assert!(session.proof.is_none());
         assert!(session.terminal.is_none());
-        assert_eq!(app.active_workspace.as_deref(), Some(directory.path()));
+        assert_eq!(app.active_workspace.as_deref(), Some(root.as_path()));
         assert_eq!(card.title, "Review peripheral Rust modules");
         // An already-open conversation focuses its original pane instead of
         // creating another provider writer.

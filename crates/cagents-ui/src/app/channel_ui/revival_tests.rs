@@ -1232,17 +1232,18 @@ fn an_unknown_conversation_opens_in_the_channel_it_was_resumed_from() {
     assert!(fixture.active_channel().cards.contains(&resumed));
 
     let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere_path = elsewhere.path().canonicalize().unwrap();
     let mut found = SavedConversation {
         card: CardId::new(),
         ..found
     };
     found.session.launch.session_id = Some("6c0d1f1e-7d84-4a8f-9f61-2f0a3b2c1d4e".into());
-    found.session.launch.recipe.working_directory = elsewhere.path().into();
+    found.session.launch.recipe.working_directory = elsewhere_path.as_path().into();
     drop(fixture.app.resume_saved_conversation(found));
     assert_eq!(fixture.app.durable.active_channel, None);
     assert_eq!(
         fixture.app.active_workspace.as_deref(),
-        Some(elsewhere.path())
+        Some(elsewhere_path.as_path())
     );
 }
 
