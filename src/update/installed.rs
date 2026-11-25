@@ -315,17 +315,6 @@ pub(super) fn perform(
             "The installed application changed before the replacement could start",
         ));
     }
-    #[cfg(target_os = "linux")]
-    if standby.is_some() && confirmed.daemon.is_none() {
-        let paths =
-            crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
-        let lease = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
-            .map_err(|error| invalid(error.to_string()))?
-            .ok_or_else(|| {
-                invalid("The terminal service started before the update could replace it")
-            })?;
-        *handoff = Some(lease);
-    }
     let mut startup_attempted = false;
     let mut startup_owned = false;
     let mut previous = None;
@@ -387,15 +376,17 @@ pub(super) fn perform(
         if let Some(standby) = standby.as_mut() {
             let pid = standby.pid();
             let daemon = root.join("bin").join(DAEMON_BINARY);
-            let lease = handoff.as_ref().ok_or_else(|| {
-                invalid("The replacement did not receive the terminal service lease")
-            })?;
+            if confirmed.daemon.is_some() && handoff.is_none() {
+                return Err(invalid(
+                    "The replacement did not receive the terminal service lease",
+                ));
+            }
             startup_attempted = true;
             startup_owned = true;
             standby
                 .activate(
                     &daemon,
-                    lease,
+                    handoff.as_ref(),
                     survivors.recovery_receipt(),
                     timeout,
                     || {

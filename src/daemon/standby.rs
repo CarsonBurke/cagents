@@ -36,6 +36,7 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Activation {
+    Fresh,
     Lease,
     Checkpoint,
 }
@@ -43,6 +44,9 @@ enum Activation {
 #[cfg(any(feature = "host", test))]
 impl Activation {
     fn slots(&self) -> Vec<i32> {
+        if matches!(self, Self::Fresh) {
+            return Vec::new();
+        }
         let mut slots = vec![DAEMON_LEASE_FD];
         if matches!(self, Self::Checkpoint) {
             slots.extend(RECEIPT_DESCRIPTORS);
@@ -217,20 +221,30 @@ impl Parked {
     pub(crate) fn activate(
         &mut self,
         executable: &Path,
-        lease: &LeaseHandoff,
+        lease: Option<&LeaseHandoff>,
         receipt: Option<&Receipt>,
         timeout: Duration,
         overdue: impl FnOnce(),
     ) -> io::Result<()> {
         self.check_running()?;
-        let mut descriptors = vec![lease.descriptor()];
+        let mut descriptors = lease
+            .into_iter()
+            .map(LeaseHandoff::descriptor)
+            .collect::<Vec<_>>();
         let request = if let Some(receipt) = receipt {
+            if lease.is_none() {
+                return Err(io::Error::other(
+                    "a checkpoint activation requires the source lease",
+                ));
+            }
             let files = receipt.files()?;
             crate::upgrade::recovery::validate_forward_target(executable, files[0])?;
             descriptors.extend(files.map(AsFd::as_fd));
             Activation::Checkpoint
-        } else {
+        } else if lease.is_some() {
             Activation::Lease
+        } else {
+            Activation::Fresh
         };
         // From the first transfer byte onward the child might receive
         // authority. Never kill it on loss of communication after this point.
@@ -337,11 +351,18 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         return Err(io::Error::other("invalid replacement daemon activation"));
     }
     let (request, descriptors) = receive_activation(&control)?;
+    if matches!(request, Activation::Fresh) && publication.is_none() {
+        return Err(io::Error::other(
+            "fresh standby activation requires a local update",
+        ));
+    }
     install_descriptors(descriptors, &request.slots())?;
     // SAFETY: the inherited authority readers run immediately afterward in
     // this same thread, consuming their normal authenticated descriptors.
     unsafe {
-        std::env::set_var(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
+        if !matches!(request, Activation::Fresh) {
+            std::env::set_var(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
+        }
         if matches!(request, Activation::Checkpoint) {
             std::env::set_var(RECOVERY_FD_ENV, RECEIPT_DESCRIPTORS[0].to_string());
         }
@@ -401,6 +422,15 @@ fn install_descriptors(descriptors: Vec<OwnedFd>, slots: &[i32]) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fresh_activation_has_no_existing_daemon_lease() {
+        let (worker, daemon) = UnixStream::pair().unwrap();
+        send(&worker, &Activation::Fresh, &[]).unwrap();
+        let (activation, files) = receive_activation(&daemon).unwrap();
+        assert_eq!(activation, Activation::Fresh);
+        assert!(files.is_empty());
+    }
 
     #[test]
     fn accepting_the_checkpoint_requires_its_complete_custody() {

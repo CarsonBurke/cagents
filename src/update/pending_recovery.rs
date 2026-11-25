@@ -165,7 +165,7 @@ pub(crate) fn run(
         let parked = false;
         #[cfg(target_os = "linux")]
         if let Some(standby) = standby.as_mut() {
-            standby.activate(&daemon, &handoff, Some(&receipt), timeout, || {
+            standby.activate(&daemon, Some(&handoff), Some(&receipt), timeout, || {
                 let _ = installed::report_overdue_startup(&state, &mut job);
             })?;
             installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout)?;
