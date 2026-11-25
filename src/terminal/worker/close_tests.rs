@@ -623,26 +623,8 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
         ..ShutdownBudget::PRODUCT
     };
     shell.terminal.set_shutdown_budget_for_test(budget);
-    #[cfg(target_os = "macos")]
-    let job_session = crate::process::table::record(child.0.pid() as libc::pid_t)
-        .map(|record| (record.bsd.pbsi_ppid, record.bsd.pbsi_pgid, record.session));
     let started = Instant::now();
-    let shutdown = shell.terminal.shutdown();
-    #[cfg(target_os = "macos")]
-    if shutdown.is_ok() {
-        panic!(
-            "shutdown succeeded with child session before close {job_session:?}, current job {:?}, prior root {}, child exited {}; {}",
-            crate::process::table::record(child.0.pid() as libc::pid_t).map(|record| (
-                record.bsd.pbsi_ppid,
-                record.bsd.pbsi_pgid,
-                record.session
-            )),
-            owner.root.pid,
-            child.0.exited().unwrap(),
-            shutdown_evidence(&shell)
-        );
-    }
-    assert!(shutdown.is_err());
+    assert!(shell.terminal.shutdown().is_err());
     assert!(started.elapsed() < budget.join);
     assert!(!shell.terminal.is_completed());
     assert!(shell.terminal.worker_joined_for_test());

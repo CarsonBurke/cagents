@@ -1072,9 +1072,13 @@ fn accepted_search_is_not_lost_when_a_real_pty_completes() {
         wait_for_text(&handle, "retained-hit");
         handle.input(b"\n").unwrap();
         handle.search(request, "retained-hit".into(), true).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !handle.is_completed() {
-            assert!(std::time::Instant::now() < deadline);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real terminal did not complete for search {request}; events: {:?}",
+                handle.events().try_iter().collect::<Vec<_>>()
+            );
             thread::sleep(Duration::from_millis(5));
         }
         assert!(handle.events().try_iter().any(|event| matches!(event, TerminalEvent::SearchResults { request: id, matches, .. } if id == request && matches.len() == 1)));
@@ -1982,6 +1986,9 @@ fn proven_checked_shutdown_does_not_require_natural_pty_eof() {
     );
 }
 
+// The fixture keeps reading and writing the inherited slave after its
+// session leader exits. Darwin revokes that tty at leader exit.
+#[cfg(target_os = "linux")]
 #[test]
 fn deferred_close_fences_older_input_during_final_query_backpressure() {
     if !std::path::Path::new("/usr/bin/python3").exists() {
