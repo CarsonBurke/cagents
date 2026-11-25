@@ -12,7 +12,6 @@ use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     process::ExitStatus,
-    sync::Arc,
 };
 
 /// Pins `child` for its executor's lifetime. Call before anything can reap it.
@@ -228,37 +227,6 @@ fn decode(observed: i32, code: i32, status: i32, pid: u32) -> io::Result<Option<
     Ok(Some(ExitStatus::from_raw(raw)))
 }
 
-/// Cancellation's wake: `notify` is written by `cancel()`, `watch` is polled.
-/// Both are nonblocking; repeated notifications coalesce and never block.
-pub(super) struct Wake {
-    pub(super) notify: Arc<OwnedFd>,
-    pub(super) watch: Arc<OwnedFd>,
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn wake() -> io::Result<Wake> {
-    // SAFETY: eventfd returns a fresh, close-on-exec owned descriptor. Its
-    // nonblocking counter coalesces notifications and cannot stall cancel().
-    let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let descriptor = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
-    Ok(Wake {
-        notify: Arc::clone(&descriptor),
-        watch: descriptor,
-    })
-}
-
-#[cfg(target_os = "macos")]
-pub(super) fn wake() -> io::Result<Wake> {
-    let (watch, notify) = crate::descriptor::pipe(true)?;
-    Ok(Wake {
-        notify: Arc::new(notify),
-        watch: Arc::new(watch),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,35 +334,5 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-    }
-
-    #[test]
-    fn a_wake_is_readable_once_notified_and_never_blocks_its_notifier() {
-        let wake = wake().unwrap();
-        let mut watched = libc::pollfd {
-            fd: wake.watch.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one owned descriptor, valid for the call.
-        assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 0);
-        let one = 1_u64;
-        for _ in 0..100_000 {
-            // SAFETY: eight readable bytes; the descriptor is nonblocking, so
-            // a full pipe answers EAGAIN rather than blocking.
-            let written = unsafe {
-                libc::write(
-                    wake.notify.as_raw_fd(),
-                    (&one as *const u64).cast(),
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if written < 0 {
-                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
-                break;
-            }
-        }
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 1);
     }
 }

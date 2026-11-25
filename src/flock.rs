@@ -159,10 +159,10 @@ pub(crate) fn holder_pid(_proc_root: &Path, _expected: &fs::Metadata) -> io::Res
     Ok(None)
 }
 
+// These fixtures fake Linux's `/proc` lock index.
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
+#[cfg(target_os = "linux")]
 mod tests {
-    //! These fixtures fake Linux's `/proc` lock index.
-    #![cfg(target_os = "linux")]
     use super::*;
     use std::os::unix::fs::symlink;
 

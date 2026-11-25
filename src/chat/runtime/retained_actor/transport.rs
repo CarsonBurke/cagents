@@ -4436,11 +4436,9 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
             libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-            libc::prctl(libc::PR_SET_NAME, c"cagents-native".as_ptr());
         }
-        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
+        crate::process::set_name(c"cagents-native");
+        crate::process::become_subreaper().map_err(|error| error.to_string())?;
         // Every child spawned from here on must register with the sweep.
         crate::daemon::adopted_orphans::become_sweeper();
         // Before any other thread starts, so all of them inherit the blocked

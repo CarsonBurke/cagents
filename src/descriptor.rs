@@ -266,6 +266,39 @@ fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
     Ok(std::ffi::OsString::from_vec(path).into())
 }
 
+/// A wake one thread can raise for another that polls: `notify` is written,
+/// `watch` is polled. Both are nonblocking, so repeated notifications
+/// coalesce and never block. Linux uses one eventfd for both; Darwin, which
+/// has none, a pipe.
+pub(crate) struct Wake {
+    pub(crate) notify: std::sync::Arc<OwnedFd>,
+    pub(crate) watch: std::sync::Arc<OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn wake() -> io::Result<Wake> {
+    // SAFETY: eventfd returns a fresh, close-on-exec owned descriptor. Its
+    // nonblocking counter coalesces notifications and cannot stall cancel().
+    let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+    Ok(Wake {
+        notify: std::sync::Arc::clone(&descriptor),
+        watch: descriptor,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn wake() -> io::Result<Wake> {
+    let (watch, notify) = pipe(true)?;
+    Ok(Wake {
+        notify: std::sync::Arc::new(notify),
+        watch: std::sync::Arc::new(watch),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -324,5 +357,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_wake_is_readable_once_notified_and_never_blocks_its_notifier() {
+        let wake = super::wake().unwrap();
+        let mut watched = libc::pollfd {
+            fd: wake.watch.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one owned descriptor, valid for the call.
+        assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 0);
+        let one = 1_u64;
+        for _ in 0..100_000 {
+            // SAFETY: eight readable bytes; the descriptor is nonblocking, so
+            // a full pipe answers EAGAIN rather than blocking.
+            let written = unsafe {
+                libc::write(
+                    wake.notify.as_raw_fd(),
+                    (&one as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 1);
     }
 }

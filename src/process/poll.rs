@@ -246,7 +246,7 @@ pub(super) fn execute(
         if let Some(stdin) = &stdin {
             set_nonblocking(stdin.as_fd())?;
         }
-        Ok::<_, io::Error>((stdout, stderr, stdin, identity::wake()?))
+        Ok::<_, io::Error>((stdout, stderr, stdin, crate::descriptor::wake()?))
     })();
     let (stdout, stderr, mut stdin, wake) = match setup {
         Ok(pipes) => pipes,
@@ -799,7 +799,7 @@ mod tests {
     #[test]
     fn cancellation_descriptor_registration_is_nonblocking_and_deregistered() {
         let cancellation = CancellationToken::new();
-        let wake = identity::wake().unwrap();
+        let wake = crate::descriptor::wake().unwrap();
         let registration = cancellation
             .register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake.notify)));
         cancellation.cancel();

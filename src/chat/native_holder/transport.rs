@@ -1519,9 +1519,9 @@ extern "C" fn serve_if_requested() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-        libc::prctl(libc::PR_SET_NAME, c"cagents-native".as_ptr());
     }
-    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+    crate::process::set_name(c"cagents-native");
+    if crate::process::become_subreaper().is_err() {
         std::process::exit(2);
     }
     // Nothing this holder was handed may outlive it in its provider: a
