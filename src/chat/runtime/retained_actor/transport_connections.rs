@@ -403,12 +403,21 @@ mod tests {
                 host_incarnation: "peer-epoch-owner".into(),
             };
             let _lease = leased_proof(&mut proof);
-            let (_client, server) = UnixStream::pair().unwrap();
+            let (client, server) = UnixStream::pair().unwrap();
             let mut accepted = Accepted::new(server);
             accepted.authorize(&proof).unwrap();
             accepted.peer.as_mut().unwrap().1 ^= 1;
             let refusal = accepted.authorize(&proof).unwrap_err();
             assert!(refusal.contains("does not own the current daemon lease"));
+            accepted.peer.as_mut().unwrap().1 ^= 1;
+            drop(client);
+            accepted.authorize(&proof).unwrap();
+            let unobserved = Accepted::new(accepted.control);
+            // XNU can retain the last PID after disconnect. Where it no
+            // longer supplies one, a late admission has no fallback proof.
+            if unobserved.peer.is_err() {
+                assert!(unobserved.authorize(&proof).is_err());
+            }
         });
     }
 }
