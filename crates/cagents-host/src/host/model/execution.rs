@@ -6358,9 +6358,10 @@ mod tests {
     }
 
     fn fixture() -> (Registry, tempfile::TempDir, Submit) {
-        let directory = tempfile::tempdir().unwrap();
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let directory = tempfile::tempdir_in(parent).unwrap();
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-        let repository = directory.path().canonicalize().unwrap();
+        let repository = directory.path().to_owned();
         registry
             .apply(&ModelEdit::OpenProject {
                 repository: repository.clone(),
@@ -6550,10 +6551,9 @@ mod tests {
     #[test]
     fn a_worktree_placement_starts_in_a_channel_and_follow_ups_need_the_open_strip() {
         let (mut registry, directory, mut request) = fixture();
-        let checkout = directory.path().canonicalize().unwrap();
         let scope = Placement::Worktree {
-            repository: checkout.clone(),
-            path: checkout.clone(),
+            repository: directory.path().into(),
+            path: directory.path().into(),
         };
         let Destination::New(spec) = &mut request.destination else {
             unreachable!()
@@ -6575,7 +6575,7 @@ mod tests {
         let foreign = tempfile::tempdir().unwrap();
         assert!(require_placement(&registry.db, &scope, foreign.path()).is_err());
         let missing = Placement::Worktree {
-            repository: checkout.clone(),
+            repository: directory.path().into(),
             path: directory.path().join("missing-view"),
         };
         assert!(require_placement(&registry.db, &missing, directory.path()).is_err());
