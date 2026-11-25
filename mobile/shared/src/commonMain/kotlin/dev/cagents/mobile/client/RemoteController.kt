@@ -135,6 +135,14 @@ class RemoteController(
      */
     private val recoveries = HashMap<String, Int>()
 
+    /**
+     * Requests awaiting their answer, for each conversation. It stays
+     * watched in the background until they have it: the computer answers
+     * a request whose conversation is let go with an error, though it may
+     * have done what was asked. Guarded by [locked].
+     */
+    private val inFlight = HashMap<String, Int>()
+
     /** Starts connecting, unless already running. */
     fun start() = locked {
         backgroundStop?.cancel()
@@ -177,14 +185,15 @@ class RemoteController(
     /**
      * Follows the app going to the background and back. In the background
      * the open conversations are unwatched at once, since nobody is looking
-     * at them. The connection stays for [ControllerConfig.backgroundGrace],
-     * so a quick switch away doesn't drop it, and then closes. Coming back
-     * watches them again.
+     * at them, or once their requests are answered. The connection stays
+     * for [ControllerConfig.backgroundGrace], so a quick switch away doesn't
+     * drop it, and then closes. Coming back watches them again and, if
+     * [connect], connects.
      */
-    fun setForeground(foreground: Boolean) {
+    fun setForeground(foreground: Boolean, connect: Boolean = true) {
         this.foreground = foreground
         if (foreground) {
-            start()
+            if (connect) start()
         } else {
             locked {
                 backgroundStop?.cancel()
@@ -244,7 +253,18 @@ class RemoteController(
 
     private suspend fun call(call: Call) {
         val bridge = current ?: throw ConnectionLost("Not connected to the computer.")
-        bridge.call(call)
+        val session = (call as? Call.OnSession)?.session ?: return bridge.call(call)
+        locked { inFlight[session] = (inFlight[session] ?: 0) + 1 }
+        try {
+            bridge.call(call)
+        } finally {
+            val last = locked {
+                val left = inFlight.getValue(session) - 1
+                if (left == 0) inFlight -= session else inFlight[session] = left
+                left == 0
+            }
+            if (last && !foreground) sync(session, SyncKind.Settle)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -331,14 +351,28 @@ class RemoteController(
      */
     private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) {
         val watched = HashSet<String>()
+        // Asked for again in the background, to be watched on return.
+        val deferred = HashSet<String>()
         for ((session, kind) in queue) {
             // A recovery given up on, or closed, since it was queued.
             if (kind == SyncKind.Resync && locked { session !in resyncing }) continue
-            val force = kind != SyncKind.Settle
-            // An ended conversation, whose updates stopped or can't be read, is
-            // let go unless asked for again; in the background, every one is.
             val held = _state.value.conversations[session]
-            val wanted = held != null && foreground && (force || held.ended == null)
+            val looking = foreground || locked { session in inFlight }
+            val force = when {
+                held == null -> {
+                    deferred -= session
+                    false
+                }
+                looking -> deferred.remove(session) || kind != SyncKind.Settle
+                else -> {
+                    if (kind != SyncKind.Settle) deferred += session
+                    false
+                }
+            }
+            // An ended conversation, whose updates stopped or can't be read, is
+            // let go unless asked for again; in the background, every one is
+            // once its requests are answered.
+            val wanted = held != null && looking && (force || held.ended == null)
             try {
                 if (wanted && (force || session !in watched)) {
                     try {

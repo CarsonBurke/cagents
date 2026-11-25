@@ -80,6 +80,9 @@ class FakeConnection {
         }
     }
 
+    /** Whether the app has written nothing it hasn't read; run the scheduler first. */
+    fun isQuiet(): Boolean = toServer.tryReceive().isFailure
+
     fun send(line: String) {
         toClient.trySend(line)
     }

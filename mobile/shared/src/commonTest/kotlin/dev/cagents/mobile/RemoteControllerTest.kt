@@ -12,10 +12,12 @@ import dev.cagents.mobile.protocol.ErrorCode
 import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.ItemBody
 import dev.cagents.mobile.protocol.SendMode
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -43,6 +45,7 @@ private fun conversation(reset: Boolean, order: String?, items: String, appends:
 private fun text(id: String, text: String, role: String = "assistant") =
     """{"id":"$id","role":"$role","kind":"text","text":"$text","thinking":false,"commentary":false}"""
 
+@OptIn(ExperimentalCoroutinesApi::class) // runCurrent
 class RemoteControllerTest {
     private val bridge = FakeBridge()
 
@@ -450,15 +453,76 @@ class RemoteControllerTest {
 
         controller.setForeground(false)
         controller.open(S)
+        runCurrent()
+        assertTrue(connection.isQuiet(), "opened in the background, it isn't watched")
         // Reconnecting in the background watches nothing either.
         connection.hangUp()
         val again = bridge.acceptWelcomed()
         again.ok(again.expect("notifications.watch"))
         controller.await { it.connection == ConnectionState.Connected }
+        runCurrent()
+        assertTrue(again.isQuiet(), "reconnected in the background, it isn't watched")
 
         controller.setForeground(true)
         val watch = again.nextRequest()
         assertEquals("conversation.watch", watch.op)
         assertEquals(S, watch.params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun aConversationWithARequestInFlightIsUnwatchedOnceItIsAnswered() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+        val sent = async { controller.send(S, "Fix it", SendMode.Queue) }
+        val send = connection.expect("conversation.send")
+
+        // Sent, then straight to the home screen: unwatching now would fail the send.
+        controller.setForeground(false)
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        connection.ok(send)
+        sent.await()
+        val unwatch = connection.nextRequest()
+        assertEquals("conversation.unwatch", unwatch.op)
+        assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun askingAgainInTheBackgroundWatchesOnReturn() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.error(connection.expect("conversation.watch"), "unavailable", "The conversation couldn't be loaded.")
+        controller.await { it.conversations[S]?.ended != null }
+
+        // Try again, tapped as the app went to the background.
+        controller.setForeground(false)
+        controller.rewatch(S)
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        controller.setForeground(true)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = "[]", items = "[]"))
+        controller.await { it.conversations[S]?.let { c -> c.loaded && c.ended == null } == true }
+    }
+
+    @Test
+    fun leavingTheAppDuringSetupStillWatchesOnceConnected() = runTest {
+        val controller = controller()
+        // Away to the computer to read its address, and back, with nothing to connect to yet.
+        controller.setForeground(false)
+        controller.setForeground(true, connect = false)
+        runCurrent()
+        assertEquals(0, bridge.opens, "nothing to connect to yet")
+
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
     }
 }
