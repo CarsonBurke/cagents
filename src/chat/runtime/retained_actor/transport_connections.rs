@@ -5,9 +5,11 @@
 //! to read its reply holds up only itself. The serve loop still runs requests
 //! one at a time, in the order they finish arriving: every protocol fence
 //! (epoch, proof, installation, retirement) keeps its single-writer ordering.
-//! A request that arrived in full runs even if its client has since hung up:
-//! an input's sender stops waiting for the reply, not for the input's receipt.
-use super::{Invocation, MAX_FRAME, TIMEOUT, authorize, receive, send};
+//! An authenticated complete request runs after its client hangs up. On
+//! Darwin the credentials needed for that proof can disappear at disconnect.
+#[cfg(target_os = "linux")]
+use super::authorize;
+use super::{Invocation, MAX_FRAME, TIMEOUT, receive, send};
 use crate::agent_execution::DirectoryIdentity;
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::Value;
@@ -146,11 +148,12 @@ impl Connections {
     /// Read, authorize and answer `control` on a worker of its own: an idle
     /// one if there is one, otherwise a new one.
     pub(super) fn admit(&self, control: UnixStream) {
+        let connection = Accepted::new(control);
         let mut workers = self.pool.lock();
         if workers.idle > 0 {
             // Sent under the lock, so a worker timing out sees it waiting.
             workers.idle -= 1;
-            let _ = self.pool.handoff.send(control);
+            let _ = self.pool.handoff.send(connection);
             return;
         }
         workers.total += 1;
@@ -160,7 +163,7 @@ impl Connections {
         // exactly as if the helper had refused it.
         if thread::Builder::new()
             .name("retained-client".into())
-            .spawn(move || pool.work(control))
+            .spawn(move || pool.work(connection))
             .is_err()
         {
             self.pool.lock().total -= 1;
@@ -190,8 +193,8 @@ fn wake(wake: &UnixStream) {
 /// second does not start a thread for each.
 struct Pool {
     workers: Mutex<Workers>,
-    handoff: Sender<UnixStream>,
-    accepted: Receiver<UnixStream>,
+    handoff: Sender<Accepted>,
+    accepted: Receiver<Accepted>,
     calls: Sender<Call>,
     wake: UnixStream,
 }
@@ -208,9 +211,9 @@ impl Pool {
     fn lock(&self) -> std::sync::MutexGuard<'_, Workers> {
         self.workers.lock().unwrap_or_else(|p| p.into_inner())
     }
-    fn work(&self, mut control: UnixStream) {
+    fn work(&self, mut accepted: Accepted) {
         loop {
-            connection(control, &self.calls, &self.wake);
+            connection(accepted, &self.calls, &self.wake);
             {
                 let mut workers = self.lock();
                 // Only a full helper stopped watching its listener.
@@ -219,12 +222,12 @@ impl Pool {
                 }
                 workers.idle += 1;
             }
-            control = match self.accepted.recv_timeout(IDLE) {
-                Ok(control) => control,
+            accepted = match self.accepted.recv_timeout(IDLE) {
+                Ok(accepted) => accepted,
                 Err(_) => {
                     let mut workers = self.lock();
                     match self.accepted.try_recv() {
-                        Ok(control) => control,
+                        Ok(accepted) => accepted,
                         Err(_) => {
                             workers.idle -= 1;
                             workers.total -= 1;
@@ -237,16 +240,87 @@ impl Pool {
     }
 }
 
-fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
-    let request = receive::<Invocation>(&control, TIMEOUT).and_then(|request| {
-        authorize(&control, &request.proof)?;
+struct Accepted {
+    control: UnixStream,
+    #[cfg(target_os = "macos")]
+    peer: std::io::Result<(crate::pinned_process::PeerCredentials, u64)>,
+}
+
+impl Accepted {
+    fn new(control: UnixStream) -> Self {
+        // Save the kernel's candidate before handing this socket to a
+        // worker. XNU does not give the peer PID an atomic epoch, but a
+        // start sample prevents reuse after admission from gaining authority.
+        #[cfg(target_os = "macos")]
+        let peer = crate::pinned_process::peer_credentials(&control).and_then(|credentials| {
+            crate::pinned_process::started_ticks_of(credentials.pid)
+                .map(|start| (credentials, start))
+        });
+        Self {
+            control,
+            #[cfg(target_os = "macos")]
+            peer,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn authorize(&self, proof: &crate::model::HostSessionProof) -> Result<(), String> {
+        authorize(&self.control, proof)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn authorize(&self, proof: &crate::model::HostSessionProof) -> Result<(), String> {
+        use crate::pinned_process::peer_credentials;
+
+        let &(credentials, start) = super::authority_result(self.peer.as_ref())?;
+        match peer_credentials(&self.control) {
+            Ok(current) if current == credentials => {}
+            Ok(_) => return Err("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED: Retained actor socket peer changed after admission".into()),
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOTCONN)
+                    && self.read_side_ended() => {}
+            Err(error) => return super::authority_result(Err(error)),
+        }
+        let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
+        let (pid, owner) =
+            super::authority_result(crate::daemon::lease_owner_process(&paths.lock, proof))?;
+        if credentials.uid != crate::daemon::current_uid()
+            || credentials.pid != pid
+            || owner.started_ticks() != start
+            || super::authority_result(owner.exited())?
+        {
+            return Err("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED: Retained actor caller does not own the current daemon lease".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_side_ended(&self) -> bool {
+        let mut byte = 0u8;
+        // SAFETY: the descriptor is live, and the read-only peek writes at
+        // most one byte. The flag prevents waiting for a client still open.
+        unsafe {
+            libc::recv(
+                self.control.as_raw_fd(),
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            ) == 0
+        }
+    }
+}
+
+fn connection(accepted: Accepted, calls: &Sender<Call>, wakeup: &UnixStream) {
+    let control = &accepted.control;
+    let request = receive::<Invocation>(control, TIMEOUT).and_then(|request| {
+        accepted.authorize(&request.proof)?;
         Ok(request)
     });
     let request = match request {
         Ok(request) => request,
         // Authentication failures use the same result boundary as refusals.
         Err(error) => {
-            let _ = send(&control, &Err::<Value, _>(error), TIMEOUT);
+            let _ = send(control, &Err::<Value, _>(error), TIMEOUT);
             return;
         }
     };
@@ -266,14 +340,11 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
     // A dropped reply means the helper stopped serving or the client left.
     match answered.recv() {
         Ok(Answer::Value(response)) => {
-            let _ = send(&control, &response, TIMEOUT);
+            let _ = send(control, &response, TIMEOUT);
         }
         Ok(Answer::Binary(response)) => {
-            let _ = super::deadline_io::send_binary_until(
-                &control,
-                &response,
-                Instant::now() + TIMEOUT,
-            );
+            let _ =
+                super::deadline_io::send_binary_until(control, &response, Instant::now() + TIMEOUT);
         }
         Ok(Answer::Watch(watch)) => {
             let response = watch.as_ref().map(|_| ()).map_err(Clone::clone);
@@ -283,7 +354,7 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
                 .map(|watch| vec![watch.as_fd()])
                 .unwrap_or_default();
             let _ = crate::descriptor_frame::send_json_with_fds_until(
-                &control,
+                control,
                 &response,
                 &fds,
                 Instant::now() + TIMEOUT,
@@ -303,7 +374,7 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
                 .map(|(_, file)| vec![file.as_fd()])
                 .unwrap_or_default();
             let _ = crate::descriptor_frame::send_json_with_fds_until(
-                &control,
+                control,
                 &response,
                 &descriptors,
                 Instant::now() + TIMEOUT,
@@ -313,5 +384,31 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
             );
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::chat::runtime::retained_actor::transport::connection_tests::{
+        isolated, leased_proof,
+    };
+
+    #[test]
+    fn a_captured_peer_epoch_cannot_authorize_a_replacement_lease_owner() {
+        isolated("CAGENTS_RETAINED_PEER_EPOCH_TEST", || {
+            let mut proof = crate::model::HostSessionProof {
+                host_session_id: "peer-epoch-session".into(),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: "peer-epoch-owner".into(),
+            };
+            let _lease = leased_proof(&mut proof);
+            let (_client, server) = UnixStream::pair().unwrap();
+            let mut accepted = Accepted::new(server);
+            accepted.authorize(&proof).unwrap();
+            accepted.peer.as_mut().unwrap().1 ^= 1;
+            let refusal = accepted.authorize(&proof).unwrap_err();
+            assert!(refusal.contains("does not own the current daemon lease"));
+        });
     }
 }
