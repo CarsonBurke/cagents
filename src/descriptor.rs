@@ -202,6 +202,129 @@ pub fn bind(path: impl AsRef<std::path::Path>) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// A Unix address includes its terminating NUL. Filesystem paths have no such
+/// small limit; [`with_socket_address`] reaches a longer endpoint through its
+/// held directory.
+pub fn socket_fits(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: sockaddr_un is plain data and only its field length is read.
+    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    path.as_os_str().as_bytes().len() < capacity
+}
+
+/// Runs `operation` with an address that reaches the endpoint at `path`, for
+/// `bind`, `connect` or a `stat` of the socket. A path that fits `sun_path` is
+/// passed as is. A longer one is reached through its parent directory, opened
+/// once and checked to be private, so the operation acts in exactly the
+/// directory that was checked:
+///
+/// * Linux passes `/proc/self/fd/N/<name>` for the held directory.
+/// * Darwin has neither `/proc` nor `bindat`/`connectat`, but each thread can
+///   have its own working directory. `operation` runs on a thread of its own
+///   whose working directory is the held one, and is passed the bare name. No
+///   other code runs on that thread, so nothing else resolves paths there.
+///
+/// Either way the endpoint stays at its full path, so discovery,
+/// authentication and inode-based retirement keep their identity and survive
+/// daemon upgrades.
+pub fn with_socket_address<T: Send>(
+    path: &std::path::Path,
+    operation: impl FnOnce(&std::path::Path) -> io::Result<T> + Send,
+) -> io::Result<T> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if socket_fits(path) {
+        return operation(path);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket endpoint has no directory",
+            )
+        })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket endpoint has no filename",
+        )
+    })?;
+    crate::secure_file::reject_symlink_components(parent)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe socket directory",
+        ));
+    }
+    // Hold the directory until the operation completes.
+    #[cfg(target_os = "linux")]
+    {
+        let address =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+        operation(&address)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsFd;
+        let name = std::path::Path::new(name);
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("socket-address".into())
+                .spawn_scoped(scope, || {
+                    enter_directory(directory.as_fd())?;
+                    operation(name)
+                })?
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+}
+
+/// Makes `directory` the calling thread's working directory, leaving every
+/// other thread's alone.
+///
+/// `pthread_fchdir_np` is exported by `libsystem_pthread`, whose own `fts`
+/// uses it, but no SDK header declares it. It is looked up rather than linked
+/// so that a system without it refuses long endpoints instead of refusing to
+/// start the program.
+#[cfg(target_os = "macos")]
+fn enter_directory(directory: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    type ThreadFchdir = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
+    static THREAD_FCHDIR: std::sync::OnceLock<Option<ThreadFchdir>> = std::sync::OnceLock::new();
+    let thread_fchdir = THREAD_FCHDIR
+        .get_or_init(|| {
+            // SAFETY: the name is NUL-terminated, and RTLD_DEFAULT only searches
+            // the images already loaded.
+            let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"pthread_fchdir_np".as_ptr()) };
+            // SAFETY: `pthread_fchdir_np` is `int pthread_fchdir_np(int fd)`.
+            (!symbol.is_null())
+                .then(|| unsafe { std::mem::transmute::<*mut libc::c_void, ThreadFchdir>(symbol) })
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this system cannot reach a socket endpoint longer than a Unix socket address",
+            )
+        })?;
+    // SAFETY: it only changes this thread's working directory to an open
+    // directory descriptor.
+    if unsafe { thread_fchdir(directory.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Accepts a connection with Linux's semantics everywhere: a BSD socket
 /// inherits its listener's `O_NONBLOCK` across `accept`, which Linux never
 /// does, so the accepted stream is made blocking there. A listener from
