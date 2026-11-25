@@ -3942,6 +3942,7 @@ fn native_child_receives_only_the_preserved_source_environment() {
     let environment = {
         let output = std::process::Command::new(&spec.program)
             .args(["-c", "import json,os; print(json.dumps(dict(os.environ)))"])
+            .current_dir(&spec.working_directory)
             .env_clear()
             .envs(&environment)
             .output()

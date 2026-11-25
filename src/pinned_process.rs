@@ -90,8 +90,9 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
 /// Darwin splits them across two options. `LOCAL_PEERCRED` answers the
 /// effective uid recorded at `connect`, as Linux does. `LOCAL_PEERPID` does
 /// not: it names the last process to use the peer's socket, which a server
-/// socket takes from its listener, and it fails with `ENOTCONN` once the peer
-/// closes. The pid is therefore only a candidate; every caller compares it to
+/// socket takes from its listener. After the peer closes, the option may
+/// return the last recorded pid or fail with `ENOTCONN`. The pid is only a
+/// candidate; every caller compares it to
 /// an owner it has already proven, or pins it and then verifies the peer's
 /// proof.
 ///
