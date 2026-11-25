@@ -217,11 +217,11 @@ fn same_lifetime(before: &table::Record, after: &table::Record) -> bool {
 /// edge against the original lifetime and its current parent before skipping
 /// it. A detached orphan is inspected on its own, even if a former ancestor
 /// belonged to this daemon.
-fn owned_by_current_daemon(
-    mut member: &table::Record,
+fn owned_by_current_daemon<'a>(
+    mut member: &'a table::Record,
     owner: u32,
     uid: u32,
-    records: &BTreeMap<u32, table::Record>,
+    records: &'a BTreeMap<u32, table::Record>,
 ) -> bool {
     if owner != std::process::id() && !records.contains_key(&owner) {
         return false;
