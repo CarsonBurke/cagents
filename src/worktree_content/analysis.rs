@@ -621,7 +621,9 @@ pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Optio
         let mounted_on = unsafe { std::ffi::CStr::from_ptr(status.f_mntonname.as_ptr()) };
         let digest = Sha256::digest(mounted_on.to_bytes());
         Some(u64::from_le_bytes(
-            digest[..8].try_into().expect("a SHA-256 digest has eight bytes"),
+            digest[..8]
+                .try_into()
+                .expect("a SHA-256 digest has eight bytes"),
         ))
     } else {
         None
