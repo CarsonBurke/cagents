@@ -1333,6 +1333,11 @@ impl Survivors {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn recovery_receipt(&self) -> Option<&crate::upgrade::recovery::Receipt> {
+        self.receipt.as_ref()
+    }
+
     /// Bind the target CLI's proof to the exact daemon selected for this update.
     /// The worker may speak only the previous wire.
     pub(super) fn confirm_successor<'a>(

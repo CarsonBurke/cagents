@@ -3,6 +3,12 @@ fn command() -> clap::Command {
         .version(cagents::version())
         .about("Run the cagents terminal and conversation daemon. Prefer `cagents daemon start`.")
         .arg(
+            clap::Arg::new("await-update-handoff")
+                .long("await-update-handoff")
+                .hide(true)
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             clap::Arg::new("stored-schema")
                 .long("stored-schema")
                 .help(
@@ -119,6 +125,23 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
+    #[cfg(target_os = "linux")]
+    let standby = if matches.get_flag("await-update-handoff") {
+        // SAFETY: the daemon has not initialized admission or started threads.
+        match unsafe { cagents::daemon::standby::await_activation() } {
+            Ok(standby) => Some(standby),
+            Err(error) => {
+                eprintln!("cagentsd: replacement daemon activation: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    if matches.get_flag("await-update-handoff") {
+        return std::process::ExitCode::FAILURE;
+    }
     // SAFETY: entry is still single-threaded. After the maintenance flags,
     // whose answers and refusals belong on the caller's stderr, and before
     // admission, so a refused start is in the development log too.
@@ -127,10 +150,16 @@ fn main() -> std::process::ExitCode {
     let admission = match unsafe { cagents_host::host::prepare_daemon_admission() } {
         Ok(admission) => admission,
         Err(error) => {
+            #[cfg(target_os = "linux")]
+            if let Some(standby) = &standby {
+                standby.failed(&error);
+            }
             eprintln!("cagentsd: {error}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    #[cfg(target_os = "linux")]
+    let admission = admission.with_update_standby(standby);
     // Both of these precede runtime startup: the daemon is spawned with stdout and stderr
     // on /dev/null, so without a durable sink a panic in the process that owns
     // every user PTY leaves nothing to diagnose, and `RUST_LOG` is inert.

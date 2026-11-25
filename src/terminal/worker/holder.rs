@@ -1360,7 +1360,7 @@ fn serve(control: UnixStream) -> i32 {
     };
     // Isolate this execed keeper before the PTY root and all of its tools
     // inherit its cgroup. A failed request retains the existing launch path.
-    let _ = crate::daemon::process_scope::enroll_holder();
+    let _ = crate::daemon::process_scope::enroll_current_process();
     let pair = match native_pty_system().openpty(size) {
         Ok(pair) => pair,
         Err(error) => return fail(format!("open PTY: {error:#}")),

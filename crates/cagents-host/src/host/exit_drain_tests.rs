@@ -405,6 +405,8 @@ fn run_host() -> (
         lease: None,
         _guard: crate::instance::DaemonAdmissionGuard::acquire().unwrap(),
         retirement_owned_by_updater: false,
+        #[cfg(target_os = "linux")]
+        standby: None,
     };
     let (complete, completion) = mpsc::channel();
     let thread = thread::spawn(move || {

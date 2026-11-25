@@ -32,6 +32,7 @@ const SCM_PIDFD: libc::c_int = 0x04;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FrameByteOrder {
     LittleEndian,
+    #[cfg(any(feature = "host", test))]
     BigEndian,
 }
 
@@ -39,6 +40,7 @@ impl FrameByteOrder {
     fn encode(self, length: u32) -> [u8; 4] {
         match self {
             Self::LittleEndian => length.to_le_bytes(),
+            #[cfg(any(feature = "host", test))]
             Self::BigEndian => length.to_be_bytes(),
         }
     }
@@ -46,6 +48,7 @@ impl FrameByteOrder {
     fn decode(self, bytes: [u8; 4]) -> u32 {
         match self {
             Self::LittleEndian => u32::from_le_bytes(bytes),
+            #[cfg(any(feature = "host", test))]
             Self::BigEndian => u32::from_be_bytes(bytes),
         }
     }

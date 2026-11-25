@@ -11,7 +11,7 @@ use std::{
 };
 
 pub(crate) const DAEMON_LEASE_ENV: &str = "CAGENTS_DAEMON_LEASE_FD";
-const DAEMON_LEASE_FD: i32 = 199;
+pub(super) const DAEMON_LEASE_FD: i32 = 199;
 const INSTALLER_LEASE_FD: i32 = 3;
 
 // Validate once at CLI/daemon startup and immediately seal the reserved slot.
@@ -64,6 +64,12 @@ impl HandoffSource {
 }
 
 impl LeaseHandoff {
+    #[cfg(target_os = "linux")]
+    pub(super) fn descriptor(&self) -> BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.lock.as_fd()
+    }
+
     pub(crate) fn duplicate_for_recovery(&self) -> io::Result<File> {
         self.lock.try_clone()
     }

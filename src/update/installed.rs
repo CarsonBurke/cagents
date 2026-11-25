@@ -1,10 +1,23 @@
 //! A locally installed matched set uses the same review and checkpoint flow.
 use super::*;
 
-const BINARIES: [&str; 3] = ["cagents", "cagents-ui", "cagentsd"];
+const DAEMON_BINARY: &str = "cagentsd";
+const BINARIES: [&str; 3] = ["cagents", "cagents-ui", DAEMON_BINARY];
 
 #[derive(PartialEq, Eq)]
 struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
+
+#[cfg(target_os = "linux")]
+impl Stamp {
+    fn daemon_inode(&self) -> (u64, u64) {
+        let index = BINARIES
+            .iter()
+            .position(|&binary| binary == DAEMON_BINARY)
+            .unwrap();
+        let (device, inode, ..) = self.0[index];
+        (device, inode)
+    }
+}
 
 fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     let mut entries = Vec::new();
@@ -167,7 +180,26 @@ pub(super) fn perform(
         }
     }
     confirmation::check_cancelled(state, job)?;
-    let output = StartupOutput::create(state)?;
+    #[cfg(target_os = "linux")]
+    let mut standby = confirmed
+        .replaces_daemon
+        .then(|| {
+            crate::daemon::standby::Parked::launch(
+                &root.join("bin").join(DAEMON_BINARY),
+                before.daemon_inode(),
+                &guard,
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            invalid(format!("The replacement terminal service could not start. Your current workspace is still open. {error}"))
+        })?;
+    #[cfg(target_os = "linux")]
+    if standby.is_some() && stamp(root)? != before {
+        return Err(invalid(
+            "The installed application changed before the replacement could start",
+        ));
+    }
     let mut startup_attempted = false;
     let mut startup_owned = false;
     let mut previous = None;
@@ -191,6 +223,10 @@ pub(super) fn perform(
                 ));
             }
             previous = (owner.version_root != root).then_some(owner.version_root);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(standby) = standby.as_mut() {
+            standby.check_running()?;
         }
         recovery.shutdown_requested = confirmed.replaces_daemon;
         floor::quiesce(
@@ -217,6 +253,25 @@ pub(super) fn perform(
             UpdatePhase::Installing,
             "Starting the installed application",
         )?;
+        let timeout = crate::install_guard::daemon_start_timeout()?;
+        #[cfg(target_os = "linux")]
+        if let Some(standby) = standby.take() {
+            let pid = standby.pid();
+            let daemon = root.join("bin").join(DAEMON_BINARY);
+            let lease = handoff.as_ref().ok_or_else(|| {
+                invalid("The replacement did not receive the terminal service lease")
+            })?;
+            startup_attempted = true;
+            startup_owned = true;
+            standby
+                .activate(&daemon, lease, survivors.recovery_receipt(), timeout)
+                .map_err(|error| {
+                    invalid(format!(
+                        "The replacement terminal service did not confirm startup: {error}"
+                    ))
+                })?;
+            return confirm_daemon_ready(&daemon, Some(pid), timeout);
+        }
         let mut command = Command::new(
             root.join("bin")
                 .join(crate::companion::Product::Cli.file_name()),
@@ -224,13 +279,13 @@ pub(super) fn perform(
         command.args(["--json", "daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
         unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        let output = StartupOutput::create(state)?;
         output.attach(&mut command)?;
         guard.inherit_for_install(&mut command)?;
         if let Some(handoff) = handoff.as_ref() {
             handoff.inherit(&mut command)?;
         }
         survivors.inherit_recovery(&mut command)?;
-        let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
         let started = wait_for_daemon_start(&mut command, timeout, state, job);
         startup_owned = started.as_ref().err().is_none_or(|failure| failure.spawned);
@@ -249,8 +304,12 @@ pub(super) fn perform(
         }
         // Wait through bounded restoration until the exact successor is
         // Ready, then prove this job's recovery inventory against it.
-        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)
+        confirm_daemon_ready(&root.join("bin/cagentsd"), None, timeout)
     })();
+    // No parked process should retain a launch-fence copy while closing an
+    // unsuccessful transaction and reopening the old application.
+    #[cfg(target_os = "linux")]
+    drop(standby);
     announce_primary_failure(&result);
     let mut restored_previous = false;
     if result.is_err()
@@ -433,16 +492,21 @@ pub(super) fn restore_current(
 
 /// Listening is not proof that startup restored the reviewed panes. Recovery
 /// deliberately serves inspection while ordinary conversation requests fail.
-fn confirm_daemon_ready(expected: &Path, timeout: Duration) -> Result<(), UpdateError> {
+fn confirm_daemon_ready(
+    expected: &Path,
+    pid: Option<u32>,
+    timeout: Duration,
+) -> Result<(), UpdateError> {
     let socket = crate::daemon::RuntimePaths::discover()
         .map_err(|error| invalid(error.to_string()))?
         .socket;
-    confirm_daemon_ready_at(&socket, expected, Instant::now() + timeout)
+    confirm_daemon_ready_at(&socket, expected, pid, Instant::now() + timeout)
 }
 
 fn confirm_daemon_ready_at(
     socket: &Path,
     expected: &Path,
+    pid: Option<u32>,
     deadline: Instant,
 ) -> Result<(), UpdateError> {
     use crate::{control::ControlClient, terminal_ipc::StartupState};
@@ -488,7 +552,9 @@ fn confirm_daemon_ready_at(
     let ownership = |proof: &crate::model::HostSessionProof| {
         let unavailable = || invalid("the confirmed terminal service changed or is unavailable");
         peer.verify(proof).map_err(|_| unavailable())?;
-        if peer.executable().map_err(|_| unavailable())? != expected {
+        if peer.executable().map_err(|_| unavailable())? != expected
+            || pid.is_some_and(|pid| pid != peer.pid())
+        {
             return Err(invalid("the confirmed terminal service changed"));
         }
         Ok(())
@@ -1047,7 +1113,7 @@ else: raise AssertionError(sys.argv)
         } else {
             std::env::current_exe().unwrap()
         };
-        let result = confirm_daemon_ready_at(&socket, &executable, Instant::now() + timeout);
+        let result = confirm_daemon_ready_at(&socket, &executable, None, Instant::now() + timeout);
         // A client whose deadline passed before it connected left the
         // fixture waiting to accept; this connection ends that wait.
         drop(UnixStream::connect(&socket));

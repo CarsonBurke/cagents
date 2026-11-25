@@ -41,7 +41,7 @@ pub mod daemon;
 pub mod daemon_health;
 #[doc(hidden)]
 pub mod descriptor;
-#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+#[cfg(any(feature = "host", target_os = "linux"))]
 pub(crate) mod descriptor_frame;
 /// The daemon's open-descriptor limit, which the processes it starts never inherit.
 #[cfg(feature = "host")]

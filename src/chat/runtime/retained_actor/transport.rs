@@ -4436,7 +4436,7 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
             let mut server = Server::start_after_scope_enrollment(
                 startup,
                 &control,
-                crate::daemon::process_scope::enroll_holder,
+                crate::daemon::process_scope::enroll_current_process,
             )?;
             let served = server.serve(
                 control.try_clone().map_err(|error| error.to_string())?,

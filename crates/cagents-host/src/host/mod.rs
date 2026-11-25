@@ -235,6 +235,17 @@ pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
     lease: Option<std::fs::File>,
     retirement_owned_by_updater: bool,
+    #[cfg(target_os = "linux")]
+    standby: Option<daemon::standby::Activated>,
+}
+
+#[cfg(target_os = "linux")]
+impl DaemonAdmission {
+    #[doc(hidden)]
+    pub fn with_update_standby(mut self, standby: Option<daemon::standby::Activated>) -> Self {
+        self.standby = standby;
+        self
+    }
 }
 
 /// Authenticate startup authority before diagnostics or runtime threads exist.
@@ -261,6 +272,8 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
         _guard: admission,
         lease,
         retirement_owned_by_updater,
+        #[cfg(target_os = "linux")]
+        standby: None,
     })
 }
 
@@ -570,6 +583,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
+    #[cfg(target_os = "linux")]
+    let standby = admission.standby.take();
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -859,6 +874,14 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         {
             tracing::warn!(%error, "recovery completion proof could not be scheduled; serving owners were kept");
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(standby) = standby
+        && let Err(error) = standby.started()
+    {
+        // The host already owns the restored state. A missing acknowledgement
+        // is never a reason to tear down its sessions.
+        tracing::warn!(%error, "replacement daemon startup acknowledgement was not delivered");
     }
     loop {
         reap_finished(&mut clients);

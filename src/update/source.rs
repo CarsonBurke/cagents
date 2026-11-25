@@ -196,6 +196,10 @@ pub(crate) struct Peer {
 }
 
 impl Peer {
+    pub(super) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Authenticate an already verified serving proof without protocol discovery.
     pub(super) fn confirm_serving(
         socket: &Path,
