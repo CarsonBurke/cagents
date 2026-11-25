@@ -71,6 +71,9 @@ pub mod fixture_workspace;
 #[doc(hidden)]
 pub mod flock;
 pub mod fs_safety;
+/// Watches on open files that wake only the subscribers of the changed inode.
+#[cfg(feature = "host")]
+pub(crate) mod fs_watch;
 pub mod git_marker;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod git_watch;

@@ -5,18 +5,11 @@ use crate::chat::{
     Launch,
     claude_metadata::{Lines, Names},
 };
+use crate::fs_watch::{FileWatch, FileWatches};
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    ffi::CString,
     fs::{File, Metadata},
-    io::{self, Read, Write},
-    os::{
-        fd::{AsFd, AsRawFd, FromRawFd},
-        unix::fs::MetadataExt,
-    },
+    os::{fd::AsFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -40,7 +33,7 @@ struct Transcript {
     changed: (i64, i64, i64, i64),
     lines: Lines,
     names: Names,
-    watch: Option<TranscriptWatch>,
+    watch: Option<FileWatch>,
 }
 
 impl ClaudeTitles {
@@ -81,7 +74,7 @@ impl ClaudeTitles {
             .as_ref()
             .and_then(|saved| saved.watch.as_ref());
         Some(watch.map_or(MetadataWake::RetryAt(retry_at), |watch| {
-            MetadataWake::Changed(watch.wake.as_fd())
+            MetadataWake::Changed(watch.as_fd())
         }))
     }
 
@@ -191,175 +184,12 @@ impl ClaudeTitles {
     }
 }
 
-fn watch_transcript(file: &File, path: &Path, metadata: &Metadata) -> Option<TranscriptWatch> {
-    let watch = TranscriptWatches::shared()?.register(file)?;
+fn watch_transcript(file: &File, path: &Path, metadata: &Metadata) -> Option<FileWatch> {
+    let watch = FileWatches::shared()?.watch(file)?;
     // If the path was already replaced when we attached the watch, no event
     // for that replacement is pending. Let the ordinary retry resolve it.
     let visible = path.symlink_metadata().ok()?;
     (visible.dev() == metadata.dev() && visible.ino() == metadata.ino()).then_some(watch)
-}
-
-// One kernel inotify instance per process. Each actor polls its own eventfd
-// so an event only wakes the actors watching that inode and each sees the edge.
-type Subscribers = HashMap<i32, Vec<Arc<File>>>;
-
-struct TranscriptWatches {
-    inotify: File,
-    subscribers: Mutex<Option<Subscribers>>,
-}
-
-impl TranscriptWatches {
-    fn shared() -> Option<Arc<Self>> {
-        static SERVICE: Mutex<Option<Arc<TranscriptWatches>>> = Mutex::new(None);
-        let mut service = SERVICE.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(service) = service.as_ref() {
-            return Some(service.clone());
-        }
-        // Leave failed initialization retryable if the inotify limit is full.
-        let started = Self::start().ok()?;
-        *service = Some(started.clone());
-        Some(started)
-    }
-
-    fn start() -> io::Result<Arc<Self>> {
-        // SAFETY: a successful call gives us an exclusively owned descriptor.
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let service = Arc::new(Self {
-            // SAFETY: fd is the successful result of inotify_init1 above.
-            inotify: unsafe { File::from_raw_fd(fd) },
-            subscribers: Mutex::new(Some(HashMap::new())),
-        });
-        let worker = service.clone();
-        thread::Builder::new()
-            .name("cagents-claude-titles".into())
-            .spawn(move || worker.dispatch())?;
-        Ok(service)
-    }
-
-    fn register(self: &Arc<Self>, file: &File) -> Option<TranscriptWatch> {
-        let pinned = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
-        // SAFETY: a successful call gives us an exclusively owned descriptor.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: fd is the successful result of eventfd above.
-        let wake = Arc::new(unsafe { File::from_raw_fd(fd) });
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let subscribers = subscribers.as_mut()?;
-        let events = libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF;
-        // SAFETY: inotify is owned by self and pinned names the open file.
-        let id =
-            unsafe { libc::inotify_add_watch(self.inotify.as_raw_fd(), pinned.as_ptr(), events) };
-        if id < 0 {
-            return None;
-        }
-        subscribers.entry(id).or_default().push(wake.clone());
-        Some(TranscriptWatch {
-            service: self.clone(),
-            id,
-            wake,
-        })
-    }
-
-    fn dispatch(&self) {
-        let mut buffer = [0; 4096];
-        loop {
-            let size = match (&self.inotify).read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => size,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            let mut subscribers = self
-                .subscribers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let Some(subscribers) = subscribers.as_mut() else {
-                break;
-            };
-            let mut records = &buffer[..size];
-            while let Some(header) = records.first_chunk::<{ size_of::<libc::inotify_event>() }>() {
-                // SAFETY: header covers a complete inotify event header of integers.
-                let event = unsafe {
-                    header
-                        .as_ptr()
-                        .cast::<libc::inotify_event>()
-                        .read_unaligned()
-                };
-                records = &records[header.len() + event.len as usize..];
-                if event.mask & libc::IN_Q_OVERFLOW != 0 {
-                    // Anyone may have missed a change when the kernel queue filled.
-                    for wake in subscribers.values().flatten() {
-                        Self::signal(wake);
-                    }
-                } else if event.mask & libc::IN_IGNORED != 0 {
-                    // An automatically removed watch needs to be registered again.
-                    for wake in subscribers.remove(&event.wd).into_iter().flatten() {
-                        Self::signal(&wake);
-                    }
-                } else if let Some(wakes) = subscribers.get(&event.wd) {
-                    for wake in wakes {
-                        Self::signal(wake);
-                    }
-                }
-            }
-        }
-        // A reader failure leaves actors on the ordinary path retry.
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        for (id, wakes) in subscribers.take().into_iter().flatten() {
-            self.remove(id);
-            for wake in wakes {
-                Self::signal(&wake);
-            }
-        }
-    }
-
-    fn signal(mut wake: &File) {
-        // A full nonblocking counter already has a wake pending.
-        let _ = wake.write_all(&1_u64.to_ne_bytes());
-    }
-
-    fn remove(&self, id: i32) {
-        // SAFETY: inotify is live and id came from this instance.
-        unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), id) };
-    }
-}
-
-struct TranscriptWatch {
-    service: Arc<TranscriptWatches>,
-    id: i32,
-    wake: Arc<File>,
-}
-
-impl Drop for TranscriptWatch {
-    fn drop(&mut self) {
-        let mut subscribers = self
-            .service
-            .subscribers
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(subscribers) = subscribers.as_mut() else {
-            return;
-        };
-        if let Entry::Occupied(mut entry) = subscribers.entry(self.id) {
-            let wakes = entry.get_mut();
-            wakes.retain(|wake| !Arc::ptr_eq(wake, &self.wake));
-            if wakes.is_empty() {
-                entry.remove();
-                self.service.remove(self.id);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -606,53 +436,6 @@ mod tests {
 
     fn history(path: &Path, id: &str, cwd: &Path, name: &str) {
         std::fs::write(path, format!("{}\n{}\n", json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"First prompt"}}), json!({"type":"custom-title","sessionId":id,"customTitle":name}))).unwrap();
-    }
-
-    fn watch_ready(watch: &TranscriptWatch, timeout: i32) -> bool {
-        let mut poll = libc::pollfd {
-            fd: watch.wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll borrows the live watch for this call.
-        assert!(unsafe { libc::poll(&mut poll, 1, timeout) } >= 0);
-        poll.revents & libc::POLLIN != 0
-    }
-
-    #[test]
-    fn one_inotify_instance_dispatches_to_individual_transcript_watchers() {
-        let mut first = tempfile::NamedTempFile::new().unwrap();
-        let mut second = tempfile::NamedTempFile::new().unwrap();
-        let watch = |transcript: &tempfile::NamedTempFile| {
-            let file = transcript.as_file();
-            watch_transcript(file, transcript.path(), &file.metadata().unwrap()).unwrap()
-        };
-        let first_watch = watch(&first);
-        let duplicate = watch(&first);
-        let second_watch = watch(&second);
-
-        assert!(Arc::ptr_eq(&first_watch.service, &second_watch.service));
-        assert_eq!(first_watch.id, duplicate.id);
-        assert_ne!(first_watch.id, second_watch.id);
-
-        writeln!(first, "first change").unwrap();
-        assert!(watch_ready(&first_watch, 2000));
-        assert!(watch_ready(&duplicate, 2000));
-        assert!(!watch_ready(&second_watch, 0));
-
-        drop(first_watch);
-        (&*duplicate.wake).read_exact(&mut [0; 8]).unwrap();
-        writeln!(first, "another change").unwrap();
-        assert!(watch_ready(&duplicate, 2000));
-
-        let id = duplicate.id;
-        drop(duplicate);
-        let subscribers = second_watch.service.subscribers.lock().unwrap();
-        assert!(!subscribers.as_ref().unwrap().contains_key(&id));
-        drop(subscribers);
-
-        writeln!(second, "other transcript").unwrap();
-        assert!(watch_ready(&second_watch, 2000));
     }
 
     #[test]
