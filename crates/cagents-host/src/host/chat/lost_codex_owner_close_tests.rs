@@ -182,6 +182,7 @@ impl Fixture {
         record
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_settled(&self) {
         let state = self.host.lock().unwrap();
         assert!(!state.native_closing.contains_key(&self.source.id));
@@ -192,6 +193,7 @@ impl Fixture {
 /// A finished local actor: it read its history, exited and closed, so it owns
 /// no work and inventory hides it. A stand-in for a Codex actor whose provider
 /// ended with its turn, which a test cannot start without a provider.
+#[cfg(target_os = "linux")]
 fn finished_actor(root: &std::path::Path) -> chat::runtime::Handle {
     let session_id = "12345678-1234-4234-8234-123456789abc";
     let project = root.join("missing-project");
@@ -699,6 +701,7 @@ fn kill(process: &registry::Process) {
 /// "The native cleanup receipt is unavailable"; it now settles as the lost
 /// owner it is. `released` is whether the earlier attempt's Release had
 /// already settled, leaving only the confirmation to fail.
+#[cfg(target_os = "linux")]
 fn pending_close_whose_owner_then_ended(root: &std::path::Path, released: bool) {
     let fixture = Fixture::new(root);
     let spawned = Spawned::new(&fixture.source);
@@ -952,34 +955,24 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
     }
 }
 
-/// A tool Codex started stays in its process group after Codex and the
-/// helper die, and still holds the conversation. Its pane names it, though it
-/// names no listener, and ends it, and the conversation then closes.
+/// A tool that outlives Codex and its helper still blocks the conversation.
+/// Linux can prove the adopted process group; Darwin only has numeric
+/// membership once both leaders are gone and must decline to signal it.
 #[test]
-fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
+fn a_codex_tool_left_after_its_provider_and_helper_died_requires_signal_proof() {
     let Some(root) =
-        isolated("a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes")
+        isolated("a_codex_tool_left_after_its_provider_and_helper_died_requires_signal_proof")
     else {
         return;
     };
     let fixture = Fixture::new(&root);
-    #[cfg(target_os = "linux")]
-    let sleep = std::path::PathBuf::from("/bin/sleep");
-    #[cfg(target_os = "macos")]
-    let sleep = {
-        let sleep = root.join("sleep");
-        std::fs::copy("/bin/sleep", &sleep).unwrap();
-        sign_fixture_program(&sleep);
-        sleep
-    };
     let spawned = Spawned::running(
         &fixture.source,
         "/bin/sh",
         &[
             "-c",
-            "\"$1\" 120 & echo $! > \"$0\"; exec \"$1\" 120",
+            "/bin/sleep 120 & echo $! > \"$0\"; exec /bin/sleep 120",
             "tool-pid",
-            sleep.to_str().unwrap(),
         ],
     );
     let record = Spawned::record(&fixture.source);
@@ -1009,7 +1002,7 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
     }
     let pin = crate::daemon::PinnedProcess::open(tool.pid as u32).unwrap();
     assert!(tool.is_current());
-    let _tool = ToolGuard(pin);
+    let tool_guard = ToolGuard(pin);
     kill(&record.holder);
     kill(&record.root);
     assert!(tool.is_current(), "the tool outlived its provider");
@@ -1024,13 +1017,25 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
             .iter()
             .map(|process| (process.process.pid, process.name.as_str(), process.proved))
             .collect::<Vec<_>>(),
-        [(tool_pid, "sleep", true)]
+        [(tool_pid, "sleep", cfg!(target_os = "linux"))]
     );
-    assert_eq!(
-        lost_processes(&fixture.host, &fixture.source, &shown(&found)).unwrap(),
-        []
-    );
-    assert!(tool.reaped(), "ending left the tool running");
+    let remaining = lost_processes(&fixture.host, &fixture.source, &[found[0].process]).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        assert!(remaining.is_empty());
+        assert!(tool.reaped(), "ending left the tool running");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(remaining, found);
+        assert!(
+            !tool_guard.0.exited().unwrap(),
+            "the unproved tool was signaled"
+        );
+        assert!(tool_guard.0.signal(libc::SIGKILL).unwrap());
+        assert!(tool_guard.0.wait_for_exit(Duration::from_secs(5)).unwrap());
+    }
+    drop(tool_guard);
     fixture.close_after_unproved_loss();
     #[cfg(target_os = "linux")]
     fixture.assert_settled();
@@ -1141,6 +1146,7 @@ fn bound_agent(fixture: &Fixture, root: &std::path::Path) -> crate::agent_execut
     accepted
 }
 
+#[cfg(target_os = "linux")]
 fn agent_closed(fixture: &Fixture, id: crate::model::AgentId) -> bool {
     let registry = fixture
         .host
@@ -1232,20 +1238,15 @@ fn codex_start_fixture(root: &std::path::Path) -> Fixture {
     let program = root.join("codex");
     std::fs::write(
         &program,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAGENTS_START_PROOF_ARGV\"\nexec /bin/sleep 60\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${0%/*}/started-argv\"\nexec /bin/sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let home = root.join("codex-home");
     std::fs::create_dir(&home).unwrap();
     fixture.source.launch.recipe.program = program.to_str().unwrap().into();
-    fixture.source.launch.recipe.environment = BTreeMap::from([
-        ("CODEX_HOME".into(), home.to_str().unwrap().into()),
-        (
-            "CAGENTS_START_PROOF_ARGV".into(),
-            root.join("started-argv").to_str().unwrap().into(),
-        ),
-    ]);
+    fixture.source.launch.recipe.environment =
+        BTreeMap::from([("CODEX_HOME".into(), home.to_str().unwrap().into())]);
     fixture.host.lock().unwrap().codex_listeners = CodexListenerRoots::at(root.into());
     fixture
 }
@@ -1284,15 +1285,18 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
             "the resumed allocation must pass the saved pane's checkpoint contract"
         );
     }
-    let expected = format!(
-        "app-server\n--listen\nunix://{}\n",
-        fixture.host.lock().unwrap().chats[&fixture.source.id]
-            .session
-            .owned_codex_listener
-            .as_ref()
-            .unwrap()
-            .socket
-            .display()
+    let (expected, handle) = {
+        let state = fixture.host.lock().unwrap();
+        let chat = &state.chats[&fixture.source.id];
+        let endpoint = &chat.session.owned_codex_listener.as_ref().unwrap().socket;
+        (
+            format!("app-server\n--listen\nunix://{}\n", endpoint.display()),
+            chat.handle.clone(),
+        )
+    };
+    let holder_socket = registry::socket(
+        &registry::directory(Kind::Native).unwrap(),
+        fixture.source.id,
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let argv = loop {
@@ -1302,7 +1306,9 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
         }
         assert!(
             Instant::now() < deadline,
-            "the fake app-server never recorded {expected:?}: {observed:?}"
+            "the fake app-server never recorded {expected:?}: {observed:?}; failure {:?}; holder {:?}",
+            handle.failure(),
+            registry::execution_record(&holder_socket),
         );
         thread::sleep(Duration::from_millis(5));
     };
@@ -1310,18 +1316,8 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
         argv.lines().collect::<Vec<_>>(),
         ["app-server", "--listen", expected.lines().nth(2).unwrap()]
     );
-    let handle = fixture.host.lock().unwrap().chats[&fixture.source.id]
-        .handle
-        .clone();
     handle.close().unwrap();
-    let record = registry::recovery_candidate(
-        &registry::socket(
-            &registry::directory(Kind::Native).unwrap(),
-            fixture.source.id,
-        ),
-        Kind::Native,
-    )
-    .unwrap();
+    let record = registry::recovery_candidate(&holder_socket, Kind::Native).unwrap();
     assert!(
         record.is_none(),
         "closing must reap the fake app-server's holder"
