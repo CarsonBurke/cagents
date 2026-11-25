@@ -53,9 +53,10 @@ impl Drop for Registration {
 /// exclusively, so even a child that exits immediately is never reaped by
 /// [`reap_exited`].
 pub(crate) fn spawn_owned(command: &mut Command) -> io::Result<(Child, Registration)> {
-    // A sweeper waits for orphans on a signalfd, so its threads block
-    // SIGCHLD. Its children must not inherit that: a provider would never
-    // hear that its own tools exited.
+    // On Linux a sweeper waits for orphans on a signalfd, so its threads
+    // block SIGCHLD. Its children must not inherit that: a provider would
+    // never hear that its own tools exited. Darwin's kqueue blocks nothing,
+    // so there the calling thread has nothing to undo.
     if super::child_events::calling_thread_blocks_sigchld() {
         // SAFETY: the hook runs only async-signal-safe sigprocmask.
         unsafe {

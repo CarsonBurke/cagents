@@ -4284,8 +4284,9 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
 /// their statuses for their owners. Nothing here signals a live child.
 ///
 /// A sweep runs when a child exits, read from [`ChildEvents`], so an idle
-/// actor does not wake. Without that descriptor, as in a process whose other
-/// threads receive SIGCHLD, it runs every [`Self::INTERVAL`] instead.
+/// actor does not wake. Without that descriptor, as when another thread
+/// receives SIGCHLD on Linux or the signal is suppressed on Darwin, it runs
+/// every [`Self::INTERVAL`] instead.
 ///
 /// The helper has no log sink, so a failed sweep is retried after
 /// [`Self::INTERVAL`] rather than reported here. Its durable symptom is the
@@ -4441,8 +4442,10 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         crate::process::become_subreaper().map_err(|error| error.to_string())?;
         // Every child spawned from here on must register with the sweep.
         crate::daemon::adopted_orphans::become_sweeper();
-        // Before any other thread starts, so all of them inherit the blocked
-        // SIGCHLD that wakes the sweep. Without it the sweep polls instead.
+        // Before any other thread starts: on Linux all of them must inherit
+        // the blocked SIGCHLD that wakes the sweep, while Darwin's kqueue
+        // records it whichever thread it reaches. Without it the sweep polls
+        // instead.
         let children = ChildEvents::new().ok();
         let mut detached = DetachedWork::Stop;
         let result = (|| {

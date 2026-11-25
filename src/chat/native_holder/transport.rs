@@ -106,8 +106,10 @@ impl Spawn {
             .stderr(Stdio::null())
             .process_group(0);
         crate::descriptor_limit::inherit(&mut command);
-        // The helper's signalfd owns SIGCHLD; its provider must receive the
-        // usual unblocked child-exit signals after exec.
+        // On Linux the helper's signalfd owns SIGCHLD, blocked in every
+        // thread; its provider must receive the usual unblocked child-exit
+        // signals after exec. Darwin's kqueue blocks nothing, so there this
+        // usually has nothing to undo.
         unsafe {
             command.pre_exec(crate::daemon::child_events::unblock_sigchld_for_exec);
         }
@@ -834,8 +836,9 @@ impl Residence {
         spawn: Spawn,
         scope: Option<crate::daemon::process_scope::ProviderScope>,
     ) -> Result<Self, String> {
-        // Block before creating children so even a very short-lived tool cannot
-        // disappear between the initial reap and the blocking poll.
+        // Watch for child exits before creating children so even a very
+        // short-lived tool cannot disappear between the initial reap and the
+        // blocking poll.
         let child_events = ChildEvents::new().map_err(|error| error.to_string())?;
         let working_directory = spawn
             .directory_fd

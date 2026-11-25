@@ -497,10 +497,38 @@ fn entry_identity(
     Ok((entry.st_mode & libc::S_IFMT, (device, entry.st_ino)))
 }
 
+/// A path that reaches the very object `held` has open, for a child process
+/// that can be given only a name: Darwin's `/dev/fd` duplicates a descriptor
+/// rather than naming its object, so it cannot be entered as a directory.
+///
+/// The path is where the kernel records the object now, confirmed to still
+/// reach it. Unlike a descriptor it can be redirected once this returns, so a
+/// caller must check again whatever acts on the name.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::NotFound`] when the recorded path no longer
+/// reaches the object, as after it was moved or replaced, and the underlying
+/// error when either cannot be stat'ed.
+#[cfg(target_os = "macos")]
+pub(crate) fn reaching_path(held: &File) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = descriptor_path(held.as_raw_fd())?;
+    let reached = std::fs::symlink_metadata(&path)?;
+    let held = held.metadata()?;
+    if (reached.dev(), reached.ino()) != (held.dev(), held.ino()) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the open object is no longer at its recorded path",
+        ));
+    }
+    Ok(path)
+}
+
 /// The path the kernel currently records for an open descriptor. It is a name,
 /// not an identity: a caller must verify what it reaches through it.
 #[cfg(target_os = "macos")]
-fn descriptor_path(descriptor: RawFd) -> io::Result<PathBuf> {
+pub(crate) fn descriptor_path(descriptor: RawFd) -> io::Result<PathBuf> {
     let mut buffer = vec![0_u8; libc::PATH_MAX as usize];
     // SAFETY: `F_GETPATH` writes at most `MAXPATHLEN` (`PATH_MAX`) bytes,
     // including the terminating NUL, into the buffer, which is that long.

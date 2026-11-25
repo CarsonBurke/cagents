@@ -430,19 +430,7 @@ fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    let mut path = vec![0_u8; libc::PATH_MAX as usize];
-    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL included, into
-    // the buffer, which outlives the call.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let length = path
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(path.len());
-    path.truncate(length);
-    Ok(std::ffi::OsString::from_vec(path).into())
+    crate::fs_safety::descriptor_path(file.as_raw_fd())
 }
 
 /// A wake one thread can raise for another that polls: `notify` is written,

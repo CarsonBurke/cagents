@@ -54,6 +54,31 @@ impl Process {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
     }
 
+    /// A path that reaches the executable this process runs, for its
+    /// identity. Linux names the running image itself, which stays valid when
+    /// its pathname is replaced or removed; a caller confirms
+    /// [`Self::is_current`] once it has read through it, as the pid may name
+    /// a later process by then.
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    pub fn executable(&self) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(format!("/proc/{}/exe", self.pid)))
+    }
+
+    /// The pathname of the executable this process runs, read while it runs.
+    /// Darwin records only the image's pathname, so an executable replaced
+    /// there since this process started reads as a different file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` once this process has exited or its pid names a
+    /// later one.
+    #[cfg(all(feature = "host", target_os = "macos"))]
+    pub fn executable(&self) -> io::Result<PathBuf> {
+        let pid = u32::try_from(self.pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        crate::pinned_process::PinnedProcess::open_started(pid, self.start)?.executable()
+    }
+
     /// Whether this exact process has exited: it is gone, its pid names a
     /// later process, or it is a zombie its parent has not reaped yet, which
     /// [`Self::is_current`] still counts. A process that cannot be inspected

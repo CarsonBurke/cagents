@@ -224,11 +224,14 @@ fn qualify_binding(
     let Some(selected) = executable(issued) else {
         return Err(UNQUALIFIED);
     };
-    let Some(running) = executable(
-        &Path::new("/proc")
-            .join(console.root.pid.to_string())
-            .join("exe"),
-    ) else {
+    // Darwin names only the image's pathname: an executable replaced there
+    // since the console started leaves it unqualified.
+    let Some(running) = console
+        .root
+        .executable()
+        .ok()
+        .and_then(|path| executable(&path))
+    else {
         return Err(UNQUALIFIED);
     };
     if !issued.is_absolute()
