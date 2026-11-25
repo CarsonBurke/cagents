@@ -1398,6 +1398,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "blake3",
+ "block2 0.6.2",
  "cagents",
  "cagents-browser-import",
  "cagents-dictate",

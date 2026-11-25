@@ -3497,7 +3497,7 @@ impl Cagents {
             .density(cosmic::cosmic_theme::Density::Compact)
             .focused(focused)
             .maximized(self.core.window.is_maximized)
-            .sharp_corners(self.core.window.sharp_corners)
+            .sharp_corners(self.window_corners_sharp())
             .start(start)
             .on_drag(Message::NativeWindowAction(cosmic::app::Action::Drag))
             .on_double_click(Message::NativeWindowAction(cosmic::app::Action::Maximize))
@@ -3527,6 +3527,7 @@ impl Cagents {
         // resize border.
         let inset = if window_controls {
             self.trailing_edge_inset()
+                .max(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing))
         } else {
             0.0
         };
@@ -3536,7 +3537,7 @@ impl Cagents {
             .center_y(design::HEADER_CONTENT_HEIGHT)
             .padding(
                 Padding::ZERO
-                    .left(self.window_controls_overhang())
+                    .left(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading))
                     .right(inset),
             )
             .width(Length::Fill)
@@ -3573,7 +3574,8 @@ impl Cagents {
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
             - self.workspace_header_width()
-            - self.window_controls_overhang()
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading)
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing)
             - design::PRIMARY_CONTROL_SIZE
             - space::XXS)
             .max(0.0);

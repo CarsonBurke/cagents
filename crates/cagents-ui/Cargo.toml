@@ -116,11 +116,14 @@ wayland-protocols = { version = "=0.32.13", features = ["client"], optional = tr
 # macOS has no XDG portal, so libcosmic's file dialogs use the native panels.
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["rfd"] }
 # The main window's AppKit conventions: an application delegate that routes
-# Quit through the window, and the traffic lights' measured place. winit
-# already links these exact versions; no feature here is one it lacks.
+# Quit through the window, the Window menu, Control-click as a secondary click
+# and the traffic lights' measured place. winit already links these exact
+# versions and every AppKit class named here; only app-kit's `block2`
+# feature, for the event monitor's handler, is one winit leaves off.
+block2 = "0.6.2"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSButton", "NSControl", "NSResponder", "NSView", "NSWindow"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSGeometry"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSButton", "NSControl", "NSEvent", "NSGraphicsContext", "NSMenu", "NSMenuItem", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSGeometry", "NSString"] }
 
 [dev-dependencies]
 # The shared library's test fixtures, which the UI's tests also use.

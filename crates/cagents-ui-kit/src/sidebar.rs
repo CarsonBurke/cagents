@@ -6039,12 +6039,22 @@ pub struct WindowCorner {
     pub controls: Option<WindowControls>,
 }
 
-/// The region the system's window controls take, measured from the window's
-/// top-left corner and including their margin to whatever follows them.
+/// The region the system's window controls take in a top corner of the
+/// window, measured from that corner and including their margin to whatever
+/// follows them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowControls {
     pub width: f32,
     pub height: f32,
+    pub edge: WindowControlsEdge,
+}
+
+/// The top corner holding the window controls: the leading one, beside this
+/// pane, unless a right-to-left system puts them at the trailing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowControlsEdge {
+    Leading,
+    Trailing,
 }
 
 fn view_inner<'a>(
@@ -6063,8 +6073,15 @@ fn view_inner<'a>(
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(utilities(compact, modal_open, shortcuts, corner.controls))
-                .padding([0.0, space::XS]),
+            widget::container(utilities(
+                compact,
+                modal_open,
+                shortcuts,
+                corner
+                    .controls
+                    .filter(|controls| controls.edge == WindowControlsEdge::Leading),
+            ))
+            .padding([0.0, space::XS]),
         )
         .push(design::horizontal_rule())
         .push(

@@ -16382,3 +16382,40 @@ fn notice_detail_ellipsis_preserves_ordinary_word_wrap_geometry() {
     assert_eq!(actual.x, expected.x);
     assert!(!text[actual.start..actual.end].starts_with(' '));
 }
+
+/// The traffic lights' room is measured in AppKit points and laid out in
+/// interface units; the header gives up only what the projects pane beside
+/// them does not already cover, or their whole width at the trailing edge.
+#[test]
+fn the_header_leaves_the_window_controls_only_what_the_projects_pane_does_not() {
+    use crate::sidebar::{WindowControls, WindowControlsEdge};
+    let mut app = context_inspector_test_app(false);
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+
+    let rail = design::NAVIGATION_RAIL_WIDTH;
+    app.settings.ui_scale = 2.0;
+    app.window_controls_points = Some(WindowControls {
+        width: 2.0 * (rail + 20.0),
+        height: 60.0,
+        edge: WindowControlsEdge::Leading,
+    });
+    app.chrome_ui.projects_collapsed = true;
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 20.0);
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Trailing), 0.0);
+    app.chrome_ui.projects_collapsed = false;
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+
+    app.window_controls_points = Some(WindowControls {
+        width: 140.0,
+        height: 60.0,
+        edge: WindowControlsEdge::Trailing,
+    });
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Trailing), 70.0);
+    // The sidebar keeps its leading-edge layout; the trailing lights are
+    // the header's to avoid.
+    assert!(
+        app.window_controls()
+            .is_some_and(|controls| controls.edge == WindowControlsEdge::Trailing)
+    );
+}

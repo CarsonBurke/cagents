@@ -8605,6 +8605,7 @@ fn the_first_row_leaves_the_window_controls_their_corner() {
     let controls = WindowControls {
         width: 76.0,
         height: 30.0,
+        edge: WindowControlsEdge::Leading,
     };
     let (bare, kept) = (first(false, None), first(false, Some(controls)));
     assert!(bare.x < controls.width, "{bare:?}");

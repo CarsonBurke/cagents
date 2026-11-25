@@ -7315,6 +7315,12 @@ impl Cagents {
     /// fullscreen and right-tiled windows have no border there and stay flush.
     ///
     /// macOS has no such border: AppKit resizes the window from its frame.
+    /// Whether the window's outer corners are drawn square: always on macOS,
+    /// where AppKit rounds and clips a titled window itself.
+    pub(super) fn window_corners_sharp(&self) -> bool {
+        cfg!(target_os = "macos") || self.core.window.sharp_corners
+    }
+
     fn window_edge_inset(&self) -> f32 {
         if cfg!(target_os = "macos") || self.window_filled || self.right_edge_tiled {
             0.0
@@ -7330,20 +7336,30 @@ impl Cagents {
             .map(|controls| sidebar::WindowControls {
                 width: controls.width / self.settings.ui_scale,
                 height: controls.height / self.settings.ui_scale,
+                ..controls
             })
     }
 
-    /// How far the traffic lights reach past the projects pane into the
-    /// workspace header, as they do beside the compact rail.
-    pub(super) fn window_controls_overhang(&self) -> f32 {
-        self.window_controls().map_or(0.0, |controls| {
-            (controls.width
+    /// How far the traffic lights reach into the header holding the window
+    /// controls from its `edge`: past the projects pane, as they do beside
+    /// the compact rail, from the leading edge, and their whole width from
+    /// the trailing edge, where a right-to-left system puts them.
+    pub(super) fn window_controls_reach(&self, edge: sidebar::WindowControlsEdge) -> f32 {
+        let Some(controls) = self
+            .window_controls()
+            .filter(|controls| controls.edge == edge)
+        else {
+            return 0.0;
+        };
+        match edge {
+            sidebar::WindowControlsEdge::Leading => (controls.width
                 - sidebar::effective_width(
                     self.projects_sidebar_mode(),
                     self.settings.sidebar_width,
                 ))
-            .max(0.0)
-        })
+            .max(0.0),
+            sidebar::WindowControlsEdge::Trailing => controls.width,
+        }
     }
 
     /// The trailing padding the rightmost surface gives its interactive edge
@@ -15376,6 +15392,8 @@ impl Cagents {
         // wait for its window anyway: the close is saved, so an answer it
         // does not hear is asked for again, and reported, at the next launch.
         let chats_closed = !self.chat_ui.closing_in_background();
+        #[cfg(target_os = "macos")]
+        macos_window::exit_began();
         self.exit = Some(ApplicationExit {
             closing: close.as_ref().map(|(window, _)| *window),
             servers_reaped: false,
@@ -17685,7 +17703,7 @@ impl Application for Cagents {
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
             sidebar::WindowCorner {
-                rounded: !self.core.window.sharp_corners,
+                rounded: !self.window_corners_sharp(),
                 controls: self.window_controls(),
             },
         )
@@ -19588,7 +19606,17 @@ impl Cagents {
                 if size.width.is_finite() && size.width > 0.0 {
                     self.window_width = size.width;
                 }
-                self.query_window_filled()
+                // Full screen hides the traffic lights, and AppKit may move
+                // them as the titlebar changes.
+                let filled = self.query_window_filled();
+                #[cfg(target_os = "macos")]
+                let filled = Task::batch([
+                    filled,
+                    macos_window::measure(window).map(|controls| {
+                        cosmic::Action::App(Message::WindowControlsMeasured(controls))
+                    }),
+                ]);
+                filled
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
