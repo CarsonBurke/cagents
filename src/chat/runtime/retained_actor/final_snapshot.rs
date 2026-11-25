@@ -1162,6 +1162,27 @@ os.waitpid(pid,0)
             })],
             ..Default::default()
         };
+        #[cfg(target_os = "macos")]
+        {
+            save(
+                true,
+                &identity,
+                &proof,
+                &source,
+                &[],
+                None,
+                Err("fixture unknown account"),
+                source.launch.session_id.as_deref(),
+                &snapshot,
+                false,
+            )
+            .unwrap();
+            let legacy_path = path(&identity.record).unwrap();
+            assert!(!legacy_path.exists());
+            assert!(close_proved(&identity, &proof, &source).unwrap());
+            assert!(!close_proved_with_scope(&identity, &proof, &source, true).unwrap());
+            std::fs::remove_file(legacy_path.with_extension("final-spared")).unwrap();
+        }
         save(
             true,
             &identity,
