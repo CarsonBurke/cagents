@@ -1495,6 +1495,31 @@ fn set_chat_timeouts(stream: &UnixStream) -> Result<(), String> {
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())
 }
+
+fn clear_chat_read_timeout(stream: &UnixStream) -> io::Result<()> {
+    let result = stream.set_read_timeout(None);
+    #[cfg(target_os = "macos")]
+    if matches!(&result, Err(error) if error.raw_os_error() == Some(libc::EINVAL)) {
+        use std::os::fd::AsRawFd;
+        // XNU refuses new socket options after a full shutdown. The peer
+        // might have closed after its final reply. Let the reader consume
+        // any remaining bytes and EOF with the attach timeout still set.
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            // XNU only registers the read filter when a read or hangup
+            // event is requested.
+            events: libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: descriptor is writable and contains a live borrowed fd.
+        let ready = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+        if ready > 0 && descriptor.revents & libc::POLLHUP != 0 {
+            return Ok(());
+        }
+    }
+    result
+}
+
 fn receive_handshake(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
@@ -2925,7 +2950,7 @@ impl ClientHandle {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
             })
             .transpose()?;
-        stream.set_read_timeout(None).map_err(|e| e.to_string())?;
+        clear_chat_read_timeout(&stream).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
         let body_requested = Arc::new(AtomicBool::new(true));
