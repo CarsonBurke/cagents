@@ -328,6 +328,30 @@ pub(crate) fn started_ticks_of(pid: u32) -> io::Result<u64> {
     imp::start_of(pid).map(imp::Start::ticks)
 }
 
+/// When, by the wall clock, the process that holds `pid` and started at
+/// `ticks` (as [`started_ticks_of`] reads it) began. The kernel recorded the
+/// time at fork, so a later change of the wall clock does not move it.
+///
+/// # Errors
+///
+/// Returns `NotFound` when that process no longer holds `pid`, including when
+/// it has become a zombie, which keeps no record of its wall-clock start.
+#[cfg(all(target_os = "macos", any(feature = "host", test)))]
+pub(crate) fn wall_clock_start_of(pid: u32, ticks: u64) -> io::Result<std::time::SystemTime> {
+    let info = imp::bsd_info(pid)?;
+    // The caller read `ticks` from this pid before the record was read, and
+    // the same process still holds the pid after: a pid can't be reused while
+    // held, so no successor can have answered in between.
+    if imp::start_of(pid)?.ticks() != ticks {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
+    let offset = std::time::Duration::from_secs(info.pbi_start_tvsec)
+        + std::time::Duration::from_micros(info.pbi_start_tvusec);
+    std::time::UNIX_EPOCH
+        .checked_add(offset)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process start is out of range"))
+}
+
 /// How many of `pid`'s children have exited but not been reaped. XNU lists a
 /// zombie among its parent's children and still accepts a null signal for it,
 /// but keeps no process record for it.

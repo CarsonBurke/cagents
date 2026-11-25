@@ -314,24 +314,6 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-/// The current time on the clock `/proc/<pid>/stat` dates processes by, in
-/// its ticks, rounded down so a process forked after this reads no earlier.
-#[cfg(any(feature = "host", test))]
-pub(crate) fn now_ticks() -> io::Result<u64> {
-    // SAFETY: sysconf has no pointer arguments; clock_gettime writes to ts.
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if ticks <= 0 || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let nanos = u128::try_from(ts.tv_sec).map_err(io::Error::other)? * 1_000_000_000
-        + u128::try_from(ts.tv_nsec).map_err(io::Error::other)?;
-    u64::try_from(nanos * ticks as u128 / 1_000_000_000).map_err(io::Error::other)
-}
-
 /// The cgroup namespace this process sees cgroup paths through.
 pub(crate) fn cgroup_namespace() -> Option<String> {
     fs::read_link("/proc/self/ns/cgroup")
@@ -411,7 +393,7 @@ pub(crate) fn record_instance_launch(
         ledger.record_launch(
             &boot,
             &lineages(session),
-            now_ticks()?,
+            crate::process::clock::start_ticks_now()?,
             launch_containment(),
         )
     })();
@@ -600,39 +582,6 @@ mod tests {
         fs::write(directory.path().join("unfinished").join(EPOCH), "{").unwrap();
         unfinished.open_epoch(&boot("a"), true).unwrap();
         assert_eq!(unfinished.birth(&boot("a"), TerminalId::new()), None);
-    }
-
-    #[test]
-    fn the_launch_clock_never_dates_a_later_process_earlier() {
-        let before = now_ticks().unwrap();
-        let stat = fs::read_to_string("/proc/thread-self/stat").unwrap();
-        let fields: Vec<_> = stat
-            .rsplit_once(')')
-            .unwrap()
-            .1
-            .split_whitespace()
-            .collect();
-        let own_start: u64 = fields[19].parse().unwrap();
-        assert!(
-            own_start <= before,
-            "this process started before the reading"
-        );
-        let child = std::process::Command::new("sleep")
-            .arg("1")
-            .spawn()
-            .unwrap();
-        let stat = fs::read_to_string(format!("/proc/{}/stat", child.id())).unwrap();
-        let fields: Vec<_> = stat
-            .rsplit_once(')')
-            .unwrap()
-            .1
-            .split_whitespace()
-            .collect();
-        let child_start: u64 = fields[19].parse().unwrap();
-        assert!(child_start >= before, "{child_start} < {before}");
-        let mut child = child;
-        child.kill().unwrap();
-        child.wait().unwrap();
     }
 
     #[test]

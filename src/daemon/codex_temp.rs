@@ -36,7 +36,7 @@ impl PrivateDir {
         // PID and start time are published atomically with mkdir, so a
         // concurrent sweep cannot mistake a new directory for an orphan.
         let _ = sweep_base(&base, namespace, Path::new(PROC));
-        let created = boot_ticks()?;
+        let created = crate::process::clock::start_ticks_now()?;
         let prefix = format!(
             "{PREFIX}{namespace:x}-{:x}-{:x}-{created:x}-",
             owner.pid, owner.start
@@ -158,17 +158,6 @@ fn owner(path: &Path) -> Option<Owner> {
             start: u64::from_str_radix(start, 16).ok()?,
         },
     })
-}
-
-fn boot_ticks() -> io::Result<u64> {
-    // SAFETY: sysconf takes a scalar. clock_gettime initializes this timespec.
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
-    if ticks <= 0 || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, now.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let now = unsafe { now.assume_init() };
-    Ok(now.tv_sec as u64 * ticks as u64 + now.tv_nsec as u64 * ticks as u64 / 1_000_000_000)
 }
 
 #[cfg(feature = "host")]
@@ -560,7 +549,7 @@ mod tests {
             "{PREFIX}{namespace:x}-{:x}-{:x}-{:x}-AbCd12",
             owner.pid,
             owner.start + 1,
-            boot_ticks().unwrap()
+            crate::process::clock::start_ticks_now().unwrap()
         ));
         fs::create_dir(&orphan).unwrap();
         fs::set_permissions(&orphan, fs::Permissions::from_mode(0o700)).unwrap();
