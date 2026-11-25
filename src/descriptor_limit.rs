@@ -148,6 +148,7 @@ pub(crate) mod tests {
         assert_eq!(raised.rlim_max, original.rlim_max);
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn assert_process_limit(pid: u32, expected: &libc::rlimit) {
         let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
         let mut fields = limits

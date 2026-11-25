@@ -86,10 +86,6 @@ pub(crate) mod tests {
         eprintln!("scope isolation unqualified: no OOM selection unit on this system");
     }
 
-    pub(crate) fn assert_commands_apart(_root: u32) {
-        eprintln!("command cgroups unqualified: no OOM selection unit on this system");
-    }
-
     /// An enrollment failure as the Linux backend reports a refused request,
     /// for owners that test the launch path an enrollment error takes.
     pub(crate) fn rejected_scope_request() -> io::Result<()> {
