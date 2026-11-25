@@ -526,8 +526,10 @@ link() {
 }
 link "$APP" "$APP_LINK" || fail "cannot link $APP_LINK"
 link "$PREFIX/current/bin/cagents" "$BIN_LINK" || fail "cannot link $BIN_LINK"
-AGENT_WRITTEN=1
+# A rename either happens or does not: only a login item that was replaced
+# has to be put back.
 mv -f "$STAGE/agent.plist" "$AGENT_PLIST" || fail 'cannot install the login item'
+AGENT_WRITTEN=1
 
 # The version kept for rollback: the one this install replaces, or after a
 # reinstall the one recorded before. Writing it commits the install.
