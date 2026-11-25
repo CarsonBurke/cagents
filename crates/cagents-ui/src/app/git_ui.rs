@@ -2275,10 +2275,11 @@ mod tests {
     #[test]
     fn a_worktree_gone_from_the_listing_is_closed_unless_the_application_deleted_it() {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first");
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.as_path().join("first");
         let snapshot = fixture(&first);
         for name in ["outside", "inside"] {
-            let path = directory.path().join(name);
+            let path = root.as_path().join(name);
             git(
                 &first,
                 &["worktree", "add", "-b", name, path.to_str().unwrap()],
@@ -2319,7 +2320,7 @@ mod tests {
         let closed = records_removed_outside(project, &state.entries[&project].snapshot, &listed);
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].project_id, project);
-        assert_eq!(closed[0].path, directory.path().join("outside"));
+        assert_eq!(closed[0].path, root.as_path().join("outside"));
         assert_eq!(closed[0].branch.as_deref(), Some("outside"));
         assert!(!closed[0].existence.is_open());
     }
@@ -2828,8 +2829,9 @@ mod tests {
     #[test]
     fn a_removed_worktree_leaves_without_failing_its_siblings() {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first");
-        let second = directory.path().join("second");
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.as_path().join("first");
+        let second = root.as_path().join("second");
         let snapshot = fixture(&first);
         git(
             &first,
@@ -2881,7 +2883,7 @@ mod tests {
         );
         // `git worktree remove` takes `.git` first; a large checkout is still
         // on disk, and still listed, while its files go.
-        let third = directory.path().join("third");
+        let third = root.as_path().join("third");
         git(
             &first,
             &["worktree", "add", "-b", "third", third.to_str().unwrap()],

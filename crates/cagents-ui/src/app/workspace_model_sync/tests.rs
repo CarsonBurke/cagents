@@ -5403,9 +5403,10 @@ fn shared_folder_reopen_loads_new_rows_and_preserves_acknowledged_terminal_membe
         let mut renderer = super::super::tests::headless_renderer();
         let navigation = crate::sidebar::NavigationCache::default();
         let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().canonicalize().unwrap().join("parent");
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("parent");
         let nested = parent.join("nested");
-        let control = directory.path().join("control");
+        let control = root.join("control");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir(&control).unwrap();
         let mut app = super::super::tests::context_inspector_test_app(true);
