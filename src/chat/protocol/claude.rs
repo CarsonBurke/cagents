@@ -2323,6 +2323,7 @@ impl Claude {
                 let reference = references.get(&index).cloned();
                 let unavailable = unverified.get(&index);
                 let correlated_call = history_calls.get(&index);
+                let position = index;
                 let index = self
                     .blocks
                     .iter()
@@ -2371,12 +2372,18 @@ impl Claude {
                 };
                 match block_type {
                     "text" | "thinking" | "redacted_thinking" => {
-                        let thinking = string(block, "type") != "text";
-                        let text = if string(block, "type") == "redacted_thinking" {
-                            "[Redacted thinking]"
-                        } else {
-                            string(block, if thinking { "thinking" } else { "text" })
+                        let text = match block_type {
+                            "redacted_thinking" => "[Redacted thinking]",
+                            "thinking" => string(block, "thinking"),
+                            _ => string(block, "text"),
                         };
+                        // Prose between tool calls that the server sends as a
+                        // thinking block. A streamed block started out as
+                        // thinking; this item, under the same id, replaces it.
+                        let narration = role == Role::Assistant
+                            && !context
+                            && narration::is_narration(frame, position, block);
+                        let thinking = block_type != "text" && !narration;
                         // A reader's prompt from another Claude client can
                         // carry the client's notes to the model as blocks
                         // of their own, and a fork's first turn its setup.
@@ -2393,6 +2400,8 @@ impl Claude {
                             context_item(format!("{id}:{index}"), text.into())
                         } else if let Some(output) = local {
                             text_item(format!("{id}:{index}"), Role::System, output, false)
+                        } else if narration {
+                            commentary_item(format!("{id}:{index}"), text.into())
                         } else {
                             text_item(format!("{id}:{index}"), role, text.into(), thinking)
                         }));
@@ -6958,16 +6967,33 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
     Item {
         id,
         role,
-        // Claude's stream-json frames carry no turn-phase label: an assistant
-        // text block is shaped identically whether it narrates progress or
-        // answers the question, and the closing `result` frame only repeats
-        // text that was already delivered as its own block. A guessed phase
-        // would demote real answers into narration, so every text item is
-        // final until the provider itself says otherwise.
+        // A Claude text block carries no turn-phase label: it is shaped
+        // identically whether it narrates progress or answers the question,
+        // and the closing `result` frame only repeats text that was already
+        // delivered as its own block. A guessed phase would demote real
+        // answers into narration, so a text block is final. The narration
+        // Claude does label arrives as thinking blocks; see
+        // [`commentary_item`].
         content: ItemContent::Text {
             text,
             thinking,
             phase: Phase::Final,
+        },
+        started_at: None,
+        at: None,
+    }
+}
+
+/// A thinking block the server labelled narration (see [`narration`]): the
+/// agent's progress prose between tool calls, not its reasoning.
+fn commentary_item(id: String, text: String) -> Item {
+    Item {
+        id,
+        role: Role::Assistant,
+        content: ItemContent::Text {
+            text,
+            thinking: false,
+            phase: Phase::Commentary,
         },
         started_at: None,
         at: None,
@@ -10236,6 +10262,7 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 mod history_branches;
 #[cfg(test)]
 mod history_tests;
+mod narration;
 mod streamed_input;
 
 #[cfg(test)]
