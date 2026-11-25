@@ -3,6 +3,49 @@
 use std::os::unix::fs::MetadataExt;
 use std::{collections::BTreeSet, fs, io, path::Path};
 
+/// Verify an exclusive flock on a description passed by a trusted updater.
+/// The caller must retain custody throughout transfer and never explicitly
+/// unlock. Darwin cannot atomically inspect a flock's owning description:
+/// independent contention alone could come from another description, and
+/// attempting an exclusive flock alone could acquire a previously free lock.
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_inherited_exclusive(file: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // XNU exposes FWASLOCKED through F_GETFL. This history belongs to the
+    // supplied open description. A fresh unlocked description must not take
+    // over if a competing owner drops its lock between the two probes below.
+    // The flag survives LOCK_UN, so the sender must still preserve custody.
+    const FWASLOCKED: libc::c_int = 0x4000;
+    // SAFETY: F_GETFL reads flags on this live descriptor and takes no pointer.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & FWASLOCKED == 0 {
+        return Err(io::Error::other(
+            "inherited description has never held a flock",
+        ));
+    }
+    let independent = crate::descriptor::reopen(file, 0)?;
+    // SAFETY: both files are live. The independent probe never changes the
+    // supplied description's lock. Neither probe waits on a competing owner.
+    if unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        return Err(io::Error::other("inherited exclusive flock is not held"));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::WouldBlock {
+        return Err(error);
+    }
+    // SAFETY: `file` keeps the supplied descriptor live through validation.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::other(
+            "exclusive flock belongs to another description",
+        ));
+    }
+    Ok(())
+}
+
 /// How many times the kernel index is read before believing that no
 /// candidate it names holds the lock.
 #[cfg(target_os = "linux")]

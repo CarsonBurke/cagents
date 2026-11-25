@@ -28,6 +28,11 @@
 //!   their blocks, so a clone costs no copy; elsewhere the image is copied.
 use std::{io, path::PathBuf};
 
+#[cfg(target_os = "macos")]
+pub(crate) use darwin::mapped_region_identity;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use darwin::own_code_address;
+
 /// The installed executable this process runs, with every symlink resolved.
 /// See the module documentation for how this differs from [`own_image`].
 pub fn current_executable() -> io::Result<PathBuf> {
@@ -143,8 +148,80 @@ mod darwin {
         std::env::args_os().map(OsString::into_vec).collect()
     }
 
+    /// `<sys/proc_info.h>`'s `PROC_PIDREGIONPATHINFO`, which libc omits.
+    const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
+
+    /// `<sys/proc_info.h>`'s `struct proc_regioninfo`.
+    #[repr(C)]
+    struct RegionInfo {
+        protection: u32,
+        max_protection: u32,
+        inheritance: u32,
+        flags: u32,
+        offset: u64,
+        behavior: u32,
+        user_wired_count: u32,
+        user_tag: u32,
+        pages_resident: u32,
+        pages_shared_now_private: u32,
+        pages_swapped_out: u32,
+        pages_dirtied: u32,
+        ref_count: u32,
+        shadow_depth: u32,
+        share_mode: u32,
+        private_pages_resident: u32,
+        shared_pages_resident: u32,
+        obj_id: u32,
+        depth: u32,
+        address: u64,
+        size: u64,
+    }
+
+    /// `<sys/proc_info.h>`'s `struct proc_regionwithpathinfo`.
+    #[repr(C)]
+    struct RegionWithPath {
+        region: RegionInfo,
+        vnode: libc::vnode_info_path,
+    }
+
+    pub(crate) fn mapped_region_identity(pid: u32, address: u64) -> io::Result<(u64, u64)> {
+        // SAFETY: all-zero is a valid value of this plain C struct.
+        let mut info: RegionWithPath = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<RegionWithPath>() as libc::c_int;
+        // SAFETY: the buffer is writable and exactly as long as declared.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                PROC_PIDREGIONPATHINFO,
+                address,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return Err(io::Error::other(
+                "the kernel did not describe this process's mapped image",
+            ));
+        }
+        // The kernel answers the region at or after the address.
+        if address
+            .checked_sub(info.region.address)
+            .is_none_or(|offset| offset >= info.region.size)
+            || info.region.protection & libc::PROT_EXEC as u32 == 0
+            || info.vnode.vip_vi.vi_stat.vst_ino == 0
+        {
+            return Err(io::Error::other(
+                "this process's code is not mapped from a file",
+            ));
+        }
+        let stat = &info.vnode.vip_vi.vi_stat;
+        Ok((u64::from(stat.vst_dev), stat.vst_ino))
+    }
+
     #[cfg(all(feature = "host", test))]
     pub(super) use image::mapped_identity;
+    #[cfg(feature = "host")]
+    pub(crate) use image::own_code_address;
     #[cfg(feature = "host")]
     pub(super) use image::{clone_image, pinned_image};
 
@@ -168,72 +245,14 @@ mod darwin {
             },
         };
 
-        /// `<sys/proc_info.h>`'s `PROC_PIDREGIONPATHINFO`, which libc omits.
-        const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
-
-        /// `<sys/proc_info.h>`'s `struct proc_regioninfo`.
-        #[repr(C)]
-        struct RegionInfo {
-            protection: u32,
-            max_protection: u32,
-            inheritance: u32,
-            flags: u32,
-            offset: u64,
-            behavior: u32,
-            user_wired_count: u32,
-            user_tag: u32,
-            pages_resident: u32,
-            pages_shared_now_private: u32,
-            pages_swapped_out: u32,
-            pages_dirtied: u32,
-            ref_count: u32,
-            shadow_depth: u32,
-            share_mode: u32,
-            private_pages_resident: u32,
-            shared_pages_resident: u32,
-            obj_id: u32,
-            depth: u32,
-            address: u64,
-            size: u64,
-        }
-
-        /// `<sys/proc_info.h>`'s `struct proc_regionwithpathinfo`.
-        #[repr(C)]
-        struct RegionWithPath {
-            region: RegionInfo,
-            vnode: libc::vnode_info_path,
-        }
-
         /// The device and inode of the file mapped at this function's code,
         /// which the executable links in: the image the kernel executed.
         pub(crate) fn mapped_identity() -> io::Result<(u64, u64)> {
-            let address = mapped_identity as fn() -> io::Result<(u64, u64)> as usize as u64;
-            // SAFETY: all-zero is a valid value of this plain C struct.
-            let mut info: RegionWithPath = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<RegionWithPath>() as libc::c_int;
-            // SAFETY: the buffer is writable and exactly as long as declared.
-            let written = unsafe {
-                libc::proc_pidinfo(
-                    std::process::id() as libc::c_int,
-                    PROC_PIDREGIONPATHINFO,
-                    address,
-                    (&raw mut info).cast(),
-                    size,
-                )
-            };
-            if written != size {
-                return Err(io::Error::other(
-                    "the kernel did not describe this process's mapped image",
-                ));
-            }
-            // The kernel answers the region at or after the address.
-            if !(info.region.address..info.region.address + info.region.size).contains(&address) {
-                return Err(io::Error::other(
-                    "this process's code is not mapped from a file",
-                ));
-            }
-            let stat = &info.vnode.vip_vi.vi_stat;
-            Ok((u64::from(stat.vst_dev), stat.vst_ino))
+            super::mapped_region_identity(std::process::id(), own_code_address())
+        }
+
+        pub(crate) fn own_code_address() -> u64 {
+            mapped_identity as fn() -> io::Result<(u64, u64)> as usize as u64
         }
 
         /// An open descriptor of this process's own image, opened by path

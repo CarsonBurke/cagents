@@ -64,7 +64,10 @@ impl HandoffSource {
 }
 
 impl LeaseHandoff {
-    #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        target_os = "macos",
+        allow(dead_code, reason = "Darwin updater wiring is separate")
+    )]
     pub(super) fn descriptor(&self) -> BorrowedFd<'_> {
         use std::os::fd::AsFd;
         self.lock.as_fd()
@@ -193,6 +196,7 @@ fn validate_inode(lock: &File, paths: &RuntimePaths) -> Result<(), PlatformError
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<(), PlatformError> {
     validate_inode(lock, paths)?;
     // fdinfo describes this exact open-file description, including locks
@@ -215,6 +219,13 @@ pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<()
         return Err(io::Error::other("daemon inherited a lease held by another process").into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<(), PlatformError> {
+    validate_inode(lock, paths)?;
+    crate::flock::verify_inherited_exclusive(lock)?;
+    validate_inode(lock, paths)
 }
 
 fn read_inherited() -> io::Result<Option<File>> {
@@ -369,6 +380,41 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_lease_requires_the_exact_exclusive_description() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            socket: root.path().join("cagentsd.sock"),
+            lock: root.path().join("cagentsd.lock"),
+            directory: root.path().to_owned(),
+        };
+        let original = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        let unrelated = open_lock(&paths).unwrap();
+        assert!(validate_inherited(&original, &paths).is_err());
+        // SAFETY: original is a live regular file, and this call never blocks.
+        assert_eq!(
+            unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let inherited = original.try_clone().unwrap();
+        assert!(validate_inherited(&inherited, &paths).is_ok());
+        assert!(validate_inherited(&unrelated, &paths).is_err());
+        assert!(LeaseHandoff::try_acquire(&paths).unwrap().is_none());
+        drop(original);
+        assert!(validate_inherited(&inherited, &paths).is_ok());
+        assert!(LeaseHandoff::try_acquire(&paths).unwrap().is_none());
+        drop(inherited);
+        assert!(LeaseHandoff::try_acquire(&paths).unwrap().is_some());
+    }
 
     #[test]
     fn lease_handoff_cancelled_waiter_is_joined_before_source_releases_lock() {
