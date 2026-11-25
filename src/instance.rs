@@ -2235,6 +2235,23 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
     .map(|_| ())
 }
 
+/// Open a primary window when an explicit recovery had no previous windows
+/// to restore. Its first pane may only attach to an existing provider.
+#[cfg(feature = "ui")]
+pub(crate) fn open_recovered_window(executable: &Path) -> io::Result<()> {
+    match launch_window_at(
+        executable,
+        false,
+        Some(PRIMARY_WINDOW),
+        None,
+        WindowRestorePolicy::ExistingOnly,
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if crate::control::handshake_reports_already_running(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Session ids belong to a daemon/device namespace. Never resolve a local
 /// coordination link against a different device's saved window.
 pub fn window_matches_selected_device(slot: &str) -> io::Result<bool> {

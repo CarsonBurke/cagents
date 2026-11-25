@@ -513,23 +513,27 @@ struct StartupError {
     /// Why the last retry could not even start the launcher, shown in place
     /// of a dialog that silently did nothing.
     retry_failure: Option<String>,
+    recovery: Option<cagents::update::AppRecovery>,
+    recovering: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum StartupErrorMessage {
     Retry,
+    Recover,
+    Recovered(Result<(), String>, Option<cagents::update::AppRecovery>),
     Close,
 }
 
 impl cosmic::Application for StartupError {
     type Executor = cosmic::executor::Default;
-    type Flags = (String, bool);
+    type Flags = (String, bool, Option<cagents::update::AppRecovery>);
     type Message = StartupErrorMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StartupError";
 
     fn init(
         core: Core,
-        (message, still_starting): (String, bool),
+        (message, still_starting, recovery): Self::Flags,
     ) -> (Self, cosmic::app::Task<StartupErrorMessage>) {
         (
             Self {
@@ -537,6 +541,8 @@ impl cosmic::Application for StartupError {
                 message,
                 still_starting,
                 retry_failure: None,
+                recovery,
+                recovering: false,
             },
             cosmic::app::Task::none(),
         )
@@ -560,15 +566,68 @@ impl cosmic::Application for StartupError {
             StartupErrorMessage::Retry => match relaunch() {
                 Ok(()) => iced::exit().map(cosmic::Action::App),
                 Err(error) => {
-                    self.retry_failure = Some(error);
+                    self.retry_failure = Some(format!("Retry failed. {error}"));
                     cosmic::app::Task::none()
                 }
             },
+            StartupErrorMessage::Recover => {
+                let Some(recovery) = self.recovery.clone().filter(|_| !self.recovering) else {
+                    return cosmic::app::Task::none();
+                };
+                let result = match recovery.start(true) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.retry_failure = Some(error.to_string());
+                        return cosmic::app::Task::none();
+                    }
+                };
+                self.recovering = true;
+                self.retry_failure = None;
+                cosmic::task::future(async move {
+                    let result = result
+                        .await
+                        .map_err(|_| {
+                            "The recovery helper exited without reporting its result.".to_owned()
+                        })
+                        .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
+                    let next = if result.is_err() {
+                        tokio::task::spawn_blocking(cagents::update::AppRecovery::latest)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    StartupErrorMessage::Recovered(result, next)
+                })
+            }
+            StartupErrorMessage::Recovered(result, next) => {
+                self.recovering = false;
+                match result {
+                    Ok(()) => iced::exit().map(cosmic::Action::App),
+                    Err(error) => {
+                        self.recovery = next;
+                        self.retry_failure = Some(error);
+                        cosmic::app::Task::none()
+                    }
+                }
+            }
         }
     }
 
     fn view(&self) -> cosmic::Element<'_, StartupErrorMessage> {
-        let mut rows = if self.still_starting {
+        let mut rows = if self.recovery.is_some() {
+            vec![
+                cagents::design::title("Finish recovering the update").into(),
+                cagents::design::body(if self.recovering {
+                    "Recovering saved conversations and terminals…"
+                } else {
+                    "The update stopped before reopening your saved conversations and terminals. Recover them to reopen cagents."
+                })
+                .into(),
+            ]
+        } else if self.still_starting {
             vec![
                 cagents::design::title("cagents is taking longer than usual to start").into(),
                 cagents::design::body(sentence(&self.message)).into(),
@@ -590,13 +649,17 @@ impl cosmic::Application for StartupError {
             ]
         };
         if let Some(failure) = &self.retry_failure {
-            rows.push(cagents::design::body(format!("Retry failed: {failure}")).into());
+            rows.push(cagents::design::body(failure).into());
         }
+        let primary = if self.recovery.is_some() {
+            cagents_ui::ui_controls::button::primary("Recover saved work")
+                .on_press_maybe((!self.recovering).then_some(StartupErrorMessage::Recover))
+        } else {
+            cagents_ui::ui_controls::button::primary("Retry").on_press(StartupErrorMessage::Retry)
+        };
         rows.push(
             cosmic::widget::row::with_children(vec![
-                cagents_ui::ui_controls::button::primary("Retry")
-                    .on_press(StartupErrorMessage::Retry)
-                    .into(),
+                primary.into(),
                 cagents_ui::ui_controls::button::secondary("Close")
                     .on_press(StartupErrorMessage::Close)
                     .into(),
@@ -752,6 +815,10 @@ fn run_startup_error_dialog(
 ) -> Result<(), Box<dyn std::error::Error>> {
     type Shell = Cosmic<StartupError>;
     let message = message.to_owned();
+    let recovery = cagents::update::AppRecovery::latest().unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not check for recoverable update");
+        None
+    });
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
     iced::daemon(
         move || {
@@ -765,7 +832,8 @@ fn run_startup_error_dialog(
             });
             let mut core = Core::default();
             core.set_main_window_id(Some(window));
-            let (shell, task) = Shell::init((core, (message.clone(), still_starting)));
+            let (shell, task) =
+                Shell::init((core, (message.clone(), still_starting, recovery.clone())));
             (shell, iced::Task::batch([open.discard(), task]))
         },
         Shell::update,

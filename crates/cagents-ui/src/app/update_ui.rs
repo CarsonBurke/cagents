@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::ChannelId;
-use crate::update::{UpdateJob, UpdatePhase, UpdateState};
+use crate::update::{AppRecovery, UpdateJob, UpdatePhase, UpdateState};
 use cosmic::iced::futures::SinkExt;
 
 #[derive(Default)]
@@ -15,6 +15,8 @@ pub(super) struct State {
     poll_retry: bool,
     listening_for_progress: Option<String>,
     review_deferred: bool,
+    recovery: Option<AppRecovery>,
+    recovery_probed: Option<String>,
     /// Whether this window runs from an installation tree, the only place an
     /// install can leave it behind.
     watch_installation: bool,
@@ -146,6 +148,9 @@ pub enum Action {
     Applied(Result<UpdateJob, String>),
     ProgressWatch(String, bool),
     DiscoveryWatchFailed(usize),
+    RecoverSavedWork,
+    RecoveryProbed(String, Option<AppRecovery>),
+    RecoveryFinished(String, Result<String, String>),
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
     InspectInstallation,
@@ -1140,6 +1145,12 @@ impl Cagents {
                 "Saving and reopening windows with the installed build".to_owned(),
                 None,
             )
+        } else if state.recovery.is_some() {
+            (
+                Icon::Warning,
+                "Recover saved conversations and terminals".to_owned(),
+                Some(Message::UpdateUi(Action::RecoverSavedWork)),
+            )
         } else if state.superseded.is_some() {
             // Reopening retries the installed update. When a review refused
             // it, this outranks the warning that names why, so carry that,
@@ -1175,7 +1186,9 @@ impl Cagents {
         // surfaces asynchronously through the notices popover.
         let blocker = matches!(
             action,
-            Some(Message::UpdateUi(Action::Apply | Action::Restart))
+            Some(Message::UpdateUi(
+                Action::Apply | Action::Restart | Action::RecoverSavedWork
+            ))
         )
         .then(|| self.window_update_blocker())
         .flatten();
@@ -1512,6 +1525,68 @@ impl Cagents {
                 self.update_ui.listening_for_progress = listening.then_some(job);
                 self.apply_update_action(Action::Poll)
             }
+            Action::RecoverSavedWork => {
+                if self.update_ui.updating() || self.window_update_blocker().is_some() {
+                    return Task::none();
+                }
+                let (Some(recovery), Some(job)) = (&self.update_ui.recovery, &self.update_ui.job)
+                else {
+                    return Task::none();
+                };
+                let job = job.id.clone();
+                let receive = match recovery.clone().start(false) {
+                    Ok(receive) => receive,
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error.to_string()));
+                        return Task::none();
+                    }
+                };
+                self.update_ui.applying = true;
+                cosmic::task::future(async move {
+                    let result = receive
+                        .await
+                        .map_err(|_| {
+                            "The recovery helper exited without reporting its result.".to_owned()
+                        })
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                    Message::UpdateUi(Action::RecoveryFinished(job, result))
+                })
+            }
+            Action::RecoveryProbed(job, recovery) => {
+                if self.update_ui.job.as_ref().is_some_and(|current| {
+                    current.id == job && current.phase == UpdatePhase::Failed
+                }) {
+                    if recovery.is_none() {
+                        self.update_ui.recovery_probed = None;
+                    }
+                    self.update_ui.recovery = recovery;
+                }
+                Task::none()
+            }
+            Action::RecoveryFinished(job, result) => {
+                self.update_ui.applying = false;
+                if self
+                    .update_ui
+                    .job
+                    .as_ref()
+                    .is_some_and(|current| current.id == job)
+                {
+                    self.update_ui.recovery = None;
+                    self.update_ui.recovery_probed = None;
+                    match result {
+                        Ok(report) => {
+                            self.notices.record(
+                                TransientNotice::success("Saved sessions recovered")
+                                    .with_details(report),
+                            );
+                        }
+                        Err(error) => {
+                            self.status = Some(TransientNotice::error(error));
+                        }
+                    }
+                }
+                self.apply_update_action(Action::Poll)
+            }
             Action::Poll => {
                 if self.update_ui.polling {
                     self.update_ui.poll_again = true;
@@ -1548,6 +1623,30 @@ impl Cagents {
                     Ok(Some(job)) => {
                         self.update_ui.poll_retry = false;
                         self.update_ui.error = None;
+                        let probe = if job.phase == UpdatePhase::Failed
+                            && self.update_ui.recovery_probed.as_ref() != Some(&job.id)
+                        {
+                            self.update_ui.recovery = None;
+                            self.update_ui.recovery_probed = Some(job.id.clone());
+                            let id = job.id.clone();
+                            cosmic::task::future(async move {
+                                let recovery = tokio::task::spawn_blocking({
+                                    let id = id.clone();
+                                    move || AppRecovery::available(&id)
+                                })
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .flatten();
+                                Message::UpdateUi(Action::RecoveryProbed(id, recovery))
+                            })
+                        } else {
+                            if job.phase != UpdatePhase::Failed {
+                                self.update_ui.recovery = None;
+                                self.update_ui.recovery_probed = None;
+                            }
+                            Task::none()
+                        };
                         if let Some(refusal) = job
                             .refusal
                             .as_ref()
@@ -1620,10 +1719,12 @@ impl Cagents {
                             .cloned();
                         let offer = self.offer_update_resume(&job);
                         self.update_ui.job = Some(job);
-                        return Task::batch([offer, followup]);
+                        return Task::batch([offer, probe, followup]);
                     }
                     Ok(None) => {
                         self.update_ui.review_deferred = false;
+                        self.update_ui.recovery = None;
+                        self.update_ui.recovery_probed = None;
                         self.update_ui.poll_retry = self.update_ui.updating();
                         if !self.update_ui.poll_retry {
                             if self.update_ui.job.take().is_some() {

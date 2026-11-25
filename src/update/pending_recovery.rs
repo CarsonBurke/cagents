@@ -3,6 +3,178 @@
 use super::*;
 use crate::{daemon::lease_handoff::LeaseHandoff, upgrade::recovery::PendingRecovery};
 
+/// A recovery the person can authorize from the update control.
+#[cfg(feature = "ui")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppRecovery {
+    job: String,
+    candidate: PathBuf,
+    checkpoint: String,
+    census: PathBuf,
+    census_digest: String,
+    include_original_census: bool,
+    saved_windows: bool,
+}
+
+#[cfg(feature = "ui")]
+impl AppRecovery {
+    pub fn latest() -> Result<Option<Self>, UpdateError> {
+        match status()? {
+            Some(job) if job.phase == UpdatePhase::Failed => Self::available(&job.id),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn available(job: &str) -> Result<Option<Self>, UpdateError> {
+        if crate::device::is_remote()
+            || std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+            || uuid::Uuid::parse_str(job)
+                .ok()
+                .is_none_or(|id| id.to_string() != job)
+        {
+            return Ok(None);
+        }
+        let Some(current) =
+            status()?.filter(|current| current.id == job && current.phase == UpdatePhase::Failed)
+        else {
+            return Ok(None);
+        };
+        let installation = locate(&std::env::current_exe()?)?;
+        let Some(pending) = PendingRecovery::inspect().map_err(invalid)? else {
+            return Ok(None);
+        };
+        let original = pending.retained_job_id().unwrap_or(job);
+        if uuid::Uuid::parse_str(original)
+            .ok()
+            .is_none_or(|id| id.to_string() != original)
+        {
+            return Ok(None);
+        }
+        let state = installation.prefix.join(".update");
+        let receipt: recovery::Receipt =
+            match read_private(&recovery::outcome_path(&state, original), JOB_STATE_LIMIT) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        let Some(required) = receipt.target_required() else {
+            return Ok(None);
+        };
+        if required.source != pending.source
+            || required.checkpoint_digest != pending.checkpoint_hash
+        {
+            return Ok(None);
+        }
+        let retained =
+            recovery::retained_install_job(&installation, &pending, original, &current.version)?;
+        receipt.matches(&recovery::Census::load(&retained.census)?)?;
+        Ok(Some(Self {
+            job: job.to_owned(),
+            candidate: retained.cli,
+            checkpoint: required.checkpoint_digest,
+            census: retained.census,
+            census_digest: required.census_digest,
+            include_original_census: !pending.original_census_complete,
+            saved_windows: !pending.windows.is_empty(),
+        }))
+    }
+
+    /// Recovery waits for open windows to release their leases. Keep its
+    /// child waiter out of any window's executor so that executor can exit.
+    pub fn start(
+        self,
+        open_window: bool,
+    ) -> io::Result<tokio::sync::oneshot::Receiver<Result<String, UpdateError>>> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        thread::Builder::new()
+            .name("update-recovery".into())
+            .spawn(move || {
+                let _ = send.send(self.recover(open_window));
+            })?;
+        Ok(receive)
+    }
+
+    fn recover(self, open_window: bool) -> Result<String, UpdateError> {
+        if Self::available(&self.job)?.as_ref() != Some(&self) {
+            return Err(invalid(
+                "The saved recovery changed. Recheck the update before continuing.",
+            ));
+        }
+        let mut command = Command::new(&self.candidate);
+        command
+            .args([
+                "--no-start",
+                "--json",
+                "daemon",
+                "recover-update",
+                "--checkpoint",
+            ])
+            .arg(&self.checkpoint)
+            .arg("--yes")
+            .stdin(Stdio::null());
+        if self.include_original_census {
+            command.arg("--census").arg(&self.census);
+        }
+        crate::install_guard::sanitize_child_environment(&mut command);
+        // The recovery coordinator closes the windows before it starts the
+        // saved daemon and waits for the new windows to report ready.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                crate::daemon::seal_inherited_descriptors()
+            });
+        }
+        let report = recovery_reply(&command.output()?)?;
+        if open_window && !self.saved_windows {
+            crate::instance::open_recovered_window(&self.candidate.with_file_name("cagents-ui"))?;
+        }
+        Ok(report)
+    }
+}
+
+#[cfg(feature = "ui")]
+fn recovery_reply(output: &std::process::Output) -> Result<String, UpdateError> {
+    if output.status.success() {
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        return reply["data"]["report"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| invalid("The recovery finished without reporting its result"));
+    }
+    let message = output
+        .stderr
+        .rsplit(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find_map(|reply| reply["error"]["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            "Recovery could not finish. Your saved sessions are still available for recovery."
+                .into()
+        });
+    Err(invalid(message))
+}
+
+#[cfg(all(test, feature = "ui"))]
+#[test]
+fn recovery_preserves_the_candidates_json_refusal() {
+    use std::os::unix::process::ExitStatusExt;
+    let output = std::process::Output {
+        status: std::process::ExitStatus::from_raw(1 << 8),
+        stdout: vec![],
+        stderr: b"diagnostic\n{\"error\":{\"message\":\"The selected checkpoint changed\"}}\n"
+            .to_vec(),
+    };
+    assert!(
+        recovery_reply(&output)
+            .unwrap_err()
+            .to_string()
+            .contains("The selected checkpoint changed")
+    );
+}
+
 /// Run only through the exact retained candidate named in the recovery command.
 /// `--yes` authorizes this hash, rather than pretending a disk artifact is ACK.
 pub(crate) fn run(

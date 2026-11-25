@@ -4545,7 +4545,7 @@ fn already_running_ui_output() -> CommandOutput {
     }
 }
 
-fn handshake_reports_already_running(error: &io::Error) -> bool {
+pub(crate) fn handshake_reports_already_running(error: &io::Error) -> bool {
     error.to_string() == instance::ApplicationLeaseError::AlreadyRunning.to_string()
 }
 

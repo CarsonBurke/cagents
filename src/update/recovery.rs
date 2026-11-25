@@ -1515,9 +1515,9 @@ fn retirement_partition(
     }
 }
 
-struct RetainedJob {
-    cli: PathBuf,
-    census: PathBuf,
+pub(super) struct RetainedJob {
+    pub cli: PathBuf,
+    pub census: PathBuf,
 }
 
 fn missing_retained_job() -> UpdateError {
@@ -1555,9 +1555,22 @@ fn retained_job(
         read_private(&status_path, JOB_STATE_LIMIT).map_err(|_| missing_retained_job())?;
     let job: UpdateJob =
         serde_json::from_slice(&status_bytes).map_err(|_| missing_retained_job())?;
-    if uuid::Uuid::parse_str(&job.id).is_err()
+    let retained = retained_install_job(&caller, pending, &job.id, &job.version)?;
+    if read_private(&status_path, JOB_STATE_LIMIT)? != status_bytes {
+        return Err(missing_retained_job());
+    }
+    Ok(Some(retained))
+}
+
+pub(super) fn retained_install_job(
+    caller: &InstallLayout,
+    pending: &crate::upgrade::recovery::PendingRecovery,
+    job: &str,
+    version: &str,
+) -> Result<RetainedJob, UpdateError> {
+    if uuid::Uuid::parse_str(job).is_err()
         || !matches!(
-            Path::new(&job.version)
+            Path::new(version)
                 .components()
                 .collect::<Vec<_>>()
                 .as_slice(),
@@ -1569,13 +1582,14 @@ fn retained_job(
     let cli = caller
         .prefix
         .join("versions")
-        .join(&job.version)
+        .join(version)
         .join("bin/cagents");
     let target = locate(&cli).map_err(|_| missing_retained_job())?;
-    if target.prefix != caller.prefix || target.version != job.version {
+    if target.prefix != caller.prefix || target.version != version {
         return Err(missing_retained_job());
     }
-    let request_bytes = read_private(&state.join(format!("{}.request", job.id)), JOB_STATE_LIMIT)
+    let state = caller.prefix.join(".update");
+    let request_bytes = read_private(&state.join(format!("{job}.request")), JOB_STATE_LIMIT)
         .map_err(|_| missing_retained_job())?;
     let request: UpdateRequest =
         serde_json::from_slice(&request_bytes).map_err(|_| missing_retained_job())?;
@@ -1584,25 +1598,24 @@ fn retained_job(
             .canonicalize()
             .is_ok_and(|root| root == target.version_root),
         UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
-            release.version == job.version
+            release.version == version
         }
     };
-    let path = census_path(&state, &job.id);
+    let path = census_path(&state, job);
     let census_bytes = read_private(&path, JOB_STATE_LIMIT).map_err(|_| missing_retained_job())?;
     let original: Census =
         serde_json::from_slice(&census_bytes).map_err(|_| missing_retained_job())?;
     original.validate().map_err(|_| missing_retained_job())?;
     if !target_matches
-        || original.transaction != job.id
+        || original.transaction != job
         || original.source.as_ref() != Some(&pending.source)
         || original.checkpoint_before.as_ref() == Some(&pending.checkpoint_hash)
-        || !pending.matches_retained_job(&job.id, &request_bytes, &census_bytes)
-        || read_private(&status_path, JOB_STATE_LIMIT)? != status_bytes
+        || !pending.matches_retained_job(job, &request_bytes, &census_bytes)
         || read_private(&path, JOB_STATE_LIMIT)? != census_bytes
     {
         return Err(missing_retained_job());
     }
-    Ok(Some(RetainedJob { cli, census: path }))
+    Ok(RetainedJob { cli, census: path })
 }
 
 fn pending_required(

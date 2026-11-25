@@ -14,6 +14,8 @@ pub mod in_flight;
 mod installed;
 mod pending_recovery;
 pub mod progress;
+#[cfg(feature = "ui")]
+pub use pending_recovery::AppRecovery;
 pub mod recovery;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]

@@ -882,6 +882,16 @@ pub(crate) fn capture_before_floor(
 }
 
 impl PendingRecovery {
+    #[cfg(feature = "ui")]
+    pub(crate) fn retained_job_id(&self) -> Option<&str> {
+        match self.producer.as_ref()? {
+            CaptureProducer::Proposed { job, .. } | CaptureProducer::Acknowledged { job, .. } => {
+                Some(job)
+            }
+            CaptureProducer::ExplicitCensus { transaction, .. } => Some(transaction),
+        }
+    }
+
     /// Read-only job routing, never acknowledgement or automatic recovery
     /// authority. Callers still bind the job's source and immutable request.
     pub(crate) fn matches_retained_job(
