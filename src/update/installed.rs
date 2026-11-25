@@ -303,7 +303,7 @@ pub(super) fn perform(
             let source =
                 crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
                     .map_err(|error| invalid(error.to_string()))?;
-            let executable = fs::read_link(format!("/proc/{}/exe", source.pid))?;
+            let executable = source.executable()?;
             let owner = locate(&executable)?;
             if owner.prefix != installation.prefix
                 || source.exited()?

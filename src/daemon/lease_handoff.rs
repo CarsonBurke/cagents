@@ -55,6 +55,10 @@ impl HandoffSource {
         self.exited_within(std::time::Duration::ZERO)
     }
 
+    pub(crate) fn executable(&self) -> io::Result<std::path::PathBuf> {
+        self.process.executable()
+    }
+
     /// Whether the pinned process exits within `timeout`. A daemon releases
     /// its lease before its process has finished exiting, so lease ownership
     /// alone does not prove the source has stopped.
