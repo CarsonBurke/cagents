@@ -1729,6 +1729,19 @@ impl UiUpdateGuard {
         Ok(slots)
     }
 
+    /// Finish draining the windows this update prepared, if any.
+    pub(crate) fn close_remaining_prepared_windows(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<bool> {
+        if self.prepared.is_empty() {
+            return Ok(false);
+        }
+        let slots = self.prepared.clone();
+        self.close_prepared_windows(&slots, timeout)?;
+        Ok(true)
+    }
+
     /// Human review has no window-RPC deadline. Closing gets its own budget.
     pub(crate) fn close_prepared_windows(
         &mut self,

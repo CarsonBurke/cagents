@@ -27,6 +27,8 @@ struct FakeSource {
     predicted_service: bool,
     fail_inventory: bool,
     existing_checkpoint: bool,
+    window_close_refused: bool,
+    windows_drained: bool,
     close_attempts: usize,
     fail_close_at: Option<usize>,
     change_on_first_close: bool,
@@ -116,6 +118,13 @@ impl FloorSource for FakeSource {
             ));
         }
         Ok(())
+    }
+    fn close_saved_windows(&mut self) -> Result<bool, UpdateError> {
+        if self.window_close_refused {
+            self.event("window close refused");
+            return Err(invalid("A saved window kept its lease"));
+        }
+        Ok(self.windows_drained)
     }
     fn prepare(&mut self, _: &impact::DaemonImpact) -> Result<(), source::PrepareError> {
         if self.lose_prepare_ack {
@@ -431,6 +440,8 @@ fn fixture() -> FakeSource {
         predicted_service: false,
         fail_inventory: false,
         existing_checkpoint: false,
+        window_close_refused: false,
+        windows_drained: false,
         close_attempts: 0,
         fail_close_at: None,
         change_on_first_close: false,
@@ -2097,6 +2108,46 @@ fn recovery_report_keeps_completed_floor_actions_for_failures_after_quiescence()
         items: Vec::new(),
     });
     assert_eq!(survivors.recovery_report(), report);
+}
+
+#[test]
+fn a_window_close_refusal_does_not_request_source_preparation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut job = job(directory.path());
+    let mut source = fixture();
+    source.window_close_refused = true;
+    let preview = source.preview.clone();
+
+    let error =
+        quiesce_source(directory.path(), &mut job, &preview, false, &mut source).unwrap_err();
+
+    assert!(error.to_string().contains("A saved window kept its lease"));
+    assert_eq!(*source.events.lock().unwrap(), ["window close refused"]);
+    source.assert_running_panes_are_unmarked();
+}
+
+#[test]
+fn draining_windows_does_not_authorize_a_new_stop_review() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut job = job(directory.path());
+    let mut source = fixture();
+    source.windows_drained = true;
+    source.prepare_refusals = 1;
+    let preview = source.preview.clone();
+
+    let error =
+        quiesce_source(directory.path(), &mut job, &preview, true, &mut source).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("No exact resumable conversation")
+    );
+    assert_eq!(
+        *source.events.lock().unwrap(),
+        ["PrepareConfirmedUpgrade refused"]
+    );
+    source.assert_running_panes_are_unmarked();
 }
 
 #[test]

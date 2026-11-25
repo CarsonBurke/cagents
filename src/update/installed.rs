@@ -140,7 +140,7 @@ pub(super) fn perform(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
-    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    guard.prepare_windows(Duration::from_secs(45))?;
     {
         let inspected = crate::install_guard::preflight_source_panes(
             &guard,
@@ -201,7 +201,7 @@ pub(super) fn perform(
             |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
             handoff,
             survivors,
-            &guard,
+            &mut guard,
         )?;
         if previous.is_some()
             && let Some(lease) = handoff.as_ref()
@@ -210,7 +210,7 @@ pub(super) fn perform(
         }
         survivors.authorize_successor(&root.join("bin/cagentsd"), None, handoff.as_ref())?;
         confirmation::prepared(state, job)?;
-        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
+        guard.close_remaining_prepared_windows(Duration::from_secs(45))?;
         set_phase(
             state,
             job,

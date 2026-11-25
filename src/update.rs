@@ -2375,7 +2375,7 @@ fn perform_update(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
-    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    guard.prepare_windows(Duration::from_secs(45))?;
     // The build these windows run, to return to if the new one cannot open.
     let previous = installation.prefix.join("current").canonicalize()?;
     // The daemon serving these windows; one still serving after the install
@@ -2440,7 +2440,7 @@ fn perform_update(
             |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
             handoff,
             survivors,
-            &guard,
+            &mut guard,
         )?;
         let target_daemon = installation
             .prefix
@@ -2455,7 +2455,7 @@ fn perform_update(
             )?;
         }
         confirmation::prepared(state, job)?;
-        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
+        guard.close_remaining_prepared_windows(Duration::from_secs(45))?;
         Installation::detect()?;
         set_phase(
             state,
