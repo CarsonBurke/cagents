@@ -35,13 +35,15 @@ class MarkdownTest {
         "Windows\r\nlines\r\n\r\n```\r\ncode\r\n```\r\nend",
         "A lone\rreturn\r```\rcode\r```\rtext\n\nnext",
         "#not a heading\n### Three\n```\nunclosed\n\nstill code",
+        "Ends\r\n\r\nin a heading\r\n## Last",
+        "Split\r\n\r\r\n\n```\r\nx\r\r\n",
         "",
     )
 
     @Test
     fun streamedTextGivesTheSameBlocksAsTheWhole() {
         for (sample in samples) {
-            for (chunk in listOf(1, 2, 3, 7, 16)) {
+            for (chunk in listOf(1, 2, 3, 4, 7, 16)) {
                 val markdown = IncrementalMarkdown()
                 var end = 0
                 while (end < sample.length) {

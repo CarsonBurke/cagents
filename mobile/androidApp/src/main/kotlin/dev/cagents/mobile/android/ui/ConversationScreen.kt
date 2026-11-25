@@ -104,7 +104,7 @@ fun ConversationScreen(
     // conversations changing don't recompose it.
     val view by remember(session) {
         vm.remote.map { ConversationView.of(it, session) }.distinctUntilChanged()
-    }.collectAsStateWithLifecycle(ConversationView.of(vm.remote.value, session))
+    }.collectAsStateWithLifecycle(remember(session) { ConversationView.of(vm.remote.value, session) })
     val conversation = view.conversation
     val state = conversation?.state ?: ConversationState()
     val title = state.title ?: view.listedTitle ?: "Conversation"
