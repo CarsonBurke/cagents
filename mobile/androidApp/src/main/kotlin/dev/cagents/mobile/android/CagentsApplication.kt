@@ -63,9 +63,8 @@ class AppGraph(private val app: Application) {
 
     init {
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
-            override fun onStart(owner: LifecycleOwner) {
-                if (settings.settings.value.isComplete) controller.setForeground(true)
-            }
+            override fun onStart(owner: LifecycleOwner) =
+                controller.setForeground(true, connect = settings.settings.value.isComplete)
 
             override fun onStop(owner: LifecycleOwner) = controller.setForeground(false)
         })

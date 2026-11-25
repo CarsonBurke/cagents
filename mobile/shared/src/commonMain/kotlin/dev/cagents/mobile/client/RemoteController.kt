@@ -90,6 +90,14 @@ class RemoteController(
 
     private var loop: Job? = null
     private var backgroundStop: Job? = null
+
+    /**
+     * Whether the person may be looking at the app. Only then are its
+     * conversations watched: a watching phone counts as someone following
+     * them on the computer.
+     */
+    @kotlin.concurrent.Volatile
+    private var foreground = true
     private val wake = Channel<Unit>(Channel.CONFLATED)
 
     @kotlin.concurrent.Volatile
@@ -108,10 +116,16 @@ class RemoteController(
     private data class Sync(val session: String, val kind: SyncKind)
 
     private enum class SyncKind {
-        /** Watch it if held and not ended, unwatch it otherwise. */
+        /**
+         * Watch it if held and not ended, unwatch it otherwise. In the
+         * background every one is unwatched once its requests are answered.
+         */
         Settle,
 
-        /** Watch it if held, even when ended or already watched, for a fresh reset. */
+        /**
+         * Watch it if held, even when ended or already watched, for a fresh
+         * reset. In the background, once the app returns.
+         */
         Watch,
 
         /** Like [Watch], unless the recovery that asked for it was settled meanwhile. */
@@ -126,6 +140,14 @@ class RemoteController(
      * cleanly in between. Guarded by [locked].
      */
     private val recoveries = HashMap<String, Int>()
+
+    /**
+     * Requests awaiting their answer, for each conversation. It stays
+     * watched in the background until they have it: the computer answers
+     * a request whose conversation is let go with an error, though it may
+     * have done what was asked. Guarded by [locked].
+     */
+    private val inFlight = HashMap<String, Int>()
 
     /** Starts connecting, unless already running. */
     fun start() = locked {
@@ -167,23 +189,29 @@ class RemoteController(
     }
 
     /**
-     * Follows the app going to the background and back. In the background the
-     * connection stays for [ControllerConfig.backgroundGrace], so a quick
-     * switch away doesn't drop it, and then closes; it no longer counts as the
-     * person looking at the open conversations.
+     * Follows the app going to the background and back. In the background
+     * the open conversations are unwatched at once, since nobody is looking
+     * at them, or once their requests are answered. The connection stays
+     * for [ControllerConfig.backgroundGrace], so a quick switch away doesn't
+     * drop it, and then closes. Coming back watches them again and, if
+     * [connect], connects.
      */
-    fun setForeground(foreground: Boolean) {
+    fun setForeground(foreground: Boolean, connect: Boolean = true) {
+        this.foreground = foreground
         if (foreground) {
-            start()
-            return
-        }
-        locked {
-            backgroundStop?.cancel()
-            backgroundStop = scope.launch {
-                delay(config.backgroundGrace)
-                disconnect()
+            if (connect) start()
+        } else {
+            locked {
+                backgroundStop?.cancel()
+                backgroundStop = scope.launch {
+                    delay(config.backgroundGrace)
+                    disconnect()
+                }
             }
         }
+        // Settles each one by whether it is wanted now, after a quick switch
+        // away and back, which may be no change at all.
+        _state.value.conversations.keys.forEach { sync(it, SyncKind.Settle) }
     }
 
     /** Follows a conversation, now and after every reconnect. */
@@ -231,7 +259,18 @@ class RemoteController(
 
     private suspend fun call(call: Call) {
         val bridge = current ?: throw ConnectionLost("Not connected to the computer.")
-        bridge.call(call)
+        val session = (call as? Call.OnSession)?.session ?: return bridge.call(call)
+        locked { inFlight[session] = (inFlight[session] ?: 0) + 1 }
+        try {
+            bridge.call(call)
+        } finally {
+            val last = locked {
+                val left = inFlight.getValue(session) - 1
+                if (left == 0) inFlight -= session else inFlight[session] = left
+                left == 0
+            }
+            if (last && !foreground) sync(session, SyncKind.Settle)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -318,14 +357,28 @@ class RemoteController(
      */
     private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) {
         val watched = HashSet<String>()
+        // Asked for again in the background, to be watched on return.
+        val deferred = HashSet<String>()
         for ((session, kind) in queue) {
             // A recovery given up on, or closed, since it was queued.
             if (kind == SyncKind.Resync && locked { session !in resyncing }) continue
-            val force = kind != SyncKind.Settle
-            // An ended conversation, whose updates stopped or can't be read, is
-            // let go unless asked for again.
             val held = _state.value.conversations[session]
-            val wanted = held != null && (force || held.ended == null)
+            val looking = foreground || locked { session in inFlight }
+            val force = when {
+                held == null -> {
+                    deferred -= session
+                    false
+                }
+                looking -> deferred.remove(session) || kind != SyncKind.Settle
+                else -> {
+                    if (kind != SyncKind.Settle) deferred += session
+                    false
+                }
+            }
+            // An ended conversation, whose updates stopped or can't be read, is
+            // let go unless asked for again; in the background, every one is
+            // once its requests are answered.
+            val wanted = held != null && looking && (force || held.ended == null)
             try {
                 if (wanted && (force || session !in watched)) {
                     try {
