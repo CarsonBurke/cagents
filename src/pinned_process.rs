@@ -389,6 +389,11 @@ impl PinnedProcess {
         self.while_running(imp::command_line(self.pid))
     }
 
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn parent_pid(&self) -> io::Result<u32> {
+        self.while_running(imp::bsd_info(self.pid).map(|info| info.pbi_ppid))
+    }
+
     /// The files the pinned process holds open.
     ///
     /// # Errors

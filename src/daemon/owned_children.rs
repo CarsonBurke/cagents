@@ -19,6 +19,29 @@ pub enum DetachedWork {
     Spare,
 }
 
+/// Establish the process boundary before a dedicated provider helper spawns.
+pub(crate) fn initialize_provider_owner() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::process::become_subreaper()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: getsid(0) queries the calling process and takes no pointers.
+        let session = unsafe { libc::getsid(0) };
+        if session < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if session as u32 != std::process::id() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider helper must lead its own session on macOS",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Processes pinned, so a process that later reuses one's pid is never
 /// signalled in its place.
 #[derive(Default)]
@@ -30,6 +53,7 @@ struct Pinned {
 impl Pinned {
     /// Pins each of `processes` that is still that exact process, exited or
     /// not; one whose pid now names another process is skipped.
+    #[cfg(target_os = "linux")]
     fn pin(processes: &[Process]) -> io::Result<Self> {
         let mut pinned = Self::default();
         for process in processes {
@@ -46,6 +70,17 @@ impl Pinned {
                 pinned.processes.push(pin);
                 pinned.pids.push(process.pid);
             }
+        }
+        Ok(pinned)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pin(processes: &[Process]) -> io::Result<Self> {
+        let mut pinned = Self::default();
+        for process in processes {
+            let pid = u32::try_from(process.pid).map_err(io::Error::other)?;
+            let pin = PinnedProcess::open_started(pid, process.start)?;
+            pinned.processes.push(pin);
         }
         Ok(pinned)
     }
@@ -151,6 +186,13 @@ impl OwnedChildren {
         self.child.as_ref().expect("owned provider").id() as i32
     }
 
+    /// The child reaper establishes that the original provider and its known
+    /// group ended. Darwin hands escaped descendants to launchd, so ECHILD
+    /// alone cannot authorize a Stop receipt for a provider that ran there.
+    pub(crate) fn require_cleanup_proof(&self) -> io::Result<()> {
+        require_detached_cleanup_proof(self.detached)
+    }
+
     pub(crate) fn exited(&self) -> bool {
         let Some(child) = &self.child else {
             return true;
@@ -210,13 +252,17 @@ impl OwnedChildren {
             if self.detached == DetachedWork::Spare {
                 // Let the provider end its own session, as quitting its CLI
                 // would, before anything is forced.
-                self.signal_provider(libc::SIGTERM);
+                self.signal_provider(libc::SIGTERM)?;
                 let grace = Instant::now() + crate::chat::TERMINATE_GRACE.min(timeout);
                 while !(self.exited() && self.provider.exited()) && Instant::now() < grace {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            self.signal_provider(libc::SIGKILL);
+            self.signal_provider(libc::SIGKILL)?;
+            #[cfg(target_os = "macos")]
+            if let Some(child) = &self.child {
+                crate::process::identity::finish_unreaped_group(child.id() as i32, timeout)?;
+            }
             self.group_signalled = true;
         }
         // The grace above is the provider's own; reaping gets the timeout.
@@ -227,15 +273,30 @@ impl OwnedChildren {
         }
     }
 
-    fn signal_provider(&self, signal: libc::c_int) {
+    fn signal_provider(&self, signal: libc::c_int) -> io::Result<()> {
         if let Some(child) = &self.child {
             // The group leader is still our unreaped child, so this number
             // cannot have been recycled. Never use it again after reaping.
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::kill(-(child.id() as i32), signal);
             }
+            #[cfg(target_os = "macos")]
+            {
+                let pid = child.id() as i32;
+                crate::process::identity::signal_unreaped_group(pid, signal)?;
+                // SAFETY: this helper owns the unreaped child. It may have
+                // left the original group, but its own pid is still reserved.
+                if unsafe { libc::kill(pid, signal) } == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
+                }
+            }
         }
         self.provider.signal(signal);
+        Ok(())
     }
 
     fn stop_children(&mut self, deadline: Instant) -> io::Result<bool> {
@@ -266,7 +327,16 @@ impl OwnedChildren {
         loop {
             // A server its launcher left behind may be adopted here only now.
             self.provider.signal(libc::SIGKILL);
-            if self.reap()? || (self.child.is_none() && !self.provider.remain()) {
+            let no_children = self.reap()?;
+            #[cfg(target_os = "linux")]
+            let ended = no_children || (self.child.is_none() && !self.provider.remain());
+            #[cfg(target_os = "macos")]
+            // The confirmed server can be reparented to launchd while it
+            // exits. Our wait cannot prove the server's end on that platform.
+            let ended = self.child.is_none() && !self.provider.remain();
+            #[cfg(target_os = "macos")]
+            let _ = no_children;
+            if ended {
                 return Ok(true);
             }
             if Instant::now() >= deadline {
@@ -299,6 +369,18 @@ impl OwnedChildren {
             }
         }
     }
+}
+
+pub(crate) fn require_detached_cleanup_proof(detached: DetachedWork) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if detached == DetachedWork::Stop {
+        return Err(io::Error::other(
+            "The provider stopped, but macOS could not confirm cleanup of detached processes",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let _ = detached;
+    Ok(())
 }
 
 /// Whether `pid`, an unreaped child of this process, exited by `SIGKILL`.

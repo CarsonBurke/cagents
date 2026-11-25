@@ -107,12 +107,13 @@ IFS= read -r frame || :
         );
         Err(error)
     };
-    let error = Server::start_after_scope_enrollment(startup(0), &control, reject)
+    let error = Server::start_after_scope_enrollment(startup(0), &control, reject, || {})
         .err()
         .unwrap();
     assert!(error.contains("Incompatible retained Claude actor launch"));
     assert!(!marker.exists(), "required startup failures remain fatal");
-    let server = Server::start_after_scope_enrollment(startup(PROTOCOL), &control, reject).unwrap();
+    let server =
+        Server::start_after_scope_enrollment(startup(PROTOCOL), &control, reject, || {}).unwrap();
     let socket = server.socket.clone();
     let record = server.identity.record.clone();
     let record_path = registry::directory(Kind::Native)
@@ -291,7 +292,7 @@ while IFS= read -r frame; do :; done
         provider_directory_observed: false,
         recovery_environment: BTreeMap::new(),
     };
-    let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
+    let server = Server::start_after_scope_enrollment(startup, &control, || Ok(()), || {}).unwrap();
     let provider = server.identity.record.root.clone();
     let mut parent = Some(parent);
     let (serving, serving_thread) = std::sync::mpsc::channel();

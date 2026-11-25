@@ -150,6 +150,80 @@ pub fn child_exit_status(
     waited_status(pid, flags)
 }
 
+/// Try to signal an owned group. Darwin returns EPERM both when the group
+/// contains only a zombie and when no member permits the signal. The caller
+/// confirms group exit with `finish_unreaped_group` before reaping.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn signal_unreaped_group(pid: i32, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: caller owns the unreaped child that reserves this group ID.
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH | libc::EPERM) => Ok(()),
+        _ => Err(error),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn finish_unreaped_group(pid: i32, timeout: std::time::Duration) -> io::Result<()> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + timeout;
+    // Check the leader's exit before taking the group snapshot. Every other
+    // listed member counts, even if it vanishes before it could be pinned:
+    // it could have forked a new member while exiting.
+    while waited_status(pid as u32, libc::WEXITED | libc::WNOWAIT)?.is_none()
+        || group_has_other_members(pid as u32)?
+    {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Provider process group has not finished exiting",
+            ));
+        }
+        signal_unreaped_group(pid, libc::SIGKILL)?;
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn group_has_other_members(group: u32) -> io::Result<bool> {
+    // XNU's PROC_PGRP_ONLY lists the exact group even when a member changed
+    // UID. A same-user census could miss a member that refused the signal.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let width = std::mem::size_of::<libc::pid_t>();
+    // SAFETY: a null buffer and size zero request the required size.
+    let needed = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Err(io::Error::other(
+            "Cannot size the provider process group census",
+        ));
+    }
+    let mut entries: Vec<libc::pid_t> = vec![0; needed as usize / width + 64];
+    let capacity = libc::c_int::try_from(entries.len() * width).map_err(io::Error::other)?;
+    // SAFETY: errno is local to this thread. The group can be empty, and
+    // libproc returns zero both for empty results and for kernel errors.
+    let (bytes, errno) = unsafe {
+        *libc::__error() = 0;
+        let bytes =
+            libc::proc_listpids(PROC_PGRP_ONLY, group, entries.as_mut_ptr().cast(), capacity);
+        (bytes, *libc::__error())
+    };
+    if bytes == 0 && errno != 0 {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    if bytes < 0 || bytes >= capacity || !(bytes as usize).is_multiple_of(width) {
+        return Err(io::Error::other("Incomplete provider process group census"));
+    }
+    Ok(entries
+        .into_iter()
+        .take(bytes as usize / width)
+        .any(|pid| pid != 0 && pid as u32 != group))
+}
+
 /// The status of a child whose exit the kernel has already announced, by
 /// NOTE_EXIT or by refusing to watch it. XNU announces the exit while tearing
 /// the process down, and only reports it to waitid once the child is a zombie,

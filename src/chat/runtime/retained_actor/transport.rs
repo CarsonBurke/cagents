@@ -2746,15 +2746,20 @@ impl Server {
         startup: Startup,
         control: &UnixStream,
         enroll: impl FnOnce() -> std::io::Result<()>,
+        on_launch: impl FnOnce(),
     ) -> Result<Self, String> {
         // This is optional OOM/cgroup isolation, not launch authorization.
         // Keep the authenticated, descriptor-sealed process-group fallback
         // used by terminal/native holders when the user manager rejects it.
         let _ = enroll();
-        Self::start(startup, control)
+        Self::start(startup, control, on_launch)
     }
 
-    fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
+    fn start(
+        startup: Startup,
+        control: &UnixStream,
+        on_launch: impl FnOnce(),
+    ) -> Result<Self, String> {
         if startup.protocol != PROTOCOL
             || startup.source.launch.provider != crate::agent::Provider::Claude
         {
@@ -2818,6 +2823,7 @@ impl Server {
         if disconnected(control)? {
             return Err("Retained actor launch cancelled before process creation".into());
         }
+        on_launch();
         let actor = LocalHandle::start_retained(
             spec_and_adapter.0,
             spec_and_adapter.1,
@@ -4365,13 +4371,20 @@ fn reap_orphans(detached: DetachedWork) -> Result<(), String> {
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        #[cfg(target_os = "linux")]
         let children =
             std::fs::read_to_string(format!("/proc/self/task/{}/children", std::process::id()))
                 .map_err(|error| error.to_string())?;
-        for pid in children
+        #[cfg(target_os = "linux")]
+        let children = children
             .split_whitespace()
-            .filter_map(|pid| pid.parse::<i32>().ok())
-        {
+            .filter_map(|pid| pid.parse::<i32>().ok());
+        #[cfg(target_os = "macos")]
+        let children =
+            crate::daemon::owned_children::direct_children().map_err(|error| error.to_string())?;
+        for pid in children {
+            // SAFETY: this helper is now the sole reaper. A child in its
+            // wait set cannot have its PID reused until this helper reaps it.
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
             }
@@ -4381,7 +4394,8 @@ fn reap_orphans(detached: DetachedWork) -> Result<(), String> {
                 pid if pid > 0 => continue,
                 0 => break,
                 _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) => {
-                    return Ok(());
+                    return crate::daemon::owned_children::require_detached_cleanup_proof(detached)
+                        .map_err(|error| error.to_string());
                 }
                 _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {
                     continue;
@@ -4439,7 +4453,8 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
             libc::signal(libc::SIGCHLD, libc::SIG_DFL);
         }
         crate::process::set_name(c"cagents-native");
-        crate::process::become_subreaper().map_err(|error| error.to_string())?;
+        crate::daemon::owned_children::initialize_provider_owner()
+            .map_err(|error| error.to_string())?;
         // Every child spawned from here on must register with the sweep.
         crate::daemon::adopted_orphans::become_sweeper();
         // Before any other thread starts: on Linux all of them must inherit
@@ -4448,12 +4463,14 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         // instead.
         let children = ChildEvents::new().ok();
         let mut detached = DetachedWork::Stop;
+        let mut launch_attempted = false;
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
             let mut server = Server::start_after_scope_enrollment(
                 startup,
                 &control,
                 crate::daemon::process_scope::enroll_current_process,
+                || launch_attempted = true,
             )?;
             let served = server.serve(
                 control.try_clone().map_err(|error| error.to_string())?,
@@ -4469,6 +4486,12 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         // refused. Failure to reap cannot be reported as successful teardown.
         // What the provider left running when a close let it quit as its CLI
         // does is the user's, not the provider's.
+        #[cfg(target_os = "macos")]
+        if !launch_attempted {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        let _ = launch_attempted;
         reap_orphans(detached)
     })())
 }

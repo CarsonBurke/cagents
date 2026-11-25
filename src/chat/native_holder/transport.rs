@@ -98,13 +98,18 @@ impl Spawn {
         let mut command = Command::new(&self.program);
         command
             .args(&self.arguments)
-            .current_dir(&self.directory)
             .env_clear()
             .envs(&self.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
+        #[cfg(target_os = "linux")]
+        command.current_dir(&self.directory);
+        #[cfg(target_os = "macos")]
+        if self.directory_fd.is_none() {
+            command.current_dir(&self.directory);
+        }
         crate::descriptor_limit::inherit(&mut command);
         // On Linux the helper's signalfd owns SIGCHLD, blocked in every
         // thread; its provider must receive the usual unblocked child-exit
@@ -835,6 +840,7 @@ impl Residence {
     fn start(
         spawn: Spawn,
         scope: Option<crate::daemon::process_scope::ProviderScope>,
+        on_spawn: impl FnOnce(),
     ) -> Result<Self, String> {
         // Watch for child exits before creating children so even a very
         // short-lived tool cannot disappear between the initial reap and the
@@ -866,12 +872,11 @@ impl Residence {
         let socket = registry::socket(&directory, spawn.recovery.source.id);
         let listener = Listener::bind(socket)?;
         let inherited = spawn.environment.get("TMPDIR").map(std::ffi::OsStr::new);
-        let pinned = working_directory
-            .as_ref()
-            .map(|directory| PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())));
-        let cwd = pinned.as_deref().unwrap_or(&spawn.directory);
-        let mut temp = PrivateDir::create(inherited, Some(cwd))
-            .map_err(|error| format!("Cannot create private Codex temporary directory: {error}"))?;
+        let mut temp =
+            PrivateDir::create_for_launch(inherited, working_directory.as_ref(), &spawn.directory)
+                .map_err(|error| {
+                    format!("Cannot create private Codex temporary directory: {error}")
+                })?;
         let mut command = spawn.command();
         command.envs(TEMP_ENV_KEYS.map(|key| (key, temp.path())));
         let child = match command.spawn() {
@@ -880,6 +885,7 @@ impl Residence {
                 return Err(error.to_string());
             }
         };
+        on_spawn();
         temp.launched();
         let record = Record {
             version: 4,
@@ -913,11 +919,17 @@ impl Residence {
         Ok(residence)
     }
 
+    #[cfg(target_os = "linux")]
     fn exited(&self) -> bool {
         self.recovery
             .server_process
             .as_ref()
             .map_or_else(|| self.child.exited(), |server| !server.is_current())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exited(&self) -> bool {
+        self.provider_pidfd.exited().unwrap_or(false)
     }
 
     fn release(&mut self) -> Result<(), String> {
@@ -934,6 +946,9 @@ impl Residence {
                     .into(),
             );
         }
+        self.child
+            .require_cleanup_proof()
+            .map_err(|error| error.to_string())?;
         if let Some(temp) = self.temp.take() {
             let path = temp.path().to_path_buf();
             if let Err(error) = temp.close_if_unused() {
@@ -1095,43 +1110,16 @@ impl Residence {
     }
 
     fn verify_server(&self, server: &Process) -> Result<(), String> {
-        if self
-            .recovery
-            .server_process
-            .as_ref()
-            .is_some_and(|old| old != server)
-        {
-            return Err("The retained app-server process changed".into());
+        match &self.recovery.server_process {
+            Some(confirmed) if confirmed != server => {
+                Err("The retained app-server process changed".into())
+            }
+            #[cfg(target_os = "macos")]
+            // The exact, already-authenticated app-server can be reparented
+            // to launchd when its launcher exits. Its pin still identifies it.
+            Some(_) => ensure_provider_live(&self.provider_pidfd),
+            _ => verify_server_ancestry(server, &self.record.holder),
         }
-        let mut current = server.clone();
-        // A launcher may exec the server or spawn it. This dedicated holder
-        // owns only that provider tree, including reparented descendants.
-        for _ in 0..1024 {
-            let stat = std::fs::read(format!("/proc/{}/stat", current.pid))
-                .map_err(|error| error.to_string())?;
-            let (_, start) = crate::model::agent_recovery::process_identity(&stat)
-                .ok_or("Invalid app-server ancestry")?;
-            let parent: i32 = std::str::from_utf8(&stat)
-                .ok()
-                .and_then(|stat| stat.rsplit_once(')'))
-                .and_then(|(_, fields)| fields.split_whitespace().nth(1))
-                .and_then(|parent| parent.parse().ok())
-                .ok_or("Invalid app-server parent")?;
-            if start != current.start {
-                break;
-            }
-            if parent == self.record.holder.pid
-                && self.record.holder.is_current()
-                && server.is_current()
-            {
-                return Ok(());
-            }
-            if parent <= 1 {
-                break;
-            }
-            current = Process::read(parent).map_err(|error| error.to_string())?;
-        }
-        Err("Codex socket peer is not owned by this native holder".into())
     }
 
     fn orphan(&mut self) -> bool {
@@ -1211,6 +1199,66 @@ impl Residence {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_server_ancestry(server: &Process, holder: &Process) -> Result<(), String> {
+    let mut current = server.clone();
+    // A launcher may exec the server or spawn it. This dedicated holder
+    // owns only that provider tree, including reparented descendants.
+    for _ in 0..1024 {
+        let stat = std::fs::read(format!("/proc/{}/stat", current.pid))
+            .map_err(|error| error.to_string())?;
+        let (_, start) = crate::model::agent_recovery::process_identity(&stat)
+            .ok_or("Invalid app-server ancestry")?;
+        let parent: i32 = std::str::from_utf8(&stat)
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')'))
+            .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+            .and_then(|parent| parent.parse().ok())
+            .ok_or("Invalid app-server parent")?;
+        if start != current.start {
+            break;
+        }
+        if parent == holder.pid && holder.is_current() && server.is_current() {
+            return Ok(());
+        }
+        if parent <= 1 {
+            break;
+        }
+        current = Process::read(parent).map_err(|error| error.to_string())?;
+    }
+    Err("Codex socket peer is not owned by this native holder".into())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_server_ancestry(server: &Process, holder: &Process) -> Result<(), String> {
+    use crate::pinned_process::PinnedProcess;
+
+    let peer = pin_provider_process(server)?;
+    let mut parent = peer.parent_pid().map_err(|error| error.to_string())?;
+    let mut child_start = peer.started_ticks();
+    // Darwin sends orphaned grandchildren to launchd. A launcher must keep
+    // its server within the observed ancestry until the first confirmation.
+    for _ in 0..1024 {
+        if parent <= 1 {
+            break;
+        }
+        let pin = PinnedProcess::open(parent).map_err(|error| error.to_string())?;
+        let start = pin.started_ticks();
+        if start > child_start {
+            break;
+        }
+        if parent as i32 == holder.pid {
+            if start == holder.start {
+                return ensure_provider_live(&peer);
+            }
+            break;
+        }
+        parent = pin.parent_pid().map_err(|error| error.to_string())?;
+        child_start = start;
+    }
+    Err("Codex socket peer is not owned by this native holder".into())
 }
 
 /// A child exit or control message is the only source of idle wakeups. Reap
@@ -1504,7 +1552,7 @@ extern "C" fn serve_if_requested() {
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
     crate::process::set_name(c"cagents-native");
-    if crate::process::become_subreaper().is_err() {
+    if crate::daemon::owned_children::initialize_provider_owner().is_err() {
         std::process::exit(2);
     }
     // Nothing this holder was handed may outlive it in its provider: a
@@ -1514,7 +1562,8 @@ extern "C" fn serve_if_requested() {
         std::process::exit(2);
     }
     let control = unsafe { UnixStream::from_raw_fd(fd) };
-    let _result = (|| {
+    let mut provider_started = false;
+    let result = (|| {
         let Some(Request::Spawn {
             protocol: PROTOCOL,
             spawn,
@@ -1529,7 +1578,7 @@ extern "C" fn serve_if_requested() {
         let scope = crate::daemon::process_scope::enroll_dividing_holder()
             .ok()
             .flatten();
-        let mut residence = match Residence::start(*spawn, scope) {
+        let mut residence = match Residence::start(*spawn, scope, || provider_started = true) {
             Ok(residence) => residence,
             Err(error) => {
                 // Only startup has no Started response yet. Preserve the
@@ -1559,6 +1608,14 @@ extern "C" fn serve_if_requested() {
         }
         Ok(())
     })();
+    #[cfg(target_os = "macos")]
+    if provider_started {
+        // Explicit Close publishes its own receipt. Abnormal exit cannot
+        // promote an empty wait set to proof about tools reparented to launchd.
+        std::process::exit(i32::from(result.is_err()));
+    }
+    #[cfg(target_os = "linux")]
+    let _ = (provider_started, result);
     // Returning from the closure drops Residence/Server, whose teardown waits
     // for ECHILD. This is an explicit receipt, not an inference from PID death.
     std::process::exit(CLEANUP_PROVED);
@@ -1566,6 +1623,120 @@ extern "C" fn serve_if_requested() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_server_ancestry_requires_the_exact_live_holder() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let socket_peer = Process::read(child.id() as i32).unwrap();
+        let owner = Process::read(std::process::id() as i32).unwrap();
+        let mut wrong_epoch = owner.clone();
+        wrong_epoch.start += 1;
+        let exact = verify_server_ancestry(&socket_peer, &owner);
+        let reused = verify_server_ancestry(&socket_peer, &wrong_epoch);
+        let wrong_tree = verify_server_ancestry(&owner, &socket_peer);
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(exact.is_ok(), "{exact:?}");
+        assert!(reused.is_err());
+        assert!(wrong_tree.is_err());
+        assert!(verify_server_ancestry(&socket_peer, &owner).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confirmed_app_server_can_outlive_its_launcher_and_is_still_closed() {
+        const CASE: &str = "CAGENTS_REPARENTED_SERVER_TEST";
+        if std::env::var_os(CASE).is_none() {
+            let runtime = tempfile::tempdir_in("/private/tmp").unwrap();
+            let name = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CASE, "1")
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        let listener = source.owned_codex_listener.as_mut().unwrap();
+        listener.allocator.boot_id = boot;
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            followed: false,
+            execution: None,
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: listener.socket.clone(),
+            },
+            program: "/usr/bin/python3".into(),
+            arguments: vec![
+                "-c".into(),
+                r#"
+import os, pathlib, time
+if os.fork() == 0:
+    os.setsid()
+    pathlib.Path('server').write_text(str(os.getpid()))
+    os.execl('/bin/sleep', 'sleep', '20')
+deadline = time.monotonic() + 15
+while not pathlib.Path('exit-launcher').exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+"#
+                .into(),
+            ],
+            working_directory: workspace.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let mut holder = spawn(spec, source).unwrap();
+        let launcher = holder.identity.record.root.clone();
+        let launcher_pin = pin_provider_process(&launcher).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let server = loop {
+            if let Ok(pid) = std::fs::read_to_string(workspace.path().join("server"))
+                && let Ok(pid) = pid.parse()
+            {
+                break Process::read(pid).unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fixture did not publish the server PID"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let server_pin = pin_provider_process(&server).unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        let confirm = |holder: &mut Holder| {
+            holder.confirm(
+                thread.clone(),
+                super::super::tests::server_identity(),
+                server.clone(),
+            )
+        };
+        confirm(&mut holder).unwrap();
+        std::fs::write(workspace.path().join("exit-launcher"), b"").unwrap();
+        assert!(launcher_pin.wait_for_exit(Duration::from_secs(5)).unwrap());
+        confirm(&mut holder).unwrap();
+        holder.close_inner(false, DetachedWork::Spare).unwrap();
+        assert!(server_pin.reaped().unwrap());
+        assert!(launcher_pin.reaped().unwrap());
+    }
+
     #[test]
     fn legacy_adopt_json_keeps_exact_source_and_proof_without_claiming_a_new_role() {
         let source = super::super::tests::recovery().source;

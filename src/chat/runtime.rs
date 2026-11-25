@@ -2145,7 +2145,6 @@ fn spawn_provider(
     let mut process = Process::new(&spec.program);
     process
         .args(&spec.arguments)
-        .current_dir(&spec.working_directory)
         .env_clear()
         // Callers withhold these already; no path may hand a provider the
         // session its daemon or a saved recipe came from.
@@ -2158,6 +2157,8 @@ fn spawn_provider(
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
         .process_group(0);
+    #[cfg(target_os = "linux")]
+    process.current_dir(&spec.working_directory);
     crate::descriptor_limit::inherit(&mut process);
     let original = spec
         .execution
@@ -2209,9 +2210,11 @@ fn spawn_provider(
         use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
 
         let inherited = spec.environment.get("TMPDIR").map(std::ffi::OsStr::new);
-        let cwd = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        let temporary = PrivateDir::create(inherited, Some(&cwd))
-            .map_err(|error| format!("Cannot create private Codex temporary directory: {error}"))?;
+        let temporary =
+            PrivateDir::create_for_launch(inherited, Some(&directory), &spec.working_directory)
+                .map_err(|error| {
+                    format!("Cannot create private Codex temporary directory: {error}")
+                })?;
         process.envs(TEMP_ENV_KEYS.map(|key| (key, temporary.path())));
         Some(temporary)
     } else {
@@ -2418,6 +2421,9 @@ impl ChildGuard {
             })
         });
         let pid = self.child.id() as i32;
+        #[cfg(target_os = "macos")]
+        let signal_group = |signal| crate::process::identity::signal_unreaped_group(pid, signal);
+        #[cfg(target_os = "linux")]
         let signal_group = |signal| {
             // SAFETY: the sole-reaper guard keeps our leader unreaped until
             // after both signals, reserving its numeric group identity.
@@ -2442,6 +2448,14 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
+        #[cfg(target_os = "macos")]
+        {
+            let timeout = Duration::from_secs(2);
+            // Keep the original child un-reaped until the group census has
+            // completed even if it left the group before its shutdown.
+            self.identity.signal(libc::SIGKILL)?;
+            crate::process::identity::finish_unreaped_group(pid, timeout)?;
+        }
         // Commands in process groups of their own outlive that signal. A
         // force-stopped provider's would hold memory the system needed, with
         // no agent left to use them, so they end with it, as do those of an

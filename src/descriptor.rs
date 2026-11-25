@@ -424,7 +424,7 @@ pub(crate) fn reopen(file: &std::fs::File, flags: libc::c_int) -> io::Result<std
 }
 
 #[cfg(target_os = "linux")]
-fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
+pub(crate) fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
     Ok(format!("/proc/self/fd/{}", file.as_raw_fd()).into())
 }
 
