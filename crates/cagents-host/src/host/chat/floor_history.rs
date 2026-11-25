@@ -269,9 +269,13 @@ fn verify_resume_processes(
         if let Some(terminal) = &source.terminal {
             verify_darwin_paired_close(_host, source, terminal, proof)?;
         }
+        require_ended_codex(source, proof)?;
         // Keep the exact issued pair in the descriptor used to match the
         // native holder's receipt. Terminal cleanup was checked separately.
-        return require_ended_codex(source, proof);
+        if !chat::native_holder::inspect_closed_source(source, &proof.boot_id)? {
+            return Err("The earlier Codex provider's exact close receipt is unavailable; nothing was started".into());
+        }
+        return Ok(());
     }
     verify_procfs_resume(source, proof, recipe, &process_root)
 }

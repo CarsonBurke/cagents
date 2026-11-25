@@ -926,15 +926,26 @@ impl ExecutionEvidence {
     /// Classify execution independently of adoption capabilities. Missing
     /// listener ownership or continuity is not evidence of a surviving writer.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
-        saved_codex_execution(self.codex_execution(source))
+        saved_codex_execution(self.codex_retirement(source))
     }
 
     fn codex_execution(&self, source: &Session) -> CodexExecution {
-        self.inspect_codex_execution(source)
+        self.inspect_codex_execution(source, false)
             .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
     }
 
-    fn inspect_codex_execution(&self, source: &Session) -> Result<CodexExecution, String> {
+    // Saved-source inspection and lost Close can retire authority. They
+    // require the old source's exact proof when Darwin observes no writer.
+    fn codex_retirement(&self, source: &Session) -> CodexExecution {
+        self.inspect_codex_execution(source, true)
+            .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
+    }
+
+    fn inspect_codex_execution(
+        &self,
+        source: &Session,
+        require_receipt: bool,
+    ) -> Result<CodexExecution, String> {
         use crate::daemon::holder_registry::{self, Kind};
         let native_holders = self.native_holders.as_ref().map_err(Clone::clone)?;
         let mut controls = vec![holder_registry::socket(native_holders, source.id)];
@@ -1048,41 +1059,33 @@ impl ExecutionEvidence {
             self.starting_patience,
             self.deadline,
         );
+        #[cfg(target_os = "linux")]
+        let _ = require_receipt;
         #[cfg(target_os = "macos")]
-        let scan = if self.processes == Path::new("/proc") {
-            // A new allocation from the resume picker has no previous owner
-            // to retire. It still needs the writer scan here and the account's
-            // thread-lock check before it can start a provider.
-            let issued = source.proof.is_some()
+        let scan = if require_receipt
+            && self.processes == Path::new("/proc")
+            && !earlier_boot
+            && matches!(scan, Ok(CodexExecution::Ended))
+            && (source.proof.is_some()
                 || source.terminal.is_some()
                 || source.owned_codex_listener.is_some()
                 || source.recorded_codex_socket().is_some()
-                || holders.iter().any(Option::is_some);
-            match scan {
-                // Inspection errors must not use the old-boot exception
-                // when Darwin cannot inspect a potentially current writer.
-                Err(reason) => Ok(CodexExecution::Unproved { reason }),
-                Ok(CodexExecution::Ended) if issued && !earlier_boot => {
-                    let retired = holders.iter().all(Option::is_none)
-                        && crate::chat::native_holder::inspect_closed_source(source, &self.boot)?;
-                    if retired {
-                        Ok(CodexExecution::Ended)
-                    } else {
-                        Ok(CodexExecution::Unproved {
-                            reason:
-                                "No exact retirement proves the prior Darwin Codex writer is gone"
-                                    .into(),
-                        })
-                    }
-                }
-                other => other,
-            }
+                || holders.iter().any(Option::is_some))
+            && !(holders.iter().all(Option::is_none)
+                && crate::chat::native_holder::inspect_closed_source(source, &self.boot)?)
+        {
+            Ok(CodexExecution::Unproved {
+                reason: "No exact retirement proves the prior Darwin Codex writer is gone".into(),
+            })
         } else {
             scan
         };
         if let Some(deadline) = self.deadline {
             check_deadline(deadline)?;
         }
+        // An older source boot cannot settle a possibly current Darwin writer.
+        // Callers with the exact issued source can separately inspect its close
+        // receipt. The census also accepts successor and fresh descriptors.
         #[cfg(target_os = "macos")]
         let earlier_boot = earlier_boot && self.processes != Path::new("/proc");
         match (scan, retained_processes, unreadable_listener) {
@@ -1160,8 +1163,8 @@ pub(super) fn codex_execution(source: &Session, boot: &crate::model::BootId) -> 
     ExecutionEvidence::codex(boot).codex_execution(source)
 }
 
-/// Whether nothing of a Codex pane of `boot` can still run, by the evidence
-/// an upgrade requires before it replaces the service that ran it.
+/// Whether the Codex writer, holder, and listener observations are clear.
+/// A caller requiring exact retirement also verifies its issued receipt.
 pub(super) fn codex_execution_ended(source: &Session, boot: &crate::model::BootId) -> bool {
     codex_execution(source, boot) == CodexExecution::Ended
 }
@@ -1210,7 +1213,7 @@ pub(super) fn execution_end(
         ..ExecutionEvidence::codex(boot)
     };
     let saved = if source.launch.provider == crate::agent::Provider::Codex {
-        match evidence.codex_execution(source) {
+        match evidence.codex_retirement(source) {
             CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING => {
                 return ExecutionEnd::Starting;
             }
