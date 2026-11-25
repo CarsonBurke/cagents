@@ -471,8 +471,8 @@ fn preflight_current_retirements(
         let crate::agent_execution::HostedSession::Chat(current) = &retained else {
             return Err("Retained execution ownership changed to another surface".into());
         };
-        let recognized_receipt = chat::native_holder::closed_source(current, proof)?
-            .is_some_and(|(record, _)| record == *owner);
+        let recognized_receipt =
+            chat::native_holder::closed_source_for_owner(current, proof, owner, false)?.is_some();
         if !recognized_receipt {
             if lineage.is_none() {
                 let (recovery, _) = chat::native_holder::inspect(owner, proof)?;

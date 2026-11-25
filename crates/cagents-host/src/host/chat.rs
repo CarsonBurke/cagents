@@ -5002,10 +5002,11 @@ pub(super) fn close_captured(
             .map_err(unavailable)?;
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
-    let closed_receipt = if matches!(
-        retained.native_continuity,
-        chat::NativeContinuity::Durable { .. }
-    ) {
+    let closed_receipt = if !pending_cleanup
+        && matches!(
+            retained.native_continuity,
+            chat::NativeContinuity::Durable { .. }
+        ) {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(target_os = "macos")]
         let receipt = if detached == crate::daemon::owned_children::DetachedWork::Stop {
