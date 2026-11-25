@@ -4,6 +4,8 @@
 pub(crate) mod clock;
 pub(crate) mod identity;
 mod image;
+#[cfg(target_os = "macos")]
+pub mod inspect;
 mod poll;
 
 pub use image::current_executable;

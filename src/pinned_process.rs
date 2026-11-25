@@ -778,20 +778,10 @@ mod imp {
     /// `PROC_PIDFDVNODEINFO` from `<sys/proc_info.h>`.
     const PROC_PIDFDVNODEINFO: libc::c_int = 1;
 
-    /// `struct proc_fileinfo` from `<sys/proc_info.h>`.
-    #[repr(C)]
-    struct ProcFileInfo {
-        fi_openflags: u32,
-        fi_status: u32,
-        fi_offset: libc::off_t,
-        fi_type: i32,
-        fi_guardflags: u32,
-    }
-
     /// `struct vnode_fdinfo` from `<sys/proc_info.h>`.
     #[repr(C)]
     struct VnodeFdInfo {
-        pfi: ProcFileInfo,
+        pfi: crate::process::inspect::ProcFileInfo,
         pvi: libc::vnode_info,
     }
 
@@ -1139,7 +1129,7 @@ mod imp {
         }
 
         pub(super) fn holds_open(&self, pid: u32, expected: &Metadata) -> io::Result<bool> {
-            let descriptors = descriptors(pid)?;
+            let descriptors = crate::process::inspect::descriptors(pid)?;
             let found = descriptors
                 .iter()
                 .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
@@ -1149,44 +1139,6 @@ mod imp {
                     })
                 });
             Ok(found)
-        }
-    }
-
-    /// Every descriptor `pid` holds, as `PROC_PIDLISTFDS` reports them.
-    fn descriptors(pid: u32) -> io::Result<Vec<libc::proc_fdinfo>> {
-        let entry = std::mem::size_of::<libc::proc_fdinfo>();
-        // A zero-length query answers the size the list needs now; it can
-        // grow before the list is read, so leave room and retry if it filled.
-        let mut capacity = 64;
-        loop {
-            let mut list: Vec<libc::proc_fdinfo> = Vec::with_capacity(capacity);
-            let bytes = libc::c_int::try_from(capacity * entry)
-                .map_err(|_| io::Error::other("descriptor list too large"))?;
-            // SAFETY: the buffer has room for `capacity` records, and the
-            // kernel writes at most `bytes` bytes of them.
-            let written = unsafe {
-                libc::proc_pidinfo(
-                    pid as libc::c_int,
-                    libc::PROC_PIDLISTFDS,
-                    0,
-                    list.as_mut_ptr().cast(),
-                    bytes,
-                )
-            };
-            if written <= 0 {
-                let error = io::Error::last_os_error();
-                return Err(match error.raw_os_error() {
-                    Some(0) | None => io::Error::from(io::ErrorKind::NotFound),
-                    _ => vanished(error),
-                });
-            }
-            let count = written as usize / entry;
-            if count < capacity {
-                // SAFETY: the kernel initialized the first `count` records.
-                unsafe { list.set_len(count) };
-                return Ok(list);
-            }
-            capacity *= 2;
         }
     }
 

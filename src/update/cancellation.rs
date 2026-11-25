@@ -99,17 +99,75 @@ pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
     })
 }
 
+/// Standard input as a description of our own.
+///
+/// Reopen instead of dup: O_NONBLOCK on a duplicate would also change the
+/// parent shell's shared stdin description. An owned description prevents
+/// a terminal SIGINT input flush between poll and read from blocking us.
+#[cfg(target_os = "linux")]
+fn own_input() -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open("/proc/self/fd/0")
+}
+
+/// Standard input as a description of our own, where one can be had.
+///
+/// Darwin's `/dev/fd/0` duplicates the shell's description rather than
+/// opening a new one, so a terminal is reopened by the name `ttyname` gives
+/// it, as Linux reopens `/proc/self/fd/0`. Other input, such as a pipe, has
+/// no name to reopen. It is duplicated and left blocking, so the shell's
+/// description keeps its flags; it is read only once poll reports it ready,
+/// which a pipe or file then honours without blocking, and only a terminal
+/// can flush input between the two.
+#[cfg(target_os = "macos")]
+fn own_input() -> io::Result<std::fs::File> {
+    use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
+    // SAFETY: isatty only inspects the descriptor.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor this function owns.
+        let duplicate = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor was just created and nothing else owns it.
+        return Ok(unsafe { std::fs::File::from_raw_fd(duplicate) });
+    }
+    let mut name = [0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: the buffer is writable for its whole length.
+    let status = unsafe { libc::ttyname_r(libc::STDIN_FILENO, name.as_mut_ptr(), name.len()) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    // SAFETY: a successful ttyname_r NUL-terminated the name in the buffer.
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    let input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(std::ffi::OsStr::from_bytes(name.to_bytes()))?;
+    // The name must still be our terminal, not a device that took it since.
+    use std::os::unix::fs::MetadataExt;
+    let mut stdin = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes a whole stat into the buffer when it succeeds.
+    if unsafe { libc::fstat(libc::STDIN_FILENO, stdin.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, so the stat is initialized.
+    let stdin = unsafe { stdin.assume_init() };
+    if input.metadata()?.rdev() != stdin.st_rdev as u64 {
+        return Err(io::Error::other(
+            "standard input's terminal changed while it was reopened",
+        ));
+    }
+    Ok(input)
+}
+
 pub(super) fn read_line_with(
     answer: &mut String,
     mut input_ready: impl FnMut(i32) -> io::Result<bool>,
 ) -> io::Result<usize> {
-    // Reopen instead of dup: O_NONBLOCK on a duplicate would also change the
-    // parent shell's shared stdin description. An owned description prevents
-    // a terminal SIGINT input flush between poll and read from blocking us.
-    let mut input = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open("/proc/self/fd/0")?;
+    let mut input = own_input()?;
     let mut bytes = Vec::new();
     loop {
         if requested() {

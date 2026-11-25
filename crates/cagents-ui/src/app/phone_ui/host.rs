@@ -9,7 +9,7 @@ use std::{
     ffi::CStr,
     fs,
     net::Ipv4Addr,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -18,6 +18,8 @@ use std::{
 use cagents::mobile::pairing::{self, AuthorizedKeys, Phone};
 use serde::Deserialize;
 
+#[cfg(target_os = "macos")]
+mod darwin;
 mod firewall;
 
 /// How long `tailscale status` may take before it counts as not answering.
@@ -125,7 +127,7 @@ pub(crate) fn probe(network: bool) -> Status {
     let connections = fixture
         .as_ref()
         .and_then(|fixture| fixture.connections(network.as_ref()))
-        .unwrap_or_else(|| connections(Path::new("/proc"), network.as_ref()));
+        .unwrap_or_else(|| connections(mobile_bridge_environments(), network.as_ref()));
     Status {
         phones,
         unwritable,
@@ -307,6 +309,7 @@ fn read_sshd_settings(
 }
 
 /// TCP ports something listens on, from `/proc/net/tcp` and `tcp6`.
+#[cfg(target_os = "linux")]
 fn listening_ports() -> Vec<u16> {
     ["/proc/net/tcp", "/proc/net/tcp6"]
         .iter()
@@ -326,6 +329,12 @@ fn listening_ports() -> Vec<u16> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// TCP ports something listens on, from the kernel's connection table.
+#[cfg(target_os = "macos")]
+fn listening_ports() -> Vec<u16> {
+    darwin::listening_ports()
 }
 
 // ---------------------------------------------------------------------------
@@ -409,18 +418,32 @@ fn lan_addresses(
         Tailscale::Connected { addresses, .. } => addresses.clone(),
         _ => Vec::new(),
     };
+    let hardware = hardware_interfaces();
     interfaces
         .iter()
         .filter(|(name, address)| {
-            address.is_private()
-                && !tailscale.contains(&address.to_string())
-                && Path::new("/sys/class/net")
-                    .join(name)
-                    .join("device")
-                    .exists()
+            address.is_private() && !tailscale.contains(&address.to_string()) && hardware(name)
         })
         .cloned()
         .collect()
+}
+
+/// Whether an interface is backed by a device, as sysfs links it.
+#[cfg(target_os = "linux")]
+fn hardware_interfaces() -> impl Fn(&str) -> bool {
+    |name| {
+        Path::new("/sys/class/net")
+            .join(name)
+            .join("device")
+            .exists()
+    }
+}
+
+/// Whether an interface is Ethernet or Wi-Fi, as its link layer says.
+#[cfg(target_os = "macos")]
+fn hardware_interfaces() -> impl Fn(&str) -> bool {
+    let hardware = darwin::hardware_interfaces();
+    move |name| hardware.contains(name)
 }
 
 fn interface_addresses() -> Vec<(String, Ipv4Addr)> {
@@ -460,15 +483,38 @@ fn interface_addresses() -> Vec<(String, Ipv4Addr)> {
 // Connected phones
 // ---------------------------------------------------------------------------
 
-/// This user's running mobile bridges under `proc`, with where each phone
-/// connected from.
-fn connections(proc: &Path, network: Option<&Network>) -> Vec<Connection> {
+/// The phones connected through `bridges`, the environments of this user's
+/// running mobile bridges, with where each connected from.
+fn connections(bridges: Vec<Vec<u8>>, network: Option<&Network>) -> Vec<Connection> {
+    let mut connections: Vec<Connection> = bridges
+        .iter()
+        .filter_map(|environ| {
+            let (from, to) = ssh_connection(environ)?;
+            Some(Connection {
+                route: route(&to, &from, network),
+                from,
+            })
+        })
+        .collect();
+    connections.sort_by(|a, b| a.from.cmp(&b.from));
+    connections
+}
+
+#[cfg(target_os = "linux")]
+fn mobile_bridge_environments() -> Vec<Vec<u8>> {
+    mobile_bridge_environments_in(Path::new("/proc"))
+}
+
+/// The environments of this user's running mobile bridges under `proc`.
+#[cfg(target_os = "linux")]
+fn mobile_bridge_environments_in(proc: &Path) -> Vec<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
     let Ok(entries) = fs::read_dir(proc) else {
         return Vec::new();
     };
-    let mut connections: Vec<Connection> = entries
+    entries
         .flatten()
         .filter(|entry| {
             entry
@@ -480,17 +526,23 @@ fn connections(proc: &Path, network: Option<&Network>) -> Vec<Connection> {
         .filter(|entry| {
             fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| is_mobile_bridge(&cmdline))
         })
-        .filter_map(|entry| {
-            let environ = fs::read(entry.path().join("environ")).ok()?;
-            let (from, to) = ssh_connection(&environ)?;
-            Some(Connection {
-                route: route(&to, &from, network),
-                from,
-            })
-        })
-        .collect();
-    connections.sort_by(|a, b| a.from.cmp(&b.from));
-    connections
+        .filter_map(|entry| fs::read(entry.path().join("environ")).ok())
+        .collect()
+}
+
+/// The environments of this user's running mobile bridges. The kernel shows
+/// a process's arguments and environment only to its own user, so the
+/// bridges of others are never read.
+#[cfg(target_os = "macos")]
+fn mobile_bridge_environments() -> Vec<Vec<u8>> {
+    use cagents::process::inspect;
+    inspect::own_user_processes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|pid| inspect::arguments(pid).ok())
+        .filter(|process| is_mobile_bridge(&process.command_line()))
+        .map(|process| process.environ())
+        .collect()
 }
 
 fn is_mobile_bridge(cmdline: &[u8]) -> bool {
@@ -744,6 +796,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // Reads a `/proc` fixture; Darwin has no procfs.
     fn connected_bridges_are_found_with_their_addresses() {
         let proc = tempfile::tempdir().unwrap();
         let process = |pid: &str, cmdline: &[u8], environ: &[u8]| {
@@ -775,7 +828,7 @@ mod tests {
         );
         fs::create_dir(proc.path().join("self")).unwrap();
         assert_eq!(
-            connections(proc.path(), None),
+            connections(mobile_bridge_environments_in(proc.path()), None),
             [
                 Connection {
                     from: "10.0.0.249".into(),
