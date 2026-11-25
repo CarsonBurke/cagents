@@ -969,7 +969,7 @@ fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveEr
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveError> {
+pub(super) fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveError> {
     let reported = parent.path.join(name);
     let leaf = c_component(name.as_os_str(), &parent.path)?;
     let mut observed = std::mem::MaybeUninit::<libc::stat>::zeroed();
@@ -1499,7 +1499,7 @@ fn unused_name(namespace: &Root) -> Result<OsString, ResolveError> {
     // No existence check is authority. Every actual mkdir/rename is exclusive.
     temporary_name().map_err(|e| ResolveError::io(&namespace.path, &e))
 }
-fn namespace_protected(root: &Root) -> io::Result<()> {
+pub(super) fn namespace_protected(root: &Root) -> io::Result<()> {
     let metadata = root.metadata()?;
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
         return Err(io::Error::new(
