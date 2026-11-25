@@ -1,0 +1,29 @@
+#!/bin/sh
+# Type-check and lint one lane for Apple Silicon macOS on the Linux build
+# host, without a Mac: Rust cross-checks natively, and scripts/darwin-cc
+# compiles the C that build scripts need. It cannot link or run anything, so
+# behaviour still needs the real Mac.
+#
+#   scripts/check-macos LANE [CARGO ARGS...]
+#
+# LANE is cli, host or ui, with the arguments of the matching
+# `mise run check:LANE`; CARGO ARGS default to --all-targets.
+set -eu
+[ "$#" -ge 1 ] || { echo "usage: scripts/check-macos cli|host|ui [CARGO ARGS...]" >&2; exit 2; }
+lane=$1
+shift
+case "$lane" in
+    cli) set -- --locked --no-default-features "$@" ;;
+    host) set -- --locked --no-default-features --package cagents --package cagents-host --features cagents/host "$@" ;;
+    ui) set -- --locked --no-default-features --package cagents --package cagents-ui --package cagents-ui-kit --features cagents/ui "$@" ;;
+    *) echo "check-macos: unknown lane $lane" >&2; exit 2 ;;
+esac
+[ "$#" -gt 3 ] || set -- "$@" --all-targets
+# Relative to the directory Cargo runs in, which on the build host is that
+# host's copy of this checkout.
+exec "$(dirname "$0")/cargo-lane" clippy --target aarch64-apple-darwin \
+    --config 'env.CC_aarch64_apple_darwin.value="scripts/darwin-cc"' \
+    --config 'env.CC_aarch64_apple_darwin.relative=true' \
+    --config 'env.AR_aarch64_apple_darwin.value="scripts/darwin-ar"' \
+    --config 'env.AR_aarch64_apple_darwin.relative=true' \
+    "$@"
