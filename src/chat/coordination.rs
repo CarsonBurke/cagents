@@ -959,20 +959,33 @@ fn claude_report(output: &str) -> Option<String> {
 
 /// Codex reports a collaboration call with its prompt as the input and, as
 /// the output, the state of every agent it addressed keyed by thread ID,
-/// which is also the ID its subagents are listed under.
+/// which is also the ID its subagents are listed under. A spawn its second
+/// multi-agent version recorded has no prompt to show, as Codex keeps it
+/// encrypted, and its one agent's state is what Codex said of the agent it
+/// started: its path, model and reasoning effort.
 fn codex(name: &str, input: &str, output: &str) -> Option<Coordination> {
-    let receivers: Vec<String> = serde_json::from_str::<Value>(output)
-        .ok()
+    let states = serde_json::from_str::<Value>(output).ok();
+    let receivers: Vec<String> = states
+        .as_ref()
         .and_then(|states| states.as_object().map(|map| map.keys().cloned().collect()))
         .unwrap_or_default();
+    let started = match (&states, receivers.as_slice()) {
+        (Some(states), [only]) => &states[only],
+        _ => &Value::Null,
+    };
     let kind = match name {
         "spawnAgent" | "spawn_agent" => Kind::Spawn(Spawn {
             agents: vec![Delegate {
                 name: String::new(),
                 kind: String::new(),
-                description: String::new(),
+                description: started["agentPath"]
+                    .as_str()
+                    .and_then(super::codex_agent_task)
+                    .unwrap_or_default(),
                 prompt: Text::Inline(input.into()),
             }],
+            model: field(started, "model").into(),
+            effort: field(started, "reasoningEffort").into(),
             ..Spawn::default()
         }),
         "sendInput" | "send_input" => Kind::Message(Outbound {
@@ -1410,6 +1423,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stopped.subagents, ["a1892b93e88999a7d"]);
+    }
+
+    #[test]
+    fn a_codex_spawn_without_a_prompt_reads_its_task_model_and_effort_from_its_agent() {
+        let spawned = native(
+            Provider::Codex,
+            "call",
+            "spawnAgent",
+            "",
+            r#"{"thread-a":{"agentPath":"/root/descendants_design","model":"gpt-6-luna","reasoningEffort":"low"}}"#,
+        )
+        .unwrap();
+        assert_eq!(spawned.subagents, ["thread-a"]);
+        let Kind::Spawn(spawn) = spawned.kind else {
+            panic!("a spawn");
+        };
+        assert_eq!(spawn.agents[0].description, "Descendants design");
+        assert_eq!(spawn.agents[0].prompt, Text::Inline(String::new()));
+        assert_eq!(
+            (spawn.model.as_str(), spawn.effort.as_str()),
+            ("gpt-6-luna", "low")
+        );
+        for (path, task) in [
+            ("/root/survey/check-links", Some("Check links")),
+            ("/root/x", Some("X")),
+            ("/root", None),
+            ("/root/", None),
+            ("/root/__", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                crate::chat::codex_agent_task(path).as_deref(),
+                task,
+                "{path}"
+            );
+        }
     }
 
     #[test]
