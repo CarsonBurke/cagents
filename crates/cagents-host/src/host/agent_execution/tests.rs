@@ -21,6 +21,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     isolated_child(name, false, false)
 }
 
+#[cfg(target_os = "linux")]
 fn isolated_with_process_namespace(name: &str, private_proc: bool) -> Option<tempfile::TempDir> {
     isolated_child(name, private_proc, false)
 }
@@ -2929,6 +2930,8 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
 /// the successor daemon relaunches its server and resumes the saved thread.
 /// The agent must then follow its relaunched conversation instead of refusing
 /// every prompt as an unavailable conversation, through successive updates.
+// The real upgrade census is isolated with a Linux PID namespace and procfs.
+#[cfg(target_os = "linux")]
 #[test]
 fn updated_codex_agent_answers_through_its_relaunched_server() {
     if isolated_with_process_namespace(
