@@ -290,7 +290,11 @@ impl SetupCheckout {
         let mut git_dir = OsString::from("--git-dir=");
         git_dir.push(self.admin.path());
         let directory = Arc::new(self.target.retained_directory().map_err(error)?);
-        RepositoryService::system("git")
+        // Resolve lookup in the parent's cwd. A relative PATH entry after
+        // fchdir would let a checkout supply the Git that inspects it.
+        let executable =
+            crate::repository::resolved_git_executable(Path::new("git")).map_err(error)?;
+        RepositoryService::system(executable)
             .git_base(Path::new("."), true)
             .cwd_held(directory)
             .map_err(error)?
@@ -1131,7 +1135,8 @@ mod tests {
         let common = service.common_dir(&fixture.primary, &cancel).unwrap();
         let checkout = SetupCheckout::capture(&fixture.destination, &common).unwrap();
         let index = SetupIndex::capture(&checkout.admin).unwrap();
-        let git = checkout.git(&index).unwrap();
+        let git = checkout.git(&index).unwrap().env("PATH", ".");
+        assert!(git.program.is_absolute());
 
         let moved = fixture.destination.with_file_name("moved");
         fs::rename(&fixture.destination, &moved).unwrap();
