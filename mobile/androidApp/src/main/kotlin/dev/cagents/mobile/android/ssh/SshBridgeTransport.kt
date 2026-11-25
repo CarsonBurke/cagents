@@ -1,6 +1,7 @@
 package dev.cagents.mobile.android.ssh
 
 import com.hierynomus.sshj.key.KeyAlgorithms
+import com.hierynomus.sshj.userauth.certificate.Certificate
 import dev.cagents.mobile.android.data.ConnectionSettings
 import dev.cagents.mobile.client.AllFailed
 import dev.cagents.mobile.client.BridgeTransport
@@ -264,13 +265,21 @@ internal class Ed25519PublicKey(private val raw: ByteArray) : PublicKey {
     }
 }
 
+/**
+ * The host key a computer presented, as `ssh-keygen -lf` fingerprints it on
+ * the computer: for a host certificate, the key it certifies. The key is
+ * what's trusted, whoever signed the certificate.
+ */
+internal fun presentedKey(key: PublicKey): PublicKey = (key as? Certificate<*>)?.key ?: key
+
 /** Asks the [HostKeyCheck] about the computer's host key, remembering why it refused one. */
 private class CheckingVerifier(private val hostKeys: HostKeyCheck) : HostKeyVerifier {
     @Volatile
     var failure: ConnectFailure? = null
 
     override fun verify(hostname: String, port: Int, key: PublicKey): Boolean {
-        failure = hostKeys.check(hostname, HostKeyStore.fingerprint(key), KeyType.fromKey(key).toString())
+        val plain = presentedKey(key)
+        failure = hostKeys.check(hostname, HostKeyStore.fingerprint(plain), KeyType.fromKey(plain).toString())
         return failure == null
     }
 

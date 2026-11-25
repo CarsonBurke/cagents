@@ -3,9 +3,11 @@
 # end without touching your own SSH server or ~/.ssh/authorized_keys.
 #
 #   scripts/mobile-pair-fixture start CAGENTS_BIN_DIR [--host ADDRESS]... [--port PORT]
+#                                     [--host-key ed25519|ecdsa|rsa] [--certificate]
 #   scripts/mobile-pair-fixture code              # prints a new pairing code, writes code.png
 #   scripts/mobile-pair-fixture requests          # the phone's request, once it has asked
 #   scripts/mobile-pair-fixture allow | decline   # answer it, as the desktop's popover does
+#   scripts/mobile-pair-fixture authorize 'ssh-ed25519 AAAA...'  # a phone set up by hand
 #   scripts/mobile-pair-fixture stop              # stop sshd and remove everything
 #
 # start runs sshd as you, listening only on loopback (port 2244 by default),
@@ -24,6 +26,13 @@
 #   emulator -avd NAME -camera-back virtualscene -virtualscene-poster wall=.../code.png
 # allow does what `Pairing::allow` does: it replaces the one-time line with
 # the phone's restricted `--mobile` line and writes the decision.
+#
+# --host-key picks the host key's type, ed25519 by default; pairing codes
+# need ed25519, but a computer set up by hand may have any. --certificate
+# also gives sshd a host certificate for it, signed by a throwaway CA, which
+# clients that accept certificates negotiate first. authorize adds the
+# `--mobile` line for a phone set up by hand: the public key from the app's
+# Settings, with or without the rest of its authorized_keys line.
 #
 # Run it from a shell of your own: the bridge refuses to pair under an agent's
 # authority, and this does nothing to get past that.
@@ -45,10 +54,17 @@ start)
     [ -x "$bin/cagents" ] && [ -x "$bin/cagentsd" ] || die "$bin needs both cagents and cagentsd"
     hosts=()
     port=2244
+    key_type=ed25519
+    certificate=false
     while [ $# -gt 0 ]; do
         case $1 in
             --host) hosts+=("$2"); shift 2 ;;
             --port) port=$2; shift 2 ;;
+            --host-key)
+                case $2 in ed25519 | ecdsa | rsa) key_type=$2 ;; *) die "--host-key is ed25519, ecdsa or rsa" ;; esac
+                shift 2
+                ;;
+            --certificate) certificate=true; shift ;;
             *) die "unknown option $1" ;;
         esac
     done
@@ -58,7 +74,7 @@ start)
     [ ! -e "$base" ] || die "$base exists; stop it first, or set CAGENTS_PAIR_FIXTURE"
     mkdir -m 700 "$base"
     mkdir -m 700 "$base/home" "$base/run"
-    ssh-keygen -q -t ed25519 -N '' -C fixture-host -f "$base/host_key" <<<y >/dev/null
+    ssh-keygen -q -t "$key_type" -N '' -C fixture-host -f "$base/host_key" <<<y >/dev/null
     : >"$base/authorized_keys"
     chmod 600 "$base/authorized_keys"
     cat >"$base/sshd_config" <<EOF
@@ -73,21 +89,28 @@ UsePAM no
 StrictModes no
 AllowUsers $USER
 EOF
+    if $certificate; then
+        ssh-keygen -q -t ed25519 -N '' -C fixture-ca -f "$base/ca" >/dev/null
+        ssh-keygen -q -s "$base/ca" -h -I fixture-host -n "$(IFS=,; echo "${hosts[*]},127.0.0.1")" -V -5m:+1d "$base/host_key.pub"
+        echo "HostCertificate $base/host_key-cert.pub" >>"$base/sshd_config"
+    fi
     {
         printf 'bin=%q\n' "$bin"
         printf 'port=%q\n' "$port"
+        printf 'key_type=%q\n' "$key_type"
         printf 'hosts=(%s)\n' "$(printf '%q ' "${hosts[@]}")"
     } >"$state"
     sshd=$(command -v sshd || echo /usr/sbin/sshd)
     "$sshd" -f "$base/sshd_config" -E "$base/sshd.log"
     for _ in $(seq 50); do [ -s "$base/sshd.pid" ] && break; sleep 0.1; done
     [ -s "$base/sshd.pid" ] || die "sshd didn't start; see $base/sshd.log"
-    echo "sshd on 127.0.0.1:$port, host key $(ssh-keygen -lf "$base/host_key.pub" | cut -d' ' -f2)"
+    echo "sshd on 127.0.0.1:$port, $key_type host key $(ssh-keygen -lf "$base/host_key.pub" | cut -d' ' -f2)$($certificate && echo ', with a certificate')"
     ;;
 code)
     [ -e "$state" ] || die "start it first"
     # shellcheck source=/dev/null
     source "$state"
+    [ "$key_type" = ed25519 ] || die "a pairing code names an Ed25519 host key; start with --host-key ed25519"
     /usr/bin/python3 -I - "$base" "$bin" "$port" "$USER" "$(hostname -s)" "${hosts[@]}" <<'PY'
 import base64, os, subprocess, sys, time, urllib.parse
 base, bin_dir, port, user, name, *hosts = sys.argv[1:]
@@ -205,6 +228,16 @@ os.rename(f.name, os.path.join(directory, "decision"))
 print(f"{word}: {request['name']}")
 PY
     rm -f "$base/pairing"
+    ;;
+authorize)
+    [ -e "$state" ] || die "start it first"
+    # shellcheck source=/dev/null
+    source "$state"
+    key=$(grep -oE 'ssh-ed25519 [A-Za-z0-9+/]+=*' <<<"$*" | head -n1) || true
+    [ -n "$key" ] || die "authorize needs the phone's ssh-ed25519 public key, as Settings shows it"
+    printf 'command="env HOME=%s/home XDG_RUNTIME_DIR=%s/run %s/cagents daemon bridge --mobile",restrict %s phone-by-hand\n' \
+        "$base" "$base" "$bin" "$key" >>"$base/authorized_keys"
+    echo "authorized $key"
     ;;
 stop)
     if [ -s "$base/sshd.pid" ]; then kill "$(cat "$base/sshd.pid")" 2>/dev/null || true; fi
