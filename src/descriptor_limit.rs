@@ -8,22 +8,42 @@
 //! descriptors past 1024, and some size tables or close loops by the limit,
 //! so every child starts with the limit the daemon itself was given.
 
-use std::{io, os::unix::process::CommandExt, process::Command, sync::OnceLock};
+use std::{
+    io,
+    os::unix::process::CommandExt,
+    process::Command,
+    sync::{
+        OnceLock,
+        atomic::{AtomicI32, Ordering},
+    },
+};
 
 /// The limit this daemon was started with, recorded only if it was raised.
 static INHERITED: OnceLock<libc::rlimit> = OnceLock::new();
+
+/// The soft limit this process raised itself to, or 0 if it never raised it.
+/// An atomic, so that a child can read it between fork and exec.
+static RAISED: AtomicI32 = AtomicI32::new(0);
+
+/// The highest soft limit this process has run with, so no descriptor it
+/// holds is numbered at or above it, even after a pre-exec hook lowered the
+/// limit for a child. Async-signal-safe.
+pub fn highest() -> libc::c_int {
+    RAISED.load(Ordering::Relaxed)
+}
 
 /// Raises this process's soft open-descriptor limit to its hard limit.
 pub fn raise() {
     let Some(limit) = current() else {
         return;
     };
-    if limit.rlim_cur >= limit.rlim_max {
+    let ceiling = ceiling(limit.rlim_max);
+    if limit.rlim_cur >= ceiling {
         return;
     }
     let inherited = *INHERITED.get_or_init(|| limit);
     let raised = libc::rlimit {
-        rlim_cur: limit.rlim_max,
+        rlim_cur: ceiling,
         rlim_max: limit.rlim_max,
     };
     // SAFETY: `raised` is a live rlimit, and a soft limit equal to the hard
@@ -34,6 +54,44 @@ pub fn raise() {
             limit = inherited.rlim_cur,
             "cannot raise the open-descriptor limit; the daemon holds fewer terminals"
         );
+        return;
+    }
+    RAISED.store(
+        libc::c_int::try_from(ceiling).unwrap_or(libc::c_int::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// The highest soft limit the kernel accepts under `hard`. Linux accepts the
+/// hard limit itself.
+#[cfg(target_os = "linux")]
+fn ceiling(hard: libc::rlim_t) -> libc::rlim_t {
+    hard
+}
+
+/// Darwin reports an unlimited hard limit but refuses a soft limit above
+/// `kern.maxfilesperproc`, so the raise stops there.
+#[cfg(target_os = "macos")]
+fn ceiling(hard: libc::rlim_t) -> libc::rlim_t {
+    let mut per_process: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&per_process);
+    let mut name = [libc::CTL_KERN, libc::KERN_MAXFILESPERPROC];
+    // SAFETY: the name and the output buffer, with its size, are live for the
+    // call, which only writes the buffer and its size.
+    let read = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            2,
+            (&raw mut per_process).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    match libc::rlim_t::try_from(per_process) {
+        Ok(per_process) if read && per_process > 0 => hard.min(per_process),
+        // `OPEN_MAX` from <sys/syslimits.h>, which the kernel always accepts.
+        _ => hard.min(10_240),
     }
 }
 
@@ -85,7 +143,8 @@ pub(crate) mod tests {
 
     pub(crate) fn assert_daemon_limit_remains_raised(original: &libc::rlimit) {
         let raised = current().unwrap();
-        assert_eq!(raised.rlim_cur, original.rlim_max);
+        assert_eq!(raised.rlim_cur, ceiling(original.rlim_max));
+        assert_eq!(libc::rlim_t::try_from(highest()).unwrap(), raised.rlim_cur);
         assert_eq!(raised.rlim_max, original.rlim_max);
     }
 

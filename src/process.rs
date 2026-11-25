@@ -1,6 +1,12 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
+pub(crate) mod identity;
 mod poll;
+
+use crate::descriptor::set_nonblocking;
+use identity::{child_exit_status, child_identity};
+#[cfg(all(test, target_os = "linux"))]
+use std::os::fd::FromRawFd;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +14,7 @@ use std::{
     ffi::OsString,
     fmt,
     io::{self, Read, Write},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -146,7 +152,8 @@ impl CommandSpec {
         self
     }
 
-    /// Retains the exact descriptor number used by `/proc/self/fd/<number>`.
+    /// Retains the exact descriptor number a child names, as
+    /// `/proc/self/fd/<number>` on Linux or `/dev/fd/<number>` on Darwin.
     /// The parent keeps CLOEXEC; only a forked child clears it. Ownership is
     /// also retained by `to_command`, even if this spec is dropped first.
     pub(crate) fn inherit_file(mut self, file: Arc<std::fs::File>) -> io::Result<Self> {
@@ -162,23 +169,12 @@ impl CommandSpec {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
             if let Some(lease) = self.inherited_lease {
-                let path = std::ffi::CString::new(format!("/proc/self/fd/{lease}")).unwrap();
-                // SAFETY: the path is prepared before fork. Only Linux open,
-                // flock and close syscalls run here; the child alone creates
+                let reopen = LeaseReopen::prepare(lease);
+                // SAFETY: the path and identity are prepared before fork. Only
+                // open, fstat, flock and close run here; the child alone creates
                 // its independent, non-CLOEXEC shared lease description.
                 unsafe {
-                    command.pre_exec(move || {
-                        let child_lease = libc::open(path.as_ptr(), libc::O_RDWR);
-                        if child_lease == -1 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        if libc::flock(child_lease, libc::LOCK_SH | libc::LOCK_NB) != 0 {
-                            let error = io::Error::last_os_error();
-                            libc::close(child_lease);
-                            return Err(error);
-                        }
-                        Ok(())
-                    });
+                    command.pre_exec(move || reopen.shared_in_child());
                 }
             }
             if !self.inherited_files.is_empty() {
@@ -218,6 +214,93 @@ impl CommandSpec {
         });
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command
+    }
+}
+
+/// How a child reopens the journal lease as its own open file description, so
+/// its shared lock outlives the parent's. Linux reopens the descriptor through
+/// `/proc/self/fd`. Darwin's `/dev/fd` would only duplicate the parent's
+/// description, so the child opens the lease's path and proves it reached the
+/// same file before locking it.
+struct LeaseReopen {
+    path: Result<std::ffi::CString, i32>,
+    #[cfg(target_os = "macos")]
+    identity: (libc::dev_t, libc::ino_t),
+}
+
+impl LeaseReopen {
+    #[cfg(target_os = "linux")]
+    fn prepare(lease: i32) -> Self {
+        Self {
+            path: Ok(std::ffi::CString::new(format!("/proc/self/fd/{lease}")).unwrap()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare(lease: i32) -> Self {
+        let failed = |error: io::Error| Self {
+            path: Err(error.raw_os_error().unwrap_or(libc::EIO)),
+            identity: (0, 0),
+        };
+        // SAFETY: an all-zero stat is a valid output buffer for fstat.
+        let mut status: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(lease, &mut status) } != 0 {
+            return failed(io::Error::last_os_error());
+        }
+        let mut path = vec![0_u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL included.
+        if unsafe { libc::fcntl(lease, libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+            return failed(io::Error::last_os_error());
+        }
+        let length = path
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(path.len());
+        path.truncate(length);
+        Self {
+            path: std::ffi::CString::new(path).map_err(|_| libc::EINVAL),
+            identity: (status.st_dev, status.st_ino),
+        }
+    }
+
+    /// Runs between fork and exec: async-signal-safe calls only, no allocation.
+    fn shared_in_child(&self) -> io::Result<()> {
+        let path = self
+            .path
+            .as_ref()
+            .map_err(|&errno| io::Error::from_raw_os_error(errno))?;
+        // `/proc/self/fd` entries are magic links, so only Darwin's real path
+        // refuses a final symlink.
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_RDWR;
+        #[cfg(target_os = "macos")]
+        let flags = libc::O_RDWR | libc::O_NOFOLLOW;
+        // SAFETY: the path is NUL-terminated and outlives the call.
+        let child_lease = unsafe { libc::open(path.as_ptr(), flags) };
+        if child_lease == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let refuse = |error: io::Error| {
+            // SAFETY: the descriptor was opened above and is closed once.
+            unsafe { libc::close(child_lease) };
+            Err(error)
+        };
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: an all-zero stat is a valid output buffer for fstat.
+            let mut status: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(child_lease, &mut status) } != 0 {
+                return refuse(io::Error::last_os_error());
+            }
+            if (status.st_dev, status.st_ino) != self.identity {
+                return refuse(io::Error::from_raw_os_error(libc::ESTALE));
+            }
+        }
+        // SAFETY: the descriptor is open and owned by this child.
+        if unsafe { libc::flock(child_lease, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return refuse(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -423,7 +506,7 @@ impl CancellationNotifier {
             Self::Descriptor(descriptor) => {
                 let one = 1_u64;
                 loop {
-                    // SAFETY: the Arc retains this nonblocking eventfd; writing
+                    // SAFETY: the Arc retains this nonblocking eventfd or pipe; writing
                     // one u64 only wakes the executor and cannot block cancel.
                     let written = unsafe {
                         libc::write(
@@ -740,17 +823,6 @@ impl Drop for GroupWaiter {
     }
 }
 
-fn child_identity(child: &std::process::Child) -> io::Result<OwnedFd> {
-    // SAFETY: pidfd_open returns a new close-on-exec descriptor for our newly
-    // spawned, unreaped child. The guard never recreates it after reaping.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
-    if descriptor < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
-    }
-}
-
 fn observe_child_exit(
     identity: &OwnedFd,
     pid: u32,
@@ -761,51 +833,6 @@ fn observe_child_exit(
         pid,
         libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 },
     )
-}
-
-fn child_exit_status(identity: &OwnedFd, pid: u32, flags: i32) -> io::Result<Option<ExitStatus>> {
-    use std::os::unix::process::ExitStatusExt;
-    let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    loop {
-        // SAFETY: P_PIDFD identifies the captured original child, including
-        // when its old numeric ID has been reused. All observations use WNOWAIT;
-        // only the worker's final call reaps after group signals are disarmed.
-        if unsafe {
-            libc::waitid(
-                libc::P_PIDFD,
-                identity.as_raw_fd() as libc::id_t,
-                &mut information,
-                flags,
-            )
-        } == 0
-        {
-            break;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-    let (observed, status) = unsafe { (information.si_pid(), information.si_status()) };
-    if observed == 0 {
-        return Ok(None);
-    }
-    if observed as u32 != pid {
-        return Err(io::Error::other(
-            "child exit observation returned another process",
-        ));
-    }
-    let raw = match information.si_code {
-        libc::CLD_EXITED => status << 8,
-        libc::CLD_KILLED => status,
-        libc::CLD_DUMPED => status | 0x80,
-        _ => {
-            return Err(io::Error::other(
-                "child exit observation returned an unexpected status",
-            ));
-        }
-    };
-    Ok(Some(ExitStatus::from_raw(raw)))
 }
 
 /// Group signals finish before the owned waiter's final reap permission.
@@ -850,23 +877,6 @@ fn terminate_process_tree(
 struct PipeRead {
     output: Vec<u8>,
     limit_exceeded: bool,
-}
-
-/// Puts `descriptor` into non-blocking mode, so a read or write reports
-/// `WouldBlock` instead of parking uninterruptibly inside the kernel.
-fn set_nonblocking(descriptor: BorrowedFd<'_>) -> io::Result<()> {
-    let raw = descriptor.as_raw_fd();
-    // SAFETY: the descriptor is borrowed for the whole call, so it cannot be
-    // closed underneath it, and `F_GETFL` takes no further argument.
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: as above, with the `int` argument `F_SETFL` requires.
-    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn output_limit_message(
@@ -1018,6 +1028,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn group_waiter_retains_leader_and_cleans_owned_descendants() {
         use std::io::BufRead;
@@ -1169,6 +1180,7 @@ sys.exit(7)
         println!("owned executor descendant cases completed");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an owned user/PID namespace and namespace-local PID allocation control"]
     fn group_waiter_refuses_a_kernel_reused_original_pid() {
@@ -1215,7 +1227,7 @@ sys.exit(7)
             std::env::var_os(NAMESPACE).unwrap()
         );
         fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
-        let mut original = std::process::Command::new("/bin/true")
+        let mut original = std::process::Command::new("true")
             .process_group(0)
             .spawn()
             .unwrap();
@@ -1348,9 +1360,13 @@ sys.exit(7)
                 // `setsid` puts the sleeper in its own session, so the process
                 // group signalled at the deadline does not contain it, and it
                 // inherits the stdout and stderr this executor is reading.
-                OsString::from(
-                    "setsid sh -c 'printf %s \"$$\" > \"$HOLDER\"; exec sleep 300' & exit 0",
-                ),
+                // Darwin has no `setsid` command; its perl calls setsid(2).
+                OsString::from(if cfg!(target_os = "macos") {
+                    "perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' \
+                        sh -c 'printf %s \"$$\" > \"$HOLDER\"; exec sleep 300' & exit 0"
+                } else {
+                    "setsid sh -c 'printf %s \"$$\" > \"$HOLDER\"; exec sleep 300' & exit 0"
+                }),
             ])
             .env("HOLDER", holder.as_os_str())
             .timeout(Duration::from_millis(200));

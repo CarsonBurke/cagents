@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -1987,11 +1987,11 @@ exec "${EXE}" --exact "${SELECTOR}" --nocapture --test-threads=1
 
 fn provider() {
     let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
-    let listener = UnixListener::bind(std::env::var_os(SOCKET).unwrap()).unwrap();
+    let listener = crate::descriptor::bind(std::env::var_os(SOCKET).unwrap()).unwrap();
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(75);
     while Instant::now() < deadline {
-        let (stream, _) = match listener.accept() {
+        let (stream, _) = match crate::descriptor::accept(&listener) {
             Ok(accepted) => accepted,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));

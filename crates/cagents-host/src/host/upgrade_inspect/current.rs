@@ -1234,12 +1234,12 @@ mod tests {
             let mut owner = proof();
             owner.boot_id = crate::daemon::read_boot_id().unwrap();
             let _lease = crate::daemon::HostLease::acquire(&paths, &owner).unwrap();
-            let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let listener = crate::descriptor::bind(&paths.socket).unwrap();
             let expected = owner.clone();
             let source = super::super::tests::session();
             let expected_source = source.clone();
             let worker = std::thread::spawn(move || {
-                let (mut peer, _) = listener.accept().unwrap();
+                let (mut peer, _) = crate::descriptor::accept(&listener).unwrap();
                 peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 peer.set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

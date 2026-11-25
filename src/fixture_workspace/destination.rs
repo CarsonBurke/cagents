@@ -70,7 +70,7 @@ impl Directories {
             data: dirs.data_dir().to_owned(),
             config: dirs.config_dir().to_owned(),
             cache: dirs.cache_dir().to_owned(),
-            runtime: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            runtime: crate::instance::runtime_base().map_err(|error| error.to_string())?,
             instance: crate::instance::development_instance().map(str::to_owned),
         })
     }

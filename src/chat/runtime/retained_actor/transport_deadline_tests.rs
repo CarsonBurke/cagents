@@ -1,12 +1,11 @@
 //! Exercise real retained call/adoption paths against a full kernel backlog.
 use super::*;
-use std::os::unix::net::UnixListener;
 
 #[test]
 fn retained_call_and_adoption_bound_the_connect_phase_without_disturbing_owner() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("actor");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
     let original = UnixStream::connect(&socket).unwrap();
     let mut actor = RemoteActor::fixture();
@@ -53,7 +52,7 @@ fn retained_call_and_adoption_bound_the_connect_phase_without_disturbing_owner()
     assert!(error.contains("`state` request"), "{error}");
     assert!(!error.contains("inspection"), "{error}");
     assert!(start.elapsed() < TIMEOUT);
-    let (_accepted, _) = listener.accept().unwrap();
+    let (_accepted, _) = crate::descriptor::accept(&listener).unwrap();
     assert!(original.peer_addr().is_ok());
     assert_eq!(actor.identity().record, record);
 }
@@ -76,16 +75,16 @@ fn a_transcript_read_survives_a_connection_the_live_helper_broke_off() {
     use crate::terminal_ipc::ServerResponse;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("actor");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let (actor, _notifications) = binary_reader(socket);
     let chat_id = actor.0.source.id;
     let helper = thread::spawn(move || {
         // The first connection ends before its answer, as when the helper
         // gives up sending to a reader that a loaded computer kept waiting.
-        let (first, _) = listener.accept().unwrap();
+        let (first, _) = crate::descriptor::accept(&listener).unwrap();
         deadline_io::receive_until::<Invocation>(&first, Instant::now() + TIMEOUT).unwrap();
         drop(first);
-        let (second, _) = listener.accept().unwrap();
+        let (second, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation =
             deadline_io::receive_until(&second, Instant::now() + TIMEOUT).unwrap();
         assert_eq!(request.method, "presentation_binary");
@@ -113,7 +112,7 @@ fn a_transcript_read_the_live_helper_never_answers_asks_the_reader_to_read_again
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("actor");
     // The helper is alive and takes the request, but never answers it.
-    let _listener = UnixListener::bind(&socket).unwrap();
+    let _listener = crate::descriptor::bind(&socket).unwrap();
     let (actor, notifications) = binary_reader(socket);
     let failure = actor
         .presentation_by(
@@ -159,7 +158,7 @@ fn a_transcript_read_the_live_helper_never_answers_asks_the_reader_to_read_again
 fn a_transcript_read_from_a_helper_that_is_gone_is_not_retried() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("actor");
-    let _listener = UnixListener::bind(&socket).unwrap();
+    let _listener = crate::descriptor::bind(&socket).unwrap();
     let (mut actor, notifications) = binary_reader(socket);
     // Another process now has the holder's process ID.
     Arc::get_mut(&mut actor.0)
@@ -182,17 +181,17 @@ fn a_transcript_read_from_a_helper_that_is_gone_is_not_retried() {
 fn a_changed_files_query_survives_a_connection_the_live_helper_broke_off() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("actor");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let (actor, _notifications) = binary_reader(socket);
     let query = chat::Command::LoadFileChanges {
         request_id: 1,
         after: None,
     };
     let helper = thread::spawn(move || {
-        let (first, _) = listener.accept().unwrap();
+        let (first, _) = crate::descriptor::accept(&listener).unwrap();
         deadline_io::receive_until::<Invocation>(&first, Instant::now() + TIMEOUT).unwrap();
         drop(first);
-        let (second, _) = listener.accept().unwrap();
+        let (second, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation =
             deadline_io::receive_until(&second, Instant::now() + TIMEOUT).unwrap();
         assert_eq!(request.method, "file_query");
@@ -211,7 +210,7 @@ fn a_changed_files_query_survives_a_connection_the_live_helper_broke_off() {
 fn a_changed_files_query_the_live_helper_never_answers_fails_without_rereading_the_transcript() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("actor");
-    let _listener = UnixListener::bind(&socket).unwrap();
+    let _listener = crate::descriptor::bind(&socket).unwrap();
     let (actor, notifications) = binary_reader(socket);
     let failure = actor
         .file_query_by(

@@ -123,20 +123,19 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
 
     #[test]
     fn full_holder_backlog_obeys_deadline_without_disturbing_original_connection() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("holder");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
         let original = UnixStream::connect(&path).unwrap();
         let start = Instant::now();
         let error = connect_until(&path, start + Duration::from_millis(80)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(2));
-        let (_accepted, _) = listener.accept().unwrap();
+        let (_accepted, _) = crate::descriptor::accept(&listener).unwrap();
         assert!(original.peer_addr().is_ok());
     }
 
@@ -144,9 +143,9 @@ mod tests {
     fn connected_stream_is_blocking_and_close_on_exec_and_expired_deadline_has_no_connection() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("holder");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         let connection = connect_until(&path, Instant::now() + Duration::from_secs(1)).unwrap();
-        let (_accepted, _) = listener.accept().unwrap();
+        let (_accepted, _) = crate::descriptor::accept(&listener).unwrap();
         assert_ne!(
             unsafe { libc::fcntl(connection.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
             0

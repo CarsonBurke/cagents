@@ -19,7 +19,6 @@ use iced_accessibility::{
     accesskit::{Action, ActionData, ActionRequest, TreeId},
 };
 use std::{
-    os::unix::net::UnixListener,
     sync::atomic::{AtomicBool, Ordering},
     thread,
 };
@@ -42,7 +41,7 @@ impl Peer {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("review.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let id = TerminalId::new();
         let proof = HostSessionProof {
@@ -69,7 +68,7 @@ impl Peer {
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut stream = loop {
-                match listener.accept() {
+                match crate::descriptor::accept(&listener) {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "hosted client did not connect");

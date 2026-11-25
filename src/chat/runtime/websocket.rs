@@ -619,7 +619,6 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
 
     /// Join without lock waits, under the production limits.
     fn join(
@@ -672,10 +671,10 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("late-response.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -766,10 +765,10 @@ mod tests {
     fn replaced_socket_is_not_joined() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("codex.sock");
-        let original = UnixListener::bind(&path).unwrap();
+        let original = crate::descriptor::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let replacement = UnixListener::bind(&path).unwrap();
+        let replacement = crate::descriptor::bind(&path).unwrap();
         replacement.set_nonblocking(true).unwrap();
         assert!(connect(&path, metadata.dev(), metadata.ino()).is_err());
         assert_eq!(
@@ -849,7 +848,7 @@ mod tests {
         provider.terminate().unwrap();
         assert_eq!(provider.child.try_wait().unwrap().unwrap().code(), Some(7));
 
-        let mut provider = ChildGuard::spawn(Process::new("/bin/true").process_group(0));
+        let mut provider = ChildGuard::spawn(Process::new("true").process_group(0));
         provider.child.wait().unwrap();
         assert_eq!(
             join(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),

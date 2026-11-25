@@ -261,6 +261,10 @@ fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn pending_prepared_keeps_original_census_and_exact_window_slots_for_retry() {
     let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
@@ -800,6 +804,10 @@ fn captured_pane_aliases_and_presentations_bind_the_exact_confirmed_allocation()
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issued_alias() {
     for original_id in [None, Some(uuid::Uuid::new_v4().to_string())] {
         let root = crate::test_fixture::tempdir().unwrap();
@@ -1400,6 +1408,10 @@ fn losing_the_continuous_worker_lease_prevents_receipt_even_with_matching_bytes(
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn a_changed_prepared_checkpoint_is_neither_reinterpreted_nor_modified() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
@@ -1421,6 +1433,10 @@ fn a_changed_prepared_checkpoint_is_neither_reinterpreted_nor_modified() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn source_finishing_ready_keeps_normal_restore_and_preserves_checkpoint_bytes() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
@@ -1444,6 +1460,10 @@ fn source_finishing_ready_keeps_normal_restore_and_preserves_checkpoint_bytes() 
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
     const ISOLATED: &str = "CAGENTS_TEST_RECOVERY_RESERVATION_ISOLATED";
     if std::env::var_os(ISOLATED).is_none() {
@@ -1495,9 +1515,10 @@ fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
         released, 0,
         "the daemon lease was not released: {released_error}"
     );
-    assert!(receipt.inherit(&mut Command::new("/bin/true")).is_err());
+    assert!(receipt.inherit(&mut Command::new("true")).is_err());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn recovery_receipt_is_immutable_after_its_causal_identity_is_sealed() {
     let root = crate::test_fixture::tempdir().unwrap();
@@ -3352,6 +3373,10 @@ fn verified_new_canonical_quarantines_unsafe_history_without_losing_evidence() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn retirement_sweeps_only_closed_private_metadata_temporaries() {
     let files = settled_files();
     let active = OpenOptions::new()
@@ -3454,6 +3479,7 @@ fn retained_checkpoint_without_prepared_phase_has_no_settled_classification() {
     );
 }
 
+#[cfg(target_os = "linux")]
 mod forwarding_tests {
     use super::*;
     use std::process::Stdio;

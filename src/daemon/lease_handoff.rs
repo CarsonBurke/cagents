@@ -28,7 +28,7 @@ pub(crate) struct LeaseHandoff {
 pub(crate) struct HandoffSource {
     pub(crate) pid: u32,
     pub(crate) proof: HostSessionProof,
-    process: File,
+    process: PinnedProcess,
     // An adopted flock retains the original updater PID, which can differ
     // from the serving daemon pinned above. Compare like identities.
     pub(crate) locker_pid: Option<i32>,
@@ -41,7 +41,7 @@ impl HandoffSource {
     ) -> Result<Self, PlatformError> {
         let lock = open_lock(paths)?;
         let pid = lease_owner(&paths.lock, proof)?;
-        let process = open_validated_pidfd(&lock, pid, Path::new("/proc"))?;
+        let process = open_validated_pidfd(&lock, pid)?;
         let locker_pid = holder_pid(paths)?;
         Ok(Self {
             pid,
@@ -59,27 +59,7 @@ impl HandoffSource {
     /// its lease before its process has finished exiting, so lease ownership
     /// alone does not prove the source has stopped.
     pub(crate) fn exited_within(&self, timeout: std::time::Duration) -> io::Result<bool> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let mut poll = libc::pollfd {
-                fd: self.process.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let milliseconds = c_int::try_from(remaining.as_millis()).unwrap_or(c_int::MAX);
-            // SAFETY: one live initialized pollfd; pidfd pins the original process.
-            if unsafe { libc::poll(&mut poll, 1, milliseconds) } < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if poll.revents != 0 || remaining.is_zero() {
-                return Ok(poll.revents != 0);
-            }
-        }
+        self.process.wait_for_exit(timeout)
     }
 }
 

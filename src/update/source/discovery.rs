@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn unqualified_165_refuses_after_discovery_without_preparing_or_writing_state() {
         use crate::terminal_ipc::ClientEnvelope;
-        use std::{fs, os::unix::net::UnixListener, process::Command, process::Stdio, thread};
+        use std::{fs, process::Command, process::Stdio, thread};
         const ROOT: &str = "CAGENTS_UNQUALIFIED_SOURCE_TEST_ROOT";
         const TEST: &str = "update::source::discovery::tests::unqualified_165_refuses_after_discovery_without_preparing_or_writing_state";
         if let Some(root) = std::env::var_os(ROOT) {
@@ -207,9 +207,9 @@ mod tests {
             let mut source = proof();
             source.boot_id = crate::daemon::read_boot_id().unwrap();
             let _lease = crate::daemon::HostLease::acquire(&paths, &source).unwrap();
-            let listener = UnixListener::bind(&paths.socket).unwrap();
+            let listener = crate::descriptor::bind(&paths.socket).unwrap();
             fs::write(root.join("ready"), []).unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             let request: ClientEnvelope =
                 postcard::from_bytes(&read(&mut stream, deadline).unwrap()).unwrap();
@@ -229,7 +229,7 @@ mod tests {
             );
             listener.set_nonblocking(true).unwrap();
             assert_eq!(
-                listener.accept().unwrap_err().kind(),
+                crate::descriptor::accept(&listener).unwrap_err().kind(),
                 io::ErrorKind::WouldBlock,
                 "unqualified source must not receive an authenticated control connection"
             );
@@ -392,7 +392,6 @@ mod tests {
     #[cfg(feature = "host")]
     fn authenticated_current_wire_source(protocol: u16) {
         use crate::terminal_ipc::{ClientEnvelope, ServerMessage};
-        use std::os::unix::net::UnixListener;
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("cagentsd.sock");
         let paths = crate::daemon::RuntimePaths {
@@ -404,7 +403,7 @@ mod tests {
         pinned.boot_id = crate::daemon::read_boot_id().unwrap();
         let expected_proof = pinned.clone();
         let _lease = crate::daemon::HostLease::acquire(&paths, &pinned).unwrap();
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let mut expected = impact();
         expected.capability.proof = pinned.clone();
         expected.policy = impact::Policy::WhenIdle;
@@ -414,7 +413,7 @@ mod tests {
         let reviewed = expected.clone();
         let worker = std::thread::spawn(move || {
             let deadline = || Instant::now() + Duration::from_secs(2);
-            let (mut discovery, _) = listener.accept().unwrap();
+            let (mut discovery, _) = crate::descriptor::accept(&listener).unwrap();
             let request: ClientEnvelope =
                 postcard::from_bytes(&read(&mut discovery, deadline()).unwrap()).unwrap();
             assert_eq!(request.version, crate::terminal_ipc::PROTOCOL_VERSION);
@@ -423,7 +422,7 @@ mod tests {
             refusal.extend_from_slice(&[255, 255, 255]);
             write(&mut discovery, &refusal, deadline()).unwrap();
             drop(discovery);
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             let reply = |stream: &mut UnixStream, request_id: u64, response: ServerResponse| {
                 let envelope = ServerEnvelope {
                     version: protocol,

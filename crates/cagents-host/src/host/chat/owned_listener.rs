@@ -313,10 +313,7 @@ pub(super) fn served_before_retire(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::{
-        fs::{DirBuilderExt, PermissionsExt, symlink},
-        net::UnixListener,
-    };
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 
     /// A private allocation directory and the runtime directory Codex binds in.
     fn directories() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -342,7 +339,7 @@ mod tests {
     fn a_stopped_socket_is_retired() {
         let (_root, allocation, _) = directories();
         let socket = allocation.join("control.sock");
-        drop(UnixListener::bind(&socket).unwrap());
+        drop(crate::descriptor::bind(&socket).unwrap());
         assert!(!served(&socket).unwrap());
         assert!(std::fs::symlink_metadata(&socket).is_err());
     }
@@ -352,7 +349,7 @@ mod tests {
         let (_root, allocation, runtime) = directories();
         let socket = allocation.join("control.sock");
         let target = runtime.join("bound");
-        drop(UnixListener::bind(&target).unwrap());
+        drop(crate::descriptor::bind(&target).unwrap());
         symlink(&target, &socket).unwrap();
         assert!(!served(&socket).unwrap());
         assert!(std::fs::symlink_metadata(&socket).is_err());
@@ -372,12 +369,12 @@ mod tests {
     fn a_listening_server_is_kept_through_either_entry() {
         let (_root, allocation, runtime) = directories();
         let direct = allocation.join("control.sock");
-        let _direct = UnixListener::bind(&direct).unwrap();
+        let _direct = crate::descriptor::bind(&direct).unwrap();
         assert!(served(&direct).unwrap());
         assert!(std::fs::symlink_metadata(&direct).is_ok());
 
         let target = runtime.join("bound");
-        let _published = UnixListener::bind(&target).unwrap();
+        let _published = crate::descriptor::bind(&target).unwrap();
         let published = allocation.join("published.sock");
         symlink(&target, &published).unwrap();
         assert!(served(&published).unwrap());
@@ -390,7 +387,7 @@ mod tests {
         std::fs::set_permissions(&allocation, std::fs::Permissions::from_mode(0o755)).unwrap();
         let socket = allocation.join("control.sock");
         let target = runtime.join("bound");
-        drop(UnixListener::bind(&target).unwrap());
+        drop(crate::descriptor::bind(&target).unwrap());
         symlink(&target, &socket).unwrap();
         assert!(served(&socket).unwrap());
         assert!(std::fs::symlink_metadata(&socket).is_ok());
@@ -540,7 +537,7 @@ mod tests {
     fn only_served_allocations_in_the_temporary_directory_are_refreshed() {
         let (root, served_allocation, runtime) = directories();
         let target = runtime.join("bound");
-        let _server = UnixListener::bind(&target).unwrap();
+        let _server = crate::descriptor::bind(&target).unwrap();
         let served_endpoint = served_allocation.join("control.sock");
         symlink(&target, &served_endpoint).unwrap();
 
@@ -550,7 +547,7 @@ mod tests {
             .create(&stopped_allocation)
             .unwrap();
         let stopped_target = runtime.join("stopped");
-        drop(UnixListener::bind(&stopped_target).unwrap());
+        drop(crate::descriptor::bind(&stopped_target).unwrap());
         symlink(&stopped_target, stopped_allocation.join("control.sock")).unwrap();
 
         let unrelated = root.path().join("unrelated");
@@ -559,7 +556,7 @@ mod tests {
             .create(&unrelated)
             .unwrap();
         let unrelated_target = runtime.join("unrelated");
-        let _unrelated_server = UnixListener::bind(&unrelated_target).unwrap();
+        let _unrelated_server = crate::descriptor::bind(&unrelated_target).unwrap();
         symlink(&unrelated_target, unrelated.join("control.sock")).unwrap();
 
         // Anyone could place an allocation-named directory that is not
@@ -571,7 +568,7 @@ mod tests {
             .unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
         let open_target = runtime.join("open");
-        let open_server = UnixListener::bind(&open_target).unwrap();
+        let open_server = crate::descriptor::bind(&open_target).unwrap();
         open_server.set_nonblocking(true).unwrap();
         symlink(&open_target, open.join("control.sock")).unwrap();
 
@@ -614,7 +611,7 @@ mod tests {
     fn refreshing_a_published_listener_touches_its_entry_but_not_its_target() {
         let (_root, allocation, runtime) = directories();
         let target = runtime.join("bound");
-        let _server = UnixListener::bind(&target).unwrap();
+        let _server = crate::descriptor::bind(&target).unwrap();
         let published = allocation.join("control.sock");
         symlink(&target, &published).unwrap();
         // A symlink's own times can only be set without following it.

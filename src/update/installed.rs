@@ -750,6 +750,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn stopped_installed_candidate_rolls_back_only_without_a_live_writer() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         const ROOT: &str = "CAGENTS_INSTALLED_ROLLBACK_FIXTURE_ROOT";
@@ -800,7 +804,7 @@ else: raise AssertionError(sys.argv)
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         fs::create_dir_all(&paths.directory).unwrap();
         fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut stopped = Command::new("/bin/true").spawn().unwrap();
+        let mut stopped = Command::new("true").spawn().unwrap();
         let stopped_pid = stopped.id();
         stopped.wait().unwrap();
         let proof = crate::model::HostSessionProof {
@@ -923,13 +927,10 @@ else: raise AssertionError(sys.argv)
                 StartupState, read_frame, write_frame,
             },
         };
-        use std::{
-            collections::VecDeque,
-            os::unix::net::{UnixListener, UnixStream},
-        };
+        use std::{collections::VecDeque, os::unix::net::UnixStream};
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("cagentsd.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let mut proof = HostSessionProof {
             host_session_id: HostSessionId::new("startup-probe"),
             boot_id: crate::daemon::read_boot_id().unwrap(),
@@ -953,7 +954,7 @@ else: raise AssertionError(sys.argv)
         }
         let lease_path = root.path().join("cagentsd.lock");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();

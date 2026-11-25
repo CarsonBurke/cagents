@@ -1,10 +1,14 @@
 //! Authenticate exclusive flock owners using their exact locked descriptors.
-use std::{collections::BTreeSet, fs, io, os::unix::fs::MetadataExt, path::Path};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::{collections::BTreeSet, fs, io, path::Path};
 
 /// How many times the kernel index is read before believing that no
 /// candidate it names holds the lock.
+#[cfg(target_os = "linux")]
 pub const INDEX_READS: usize = 3;
 
+#[cfg(target_os = "linux")]
 pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
     let fields: Vec<_> = line.split_whitespace().collect();
     if fields.len() != 8
@@ -33,6 +37,7 @@ pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
 /// to a few percent of reads. The index is also keyed by inode alone here, so
 /// another filesystem's row can stand in for the skipped one. Until some
 /// candidate is proven, the index is read again.
+#[cfg(target_os = "linux")]
 pub(crate) fn proven_owners<T>(
     proc_root: &Path,
     expected: &fs::Metadata,
@@ -47,6 +52,26 @@ pub(crate) fn proven_owners<T>(
     )
 }
 
+/// Darwin keeps no lock index, so only the `extra` candidates a caller
+/// recorded can be proven.
+#[cfg(target_os = "macos")]
+pub(crate) fn proven_owners<T>(
+    _proc_root: &Path,
+    _expected: &fs::Metadata,
+    extra: &[u32],
+    mut prove: impl FnMut(u32) -> io::Result<Option<T>>,
+) -> io::Result<Vec<T>> {
+    let candidates: BTreeSet<u32> = extra.iter().copied().filter(|pid| *pid > 1).collect();
+    let mut proven = Vec::new();
+    for pid in candidates {
+        if let Some(owner) = prove(pid)? {
+            proven.push(owner);
+        }
+    }
+    Ok(proven)
+}
+
+#[cfg(target_os = "linux")]
 fn proven_owners_from<T>(
     mut read: impl FnMut() -> io::Result<String>,
     expected: &fs::Metadata,
@@ -72,12 +97,14 @@ fn proven_owners_from<T>(
     Ok(Vec::new())
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn fdinfo_owns_lock(info: &str, pid: u32, metadata: &fs::Metadata) -> bool {
     info.lines()
         .filter_map(|line| line.strip_prefix("lock:"))
         .any(|line| flock_owner(line, metadata) == Some(pid))
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn process_owns_lock(
     process: &Path,
     pid: u32,
@@ -100,6 +127,7 @@ pub(crate) fn process_owns_lock(
 /// `/proc/locks` is an inode index, not a file identity proof: Btrfs prints
 /// the superblock device there, while stat reports the subvolume device.
 /// Disambiguate candidates with fdinfo and stat of the same descriptor.
+#[cfg(target_os = "linux")]
 pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Result<Option<u32>> {
     // This index is advisory contender discovery. Losing procfs visibility is
     // not proof of an owner and must not abort a requested shutdown; flock on
@@ -122,8 +150,19 @@ pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Resul
     Ok(owners.ok().and_then(|owners| owners.into_iter().next()))
 }
 
+/// Darwin never names a flock's holder: `F_GETLK` reports pid -1 for flock
+/// locks and there is no lock index. Discovery is advisory, and a missing
+/// index is already "no proven owner", so this answers that; flock on the
+/// caller's own validated file remains the authoritative reservation.
+#[cfg(target_os = "macos")]
+pub(crate) fn holder_pid(_proc_root: &Path, _expected: &fs::Metadata) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
+    //! These fixtures fake Linux's `/proc` lock index.
+    #![cfg(target_os = "linux")]
     use super::*;
     use std::os::unix::fs::symlink;
 

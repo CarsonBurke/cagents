@@ -1728,7 +1728,7 @@ fn await_successor(
             }
         }
         if targets[0].revents != 0
-            && let Ok((successor, _)) = listener.accept()
+            && let Ok((successor, _)) = crate::descriptor::accept(listener)
             && hand_over(
                 &successor,
                 master,
@@ -2545,9 +2545,9 @@ mod tests {
         let invalid_directory = tempfile::tempfile().unwrap();
         let expected = pin_launch_directory(&command("true")).unwrap().0;
         let socket = directory.path().join("anonymous.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            let (control, _) = listener.accept().unwrap();
+            let (control, _) = crate::descriptor::accept(&listener).unwrap();
             control
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

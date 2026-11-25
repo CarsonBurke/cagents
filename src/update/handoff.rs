@@ -349,6 +349,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn source_that_answers_again_ends_update_without_waiting_for_its_exit() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -375,6 +379,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn lease_is_handed_over_only_after_the_releasing_source_exits() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -413,6 +421,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn source_exiting_during_successful_probe_is_not_reported_as_resumed() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -440,6 +452,10 @@ while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn empty_rival_is_stopped_and_handoff_retried_but_live_rival_is_preserved() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -510,6 +526,10 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn only_the_pinned_source_handshake_ends_wait_with_original_service_running() {
         if !crate::daemon::isolated_handoff_coordinator() {
             return;
@@ -518,7 +538,6 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, read_frame, write_frame,
         };
-        use std::os::unix::net::UnixListener;
 
         for matches_source in [true, false] {
             let root = tempfile::tempdir().unwrap();
@@ -569,7 +588,7 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
             };
             let server_lock = lock.try_clone().unwrap();
             let (release_server_lock, release_lock) = std::sync::mpsc::channel();
-            let listener = UnixListener::bind(&paths.socket).unwrap();
+            let listener = crate::descriptor::bind(&paths.socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let server = thread::spawn(move || {
                 // Source discovery and its fresh authenticated handshake are
@@ -577,7 +596,7 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
                 for _ in 0..2 {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     let mut stream = loop {
-                        match listener.accept() {
+                        match crate::descriptor::accept(&listener) {
                             Ok((stream, _)) => break stream,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 assert!(Instant::now() < deadline, "source probe never connected");

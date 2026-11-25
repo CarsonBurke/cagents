@@ -113,7 +113,7 @@ fn present_authority_never_downgrades_terminal_or_work_cli_to_user() {
     let role = role.to_str().unwrap().to_owned();
     let socket = daemon_socket_path().unwrap();
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new("fixture-host"),
@@ -367,7 +367,7 @@ fn accept(listener: &UnixListener) -> UnixStream {
         revents: 0,
     };
     assert_eq!(unsafe { libc::poll(&mut target, 1, 5000) }, 1);
-    let (stream, _) = listener.accept().unwrap();
+    let (stream, _) = crate::descriptor::accept(listener).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();

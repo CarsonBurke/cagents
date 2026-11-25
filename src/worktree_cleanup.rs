@@ -448,18 +448,10 @@ impl Protection {
     #[cfg(any(feature = "host", feature = "ui", test))]
     pub(crate) fn retained_child_files(&self) -> io::Result<Vec<std::sync::Arc<std::fs::File>>> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
         let mut files = Vec::new();
         for lock in &self._locks {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
-            let old = lock.metadata()?;
-            let new = file.metadata()?;
-            if (old.dev(), old.ino()) != (new.dev(), new.ino()) {
-                return Err(io::Error::other("directory protection inode changed"));
-            }
+            // A new open description, so its shared lock is the child's own.
+            let file = crate::descriptor::reopen(lock, 0)?;
             // SAFETY: file owns this independent open description. It only
             // closes on drop; an inherited child keeps its SH lock alive.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
@@ -1294,6 +1286,7 @@ mod tests {
         for pin in &protection._directories {
             let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
             assert!(flags >= 0);
+            #[cfg(target_os = "linux")]
             assert_ne!(flags & libc::O_PATH, 0);
         }
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();

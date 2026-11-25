@@ -3306,7 +3306,7 @@ mod tests {
             assert_eq!(named, SavedExecution::Running);
             // A server under another name still bound to the listener path.
             std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-            let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let bound = crate::descriptor::bind(&socket).unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Running
@@ -3323,7 +3323,7 @@ mod tests {
             let runtime = tempfile::tempdir_in("/var/tmp").unwrap();
             let target = runtime.path().join("served");
             std::os::unix::fs::symlink(&target, &socket).unwrap();
-            let bound = std::os::unix::net::UnixListener::bind(&target).unwrap();
+            let bound = crate::descriptor::bind(&target).unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Running,

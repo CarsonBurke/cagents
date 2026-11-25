@@ -90,7 +90,7 @@ impl Peer {
         if socket.exists() {
             fs::remove_file(&socket).unwrap();
         }
-        let listener = UnixListener::bind(socket).unwrap();
+        let listener = crate::descriptor::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         Self(Some(thread::spawn(move || {
             let attempts = if matches!(business, Business::Send) {
@@ -102,7 +102,7 @@ impl Peer {
             for attempt in 0..attempts {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut peer = loop {
-                    match listener.as_ref().unwrap().accept() {
+                    match crate::descriptor::accept(listener.as_ref().unwrap()) {
                         Ok((peer, _)) => break peer,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             assert!(
@@ -197,7 +197,7 @@ impl Peer {
         let listener = self.0.take().unwrap().join().unwrap();
         if let Some(listener) = listener {
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+                matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
                 "no extra connection after the definitive refusal"
             );
         }

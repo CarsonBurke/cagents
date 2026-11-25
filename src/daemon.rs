@@ -52,6 +52,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::model::{BootId, HostSessionProof};
+use crate::pinned_process::{PinnedProcess, peer_credentials};
 use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
 #[cfg(feature = "host")]
@@ -239,10 +240,7 @@ pub struct RuntimePaths {
 
 impl RuntimePaths {
     pub fn discover() -> Result<Self, PlatformError> {
-        let base = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .ok_or(PlatformError::MissingRuntimeDirectory)?;
+        let base = instance::runtime_base()?.ok_or(PlatformError::MissingRuntimeDirectory)?;
         let directory = base.join(instance::runtime_subdirectory());
         Ok(Self {
             socket: directory.join(SOCKET_FILE_NAME),
@@ -282,21 +280,13 @@ impl RecoveryLease {
             .into());
         }
         let lock_path = directory_path.join("cagentsd.recovery.lock");
-        // SAFETY: directory is a live directory descriptor and the fixed name
-        // is NUL-terminated. Opening relative to it cannot follow a swapped path.
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                c"cagentsd.recovery.lock".as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | LOCK_OPEN_FLAGS,
-                0o600 as libc::mode_t,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: openat returned a new descriptor, transferred exactly once.
-        let lock = unsafe { File::from_raw_fd(fd) };
+        // Opening relative to the directory cannot follow a swapped path.
+        let lock = File::from(crate::descriptor::openat(
+            directory.as_raw_fd(),
+            c"cagentsd.recovery.lock",
+            libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | LOCK_OPEN_FLAGS,
+            0o600,
+        )?);
         let metadata = lock.metadata()?;
         validate_lock_file(&lock_path, &metadata, current_uid())?;
         if metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
@@ -597,32 +587,17 @@ fn store_maintenance_guard(
 
 #[cfg(feature = "host")]
 fn recorded_daemon_exited(pid: u32) -> io::Result<bool> {
-    let pid = i32::try_from(pid)
-        .ok()
-        .filter(|pid| *pid > 1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
-    // SAFETY: pidfd_open pins the recorded process before checking exit.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if descriptor < 0 {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(true)
-        } else {
-            Err(error)
-        };
+    if pid <= 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid daemon PID",
+        ));
     }
-    // SAFETY: pidfd_open returned a new descriptor owned exactly once here.
-    let process = unsafe { File::from_raw_fd(descriptor as c_int) };
-    let mut poll = libc::pollfd {
-        fd: process.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: poll points to one initialized pollfd for the live pidfd.
-    if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
-        return Err(io::Error::last_os_error());
+    match PinnedProcess::open(pid) {
+        Ok(process) => process.exited(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
     }
-    Ok(poll.revents & libc::POLLIN != 0)
 }
 
 impl Drop for HostLease {
@@ -687,65 +662,30 @@ pub(crate) fn daemon_process_alive_at(paths: &RuntimePaths) -> Result<bool, Plat
     };
     validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
     let stored: StoredLockMetadata = read_lock_metadata(&lock)?;
-    let pid = i32::try_from(stored.pid)
-        .ok()
-        .filter(|pid| *pid > 1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
+    if stored.pid <= 1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID").into());
+    }
     // Pin and check exit before inspecting descriptors: an exited zombie has
-    // no descriptors even though its /proc directory and pidfd still exist.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if descriptor < 0 {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(false)
-        } else {
-            Err(error.into())
-        };
-    }
-    // SAFETY: successful pidfd_open returned a fresh descriptor owned here.
-    let process = unsafe { File::from_raw_fd(descriptor as c_int) };
-    let exited = || -> io::Result<bool> {
-        let mut poll = libc::pollfd {
-            fd: process.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd referring to the pinned process.
-        if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(poll.revents != 0)
+    // no descriptors even though its record and pin still exist.
+    let process = match PinnedProcess::open(stored.pid) {
+        Ok(process) => process,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
-    if exited()? {
-        return Ok(false);
-    }
-    let process_path = Path::new("/proc").join(stored.pid.to_string());
+    // A process can finish while its descriptor ownership is being inspected;
+    // every answer below refuses to describe one that has.
     let ownership = (|| -> io::Result<bool> {
-        validate_owner(
-            &process_path,
-            &fs::symlink_metadata(&process_path)?,
-            current_uid(),
-        )
-        .map_err(io::Error::other)?;
-        let expected = lock.metadata()?;
-        for entry in fs::read_dir(process_path.join("fd"))? {
-            let entry = entry?;
-            let actual = match fs::metadata(entry.path()) {
-                Ok(actual) => actual,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if actual.dev() == expected.dev() && actual.ino() == expected.ino() {
-                return Ok(true);
-            }
+        if process.uid()? != current_uid() {
+            return Err(io::Error::other(
+                "the recorded daemon belongs to another user",
+            ));
         }
-        Ok(false)
+        process.holds_open(&lock.metadata()?)
     })();
-    // A process can finish while its descriptor ownership is being inspected.
-    if exited()? {
-        return Ok(false);
+    match ownership {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        ownership => ownership.map_err(Into::into),
     }
-    ownership.map_err(Into::into)
 }
 
 /// Locate the executable of this instance's live, kernel-verified lock owner.
@@ -766,14 +706,11 @@ pub(crate) fn running_executable_at(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let Some(_pidfd) = daemon_pidfd_from_lock(&mut lock, paths)? else {
+    let Some(process) = daemon_pidfd_from_lock(&mut lock, paths)? else {
         return Ok(None);
     };
-    lock.seek(SeekFrom::Start(0))?;
-    let stored: StoredLockMetadata = read_lock_metadata(&mut lock)?;
-    let executable = fs::read_link(format!("/proc/{}/exe", stored.pid))?;
-    let _validated = open_validated_pidfd(&lock, stored.pid, Path::new("/proc"))?;
-    Ok(Some(executable))
+    // The pinned owner answers for itself, so a successor to its pid cannot.
+    Ok(Some(process.executable()?))
 }
 
 /// Authenticate the current socket against the daemon's exclusive lease before
@@ -782,22 +719,8 @@ pub(crate) fn running_executable_at(
 pub fn replacement_owner(socket: &Path, proof: &HostSessionProof) -> Result<u32, PlatformError> {
     let pid = lease_owner(&socket.with_file_name("cagentsd.lock"), proof)?;
     let stream = UnixStream::connect(socket)?;
-    let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: credential and length are writable buffers of the declared size.
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credential as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error().into());
-    }
-    if credential.uid != current_uid() || u32::try_from(credential.pid).ok() != Some(pid) {
+    let credential = peer_credentials(&stream)?;
+    if credential.uid != current_uid() || credential.pid != pid {
         return Err(io::Error::other("daemon socket does not belong to its lease owner").into());
     }
     Ok(pid)
@@ -825,7 +748,7 @@ pub fn lease_owner(lock_path: &Path, proof: &HostSessionProof) -> Result<u32, Pl
 /// Pin the authenticated serving owner before requesting shutdown. The pidfd
 /// survives lease release and cannot follow a replacement or a reused PID.
 pub(crate) struct ShutdownTarget {
-    process: File,
+    process: PinnedProcess,
 }
 
 impl ShutdownTarget {
@@ -847,31 +770,25 @@ impl ShutdownTarget {
     }
 
     pub(crate) fn wait(&self, timeout: std::time::Duration) -> io::Result<bool> {
-        wait_process(&self.process, timeout)
+        self.process.wait_for_exit(timeout)
     }
 
     /// Sends SIGTERM to the pinned process only. One that already exited is
     /// not an error: it is stopping either way.
     fn terminate(&self) -> io::Result<()> {
-        signal_process(&self.process, libc::SIGTERM)
+        self.process.signal(libc::SIGTERM).map(drop)
     }
 
-    /// The pinned process's ID in this PID namespace, for messages only.
+    /// The pinned process's ID, for messages only.
     fn pid(&self) -> Option<u32> {
-        let info =
-            fs::read_to_string(format!("/proc/self/fdinfo/{}", self.process.as_raw_fd())).ok()?;
-        info.lines()
-            .find_map(|line| line.strip_prefix("Pid:"))?
-            .trim()
-            .parse()
-            .ok()
+        Some(self.process.pid())
     }
 }
 
 fn lease_owner_process(
     lock_path: &Path,
     proof: &HostSessionProof,
-) -> Result<(u32, File), PlatformError> {
+) -> Result<(u32, PinnedProcess), PlatformError> {
     #[derive(Deserialize)]
     struct RecoveryMetadata {
         pid: u32,
@@ -897,7 +814,7 @@ fn lease_owner_process(
     if !proof.is_complete() || metadata.proof != *proof || read_boot_id()? != proof.boot_id {
         return Err(io::Error::other("daemon lease does not match its discovery proof").into());
     }
-    let process = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
+    let process = open_validated_pidfd(&lock, metadata.pid)?;
     Ok((metadata.pid, process))
 }
 
@@ -993,7 +910,8 @@ fn remove_exited_owner_socket(lock: &File, paths: &RuntimePaths) -> Result<(), P
 #[cfg(feature = "ui")]
 #[derive(Debug)]
 pub struct RestartTarget {
-    process: File,
+    /// `None` only for the inert UI fixture, which can name no process.
+    process: Option<PinnedProcess>,
     proof: HostSessionProof,
 }
 
@@ -1017,25 +935,25 @@ fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformErro
         .ok_or_else(|| io::Error::other("the daemon has already stopped"))?;
     lock.seek(SeekFrom::Start(0))?;
     let metadata: Metadata = read_lock_metadata(&mut lock)?;
-    let process = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
+    let process = open_validated_pidfd(&lock, metadata.pid)?;
     if lease_owner(&paths.lock, &metadata.proof)? != metadata.pid {
         return Err(io::Error::other("daemon ownership changed while opening confirmation").into());
     }
     Ok(RestartTarget {
-        process,
+        process: Some(process),
         proof: metadata.proof,
     })
 }
 
 #[cfg(feature = "ui")]
 impl RestartTarget {
-    /// An inert UI state-machine fixture. The regular file cannot name or
-    /// signal a process; tests must drop restart tasks without polling them.
+    /// An inert UI state-machine fixture. It names no process and cannot
+    /// signal one; tests must drop restart tasks without polling them.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn inert_for_ui_test() -> Self {
         Self {
-            process: tempfile::tempfile().expect("inert restart fixture"),
+            process: None,
             proof: HostSessionProof {
                 host_session_id: crate::model::HostSessionId::new("inert-ui-test"),
                 boot_id: BootId::new("inert-ui-test"),
@@ -1057,14 +975,18 @@ impl RestartTarget {
         paths: &RuntimePaths,
         grace: std::time::Duration,
     ) -> Result<(), PlatformError> {
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the inert restart fixture names no process"))?;
         lease_owner(&paths.lock, &self.proof)?;
-        signal_process(&self.process, libc::SIGTERM)?;
-        if !wait_process(&self.process, grace)? {
+        process.signal(libc::SIGTERM)?;
+        if !process.wait_for_exit(grace)? {
             // If ownership changed during the wait, do not kill anything on
             // behalf of an obsolete confirmation.
             lease_owner(&paths.lock, &self.proof)?;
-            signal_process(&self.process, libc::SIGKILL)?;
-            if !wait_process(&self.process, std::time::Duration::from_secs(5))? {
+            process.signal(libc::SIGKILL)?;
+            if !process.wait_for_exit(std::time::Duration::from_secs(5))? {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "the confirmed daemon did not exit",
@@ -1076,65 +998,10 @@ impl RestartTarget {
     }
 }
 
-fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
-    // SAFETY: the owned descriptor is a validated pidfd; the caller supplies
-    // SIGTERM or SIGKILL. No PID lookup occurs after authentication.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            process.as_raw_fd(),
-            signal,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    } == -1
-    {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
-fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<bool> {
-    let deadline = std::time::Instant::now() + duration;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let mut poll = libc::pollfd {
-            fd: process.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll is a live single-element writable array; a pidfd becomes
-        // readable after its pinned process exits.
-        let result = unsafe {
-            libc::poll(
-                &mut poll,
-                1,
-                remaining
-                    .as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(i32::MAX as u128) as i32,
-            )
-        };
-        if result > 0 {
-            return Ok(poll.revents & libc::POLLIN != 0);
-        }
-        if result == 0 {
-            return Ok(false);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
 fn daemon_pidfd_from_lock(
     lock: &mut File,
     paths: &RuntimePaths,
-) -> Result<Option<File>, PlatformError> {
+) -> Result<Option<PinnedProcess>, PlatformError> {
     validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
     // Check ownership before trusting metadata: a crashed writer can leave a
     // truncated lock file, but an unheld flock proves no daemon can be using it.
@@ -1159,8 +1026,8 @@ fn open_daemon_pidfd_or_recover(
     lock: &File,
     paths: &RuntimePaths,
     pid: u32,
-) -> Result<Option<File>, PlatformError> {
-    match open_validated_pidfd(lock, pid, Path::new("/proc")) {
+) -> Result<Option<PinnedProcess>, PlatformError> {
+    match open_validated_pidfd(lock, pid) {
         Ok(pidfd) => Ok(Some(pidfd)),
         Err(validation_error) => {
             // A dead daemon can leave both metadata files behind. Only remove
@@ -1178,39 +1045,30 @@ fn open_daemon_pidfd_or_recover(
     }
 }
 
-fn open_validated_pidfd(lock: &File, pid: u32, proc_root: &Path) -> io::Result<File> {
-    let pid = i32::try_from(pid)
-        .ok()
-        .filter(|pid| *pid > 1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
-    // SAFETY: pidfd_open takes scalar arguments and returns a new owned file
-    // descriptor or -1 without writing through any pointer.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if descriptor == -1 {
-        return Err(io::Error::last_os_error());
+/// Pins the recorded daemon and proves it is this user's process holding the
+/// validated lock file open. The pin is taken before the proof, so a pid
+/// reused after it cannot inherit the answer.
+fn open_validated_pidfd(lock: &File, pid: u32) -> io::Result<PinnedProcess> {
+    if pid <= 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid daemon PID",
+        ));
     }
-    // SAFETY: a successful pidfd_open returns a fresh descriptor owned here.
-    let pidfd = unsafe { File::from_raw_fd(descriptor as c_int) };
-
-    let process_path = proc_root.join(pid.to_string());
-    validate_owner(
-        &process_path,
-        &fs::symlink_metadata(&process_path)?,
-        current_uid(),
-    )
-    .map_err(io::Error::other)?;
-    let expected = lock.metadata()?;
-    let owns_lock = fs::read_dir(process_path.join("fd"))?
-        .filter_map(Result::ok)
-        .filter_map(|entry| fs::metadata(entry.path()).ok())
-        .any(|metadata| metadata.dev() == expected.dev() && metadata.ino() == expected.ino());
-    if !owns_lock {
+    let process = PinnedProcess::open(pid)?;
+    if process.uid()? != current_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon PID belongs to another user",
+        ));
+    }
+    if !process.holds_open(&lock.metadata()?)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "daemon PID does not own the validated lock file",
         ));
     }
-    Ok(pidfd)
+    Ok(process)
 }
 
 #[cfg(feature = "host")]
@@ -1305,6 +1163,7 @@ pub fn current_uid() -> u32 {
 
 /// Called only in a child's pre-exec hook. Long-lived sibling processes must
 /// not retain installer assets, update leases, or other inherited descriptors.
+#[cfg(target_os = "linux")]
 pub fn seal_inherited_descriptors() -> io::Result<()> {
     // SAFETY: close_range takes scalar bounds and only changes descriptor flags.
     if unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) } != 0 {
@@ -1313,37 +1172,74 @@ pub fn seal_inherited_descriptors() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "host")]
-pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    // SAFETY: zero is valid for every scalar field of the kernel credential buffer.
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
-        .expect("Linux ucred size must fit socklen_t");
-    // SAFETY: credentials and length are valid writable objects of the sizes
-    // passed to getsockopt, and stream owns a live socket descriptor.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
+/// Called only in a child's pre-exec hook. Long-lived sibling processes must
+/// not retain installer assets, update leases, or other inherited descriptors.
+///
+/// Darwin has no `close_range`. Between fork and exec only async-signal-safe
+/// calls are allowed and nothing may allocate, so the kernel lists this
+/// process's open descriptors into a buffer on the stack, and each is marked
+/// close-on-exec. A list that may have been cut short falls back to marking
+/// every number below the highest descriptor limit the process has run with:
+/// an earlier hook may already have lowered the limit for the child, which
+/// leaves descriptors numbered above it open.
+#[cfg(target_os = "macos")]
+pub fn seal_inherited_descriptors() -> io::Result<()> {
+    const LISTED: usize = 4096;
+    let mut listed = [libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; LISTED];
+    let room = std::mem::size_of_val(&listed);
+    // SAFETY: the buffer is writable and exactly `room` bytes long; the call
+    // only fills it and answers how many bytes it wrote.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            listed.as_mut_ptr().cast(),
+            room as libc::c_int,
         )
     };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
+    match usize::try_from(written) {
+        Ok(written) if written > 0 && written < room => {
+            let count = written / std::mem::size_of::<libc::proc_fdinfo>();
+            listed[..count]
+                .iter()
+                .filter(|entry| entry.proc_fd > 2)
+                .try_for_each(|entry| close_on_exec(entry.proc_fd))
+        }
+        _ => {
+            // SAFETY: getdtablesize has no preconditions.
+            let limit = unsafe { libc::getdtablesize() };
+            // Only the daemon raises its own limit.
+            #[cfg(feature = "host")]
+            let limit = limit.max(crate::descriptor_limit::highest());
+            (3..limit).try_for_each(close_on_exec)
+        }
     }
-    if usize::try_from(length).ok() != Some(std::mem::size_of::<libc::ucred>()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "kernel returned an invalid SO_PEERCRED length",
-        ));
+}
+
+/// Marks `descriptor` close-on-exec; a number not in use is left alone.
+#[cfg(target_os = "macos")]
+fn close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
+    // SAFETY: fcntl takes scalar arguments; an unused number answers EBADF.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBADF) {
+            return Err(error);
+        }
     }
-    Ok(credentials.uid)
+    Ok(())
+}
+
+#[cfg(feature = "host")]
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    crate::pinned_process::peer_uid(stream)
 }
 
 pub fn read_boot_id() -> io::Result<BootId> {
-    let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let value = kernel_boot_id()?;
     let value = value.trim();
     if value.is_empty() || value.len() > 128 {
         return Err(io::Error::new(
@@ -1352,6 +1248,40 @@ pub fn read_boot_id() -> io::Result<BootId> {
         ));
     }
     Ok(BootId::new(value))
+}
+
+/// The kernel's identifier for the current boot, which changes on every boot.
+#[cfg(target_os = "linux")]
+fn kernel_boot_id() -> io::Result<String> {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+}
+
+/// The kernel's identifier for the current boot: Darwin's `kern.bootsessionuuid`,
+/// a UUID drawn afresh on every boot, like Linux's `boot_id`.
+#[cfg(target_os = "macos")]
+fn kernel_boot_id() -> io::Result<String> {
+    let mut buffer = [0_u8; 64];
+    let mut length = buffer.len();
+    // SAFETY: the name is NUL-terminated, the output buffer and its length are
+    // writable and agree, and no new value is supplied.
+    if unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let value = buffer[..length.min(buffer.len())]
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    String::from_utf8(value.to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "kernel boot ID is not UTF-8"))
 }
 
 #[cfg(feature = "host")]
@@ -1403,10 +1333,17 @@ pub fn shut_down_test_listener(listener: std::os::unix::net::UnixListener) {
     // Concurrent tests may fork before CLOEXEC closes an inherited copy.
     // Shut down the shared socket so every retained descriptor refuses connections.
     // SAFETY: the listener owns this live socket descriptor.
+    #[cfg(target_os = "linux")]
     assert_eq!(
         unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) },
         0
     );
+    // XNU shuts down only connected sockets and answers ENOTCONN for a
+    // listener, so Darwin can only close it. Most spawns there use
+    // posix_spawn, which inherits no close-on-exec copy; a concurrent
+    // fork-and-exec spawn can still hold one until its exec.
+    #[cfg(target_os = "macos")]
+    drop(listener);
 }
 
 /// LeaseHandoff deliberately closes without LOCK_UN because a successor
@@ -1443,9 +1380,9 @@ pub(crate) fn isolated_handoff_coordinator() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     #[cfg(feature = "host")]
     use std::os::unix::fs::symlink;
-    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
     use tempfile::tempdir;
 
@@ -1515,7 +1452,7 @@ mod tests {
             socket: root.path().join("cagentsd.sock"),
             lock: root.path().join("cagentsd.lock"),
         };
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
         let lock = OpenOptions::new()
             .create_new(true)
@@ -1551,7 +1488,7 @@ mod tests {
         };
         let directory = tempdir().unwrap();
         let path = directory.path().join("activity.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         // Unlike the global signal channel, this local test channel never
         // publishes a descriptor to a handler or mutates process signal state.
         let channel = Arc::new(Wakeup::channel().unwrap());
@@ -1591,7 +1528,7 @@ mod tests {
         );
         let _client = UnixStream::connect(&path).unwrap();
         wait_for_activity_with(&listener, &channel).unwrap();
-        let _accepted = listener.accept().unwrap();
+        let _accepted = crate::descriptor::accept(&listener).unwrap();
     }
 
     #[cfg(all(feature = "host", target_os = "linux"))]
@@ -1667,7 +1604,7 @@ mod tests {
     fn lifecycle_activity_wait_observes_absolute_deadline_without_other_activity() {
         use std::{sync::mpsc, time::Duration};
         let directory = tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("deadline.sock")).unwrap();
+        let listener = crate::descriptor::bind(directory.path().join("deadline.sock")).unwrap();
         let channel = Arc::new(Wakeup::channel().unwrap());
         let owned_channel = channel.clone();
         let (sent, received) = mpsc::channel();
@@ -1709,7 +1646,7 @@ mod tests {
     fn lifecycle_activity_wait_wakes_on_original_holder_exit_with_quiet_listener_and_wake() {
         use std::{sync::mpsc, time::Duration};
         let directory = tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("holder.sock")).unwrap();
+        let listener = crate::descriptor::bind(directory.path().join("holder.sock")).unwrap();
         let inspect_listener = listener.try_clone().unwrap();
         let channel = Arc::new(Wakeup::channel().unwrap());
         let owned_channel = channel.clone();
@@ -1774,7 +1711,7 @@ mod tests {
     fn lifecycle_activity_wait_preserves_local_wake_with_pending_holder_and_deadline() {
         use std::{sync::mpsc, time::Duration};
         let directory = tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("wake-holder.sock")).unwrap();
+        let listener = crate::descriptor::bind(directory.path().join("wake-holder.sock")).unwrap();
         let channel = Arc::new(Wakeup::channel().unwrap());
         let owned_channel = channel.clone();
         let mut child = ActivityWaitChild::start();
@@ -1835,6 +1772,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn special_daemon_locks_are_rejected_before_blocking_open() {
         use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
@@ -2137,7 +2075,7 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = paths(root.path().join("runtime"));
         let lease = HostLease::acquire(&paths, &proof()).unwrap();
-        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let listener = crate::descriptor::bind(&paths.socket).unwrap();
         drop(listener);
         fs::remove_file(&paths.socket).unwrap();
 
@@ -2169,13 +2107,23 @@ mod tests {
         let root = tempdir().unwrap();
         let lock = File::create(root.path().join("lock")).unwrap();
 
-        let pidfd = open_validated_pidfd(&lock, std::process::id(), Path::new("/proc")).unwrap();
+        let process = open_validated_pidfd(&lock, std::process::id()).unwrap();
+        assert_eq!(process.pid(), std::process::id());
+        assert!(!process.exited().unwrap());
 
-        assert!(pidfd.metadata().is_ok());
+        // A file this process no longer holds open proves nothing.
+        let unheld = File::create(root.path().join("other"))
+            .unwrap()
+            .metadata()
+            .unwrap();
+        let error =
+            open_validated_pidfd(&File::open(root.path().join("other")).unwrap(), 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!process.holds_open(&unheld).unwrap());
     }
 
     fn leave_stale_socket(path: &Path) {
-        let listener = UnixListener::bind(path).unwrap();
+        let listener = crate::descriptor::bind(path).unwrap();
         shut_down_test_listener(listener);
     }
 
@@ -2385,15 +2333,11 @@ for line in sys.stdin:
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
         let mut normal = StopFixture::start(&paths, "normal");
-        let pin = open_validated_pidfd(
-            &File::open(&paths.lock).unwrap(),
-            normal.child.id(),
-            Path::new("/proc"),
-        )
-        .unwrap();
+        let pin =
+            open_validated_pidfd(&File::open(&paths.lock).unwrap(), normal.child.id()).unwrap();
         assert!(terminate_daemon_at(&paths, Duration::from_secs(2)).unwrap());
         assert!(
-            wait_process(&pin, Duration::ZERO).unwrap(),
+            pin.wait_for_exit(Duration::ZERO).unwrap(),
             "success requires the ORIGINAL process exit, not just SIGTERM delivery"
         );
         let status = normal.child.wait().unwrap();
@@ -2652,7 +2596,7 @@ while True: time.sleep(1)
         }
         let root = tempdir().unwrap();
         let paths = paths(root.path().join("runtime"));
-        let mut ended = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
         let ended_pid = ended.id();
         ended.wait().unwrap();
         let mut original = HostLease::acquire(&paths, &proof()).unwrap();

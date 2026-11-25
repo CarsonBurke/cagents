@@ -696,6 +696,10 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn zombie_source_metadata_does_not_mask_prepared_failure_or_start_another_daemon() {
     use std::os::unix::fs::PermissionsExt;
 

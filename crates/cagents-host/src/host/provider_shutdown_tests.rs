@@ -376,7 +376,7 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
     host.lock().unwrap().enable_holder_recovery();
     // Inject a real bind failure after acquiring the actual lease. This socket
     // is only this fixture's blocker; it never accepts or serves a client.
-    let blocker = UnixListener::bind(&paths.socket).unwrap();
+    let blocker = crate::descriptor::bind(&paths.socket).unwrap();
     let blocker_stat = fs::symlink_metadata(&paths.socket).unwrap();
     let restored = Cell::new(false);
     let restore = || {

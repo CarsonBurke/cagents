@@ -120,12 +120,12 @@ impl Peer {
         handshake: ServerMessage,
         serve: impl FnOnce(&mut UnixStream) + Send + 'static,
     ) -> Self {
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut stream = loop {
-                match listener.accept() {
+                match crate::descriptor::accept(&listener) {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "private peer was not connected");
@@ -160,7 +160,7 @@ impl Peer {
     fn finished(mut self) {
         let listener = self.worker.take().unwrap().join().unwrap();
         assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
             "legacy command must not open a retry/fallback connection"
         );
     }

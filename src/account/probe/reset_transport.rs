@@ -765,7 +765,11 @@ mod offer_context_tests {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
-                        Ok((stream, _)) => break stream,
+                        // A BSD stream inherits the listener's O_NONBLOCK.
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            break stream;
+                        }
                         Err(error)
                             if error.kind() == io::ErrorKind::WouldBlock
                                 && std::time::Instant::now() < deadline =>

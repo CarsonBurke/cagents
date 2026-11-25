@@ -72,14 +72,14 @@ impl Peer {
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         assert!(socket.starts_with(root()));
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         Self(Some(thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut readiness = 0;
             let (mut peer, auth) = loop {
                 let mut peer = loop {
-                    match listener.accept() {
+                    match crate::descriptor::accept(&listener) {
                         Ok((peer, _)) => break peer,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             assert!(
@@ -160,7 +160,7 @@ impl Peer {
     fn finished(mut self) -> usize {
         let (listener, readiness) = self.0.take().unwrap().join().unwrap();
         assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
         );
         readiness
     }

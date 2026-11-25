@@ -9,11 +9,7 @@ use crate::{
         views::{Pane, Scope},
     },
 };
-use std::{
-    fs,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
-    path::Path,
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
 fn daemon_eof_relaunches_only_the_console_and_keeps_its_running_turn() {
@@ -151,7 +147,7 @@ while True:
 "#,
     );
     fs::write(root.join("lease-third-frame-gate"), b"hold").unwrap();
-    let listener = UnixListener::bind(root.join("old.sock")).unwrap();
+    let listener = crate::descriptor::bind(root.join("old.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     fs::write(root.join("console-lock-path"), paths.lock.to_str().unwrap()).unwrap();
@@ -261,7 +257,9 @@ while True:
     let mut connection = None;
     wait(
         || {
-            connection = listener.accept().ok().map(|(stream, _)| stream);
+            connection = crate::descriptor::accept(&listener)
+                .ok()
+                .map(|(stream, _)| stream);
             connection.is_some()
         },
         "fake console never connected to its old daemon",

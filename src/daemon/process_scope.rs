@@ -731,7 +731,7 @@ pub(crate) mod tests {
             eprintln!("scope withdrawal unqualified: OS user manager unavailable");
             return;
         }
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -783,7 +783,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_manager_that_exited_after_its_proof_receives_no_request() {
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
         // SAFETY: pidfd_open returns a new descriptor for this unreaped child.
         let peer = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
         assert!(peer >= 0);
@@ -985,12 +985,11 @@ pub(crate) mod tests {
 
     #[test]
     fn private_peer_connection_is_nonblocking_without_a_manager_request() {
-        use std::os::unix::net::UnixListener;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fixture.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         let connection = connect_nonblocking(&path).unwrap();
-        let (_accepted, _) = listener.accept().unwrap();
+        let (_accepted, _) = crate::descriptor::accept(&listener).unwrap();
         // SAFETY: F_GETFL only observes the owned socket's status flags.
         let flags = unsafe { libc::fcntl(connection.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(flags, -1);
@@ -1062,7 +1061,7 @@ pub(crate) mod tests {
     }
     pub(crate) fn rejected_scope_request() -> io::Result<()> {
         enroll_with(
-            Command::new("/bin/false"),
+            Command::new("false"),
             "fixture.scope",
             Duration::from_secs(1),
             || panic!("failed request must not verify membership"),
@@ -1072,7 +1071,7 @@ pub(crate) mod tests {
     #[test]
     fn successful_request_requires_exact_confirmed_membership() {
         let error = enroll_with(
-            Command::new("/bin/true"),
+            Command::new("true"),
             "fixture.scope",
             Duration::from_millis(30),
             || Ok("/app.slice/other.scope".into()),
@@ -1080,7 +1079,7 @@ pub(crate) mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         enroll_with(
-            Command::new("/bin/true"),
+            Command::new("true"),
             "fixture.scope",
             Duration::from_secs(1),
             || Ok("/app.slice/fixture.scope".into()),

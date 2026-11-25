@@ -167,6 +167,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn protocol_comes_from_verified_candidate_execution() {
         let directory = tempfile::tempdir().unwrap();
         let bin = directory.path().join("cagents-9.8.7/bin");
