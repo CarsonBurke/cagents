@@ -510,7 +510,7 @@ fn entry_identity(
 /// Returns [`io::ErrorKind::NotFound`] when the recorded path no longer
 /// reaches the object, as after it was moved or replaced, and the underlying
 /// error when either cannot be stat'ed.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
 pub(crate) fn reaching_path(held: &File) -> io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let path = descriptor_path(held.as_raw_fd())?;
