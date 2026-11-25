@@ -3802,7 +3802,7 @@ fn restored_camera_initializes_native_scroll_once_before_the_first_frame() {
 }
 
 #[test]
-fn a_chat_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane() {
+fn a_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane() {
     use cosmic::iced::advanced::{clipboard, renderer::Headless};
     use keyboard::key::{Code, Physical};
 
@@ -3836,11 +3836,12 @@ fn a_chat_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane()
         .unwrap();
     let card = CardId::new();
     for (focused, delivered) in [
-        // A chat pane's content sees the chord first; its focused message
-        // editor takes it as redo.
+        // A pane's content sees the chord first; its focused editor, such
+        // as a chat's message editor, takes it as redo.
         (FocusedPane::Chat, true),
-        // Anywhere else the workspace keeps it.
-        (FocusedPane::Other, false),
+        (FocusedPane::Review, true),
+        (FocusedPane::Other, true),
+        // A terminal would take every key, so the workspace keeps it.
         (FocusedPane::Terminal, false),
     ] {
         let mut element: Element<'_, Option<CardId>> = WorkspaceSurface::new(
@@ -3877,7 +3878,8 @@ fn a_chat_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane()
     // still reopens the last closed pane.
     assert!(deferred_shortcut_taken(&redo, true, FocusedPane::Chat));
     assert!(!deferred_shortcut_taken(&redo, false, FocusedPane::Chat));
-    assert!(!deferred_shortcut_taken(&redo, true, FocusedPane::Other));
+    assert!(deferred_shortcut_taken(&redo, true, FocusedPane::Other));
+    assert!(!deferred_shortcut_taken(&redo, true, FocusedPane::Terminal));
     for (event, defers) in [
         (chord("z", Code::KeyZ, control), true),
         (chord("y", Code::KeyY, control), true),

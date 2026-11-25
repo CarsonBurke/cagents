@@ -1048,20 +1048,23 @@ pub fn recordable_shortcut_character(
 }
 
 /// Whether a chord is undo or redo (primary+Z, primary+Shift+Z, primary+Y,
-/// the primary modifier being Ctrl on Linux and Cmd on macOS) pressed in
-/// a chat pane, whose message editor has an undo history of its own.
+/// the primary modifier being Ctrl on Linux and Cmd on macOS) pressed in a
+/// pane that can hold a text editor with an undo history of its own: a
+/// chat's message editor, a review comment, a file being edited.
 ///
 /// The pane's content sees such a chord before the workspace does: the
 /// focused editor takes it, and the workspace's action bound to the same
-/// chord, such as reopening a closed pane on Ctrl+Shift+Z, runs only when
-/// nothing there took it ([`deferred_shortcut_taken`]).
+/// chord, such as reopening a closed pane on primary+Shift+Z, runs only when
+/// nothing there took it ([`deferred_shortcut_taken`]). A terminal is left
+/// out: it takes every key for its process, so the chord would never reach
+/// the workspace.
 pub(crate) fn defers_to_focused_editor(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     focused: FocusedPane,
 ) -> bool {
-    focused == FocusedPane::Chat
+    !matches!(focused, FocusedPane::Terminal | FocusedPane::None)
         && crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
         && match latin_key(key, physical_key) {
             Some('z') => true,
