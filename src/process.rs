@@ -21,6 +21,8 @@ pub use image::pin_own_image;
 pub(crate) use image::{command_line, own_image};
 
 use crate::descriptor::set_nonblocking;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use identity::group_members;
 use identity::{child_exit_status, child_identity};
 #[cfg(all(test, target_os = "linux"))]
 use std::os::fd::FromRawFd;
