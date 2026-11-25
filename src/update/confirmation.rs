@@ -86,7 +86,7 @@ struct Decision {
     choice: Choice,
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -152,6 +152,25 @@ pub(super) fn cancel_at(state: &Path, job: &str) -> Result<bool, UpdateError> {
 /// A choice only applies to the exact preview still held by the leased worker.
 /// Unique files avoid replacing another window's decision mid-read.
 pub fn decide(job: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError> {
+    submit(job, nonce, choice, DecisionSource::Controls)
+}
+
+pub(super) fn answer_prompt(job: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError> {
+    submit(job, nonce, choice, DecisionSource::Prompt)
+}
+
+#[derive(Clone, Copy)]
+enum DecisionSource {
+    Controls,
+    Prompt,
+}
+
+fn submit(
+    job: &str,
+    nonce: &str,
+    choice: Choice,
+    source: DecisionSource,
+) -> Result<(), UpdateError> {
     for value in [job, nonce] {
         if uuid::Uuid::parse_str(value)
             .ok()
@@ -161,33 +180,53 @@ pub fn decide(job: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError>
         }
     }
     let state = running_installation()?.state_dir()?;
-    decide_at(&state, job, nonce, choice)
+    decide_at_from(&state, job, nonce, choice, source)
 }
 
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 pub(super) fn decide_at(
     state: &Path,
     job: &str,
     nonce: &str,
     choice: Choice,
 ) -> Result<(), UpdateError> {
+    decide_at_from(state, job, nonce, choice, DecisionSource::Controls)
+}
+
+fn decide_at_from(
+    state: &Path,
+    job: &str,
+    nonce: &str,
+    choice: Choice,
+    source: DecisionSource,
+) -> Result<(), UpdateError> {
     let _decisions = DecisionLease::acquire(state, job)?;
     let current: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
-    let accepts_choice = matches!(
-        current.phase,
-        UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
-    ) || matches!(choice, Choice::Cancel)
-        && current.phase == UpdatePhase::ClosingWindows;
+    let cancel = matches!(choice, Choice::Cancel);
+    let accepts_choice = match source {
+        DecisionSource::Prompt => current.phase == UpdatePhase::AwaitingConfirmation,
+        DecisionSource::Controls => {
+            matches!(
+                current.phase,
+                UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
+            ) || cancel && current.phase == UpdatePhase::ClosingWindows
+        }
+    };
     if !accepts_choice
         || current.id != job
         || current.confirmation.as_ref().is_none_or(|confirmation| {
             confirmation.nonce != nonce
-                || !matches!(choice, Choice::Cancel) && now_ms() >= confirmation.expires_at_unix_ms
+                || (!cancel || matches!(source, DecisionSource::Prompt))
+                    && now_ms() >= confirmation.expires_at_unix_ms
         })
     {
-        return Err(invalid(
-            "update preview changed or expired; review the current preview",
-        ));
+        return Err(UpdateError::DecisionExpired);
+    }
+    if matches!(source, DecisionSource::Prompt)
+        && state.join(format!("{job}.{nonce}.decision")).try_exists()?
+    {
+        return Err(UpdateError::DecisionAlreadySubmitted);
     }
     publish_decision(state, job, nonce, choice)
 }
@@ -254,6 +293,9 @@ fn publish_decision(
     match published {
         Ok(()) => (),
         Err(error) if suffix == "cancel" && error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(UpdateError::DecisionAlreadySubmitted);
+        }
         Err(error) => return Err(error.into()),
     }
     File::open(state)?.sync_all()?;
@@ -463,6 +505,7 @@ fn wait_for(
         None => Review::new(policy, observe(policy)?, Approval::Required),
     };
     let mut handoff = None;
+    let mut answered = None;
     loop {
         if Instant::now() >= deadline {
             return Err(refused(&review.preview, true).unwrap_or_else(|| {
@@ -499,6 +542,7 @@ fn wait_for(
             };
             let (phase, message) = review.approval.publication();
             publish_review(state, job, confirmation, phase, |_| Ok(message.to_owned()))?;
+            release_answer(&mut answered)?;
         }
         check_review_closed(state, job)?;
         let path = state.join(format!("{}.{}.decision", job.id, review.nonce));
@@ -510,7 +554,11 @@ fn wait_for(
                         "update decision does not match the current preview",
                     ));
                 }
-                fs::remove_file(&path)?;
+                if matches!(decision.choice, Choice::StopListed { .. }) {
+                    fs::remove_file(path)?;
+                } else {
+                    answered = Some(path);
+                }
                 match decision.choice {
                     Choice::Cancel => return Err(closed(&review.preview)),
                     Choice::Confirm => {
@@ -567,6 +615,16 @@ fn wait_for(
         }
         thread::sleep(decision_poll());
     }
+}
+
+// The decision file keeps its slot occupied while a slow source observation
+// runs. Release it under the decision lease only after a new phase or nonce is
+// visible, so another open prompt cannot answer the old review in that gap.
+fn release_answer(answered: &mut Option<PathBuf>) -> io::Result<()> {
+    if let Some(path) = answered.take() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// Closing a review is a cancellation unless something it named had to be
@@ -674,6 +732,7 @@ pub(super) fn wait_stop(
         )));
     }
     let mut nonce = uuid::Uuid::new_v4().to_string();
+    let mut answered = None;
     loop {
         if Instant::now() >= deadline {
             return Err(invalid(
@@ -705,31 +764,36 @@ pub(super) fn wait_stop(
                     ))
                 },
             )?;
+            release_answer(&mut answered)?;
         }
         check_review_closed(state, job)?;
         let path = state.join(format!("{}.{}.decision", job.id, nonce));
-        let decision = match read_private(&path, SMALL_ASSET_LIMIT) {
+        let approved = match read_private(&path, SMALL_ASSET_LIMIT) {
             Ok(bytes) => {
                 let decision: Decision = serde_json::from_slice(&bytes)?;
-                fs::remove_file(&path)?;
                 if decision.job != job.id || decision.nonce != nonce {
                     return Err(invalid("Stop decision does not match the current list"));
                 }
-                Some(decision.choice)
+                match decision.choice {
+                    Choice::Cancel => return Err(closed(&preview)),
+                    Choice::StopListed { items_digest } if items_digest == list.digest() => {
+                        answered = Some(path);
+                        true
+                    }
+                    _ => {
+                        fs::remove_file(&path)?;
+                        false
+                    }
+                }
             }
-            Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
-        if matches!(decision, Some(Choice::Cancel)) {
-            return Err(closed(&preview));
-        }
         let (current, current_list) = observe()?;
         check_review_closed(state, job)?;
         let unchanged =
             preview.preserves_stop_consent(&current) && list.digest() == current_list.digest();
-        if unchanged
-            && matches!(decision, Some(Choice::StopListed { items_digest }) if items_digest == current_list.digest())
-        {
+        if unchanged && approved {
             // Keep this nonce cancellable through snapshot capture and the
             // final inventory checks. Only prepared() closes admission.
             return Ok((current, current_list));
@@ -895,11 +959,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_i_is_the_only_confirmation_for_an_unchanged_ordinary_update() {
+    fn terminal_follows_the_same_interrupt_decision_from_either_surface() {
         struct Terminal {
             state: PathBuf,
             output: Vec<u8>,
             reads: usize,
+            answered_in_app: bool,
             deadline: Instant,
         }
         impl Write for Terminal {
@@ -923,9 +988,17 @@ mod tests {
                 nonce: &str,
                 choice: Choice,
             ) -> Result<(), UpdateError> {
-                decide_at(&self.state, job, nonce, choice)
+                assert!(
+                    !self.answered_in_app,
+                    "the CLI must follow the app's answer"
+                );
+                decide_at_from(&self.state, job, nonce, choice, DecisionSource::Prompt)
             }
             fn cancel(&mut self, job: &str) -> Result<bool, UpdateError> {
+                assert!(
+                    !self.answered_in_app,
+                    "the CLI must not cancel the app's answer"
+                );
                 cancel_at(&self.state, job)
             }
             fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
@@ -933,6 +1006,34 @@ mod tests {
                 let text = if self.reads == 1 { "i\n" } else { "n\n" };
                 answer.push_str(text);
                 Ok(text.len())
+            }
+            fn read_review_line(
+                &mut self,
+                answer: &mut String,
+                shown: &UpdateJob,
+                _deadline: Instant,
+            ) -> io::Result<usize> {
+                if !self.answered_in_app {
+                    return self.read_line(answer);
+                }
+                self.reads += 1;
+                assert_eq!(
+                    self.reads, 1,
+                    "the CLI should keep following without another prompt"
+                );
+                decide_at(
+                    &self.state,
+                    &shown.id,
+                    &shown.active_confirmation().unwrap().nonce,
+                    Choice::InterruptNow,
+                )
+                .unwrap();
+                loop {
+                    if !same_terminal_prompt(shown, &self.status().unwrap().unwrap()) {
+                        return Err(io::Error::other(PromptChanged));
+                    }
+                    self.pause(self.deadline);
+                }
             }
             fn is_terminal(&self) -> bool {
                 true
@@ -945,43 +1046,89 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().to_owned();
-        let initial = working_preview();
-        let worker = thread::spawn(move || {
-            let mut job = job(&path);
-            let outcome = wait(&path, &mut job, true, |policy| {
-                Ok(if policy == impact::Policy::Interrupt {
-                    super::super::review::interruption_review(&initial)
+        for answered_in_app in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_owned();
+            let initial = working_preview();
+            let worker = thread::spawn(move || {
+                let mut job = job(&path);
+                let outcome = wait(&path, &mut job, true, |policy| {
+                    Ok(if policy == impact::Policy::Interrupt {
+                        super::super::review::interruption_review(&initial)
+                    } else {
+                        initial.clone()
+                    })
+                });
+                job.phase = if outcome.is_ok() {
+                    UpdatePhase::Complete
                 } else {
-                    initial.clone()
+                    UpdatePhase::Failed
+                };
+                job.confirmation = None;
+                job.message = "fixture finished".into();
+                write_job(&path, &job).unwrap();
+                outcome
+            });
+            let initial = published(directory.path(), None);
+            let mut terminal = Terminal {
+                state: directory.path().to_owned(),
+                output: Vec::new(),
+                reads: 0,
+                answered_in_app,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            let outcome = drive_terminal_review_with(initial, false, false, &mut terminal);
+            let worker_outcome = worker.join().unwrap();
+            outcome.unwrap();
+            worker_outcome.unwrap();
+            let output = String::from_utf8(terminal.output).unwrap();
+            assert_eq!(terminal.reads, 1, "{output}");
+            assert_eq!(output.matches("Update cagents ").count(), 1, "{output}");
+            assert!(!output.contains("Update now?"), "{output}");
+        }
+    }
+
+    #[test]
+    fn an_answer_stays_claimed_while_the_worker_checks_its_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path();
+        let (checking, checked) = std::sync::mpsc::sync_channel(1);
+        let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+        thread::scope(|workers| {
+            let worker = workers.spawn(move || {
+                let mut job = job(state);
+                let initial = working_preview();
+                let mut barrier = Some((checking, resumed));
+                wait(state, &mut job, true, |policy| {
+                    if policy == impact::Policy::Interrupt {
+                        if let Some((checking, resumed)) = barrier.take() {
+                            checking.send(()).unwrap();
+                            resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                        Ok(super::super::review::interruption_review(&initial))
+                    } else {
+                        Ok(initial.clone())
+                    }
                 })
             });
-            job.phase = if outcome.is_ok() {
-                UpdatePhase::Complete
-            } else {
-                UpdatePhase::Failed
-            };
-            job.confirmation = None;
-            job.message = "fixture finished".into();
-            write_job(&path, &job).unwrap();
-            outcome
+            let shown = published(state, None);
+            let nonce = &shown.active_confirmation().unwrap().nonce;
+            decide_at(state, &shown.id, nonce, Choice::InterruptNow).unwrap();
+            checked.recv_timeout(Duration::from_secs(5)).unwrap();
+            let late_answer = decide_at_from(
+                state,
+                &shown.id,
+                nonce,
+                Choice::Cancel,
+                DecisionSource::Prompt,
+            );
+            resume.send(()).unwrap();
+            assert!(matches!(
+                late_answer,
+                Err(UpdateError::DecisionAlreadySubmitted)
+            ));
+            worker.join().unwrap().unwrap();
         });
-        let initial = published(directory.path(), None);
-        let mut terminal = Terminal {
-            state: directory.path().to_owned(),
-            output: Vec::new(),
-            reads: 0,
-            deadline: Instant::now() + Duration::from_secs(10),
-        };
-        let outcome = drive_terminal_review_with(initial, false, false, &mut terminal);
-        let worker_outcome = worker.join().unwrap();
-        outcome.unwrap();
-        worker_outcome.unwrap();
-        let output = String::from_utf8(terminal.output).unwrap();
-        assert_eq!(terminal.reads, 1, "{output}");
-        assert_eq!(output.matches("Update cagents ").count(), 1, "{output}");
-        assert!(!output.contains("Update now?"), "{output}");
     }
 
     /// A renewal the confirmed review still covers, such as a briefly

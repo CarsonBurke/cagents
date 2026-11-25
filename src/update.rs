@@ -131,6 +131,10 @@ pub enum UpdateError {
     TargetRecoveryRequired(Box<recovery::TargetRecoveryRequired>),
     #[error("Update cancelled")]
     Cancelled,
+    #[error("Update preview changed or expired. Review the current preview.")]
+    DecisionExpired,
+    #[error("The update review already has an answer.")]
+    DecisionAlreadySubmitted,
     /// The review was closed, or expired, while something it named had to
     /// be resolved by hand first. Unlike a cancellation, this says what.
     #[error("{}", .0.report())]
@@ -754,6 +758,14 @@ trait TerminalReview: Write {
     fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError>;
     fn cancel(&mut self, job: &str) -> Result<bool, UpdateError>;
     fn read_line(&mut self, answer: &mut String) -> io::Result<usize>;
+    fn read_review_line(
+        &mut self,
+        answer: &mut String,
+        _review: &UpdateJob,
+        _deadline: Instant,
+    ) -> io::Result<usize> {
+        self.read_line(answer)
+    }
     fn is_terminal(&self) -> bool;
     fn interrupted(&self) -> bool;
     fn worker_running(&mut self) -> Result<bool, UpdateError> {
@@ -766,6 +778,26 @@ trait TerminalReview: Write {
 
 struct NativeTerminalReview {
     progress: Option<progress::TerminalChanges>,
+}
+
+#[derive(Debug, Error)]
+#[error("The update review moved on")]
+struct PromptChanged;
+
+fn prompt_changed(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|reason| reason.is::<PromptChanged>())
+}
+
+fn same_terminal_prompt(shown: &UpdateJob, current: &UpdateJob) -> bool {
+    shown.id == current.id
+        && shown.phase == current.phase
+        && shown.active_confirmation().is_some_and(|shown| {
+            current.active_confirmation().is_some_and(|current| {
+                shown.nonce == current.nonce && confirmation::now_ms() < current.expires_at_unix_ms
+            })
+        })
 }
 impl Write for NativeTerminalReview {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -780,13 +812,65 @@ impl TerminalReview for NativeTerminalReview {
         status()
     }
     fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError> {
-        decide(job, nonce, choice)
+        confirmation::answer_prompt(job, nonce, choice)
     }
     fn cancel(&mut self, job: &str) -> Result<bool, UpdateError> {
         confirmation::cancel(job)
     }
     fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
         cancellation::read_line(answer)
+    }
+    fn read_review_line(
+        &mut self,
+        answer: &mut String,
+        shown: &UpdateJob,
+        deadline: Instant,
+    ) -> io::Result<usize> {
+        use progress::TerminalWake;
+        let expires = shown.active_confirmation().map(|confirmation| {
+            Duration::from_millis(
+                confirmation
+                    .expires_at_unix_ms
+                    .saturating_sub(confirmation::now_ms()),
+            )
+        });
+        let deadline = expires
+            .and_then(|expires| Instant::now().checked_add(expires))
+            .map_or(deadline, |expires| deadline.min(expires));
+        cancellation::read_line_with(answer, |input| {
+            let changed = || io::Error::other(PromptChanged);
+            let current = || -> io::Result<bool> {
+                Ok(Instant::now() < deadline
+                    && status()
+                        .map_err(io::Error::other)?
+                        .as_ref()
+                        .is_some_and(|current| same_terminal_prompt(shown, current)))
+            };
+            let wake_at = self.progress.as_ref().map_or_else(
+                || deadline.min(Instant::now() + Duration::from_millis(250)),
+                |_| deadline,
+            );
+            let ready = match progress::TerminalChanges::wait_with_input(
+                self.progress.as_ref(),
+                Some(input),
+                Some(wake_at),
+            ) {
+                TerminalWake::Input => true,
+                TerminalWake::Unavailable => {
+                    self.progress = None;
+                    false
+                }
+                TerminalWake::Changed | TerminalWake::Deadline => false,
+            };
+            if cancellation::requested() {
+                return Err(changed());
+            }
+            if !current()? {
+                cancellation::discard_terminal_input(input)?;
+                return Err(changed());
+            }
+            Ok(ready)
+        })
     }
     fn is_terminal(&self) -> bool {
         use std::io::IsTerminal;
@@ -870,14 +954,9 @@ fn drive_terminal_review_with(
     interrupt: bool,
     terminal: &mut impl TerminalReview,
 ) -> Result<UpdateJob, UpdateError> {
-    let mut policy = if interrupt {
-        impact::Policy::Interrupt
-    } else {
-        impact::Policy::WhenIdle
-    };
+    let mut choose_interrupt = interrupt;
     let mut submitted = std::collections::BTreeSet::new();
     let mut waiting = None;
-    let mut policy_requested = None;
     let mut reviewed = None;
     // The review the person confirmed. A renewal it still covers, by the same
     // rule the worker uses to keep an approval, needs no second answer.
@@ -928,6 +1007,7 @@ fn drive_terminal_review_with(
             }
         } else if let Some(confirmation) = job.active_confirmation() {
             if job.phase == UpdatePhase::WaitingForIdle {
+                choose_interrupt = false;
                 let labels = confirmation.preview.waiting_for_idle();
                 if let Some(progress) = idle_wait_progress(waiting.as_ref(), &labels) {
                     write!(terminal, "{progress}")?;
@@ -937,18 +1017,25 @@ fn drive_terminal_review_with(
                 // it with a fresh nonce during its cancellable idle wait.
                 submitted.insert(confirmation.nonce.clone());
             }
-            if confirmation.stop.is_none()
-                && confirmation
-                    .preview
-                    .daemon
-                    .as_ref()
-                    .is_some_and(|daemon| daemon.policy != policy)
+            if choose_interrupt
+                && confirmation.stop.is_none()
+                && let Some(daemon) = &confirmation.preview.daemon
             {
-                if policy_requested.as_ref() != Some(&confirmation.nonce) {
-                    terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
-                    policy_requested = Some(confirmation.nonce.clone());
+                choose_interrupt = false;
+                if daemon.policy != impact::Policy::Interrupt {
+                    submit_current_choice(
+                        terminal,
+                        &job.id,
+                        &confirmation.nonce,
+                        UpdateChoice::Policy(impact::Policy::Interrupt),
+                    )?;
+                    submitted.insert(confirmation.nonce.clone());
+                    continue;
                 }
-            } else if !submitted.contains(&confirmation.nonce) {
+            }
+            if !submitted.contains(&confirmation.nonce)
+                && confirmation::now_ms() < confirmation.expires_at_unix_ms
+            {
                 if let Some(list) = &confirmation.stop {
                     write!(
                         terminal,
@@ -967,7 +1054,7 @@ fn drive_terminal_review_with(
                     }
                     let is_terminal = terminal.is_terminal();
                     let choice = match floor_display::read_stop_choice_from(
-                        |answer| terminal.read_line(answer),
+                        |answer| terminal.read_review_line(answer, &job, deadline),
                         is_terminal,
                         list,
                     ) {
@@ -979,16 +1066,20 @@ fn drive_terminal_review_with(
                                 }
                                 continue;
                             }
-                            let _ = terminal.cancel(&job.id);
+                            if prompt_changed(&error) {
+                                continue;
+                            }
                             return Err(error.into());
                         }
                     };
-                    if !submit_current_choice(
+                    let accepted = submit_current_choice(
                         terminal,
                         &job.id,
                         &confirmation.nonce,
                         choice.clone(),
-                    )? {
+                    )?;
+                    submitted.insert(confirmation.nonce.clone());
+                    if !accepted {
                         // Live work changed while the person was reading or
                         // typing. Reload and display its new list in this CLI.
                         continue;
@@ -996,21 +1087,19 @@ fn drive_terminal_review_with(
                     if matches!(choice, UpdateChoice::Cancel) {
                         return Err(confirmation::closed(&confirmation.preview));
                     }
-                    submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
                 if confirmed
                     .as_ref()
                     .is_some_and(|approved| approved.preserves_consent(&confirmation.preview))
                 {
-                    if submit_current_choice(
+                    submit_current_choice(
                         terminal,
                         &job.id,
                         &confirmation.nonce,
                         UpdateChoice::Confirm,
-                    )? {
-                        submitted.insert(confirmation.nonce.clone());
-                    }
+                    )?;
+                    submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
                 write!(
@@ -1040,7 +1129,7 @@ fn drive_terminal_review_with(
                 } else if let Some(choice) = ordinary_approval(yes, terminal.is_terminal()) {
                     choice
                 } else {
-                    match prompt_review(terminal, &confirmation.preview) {
+                    match prompt_review(terminal, &job, deadline) {
                         Ok(choice) => choice,
                         Err(error) => {
                             if terminal.interrupted() {
@@ -1049,46 +1138,49 @@ fn drive_terminal_review_with(
                                 }
                                 continue;
                             }
-                            // A failed read is not the person's answer, so
-                            // it ends the update as the stop list's does.
-                            let _ = terminal.cancel(&job.id);
+                            if prompt_changed(&error) {
+                                continue;
+                            }
                             return Err(error.into());
                         }
                     }
                 };
                 match choice {
                     OrdinaryChoice::Cancel => {
-                        terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
-                        // Says what the worker records for this review.
-                        return Err(confirmation::closed(&confirmation.preview));
-                    }
-                    OrdinaryChoice::InterruptNow => {
-                        confirmed = None;
-                        reviewed = Some(confirmation.preview.clone());
-                        if !submit_current_choice(
-                            terminal,
-                            &job.id,
-                            &confirmation.nonce,
-                            choice.into(),
-                        )? {
-                            continue;
-                        }
-                        reviewed = Some(review::interruption_review(&confirmation.preview));
-                        policy = impact::Policy::Interrupt;
-                        policy_requested = Some(confirmation.nonce.clone());
-                        submitted.insert(confirmation.nonce.clone());
-                    }
-                    OrdinaryChoice::Confirm => {
-                        confirmed = Some(confirmation.preview.clone());
-                        reviewed = Some(confirmation.preview.clone());
                         if submit_current_choice(
                             terminal,
                             &job.id,
                             &confirmation.nonce,
                             choice.into(),
                         )? {
-                            submitted.insert(confirmation.nonce.clone());
+                            return Err(confirmation::closed(&confirmation.preview));
                         }
+                        submitted.insert(confirmation.nonce.clone());
+                    }
+                    OrdinaryChoice::InterruptNow => {
+                        confirmed = None;
+                        reviewed = Some(confirmation.preview.clone());
+                        let accepted = submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )?;
+                        if accepted {
+                            reviewed = Some(review::interruption_review(&confirmation.preview));
+                        }
+                        submitted.insert(confirmation.nonce.clone());
+                    }
+                    OrdinaryChoice::Confirm => {
+                        reviewed = Some(confirmation.preview.clone());
+                        confirmed = Some(confirmation.preview.clone());
+                        submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )?;
+                        submitted.insert(confirmation.nonce.clone());
                     }
                 }
             }
@@ -1097,8 +1189,7 @@ fn drive_terminal_review_with(
     }
 }
 
-/// A stale nonce means re-display, while a real failure must release prepared
-/// windows through cancellation of the current review.
+/// A concurrent or stale answer leaves the worker's published decision in charge.
 fn submit_current_choice(
     terminal: &mut impl TerminalReview,
     job: &str,
@@ -1107,16 +1198,20 @@ fn submit_current_choice(
 ) -> Result<bool, UpdateError> {
     match terminal.decide(job, nonce, choice) {
         Ok(()) => Ok(true),
+        Err(UpdateError::DecisionExpired | UpdateError::DecisionAlreadySubmitted) => Ok(false),
         Err(error) => {
             if terminal
                 .status()?
                 .filter(|current| current.id == job)
-                .and_then(|current| current.active_confirmation().cloned())
-                .is_some_and(|confirmation| confirmation.nonce != nonce)
+                .is_some_and(|current| {
+                    current.phase != UpdatePhase::AwaitingConfirmation
+                        || current
+                            .active_confirmation()
+                            .is_none_or(|confirmation| confirmation.nonce != nonce)
+                })
             {
                 return Ok(false);
             }
-            let _ = terminal.cancel(job);
             Err(error)
         }
     }
@@ -1159,8 +1254,13 @@ fn review_answer(answer: &str, working: bool) -> Option<OrdinaryChoice> {
 
 fn prompt_review(
     terminal: &mut impl TerminalReview,
-    preview: &impact::Preview,
+    job: &UpdateJob,
+    deadline: Instant,
 ) -> io::Result<OrdinaryChoice> {
+    let preview = &job
+        .active_confirmation()
+        .ok_or_else(|| io::Error::other(PromptChanged))?
+        .preview;
     let working = preview.daemon.as_ref().is_some_and(|daemon| {
         daemon.policy == impact::Policy::WhenIdle
             && daemon
@@ -1176,7 +1276,7 @@ fn prompt_review(
         |prompt, answer| {
             terminal.write_all(prompt.as_bytes())?;
             terminal.flush()?;
-            terminal.read_line(answer)
+            terminal.read_review_line(answer, job, deadline)
         },
         working,
         stops,

@@ -91,6 +91,18 @@ pub(super) fn requested() -> bool {
 /// read indefinitely. Avoid buffering past the newline so a pasted second
 /// answer remains visible to poll on the next prompt.
 pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
+    read_line_with(answer, |input| {
+        Ok(
+            progress::TerminalChanges::wait_with_input(None, Some(input), None)
+                == progress::TerminalWake::Input,
+        )
+    })
+}
+
+pub(super) fn read_line_with(
+    answer: &mut String,
+    mut input_ready: impl FnMut(i32) -> io::Result<bool>,
+) -> io::Result<usize> {
     // Reopen instead of dup: O_NONBLOCK on a duplicate would also change the
     // parent shell's shared stdin description. An owned description prevents
     // a terminal SIGINT input flush between poll and read from blocking us.
@@ -106,25 +118,7 @@ pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
                 "Update cancellation requested",
             ));
         }
-        let mut poll = [input.as_raw_fd(), wake_fd()].map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        // SAFETY: two initialized descriptors retained through the call.
-        let ready = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        } else if ready > 0 {
-            if poll[1].revents != 0 {
-                drain_wake();
-            }
-            if requested() {
-                continue;
-            }
+        if input_ready(input.as_raw_fd())? && !requested() {
             let mut byte = [0u8];
             match input.read(&mut byte) {
                 Err(error)
@@ -154,9 +148,67 @@ pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
     }
 }
 
+/// A line typed for a retired prompt must not become an answer to the
+/// next preview, including a pending newline after a partially read line.
+pub(super) fn discard_terminal_input(input: i32) -> io::Result<()> {
+    // SAFETY: the caller retains the open stdin description.
+    if unsafe { libc::isatty(input) } != 1 {
+        return Ok(());
+    }
+    loop {
+        // SAFETY: the fd stays open and refers to a terminal.
+        if unsafe { libc::tcflush(input, libc::TCIFLUSH) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted || requested() {
+            return Err(error);
+        }
+    }
+}
+
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retiring_a_terminal_prompt_discards_a_queued_old_answer() {
+        use std::os::fd::FromRawFd;
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: writable descriptors and optional defaults for the private PTY.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful openpty returned two new owned descriptors.
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let fd = slave.as_raw_fd();
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        let wait = || progress::TerminalChanges::wait_with_input(None, Some(fd), Some(deadline()));
+
+        master.write_all(b"y\n").unwrap();
+        assert_eq!(wait(), progress::TerminalWake::Input);
+        discard_terminal_input(fd).unwrap();
+        assert_eq!(
+            progress::TerminalChanges::wait_with_input(None, Some(fd), Some(Instant::now())),
+            progress::TerminalWake::Deadline
+        );
+        master.write_all(b"n\n").unwrap();
+        assert_eq!(wait(), progress::TerminalWake::Input);
+        let mut line = String::new();
+        (&slave).take(2).read_to_string(&mut line).unwrap();
+        assert_eq!(line, "n\n");
+    }
 
     #[test]
     #[cfg_attr(
