@@ -2233,8 +2233,25 @@ mod tests {
     #[test]
     fn failed_adoption_commit_acknowledgement_keeps_unconsumed_replay() {
         let (successor, holder) = UnixStream::pair().unwrap();
-        successor.shutdown(std::net::Shutdown::Read).unwrap();
         send(&successor, &Request::CommitAdoption, &[]).unwrap();
+        // The request remains queued after close. Darwin can still accept
+        // writes after the peer only shuts down its read half.
+        drop(successor);
+        let body = serde_json::to_vec(&Request::CommitAdoption).unwrap();
+        let mut frame = vec![0; 4 + body.len()];
+        // SAFETY: the buffer is writable, the socket is live, and MSG_PEEK
+        // leaves the queued request available to attend.
+        let queued = unsafe {
+            libc::recv(
+                holder.as_raw_fd(),
+                frame.as_mut_ptr().cast(),
+                frame.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(queued, frame.len() as isize);
+        assert_eq!(frame[..4], (body.len() as u32).to_le_bytes());
+        assert_eq!(frame[4..], body);
         let mut replay = Some(("screen".to_owned(), b"orphan-output".to_vec(), false));
         let expected = replay.clone();
         // An already reaped root is never polled; its pin is ignored.
@@ -2553,14 +2570,19 @@ mod tests {
         let moved = directory.path().join("moved");
         std::fs::create_dir(&original).unwrap();
         std::fs::write(original.join("payload"), "ORIGINAL_PAYLOAD\n").unwrap();
-        let mut command = command(
-            "echo started >> launches; /usr/bin/stat -Lc 'PIN_ID:%d:%i' .; echo ready; read line; /bin/cat payload; echo PIN_DONE",
-        );
+        #[cfg(target_os = "linux")]
+        let stat = "/usr/bin/stat -Lc 'PIN_ID:%d:%i' .";
+        #[cfg(target_os = "macos")]
+        let stat = "/usr/bin/stat -f 'PIN_ID:%d:%i' .";
+        let mut command = command(&format!(
+            "echo started >> launches; {stat}; echo ready; read line; /bin/cat payload; echo PIN_DONE"
+        ));
         command.cwd(&original);
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let mut held = spawn(command, size(), exits).unwrap();
         let pin = held.launch_directory.as_ref().unwrap().clone();
-        let child_pid = held.child.pid();
+        let child = registry::Process::read(held.child.pid()).unwrap();
+        let holder = registry::Process::read(holder_pid(&held) as i32).unwrap();
         assert!(
             read_until(&held.master, "ready")
                 .contains(&format!("PIN_ID:{}:{}", pin.0.device, pin.0.inode))
@@ -2573,7 +2595,9 @@ mod tests {
         drop(held);
         let (exits, exited) = crossbeam_channel::bounded(1);
         let adopted = adopt(&socket, exits).unwrap();
-        assert_eq!(adopted.held.child.pid(), child_pid);
+        assert_eq!(registry::Process::read(adopted.held.child.pid()).unwrap(), child);
+        let peer = peer_credentials(&adopted.held.holder.control).unwrap();
+        assert_eq!(registry::Process::read(peer.pid as i32).unwrap(), holder);
         let adopted_pin = adopted.held.launch_directory.as_ref().unwrap();
         assert_eq!(adopted_pin.0, pin.0);
         assert_eq!(
