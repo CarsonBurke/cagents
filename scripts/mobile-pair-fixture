@@ -110,7 +110,7 @@ code)
     [ -e "$state" ] || die "start it first"
     # shellcheck source=/dev/null
     source "$state"
-    [ "$key_type" = ed25519 ] || die "a pairing code names an Ed25519 host key; start with --host-key ed25519"
+    [ "${key_type:-ed25519}" = ed25519 ] || die "a pairing code names an Ed25519 host key; start with --host-key ed25519"
     /usr/bin/python3 -I - "$base" "$bin" "$port" "$USER" "$(hostname -s)" "${hosts[@]}" <<'PY'
 import base64, os, subprocess, sys, time, urllib.parse
 base, bin_dir, port, user, name, *hosts = sys.argv[1:]
@@ -233,7 +233,8 @@ authorize)
     [ -e "$state" ] || die "start it first"
     # shellcheck source=/dev/null
     source "$state"
-    key=$(grep -oE 'ssh-ed25519 [A-Za-z0-9+/]+=*' <<<"$*" | head -n1) || true
+    # A whole key: ssh-ed25519 and its 51-character blob, not the README's placeholder.
+    key=$(grep -oE 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}' <<<"$*" | head -n1) || true
     [ -n "$key" ] || die "authorize needs the phone's ssh-ed25519 public key, as Settings shows it"
     printf 'command="env HOME=%s/home XDG_RUNTIME_DIR=%s/run %s/cagents daemon bridge --mobile",restrict %s phone-by-hand\n' \
         "$base" "$base" "$bin" "$key" >>"$base/authorized_keys"

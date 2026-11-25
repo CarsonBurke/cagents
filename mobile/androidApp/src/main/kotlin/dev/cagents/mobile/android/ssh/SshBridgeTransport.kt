@@ -98,8 +98,17 @@ private class StoredHostKeys(private val store: HostKeyStore, private val target
         }
     }
 
-    override fun preferred(host: String) = store.pinnedType(target.hostKeyId(host))?.let(::listOf).orEmpty()
+    override fun preferred(host: String) = store.pinnedType(target.hostKeyId(host))?.let(::hostKeyAlgorithms).orEmpty()
 }
+
+/**
+ * The host key algorithms that present a key of [keyType]. An RSA key's
+ * type is `ssh-rsa`, but that algorithm signs with SHA-1, which OpenSSH
+ * 8.8 and later no longer offers; asked for it alone, the computer would
+ * present another of its keys instead.
+ */
+internal fun hostKeyAlgorithms(keyType: String): List<String> =
+    if (keyType == "ssh-rsa") listOf("rsa-sha2-512", "rsa-sha2-256", "ssh-rsa") else listOf(keyType)
 
 internal class SshTarget(
     /** What to call the computer in messages. */

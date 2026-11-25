@@ -71,8 +71,9 @@ by hand instead**:
 3. Tap **Connect**. On first connection the app shows the computer's host key
    fingerprint and the command that prints it on the computer, such as
    `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` for an Ed25519 key.
-   Compare the two before trusting it. A later change of key is refused until you forget the old one
-   in Settings. For a paired computer, pair again from the computer instead.
+   Compare the two before trusting it. A later change of key is refused until
+   you forget the old one in Settings. For a paired computer, pair again from
+   the computer instead.
 
 The phone and the computer must reach each other: on the same network, or
 over a VPN such as Tailscale when away.

@@ -139,7 +139,7 @@ fun HostKeyDialogs(vm: MainViewModel, onPairAgain: () -> Unit) {
                         Fingerprint(failure.fingerprint)
                         Text(
                             hostKeyFile(failure.keyType)?.let { "On the computer: ssh-keygen -lf $it" }
-                                ?: "On the computer, run ssh-keygen -lf on its ${failure.keyType} host key in /etc/ssh.",
+                                ?: "On the computer: ssh-keygen -lf on its host key in /etc/ssh",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
