@@ -927,10 +927,25 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let running = started_ticks_of(pid).unwrap();
-        assert_eq!(PinnedProcess::open(pid).unwrap().started_ticks(), running);
-        drop(child.stdin.take());
+        // Pinned before its input closes, since it may exit at once after.
         let process = PinnedProcess::open(pid).unwrap();
+        assert_eq!(process.started_ticks(), running);
+        drop(child.stdin.take());
         assert!(process.wait_for_exit(Duration::from_secs(10)).unwrap());
+        // The exit event can precede the zombie; waiting without reaping
+        // returns only once it is one.
+        // SAFETY: an all-zero `siginfo_t` is a valid output record.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the child is ours and unreaped; WNOWAIT leaves it so.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
         assert_eq!(started_ticks_of(pid).unwrap(), running, "the zombie");
         child.wait().unwrap();
         assert_eq!(
