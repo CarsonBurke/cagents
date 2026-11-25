@@ -2241,6 +2241,16 @@ pub fn validate_stage_guard() -> io::Result<()> {
     validate_install_fence(false)
 }
 
+/// Keep legacy-window exclusion from Parked through the daemon's readiness
+/// acknowledgement, even if the coordinator releases its own description.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn reserve_standby_legacy_fence() -> io::Result<OwnedLock> {
+    owned_lock(
+        &runtime_directory()?.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )
+}
+
 fn validate_install_fence(require_closed: bool) -> io::Result<()> {
     use std::os::fd::BorrowedFd;
     if env::var(INSTALL_GUARD_ENV).ok().as_deref() != Some("197") {

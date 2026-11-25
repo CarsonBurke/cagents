@@ -386,6 +386,8 @@ pub struct Activated {
     channel: UnixStream,
     #[cfg(target_os = "linux")]
     publication: Option<crate::update::LocalPublication>,
+    #[cfg(target_os = "macos")]
+    _legacy_fence: crate::instance::OwnedLock,
 }
 
 #[cfg(feature = "host")]
@@ -420,6 +422,8 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     // scope enrollment must never inherit a copy across their own exec.
     super::seal_inherited_descriptors()?;
     crate::instance::validate_stage_guard()?;
+    #[cfg(target_os = "macos")]
+    let legacy_fence = crate::instance::reserve_standby_legacy_fence()?;
     #[cfg(target_os = "linux")]
     let publication = std::env::var_os(LOCAL_PREVIOUS_CURRENT)
         .map(|expected| {
@@ -507,6 +511,8 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         channel: control,
         #[cfg(target_os = "linux")]
         publication,
+        #[cfg(target_os = "macos")]
+        _legacy_fence: legacy_fence,
     })
 }
 
