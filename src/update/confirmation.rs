@@ -130,7 +130,7 @@ pub(super) fn cancellation_path(state: &Path, job: &str) -> Result<Option<PathBu
 
 /// True means cancellation was recorded before the preparation boundary.
 /// False means the worker must finish restoring service instead.
-pub(super) fn cancel(job: &str) -> Result<bool, UpdateError> {
+pub fn cancel(job: &str) -> Result<bool, UpdateError> {
     let state = running_installation()?.state_dir()?;
     cancel_at(&state, job)
 }

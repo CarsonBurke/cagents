@@ -25,7 +25,9 @@ mod retention;
 mod review_fixture;
 pub use recovery::TargetRecoveryRequired;
 pub mod source;
-pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
+pub use confirmation::{
+    Choice as UpdateChoice, Confirmation as UpdateConfirmation, cancel, decide,
+};
 pub mod impact;
 mod review;
 pub mod source_inspection;

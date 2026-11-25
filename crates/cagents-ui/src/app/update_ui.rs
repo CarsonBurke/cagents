@@ -141,7 +141,10 @@ pub enum Action {
     /// Apply the waiting update with the interruption impact shown in its popover.
     InterruptWaiting(String),
     /// From the waiting update's popover: give up on the update.
-    CancelWaiting,
+    CancelWaiting {
+        job: String,
+        nonce: String,
+    },
     StartApply,
     Applied(Result<UpdateJob, String>),
     ProgressWatch(String, bool),
@@ -327,11 +330,19 @@ fn waits_for_idle(preview: &crate::update::impact::Preview) -> bool {
     })
 }
 
-/// Conversations whose current turns can be interrupted by the choice now
-/// on screen. An already claimed delivery cannot be interrupted for update.
+#[derive(Debug, PartialEq, Eq)]
+struct Interruptions {
+    conversations: usize,
+    subagents: usize,
+    delivery_waits: bool,
+    recovery_needed: bool,
+}
+
+/// Conversations whose current turns can be interrupted. The worker can
+/// interrupt these while letting any claimed deliveries finish.
 fn interruptions_available(
     confirmation: &crate::update::UpdateConfirmation,
-) -> Option<(usize, usize)> {
+) -> Option<Interruptions> {
     use crate::update::impact::{Disposition, Policy, SessionCause, SessionKind};
 
     if confirmation.stop.is_some() {
@@ -343,38 +354,62 @@ fn interruptions_available(
     }
     let mut conversations = 0;
     let mut subagents = 0;
+    let mut delivery_waits = false;
+    let mut recovery_needed = false;
     for session in daemon.sessions.iter().filter(|session| {
         session.kind == SessionKind::NativeChat && session.disposition == Disposition::WaitsForIdle
     }) {
-        // A staged update can have started in an earlier worker. Its
-        // interruption approval must not be broader than these buttons say.
-        if session.reason == SessionCause::PendingDelivery
-            || confirmation
-                .preview
-                .stopped
-                .iter()
-                .any(|pane| pane.pane == session.id)
-        {
-            return None;
+        if session.reason == SessionCause::PendingDelivery {
+            delivery_waits = true;
+            continue;
         }
+        recovery_needed |= confirmation
+            .preview
+            .stopped
+            .iter()
+            .any(|pane| pane.pane == session.id);
         conversations += 1;
         subagents += session.interrupted_subagents.len();
     }
-    (conversations > 0).then_some((conversations, subagents))
+    (conversations > 0).then_some(Interruptions {
+        conversations,
+        subagents,
+        delivery_waits,
+        recovery_needed,
+    })
 }
 
-fn interruption_choice_summary(conversations: usize, subagents: usize) -> String {
+fn initial_interruptions(
+    confirmation: &crate::update::UpdateConfirmation,
+) -> Option<Interruptions> {
+    interruptions_available(confirmation)
+        .filter(|impact| !impact.delivery_waits && !impact.recovery_needed)
+}
+
+fn interruption_choice_summary(impact: Interruptions) -> String {
+    let Interruptions {
+        conversations,
+        subagents,
+        delivery_waits,
+        recovery_needed,
+    } = impact;
     let mut summary = if conversations == 1 {
-        "Updating now interrupts one running conversation and then reopens it.".to_owned()
+        "Updating now interrupts one running conversation".to_owned()
     } else {
-        format!(
-            "Updating now interrupts {conversations} running conversations and then reopens them."
-        )
+        format!("Updating now interrupts {conversations} running conversations")
     };
+    summary.push_str(match (recovery_needed, conversations) {
+        (true, _) => ". See the list for any steps to reopen conversations.",
+        (false, 1) => " and then reopens it.",
+        (false, _) => " and then reopens them.",
+    });
     match subagents {
         0 => {}
         1 => summary.push_str(" One background agent will stop."),
         count => summary.push_str(&format!(" {count} background agents will stop.")),
+    }
+    if delivery_waits {
+        summary.push_str(" Messages already being delivered finish before the update starts.");
     }
     summary
 }
@@ -445,35 +480,46 @@ pub(super) struct IdleWait<'a> {
 }
 
 impl IdleWait<'_> {
-    /// Each conversation still waited for, as the review names it, with why.
-    fn remaining(&self) -> Vec<(crate::model::TerminalId, String, String)> {
-        let preview = &self.confirmation.preview;
-        preview
+    fn sessions(&self) -> impl Iterator<Item = &crate::update::impact::SessionImpact> {
+        self.confirmation
+            .preview
             .daemon
             .iter()
             .flat_map(|daemon| &daemon.sessions)
             .filter(|session| {
                 session.disposition == crate::update::impact::Disposition::WaitsForIdle
             })
+    }
+
+    /// Each conversation still waited for, as the review names it, with why.
+    fn remaining(&self) -> Vec<(crate::model::TerminalId, String, String)> {
+        let preview = &self.confirmation.preview;
+        let mut rows: Vec<_> = self
+            .sessions()
             .map(|session| {
-                let review = session.review();
-                (
-                    session.id,
-                    preview
-                        .labels
-                        .names
-                        .get(&session.id)
-                        .cloned()
-                        .unwrap_or(review.title),
-                    review.reason,
-                )
+                let mut review = session.review();
+                let stopped = preview.stopped.iter().find(|pane| pane.pane == session.id);
+                if let Some(stopped) = stopped {
+                    review.reason.push(' ');
+                    review.reason.push_str(&stopped.recovery_notice());
+                }
+                let name = preview
+                    .labels
+                    .names
+                    .get(&session.id)
+                    .cloned()
+                    .unwrap_or(review.title);
+                let needs_attention = stopped.is_some() || review.warns_about_agent_run;
+                (needs_attention, (session.id, name, review.reason))
             })
-            .collect()
+            .collect();
+        rows.sort_by_key(|(needs_attention, _)| !needs_attention);
+        rows.into_iter().map(|(_, row)| row).collect()
     }
 
     /// The header's compact account, which stays readable at a glance.
     fn label(&self) -> String {
-        match self.remaining().len() {
+        match self.sessions().count() {
             0 => "Update starting".into(),
             count => format!("Update waiting for {count}"),
         }
@@ -586,6 +632,16 @@ impl Cagents {
         nonce: String,
         choice: crate::update::UpdateChoice,
     ) -> Task<Message> {
+        self.submit_update_decision(nonce, move |id, nonce| {
+            crate::update::decide(id, nonce, choice)
+        })
+    }
+
+    fn submit_update_decision(
+        &mut self,
+        nonce: String,
+        decide: impl FnOnce(&str, &str) -> Result<(), crate::update::UpdateError> + Send + 'static,
+    ) -> Task<Message> {
         let Some(job) = &self.update_ui.job else {
             return Task::none();
         };
@@ -596,7 +652,7 @@ impl Cagents {
             let expected_nonce = nonce.clone();
             let result = tokio::task::spawn_blocking(move || {
                 use crate::update::UpdateError;
-                crate::update::decide(&id, &nonce, choice).map_err(|error| match error {
+                decide(&id, &nonce).map_err(|error| match error {
                     UpdateError::DecisionExpired | UpdateError::DecisionAlreadySubmitted => {
                         error.to_string()
                     }
@@ -625,7 +681,7 @@ impl Cagents {
         if confirmation.nonce != nonce
             || !confirmable(confirmation)
             || matches!(choice, crate::update::UpdateChoice::InterruptNow)
-                && interruptions_available(confirmation).is_none()
+                && initial_interruptions(confirmation).is_none()
         {
             return Task::none();
         }
@@ -654,7 +710,8 @@ impl Cagents {
             None => title,
         };
         let terminal_confirmation = confirmation.stop.is_some();
-        let interruptions = interruptions_available(confirmation);
+        let interruptions = initial_interruptions(confirmation);
+        let choosing_when = interruptions.is_some();
         let mut body = vec![
             heading,
             notice_body(if terminal_confirmation {
@@ -663,11 +720,8 @@ impl Cagents {
                 preview_summary(preview)
             }),
         ];
-        if let Some((conversations, subagents)) = interruptions {
-            body.push(notice_body(interruption_choice_summary(
-                conversations,
-                subagents,
-            )));
+        if let Some(impact) = interruptions {
+            body.push(notice_body(interruption_choice_summary(impact)));
         }
         let mut rows = Vec::new();
         if terminal_confirmation {
@@ -699,7 +753,7 @@ impl Cagents {
             rows.extend(
                 sessions
                     .into_iter()
-                    .map(|session| self.update_session_row(session, interruptions.is_some())),
+                    .map(|session| self.update_session_row(session, choosing_when)),
             );
             rows.extend(daemon.review_notices().into_iter().map(notice_body));
         }
@@ -713,7 +767,7 @@ impl Cagents {
         if let Some(handoff) = terminal_handoff(confirmation) {
             body.push(notice_body(handoff));
         }
-        if interruptions.is_none()
+        if !choosing_when
             && !terminal_confirmation
             && let Some(daemon) = &preview.daemon
             && let Some((label, policy)) = policy_choice(daemon)
@@ -737,7 +791,7 @@ impl Cagents {
                 .on_press(Message::UpdateUi(Action::CancelApply))
                 .into(),
         ];
-        if interruptions.is_some() {
+        if choosing_when {
             actions.push(
                 crate::ui_controls::button::secondary("Update when idle")
                     .id(widget::Id::new("update.when-idle"))
@@ -1160,15 +1214,15 @@ impl Cagents {
         let mut actions = vec![
             crate::ui_controls::button::secondary("Cancel update")
                 .id(widget::Id::new(WAITING_CANCEL_ID))
-                .on_press(Message::UpdateUi(Action::CancelWaiting))
+                .on_press(Message::UpdateUi(Action::CancelWaiting {
+                    job: wait.job.id.clone(),
+                    nonce: wait.confirmation.nonce.clone(),
+                }))
                 .into(),
             iced::widget::Space::new().width(Length::Fill).into(),
         ];
-        if let Some((conversations, subagents)) = interruptions_available(wait.confirmation) {
-            body.push(notice_body(interruption_choice_summary(
-                conversations,
-                subagents,
-            )));
+        if let Some(impact) = interruptions_available(wait.confirmation) {
+            body.push(notice_body(interruption_choice_summary(impact)));
             actions.push(
                 crate::ui_controls::button::primary("Update now")
                     .id(widget::Id::new(WAITING_NOW_ID))
@@ -1536,13 +1590,21 @@ impl Cagents {
                 self.chrome_ui.close();
                 self.submit_update_choice(nonce, crate::update::UpdateChoice::InterruptNow)
             }
-            Action::CancelWaiting => {
-                let Some(nonce) = self.idle_wait().map(|wait| wait.confirmation.nonce.clone())
-                else {
+            Action::CancelWaiting { job, nonce } => {
+                if self
+                    .update_ui
+                    .job
+                    .as_ref()
+                    .is_none_or(|current| current.id != job)
+                {
                     return Task::none();
-                };
+                }
                 self.chrome_ui.close();
-                self.submit_update_choice(nonce, crate::update::UpdateChoice::Cancel)
+                self.submit_update_decision(nonce, |id, _| {
+                    crate::update::cancel(id)?
+                        .then_some(())
+                        .ok_or(crate::update::UpdateError::DecisionExpired)
+                })
             }
             Action::Decided { job, nonce, result } => {
                 if self
@@ -2614,12 +2676,16 @@ pub(in crate::app) mod tests {
         awaiting_delivery.reason = SessionCause::PendingDelivery;
         let mut working = session("Lead", Disposition::WaitsForIdle);
         working.interrupted_subagents.push("child".into());
-        let mixed = daemon_preview(vec![working.clone(), awaiting_delivery]);
-        assert_eq!(interruptions_available(&mixed), None);
-        let confirmation = daemon_preview(vec![working]);
-        assert_eq!(interruptions_available(&confirmation), Some((1, 1)));
+        let mixed = daemon_preview(vec![working.clone(), awaiting_delivery.clone()]);
+        assert_eq!(initial_interruptions(&mixed), None);
         assert_eq!(
-            interruption_choice_summary(1, 1),
+            interruption_choice_summary(interruptions_available(&mixed).unwrap()),
+            "Updating now interrupts one running conversation and then reopens it. One background agent will stop. Messages already being delivered finish before the update starts."
+        );
+        assert!(interruptions_available(&daemon_preview(vec![awaiting_delivery])).is_none());
+        let confirmation = daemon_preview(vec![working]);
+        assert_eq!(
+            interruption_choice_summary(initial_interruptions(&confirmation).unwrap()),
             "Updating now interrupts one running conversation and then reopens it. One background agent will stop."
         );
 
@@ -2650,6 +2716,39 @@ pub(in crate::app) mod tests {
                 Some(confirmation.nonce.clone())
             );
         }
+    }
+
+    #[test]
+    fn the_waiting_review_shows_recovery_before_offering_interruption() {
+        use crate::update::{
+            impact::Disposition,
+            source_inspection::{StoppedKind, StoppedPane},
+        };
+        let ordinary = session("lead", Disposition::WaitsForIdle);
+        let paused = session("review", Disposition::WaitsForIdle);
+        let mut confirmation = daemon_preview(vec![ordinary, paused.clone()]);
+        confirmation.preview.stopped.push(StoppedPane {
+            pane: paused.id,
+            kind: StoppedKind::Chat,
+            label: paused.title,
+            reason: "its conversation could not be confirmed".into(),
+            recovery: "Reopen its tab after the update.".into(),
+        });
+        assert!(initial_interruptions(&confirmation).is_none());
+        let job = awaiting(&confirmation);
+        let wait = IdleWait {
+            job: &job,
+            confirmation: &confirmation,
+        };
+        let rows = wait.remaining();
+        assert_eq!(rows[0].0, paused.id);
+        assert!(rows[0].2.ends_with(
+            "Its conversation could not be confirmed. Reopen its tab after the update."
+        ));
+        assert_eq!(
+            interruption_choice_summary(interruptions_available(wait.confirmation).unwrap()),
+            "Updating now interrupts 2 running conversations. See the list for any steps to reopen conversations."
+        );
     }
 
     /// After "Update when idle" the review goes away, and the header says the

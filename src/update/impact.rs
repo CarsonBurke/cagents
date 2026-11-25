@@ -372,9 +372,6 @@ impl DaemonImpact {
             })
     }
 
-    /// A renewed short-lived capability may retain consent only for the same
-    /// daemon and exact session owners. Waiting authorizes the observed busy
-    /// conversations to become idle; it never authorizes an extra interruption.
     /// An idle approval can outlive new warnings about interrupting a turn.
     /// A separate choice to interrupt still has to show those warnings.
     pub(super) fn expands_interruption_warning(&self, observed: &Self) -> bool {
@@ -389,6 +386,9 @@ impl DaemonImpact {
         })
     }
 
+    /// A renewed short-lived capability may retain consent only for the same
+    /// daemon and exact session owners. Waiting authorizes the observed busy
+    /// conversations to become idle; it never authorizes an extra interruption.
     pub fn preserves_consent(&self, observed: &Self) -> bool {
         fn keyed(
             sessions: &[SessionImpact],

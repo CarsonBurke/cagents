@@ -537,7 +537,7 @@ fn clause(reason: &str) -> String {
     }
 }
 
-fn recovery_detail(reason: &str, recovery: &str) -> String {
+pub(super) fn recovery_detail(reason: &str, recovery: &str) -> String {
     let reason = clause(reason);
     format!("{reason}. {recovery}")
 }
