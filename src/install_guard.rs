@@ -252,12 +252,8 @@ pub(crate) fn run(
     // the shell shares its offset; this freshly opened script is at offset 0
     // and nothing else reads it. The installer must therefore never reopen
     // `$0` while guarded: there it would resume wherever sh had read to.
-    #[cfg(target_os = "linux")]
-    let script_path = format!("/proc/self/fd/{fd}");
-    #[cfg(target_os = "macos")]
-    let script_path = format!("/dev/fd/{fd}");
     command
-        .arg(script_path)
+        .arg(crate::descriptor::inherited_file_path(fd))
         .args(arguments)
         .env(RESULT_FD_ENV, result_fd.to_string())
         .stdin(Stdio::null())

@@ -12,6 +12,22 @@ use std::{
 
 type Record = crate::upgrade::floor::Record;
 
+#[test]
+fn inherited_checkpoint_input_opens_at_the_start_in_the_child() {
+    let expected = br#"{"checkpoint":"private update input"}"#;
+    let mut file = anonymous_file().unwrap();
+    file.write_all(expected).unwrap();
+    let mut file = seal_file(file).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let fd = file.as_raw_fd();
+    let mut command = Command::new("cat");
+    command.arg(crate::descriptor::inherited_file_path(fd));
+    candidate::inherit(&mut command, fd);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, expected);
+}
+
 struct FakeSource {
     preview: impact::Preview,
     inventory: Inventory,

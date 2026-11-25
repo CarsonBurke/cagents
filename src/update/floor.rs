@@ -1203,8 +1203,8 @@ fn floor_record_helper(
     let helper = crate::companion::Product::Daemon.beside(&crate::process::current_executable()?)?;
     let mut file = anonymous_file()?;
     file.write_all(&record.encode_capture().map_err(invalid)?)?;
+    let mut file = seal_file(file)?;
     file.seek(SeekFrom::Start(0))?;
-    let file = seal_file(file)?;
     let fd = file.as_raw_fd();
     let mut command = Command::new(helper);
     crate::install_guard::sanitize_child_environment(&mut command);
@@ -1214,7 +1214,7 @@ fn floor_record_helper(
         } else {
             "--retain-update-floor"
         })
-        .arg(format!("/proc/self/fd/{fd}"));
+        .arg(crate::descriptor::inherited_file_path(fd));
     candidate::inherit(&mut command, fd);
     guard.inherit_for_install(&mut command)?;
     bounded_command(
