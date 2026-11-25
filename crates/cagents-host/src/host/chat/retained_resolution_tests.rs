@@ -227,10 +227,34 @@ impl Fixture {
         let identity = handle
             .actor_identity()
             .expect("actual remote helper required");
-        wait(
-            || handle.attachment_snapshot().ready,
-            "helper did not become ready",
-        );
+        let startup_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snapshot = handle.attachment_snapshot();
+            if snapshot.ready {
+                break;
+            }
+            if snapshot.exited || Instant::now() >= startup_deadline {
+                let listener = crate::daemon::holder_registry::socket(
+                    &crate::daemon::holder_registry::directory(
+                        crate::daemon::holder_registry::Kind::Native,
+                    )
+                    .unwrap(),
+                    id,
+                );
+                let record = crate::daemon::holder_registry::execution_record(&listener);
+                let image = record
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map(|owner| owner.root.executable());
+                panic!(
+                    "offline provider failed readiness: {:?}; holder {record:?}; image {image:?}; fixture trace {:?}",
+                    snapshot.error,
+                    fs::read_to_string(root.join("provider-trace.jsonl"))
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let original = host.lock().unwrap().chats[&id].session.clone();
         assert!(original.launch.session_id.is_none());
         assert!(matches!(
