@@ -172,6 +172,68 @@ class RemoteControllerTest {
         assertEquals(3, bridge.opens)
     }
 
+    /** A controller connected to a computer, following its sessions, a notice and conversation [S]. */
+    private suspend fun TestScope.following(): RemoteController {
+        val controller = controller()
+        controller.open(S)
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.send(sessionsEvent("working"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.send("""{"type":"event","event":"notifications","data":{"notices":[{"id":"n1","kind":"waiting","title":"Agent needs your attention","session":"$S","request":"approval"}]}}""")
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.sessions != null && it.notices.isNotEmpty() && it.conversations[S]?.loaded == true }
+        return controller
+    }
+
+    @Test
+    fun anotherComputerStartsWithNothingFromTheLast() = runTest {
+        val controller = following()
+        controller.restart(computerChanged = true)
+        assertEquals(RemoteState(), controller.state.value.copy(connection = ConnectionState.Offline))
+
+        val other = bridge.acceptWelcomed()
+        other.ok(other.expect("sessions.watch"))
+        other.ok(other.expect("notifications.watch"))
+        runCurrent()
+        // The last computer's conversation isn't watched on this one.
+        assertTrue(other.isQuiet())
+        val state = controller.await { it.connection == ConnectionState.Connected }
+        assertNull(state.sessions)
+        assertTrue(state.notices.isEmpty())
+        assertTrue(state.conversations.isEmpty())
+    }
+
+    @Test
+    fun overlappingRestartsLeaveOneConnectionThatWorks() = runTest {
+        val controller = following()
+        val first = async { controller.restart(computerChanged = true) }
+        val second = async { controller.restart(computerChanged = true) }
+        first.await()
+        second.await()
+        runCurrent()
+        // The connection the second restart ended, if the first got to make it, then the one that stays.
+        repeat(bridge.opens - 2) { bridge.accept() }
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        controller.await { it.connection == ConnectionState.Connected }
+        // Requests go to this connection, not to one closed under it.
+        controller.open(S)
+        assertEquals(S, connection.expect("conversation.watch").params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun theSameComputerKeepsItsConversationsAcrossARestart() = runTest {
+        val controller = following()
+        controller.restart()
+        assertTrue(S in controller.state.value.conversations)
+        val again = bridge.acceptWelcomed()
+        again.ok(again.expect("conversation.watch"))
+    }
+
     @Test
     fun waitsForThePersonWhenTheHostKeyIsUnknown() = runTest {
         val controller = controller()

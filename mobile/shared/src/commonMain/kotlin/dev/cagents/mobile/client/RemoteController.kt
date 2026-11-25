@@ -14,7 +14,6 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -23,7 +22,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.atomicfu.locks.SynchronizedObject
@@ -92,6 +94,16 @@ class RemoteController(
     private var backgroundStop: Job? = null
 
     /**
+     * Held while a connection is stopped, so that stops, restarts and the
+     * background's stop take turns: each waits for the one before to have
+     * ended its connection.
+     */
+    private val stopping = Mutex()
+
+    /** Restarts under way, each of which starts the loop once done. Guarded by [locked]. */
+    private var restarts = 0
+
+    /**
      * Whether the person may be looking at the app. Only then are its
      * conversations watched: a watching phone counts as someone following
      * them on the computer.
@@ -150,12 +162,16 @@ class RemoteController(
     private val inFlight = HashMap<String, Int>()
 
     /** Starts connecting, unless already running. */
-    fun start() = locked {
+    fun start() = locked { startLocked() }
+
+    private fun startLocked() {
+        // The restart starts it, once the old connection has ended.
+        if (restarts > 0) return
         backgroundStop?.cancel()
         backgroundStop = null
         if (loop?.isActive == true) {
             wake.trySend(Unit)
-            return@locked
+            return
         }
         loop = scope.launch { connectLoop() }
     }
@@ -166,21 +182,59 @@ class RemoteController(
             backgroundStop?.cancel()
             backgroundStop = null
         }
-        disconnect()
+        stopping.withLock { disconnect() }
     }
 
-    private suspend fun disconnect() {
-        val job = locked { loop.also { loop = null } }
+    /**
+     * Ends the connection and waits until it has. Not cancellable: a stop
+     * given up halfway would leave the old connection running unseen.
+     */
+    private suspend fun disconnect(onlyIf: () -> Boolean = { true }) = withContext(NonCancellable) {
+        val job = locked {
+            if (!onlyIf()) return@withContext
+            loop.also { loop = null }
+        }
+        // Cancelled before the close, so the loop doesn't take the closed
+        // connection for a dropped one and connect again meanwhile, by then
+        // perhaps to another computer.
+        job?.cancel()
         // Closing an SSH channel can block on the network; keep it off the caller's thread.
-        withContext(NonCancellable + Dispatchers.Default) { current?.close() }
-        job?.cancelAndJoin()
-        _state.update { it.copy(connection = ConnectionState.Offline) }
+        withContext(Dispatchers.Default) { current?.close() }
+        job?.join()
+        // Unless a connection was started meanwhile, such as on returning to the app.
+        locked { if (loop == null) _state.update { it.copy(connection = ConnectionState.Offline) } }
     }
 
-    /** Drops the connection and connects afresh, such as after the settings changed. */
-    suspend fun restart() {
-        stop()
-        start()
+    /**
+     * Drops the connection and connects afresh, such as after the settings
+     * changed. When [computerChanged], it first forgets what the last
+     * computer sent, its sessions, notices and name, and the conversations
+     * followed there, so none of it shows as the new computer's or is
+     * watched there.
+     */
+    suspend fun restart(computerChanged: Boolean = false) = withContext(NonCancellable) {
+        // Not cancellable: given up halfway, it would leave no connection.
+        locked {
+            restarts++
+            backgroundStop?.cancel()
+            backgroundStop = null
+        }
+        // Hidden at once, while the old connection closes, so nothing of it
+        // can be opened meanwhile.
+        if (computerChanged) _state.value = RemoteState(connection = ConnectionState.Connecting)
+        stopping.withLock {
+            disconnect()
+            locked {
+                // Again, for what the old connection sent as it closed.
+                if (computerChanged) {
+                    resyncing.clear()
+                    recoveries.clear()
+                    _state.value = RemoteState()
+                }
+                restarts--
+                startLocked()
+            }
+        }
     }
 
     /** Skips the remaining backoff, such as when the network comes back. */
@@ -205,7 +259,9 @@ class RemoteController(
                 backgroundStop?.cancel()
                 backgroundStop = scope.launch {
                     delay(config.backgroundGrace)
-                    disconnect()
+                    val self = coroutineContext.job
+                    // Unless the app came back meanwhile, which replaces or clears it.
+                    stopping.withLock { disconnect(onlyIf = { backgroundStop === self }) }
                 }
             }
         }
@@ -313,26 +369,27 @@ class RemoteController(
     private suspend fun connectOnce(onConnected: () -> Unit): String {
         val channel = transport.open()
         val bridge = BridgeSession(channel, config.clientName, config.clientVersion)
+        var queue: Channel<Sync>? = null
         try {
             val welcome = bridge.handshake()
             onConnected()
             // Drain a wake that arrived while connecting, so it doesn't skip a later backoff.
             wake.tryReceive()
-            val queue = Channel<Sync>(Channel.UNLIMITED)
+            val syncQueue = Channel<Sync>(Channel.UNLIMITED).also { queue = it }
             return coroutineScope {
                 val reader = async { bridge.run { event -> handle(event) } }
                 locked {
                     resyncing.clear()
                     recoveries.clear()
+                    syncs = syncQueue
+                    current = bridge
                 }
-                syncs = queue
-                current = bridge
                 _state.update { it.copy(connection = ConnectionState.Connected, welcome = welcome) }
                 launch {
                     subscribe(bridge)
                     // Opened before this connection, or while it was being made.
-                    _state.value.conversations.keys.forEach { queue.trySend(Sync(it, SyncKind.Watch)) }
-                    reconcile(bridge, queue)
+                    _state.value.conversations.keys.forEach { syncQueue.trySend(Sync(it, SyncKind.Watch)) }
+                    reconcile(bridge, syncQueue)
                 }
                 launch { keepalive(bridge) }
                 val reason = reader.await()
@@ -340,8 +397,11 @@ class RemoteController(
                 reason
             }
         } finally {
-            syncs = null
-            current = null
+            // Unless a newer connection has taken their place.
+            locked {
+                if (syncs === queue) syncs = null
+                if (current === bridge) current = null
+            }
             bridge.close()
         }
     }
