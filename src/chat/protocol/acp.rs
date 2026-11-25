@@ -16,7 +16,9 @@
 //!
 //! A message queued while a turn runs waits in this adapter, and the next
 //! turn starts with everything queued as soon as the running one ends, in
-//! the same step, so nothing else can start a turn in between. An agent
+//! the same step, so nothing else can start a turn in between. A turn the
+//! reader stopped, or one the agent refused to work on at all, leaves the
+//! queue for the reader to start: their next message goes after it. An agent
 //! whose profile [steers](Profile::steers) also takes a message mid-turn:
 //! Antigravity 1.5.17 answers the running `session/prompt` at once, as
 //! `end_turn`, and carries on with its work, background commands included,
@@ -290,6 +292,8 @@ struct Permission {
     /// Each option's identifier and its kind, which alone says whether
     /// choosing it refuses the action.
     options: Vec<(String, String)>,
+    /// The tool call it asks about.
+    call: String,
 }
 
 struct Acp {
@@ -322,6 +326,10 @@ struct Acp {
     usage: chat::Usage,
     queued: Vec<Queued>,
     next_queued: u64,
+    /// Names this adapter's queued messages apart from those of the one
+    /// before it, whose queue went with its process: removing one of those
+    /// cannot be answered as if it had been delivered.
+    queue_tag: String,
 }
 
 impl Acp {
@@ -352,6 +360,7 @@ impl Acp {
             usage: chat::Usage::default(),
             queued: Vec::new(),
             next_queued: 0,
+            queue_tag: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
         }
     }
 
@@ -465,6 +474,9 @@ impl Acp {
             // A message queued during a turn waits here for the next one.
             queue: true,
             queue_remove: true,
+            // One queued message can go ahead of the rest, or, held between
+            // turns by a stop or a refusal, start the next turn.
+            queue_start: true,
             // Sending what is queued now steers it into the running turn.
             send_queued_now: self.profile.steers,
             interrupt_stops_background: self.profile.cancel_stops_background,
@@ -720,8 +732,7 @@ impl Acp {
             ));
         }
         self.next_queued += 1;
-        let mut message =
-            chat::QueuedMessage::new(format!("acp-queued:{}", self.next_queued), text);
+        let mut message = chat::QueuedMessage::new(self.queued_id(self.next_queued), text);
         message.attachments = attachments;
         self.queued.push(Queued {
             message,
@@ -732,6 +743,20 @@ impl Acp {
         let mut step = Step::default();
         self.queue_changed(&mut step);
         Ok(step)
+    }
+
+    fn queued_id(&self, number: u64) -> String {
+        format!("acp-queued:{}:{number}", self.queue_tag)
+    }
+
+    /// Whether `id` names a message this adapter queued, whether or not it
+    /// is still queued.
+    fn queued_here(&self, id: &str) -> bool {
+        id.strip_prefix("acp-queued:")
+            .and_then(|rest| rest.strip_prefix(self.queue_tag.as_str()))
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|number| number.parse::<u64>().ok())
+            .is_some_and(|number| (1..=self.next_queued).contains(&number))
     }
 
     fn queue_changed(&self, step: &mut Step) {
@@ -765,7 +790,11 @@ impl Acp {
             // The unstable `PromptResponse.usage` is this prompt's own
             // tokens, so prompts add up: Antigravity 1.5.12's second turn of
             // a conversation reports only its own input, apart from what it
-            // read from cache, as Claude's do.
+            // read from cache, as Claude's do. Within a steered turn each
+            // reply counts only the model's responses made under its own
+            // prompt: in 1.5.17, the first reply's 12386 tokens were the one
+            // response before the steer, and the second's 52696 the four
+            // after it, to the token.
             if let Some(usage) = result.get("usage").filter(|usage| usage.is_object()) {
                 let count = |key: &str| usage[key].as_u64().unwrap_or(0);
                 self.usage.input_tokens += count("inputTokens");
@@ -773,11 +802,24 @@ impl Acp {
                 step.events.push(Event::Usage(self.usage.clone()));
             }
         }
-        let Some(turn) = self.turn.as_mut() else {
+        // A late reply to a prompt of a turn already ended says nothing of
+        // the one running now.
+        let Some(turn) = self
+            .turn
+            .as_mut()
+            .filter(|turn| turn.requests.contains(&request))
+        else {
             return;
         };
         turn.requests.retain(|pending| *pending != request);
-        if turn.requests.is_empty() {
+        // Stopped, the turn is over once any of its prompts says so: an
+        // agent owes the others no reply of their own.
+        let stopped = turn.cancelling
+            && match outcome {
+                Ok(result) => result["stopReason"] == "cancelled",
+                Err(error) => error["code"].as_i64() == Some(rpc::REQUEST_CANCELLED),
+            };
+        if turn.requests.is_empty() || stopped {
             return self.end_turn(outcome, step);
         }
         // A later message took the turn over. Only an earlier prompt that
@@ -863,10 +905,12 @@ impl Acp {
         // What was queued starts the next turn in this same step, so the
         // conversation never looks idle to whatever would start one of its
         // own in between, such as a message from another session. After a
-        // refusal to work at all, it waits for the reader instead.
+        // refusal to work at all, or the reader's Stop, it waits for the
+        // reader instead: their next message, Send now or starting one
+        // queued message.
         let refused = outcome
             .is_err_and(|error| (self.profile.sign_in_required)(error) || no_allowance(error));
-        let next = if refused {
+        let next = if refused || kind == Kind::Cancelled {
             None
         } else {
             self.take_queued(step)
@@ -1108,6 +1152,7 @@ impl Acp {
                 rpc,
                 json!({"outcome": {"outcome": "cancelled"}}),
             ));
+            self.calls.declined(&call_id);
             return;
         }
         self.next_permission += 1;
@@ -1152,6 +1197,7 @@ impl Acp {
                     .into_iter()
                     .map(|(option, _, kind)| (option, kind))
                     .collect(),
+                call: call_id,
             },
         );
     }
@@ -1490,10 +1536,15 @@ impl Adapter for Acp {
         );
         Ok(Step {
             writes: vec![frame],
-            events: vec![Event::Status {
-                busy: false,
-                detail: "Starting".into(),
-            }],
+            events: vec![
+                Event::Status {
+                    busy: false,
+                    detail: "Starting".into(),
+                },
+                // A new process starts with nothing queued: what an earlier
+                // one held went with it.
+                Event::QueueChanged(Vec::new()),
+            ],
             ..Step::default()
         })
     }
@@ -1535,6 +1586,14 @@ impl Adapter for Acp {
         ) {
             return Err(format!(
                 "A correlated {} run requires one idle direct prompt",
+                self.profile.label
+            ));
+        }
+        // A prompt sent now takes what the reader's queue holds with it;
+        // the run must not answer for messages the reader never sent it.
+        if !self.queued.is_empty() {
+            return Err(format!(
+                "{} has the reader's queued messages to send first",
                 self.profile.label
             ));
         }
@@ -1600,7 +1659,17 @@ impl Adapter for Acp {
                     },
                 )?;
                 let step = match mode {
-                    PromptMode::Send => self.start_turn(prompt.blocks, prompt.items)?,
+                    // What a stop or a refusal held in the queue was written
+                    // first, so it goes first, in the same prompt.
+                    PromptMode::Send => {
+                        let mut step = Step::default();
+                        let (mut blocks, mut items) =
+                            self.take_queued(&mut step).unwrap_or_default();
+                        blocks.extend(prompt.blocks);
+                        items.extend(prompt.items);
+                        self.begin_turn(blocks, items, &mut step);
+                        step
+                    }
                     PromptMode::Queue => {
                         self.queue(text, attachments, prompt.blocks, prompt.items)?
                     }
@@ -1690,7 +1759,12 @@ impl Adapter for Acp {
                 } else {
                     return Err(format!("{label} did not offer that choice."));
                 };
+                let declined = self.answer_declines(&request_id, &action);
                 let permission = self.permissions.remove(&request_id).unwrap();
+                // A call refused is over, whether or not the agent says so.
+                if declined {
+                    self.calls.declined(&permission.call);
+                }
                 let mut step = Step::default();
                 step.writes
                     .push(rpc::result(&permission.rpc, json!({"outcome": outcome})));
@@ -1750,6 +1824,10 @@ impl Adapter for Acp {
             Command::SetFastMode { .. } => Err(format!("{label} has no fast mode.")),
             Command::SetInterruptMode { .. } => Err(format!("{label} stops a turn only one way.")),
             Command::RemoveQueued { id } => {
+                // Queued by an earlier process of the agent, it went with it.
+                if !self.queued_here(&id) {
+                    return Err(format!("That message is no longer queued with {label}."));
+                }
                 let mut step = Step::default();
                 let position = self
                     .queued
@@ -1767,23 +1845,56 @@ impl Adapter for Acp {
                 Ok(step)
             }
             Command::SendQueuedNow => {
-                if !self.profile.steers {
-                    return Err(format!("{label} cannot take a message mid-turn."));
-                }
                 let mut step = Step::default();
-                // With no turn to take them, what is queued has already
-                // started the next one.
-                if self.turn.as_ref().is_none_or(|turn| turn.cancelling) {
-                    return Ok(step);
-                }
-                if let Some((blocks, items)) = self.take_queued(&mut step) {
-                    self.steer(blocks, items, &mut step);
+                match &self.turn {
+                    // Held by a stop or a refusal, what is queued starts a
+                    // turn of its own.
+                    None => {
+                        self.accepts_turn()?;
+                        if let Some((blocks, items)) = self.take_queued(&mut step) {
+                            self.begin_turn(blocks, items, &mut step);
+                        }
+                    }
+                    Some(turn) if turn.cancelling => {
+                        return Err(format!(
+                            "{label} is stopping this turn; send them once it has stopped."
+                        ));
+                    }
+                    Some(_) if !self.profile.steers => {
+                        return Err(format!("{label} cannot take a message mid-turn."));
+                    }
+                    Some(_) => {
+                        if let Some((blocks, items)) = self.take_queued(&mut step) {
+                            self.steer(blocks, items, &mut step);
+                        }
+                    }
                 }
                 Ok(step)
             }
-            Command::StartQueued { .. } => Err(format!(
-                "{label} sends queued messages together; send them now instead."
-            )),
+            Command::StartQueued { id } => {
+                let position = self
+                    .queued
+                    .iter()
+                    .position(|queued| queued.message.id == id)
+                    .ok_or_else(|| format!("That message is no longer queued with {label}."))?;
+                let between = self.turn.is_none();
+                if between {
+                    self.accepts_turn()?;
+                }
+                let mut step = Step::default();
+                let queued = self.queued.remove(position);
+                if between {
+                    // Between turns, as a stop or a refusal leaves them, it
+                    // starts the next turn, and the rest follow it.
+                    self.queue_changed(&mut step);
+                    self.begin_turn(queued.blocks, queued.items, &mut step);
+                } else {
+                    // During one, it goes first when the turn ends.
+                    self.queued.insert(0, queued);
+                    self.queue_changed(&mut step);
+                }
+                Ok(step)
+            }
             Command::ListBranches | Command::Branch { .. } => {
                 Err(format!("{label} cannot branch a conversation."))
             }

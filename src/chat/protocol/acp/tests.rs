@@ -960,10 +960,10 @@ fn a_message_queued_during_a_turn_waits_in_the_adapter() {
     assert!(step.writes.is_empty(), "{:?}", step.writes);
     // Shown in the queue, not yet in the transcript.
     assert!(items(&step).is_empty());
-    assert_eq!(
-        queue_listing(&step),
-        Some(vec![("acp-queued:1", "then run the tests")])
-    );
+    let listed = queue_listing(&step).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].0.starts_with("acp-queued:"));
+    assert_eq!(listed[0].1, "then run the tests");
     let step = acp.command(send("and lint", PromptMode::Queue)).unwrap();
     let listed = queue_listing(&step).unwrap();
     assert_eq!(listed.len(), 2);
@@ -1043,31 +1043,33 @@ fn a_queued_message_can_be_removed_before_it_goes() {
     ready(&mut acp);
     let request = prompt(&mut acp, "hold");
     acp.command(send("keep", PromptMode::Queue)).unwrap();
-    acp.command(send("drop", PromptMode::Queue)).unwrap();
+    let step = acp.command(send("drop", PromptMode::Queue)).unwrap();
+    let listed = queue_listing(&step).unwrap();
+    let (kept, dropped) = (listed[0].0.to_owned(), listed[1].0.to_owned());
     let step = acp
         .command(Command::RemoveQueued {
-            id: "acp-queued:2".into(),
+            id: dropped.clone(),
         })
         .unwrap();
     assert!(step.writes.is_empty());
     assert!(
         step.events
             .contains(&Event::QueueRemoval(chat::QueueRemoval {
-                id: "acp-queued:2".into(),
+                id: dropped.clone(),
                 removed: true,
             }))
     );
-    assert_eq!(queue_listing(&step), Some(vec![("acp-queued:1", "keep")]));
+    assert_eq!(queue_listing(&step), Some(vec![(kept.as_str(), "keep")]));
     // One that already left is answered as not removed.
     let step = acp
         .command(Command::RemoveQueued {
-            id: "acp-queued:2".into(),
+            id: dropped.clone(),
         })
         .unwrap();
     assert!(
         step.events
             .contains(&Event::QueueRemoval(chat::QueueRemoval {
-                id: "acp-queued:2".into(),
+                id: dropped,
                 removed: false,
             }))
     );
@@ -1101,17 +1103,125 @@ fn a_queue_waits_for_the_reader_after_a_refusal_to_work() {
             .iter()
             .all(|frame| frame["method"] != "session/prompt")
     );
-    // Still queued: it goes after the reader's next turn.
+    // Still queued, it goes ahead of the reader's next message, in the
+    // order written.
     assert_eq!(queue_listing(&step), None);
-    let request = prompt(&mut acp, "signed in again");
     let step = acp
-        .receive(reply(&request, json!({"stopReason": "end_turn"})))
+        .command(send("signed in again", PromptMode::Send))
         .unwrap();
+    assert_eq!(
+        prompt_texts(only_write(&step)),
+        ["later", "signed in again"]
+    );
+    assert_eq!(queue_listing(&step), Some(Vec::new()));
+}
+
+#[test]
+fn a_stopped_turn_holds_its_queue_until_the_reader_starts_it() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let request = prompt(&mut acp, "hold");
+    acp.command(send("one", PromptMode::Queue)).unwrap();
+    acp.command(send("two", PromptMode::Queue)).unwrap();
+    let step = acp.command(send("three", PromptMode::Queue)).unwrap();
+    let second = queue_listing(&step).unwrap()[1].0.to_owned();
+    acp.command(Command::Interrupt).unwrap();
+    let step = acp
+        .receive(reply(&request, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    // Nothing starts on its own after a Stop.
+    assert_eq!(finished(&step), Some(Kind::Cancelled));
+    assert_eq!(statuses(&step), [(false, "Ready")]);
     assert!(
         step.writes
             .iter()
-            .any(|frame| frame["method"] == "session/prompt")
+            .all(|frame| frame["method"] != "session/prompt")
     );
+    // One started from the queue goes alone, and the rest follow it.
+    let step = acp.command(Command::StartQueued { id: second }).unwrap();
+    let started = only_write(&step).clone();
+    assert_eq!(prompt_texts(&started), ["two"]);
+    assert!(step.events.contains(&Event::TurnStarted));
+    assert_eq!(queue_listing(&step).unwrap().len(), 2);
+    let step = acp
+        .receive(reply(&started, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let next = step
+        .writes
+        .iter()
+        .find(|frame| frame["method"] == "session/prompt")
+        .unwrap();
+    assert_eq!(prompt_texts(next), ["one", "three"]);
+}
+
+#[test]
+fn send_now_between_turns_starts_what_a_stop_held() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let request = prompt(&mut acp, "hold");
+    acp.command(send("one", PromptMode::Queue)).unwrap();
+    acp.command(Command::Interrupt).unwrap();
+    acp.receive(refusal(
+        &request,
+        rpc::REQUEST_CANCELLED,
+        "Request cancelled",
+    ))
+    .unwrap();
+    let step = acp.command(Command::SendQueuedNow).unwrap();
+    assert_eq!(prompt_texts(only_write(&step)), ["one"]);
+    assert!(step.events.contains(&Event::TurnStarted));
+    assert_eq!(statuses(&step), [(true, "Working")]);
+}
+
+#[test]
+fn a_queued_message_moved_ahead_during_a_turn_goes_first() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let request = prompt(&mut acp, "hold");
+    acp.command(send("one", PromptMode::Queue)).unwrap();
+    let step = acp.command(send("two", PromptMode::Queue)).unwrap();
+    let second = queue_listing(&step).unwrap()[1].0.to_owned();
+    let step = acp.command(Command::StartQueued { id: second }).unwrap();
+    assert!(step.writes.is_empty());
+    let listed = queue_listing(&step).unwrap();
+    assert_eq!(
+        listed.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+        ["two", "one"]
+    );
+    let step = acp
+        .receive(reply(&request, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let next = step
+        .writes
+        .iter()
+        .find(|frame| frame["method"] == "session/prompt")
+        .unwrap();
+    assert_eq!(prompt_texts(next), ["two", "one"]);
+}
+
+/// A new process of the agent queued nothing: what the last one listed
+/// went with it, and removing one of those is not answered as delivered.
+#[test]
+fn a_new_agent_process_starts_with_an_empty_queue_and_knows_no_earlier_one() {
+    let mut earlier = adapter(&[], None);
+    ready(&mut earlier);
+    prompt(&mut earlier, "hold");
+    let step = earlier.command(send("lost", PromptMode::Queue)).unwrap();
+    let stale = queue_listing(&step).unwrap()[0].0.to_owned();
+
+    let mut acp = adapter(&[], None);
+    let step = acp.initialize().unwrap();
+    assert_eq!(queue_listing(&step), Some(Vec::new()));
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    prompt(&mut acp, "hold");
+    acp.command(send("fresh", PromptMode::Queue)).unwrap();
+    assert!(
+        acp.command(Command::RemoveQueued { id: stale.clone() })
+            .is_err()
+    );
+    assert!(acp.command(Command::StartQueued { id: stale }).is_err());
+    assert_eq!(acp.queued.len(), 1);
 }
 
 /// Antigravity 1.5.17, recorded: a second `session/prompt` sent while the
@@ -1221,30 +1331,91 @@ fn send_now_steers_everything_queued_into_the_running_turn() {
     assert_eq!(finished(&step), Some(Kind::Succeeded));
 }
 
+/// An agent stopped with two prompts open may answer only one of them;
+/// the turn ends with the first that says it was cancelled.
 #[test]
-fn stopping_a_steered_turn_waits_for_every_reply() {
+fn a_stopped_steered_turn_ends_with_its_first_cancelled_reply() {
+    for newest_first in [false, true] {
+        let mut acp = adapter(&[], None);
+        ready(&mut acp);
+        let first = prompt(&mut acp, "hold");
+        let step = acp.command(send("more", PromptMode::Steer)).unwrap();
+        let second = only_write(&step).clone();
+        acp.command(Command::Interrupt).unwrap();
+        // Steering a turn being stopped is refused; queueing is not.
+        assert!(acp.command(send("again", PromptMode::Steer)).is_err());
+        let (answered, late) = if newest_first {
+            (&second, &first)
+        } else {
+            (&first, &second)
+        };
+        let step = acp
+            .receive(reply(answered, json!({"stopReason": "cancelled"})))
+            .unwrap();
+        assert_eq!(finished(&step), Some(Kind::Cancelled), "{newest_first}");
+        assert_eq!(statuses(&step), [(false, "Ready")]);
+        // The other's reply, if it ever comes, belongs to no turn.
+        let step = acp
+            .receive(refusal(late, rpc::REQUEST_CANCELLED, "Request cancelled"))
+            .unwrap();
+        assert!(step.events.is_empty(), "{newest_first}: {:?}", step.events);
+        assert!(acp.command(send("next", PromptMode::Send)).is_ok());
+    }
+}
+
+/// A call the reader refused that the agent never reports ended does not
+/// keep a turn that waits on background work from saying so.
+#[test]
+fn a_refused_call_does_not_hide_a_wait_on_background_work() {
     let mut acp = adapter(&[], None);
-    ready(&mut acp);
-    let first = prompt(&mut acp, "hold");
-    let step = acp.command(send("more", PromptMode::Steer)).unwrap();
-    let second = only_write(&step).clone();
-    acp.command(Command::Interrupt).unwrap();
-    // Steering a turn being stopped is refused; queueing is not.
-    assert!(acp.command(send("again", PromptMode::Steer)).is_err());
+    let session = ready(&mut acp);
+    prompt(&mut acp, "build in the background, then edit");
+    let usage = |used: u64| {
+        update(
+            &session,
+            json!({"sessionUpdate": "usage_update", "used": used, "size": 1048576}),
+        )
+    };
+    acp.receive(usage(100)).unwrap();
+    acp.receive(update(
+        &session,
+        json!({"sessionUpdate": "tool_call", "toolCallId": "build", "kind": "execute",
+            "title": "make release", "status": "in_progress"}),
+    ))
+    .unwrap();
+    acp.receive(update(
+        &session,
+        json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "The build runs in the background."}}),
+    ))
+    .unwrap();
     let step = acp
-        .receive(refusal(&first, rpc::REQUEST_CANCELLED, "Request cancelled"))
+        .receive(
+            json!({"jsonrpc": "2.0", "id": "agent-9", "method": "session/request_permission",
+            "params": {"sessionId": session,
+                "toolCall": {"toolCallId": "edit", "title": "Edit notes.md", "kind": "edit",
+                    "status": "pending"},
+                "options": [
+                    {"optionId": "yes", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "no", "name": "Reject", "kind": "reject_once"}]}}),
+        )
         .unwrap();
-    assert!(
-        !step
-            .events
-            .iter()
-            .any(|event| matches!(event, Event::Error { .. }))
-    );
-    assert_eq!(finished(&step), None);
-    let step = acp
-        .receive(reply(&second, json!({"stopReason": "cancelled"})))
+    let request = step
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Request(request) => Some(request.id.clone()),
+            _ => None,
+        })
         .unwrap();
-    assert_eq!(finished(&step), Some(Kind::Cancelled));
+    acp.command(Command::Answer {
+        request_id: request,
+        action: "no".into(),
+        answers: Vec::new(),
+    })
+    .unwrap();
+    let step = acp.receive(usage(200)).unwrap();
+    assert_eq!(statuses(&step), [(true, chat::WAITING_ON_BACKGROUND_WORK)]);
 }
 
 /// Antigravity 1.5.17, recorded: a turn whose command it started in the
@@ -1362,7 +1533,7 @@ fn agents_offer_the_queue_and_steer_only_where_recorded() {
     };
     let agy = Acp::new(&antigravity::PROFILE);
     let offered = capabilities(&agy);
-    assert!(offered.queue && offered.queue_remove && !offered.queue_start);
+    assert!(offered.queue && offered.queue_remove && offered.queue_start);
     assert!(offered.steer && offered.send_queued_now);
     assert!(offered.interrupt_stops_background);
     let muse = Acp::new(&muse::PROFILE);
@@ -2066,6 +2237,26 @@ fn a_correlated_run_is_started_scoped_settled_and_finished() {
         acp.command_for_run(run, Command::Compact).is_err(),
         "only a direct prompt"
     );
+}
+
+/// A run started while a stop holds the reader's queue would send those
+/// messages with its own prompt and answer for them; it waits instead.
+#[test]
+fn a_correlated_run_never_takes_the_readers_held_queue() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let request = prompt(&mut acp, "hold");
+    acp.command(send("mine", PromptMode::Queue)).unwrap();
+    acp.command(Command::Interrupt).unwrap();
+    acp.receive(reply(&request, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    let run = crate::model::RunId::new();
+    assert!(
+        acp.command_for_run(run, send("the run's", PromptMode::Send))
+            .is_err()
+    );
+    assert!(acp.turn.is_none());
+    assert_eq!(acp.queued.len(), 1);
 }
 
 #[test]

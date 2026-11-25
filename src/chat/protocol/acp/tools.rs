@@ -33,6 +33,9 @@ struct Call {
     started: bool,
     /// The agent went on while it ran: it runs in the background.
     background: bool,
+    /// The reader refused it, so it will not run, whatever the agent
+    /// later reports of it.
+    declined: bool,
 }
 
 #[derive(Default)]
@@ -118,13 +121,21 @@ impl Calls {
         moved
     }
 
+    /// Notes that the reader refused `id`.
+    pub fn declined(&mut self, id: &str) {
+        if let Some(call) = self.calls.get_mut(id) {
+            call.declined = true;
+        }
+    }
+
     /// Whether something is still running and all of it runs in the
-    /// background.
+    /// background. A call the reader refused is not running, though an
+    /// agent may never say that it ended.
     pub fn only_background_live(&self) -> bool {
         let mut live = self
             .calls
             .values()
-            .filter(|call| call.status.is_none_or(ToolStatus::is_live))
+            .filter(|call| !call.declined && call.status.is_none_or(ToolStatus::is_live))
             .peekable();
         live.peek().is_some() && live.all(|call| call.background)
     }
