@@ -105,8 +105,13 @@ umask 022
 # scripts/package-macos makes) leaves the account's registrations alone.
 ACCOUNT_HOME=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p') \
     || ACCOUNT_HOME=
+# Whether HOME is the account's own home, compared by real path. An account
+# whose home the local directory does not name counts as private.
+own_home() {
+    [ -n "$ACCOUNT_HOME" ] && [ "$(cd "$HOME" 2>/dev/null && pwd -P)" = "$(cd "$ACCOUNT_HOME" 2>/dev/null && pwd -P)" ]
+}
 register_app() {
-    [ "$HOME" = "$ACCOUNT_HOME" ] && [ -x "$LSREGISTER" ] || return 0
+    own_home && [ -x "$LSREGISTER" ] || return 0
     "$LSREGISTER" "$@" >/dev/null 2>&1 || :
 }
 
@@ -286,12 +291,30 @@ owned_prefix || printf '%s\n' "$MARKER_TEXT" > "$PREFIX/.cagents-install-root"
 acquire_lock
 
 STAGE=$(mktemp -d "$PREFIX/.stage.XXXXXX")
+# The login item is staged beside the one it replaces (see AGENT_STAGE).
+AGENT_STAGE=
+# Until the install starts changing what is published, there is nothing to
+# roll back; see roll_back below.
+PUBLISHING=0
+STAGE_KEPT=0
+roll_back() { :; }
 cleanup() {
-    rm -rf "$STAGE"
+    # Nothing may stop a rollback halfway: not a second interrupt, nor a
+    # message to a terminal or pipe that has gone.
+    set +e
+    trap '' HUP INT TERM PIPE
+    roll_back
+    rm -f "$PREFIX/.current.$$"
+    [ "$STAGE_KEPT" -eq 1 ] || rm -rf "$STAGE"
+    if [ -n "$AGENT_STAGE" ]; then
+        rm -f "$AGENT_STAGE/new"
+        [ "$STAGE_KEPT" -eq 1 ] && exists "$AGENT_STAGE/prior" || rm -rf "$AGENT_STAGE"
+    fi
     release_lock
 }
+exists() { [ -e "$1" ] || [ -L "$1" ]; }
 trap cleanup EXIT
-trap 'exit 1' HUP INT TERM
+trap 'trap "" HUP INT TERM; exit 1' HUP INT TERM
 
 download() {
     curl $CURL_OPTIONS -o "$STAGE/$1" "https://github.com/$REPOSITORY/releases/download/v$VERSION/$1" \
@@ -353,58 +376,25 @@ if [ -n "$daemon" ] && [ "$daemon" != "$VERSION" ]; then
 fi
 
 TARGET_DIR=$PREFIX/versions/$VERSION
-if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
-    # This release again, as a repair or a return to the version kept for
-    # rollback: keep the tree when it is the release's, or replace it whole.
-    # A process running from the old tree keeps the files it has open.
-    if [ -L "$TARGET_DIR" ] || ! diff -rq "$NEW" "$TARGET_DIR" >/dev/null 2>&1; then
-        mv "$TARGET_DIR" "$STAGE/replaced"
-        mv "$NEW" "$TARGET_DIR"
-    fi
-else
-    mv "$NEW" "$TARGET_DIR"
-fi
-# The version kept for rollback: the one this install replaces, or after a
-# reinstall the one recorded before.
-PREVIOUS_VERSION=$(cat "$PREFIX/.previous" 2>/dev/null || :)
-if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
-    PREVIOUS_VERSION=$CURRENT_VERSION
-fi
-[ "$PREVIOUS_VERSION" != "$VERSION" ] || PREVIOUS_VERSION=
-rm -f "$PREFIX/.current.$$"
-ln -s "versions/$VERSION" "$PREFIX/.current.$$"
-mv -fh "$PREFIX/.current.$$" "$PREFIX/current"
-printf '%s\n' "$PREVIOUS_VERSION" > "$PREFIX/.previous"
+mkdir -p "$HOME/Applications" "$HOME/.local/bin" "$HOME/Library/LaunchAgents" \
+    || fail 'cannot create the folders the installation links from; the installation was not changed'
+# The new login item and a copy of the one it replaces are staged in a
+# hidden folder beside it, so that publishing and restoring it are renames
+# within one volume, whatever the prefix. launchd does not look inside it.
+AGENT_STAGE=$(mktemp -d "$HOME/Library/LaunchAgents/.cagents-install.XXXXXX") \
+    || fail 'cannot stage the login item; the installation was not changed'
+AGENT_NEW=$AGENT_STAGE/new
+AGENT_PRIOR=$AGENT_STAGE/prior
 
-# Cagents.app stays at one path, which the Dock and Login Items remember. Replace it only when the release changed it.
-if [ ! -d "$APP" ] || ! diff -rq "$TARGET_DIR/Cagents.app" "$APP" >/dev/null 2>&1; then
-    rm -rf "$PREFIX/.Cagents.app.new" "$PREFIX/.Cagents.app.old"
-    ditto "$TARGET_DIR/Cagents.app" "$PREFIX/.Cagents.app.new"
-    [ ! -e "$APP" ] || mv "$APP" "$PREFIX/.Cagents.app.old"
-    mv "$PREFIX/.Cagents.app.new" "$APP"
-    rm -rf "$PREFIX/.Cagents.app.old"
-    register_app -f "$APP"
-fi
-
-mkdir -p "$HOME/Applications" "$HOME/.local/bin"
-link() {
-    if [ -L "$2" ]; then
-        rm -f "$2"
-    elif [ -e "$2" ]; then
-        note "kept the existing $2; it is not a link this installer made"
-        return 0
-    fi
-    ln -s "$1" "$2"
-}
-link "$APP" "$APP_LINK"
-link "$PREFIX/current/bin/cagents" "$BIN_LINK"
-
+# Everything the installation publishes is prepared in the stage first: the
+# login item, and the stable bundle as it will be. Nothing outside the stage
+# changes until the release is in place and answers from there.
+#
 # The login item runs `cagents daemon start` once at login, as the XDG
 # autostart entry does on Linux. It names the version's real path: on macOS
 # an executable sees the path it was started by, and a daemon started
 # through `current` would look for its companions in the next version.
-mkdir -p "$HOME/Library/LaunchAgents"
-cat > "$STAGE/agent.plist" <<EOF
+cat > "$AGENT_NEW" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -430,27 +420,182 @@ cat > "$STAGE/agent.plist" <<EOF
 </dict>
 </plist>
 EOF
-plutil -lint -s "$STAGE/agent.plist" || fail 'could not write the login item'
-mv -f "$STAGE/agent.plist" "$AGENT_PLIST"
-chmod 0644 "$AGENT_PLIST"
+plutil -lint -s "$AGENT_NEW" && chmod 0644 "$AGENT_NEW" \
+    || fail 'could not write the login item; the installation was not changed'
+# Cagents.app stays at one path, which the Dock and Login Items remember;
+# it is replaced only when the release changed it.
+APP_CHANGED=0
+if [ ! -d "$APP" ] || ! diff -rq "$NEW/Cagents.app" "$APP" >/dev/null 2>&1; then
+    APP_CHANGED=1
+    ditto "$NEW/Cagents.app" "$STAGE/Cagents.app" \
+        && codesign --verify --strict "$STAGE/Cagents.app" 2>/dev/null \
+        || fail 'could not prepare Cagents.app; the installation was not changed'
+fi
+
+# The version kept for rollback: the one this install replaces, or after a
+# reinstall the one recorded before. Publishing it commits the install.
+PREVIOUS_VERSION=$(cat "$PREFIX/.previous" 2>/dev/null || :)
+if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
+    PREVIOUS_VERSION=$CURRENT_VERSION
+fi
+[ "$PREVIOUS_VERSION" != "$VERSION" ] || PREVIOUS_VERSION=
+printf '%s\n' "$PREVIOUS_VERSION" > "$STAGE/previous" \
+    || fail 'cannot record the version kept for rollback; the installation was not changed'
+
+# A failure before the install commits puts each change back in reverse:
+# the login item, the links, the bundle, `current` and the version tree.
+# Each step is a rename or a link, and the rollback reads what each one left
+# rather than a record of it, so an interrupt between a step and anything
+# after it cannot mislead it.
+PRIOR_CURRENT=
+[ ! -L "$PREFIX/current" ] || PRIOR_CURRENT=$(readlink "$PREFIX/current")
+PRIOR_BIN_LINK=
+[ ! -L "$BIN_LINK" ] || PRIOR_BIN_LINK=$(readlink "$BIN_LINK")
+PRIOR_APP_LINK=
+[ ! -L "$APP_LINK" ] || PRIOR_APP_LINK=$(readlink "$APP_LINK")
+# Each is published by renaming a staged file over it, and a rename onto a
+# folder or link would move the file inside or past it instead.
+for published in "$AGENT_PLIST" "$PREFIX/.previous"; do
+    if exists "$published" && { [ -L "$published" ] || [ ! -f "$published" ]; }; then
+        fail "$published is not a file this installer made; remove it, then run this installer again"
+    fi
+done
+PRIOR_AGENT=0
+if [ -f "$AGENT_PLIST" ]; then
+    cp "$AGENT_PLIST" "$AGENT_PRIOR" \
+        || fail 'cannot keep a copy of the login item; the installation was not changed'
+    PRIOR_AGENT=1
+fi
+TREE=kept
+put_back_link() { # LINK PRIOR-TARGET
+    if [ -n "$2" ]; then
+        [ -L "$1" ] && [ "$(readlink "$1")" = "$2" ] && return 0
+        rm -f "$1" && ln -s "$2" "$1"
+    elif [ -L "$1" ]; then
+        rm -f "$1"
+    fi
+}
+roll_back() {
+    # Committed once the staged record of the kept version was published.
+    [ "$PUBLISHING" -eq 1 ] && exists "$STAGE/previous" || return 0
+    ok=1
+    # Only a published login item consumed the staged one.
+    if ! exists "$AGENT_NEW"; then
+        if [ "$PRIOR_AGENT" -eq 1 ]; then
+            mv -f "$AGENT_PRIOR" "$AGENT_PLIST" || ok=0
+        else
+            rm -f "$AGENT_PLIST" || ok=0
+        fi
+    fi
+    put_back_link "$APP_LINK" "$PRIOR_APP_LINK" || ok=0
+    put_back_link "$BIN_LINK" "$PRIOR_BIN_LINK" || ok=0
+    if [ "$APP_CHANGED" -eq 1 ]; then
+        # The staged bundle is gone once it was moved into place; the one it
+        # replaced is in the stage once it was moved aside.
+        exists "$STAGE/Cagents.app" || rm -rf "$APP" || ok=0
+        if exists "$STAGE/Cagents.app.prior"; then
+            if exists "$APP"; then ok=0; else mv "$STAGE/Cagents.app.prior" "$APP" || ok=0; fi
+        fi
+    fi
+    if [ -n "$PRIOR_CURRENT" ]; then
+        if [ "$(readlink "$PREFIX/current" 2>/dev/null || :)" != "$PRIOR_CURRENT" ]; then
+            { rm -f "$PREFIX/.current.$$" \
+                && ln -s "$PRIOR_CURRENT" "$PREFIX/.current.$$" \
+                && mv -fh "$PREFIX/.current.$$" "$PREFIX/current"; } || ok=0
+        fi
+    elif [ -L "$PREFIX/current" ]; then
+        rm -f "$PREFIX/current" || ok=0
+    fi
+    # The unpacked release is gone from the stage once it was moved into
+    # place; the tree it replaced is in the stage once it was set aside.
+    if [ "$TREE" != kept ] && ! exists "$NEW"; then
+        rm -rf "$TARGET_DIR" || ok=0
+    fi
+    if [ "$TREE" = replacing ] && exists "$STAGE/replaced"; then
+        if exists "$TARGET_DIR"; then ok=0; else mv "$STAGE/replaced" "$TARGET_DIR" || ok=0; fi
+    fi
+    if [ "$ok" -eq 1 ]; then
+        note 'rolled back; the previous installation is unchanged'
+    else
+        STAGE_KEPT=1
+        note "could not fully roll back; the files this install replaced are in $STAGE"
+        ! exists "$AGENT_PRIOR" || note "and the login item it replaced is $AGENT_PRIOR"
+    fi
+}
+PUBLISHING=1
+
+if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
+    # This release again, as a repair or a return to the version kept for
+    # rollback: keep the tree when it is the release's, or replace it whole.
+    # A process running from the old tree keeps the files it has open.
+    if [ -L "$TARGET_DIR" ] || ! diff -rq "$NEW" "$TARGET_DIR" >/dev/null 2>&1; then
+        TREE=replacing
+        mv "$TARGET_DIR" "$STAGE/replaced" || fail 'cannot set aside the version tree it replaces'
+        mv "$NEW" "$TARGET_DIR" || fail 'cannot move the release into place'
+    fi
+else
+    TREE=added
+    mv "$NEW" "$TARGET_DIR" || fail 'cannot move the release into place'
+fi
+# Ready means every program answers from where it will run.
+for program in cagents cagentsd cagents-ui cagents-dictate; do
+    [ "$("$TARGET_DIR/bin/$program" --version 2>/dev/null)" = "$program $VERSION" ] \
+        || fail "the installed $program does not run"
+done
+
+{ rm -f "$PREFIX/.current.$$" && ln -s "versions/$VERSION" "$PREFIX/.current.$$" \
+    && mv -fh "$PREFIX/.current.$$" "$PREFIX/current"; } || fail 'cannot select the new version'
+if [ "$APP_CHANGED" -eq 1 ]; then
+    if [ -e "$APP" ] || [ -L "$APP" ]; then
+        mv "$APP" "$STAGE/Cagents.app.prior" || fail 'cannot replace Cagents.app'
+    fi
+    mv "$STAGE/Cagents.app" "$APP" || fail 'cannot replace Cagents.app'
+fi
+link() {
+    if [ -L "$2" ]; then
+        rm -f "$2" || return 1
+    elif [ -e "$2" ]; then
+        note "kept the existing $2; it is not a link this installer made"
+        return 0
+    fi
+    ln -s "$1" "$2"
+}
+link "$APP" "$APP_LINK" || fail "cannot link $APP_LINK"
+link "$PREFIX/current/bin/cagents" "$BIN_LINK" || fail "cannot link $BIN_LINK"
+mv -f "$AGENT_NEW" "$AGENT_PLIST" || fail 'cannot install the login item'
+# The commit.
+mv -f "$STAGE/previous" "$PREFIX/.previous" || fail 'cannot record the version kept for rollback'
+[ "$APP_CHANGED" -eq 0 ] || register_app -f "$APP"
+
 DAEMON_STARTED=0
 if [ "$START" -eq 1 ]; then
     # A job loaded from an earlier install would keep its old definition.
     unload_agent
-    if launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" 2>/dev/null; then
-        # RunAtLoad starts the daemon now; wait briefly to report it.
+    # launchd runs a job in the account's own environment, so the login item
+    # of a private HOME would start a daemon serving the account's data, and
+    # its label is the account's. Such an installation starts its daemon
+    # here, in this environment, and leaves the login item unloaded.
+    attempt=20
+    if ! own_home; then
+        if "$TARGET_DIR/bin/cagents" daemon start >/dev/null 2>&1; then
+            attempt=0
+        else
+            note 'could not start the daemon; it will start when you open cagents'
+        fi
+    elif launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" 2>/dev/null; then
         attempt=0
-        while [ "$attempt" -lt 20 ]; do
-            if [ -n "$(running_daemon "$TARGET_DIR/bin/cagents" 2>/dev/null)" ]; then
-                DAEMON_STARTED=1
-                break
-            fi
-            attempt=$((attempt + 1))
-            sleep 1
-        done
     else
         note 'could not load the login item now; the daemon will start at your next login'
     fi
+    # RunAtLoad starts the daemon now; wait briefly to report it.
+    while [ "$attempt" -lt 20 ]; do
+        if [ -n "$(running_daemon "$TARGET_DIR/bin/cagents" 2>/dev/null)" ]; then
+            DAEMON_STARTED=1
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
 fi
 
 # Keep the served version and the one it replaced, for rollback; remove
