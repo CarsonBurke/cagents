@@ -207,12 +207,17 @@ build_commit() {
 
 CANDIDATE=$PREFIX/versions/$VERSION
 STAGED_MARKER=$CANDIDATE/.cagents-local-candidate-v1
+STAGED_SOURCE=
+if [[ -f $STAGED_MARKER && ! -L $STAGED_MARKER && -O $STAGED_MARKER ]]; then
+    STAGED_SOURCE=$(<"$STAGED_MARKER")
+fi
+SELECTED=$(readlink -f -- "$PREFIX/current" || :)
 FRESH_INSTALL=0
 if [[ $PREFIX/current -ef $CANDIDATE ]]; then
     printf '%s is already current; skipping the build.\n' "$VERSION"
-elif [[ -f $STAGED_MARKER && ! -L $STAGED_MARKER && -O $STAGED_MARKER ]]; then
+elif [[ -n $STAGED_SOURCE && $STAGED_SOURCE == "${SELECTED##*/}" ]]; then
     printf '%s is already staged; skipping the build.\n' "$VERSION"
-elif [[ -e $CANDIDATE ]]; then
+elif [[ -e $CANDIDATE && -z $STAGED_SOURCE ]]; then
     fail "$CANDIDATE exists but is not a staged build"
 else
     if [[ -z $BUILD_HOST ]]; then

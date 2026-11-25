@@ -2753,7 +2753,9 @@ code is recompiled. The new build's `cagents daemon upgrade` shows the
 affected sessions and asks before replacing anything. The public `cagents`
 command keeps serving the current installation until the replacement daemon
 is ready. `--stage-only` stops after staging and prints the command to
-finish later. Rerunning the script for the same staged build reuses it.
+finish later. Rerunning the script for the same staged build reuses it. If
+another update changed the source, the installer verifies the archive again
+before staging it over the newer installation.
 A source daemon whose protocol live updates do
 not start from is refused before anything changes; follow the cold
 installation the refusal describes.

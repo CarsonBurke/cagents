@@ -439,6 +439,57 @@ class InstallerCoordinator(unittest.TestCase):
         self.assertEqual((self.prefix / 'current').readlink(), Path(f'versions/{VERSION}'))
         self.assertFalse((self.prefix / 'current/.cagents-local-candidate-v1').exists())
         self.assertTrue((self.home / '.local/bin/cagents').is_file())
+        self.assertIn('The terminal service starts when you open cagents.', staged.stdout)
+        self.assertNotIn('daemon upgrade', staged.stdout)
+
+    def test_a_stale_private_stage_revalidates_before_it_binds_to_another_source(self):
+        self.installed_cli(guarded=True, version='9.9.7')
+        self.assertEqual(self.install('--stage-for-upgrade').returncode, 0)
+        candidate = self.prefix / 'versions' / VERSION
+        cli = candidate / 'bin/cagents'
+        source = candidate / '.cagents-local-candidate-v1'
+        originally = cli.stat()
+        old = self.prefix / 'versions/9.9.7'
+        new = self.prefix / 'versions/9.9.8'
+        shutil.copytree(old, new)
+        (self.prefix / 'current').unlink()
+        (self.prefix / 'current').symlink_to('versions/9.9.8')
+        accepted = self.install('--stage-for-upgrade')
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        self.assertEqual(source.read_text(), '9.9.8\n')
+        self.assertTrue(os.path.samestat(originally, cli.stat()))
+        cli.write_text('changed locally\n')
+        refused = self.install('--stage-for-upgrade')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('the prepared candidate contents changed', refused.stderr)
+        self.assertEqual(source.read_text(), '9.9.8\n')
+        self.assertEqual((self.prefix / 'current').readlink(), Path('versions/9.9.8'))
+
+    def test_private_stage_prunes_obsolete_builds_and_keeps_its_rollback_source(self):
+        active = self.installed_cli(guarded=True, version='9.9.8').parent
+        self.write(active / '.cagents-local-source-v1', '9.9.7\n')
+        (active / '.cagents-local-source-v1').chmod(0o600)
+        versions = self.prefix / 'versions'
+        for version in ['9.9.7', '9.9.6', '9.9.5', '9.9.4']:
+            shutil.copytree(self.payload, versions / version)
+        expired = versions / '9.9.5/.cagents-local-candidate-v1'
+        self.write(expired, '9.9.4\n')
+        old = time.time() - 16 * 86400
+        os.utime(expired, (old, old))
+        self.write(versions / '9.9.4/.cagents-local-candidate-v1', '9.9.7\n')
+        staged = self.install('--stage-for-upgrade')
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assertEqual({root.name for root in versions.iterdir()},
+                         {'9.9.4', '9.9.7', '9.9.8', VERSION})
+
+    def test_private_stage_with_an_optional_new_editor_keeps_the_existing_cli(self):
+        previous = self.installed_cli(guarded=True, version='9.9.8')
+        self.add_editor_to_archive()
+        result = self.install('--stage-for-upgrade')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.managed_link('bin/cagents').resolve(), previous / 'cagents')
+        self.assertTrue(os.access(self.managed_link('bin/cagents'), os.X_OK))
+        self.assertTrue((self.prefix / 'versions' / VERSION / 'bin/ceditor').is_file())
 
     def test_install_defers_pruning_when_a_live_cagents_executable_cannot_be_read(self):
         self.installed_cli(guarded=True)

@@ -53,6 +53,35 @@ fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
     assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn local_startup_reports_ready_only_after_public_selection() {
+    let host = Arc::new(HostLock::new(test_host()));
+    let mut state = host.lock().unwrap();
+    state.publishing_startup = true;
+    assert_eq!(
+        state.startup_state_before_publication(),
+        StartupState::Ready
+    );
+    assert_eq!(
+        state.startup_state(),
+        StartupState::Restoring { awaiting: 0 }
+    );
+    assert_eq!(state.startup_recovery(), None);
+    assert!(state.startup_blocks_shutdown());
+    state.publishing_startup = false;
+    assert_eq!(state.startup_state(), StartupState::Ready);
+    assert!(!state.startup_blocks_shutdown());
+    state.publishing_startup = true;
+    state.retain_startup_recovery("Original work remains retained".into());
+    let retained = StartupState::Retained {
+        detail: "Original work remains retained".into(),
+    };
+    assert_eq!(state.startup_state(), retained);
+    state.publishing_startup = false;
+    assert_eq!(state.startup_state(), retained);
+}
+
 #[test]
 fn terminal_spawn_accepts_byte_budgets_and_refuses_over_limit_before_spawn() {
     assert_eq!(

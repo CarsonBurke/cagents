@@ -4,6 +4,7 @@ use super::*;
 const DAEMON_BINARY: &str = "cagentsd";
 const BINARIES: [&str; 3] = ["cagents", "cagents-ui", DAEMON_BINARY];
 pub(super) const LOCAL_STAGE_MARKER: &str = ".cagents-local-candidate-v1";
+const LOCAL_SOURCE_MARKER: &str = ".cagents-local-source-v1";
 
 #[derive(PartialEq, Eq)]
 pub(super) struct Selection {
@@ -12,6 +13,9 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    pub(super) fn previous_link(&self) -> Option<&Path> {
+        self.previous_link.as_deref()
+    }
     pub(super) fn capture(candidate: &InstallLayout) -> Result<Self, UpdateError> {
         let current = served_version_root(candidate)?;
         if current == candidate.version_root {
@@ -64,13 +68,44 @@ pub(super) fn complete_selection(
 ) -> Result<(), UpdateError> {
     if let Some(switch) = switch {
         switch.commit()?;
-        match fs::remove_file(candidate.version_root.join(LOCAL_STAGE_MARKER)) {
+        match fs::rename(
+            candidate.version_root.join(LOCAL_STAGE_MARKER),
+            candidate.version_root.join(LOCAL_SOURCE_MARKER),
+        ) {
             Ok(()) => (),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => eprintln!("Could not retire the local staging marker: {error}"),
         }
     }
     Ok(())
+}
+
+/// Owned by the exact standby before it accepts the source's terminal lease.
+#[cfg(all(target_os = "linux", feature = "host"))]
+pub struct LocalPublication {
+    switch: crate::install_guard::CurrentExchange,
+    candidate: InstallLayout,
+}
+
+#[cfg(all(target_os = "linux", feature = "host"))]
+impl LocalPublication {
+    pub(crate) fn prepare(expected: &Path) -> Result<Self, UpdateError> {
+        let candidate = locate(&crate::process::current_executable()?)?;
+        let selection = Selection::capture(&candidate)?;
+        if selection.previous_link.as_deref() != Some(expected)
+            || candidate.version != crate::version()
+        {
+            return Err(invalid("The standby's staged source no longer matches"));
+        }
+        let switch = selection
+            .prepare(&candidate)?
+            .ok_or_else(|| invalid("The standby's local build is already selected"))?;
+        Ok(Self { switch, candidate })
+    }
+
+    pub fn publish(self) -> Result<(), UpdateError> {
+        complete_selection(Some(self.switch), &self.candidate)
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -250,15 +285,24 @@ pub(super) fn perform(
         }
     }
     confirmation::check_cancelled(state, job)?;
-    let switch = selection.prepare(&layout)?;
     #[cfg(target_os = "linux")]
-    let mut standby = confirmed
-        .replaces_daemon
+    let parks_successor = confirmed.replaces_daemon
+        || (selection.previous_link.is_some() && confirmed.daemon.is_none());
+    #[cfg(not(target_os = "linux"))]
+    let parks_successor = false;
+    let switch = if parks_successor {
+        None
+    } else {
+        selection.prepare(&layout)?
+    };
+    #[cfg(target_os = "linux")]
+    let mut standby = parks_successor
         .then(|| {
             crate::daemon::standby::Parked::launch(
                 &root.join("bin").join(DAEMON_BINARY),
                 before.daemon_inode(),
                 &guard,
+                selection.previous_link.as_deref(),
             )
         })
         .transpose()
@@ -270,6 +314,17 @@ pub(super) fn perform(
         return Err(invalid(
             "The installed application changed before the replacement could start",
         ));
+    }
+    #[cfg(target_os = "linux")]
+    if standby.is_some() && confirmed.daemon.is_none() {
+        let paths =
+            crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
+        let lease = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
+            .map_err(|error| invalid(error.to_string()))?
+            .ok_or_else(|| {
+                invalid("The terminal service started before the update could replace it")
+            })?;
+        *handoff = Some(lease);
     }
     let mut startup_attempted = false;
     let mut startup_owned = false;
@@ -298,6 +353,9 @@ pub(super) fn perform(
         #[cfg(target_os = "linux")]
         if let Some(standby) = standby.as_mut() {
             standby.check_running()?;
+            if Selection::capture(&layout)? != selection {
+                return Err(invalid("The public installation changed before handoff"));
+            }
         }
         recovery.shutdown_requested = confirmed.replaces_daemon;
         floor::quiesce(
@@ -406,7 +464,9 @@ pub(super) fn perform(
     // unsuccessful transaction and reopening the old application.
     #[cfg(target_os = "linux")]
     drop(standby);
-    if result.is_ok() {
+    if result.is_ok() && parks_successor && selection.previous_link.is_some() {
+        result = selected_candidate(&layout.prefix, root);
+    } else if result.is_ok() {
         result = complete_selection(switch, &layout);
     }
     announce_primary_failure(&result);
@@ -593,7 +653,7 @@ pub(super) fn restore_current(
 
 /// Listening is not proof that startup restored the reviewed panes. Recovery
 /// deliberately serves inspection while ordinary conversation requests fail.
-fn confirm_daemon_ready(
+pub(super) fn confirm_daemon_ready(
     expected: &Path,
     pid: Option<u32>,
     timeout: Duration,
@@ -779,7 +839,7 @@ fn wait_for_daemon_start(
     })
 }
 
-fn report_overdue_startup(state: &Path, job: &mut UpdateJob) -> io::Result<()> {
+pub(super) fn report_overdue_startup(state: &Path, job: &mut UpdateJob) -> io::Result<()> {
     let persisted = set_phase(state, job, UpdatePhase::Installing, WAITING_FOR_STARTUP)
         .map_err(|error| io::Error::other(error.to_string()));
     // The captured stderr remains useful even if the status file cannot update.

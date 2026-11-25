@@ -125,6 +125,8 @@ class InstallLocalHead(unittest.TestCase):
         self.assertTrue(result.stdout.endswith("daemon\nupgrade\n--yes\n--interrupt\n"))
         self.assertEqual((prefix / "current").readlink(), Path("versions/source"))
         self.assertFalse(self.builds.exists())
+        (staged / ".cagents-local-candidate-v1").write_text("previous-source\n")
+        self.assert_built(self.run_script())
 
     def test_stale_detached_head_is_refused_with_the_update_command(self):
         stale = self.short()

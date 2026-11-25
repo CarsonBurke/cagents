@@ -50,11 +50,14 @@ pub(crate) fn run(
     guard.set_fallback_executable(ui.clone());
     let before = candidate_stamp(&layout.version_root)?;
     let local_stage = fs::symlink_metadata(layout.version_root.join(installed::LOCAL_STAGE_MARKER));
-    let switch = match local_stage {
-        Ok(_) => installed::Selection::capture(&layout)?.prepare(&layout)?,
+    let selection = match local_stage {
+        Ok(_) => Some(installed::Selection::capture(&layout)?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    let previous_link = selection
+        .as_ref()
+        .and_then(installed::Selection::previous_link);
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
     let settled = match verify(&pending, &daemon) {
@@ -69,6 +72,11 @@ pub(crate) fn run(
         Err(_) => false,
     };
     if settled {
+        let switch = selection
+            .as_ref()
+            .map(|selection| selection.prepare(&layout))
+            .transpose()?
+            .flatten();
         installed::complete_selection(switch, &layout)?;
         // A pre-existing UI may have ordinary restore policy. Close and reopen
         // it under the same guarded policy instead of merely activating it.
@@ -134,33 +142,58 @@ pub(crate) fn run(
                 "The selected candidate changed before recovery; nothing was started",
             ));
         }
-        if switch.is_none() {
+        #[cfg(target_os = "linux")]
+        let mut standby = previous_link
+            .map(|expected| {
+                let binary = fs::symlink_metadata(&daemon)?;
+                crate::daemon::standby::Parked::launch(
+                    &daemon,
+                    (binary.dev(), binary.ino()),
+                    &guard,
+                    Some(expected),
+                )
+            })
+            .transpose()?;
+        if previous_link.is_none() {
             select_target(&layout)?;
         }
         guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
-        let mut command = Command::new(&cli);
-        command
-            .args(["daemon", "start"])
-            .stdout(log.try_clone()?)
-            .stderr(log.try_clone()?);
-        crate::install_guard::sanitize_child_environment(&mut command);
-        unsafe {
-            command.pre_exec(crate::daemon::seal_inherited_descriptors);
+        #[cfg(target_os = "linux")]
+        let parked = standby.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let parked = false;
+        #[cfg(target_os = "linux")]
+        if let Some(standby) = standby.as_mut() {
+            standby.activate(&daemon, &handoff, Some(&receipt), timeout, || {
+                let _ = installed::report_overdue_startup(&state, &mut job);
+            })?;
+            installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout)?;
+            installed::selected_candidate(&layout.prefix, &layout.version_root)?;
         }
-        guard.inherit_for_install(&mut command)?;
-        handoff.inherit(&mut command)?;
-        // Receipt forwarding must remain last, after every descriptor remap.
-        receipt.inherit(&mut command)?;
-        crate::install_guard::wait_daemon_start(&mut command, timeout)
+        if !parked {
+            let mut command = Command::new(&cli);
+            command
+                .args(["daemon", "start"])
+                .stdout(log.try_clone()?)
+                .stderr(log.try_clone()?);
+            crate::install_guard::sanitize_child_environment(&mut command);
+            unsafe {
+                command.pre_exec(crate::daemon::seal_inherited_descriptors);
+            }
+            guard.inherit_for_install(&mut command)?;
+            handoff.inherit(&mut command)?;
+            // Receipt forwarding must remain last, after every descriptor remap.
+            receipt.inherit(&mut command)?;
+            crate::install_guard::wait_daemon_start(&mut command, timeout)
             .map_err(|failure| invalid(format!("Target recovery startup failed: {}. Its checkpoint and claim were preserved; inspect {} before another recovery attempt", failure.error, job.log_path.display())))?;
+        }
         // The host has settled and dropped its copies of the updater fences.
         // Keep our own continuous daemon reservation until verified service.
         let pending = PendingRecovery::inspect()
             .map_err(invalid)?
             .ok_or_else(|| invalid("The Prepared evidence disappeared after recovery"))?;
         let outcome = verify(&pending, &daemon)?;
-        installed::complete_selection(switch, &layout)?;
         receipt.release_daemon_reservation();
         Ok::<_, UpdateError>(outcome)
     })();

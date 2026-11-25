@@ -620,18 +620,26 @@ impl CurrentExchange {
         }
         let next = prefix.join(format!(".select.{}", uuid::Uuid::new_v4()));
         std::os::unix::fs::symlink(link, &next)?;
-        Ok(Self {
+        let prepared = Self {
             current,
             next,
             expected: expected.to_owned(),
             keep_next: false,
-        })
+        };
+        // Detect filesystems without atomic exchange before releasing the
+        // source. Both test links name the same version.
+        let probe = prefix.join(format!(".select-probe.{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(link, &probe)?;
+        let tested = prepared.swap(&probe);
+        let cleanup = std::fs::remove_file(&probe);
+        tested.and(cleanup)?;
+        Ok(prepared)
     }
 
-    fn swap(&self) -> io::Result<()> {
+    fn swap(&self, with: &Path) -> io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let from = std::ffi::CString::new(self.next.as_os_str().as_bytes())?;
-        let to = std::ffi::CString::new(self.current.as_os_str().as_bytes())?;
+        let to = std::ffi::CString::new(with.as_os_str().as_bytes())?;
         // SAFETY: both paths are NUL-terminated and outlive the call.
         #[cfg(target_os = "linux")]
         let exchanged = unsafe {
@@ -661,7 +669,7 @@ impl CurrentExchange {
     }
 
     pub(crate) fn commit(mut self) -> io::Result<()> {
-        self.swap().map_err(|error| {
+        self.swap(&self.current).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -672,7 +680,7 @@ impl CurrentExchange {
         })?;
         // The temporary name now holds the previous public pointer.
         if std::fs::read_link(&self.next).ok().as_deref() != Some(self.expected.as_path()) {
-            return Err(io::Error::other(match self.swap() {
+            return Err(io::Error::other(match self.swap(&self.current) {
                 Ok(()) => "current installation changed independently; the link observed during selection was restored".into(),
                 Err(error) => {
                     self.keep_next = true;
