@@ -557,7 +557,7 @@ fn ready(descriptor: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
 /// # Errors
 ///
 /// Returns the underlying error when the children cannot be listed.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) fn children_of(pid: u32) -> io::Result<Vec<u32>> {
     imp::children(pid)
 }
