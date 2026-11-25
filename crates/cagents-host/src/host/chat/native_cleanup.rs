@@ -217,7 +217,15 @@ fn close_retained_inner(
     };
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
-        let receipt = close_receipt(source, &proof, require_exact)?;
+        let receipt = match &pending {
+            Some(pending) => chat::native_holder::closed_source_for_owner(
+                source,
+                &proof,
+                &pending.owner.record,
+                require_exact,
+            ),
+            None => close_receipt(source, &proof, require_exact),
+        }?;
         let owner = match pending
             .as_ref()
             .map(|pending| pending.owner.record.clone())
@@ -233,7 +241,8 @@ fn close_retained_inner(
         };
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
-            retire_closed_execution(host, source, record, &proof, require_exact)?;
+            debug_assert_eq!(*record, owner);
+            retire_closed_execution(host, source, &owner, &proof, require_exact)?;
             return Ok(());
         }
         // A holder that died while its provider runs on can no longer be
@@ -339,15 +348,19 @@ fn close_retained_inner(
         // it, settled this close without a receipt, so there is none to
         // confirm. Its close stays pending until the loss is proved; an owner
         // still running keeps its record, which refuses the loss.
-        if pending.paired.is_none() && close_receipt(source, &proof, require_exact)?.is_none() {
+        let owned_receipt = chat::native_holder::closed_source_for_owner(
+            source,
+            &proof,
+            &pending.owner.record,
+            require_exact,
+        )?;
+        if pending.paired.is_none() && owned_receipt.is_none() {
             chat::native_holder::retire_abandoned(&pending.owner.record)?;
             return super::settle_lost_execution(host, source, &proof);
         }
         if let Some(pair) = &pending.paired {
             #[cfg(target_os = "macos")]
-            if !close_receipt(source, &proof, require_exact)?
-                .is_some_and(|(record, _)| record == pending.owner.record)
-            {
+            if owned_receipt.is_none() {
                 return Err(
                     "The native close receipt for the paired terminal is unavailable".into(),
                 );
@@ -514,8 +527,8 @@ fn retire_closed_execution(
         let crate::agent_execution::HostedSession::Chat(source) = source else {
             return Err("Retained execution ownership changed to another surface".into());
         };
-        if !close_receipt(&source, proof, require_exact)?
-            .is_some_and(|(record, paired_closed)| record == *owner && paired_closed)
+        if !chat::native_holder::closed_source_for_owner(&source, proof, owner, require_exact)?
+            .is_some_and(|(_, paired_closed)| paired_closed)
         {
             return Err("The current execution descriptor is not covered by this exact native teardown receipt".into());
         }

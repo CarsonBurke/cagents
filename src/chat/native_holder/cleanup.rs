@@ -344,6 +344,17 @@ pub fn closed_source_for_stop(
         .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
 }
 
+/// Restricts a retry to the holder captured before the first cleanup attempt.
+pub fn closed_source_for_owner(
+    source: &crate::chat::Session,
+    proof: &HostSessionProof,
+    owner: &Record,
+    require_exact: bool,
+) -> Result<Option<(Record, bool)>, String> {
+    Ok(find_source(source, proof, require_exact, Some(owner))?
+        .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
+}
+
 /// Retires `record` when it names an owner that has ended: its holder and
 /// provider are gone with everything in their process group and session. That
 /// is the evidence an abandoned retained actor gives, and discovery deletes
