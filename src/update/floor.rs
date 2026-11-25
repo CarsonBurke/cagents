@@ -251,6 +251,7 @@ trait FloorSource {
     ) -> Result<(), UpdateError> {
         Ok(())
     }
+    fn close_saved_windows(&mut self) -> Result<bool, UpdateError>;
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), source::PrepareError>;
     fn begin_interrupts(
         &mut self,
@@ -325,7 +326,7 @@ struct NativeSource<'a, O> {
     handoff: &'a mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &'a mut Survivors,
     reviewed: &'a impact::Preview,
-    guard: &'a crate::instance::UiUpdateGuard,
+    guard: &'a mut crate::instance::UiUpdateGuard,
     interrupts: Option<source::Interrupts>,
     interrupt_reviewed: Option<impact::DaemonImpact>,
     preparing_client: Option<source::Client>,
@@ -474,6 +475,11 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         }
         self.preparing_client = Some(client);
         Ok(())
+    }
+    fn close_saved_windows(&mut self) -> Result<bool, UpdateError> {
+        self.guard
+            .close_remaining_prepared_windows(Duration::from_secs(45))
+            .map_err(UpdateError::from)
     }
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), source::PrepareError> {
         let mut client = self.preparing_client.take().ok_or_else(|| {
@@ -663,7 +669,7 @@ pub(super) fn quiesce(
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut Survivors,
-    guard: &crate::instance::UiUpdateGuard,
+    guard: &mut crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
     let Some(initial) = &confirmed.daemon else {
         return Ok(());
@@ -831,10 +837,16 @@ fn quiesce_inner(
     // checkpoint. A refusal has not ended anything and precedes the one stop list.
     if !daemon.blocked() {
         source.begin_preparation(state, job, daemon)?;
+        // A mixed-protocol successor cannot start until the old windows
+        // release their leases. Prove that while the source still serves.
+        let drained_windows = source.close_saved_windows()?;
         confirmation::prepared(state, job)?;
         match source.prepare(daemon) {
             Ok(()) => return source.stopped(state, job, false),
             Err(source::PrepareError::Refused(error)) => {
+                if drained_windows {
+                    return Err(error);
+                }
                 confirmation::resume_cancellation(state, job)?;
                 eprintln!("The source could not checkpoint its work: {error}");
                 service = true;
