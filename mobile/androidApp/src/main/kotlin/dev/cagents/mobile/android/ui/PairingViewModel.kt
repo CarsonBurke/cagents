@@ -67,6 +67,9 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
     /** What to say when the camera is still on the code from before scanning again. */
     private var stillThere = ""
 
+    /** Why the code in view can't be used, said for as long as it is in view. */
+    private var codeHint: String? = null
+
     init {
         link?.let(::offered)
     }
@@ -82,6 +85,10 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
         if (_state.value != PairingState.Scanning) return
         when (seen.frame(text, SystemClock.elapsedRealtime())) {
             SeenCodes.Sighting.Nothing -> return
+            SeenCodes.Sighting.Same -> {
+                codeHint?.let(::showHint)
+                return
+            }
             SeenCodes.Sighting.StillThere -> {
                 showHint(stillThere)
                 return
@@ -89,14 +96,16 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
             SeenCodes.Sighting.New -> {}
         }
         val read = text ?: return
+        codeHint = null
         when (val parsed = PairingCode.parse(read, now())) {
             is PairingCode.Parsed.Code -> {
                 val confirm = confirmation(parsed.code, fromCamera = true)
                 if (confirm.warnings.any) _state.value = confirm else start(parsed.code)
             }
-            is PairingCode.Parsed.Invalid -> showHint(parsed.message)
-            PairingCode.Parsed.NotACode -> showHint("That isn't a cagents pairing code.")
+            is PairingCode.Parsed.Invalid -> codeHint = parsed.message
+            PairingCode.Parsed.NotACode -> codeHint = "That isn't a cagents pairing code."
         }
+        codeHint?.let(::showHint)
     }
 
     /**
@@ -158,7 +167,6 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
             } catch (e: Exception) {
                 PairOutcome.Failed("Couldn't pair: ${e.message ?: e::class.simpleName}")
             }
-            val retryable = now() <= code.expires + PairingCode.CLOCK_SKEW_SECONDS
             _state.value = when (outcome) {
                 is PairOutcome.Paired -> {
                     // Connect with the phone's own key to the computer just saved.
@@ -167,7 +175,12 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
                     PairingState.Paired(code)
                 }
                 PairOutcome.Declined -> PairingState.Declined(code)
-                is PairOutcome.Failed -> PairingState.Failed(outcome.message, code.takeIf { retryable })
+                is PairOutcome.Failed -> when {
+                    !outcome.retry -> PairingState.Failed(outcome.message)
+                    now() > code.expires + PairingCode.CLOCK_SKEW_SECONDS ->
+                        PairingState.Failed("${outcome.message} The code has expired meanwhile: show a new one on the computer.")
+                    else -> PairingState.Failed(outcome.message, code)
+                }
             }
         }
     }
@@ -178,10 +191,10 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
      * until it has looked away.
      */
     fun scanAgain() {
-        stillThere = if (_state.value is PairingState.Declined) {
-            "That code was used. Show a new one on the computer."
-        } else {
-            "That's the code from before. Point the camera away and back to use it again."
+        stillThere = when (val s = _state.value) {
+            is PairingState.Declined -> USED
+            is PairingState.Failed -> if (s.code == null) USED else AGAIN
+            else -> AGAIN
         }
         job?.cancel()
         job = null
@@ -208,5 +221,7 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
 
     private companion object {
         const val HINT_MILLIS = 4_000L
+        const val AGAIN = "That's the code from before. Point the camera away and back to use it again."
+        const val USED = "That code can't be used again. Show a new one on the computer."
     }
 }

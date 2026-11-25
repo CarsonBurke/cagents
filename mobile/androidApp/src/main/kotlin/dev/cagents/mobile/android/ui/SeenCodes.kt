@@ -9,11 +9,14 @@ package dev.cagents.mobile.android.ui
  */
 internal class SeenCodes(private val awayMillis: Long = 1_500) {
     enum class Sighting {
-        /** No code, or the one acted on, still in view since. */
+        /** No code. */
         Nothing,
 
         /** A code coming into view, to act on. */
         New,
+
+        /** The code acted on, still in view. */
+        Same,
 
         /** The code acted on before the last [resume], still in view. */
         StillThere,
@@ -38,7 +41,7 @@ internal class SeenCodes(private val awayMillis: Long = 1_500) {
         if (previous != null) {
             if (text == previous) {
                 seenAt = nowMillis
-                return if (before) Sighting.StillThere else Sighting.Nothing
+                return if (before) Sighting.StillThere else Sighting.Same
             }
             val seen = seenAt
             if (seen != null && nowMillis - seen >= awayMillis) {

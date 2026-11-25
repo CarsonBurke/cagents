@@ -17,8 +17,11 @@ sealed interface PairOutcome {
     /** The person chose not to allow the phone. */
     data object Declined : PairOutcome
 
-    /** Pairing didn't happen; [message] is written for the person. */
-    data class Failed(val message: String) : PairOutcome
+    /**
+     * Pairing didn't happen; [message] is written for the person. [retry]
+     * when the computer wasn't reached, so the same code may work later.
+     */
+    data class Failed(val message: String, val retry: Boolean = false) : PairOutcome
 }
 
 /**

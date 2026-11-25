@@ -46,7 +46,7 @@ class Pairing(
                 ),
             )
         } catch (e: ConnectFailure) {
-            return PairOutcome.Failed(e.message ?: "Couldn't reach ${code.name}.")
+            return PairOutcome.Failed(e.message ?: "Couldn't reach ${code.name}.", retry = e.retry)
         }
         val outcome = try {
             PairingExchange.pair(channel, key.openSshKey, withContext(Dispatchers.IO) { deviceName() }, onWaiting)

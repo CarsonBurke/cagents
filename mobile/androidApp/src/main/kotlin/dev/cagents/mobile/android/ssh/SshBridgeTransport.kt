@@ -157,7 +157,7 @@ internal suspend fun openSsh(target: SshTarget): LineChannel {
                 made = null
                 throw when (e) {
                     is CancellationException, is ConnectFailure -> e
-                    is Exception -> ConnectFailure.Network(describe(e, client.remoteHostname, target.port), e)
+                    is Exception -> ConnectFailure.Network(describeConnectFailure(e, client.remoteHostname, target.port), e)
                     else -> e
                 }
             }
@@ -186,10 +186,10 @@ private suspend fun connect(target: SshTarget, host: String): SSHClient {
         throw e
     } catch (e: TransportException) {
         client.disconnectQuietly()
-        throw verifier.failure ?: ConnectFailure.Network(describe(e, host, target.port), e)
+        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e)
     } catch (e: Exception) {
         client.disconnectQuietly()
-        throw ConnectFailure.Network(describe(e, host, target.port), e)
+        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e)
     }
     return client
 }
@@ -212,7 +212,7 @@ private fun SSHClient.disconnectQuietly() {
     runCatching { disconnect() }
 }
 
-internal fun describe(e: Throwable, host: String, port: Int): String {
+internal fun describeConnectFailure(e: Throwable, host: String, port: Int): String {
     val address = "$host:$port"
     // The first known kind in the chain: on Android a refused connection's
     // root cause is the system's ErrnoException, under a ConnectException.

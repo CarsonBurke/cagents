@@ -14,7 +14,7 @@ class SeenCodesTest {
         val seen = SeenCodes()
         assertEquals(Sighting.Nothing, seen.frame(null, 0))
         assertEquals(Sighting.New, seen.frame(code, 100))
-        for (t in 200L..5_000L step 100) assertEquals(Sighting.Nothing, seen.frame(code, t))
+        for (t in 200L..5_000L step 100) assertEquals(Sighting.Same, seen.frame(code, t))
     }
 
     @Test
@@ -47,7 +47,7 @@ class SeenCodesTest {
         assertEquals(Sighting.Nothing, seen.frame(null, 61_500))
         assertEquals(Sighting.Nothing, seen.frame(null, 62_600))
         assertEquals(Sighting.New, seen.frame(code, 62_700))
-        assertEquals(Sighting.Nothing, seen.frame(code, 62_800))
+        assertEquals(Sighting.Same, seen.frame(code, 62_800))
     }
 
     @Test
@@ -56,7 +56,7 @@ class SeenCodesTest {
         seen.frame(code, 0)
         seen.resume()
         assertEquals(Sighting.New, seen.frame(other, 60_000))
-        assertEquals(Sighting.Nothing, seen.frame(other, 60_100))
+        assertEquals(Sighting.Same, seen.frame(other, 60_100))
     }
 
     @Test
@@ -66,7 +66,8 @@ class SeenCodesTest {
         var t = 0L
         repeat(40) {
             t += 250
-            assertEquals(Sighting.Nothing, seen.frame(if (it % 3 == 0) null else code, t))
+            val inView = it % 3 != 0
+            assertEquals(if (inView) Sighting.Same else Sighting.Nothing, seen.frame(if (inView) code else null, t))
         }
     }
 
