@@ -139,6 +139,22 @@ impl Fixture {
         &self.source.owned_codex_listener.as_ref().unwrap().socket
     }
 
+    fn close_after_unproved_loss(&self) {
+        let result = close_retained_from_pane(&self.host, &self.source);
+        #[cfg(target_os = "linux")]
+        result.unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let refusal = result.unwrap_err();
+            assert!(
+                refusal.contains(LOST_EXECUTION_UNPROVED)
+                    || refusal.contains("Cannot confirm detached provider cleanup"),
+                "{refusal}"
+            );
+            assert!(self.socket().parent().unwrap().exists());
+        }
+    }
+
     /// A discovery record for this conversation's holder, as the holder writes
     /// it, naming `holder` and the provider `root`.
     fn record(&self, holder: registry::Process, root: registry::Process) -> Record {
@@ -287,7 +303,7 @@ fn exited(pid: i32) -> registry::Process {
 /// its record, so exact cleanup has nothing to adopt. Before, every Close was
 /// refused with "No exact native holder or confirmed close receipt is
 /// available" and the pane stayed open for good.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pane_whose_codex_owner_left_no_trace_closes() {
     let Some(root) = isolated("a_pane_whose_codex_owner_left_no_trace_closes") else {
@@ -304,7 +320,7 @@ fn a_pane_whose_codex_owner_left_no_trace_closes() {
 
 /// A holder that died with its provider: its record outlives both until
 /// discovery runs, and names nothing that could still be stopped.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pane_whose_holder_and_provider_both_exited_closes_and_retires_their_record() {
     let Some(root) =
@@ -450,7 +466,7 @@ fn a_start_holding_the_allocation_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().parent().unwrap().exists());
     drop(reservation);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
 }
 
 /// A terminal about to run Codex's CLI on the conversation launches a writer
@@ -508,7 +524,8 @@ fn a_terminal_spawning_codex_on_the_conversation_keeps_the_refusal() {
         .unwrap_err();
     assert!(refused.retryable, "{refused:?}");
     drop(closing);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
+    #[cfg(target_os = "linux")]
     fixture.assert_settled();
     // Once it closed, the terminal may resume the conversation.
     fixture
@@ -534,13 +551,17 @@ fn a_lost_execution_settles_only_under_its_close_claim() {
         let mut state = fixture.host.lock().unwrap();
         capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap()
     };
-    settle_lost_execution(&fixture.host, &fixture.source, &proof).unwrap();
+    let outcome = settle_lost_execution(&fixture.host, &fixture.source, &proof);
+    #[cfg(target_os = "linux")]
+    outcome.unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(outcome.unwrap_err().contains(LOST_EXECUTION_UNPROVED));
     drop(closing);
 }
 
 /// The state the report left: the same daemon, no record, no receipt, and the
 /// allocation itself already given back.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pane_whose_allocation_is_already_gone_closes() {
     let Some(root) = isolated("a_pane_whose_allocation_is_already_gone_closes") else {
@@ -564,14 +585,14 @@ fn a_process_naming_the_listener_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().parent().unwrap().exists());
     drop(named);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
 }
 
 /// A receipt shows how this terminal's owner closed another descriptor of
 /// its conversation. It proves nothing about this one either way, so this
 /// one's Close asks what can still run, as it would with no receipt: once
 /// nothing can, it closes, and the receipt stays for the close it confirms.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_receipt_for_another_descriptor_does_not_hold_the_close() {
     let Some(root) = isolated("a_receipt_for_another_descriptor_does_not_hold_the_close") else {
@@ -780,7 +801,7 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
     assert!(!record.holder.is_current() && !record.root.is_current());
 }
 
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pending_close_whose_owner_then_ended_closes() {
     let Some(root) = isolated("a_pending_close_whose_owner_then_ended_closes") else {
@@ -789,7 +810,7 @@ fn a_pending_close_whose_owner_then_ended_closes() {
     pending_close_whose_owner_then_ended(&root, false);
 }
 
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_released_close_whose_owner_then_ended_closes() {
     let Some(root) = isolated("a_released_close_whose_owner_then_ended_closes") else {
@@ -829,7 +850,8 @@ fn a_pending_close_whose_provider_outlived_its_holder_waits_for_it() {
     );
     assert!(has_native_owner(&fixture.source).unwrap());
     kill(&record.root);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
+    #[cfg(target_os = "linux")]
     fixture.assert_settled();
 }
 
@@ -990,7 +1012,8 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
         []
     );
     assert!(tool.reaped(), "ending left the tool running");
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
+    #[cfg(target_os = "linux")]
     fixture.assert_settled();
     assert!(!has_native_owner(&fixture.source).unwrap());
 }
@@ -1019,7 +1042,7 @@ fn a_conversation_whose_listener_is_served_does_not_reopen() {
 /// pane's inventory no longer lists it and Close goes to exact cleanup, which
 /// refused it with "No exact native holder or confirmed close receipt is
 /// available". The pane now closes, and the resident goes with it.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_finished_resident_whose_owner_ended_closes() {
     let Some(root) = isolated("a_finished_resident_whose_owner_ended_closes") else {
@@ -1119,7 +1142,7 @@ fn agent_closed(fixture: &Fixture, id: crate::model::AgentId) -> bool {
 /// Nothing settled it: the lost-owner proof refused any conversation an
 /// agent claimed, and the agent's own close found no receipt either. Its
 /// Close now ends the agent with the pane.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_lost_codex_agents_pane_closes_and_ends_the_agent() {
     let Some(root) = isolated("a_lost_codex_agents_pane_closes_and_ends_the_agent") else {
@@ -1135,7 +1158,7 @@ fn a_lost_codex_agents_pane_closes_and_ends_the_agent() {
 }
 
 /// `cagents agent close` takes the same route for that agent.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_lost_codex_agent_closes_by_command() {
     let Some(root) = isolated("a_lost_codex_agent_closes_by_command") else {
@@ -1382,7 +1405,7 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
     assert_codex_started(&fixture, &root);
 }
 
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_legacy_pane_without_a_surviving_process_starts() {
     let Some(root) = isolated("codex_start_legacy_pane_without_a_surviving_process_starts") else {
@@ -1410,7 +1433,7 @@ fn codex_start_earlier_boot_legacy_pane_starts() {
     assert_codex_started(&fixture, &root);
 }
 
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_legacy_pane_with_an_ended_holder_record_starts() {
     let Some(root) = isolated("codex_start_legacy_pane_with_an_ended_holder_record_starts") else {
@@ -1427,7 +1450,7 @@ fn codex_start_legacy_pane_with_an_ended_holder_record_starts() {
     assert_codex_started(&fixture, &root);
 }
 
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_paired_console_without_surviving_execution_starts() {
     let Some(root) = isolated("codex_start_paired_console_without_surviving_execution_starts")
@@ -1450,7 +1473,7 @@ fn codex_start_paired_console_without_surviving_execution_starts() {
 /// Reopening a conversation whose pane closed after losing its owner: that
 /// owner left no receipt, and the old refusal asked the user to restore the
 /// pane they had just closed and close it again. It reopens, and starts.
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_picker_resume_of_an_ended_pane_starts() {
     let Some(root) = isolated("codex_picker_resume_of_an_ended_pane_starts") else {
@@ -1568,7 +1591,7 @@ fn codex_picker_reports_unreadable_console_evidence() {
     assert!(!root.join("started-argv").exists());
 }
 
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_legacy_equals_endpoint_without_survivors_starts() {
     let Some(root) = isolated("codex_start_legacy_equals_endpoint_without_survivors_starts") else {
@@ -1833,7 +1856,7 @@ fn codex_picker_resume_refuses_a_live_terminals_recorded_conversation() {
     assert_codex_started(&fixture, &root);
 }
 
-#[cfg(target_os = "linux")] // The same-boot proof relies on complete subreaper custody.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_ignores_an_ordinary_process_merely_mentioning_the_listener() {
     let Some(root) =
