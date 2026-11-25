@@ -6851,7 +6851,8 @@ mod tests {
     }
 
     fn fixture() -> (Registry, tempfile::TempDir, Submit) {
-        let directory = tempfile::tempdir().unwrap();
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let directory = tempfile::tempdir_in(parent).unwrap();
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         let repository = directory.path().to_owned();
         registry
