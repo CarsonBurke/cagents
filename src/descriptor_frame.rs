@@ -21,8 +21,20 @@ const RECEIVE_CLOEXEC: libc::c_int = libc::MSG_CMSG_CLOEXEC;
 #[cfg(target_os = "macos")]
 const RECEIVE_CLOEXEC: libc::c_int = 0;
 
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+#[cfg(target_os = "macos")]
+const SEND_FLAGS: libc::c_int = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL | DARWIN_MSG_NBIO;
+/// XNU's send-buffer capacity check uses MSG_NBIO from socket_private.h.
+/// MSG_DONTWAIT only prevents waiting for its buffer lock. Pass both so an
+/// attached stream can keep its shared descriptor flags and timeouts.
+#[cfg(target_os = "macos")]
+const DARWIN_MSG_NBIO: libc::c_int = 0x20000;
+
 // Linux's SCM_MAX_FD. Receive enough space to own and close excess rights even
-// when a caller permits fewer. MSG_CTRUNC is still an error, never a partial set.
+// when a caller permits fewer. On Darwin sockargs limits control data to one
+// cluster even after expanding descriptor numbers to pointers. Use the full
+// buffer there: XNU installs rights before copying out ancillary bytes.
 const MAX_RIGHTS: usize = 253;
 const CONTROL_WORDS: usize = 256;
 // Linux UAPI SCM_PIDFD (not yet exported by our libc version). We reject this
@@ -187,13 +199,9 @@ pub(crate) fn send_json_with_fds_until(
                 }
             }
         }
-        let count = unsafe {
-            libc::sendmsg(
-                control.as_raw_fd(),
-                &message,
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
+        // SAFETY: the socket, frame and any aligned ancillary bytes remain
+        // valid for this call.
+        let count = unsafe { libc::sendmsg(control.as_raw_fd(), &message, SEND_FLAGS) };
         if count < 0 {
             let error = io::Error::last_os_error();
             match error.kind() {
@@ -549,11 +557,21 @@ mod tests {
                 (received.dev(), received.ino()),
                 (identity.dev(), identity.ino())
             );
-            assert_eq!(
-                std::fs::read_to_string(format!("/proc/self/fd/{}/identity", file.as_raw_fd()))
-                    .unwrap(),
-                "original"
-            );
+            // SAFETY: file is the retained directory and the name is a
+            // literal relative path. A successful open returns a fresh fd.
+            let identity_fd = unsafe {
+                libc::openat(
+                    file.as_raw_fd(),
+                    c"identity".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(identity_fd >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: the successful open transferred ownership to this test.
+            let mut identity_file = unsafe { File::from_raw_fd(identity_fd) };
+            let mut contents = String::new();
+            std::io::Read::read_to_string(&mut identity_file, &mut contents).unwrap();
+            assert_eq!(contents, "original");
             assert_ne!(
                 unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
                 0
@@ -661,6 +679,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // XNU installs even fd numbers lost to a short control buffer.
     fn truncated_or_unexpected_ancillary_closes_installed_rights() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let (reader, writer) = pipe();
