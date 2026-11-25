@@ -1663,9 +1663,6 @@ fn canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignore
     exercise_canonical_upgrade(false, true);
 }
 
-// Darwin's Unix sockets can still accept a peer write after a read-only
-// shutdown; this fixture requires Linux's immediate broken-pipe signal.
-#[cfg(target_os = "linux")]
 #[test]
 fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission() {
     if isolated("an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission") {
@@ -1717,7 +1714,13 @@ fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admissio
         canonical: canonical.clone(),
         refuse_lineage: false,
     }));
-    for close_reader in [true, false] {
+    // Darwin can still accept a peer write after a read-only shutdown.
+    #[cfg(target_os = "linux")]
+    let scenarios = [true, false];
+    #[cfg(target_os = "macos")]
+    let scenarios = [false];
+    let mut cancellations = 0;
+    for close_reader in scenarios {
         let mut stream =
             UnixStream::connect(crate::terminal_ipc::daemon_socket_path().unwrap()).unwrap();
         stream
@@ -1778,6 +1781,7 @@ fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admissio
             // Keep the write half live so the real server receives the whole
             // request after its peer has already stopped accepting replies.
             stream.shutdown(Shutdown::Read).unwrap();
+            cancellations += 1;
             write_frame(
                 &mut stream,
                 &ClientEnvelope {
@@ -1801,10 +1805,13 @@ fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admissio
                 ServerResponse::Accepted
             ));
         }
-        assert_eq!(daemon.visibility_cancellations.load(Ordering::Acquire), 1);
+        assert_eq!(
+            daemon.visibility_cancellations.load(Ordering::Acquire),
+            cancellations
+        );
     }
-    assert_eq!(daemon.resolutions(), vec![source.clone(), source]);
-    assert_eq!(daemon.requests(), vec![canonical.clone(), canonical]);
+    assert_eq!(daemon.resolutions(), vec![source; scenarios.len()]);
+    assert_eq!(daemon.requests(), vec![canonical; scenarios.len()]);
     assert!(matches!(
         daemon.visibility_canceled.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
