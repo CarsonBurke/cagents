@@ -138,9 +138,8 @@ pub enum Action {
     ShowSession(crate::model::TerminalId),
     CopyDetails,
     CancelApply,
-    /// From the waiting update's popover: review interrupting the
-    /// conversations it still waits for, to update now.
-    InterruptWaiting,
+    /// Apply the waiting update with the interruption impact shown in its popover.
+    InterruptWaiting(String),
     /// From the waiting update's popover: give up on the update.
     CancelWaiting,
     StartApply,
@@ -472,18 +471,6 @@ impl IdleWait<'_> {
             .collect()
     }
 
-    /// Whether interrupting is a choice still open: the wait is for idle,
-    /// not for a delivery that interrupting cannot hurry.
-    fn can_interrupt(&self) -> bool {
-        self.confirmation.stop.is_none()
-            && self
-                .confirmation
-                .preview
-                .daemon
-                .as_ref()
-                .is_some_and(|daemon| daemon.policy == crate::update::impact::Policy::WhenIdle)
-    }
-
     /// The header's compact account, which stays readable at a glance.
     fn label(&self) -> String {
         match self.remaining().len() {
@@ -591,20 +578,33 @@ impl Cagents {
         let Some(confirmation) = self.update_ui.confirmation.take() else {
             return Task::none();
         };
+        self.submit_update_choice(confirmation.nonce, choice)
+    }
+
+    fn submit_update_choice(
+        &mut self,
+        nonce: String,
+        choice: crate::update::UpdateChoice,
+    ) -> Task<Message> {
         let Some(job) = &self.update_ui.job else {
             return Task::none();
         };
         let id = job.id.clone();
-        self.update_ui.submitted_confirmation = Some(confirmation.nonce.clone());
+        self.update_ui.submitted_confirmation = Some(nonce.clone());
         cosmic::task::future(async move {
             let expected_job = id.clone();
-            let expected_nonce = confirmation.nonce.clone();
+            let expected_nonce = nonce.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::update::decide(&id, &confirmation.nonce, choice)
-                    .map_err(|error| error.to_string())
+                use crate::update::UpdateError;
+                crate::update::decide(&id, &nonce, choice).map_err(|error| match error {
+                    UpdateError::DecisionExpired | UpdateError::DecisionAlreadySubmitted => {
+                        error.to_string()
+                    }
+                    _ => format!("Could not send your update choice. {error}"),
+                })
             })
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("Could not send your update choice. {error}"))
             .and_then(|result| result);
             Message::UpdateUi(Action::Decided {
                 job: expected_job,
@@ -1094,8 +1094,7 @@ impl Cagents {
         )
     }
 
-    /// Who the update still waits for, live, and the two ways out of the
-    /// wait: review interrupting them to update now, or give the update up.
+    /// Who the update still waits for and what updating now would interrupt.
     fn waiting_popover(&self, wait: &IdleWait<'_>) -> Element<'_, Message> {
         let remaining = wait.remaining();
         let heading = widget::row::with_children(vec![
@@ -1165,13 +1164,17 @@ impl Cagents {
                 .into(),
             iced::widget::Space::new().width(Length::Fill).into(),
         ];
-        if wait.can_interrupt() && !wait.remaining().is_empty() {
-            // The interruption review that follows names what stops; nothing
-            // is interrupted until it is confirmed there.
+        if let Some((conversations, subagents)) = interruptions_available(wait.confirmation) {
+            body.push(notice_body(interruption_choice_summary(
+                conversations,
+                subagents,
+            )));
             actions.push(
-                crate::ui_controls::button::primary("Update now…")
+                crate::ui_controls::button::primary("Update now")
                     .id(widget::Id::new(WAITING_NOW_ID))
-                    .on_press(Message::UpdateUi(Action::InterruptWaiting))
+                    .on_press(Message::UpdateUi(Action::InterruptWaiting(
+                        wait.confirmation.nonce.clone(),
+                    )))
                     .into(),
             );
         }
@@ -1202,21 +1205,10 @@ impl Cagents {
                 .map(|(id, _, _)| Cow::Owned(waiting_show_id(*id))),
         );
         ring.push(Cow::Borrowed(WAITING_CANCEL_ID));
-        if wait.can_interrupt() && !remaining.is_empty() {
+        if interruptions_available(wait.confirmation).is_some() {
             ring.push(Cow::Borrowed(WAITING_NOW_ID));
         }
         ring
-    }
-
-    /// Answers the waiting update's popover with `choice`, against the
-    /// review the person already confirmed.
-    fn decide_waiting(&mut self, choice: crate::update::UpdateChoice) -> Task<Message> {
-        let Some(confirmation) = self.idle_wait().map(|wait| wait.confirmation.clone()) else {
-            return Task::none();
-        };
-        self.chrome_ui.close();
-        self.update_ui.confirmation = Some(confirmation);
-        self.decide_update(choice)
     }
 
     pub(super) fn update_control(&self) -> Option<Element<'_, Message>> {
@@ -1531,10 +1523,27 @@ impl Cagents {
                 self.confirm_update(nonce, crate::update::UpdateChoice::InterruptNow)
             }
             Action::CancelApply => self.decide_update(crate::update::UpdateChoice::Cancel),
-            Action::InterruptWaiting => self.decide_waiting(crate::update::UpdateChoice::Policy(
-                crate::update::impact::Policy::Interrupt,
-            )),
-            Action::CancelWaiting => self.decide_waiting(crate::update::UpdateChoice::Cancel),
+            Action::InterruptWaiting(nonce) => {
+                if !self.idle_wait().is_some_and(|wait| {
+                    wait.confirmation.nonce == nonce
+                        && interruptions_available(wait.confirmation).is_some()
+                }) {
+                    self.status = Some(TransientNotice::warning(
+                        crate::update::UpdateError::DecisionExpired.to_string(),
+                    ));
+                    return Task::none();
+                }
+                self.chrome_ui.close();
+                self.submit_update_choice(nonce, crate::update::UpdateChoice::InterruptNow)
+            }
+            Action::CancelWaiting => {
+                let Some(nonce) = self.idle_wait().map(|wait| wait.confirmation.nonce.clone())
+                else {
+                    return Task::none();
+                };
+                self.chrome_ui.close();
+                self.submit_update_choice(nonce, crate::update::UpdateChoice::Cancel)
+            }
             Action::Decided { job, nonce, result } => {
                 if self
                     .update_ui
@@ -1547,13 +1556,7 @@ impl Cagents {
                 }
                 if let Err(error) = result {
                     self.update_ui.submitted_confirmation = None;
-                    // The next poll clears the header's error and may bring
-                    // back the review the choice was made on, so a notice is
-                    // what tells the person it didn't take.
-                    self.status = Some(TransientNotice::warning(format!(
-                        "The update didn't take that choice: {error}"
-                    )));
-                    self.update_ui.error = Some(error);
+                    self.status = Some(TransientNotice::warning(error));
                 }
                 self.apply_update_action(Action::Poll)
             }
@@ -2651,8 +2654,8 @@ pub(in crate::app) mod tests {
 
     /// After "Update when idle" the review goes away, and the header says the
     /// update is waiting and for how many. Its popover lists who remains,
-    /// shrinking as each goes idle, and offers updating now through the
-    /// interruption review or cancelling, without a modal over the work.
+    /// shrinking as each goes idle, and explains what updating now would
+    /// interrupt. Dismissing it leaves the approval in place.
     #[test]
     fn a_confirmed_idle_wait_stays_visible_and_offers_a_way_out() {
         use crate::update::impact::{Disposition, Policy};
@@ -2728,29 +2731,37 @@ pub(in crate::app) mod tests {
             ["ci"]
         );
 
-        // Updating now asks the worker for the interruption review, against
-        // the review already confirmed, and leaves the popover for it.
-        drop(app.update(Message::UpdateUi(Action::InterruptWaiting)));
+        drop(other.update(Message::ChromeUi(chrome_ui::Action::ToggleUpdate)));
+        drop(other.update(Message::ChromeUi(chrome_ui::Action::Close)));
+        assert!(!other.update_popup_is_open());
+        assert!(other.update_ui.submitted_confirmation.is_none());
+        assert!(other.idle_wait().is_some());
+
+        // The button submits the scope shown in the popover directly.
+        let (mut messages, _) = crate::app::dialog_ui::tests::key_control(
+            app.waiting_popover(&wait),
+            widget::Id::new(WAITING_NOW_ID),
+            crate::app::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+        );
+        assert!(matches!(messages.as_slice(),
+            [Message::UpdateUi(Action::InterruptWaiting(nonce))] if nonce == &confirmation.nonce
+        ));
+        drop(app.update(messages.pop().unwrap()));
         assert!(!app.update_popup_is_open());
         assert_eq!(
             app.update_ui.submitted_confirmation.as_ref(),
             Some(&confirmation.nonce)
         );
         assert!(app.update_ui.confirmation.is_none());
-        // A choice the worker refuses says so rather than vanishing with the
-        // next poll.
+        // A stale choice has a notice while the live job stays visible.
+        let notice = crate::update::UpdateError::DecisionExpired.to_string();
         drop(app.update_update_ui(Action::Decided {
             job: job.id.clone(),
             nonce: confirmation.nonce.clone(),
-            result: Err("This review expired".into()),
+            result: Err(notice.clone()),
         }));
-        assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message.contains("This review expired")),
-            "{:?}",
-            app.status.as_ref().map(|notice| &notice.message)
-        );
+        assert_eq!(app.status.as_ref().unwrap().message, notice);
+        assert!(app.update_ui.error.is_none());
 
         // The interruption review that follows updates now: its button
         // doesn't promise a wait, even for a delivery still on its way.

@@ -136,7 +136,7 @@ pub enum UpdateError {
     TargetRecoveryRequired(Box<recovery::TargetRecoveryRequired>),
     #[error("Update cancelled")]
     Cancelled,
-    #[error("Update preview changed or expired. Review the current preview.")]
+    #[error("The update changed before your choice could be applied.")]
     DecisionExpired,
     #[error("The update review already has an answer.")]
     DecisionAlreadySubmitted,
