@@ -2375,31 +2375,34 @@ fn fresh_omp_activity_does_not_require_a_resumable_session() {
         ]),
     });
     let deadline = Instant::now() + Duration::from_secs(3);
-    let process = loop {
-        if let Some(process) = worker.observe_agent_process().cloned() {
-            break process;
-        }
+    while worker.observe_agent_process().is_none() {
         assert!(Instant::now() < deadline, "PTY foreground never became OMP");
         std::thread::sleep(Duration::from_millis(1));
-    };
-    let tty = std::fs::read_link(format!("/proc/{}/fd/0", process.pid)).unwrap();
-    let markers = directory.path().join("terminal-sessions");
-    std::fs::create_dir(&markers).unwrap();
-    std::fs::write(
-        markers.join(format!(
-            "pts-{}",
-            tty.file_name().unwrap().to_str().unwrap()
-        )),
-        format!(
-            "{}\n{}\n",
-            directory.path().display(),
-            directory
-                .path()
-                .join("sessions/fresh_12345678-1234-1234-1234-123456789abc.jsonl")
-                .display()
-        ),
-    )
-    .unwrap();
+    }
+    // Only Linux verifies OMP's synthetic /dev/pts marker. Darwin should
+    // still show fresh OMP activity while it cannot prove a resume identity.
+    #[cfg(target_os = "linux")]
+    {
+        let pid = worker.agent_process.as_ref().unwrap().pid;
+        let tty = std::fs::read_link(format!("/proc/{pid}/fd/0")).unwrap();
+        let markers = directory.path().join("terminal-sessions");
+        std::fs::create_dir(&markers).unwrap();
+        std::fs::write(
+            markers.join(format!(
+                "pts-{}",
+                tty.file_name().unwrap().to_str().unwrap()
+            )),
+            format!(
+                "{}\n{}\n",
+                directory.path().display(),
+                directory
+                    .path()
+                    .join("sessions/fresh_12345678-1234-1234-1234-123456789abc.jsonl")
+                    .display()
+            ),
+        )
+        .unwrap();
+    }
     worker.handle_command(Command::Hide);
     let generation = worker.generation;
     for title in ["π ⠋ fresh", "π ⠙ fresh", "π ! fresh", "π > fresh"] {
