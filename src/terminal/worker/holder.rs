@@ -2534,7 +2534,7 @@ mod tests {
             let stat = "/usr/bin/stat -f 'PIN_ID:%d:%i' .";
             std::fs::write(
                 &program,
-                format!("#!/bin/sh\n{stat}\n/bin/cat payload\nprintf 'PIN_OK\n'\nIFS= read -r release\nprintf 'PIN_DONE\n'\n"),
+                format!("#!/bin/sh\n{{ {stat}; /bin/cat payload; }} > observed\n"),
             )
             .unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2564,22 +2564,14 @@ mod tests {
             let pair = native_pty_system().openpty(size()).unwrap();
             let mut child = pair.slave.spawn_command(command).unwrap();
             drop(pair.slave);
-            let master = pair.master.as_raw_fd().unwrap();
-            let duplicate = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0) };
-            assert!(duplicate >= 0);
-            let master = PtyMaster(unsafe { OwnedFd::from_raw_fd(duplicate) });
-            eprintln!("held cwd fixture using relative PATH: {relative_path}");
-            let output = read_until(&master, "PIN_OK");
+            assert_eq!(child.wait().unwrap().exit_code(), 0);
+            let output = std::fs::read_to_string(moved.join("observed")).unwrap();
             assert!(
                 output.contains(&format!("PIN_ID:{}:{}", pin.0.device, pin.0.inode)),
                 "{output}"
             );
             assert!(output.contains("ORIGINAL_PAYLOAD"), "{output}");
             assert!(!output.contains("REPLACEMENT"), "{output}");
-            let mut writer = File::from(master.duplicate().unwrap());
-            std::io::Write::write_all(&mut writer, b"\n").unwrap();
-            assert!(read_until(&master, "PIN_DONE").contains("PIN_DONE"));
-            assert_eq!(child.wait().unwrap().exit_code(), 0);
             assert_eq!(
                 crate::agent_execution::DirectoryIdentity::from_metadata(
                     &pin.1.metadata().unwrap()
@@ -3372,7 +3364,8 @@ mod tests {
             daemon,
             holder: None,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The fixture starts two holders, one for the deliberate refusal.
+        let deadline = Instant::now() + START_TIMEOUT * 2;
         while !ready.exists() {
             assert!(
                 cleanup.daemon.try_wait().unwrap().is_none(),
