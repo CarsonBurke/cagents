@@ -14,12 +14,11 @@ pub mod in_flight;
 mod installed;
 mod pending_recovery;
 pub mod progress;
-#[cfg(feature = "ui")]
-pub use pending_recovery::AppRecovery;
 pub mod recovery;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
 mod review_fixture;
+pub use pending_recovery::AppRecovery;
 pub use recovery::TargetRecoveryRequired;
 pub mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};

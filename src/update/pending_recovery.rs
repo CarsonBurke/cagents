@@ -4,7 +4,6 @@ use super::*;
 use crate::{daemon::lease_handoff::LeaseHandoff, upgrade::recovery::PendingRecovery};
 
 /// A recovery the person can authorize from the update control.
-#[cfg(feature = "ui")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppRecovery {
     job: String,
@@ -16,9 +15,13 @@ pub struct AppRecovery {
     saved_windows: bool,
 }
 
-#[cfg(feature = "ui")]
 impl AppRecovery {
     pub fn latest() -> Result<Option<Self>, UpdateError> {
+        if crate::device::is_remote()
+            || std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+        {
+            return Ok(None);
+        }
         match status()? {
             Some(job) if job.phase == UpdatePhase::Failed => Self::available(&job.id),
             _ => Ok(None),
@@ -81,8 +84,13 @@ impl AppRecovery {
         }))
     }
 
+    fn candidate_ui(&self) -> PathBuf {
+        self.candidate.with_file_name("cagents-ui")
+    }
+
     /// Recovery waits for open windows to release their leases. Keep its
     /// child waiter out of any window's executor so that executor can exit.
+    #[cfg(feature = "ui")]
     pub fn start(
         self,
         open_window: bool,
@@ -96,7 +104,8 @@ impl AppRecovery {
         Ok(receive)
     }
 
-    fn recover(self, open_window: bool) -> Result<String, UpdateError> {
+    /// Perform the exact previously offered recovery after explicit approval.
+    pub fn recover(self, open_window: bool) -> Result<String, UpdateError> {
         if Self::available(&self.job)?.as_ref() != Some(&self) {
             return Err(invalid(
                 "The saved recovery changed. Recheck the update before continuing.",
@@ -130,13 +139,12 @@ impl AppRecovery {
         }
         let report = recovery_reply(&command.output()?)?;
         if open_window && !self.saved_windows {
-            crate::instance::open_recovered_window(&self.candidate.with_file_name("cagents-ui"))?;
+            crate::instance::open_recovered_window(&self.candidate_ui())?;
         }
         Ok(report)
     }
 }
 
-#[cfg(feature = "ui")]
 fn recovery_reply(output: &std::process::Output) -> Result<String, UpdateError> {
     if output.status.success() {
         let reply: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -157,7 +165,7 @@ fn recovery_reply(output: &std::process::Output) -> Result<String, UpdateError> 
     Err(invalid(message))
 }
 
-#[cfg(all(test, feature = "ui"))]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 #[test]
 fn recovery_preserves_the_candidates_json_refusal() {
     use std::os::unix::process::ExitStatusExt;

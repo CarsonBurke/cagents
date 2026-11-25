@@ -882,7 +882,6 @@ pub(crate) fn capture_before_floor(
 }
 
 impl PendingRecovery {
-    #[cfg(feature = "ui")]
     pub(crate) fn retained_job_id(&self) -> Option<&str> {
         match self.producer.as_ref()? {
             CaptureProducer::Proposed { job, .. } | CaptureProducer::Acknowledged { job, .. } => {

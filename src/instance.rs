@@ -2237,7 +2237,6 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
 
 /// Open a primary window when an explicit recovery had no previous windows
 /// to restore. Its first pane may only attach to an existing provider.
-#[cfg(feature = "ui")]
 pub(crate) fn open_recovered_window(executable: &Path) -> io::Result<()> {
     match launch_window_at(
         executable,

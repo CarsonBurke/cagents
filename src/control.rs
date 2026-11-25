@@ -4044,6 +4044,22 @@ where
         );
         return ExitCode::FAILURE;
     }
+    if !hosted
+        && !crate::device::is_remote()
+        && matches!(&cli.command, TopCommand::Ui { .. })
+        && let Some(recovery) = launch_update_recovery()
+    {
+        return match recovery {
+            Ok(output) => {
+                emit_success(cli.global.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.global.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
     // Retain legacy write scope before installer recovery or an older CLI can
     // handle the command. Legacy reads keep their original routing; a scoped
     // legacy write uses this client's selected host.
@@ -4390,6 +4406,56 @@ fn execute_with_model_context(
             })
         }
     }
+}
+
+/// A staged launch can try to restart the previous daemon before it creates
+/// any window. A verified Prepared failure needs the retained target's dialog
+/// first. Showing it does not start a daemon or take a window's lease.
+fn launch_update_recovery() -> Option<Result<CommandOutput, AppError>> {
+    crate::update::AppRecovery::latest().ok().flatten()?;
+    let socket = crate::terminal_ipc::local_daemon_socket_path().ok()?;
+    let absent = connect_control_socket(&socket, Duration::from_millis(100)).is_err_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        )
+    });
+    if !absent {
+        return None;
+    }
+    let executable = crate::companion::Product::Ui.beside_current().ok()?;
+    let mut command = Command::new(&executable);
+    command
+        .args([
+            crate::instance::STARTUP_ERROR_MODE,
+            "The update needs to recover your saved work before cagents can open.",
+        ])
+        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    // SAFETY: the hook closes inherited descriptors on exec using syscalls only.
+    unsafe {
+        command.pre_exec(crate::daemon::seal_inherited_descriptors);
+    }
+    Some(
+        command
+            .spawn()
+            .map(|mut child| {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                CommandOutput {
+                    command: "ui",
+                    data: json!({"launched": true, "recovery": true, "executable": executable}),
+                    human: "Opened the update recovery dialog".into(),
+                }
+            })
+            .map_err(|error| AppError::new("launch", error)),
+    )
 }
 
 fn launch_ui(
