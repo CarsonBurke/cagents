@@ -2532,6 +2532,8 @@ impl Runtime {
             {
                 Some((glyph, label))
             }
+            // The turn stays open on its background commands alone.
+            Some(Icon::AgentBackground) if snapshot.busy => Some((Icon::AgentBackground, label)),
             // A recent failed task stays actionable even after the lead finishes.
             Some(Icon::Error) if !snapshot.subagent_activity().failed.is_empty() => {
                 Some((Icon::Error, label))
@@ -2783,23 +2785,24 @@ impl Runtime {
         } else {
             ("them", "they wait")
         };
+        let provider = self.session.launch.provider.label();
         let tooltip: Cow<'_, str> = match self.snapshot.send_now {
             Some(chat::SendNow::Declined) => format!(
-                "Claude couldn't take {it} early, so {they} in the queue. You can try again \
+                "{provider} couldn't take {it} early, so {they} in the queue. You can try again \
                  once the queue changes."
             )
             .into(),
             Some(_) => "Sending now…".into(),
             None => {
-                // Where Stop also ends background subagents, say so: that
+                // Where Stop also ends background work, say so: that
                 // is the difference that makes Send now worth choosing.
                 let stop = if self.snapshot.capabilities.interrupt_stops_background {
-                    " Stop cancels the turn and its background subagents."
+                    " Stop cancels the turn and its background work."
                 } else {
                     ""
                 };
                 format!(
-                    "Send {it} to Claude now. Subagents and background work keep running; the \
+                    "Send {it} to {provider} now. Subagents and background work keep running; the \
                      reply being written may be cut short.{stop}"
                 )
                 .into()
@@ -2927,6 +2930,14 @@ impl Runtime {
                 .any(|agent| !agent.waiting && agent.status == chat::ToolStatus::Running)
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
+        } else if snapshot.busy && snapshot.detail == chat::WAITING_ON_BACKGROUND_WORK {
+            // The turn is open but the agent is idle until its background
+            // commands finish, however long that takes; its last words
+            // would otherwise read as a reply still being written.
+            (
+                Some(Icon::AgentBackground),
+                chat::WAITING_ON_BACKGROUND_WORK,
+            )
         } else if snapshot.is_working() {
             (
                 Some(Icon::AgentWorking),

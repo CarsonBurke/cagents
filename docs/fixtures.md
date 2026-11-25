@@ -1372,6 +1372,7 @@ The first of these words a prompt contains chooses what it does:
 | `edits` | edits three files in one step (a two-hunk change to `src/config.rs`, a new `src/error.rs` and a deleted `docs/legacy-config.md`), then rewrites `src/handlers.rs` with a long patch |
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
 | `hold` | runs a long step and thinks until stopped |
+| `background` | starts a build in the background, says it is waiting, and stays silent until the build ends after `FAKE_ACP_BACKGROUND_SECONDS` (default 20); Stop fails the build |
 | `garbage` | writes a line that is not JSON between two parts of its answer |
 | `files` | asks the client to read a file and reports the error it got |
 | `mode` | moves to the next mode and reports it |
@@ -1381,8 +1382,15 @@ The first of these words a prompt contains chooses what it does:
 | `allowance` | refuses the turn as a login with no usage allowance |
 | `/compact`, at the start | compacts the conversation |
 
-Anything else gets a thought and `Fake answer to: ...`. These variables add
-failures:
+Anything else gets a thought and `Fake answer to: ...`.
+
+A prompt sent during a turn is handled the way Antigravity 1.5.17 handles
+one. The running prompt ends at once with `end_turn`. The turn then goes
+on under the new prompt, answers it with `Fake answer to: ...`, and ends
+with that prompt's reply. In Muse's shape, a prompt sent during a turn is
+refused because a prompt is already running.
+
+These variables add failures:
 
 | Variable | Effect |
 | --- | --- |
@@ -1392,6 +1400,7 @@ failures:
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+| `FAKE_ACP_BACKGROUND_SECONDS=N` | how long the `background` turn's build runs |
 | `FAKE_ACP_WORK=PATH` | the Claude Code transcript a `work` prompt replays. The installed `agy` and `muse-upstream` read the fixture's `home/.claude/fixture-frames.jsonl`, which `conversation-work.py` writes |
 | `FAKE_ACP_AUTH_FILE=PATH` | the sign-in record Muse's `login` writes and `logout` removes; only ever a fixture's own file |
 
@@ -1402,6 +1411,7 @@ These files under `FAKE_ACP_STATE` switch states that last across processes:
 | `signed-out` | every new or loaded session and every prompt answers that sign-in is required |
 | `no-allowance` | every prompt is refused as a login with no usage allowance, and Muse's `usage --json` reports none |
 | `hang-probe` | a session opened by the account probe (`--app-data-dir`) never answers, as one that times out |
+| `background-seconds` | in the native-evidence fixture only, how long a `background` prompt's build runs, where `FAKE_ACP_BACKGROUND_SECONDS` cannot reach the app's agent |
 
 Run with `--app-data-dir DIR`, as the Antigravity account probe runs
 `agy acp`, it saves each new session's files under `~/.gemini/DIR` the way

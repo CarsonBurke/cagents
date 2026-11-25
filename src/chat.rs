@@ -927,6 +927,12 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 /// The largest image an ACP prompt carries inline.
 pub const ACP_MAX_IMAGE_BYTES: u64 = 16 * MIB;
 
+/// A provider's [`Event::Status`] detail while its turn waits only on
+/// commands the agent left running in the background, having said all it
+/// will until they finish. The turn is still open, and a message sent now
+/// waits for it.
+pub const WAITING_ON_BACKGROUND_WORK: &str = "Waiting on background work";
+
 /// Inline tool images are spooled to private files before entering a snapshot.
 pub const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;

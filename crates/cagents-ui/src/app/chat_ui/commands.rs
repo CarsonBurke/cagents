@@ -1932,6 +1932,38 @@ mod tests {
         }
     }
 
+    /// An ACP agent's adapter holds a message written mid-turn itself, so
+    /// it goes to the provider rather than waiting in the window, where the
+    /// courier and every other window can see it.
+    #[test]
+    fn an_acp_agent_takes_a_message_written_mid_turn_into_its_own_queue() {
+        for provider in [Provider::Antigravity, Provider::Muse] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session.launch.provider = provider;
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.busy = true;
+            snapshot.capabilities.queue = true;
+            snapshot.capabilities.queue_remove = true;
+            runtime.replace_draft(text_editor::Content::with_text("Then run the tests"));
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.followups.is_empty(), "{provider:?}");
+            let sent = runtime.commands.in_flight().expect("sent to the provider");
+            assert!(
+                matches!(
+                    &sent.message,
+                    Some(Command::Prompt { text, mode: PromptMode::Queue, .. })
+                        if text == "Then run the tests"
+                ),
+                "{provider:?}: {:?}",
+                sent.message
+            );
+        }
+    }
+
     /// Commands given while one is on its way wait behind it in order and
     /// go one at a time; a repeat of one still waiting is not sent twice.
     #[test]

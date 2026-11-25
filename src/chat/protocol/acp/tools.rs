@@ -29,6 +29,10 @@ struct Call {
     locations: Vec<String>,
     input: Value,
     raw_output: Value,
+    /// The agent has reported it running, not only waiting to run.
+    started: bool,
+    /// The agent went on while it ran: it runs in the background.
+    background: bool,
 }
 
 #[derive(Default)]
@@ -58,10 +62,13 @@ impl Calls {
         if let Some(kind) = update["kind"].as_str() {
             call.kind = kind.to_owned();
         }
-        if let Some(status) = update["status"].as_str().and_then(status) {
+        if let Some(reported) = update["status"].as_str() {
+            call.started |= reported == "in_progress";
             // A finished call stays finished: a revision delivered out of
             // order, or a late copy of the original call, says less.
-            if call.status.is_none_or(ToolStatus::is_live) {
+            if let Some(status) = status(reported)
+                && call.status.is_none_or(ToolStatus::is_live)
+            {
                 call.status = Some(status);
             }
         }
@@ -85,6 +92,41 @@ impl Calls {
             call.raw_output = update["rawOutput"].clone();
         }
         Some((format!("tool:{id}"), call.content()))
+    }
+
+    /// Marks every command still running as running in the background, as
+    /// it is once the agent goes on without waiting for it: it writes, or
+    /// reports the usage of a model response that ended after the command
+    /// started. Agents report a step's calls together after its usage, so
+    /// calls made side by side are not taken for background ones. Returns
+    /// the steps that changed.
+    pub fn background_running(&mut self) -> Vec<(String, ItemContent)> {
+        let mut moved = Vec::new();
+        for id in &self.order {
+            let Some(call) = self.calls.get_mut(id) else {
+                continue;
+            };
+            if call.kind == "execute"
+                && call.started
+                && !call.background
+                && call.status == Some(ToolStatus::Running)
+            {
+                call.background = true;
+                moved.push((format!("tool:{id}"), call.content()));
+            }
+        }
+        moved
+    }
+
+    /// Whether something is still running and all of it runs in the
+    /// background.
+    pub fn only_background_live(&self) -> bool {
+        let mut live = self
+            .calls
+            .values()
+            .filter(|call| call.status.is_none_or(ToolStatus::is_live))
+            .peekable();
+        live.peek().is_some() && live.all(|call| call.background)
     }
 
     /// Ends every call still running, as a turn's end does: whatever it was
@@ -134,7 +176,10 @@ impl Calls {
 
 impl Call {
     fn content(&self) -> ItemContent {
-        let status = self.status.unwrap_or(ToolStatus::Running);
+        let status = match self.status.unwrap_or(ToolStatus::Running) {
+            ToolStatus::Running if self.background => ToolStatus::Waiting,
+            status => status,
+        };
         if let Some(diffs) = &self.diffs {
             return ItemContent::Changes {
                 changes: diffs.clone(),

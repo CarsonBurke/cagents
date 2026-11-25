@@ -13,6 +13,14 @@
 //! the launch's model, reasoning and mode through the session's config
 //! options; only then does it take prompts. Each prompt is one
 //! `session/prompt` request whose reply ends the turn.
+//!
+//! A message queued while a turn runs waits in this adapter, and the next
+//! turn starts with everything queued as soon as the running one ends, in
+//! the same step, so nothing else can start a turn in between. An agent
+//! whose profile [steers](Profile::steers) also takes a message mid-turn:
+//! Antigravity 1.5.17 answers the running `session/prompt` at once, as
+//! `end_turn`, and carries on with its work, background commands included,
+//! under the new one, whose reply then ends the turn.
 use super::{Adapter, ProcessSpec, Step};
 use crate::chat::{
     self, Capabilities, Choice, Command, Event, Item, ItemContent, Launch, PlanState, PlanStep,
@@ -51,6 +59,10 @@ const MAX_SEGMENT_IDS: usize = 4096;
 /// The approvals that may be open at once; an agent asking for more is
 /// refused rather than piling them up in front of the reader.
 const MAX_PERMISSIONS: usize = 64;
+/// The messages that may wait for the next turn, and the bytes their
+/// prompts may hold between them, inline images included.
+const MAX_QUEUED: usize = 32;
+const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 
 fn title_text(value: &Value) -> Option<&str> {
     let title = value.as_str()?;
@@ -78,6 +90,14 @@ pub struct Profile {
     /// Whether an error reply means the user has to sign in again. ACP
     /// reserves `-32000` for this; [`auth_required`] checks only that.
     pub sign_in_required: fn(&Value) -> bool,
+    /// Whether a `session/prompt` sent while a turn runs reaches that turn
+    /// without stopping it. ACP v1 does not say what an agent does with one;
+    /// Antigravity 1.5.17 answers the running prompt at once and goes on
+    /// with the new one, its tools and background commands still running.
+    pub steers: bool,
+    /// Whether `session/cancel` also ends the commands the agent left
+    /// running in the background, as Antigravity 1.5.17's does.
+    pub cancel_stops_background: bool,
 }
 
 /// The ACP server's command line, and the settings to apply once its
@@ -231,11 +251,28 @@ enum Pending {
 
 /// The prompt in flight, from its request until its reply.
 struct Turn {
-    request: u64,
+    /// The turn's `session/prompt` requests still unanswered, oldest first:
+    /// the one that started it, and each message steered into it since. The
+    /// agent answers an earlier one when a later one takes over the turn,
+    /// which ends with the reply to the last.
+    requests: Vec<u64>,
     key: String,
     /// `session/cancel` has been sent; the reply decides how the turn ended.
     cancelling: bool,
     run: Option<crate::model::RunId>,
+    /// The agent has said all it will until the commands it left running in
+    /// the background finish.
+    on_background: bool,
+}
+
+/// A message written during a turn, held for the next one.
+struct Queued {
+    message: chat::QueuedMessage,
+    blocks: Vec<Value>,
+    /// The message as the transcript shows it once it is sent.
+    items: Vec<Item>,
+    /// Its blocks' serialized size, which the queue's bound counts.
+    bytes: usize,
 }
 
 /// A text stream being written into one item.
@@ -283,6 +320,8 @@ struct Acp {
     permissions: BTreeMap<String, Permission>,
     next_permission: u64,
     usage: chat::Usage,
+    queued: Vec<Queued>,
+    next_queued: u64,
 }
 
 impl Acp {
@@ -311,6 +350,8 @@ impl Acp {
             permissions: BTreeMap::new(),
             next_permission: 0,
             usage: chat::Usage::default(),
+            queued: Vec::new(),
+            next_queued: 0,
         }
     }
 
@@ -420,9 +461,13 @@ impl Acp {
 
     fn capabilities(&self) -> Event {
         Event::Capabilities(Capabilities {
-            // cagents holds a message sent during a turn until the turn ends.
-            steer: false,
-            queue: false,
+            steer: self.profile.steers,
+            // A message queued during a turn waits here for the next one.
+            queue: true,
+            queue_remove: true,
+            // Sending what is queued now steers it into the running turn.
+            send_queued_now: self.profile.steers,
+            interrupt_stops_background: self.profile.cancel_stops_background,
             attachments: true,
             compact: self.compacts(),
             model_selection: self.config.model_selection(),
@@ -577,15 +622,21 @@ impl Acp {
     fn start_turn(&mut self, blocks: Vec<Value>, items: Vec<Item>) -> Result<Step, String> {
         self.accepts_turn()?;
         let mut step = Step::default();
+        self.begin_turn(blocks, items, &mut step);
+        Ok(step)
+    }
+
+    fn begin_turn(&mut self, blocks: Vec<Value>, items: Vec<Item>, step: &mut Step) {
         let params = json!({"sessionId": self.session_id(), "prompt": blocks});
         let (id, frame) = self.request("session/prompt", params, Pending::Prompt);
         step.writes.push(frame);
         self.segment = None;
         self.turn = Some(Turn {
-            request: id,
+            requests: vec![id],
             key: format!("acp-prompt:{}:{id}", self.session_id()),
             cancelling: false,
             run: None,
+            on_background: false,
         });
         step.events.extend(items.into_iter().map(Event::Item));
         step.events.push(Event::TurnStarted);
@@ -593,7 +644,154 @@ impl Acp {
             busy: true,
             detail: "Working".into(),
         });
+    }
+
+    /// Sends `blocks` into the running turn, which the agent goes on with;
+    /// see [`Profile::steers`].
+    fn steer(&mut self, blocks: Vec<Value>, items: Vec<Item>, step: &mut Step) {
+        let params = json!({"sessionId": self.session_id(), "prompt": blocks});
+        let (id, frame) = self.request("session/prompt", params, Pending::Prompt);
+        step.writes.push(frame);
+        self.segment = None;
+        step.events.extend(items.into_iter().map(Event::Item));
+        if let Some(turn) = &mut self.turn {
+            turn.requests.push(id);
+        }
+        self.at_work(&mut step.events);
+    }
+
+    /// The agent is at work again after waiting on its background commands.
+    fn at_work(&mut self, events: &mut Vec<Event>) {
+        if let Some(turn) = self.turn.as_mut().filter(|turn| turn.on_background) {
+            turn.on_background = false;
+            // A turn being stopped already says so.
+            if turn.cancelling {
+                return;
+            }
+            events.push(Event::Status {
+                busy: true,
+                detail: "Working".into(),
+            });
+        }
+    }
+
+    /// The agent went on while its commands ran: they run in the background.
+    fn went_on(&mut self, events: &mut Vec<Event>) {
+        for (id, content) in self.calls.background_running() {
+            events.push(Event::Item(tool_item(id, content)));
+        }
+    }
+
+    /// Whether the turn now waits only on commands the agent left running
+    /// in the background, having said all it will until they finish: an
+    /// agent reports its usage as each model response ends. Published once,
+    /// until the agent is at work again.
+    fn awaits_background(&mut self, events: &mut Vec<Event>) {
+        let waits = self.permissions.is_empty() && self.calls.only_background_live();
+        if let Some(turn) = self.turn.as_mut().filter(|turn| !turn.cancelling)
+            && waits
+            && !turn.on_background
+        {
+            turn.on_background = true;
+            events.push(Event::Status {
+                busy: true,
+                detail: chat::WAITING_ON_BACKGROUND_WORK.into(),
+            });
+        }
+    }
+
+    /// Joins `blocks` to the queue for the next turn.
+    fn queue(
+        &mut self,
+        text: String,
+        attachments: Vec<chat::Attachment>,
+        blocks: Vec<Value>,
+        items: Vec<Item>,
+    ) -> Result<Step, String> {
+        let bytes = blocks
+            .iter()
+            .map(|block| serde_json::to_vec(block).map_or(0, |encoded| encoded.len()))
+            .sum::<usize>();
+        let held = self.queued.iter().map(|queued| queued.bytes).sum::<usize>();
+        if self.queued.len() >= MAX_QUEUED || held + bytes > MAX_QUEUED_BYTES {
+            return Err(format!(
+                "{} has as many messages waiting as it can hold; wait for them to go, or remove one.",
+                self.profile.label
+            ));
+        }
+        self.next_queued += 1;
+        let mut message =
+            chat::QueuedMessage::new(format!("acp-queued:{}", self.next_queued), text);
+        message.attachments = attachments;
+        self.queued.push(Queued {
+            message,
+            blocks,
+            items,
+            bytes,
+        });
+        let mut step = Step::default();
+        self.queue_changed(&mut step);
         Ok(step)
+    }
+
+    fn queue_changed(&self, step: &mut Step) {
+        step.events.push(Event::QueueChanged(
+            self.queued
+                .iter()
+                .map(|queued| queued.message.clone())
+                .collect(),
+        ));
+    }
+
+    /// Everything queued, as one prompt: each message's blocks in the order
+    /// they were written, and each message shown as it was written.
+    fn take_queued(&mut self, step: &mut Step) -> Option<(Vec<Value>, Vec<Item>)> {
+        if self.queued.is_empty() {
+            return None;
+        }
+        let (mut blocks, mut items) = (Vec::new(), Vec::new());
+        for queued in std::mem::take(&mut self.queued) {
+            blocks.extend(queued.blocks);
+            items.extend(queued.items);
+        }
+        self.queue_changed(step);
+        Some((blocks, items))
+    }
+
+    /// A reply to one of the turn's prompts: the last one's ends the turn,
+    /// and an earlier one's only says that a later one took over.
+    fn answered(&mut self, request: u64, outcome: Result<&Value, &Value>, step: &mut Step) {
+        if let Ok(result) = outcome {
+            // The unstable `PromptResponse.usage` is this prompt's own
+            // tokens, so prompts add up: Antigravity 1.5.12's second turn of
+            // a conversation reports only its own input, apart from what it
+            // read from cache, as Claude's do.
+            if let Some(usage) = result.get("usage").filter(|usage| usage.is_object()) {
+                let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+                self.usage.input_tokens += count("inputTokens");
+                self.usage.output_tokens += count("outputTokens");
+                step.events.push(Event::Usage(self.usage.clone()));
+            }
+        }
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
+        turn.requests.retain(|pending| *pending != request);
+        if turn.requests.is_empty() {
+            return self.end_turn(outcome, step);
+        }
+        // A later message took the turn over. Only an earlier prompt that
+        // failed has anything to say; one stopped by the reader's Stop is
+        // what they asked for, and the turn's last reply says how it ended.
+        let cancelling = turn.cancelling;
+        if let Err(error) = outcome
+            && !(cancelling && error["code"].as_i64() == Some(rpc::REQUEST_CANCELLED))
+        {
+            step.events.push(Event::Error {
+                message: self.failure(error),
+                fatal: false,
+            });
+        }
     }
 
     fn end_turn(&mut self, outcome: Result<&Value, &Value>, step: &mut Step) {
@@ -602,48 +800,36 @@ impl Acp {
         };
         self.segment = None;
         let (kind, notice) = match outcome {
-            Ok(result) => {
-                // The unstable `PromptResponse.usage` is this turn's own
-                // tokens, so turns add up: Antigravity 1.5.12's second turn
-                // of a conversation reports only its own input, apart from
-                // what it read from cache, as Claude's do.
-                if let Some(usage) = result.get("usage").filter(|usage| usage.is_object()) {
-                    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
-                    self.usage.input_tokens += count("inputTokens");
-                    self.usage.output_tokens += count("outputTokens");
-                    step.events.push(Event::Usage(self.usage.clone()));
-                }
-                match result["stopReason"].as_str() {
-                    Some("end_turn") => (Kind::Succeeded, None),
-                    Some("cancelled") => (Kind::Cancelled, None),
-                    Some("max_tokens") => (
-                        Kind::Failed,
-                        Some(format!(
-                            "{} stopped: it reached its output limit.",
-                            self.profile.label
-                        )),
-                    ),
-                    Some("max_turn_requests") => (
-                        Kind::Failed,
-                        Some(format!(
-                            "{} stopped: the turn reached its limit of model requests.",
-                            self.profile.label
-                        )),
-                    ),
-                    Some("refusal") => (
-                        Kind::Failed,
-                        Some(format!("{} declined to continue.", self.profile.label)),
-                    ),
-                    other => (
-                        Kind::Failed,
-                        Some(format!(
-                            "{} ended the turn for a reason cagents does not know ({}).",
-                            self.profile.label,
-                            other.unwrap_or("none given")
-                        )),
-                    ),
-                }
-            }
+            Ok(result) => match result["stopReason"].as_str() {
+                Some("end_turn") => (Kind::Succeeded, None),
+                Some("cancelled") => (Kind::Cancelled, None),
+                Some("max_tokens") => (
+                    Kind::Failed,
+                    Some(format!(
+                        "{} stopped: it reached its output limit.",
+                        self.profile.label
+                    )),
+                ),
+                Some("max_turn_requests") => (
+                    Kind::Failed,
+                    Some(format!(
+                        "{} stopped: the turn reached its limit of model requests.",
+                        self.profile.label
+                    )),
+                ),
+                Some("refusal") => (
+                    Kind::Failed,
+                    Some(format!("{} declined to continue.", self.profile.label)),
+                ),
+                other => (
+                    Kind::Failed,
+                    Some(format!(
+                        "{} ended the turn for a reason cagents does not know ({}).",
+                        self.profile.label,
+                        other.unwrap_or("none given")
+                    )),
+                ),
+            },
             // A turn cancelled before the agent could answer is still the
             // cancellation the reader asked for.
             Err(error)
@@ -674,10 +860,23 @@ impl Acp {
             });
         }
         step.events.push(Event::TurnSettled);
-        step.events.push(Event::Status {
-            busy: false,
-            detail: "Ready".into(),
-        });
+        // What was queued starts the next turn in this same step, so the
+        // conversation never looks idle to whatever would start one of its
+        // own in between, such as a message from another session. After a
+        // refusal to work at all, it waits for the reader instead.
+        let refused = outcome
+            .is_err_and(|error| (self.profile.sign_in_required)(error) || no_allowance(error));
+        let next = if refused {
+            None
+        } else {
+            self.take_queued(step)
+        };
+        if next.is_none() {
+            step.events.push(Event::Status {
+                busy: false,
+                detail: "Ready".into(),
+            });
+        }
         if let Some(run) = turn.run {
             use crate::agent_execution::ProviderEvent;
             step.events.push(Event::Execution {
@@ -693,6 +892,9 @@ impl Acp {
             key: Some(turn.key),
             outcome: kind,
         });
+        if let Some((blocks, items)) = next {
+            self.begin_turn(blocks, items, step);
+        }
         self.refresh_title(MAX_TURN_TITLE_LIST_PAGES, step);
     }
 
@@ -772,7 +974,7 @@ impl Acp {
                     self.become_ready(step);
                 }
             }
-            Pending::Prompt => self.end_turn(outcome, step),
+            Pending::Prompt => self.answered(id, outcome, step),
         }
     }
 
@@ -883,6 +1085,7 @@ impl Acp {
             self.segment = None;
             step.events.push(Event::Item(tool_item(id, content)));
         }
+        self.at_work(&mut step.events);
         let options = params["options"]
             .as_array()
             .into_iter()
@@ -978,6 +1181,9 @@ impl Acp {
         }
         let update = &params["update"];
         let mut events = Vec::new();
+        // What the agent does live, rather than replays, says whether it is
+        // at work or waits on its background commands.
+        let live = self.turn.is_some() && self.replay.is_none();
         match update["sessionUpdate"].as_str().unwrap_or_default() {
             kind @ ("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk") => {
                 let role = if kind == "user_message_chunk" {
@@ -987,8 +1193,12 @@ impl Acp {
                 };
                 // The reader's own message is shown when it is sent; an agent
                 // that echoes it during the turn would show it twice.
-                if role == Role::User && self.replay.is_none() && self.turn.is_some() {
+                if role == Role::User && live {
                     return;
+                }
+                if live {
+                    self.went_on(&mut events);
+                    self.at_work(&mut events);
                 }
                 self.chunk(role, kind == "agent_thought_chunk", update, &mut events);
             }
@@ -996,6 +1206,11 @@ impl Acp {
                 if let Some((id, content)) = self.calls.merge(update) {
                     self.segment = None;
                     events.push(Event::Item(tool_item(id, content)));
+                }
+                // A background command's own progress is not the agent at
+                // work; its end, or any other step, is.
+                if live && !self.calls.only_background_live() {
+                    self.at_work(&mut events);
                 }
             }
             "plan" => events.push(Event::Plan {
@@ -1076,6 +1291,12 @@ impl Acp {
                         self.usage.cost_microusd = Some((amount * 1_000_000.0) as u64);
                     }
                     events.push(Event::Usage(self.usage.clone()));
+                }
+                // A model response ended: what it left running runs on in
+                // the background, and may be all the turn waits for.
+                if live {
+                    self.went_on(&mut events);
+                    self.awaits_background(&mut events);
                 }
             }
             // A kind from a later protocol revision, or an agent's own
@@ -1343,12 +1564,28 @@ impl Adapter for Acp {
                 attachments,
                 mode,
             } => {
-                if mode != PromptMode::Send {
-                    return Err(format!(
-                        "{label} cannot take a message while it is working; send it once this turn ends."
-                    ));
+                if self.stage != Stage::Ready {
+                    self.accepts_turn()?;
                 }
-                self.accepts_turn()?;
+                // A message written for a running turn that has just ended
+                // starts the next one.
+                let mode = match (&self.turn, mode) {
+                    (None, _) => PromptMode::Send,
+                    (Some(turn), PromptMode::Steer) if turn.cancelling => {
+                        return Err(format!(
+                            "{label} is stopping this turn; send the message once it has stopped."
+                        ));
+                    }
+                    (Some(_), PromptMode::Steer) if !self.profile.steers => {
+                        return Err(format!(
+                            "{label} cannot take a message mid-turn; queue it for the next turn."
+                        ));
+                    }
+                    (Some(_), mode) => mode,
+                };
+                if mode == PromptMode::Send {
+                    self.accepts_turn()?;
+                }
                 let mut next = 0;
                 let base = self.next_item;
                 let prompt = prompt::build(
@@ -1362,7 +1599,17 @@ impl Adapter for Acp {
                         format!("acp:{}", base + next)
                     },
                 )?;
-                let step = self.start_turn(prompt.blocks, prompt.items)?;
+                let step = match mode {
+                    PromptMode::Send => self.start_turn(prompt.blocks, prompt.items)?,
+                    PromptMode::Queue => {
+                        self.queue(text, attachments, prompt.blocks, prompt.items)?
+                    }
+                    PromptMode::Steer => {
+                        let mut step = Step::default();
+                        self.steer(prompt.blocks, prompt.items, &mut step);
+                        step
+                    }
+                };
                 self.next_item += next;
                 Ok(step)
             }
@@ -1502,9 +1749,41 @@ impl Adapter for Acp {
             Command::StopSubagent { .. } => Err(format!("{label} cannot stop a single subagent.")),
             Command::SetFastMode { .. } => Err(format!("{label} has no fast mode.")),
             Command::SetInterruptMode { .. } => Err(format!("{label} stops a turn only one way.")),
-            Command::RemoveQueued { .. } | Command::StartQueued { .. } | Command::SendQueuedNow => {
-                Err(format!("{label} keeps no queue of its own."))
+            Command::RemoveQueued { id } => {
+                let mut step = Step::default();
+                let position = self
+                    .queued
+                    .iter()
+                    .position(|queued| queued.message.id == id);
+                if let Some(position) = position {
+                    self.queued.remove(position);
+                }
+                // One already sent has left the queue without being removed.
+                step.events.push(Event::QueueRemoval(chat::QueueRemoval {
+                    id,
+                    removed: position.is_some(),
+                }));
+                self.queue_changed(&mut step);
+                Ok(step)
             }
+            Command::SendQueuedNow => {
+                if !self.profile.steers {
+                    return Err(format!("{label} cannot take a message mid-turn."));
+                }
+                let mut step = Step::default();
+                // With no turn to take them, what is queued has already
+                // started the next one.
+                if self.turn.as_ref().is_none_or(|turn| turn.cancelling) {
+                    return Ok(step);
+                }
+                if let Some((blocks, items)) = self.take_queued(&mut step) {
+                    self.steer(blocks, items, &mut step);
+                }
+                Ok(step)
+            }
+            Command::StartQueued { .. } => Err(format!(
+                "{label} sends queued messages together; send them now instead."
+            )),
             Command::ListBranches | Command::Branch { .. } => {
                 Err(format!("{label} cannot branch a conversation."))
             }
@@ -1561,7 +1840,10 @@ impl Adapter for Acp {
                 id: Some(id),
                 outcome,
             } => {
-                scoped = self.turn.as_ref().is_some_and(|turn| turn.request == id);
+                scoped = self
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.requests.contains(&id));
                 self.respond(id, outcome, &mut step);
             }
         }
@@ -1591,6 +1873,8 @@ pub(crate) static TEST_PROFILE: Profile = Profile {
     ],
     offers_model: |model| !model.ends_with("-contributor"),
     sign_in_required: auth_required,
+    steers: true,
+    cancel_stops_background: true,
 };
 
 #[cfg(test)]
