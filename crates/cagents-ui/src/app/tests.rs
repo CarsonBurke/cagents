@@ -6154,7 +6154,10 @@ fn the_inspector_shortcut_toggles_the_focused_pane_and_honors_bindings_and_modal
         text: None,
         repeat,
     };
-    let default = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    let default = match settings::ShortcutPlatform::CURRENT {
+        settings::ShortcutPlatform::Linux => keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        settings::ShortcutPlatform::MacOs => keyboard::Modifiers::LOGO | keyboard::Modifiers::ALT,
+    };
     for captured in [false, true] {
         for custom in [false, true] {
             let mut app = context_inspector_test_app(true);
@@ -7455,7 +7458,7 @@ fn workspace_switcher_tab_steers_a_compositor_safe_fallback_hold() {
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Code(physical),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
             text: None,
             repeat: false,
         },
@@ -14915,7 +14918,7 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
             modified_key: keyboard::Key::Character("S".into()),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
             text: None,
             repeat: false,
         },
@@ -14929,7 +14932,10 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     );
     assert!(!app.palette.is_open());
     app.source_control_mutations.clear();
-    app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
+    app.settings.keyboard_shortcuts.command_palette = settings::parse_chords(&format!(
+        "{}+Shift+S",
+        settings::ModifierNames::CURRENT.primary
+    ));
     drop(app.update(key()));
     assert!(app.palette.is_open());
     assert!(app.source_control_mutations.is_empty(), "nothing is staged");

@@ -327,7 +327,7 @@ pub fn face_has_advances(
     face: cosmic_text::fontdb::ID,
 ) -> bool {
     database
-        .with_face_data(face, |data, index| horizontal_metric_count(data, index))
+        .with_face_data(face, horizontal_metric_count)
         .flatten()
         .is_some_and(|count| count > 0)
 }

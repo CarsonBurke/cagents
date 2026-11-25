@@ -751,20 +751,21 @@ fn submit_control(
     enter_sends: bool,
     unsendable: Option<blocked_recovery::Unsendable>,
 ) -> (Icon, String) {
-    let (command_enter, command_shift_enter) = if cfg!(target_os = "macos") {
-        ("Cmd+Enter", "Cmd+Shift+Enter")
+    let command = crate::settings::ModifierNames::CURRENT.primary;
+    let primary = if enter_sends {
+        "Enter".to_owned()
     } else {
-        ("Ctrl+Enter", "Ctrl+Shift+Enter")
+        format!("{command}+Enter")
     };
-    let primary = if enter_sends { "Enter" } else { command_enter };
+    let alternate = format!("{command}+Shift+Enter");
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
         (PromptMode::Steer, 0) => (Icon::Send, "Steer the active turn", primary),
-        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", command_shift_enter),
+        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", alternate),
         (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
-        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", command_shift_enter),
+        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", alternate),
     };
-    let tail = unsendable.map_or(chord, |unsendable| unsendable.reason);
+    let tail = unsendable.map_or(chord.as_str(), |unsendable| unsendable.reason);
     (name, format!("{verb} — {tail}"))
 }
 /// The submit mode a composer key press asks for, or `None` when the press is

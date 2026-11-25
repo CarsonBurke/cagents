@@ -7778,7 +7778,7 @@ fn prompt_notice_and_raw_output_share_transcript_selection() {
                     keyboard::key::NativeCode::Unidentified,
                 ),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat: false,
             }),
@@ -8091,7 +8091,7 @@ fn copy_web_search_native(select_all: bool) {
                     keyboard::key::NativeCode::Unidentified,
                 ),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat: false,
             }),
@@ -8854,7 +8854,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
                     keyboard::key::NativeCode::Unidentified,
                 ),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat: false,
             }),
@@ -9202,7 +9202,7 @@ fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
                             keyboard::key::NativeCode::Unidentified,
                         ),
                         location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::CTRL,
+                        modifiers: keyboard::Modifiers::COMMAND,
                         text: None,
                         repeat: false,
                     }),
@@ -11055,17 +11055,23 @@ fn a_bare_enter_submits_only_when_the_preference_asks() {
 /// keyboard path stays invisible.
 #[test]
 fn submit_tooltips_name_the_chord_the_preference_bound() {
+    let primary = crate::settings::ModifierNames::CURRENT.primary;
     for (mode, slot, enter_sends, chord) in [
-        (PromptMode::Send, 0, true, "Enter"),
-        (PromptMode::Send, 0, false, "Ctrl+Enter"),
-        (PromptMode::Steer, 0, true, "Enter"),
-        (PromptMode::Queue, 0, false, "Ctrl+Enter"),
-        (PromptMode::Steer, 1, true, "Ctrl+Shift+Enter"),
-        (PromptMode::Queue, 1, false, "Ctrl+Shift+Enter"),
+        (PromptMode::Send, 0, true, "Enter".to_owned()),
+        (PromptMode::Send, 0, false, format!("{primary}+Enter")),
+        (PromptMode::Steer, 0, true, "Enter".to_owned()),
+        (PromptMode::Queue, 0, false, format!("{primary}+Enter")),
+        (PromptMode::Steer, 1, true, format!("{primary}+Shift+Enter")),
+        (
+            PromptMode::Queue,
+            1,
+            false,
+            format!("{primary}+Shift+Enter"),
+        ),
     ] {
         let (_, label) = submit_control(mode, slot, enter_sends, None);
         assert!(
-            label.ends_with(chord),
+            label.ends_with(&chord),
             "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
         );
     }

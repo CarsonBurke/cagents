@@ -1717,13 +1717,15 @@ mod tests {
                     }),
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                    Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+                    Event::Keyboard(keyboard::Event::ModifiersChanged(
+                        keyboard::Modifiers::COMMAND,
+                    )),
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Character("a".into()),
                         modified_key: keyboard::Key::Character("a".into()),
                         physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
                         location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::CTRL,
+                        modifiers: keyboard::Modifiers::COMMAND,
                         text: None,
                         repeat: false,
                     }),

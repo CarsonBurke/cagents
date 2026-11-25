@@ -2209,6 +2209,9 @@ mod keyboard_table_tests {
         }
     }
 
+    // Spelled from the Linux table.
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn key_filter_includes_fixed_rows_and_all_matching_registered_actions() {
         let mut draft = SettingsDraft::from_settings(&AppSettings::default());

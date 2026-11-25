@@ -543,6 +543,8 @@ pub struct ModifierNames {
     pub alt: &'static str,
     pub logo: &'static str,
     pub shift: &'static str,
+    /// The application's own modifier: Ctrl on Linux, Cmd on macOS.
+    pub primary: &'static str,
     /// Whether the logo key leads, as Command does on macOS.
     logo_first: bool,
 }
@@ -553,6 +555,7 @@ impl ModifierNames {
         alt: "Alt",
         logo: "Super",
         shift: "Shift",
+        primary: "Ctrl",
         logo_first: false,
     };
     pub const MACOS: Self = Self {
@@ -560,6 +563,7 @@ impl ModifierNames {
         alt: "Option",
         logo: "Cmd",
         shift: "Shift",
+        primary: "Cmd",
         logo_first: true,
     };
     pub const CURRENT: Self = match ShortcutPlatform::CURRENT {
