@@ -29,6 +29,7 @@ use std::{
 };
 
 mod daemon_admission;
+pub mod state_claim;
 #[doc(hidden)]
 pub mod ui_options;
 #[cfg(any(feature = "host", test))]
@@ -437,6 +438,9 @@ pub(crate) fn update_fence_held() -> io::Result<bool> {
 /// the one shared daemon. The old global lock remains held shared, so older
 /// exclusive-lease binaries cannot open any of these stores concurrently.
 pub struct WindowLease {
+    // Fields drop in order: the saved window's claim goes before the slot
+    // lock it records.
+    _state: Option<state_claim::StateClaim>,
     _legacy_fence: OwnedLock,
     _slot: OwnedLock,
 }
@@ -460,6 +464,7 @@ impl WindowLease {
     ) -> io::Result<Self> {
         let (lease, slot) = Self::acquire_waiting_in(
             &runtime_directory()?,
+            Some(&state_claim::claims_directory()?),
             new_window,
             requested,
             daemon_admission::admission_wait_timeout(),
@@ -486,11 +491,21 @@ impl WindowLease {
         new_window: bool,
         requested: Option<&str>,
     ) -> io::Result<(Self, String)> {
-        Self::acquire_waiting_in(runtime, new_window, requested, Duration::ZERO, &mut |_| {})
+        Self::acquire_waiting_in(
+            runtime,
+            None,
+            new_window,
+            requested,
+            Duration::ZERO,
+            &mut |_| {},
+        )
     }
 
+    /// `claims` is where windows claim their saved state, so that a window in
+    /// another runtime directory cannot open the same saved window.
     fn acquire_waiting_in(
         runtime: &Path,
+        claims: Option<&Path>,
         new_window: bool,
         requested: Option<&str>,
         admission_timeout: Duration,
@@ -524,9 +539,30 @@ impl WindowLease {
                 libc::LOCK_EX | libc::LOCK_NB,
             ) {
                 Ok(mut lock) => {
+                    let state = match claims {
+                        Some(claims) => match state_claim::claim_window_state_in(
+                            claims,
+                            &slot,
+                            &runtime.join(slot_lock_name(&slot)),
+                        ) {
+                            Ok(claim) => Some(claim),
+                            // Another session has this saved window open; a
+                            // new window takes the next free one instead.
+                            Err(error)
+                                if new_window
+                                    && requested.is_none()
+                                    && state_claim::state_in_use(&error).is_some() =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        },
+                        None => None,
+                    };
                     daemon_admission::publish_capability(lock.file_mut())?;
                     return Ok((
                         Self {
+                            _state: state,
                             _legacy_fence: legacy,
                             _slot: lock,
                         },
@@ -5507,6 +5543,36 @@ mod startup_update_tests {
         )));
     }
     #[test]
+    fn a_window_in_another_runtime_directory_cannot_open_the_same_saved_window() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for runtime in &runtimes {
+            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let open = |runtime: &tempfile::TempDir, new_window| {
+            WindowLease::acquire_waiting_in(
+                runtime.path(),
+                Some(claims.path()),
+                new_window,
+                None,
+                Duration::ZERO,
+                &mut |_| {},
+            )
+        };
+        let (_first, slot) = open(&runtimes[0], false).unwrap();
+        assert_eq!(slot, PRIMARY_WINDOW);
+        let Err(error) = open(&runtimes[1], false) else {
+            panic!("a second session opened the primary window's saved state");
+        };
+        let refusal = state_claim::state_in_use(&error).expect("a state refusal");
+        assert_eq!(refusal.pid(), Some(process::id()));
+        // A new window in the other session takes a saved window nobody has
+        // open instead.
+        let (_second, slot) = open(&runtimes[1], true).unwrap();
+        assert_eq!(slot, "window-2");
+    }
+
+    #[test]
     fn a_window_launched_during_daemon_admission_waits_and_then_takes_its_lease() {
         let runtime = tempfile::tempdir().unwrap();
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -5515,6 +5581,7 @@ mod startup_update_tests {
         let mut waited = Vec::new();
         let (lease, slot) = WindowLease::acquire_waiting_in(
             runtime.path(),
+            None,
             false,
             None,
             Duration::from_secs(30),
@@ -5535,6 +5602,7 @@ mod startup_update_tests {
         let _admission = daemon_admission::AdmissionFence::acquire_in(runtime.path()).unwrap();
         let error = WindowLease::acquire_waiting_in(
             runtime.path(),
+            None,
             false,
             None,
             Duration::from_millis(60),

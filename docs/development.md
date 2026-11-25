@@ -509,6 +509,13 @@ nested session cannot put a UI on the user's desktop. It requires a session's
 private `nh-*` runtime directory and no `DISPLAY` or `WAYLAND_SOCKET`, which is
 what `niri-harness exec` provides.
 
+An unnamed run inside a harness session has a private runtime directory but
+the shared development storage. While the unnamed development daemon in your
+login session serves that storage, the nested run's daemon refuses to start,
+and its window says which daemon holds the storage; give the nested run an
+`--instance` instead. The same holds for the production storage: a production
+`cagents-ui` launched in a harness session refuses while your own cagents runs.
+
 To fill an instance with a realistic workspace before its first launch, see
 [Fixture workspaces](fixture-workspace.md#a-development-instance).
 
