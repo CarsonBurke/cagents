@@ -4974,7 +4974,11 @@ pub(super) fn close_captured(
         // Its Release failed. When that is because the helper died while the
         // provider runs on, say what holds the conversation; the pane offers
         // to end it.
-        let refusal = registered_holder_lost_refusal(host, &source).ok().flatten();
+        let refusal = registered_holder_lost_refusal(host, &source);
+        #[cfg(target_os = "linux")]
+        let refusal = refusal.ok().flatten();
+        #[cfg(target_os = "macos")]
+        let refusal = refusal.unwrap_or_else(Some);
         return Err(unavailable(refusal.unwrap_or(error)));
     }
     let snapshot = handle.snapshot(None).ok_or_else(|| {

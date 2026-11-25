@@ -872,10 +872,30 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
         []
     );
     assert!(record.root.reaped(), "ending left the provider running");
-    close().unwrap();
-    fixture.assert_settled();
-    assert!(!has_native_owner(&fixture.source).unwrap());
-    assert!(!fixture.socket().parent().unwrap().exists());
+    #[cfg(target_os = "linux")]
+    {
+        close().unwrap();
+        fixture.assert_settled();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let refusal = close().expect_err("a lost watch cannot prove teardown");
+        assert!(
+            refusal
+                .message
+                .contains("Cannot confirm detached provider cleanup"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            fixture
+                .host
+                .lock()
+                .unwrap()
+                .chats
+                .contains_key(&fixture.source.id)
+        );
+    }
 }
 
 /// A tool Codex started stays in its process group after Codex and the
