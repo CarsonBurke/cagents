@@ -16654,6 +16654,14 @@ impl Application for Cagents {
         std::thread::spawn(chat_ui::prune_pasted_images);
         // Before any system theme is applied, so none shows the stock warning.
         cosmic::theme::adjust_system_themes(crate::settings::attention_in_yellow);
+        // Before anything is shaped: no text may select a face swash cannot shape.
+        let unusable_faces = crate::terminal::drop_faces_without_advances();
+        if unusable_faces > 0 {
+            tracing::info!(
+                unusable_faces,
+                "Left out installed fonts that declare no advances"
+            );
+        }
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         // AppKit draws these as the traffic lights.

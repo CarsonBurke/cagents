@@ -10,9 +10,7 @@ fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a,
         let mut names: Vec<_> = fonts
             .db()
             .faces()
-            .filter(|face| {
-                face.monospaced && crate::terminal::face_has_advances(fonts.db(), face.id)
-            })
+            .filter(|face| face.monospaced)
             .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
             .collect();
         names.sort_unstable();

@@ -215,11 +215,6 @@ impl CellMetrics {
     }
 
     fn measure(font_size: f32, scale_factor: f32, family: &'static str) -> Self {
-        // Shaping a face without advances fails inside swash, so it is never
-        // measured; see `face_has_advances`.
-        if !family.is_empty() && !family_has_advances(family) {
-            return Self::measure(font_size, scale_factor, "");
-        }
         // Every face is measured up front: one face that is not fixed-pitch
         // disqualifies the whole family, and the same measurement then sets
         // that face's drawing size.
@@ -302,16 +297,28 @@ fn measured_advance(sample: &str, font_size: f32, family: &'static str, key: Fac
     paragraph.min_bounds().width / sample.len() as f32
 }
 
-/// Whether every installed face named `family` can be shaped.
-fn family_has_advances(family: &str) -> bool {
-    let fonts = font_system()
-        .read()
+/// Removes every face that cannot be shaped from the shared font database,
+/// so no setting, picker or fallback ever selects one; see
+/// [`face_has_advances`]. Runs once at startup, before any text is shaped,
+/// and returns how many faces it removed.
+pub fn drop_faces_without_advances() -> usize {
+    let mut fonts = font_system()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let database = fonts.db();
-    database
+    let fonts = fonts.raw();
+    let unusable: Vec<_> = fonts
+        .db()
         .faces()
-        .filter(|face| face.families.iter().any(|(name, _)| name == family))
-        .all(|face| face_has_advances(database, face.id))
+        .filter(|face| !face_has_advances(fonts.db(), face.id))
+        .map(|face| face.id)
+        .collect();
+    if !unusable.is_empty() {
+        let database = fonts.db_mut();
+        for face in &unusable {
+            database.remove_face(*face);
+        }
+    }
+    unusable.len()
 }
 
 /// Whether a face declares horizontal advances: an `hhea` table whose
@@ -322,7 +329,7 @@ fn family_has_advances(family: &str) -> bool {
 /// `numberOfHMetrics - 1`, which underflows: shaping one panics wherever
 /// overflow checks are on, the development runner included, and measures
 /// zero width elsewhere. Such a face is never offered or drawn with.
-pub fn face_has_advances(
+fn face_has_advances(
     database: &cosmic_text::fontdb::Database,
     face: cosmic_text::fontdb::ID,
 ) -> bool {
@@ -5265,6 +5272,30 @@ mod tests {
                 "scale {scale}: row height {physical}px is not a whole pixel"
             );
         }
+    }
+
+    /// Startup leaves only faces that can be shaped, in time that does not
+    /// hold up the first frame on a desktop with many fonts installed.
+    #[test]
+    fn startup_leaves_the_font_database_only_faces_that_can_be_shaped() {
+        // The installed fonts load on first use; only the check is timed.
+        drop(font_system().read());
+        let started = std::time::Instant::now();
+        let dropped = drop_faces_without_advances();
+        let elapsed = started.elapsed();
+        let guard = font_system()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let faces = guard.db().faces().count();
+        assert!(
+            guard
+                .db()
+                .faces()
+                .all(|face| face_has_advances(guard.db(), face.id))
+        );
+        drop(guard);
+        eprintln!("checked {} faces, dropped {dropped}, in {elapsed:?}", faces + dropped);
+        assert_eq!(drop_faces_without_advances(), 0);
     }
 
     /// Every installed family whose faces `fontdb` flags as `monospaced` or
