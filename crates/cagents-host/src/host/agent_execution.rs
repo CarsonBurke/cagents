@@ -1378,10 +1378,14 @@ fn persist_confirmed_identity(
     let Some(HostedSession::Chat(bound)) = agent.session.filter(|_| !agent.closed) else {
         return Ok(false);
     };
-    if bound.launch.session_id.is_some()
-        || !crate::agent_execution::same_chat_process(&bound, hosted)
-    {
+    if !crate::agent_execution::same_chat_process(&bound, hosted) {
         return Ok(false);
+    }
+    if bound.launch.session_id.is_some() {
+        // The agent learned it first: before its pane existed, or before a
+        // window wrote the pane from an agent it read earlier. The pane is
+        // what recovery reads once this actor is gone.
+        return store.learn_saved_pane_identity(&bound);
     }
     let mut learned = bound.clone();
     learned.launch.session_id = Some(confirmed);

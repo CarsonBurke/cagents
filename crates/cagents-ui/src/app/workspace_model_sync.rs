@@ -2981,12 +2981,48 @@ impl Cagents {
         self.adopt_execution_agent_resolved_session(agent, display, session)
     }
 
+    /// Gives open card `card`, showing `current`, the conversation ID its
+    /// agent's `session` holds, when that is the only difference: the
+    /// provider named the thread after the card was made from a descriptor
+    /// without it. Returns whether the card learned it.
+    fn learn_agent_identity(
+        &mut self,
+        card: CardId,
+        current: &crate::agent_execution::HostedSession,
+        session: &crate::agent_execution::HostedSession,
+    ) -> bool {
+        use crate::agent_execution::HostedSession;
+        let (HostedSession::Chat(current), HostedSession::Chat(learned)) = (current, session)
+        else {
+            return false;
+        };
+        if !crate::chat::is_confirmed_identity_update(current, learned) {
+            return false;
+        }
+        let Some(state) = self.card_state_mut(card) else {
+            return false;
+        };
+        state.kind = CardKind::Chat(learned.clone());
+        true
+    }
+
     fn adopt_execution_agent_resolved_session(
         &mut self,
         agent: &crate::agent_execution::Agent,
         display: crate::workspace_model::views::ManagedDisplay,
         session: crate::agent_execution::HostedSession,
     ) -> Option<Task<Message>> {
+        // A pane written before the provider named the thread shows the
+        // agent's process without the ID the agent holds; the card takes it.
+        let session = match (&session, &agent.session) {
+            (
+                crate::agent_execution::HostedSession::Chat(shown),
+                Some(crate::agent_execution::HostedSession::Chat(saved)),
+            ) if crate::chat::is_confirmed_identity_update(shown, saved) => {
+                crate::agent_execution::HostedSession::Chat(saved.clone())
+            }
+            _ => session,
+        };
         let placement = &display.scope;
         if !session.has_complete_proof()
             || self
@@ -3050,7 +3086,10 @@ impl Cagents {
             if !session.same_process(&current) {
                 return None;
             }
-            let saved = display.pane.as_ref()?;
+            let learned = self.learn_agent_identity(card_id, &current, &session);
+            let Some(saved) = display.pane.as_ref() else {
+                return learned.then(Task::none);
+            };
             let in_place = match placement {
                 crate::agent_execution::Placement::Channel(channel) => self
                     .durable
@@ -3067,7 +3106,7 @@ impl Cagents {
                 }
             };
             if in_place {
-                return None;
+                return learned.then(Task::none);
             }
             let durable = Arc::make_mut(&mut self.durable);
             durable

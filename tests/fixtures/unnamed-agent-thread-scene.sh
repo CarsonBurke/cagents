@@ -7,6 +7,9 @@
 #         stop, `forget`, and save-seed.
 #   forget  clears the saved thread IDs, with the session stopped, and
 #         records the listener each of those panes owns for `survive`.
+#   forget-pane  instead clears them from the panes alone, which the agents
+#         still name: a pane a window wrote before the provider named the
+#         thread, whose process then ended.
 #   survive  (after forget, before start) starts a stand-in for a Codex
 #         provider that outlived its daemon, serving each forgotten pane's
 #         listener. The app asks about it as it restores the card, so it must
@@ -20,7 +23,7 @@ if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
     printf '%s\n' 'unnamed-agent-thread-scene: run on the native-evidence host through plain SSH; inherited agent authority was not modified' >&2
     exit 77
 fi
-scene=${1:?usage: unnamed-agent-thread-scene.sh seed|forget|survive|survivors|end|show}
+scene=${1:?usage: unnamed-agent-thread-scene.sh seed|forget|forget-pane|survive|survivors|end|show}
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
 : "${CAGENTS_EVIDENCE_TOOL:?name scripts/native-evidence on the host}"
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -41,8 +44,8 @@ seed)
         --repository "$fixture/project" --channel "$channel" --wait --timeout 120 \
         'Review the fixture design.' >"$scene_state/agent.json"
     ;;
-forget)
-    evidence env python3 "$here/unnamed-agent-thread.py" forget >"$scene_state/forgotten.json"
+forget|forget-pane)
+    evidence env python3 "$here/unnamed-agent-thread.py" "$scene" >"$scene_state/forgotten.json"
     evidence env python3 "$here/unnamed-agent-thread.py" listeners >"$listeners"
     ;;
 survive)
@@ -73,5 +76,5 @@ show)
     sleep 1
     evidence shot "${2:-agent-card}"
     ;;
-*) printf '%s\n' 'usage: unnamed-agent-thread-scene.sh seed|forget|survive|survivors|end|show' >&2; exit 2 ;;
+*) printf '%s\n' 'usage: unnamed-agent-thread-scene.sh seed|forget|forget-pane|survive|survivors|end|show' >&2; exit 2 ;;
 esac

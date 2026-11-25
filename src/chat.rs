@@ -1179,6 +1179,56 @@ pub fn is_retained_resume_commit(source: &Session, started: &Session) -> bool {
         && started.has_valid_native_continuity()
 }
 
+/// An identity-only projection: `replacement` is `source` with nothing changed
+/// but the conversation ID and native continuity its provider confirmed. It
+/// covers retained Claude helpers and daemon-hosted Codex threads on their own
+/// listener, the two actors whose first identity arrives after the descriptor
+/// was saved. This shape grants no authority: callers must authenticate the
+/// exact source lineage (the hosted actor, the helper's census, or the
+/// daemon's own saved agent record) before updating a saved agent or pane.
+pub fn is_confirmed_identity_update(source: &Session, replacement: &Session) -> bool {
+    let learns = match source.launch.provider {
+        Provider::Claude => matches!(
+            source.native_continuity,
+            NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ),
+        // A begun Codex thread never changes identity, and only a thread on
+        // its own listener belongs to this one hosted conversation.
+        Provider::Codex => {
+            source.launch.session_id.is_none()
+                && source.owns_codex_listener()
+                && source.native_continuity == NativeContinuity::ReconnectOnly
+        }
+        _ => false,
+    };
+    if !learns
+        || !source.has_valid_native_continuity()
+        || !replacement.has_valid_native_continuity()
+        || !source
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_complete())
+        || replacement
+            .launch
+            .session_id
+            .as_ref()
+            .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+    {
+        return false;
+    }
+    let mut projected = source.clone();
+    projected.launch.session_id = replacement.launch.session_id.clone();
+    if source.launch.provider == Provider::Codex
+        && matches!(
+            replacement.native_continuity,
+            NativeContinuity::Durable { .. }
+        )
+    {
+        projected.native_continuity = replacement.native_continuity.clone();
+    }
+    projected == *replacement
+}
+
 /// A formerly hosted pane may never have observed its first provider identity.
 /// This narrow transition is usable only after authenticated upgrade resolution,
 /// exact attachment and snapshot confirmation, followed by a writer receipt.

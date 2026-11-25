@@ -557,6 +557,28 @@ fn save_abandoned_identities(host: &SharedHost) {
     }
 }
 
+/// Saves each open agent's conversation ID to its pane where the pane shows
+/// the same process without one, so a chat whose process is gone reopens its
+/// conversation instead of reporting that cagents lost track of it.
+fn save_agent_pane_identities(host: &SharedHost) {
+    let Ok(registry) = agent_execution::registry(host) else {
+        return;
+    };
+    let saved = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .save_agent_pane_identities();
+    if let Some(error) = saved.unread {
+        tracing::warn!(%error, "cannot read the agents whose panes lack their conversation ID");
+    }
+    if !saved.written.is_empty() {
+        tracing::info!(chats = ?saved.written, "saved agents' conversation IDs to the panes that lacked them");
+    }
+    for (chat, error) in saved.failed {
+        tracing::warn!(%chat, %error, "cannot save this agent's conversation ID to its pane; a later start tries again");
+    }
+}
+
 fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
     use crate::chat::runtime::Deliveries;
 
@@ -743,6 +765,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         if restored.is_ok() {
             save_abandoned_identities(&host);
         }
+        // An open agent's own ID is the daemon's record whatever restore
+        // reached, so its pane learns it before any client reads the pane.
+        save_agent_pane_identities(&host);
         match restored {
             Ok(()) => Ok(()),
             Err(error) => {
