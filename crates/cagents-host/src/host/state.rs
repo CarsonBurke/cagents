@@ -412,6 +412,9 @@ pub(crate) struct HostState {
     /// Keyed sends survive replacement of a chat's process or attachment.
     pub(super) chat_deliveries: Option<Arc<crate::chat::runtime::Deliveries>>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
+    /// The attached windows holding follow-ups the person wrote for each
+    /// conversation's next turn, which the courier lets go first.
+    pub(super) held_followups: BTreeMap<TerminalId, BTreeSet<ClientId>>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     /// Subset of transition reservations that retire an exact original source.
@@ -574,6 +577,7 @@ impl HostState {
             prompt_cache: Arc::new(super::agent_execution::prompt_cache::Calibration::in_memory()),
             chat_deliveries: None,
             chats: BTreeMap::new(),
+            held_followups: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_close_reservations: BTreeMap::new(),
@@ -1148,6 +1152,10 @@ impl HostState {
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
         }
+        self.held_followups.retain(|_, holders| {
+            holders.remove(&client_id);
+            !holders.is_empty()
+        });
         // With each terminal's visibility before the disconnect: only a change
         // is sent, as every other writer does. Re-sending Visible while
         // another client still shows the terminal would force a full capture.

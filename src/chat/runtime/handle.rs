@@ -712,6 +712,17 @@ impl Handle {
             Owner::Remote(remote) => remote.state().idle,
         }
     }
+    /// Whether the courier may start a turn now: the conversation is idle
+    /// and its provider holds nothing the person queued.
+    pub fn takes_courier(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.takes_courier(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                state.idle && !state.queued_input
+            }
+        }
+    }
     /// The provider-confirmed permission mode. A local actor reads it
     /// without publishing a snapshot.
     pub fn permission_mode(&self) -> Option<String> {

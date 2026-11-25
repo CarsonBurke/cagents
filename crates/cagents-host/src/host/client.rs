@@ -174,6 +174,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ChatCommand { .. }
             | ClientRequest::ChatDeliver { .. }
             | ClientRequest::ChatVisibility { .. }
+            | ClientRequest::ChatHoldsFollowups { .. }
             | ClientRequest::ChatRead { .. }
             | ClientRequest::ChatAcknowledge { .. }
             | ClientRequest::ChatList
@@ -555,21 +556,29 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     {
         let gate = control_gate(host);
         let _control = gate.shared();
-        let handles = {
+        let (handles, held_followups) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if state.shutting_down && !state.ordinary_exit_cleanup_pending() {
                 // Shutdown owns the remaining session state. Removing delivery is
                 // safe, but unregistering would enqueue visibility/redraw effects
                 // after the upgrade's terminal snapshots have been committed.
                 state.forget_client_delivery(client_id);
-                Vec::new()
+                (Vec::new(), false)
             } else {
-                state.unregister_client(client_id)
+                let held_followups = state
+                    .held_followups
+                    .values()
+                    .any(|holders| holders.contains(&client_id));
+                (state.unregister_client(client_id), held_followups)
             }
         };
         // Clear a disconnected GUI's outstanding redraw edge outside HostState.
         for handle in handles {
             handle.acknowledge_redraw(handle.generation());
+        }
+        // Messages waiting behind the follow-ups it held need not wait on it.
+        if held_followups {
+            super::agent_execution::mailbox::wake(host);
         }
     }
     // Outside the control gate: unwatching waits for a board being assembled,
@@ -1947,6 +1956,7 @@ fn process_admitted_request(
         | ClientRequest::ChatCommand { .. }
         | ClientRequest::ChatDeliver { .. }
         | ClientRequest::ChatVisibility { .. }
+        | ClientRequest::ChatHoldsFollowups { .. }
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
         | ClientRequest::ChatClose { .. }

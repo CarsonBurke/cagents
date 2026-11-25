@@ -186,6 +186,10 @@ pub struct Resident {
     pub installed: bool,
     pub close: CloseObservation,
     pub idle: bool,
+    /// Whether the provider holds messages the person queued, which go
+    /// before the courier's. A helper that predates it reports none.
+    #[serde(default)]
+    pub queued_input: bool,
     pub failure: Option<String>,
     /// When the latest turn finished, in Unix milliseconds. A helper that
     /// predates it reports none.
@@ -547,6 +551,7 @@ impl RemoteActor {
                 owns_work: true,
             },
             idle: true,
+            queued_input: false,
             failure: None,
             finished_at: None,
             confirmed_session: None,
@@ -3016,6 +3021,7 @@ impl Server {
         let sampled_activity = state.activity();
         let work_hold = state.work_hold();
         let background_tasks = state.background_tasks;
+        let queued_input = !state.queued_messages.is_empty();
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -3101,6 +3107,7 @@ impl Server {
             owns_work: owns_work || failure.is_some(),
             completed,
             idle,
+            queued_input,
             failure,
             finished_at: self.actor.finished_at(),
             confirmed_session,

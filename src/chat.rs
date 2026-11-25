@@ -3890,7 +3890,7 @@ fn mailbox_prompt(text: &str) -> bool {
     // This filters title candidates on replay. A seal grants no authority
     // here. Only the daemon's recognizer can turn a prompt into a delivery.
     text.starts_with("[cagents ")
-        && crate::agent_execution::mailbox::open(text, |_, seal| {
+        && crate::agent_execution::mailbox::open_all(text, |_, seal| {
             seal.len() == 32 && seal.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
         .is_some()

@@ -334,7 +334,11 @@ use crate::{
 /// on long work without stopping its subagents. An older client is sent
 /// snapshots without both fields; one read from an older update source has
 /// neither.
-pub const PROTOCOL_VERSION: u16 = 205;
+///
+/// Version 206 appends `ChatHoldsFollowups`: whether a window holds messages
+/// the person wrote for a conversation's next turn, which go before the
+/// courier's. An older client never sends it.
+pub const PROTOCOL_VERSION: u16 = 206;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -868,6 +872,14 @@ pub enum ClientRequest {
         nonce: [u8; crate::device_trust::SECRET_BYTES],
     },
     ProviderStatus,
+    /// Whether this attached window holds follow-ups the person wrote for
+    /// the chat's next turn, which its provider has no queue to take. The
+    /// courier starts no turn ahead of them for a short while once the turn
+    /// ends. Detaching or disconnecting withdraws it.
+    ChatHoldsFollowups {
+        chat_id: TerminalId,
+        held: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

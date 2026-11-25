@@ -7466,7 +7466,11 @@ impl Runtime {
                 let result = if frozen {
                     handle.hand_off_source_body()
                 } else {
-                    handle.set_interest(interested, retain_body)
+                    // The daemon's courier waits while the person has
+                    // follow-ups lined up here, so they go before its messages.
+                    handle
+                        .set_holds_followups(!self.followups.is_empty())
+                        .and_then(|()| handle.set_interest(interested, retain_body))
                 };
                 match result {
                     // The connection can drop between the check and the call, and

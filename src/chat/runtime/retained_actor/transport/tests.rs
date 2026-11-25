@@ -1392,6 +1392,33 @@ fn retained_parent_accepts_prompts_while_background_children_keep_working() {
     assert_eq!(fixture.server.resident().unwrap().prompt_revision, before);
 }
 #[test]
+fn a_retained_helper_reports_what_the_person_queued_with_its_provider() {
+    let fixture = resident_fixture();
+    fixture.server.actor.0.state.lock().unwrap().busy = false;
+    assert!(!fixture.server.resident().unwrap().queued_input);
+    fixture
+        .server
+        .actor
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .queued_messages
+        .push(chat::QueuedMessage::new("person-1".into(), "Next".into()));
+    let resident = fixture.server.resident().unwrap();
+    assert!(resident.queued_input);
+    assert!(resident.idle, "the person may still send it");
+    // A helper from before the field reports nothing queued.
+    let mut older = serde_json::to_value(&resident).unwrap();
+    older.as_object_mut().unwrap().remove("queued_input");
+    assert!(
+        !serde_json::from_value::<Resident>(older)
+            .unwrap()
+            .queued_input
+    );
+}
+
+#[test]
 fn a_helper_that_predates_named_holds_still_reports_its_background_work() {
     let mut resident = serde_json::to_value(RemoteActor::fixture().state().as_ref()).unwrap();
     let fields = resident.as_object_mut().unwrap();

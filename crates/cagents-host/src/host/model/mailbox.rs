@@ -608,20 +608,107 @@ impl Registry {
 
     /// Settles a message as given to `session`. False when it was already
     /// settled, by another delivery or by its recipient reading it.
+    #[cfg(test)]
     pub(crate) fn deliver_message(
         &mut self,
         id: MessageId,
         session: TerminalId,
         now: u64,
     ) -> Result<bool, String> {
-        self.db
-            .execute(
-                "UPDATE messages SET state = 'delivered', delivered_session = ?2, settled_ms = ?3
-                 WHERE id = ?1 AND state = 'pending'",
-                params![id.to_string(), session.to_string(), now as i64],
+        Ok(!self.deliver_messages(&[id], session, now)?.is_empty())
+    }
+
+    /// Every pending message `lineage` may now receive, oldest first: what
+    /// the courier hands its conversation together, in one prompt. A reply
+    /// held for an asker still waiting on it stays out, as it does of
+    /// [`Self::deliverable_messages`].
+    pub(crate) fn deliverable_to(
+        &self,
+        lineage: Lineage,
+        now: u64,
+    ) -> Result<Vec<Message>, String> {
+        let mut statement = self
+            .db
+            .prepare_cached(&format!(
+                "SELECT {COLUMNS} FROM messages m
+                 WHERE m.recipient_lineage = :lineage AND {ELIGIBLE_PENDING}
+                 ORDER BY m.created_ms, m.rowid LIMIT :limit"
+            ))
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(
+                rusqlite::named_params! {
+                    ":lineage": lineage.to_string(),
+                    ":now": now as i64,
+                    ":limit": MAX_PENDING as i64,
+                },
+                message,
             )
-            .map(|changed| changed == 1)
+            .and_then(Iterator::collect)
             .map_err(|error| error.to_string())
+    }
+
+    /// Settles each of `ids` as given to `session`, together: either every
+    /// one still pending is settled or none is. Returns those it settled, in
+    /// the order given; the rest were already settled, by another delivery
+    /// or by their recipient reading them.
+    pub(crate) fn deliver_messages(
+        &mut self,
+        ids: &[MessageId],
+        session: TerminalId,
+        now: u64,
+    ) -> Result<Vec<MessageId>, String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut settled = Vec::with_capacity(ids.len());
+        {
+            let mut update = tx
+                .prepare_cached(
+                    "UPDATE messages SET state = 'delivered', delivered_session = ?2, settled_ms = ?3
+                     WHERE id = ?1 AND state = 'pending'",
+                )
+                .map_err(|error| error.to_string())?;
+            for id in ids {
+                if update
+                    .execute(params![id.to_string(), session.to_string(), now as i64])
+                    .map_err(|error| error.to_string())?
+                    == 1
+                {
+                    settled.push(*id);
+                }
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(settled)
+    }
+
+    /// Returns messages `session` refused to the queue they were claimed
+    /// from, together.
+    pub(crate) fn undeliver_messages(
+        &mut self,
+        ids: &[MessageId],
+        session: TerminalId,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        {
+            let mut update = tx
+                .prepare_cached(
+                    "UPDATE messages SET state = 'pending', delivered_session = NULL, settled_ms = NULL
+                     WHERE id = ?1 AND state = 'delivered' AND delivered_session = ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            for id in ids {
+                update
+                    .execute(params![id.to_string(), session.to_string()])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Settles a pending message as given to its recipient agent and accepts
@@ -666,22 +753,6 @@ impl Registry {
         };
         tx.commit().map_err(|error| error.to_string())?;
         Ok(MessageHandoff::Accepted(Box::new(accepted)))
-    }
-
-    /// Returns a message `session` refused to the queue it was claimed from.
-    pub(crate) fn undeliver_message(
-        &mut self,
-        id: MessageId,
-        session: TerminalId,
-    ) -> Result<(), String> {
-        self.db
-            .execute(
-                "UPDATE messages SET state = 'pending', delivered_session = NULL, settled_ms = NULL
-                 WHERE id = ?1 AND state = 'delivered' AND delivered_session = ?2",
-                params![id.to_string(), session.to_string()],
-            )
-            .map(drop)
-            .map_err(|error| error.to_string())
     }
 
     /// Returns bodies without changing delivery state. A reply that cannot
@@ -1719,6 +1790,69 @@ mod tests {
         assert_eq!(
             registry.message(first.id).unwrap().unwrap().to.session,
             Some(session)
+        );
+    }
+
+    #[test]
+    fn messages_handed_over_together_settle_each_once_and_return_together() {
+        let (mut registry, _directory) = registry();
+        let (a, b) = (Lineage(TerminalId::new()), Lineage(TerminalId::new()));
+        // b asked a, waiting on the reply until 100.
+        let mut asked = message(party(b), party(a), 0);
+        asked.wait_until_ms = Some(100);
+        let mut held = message(party(a), party(b), 1);
+        held.reply_to = Some(asked.id);
+        let first = message(party(a), party(b), 2);
+        let second = message(Party::user(), party(b), 3);
+        let third = message(party(a), party(b), 4);
+        // Posted out of order: when each was written decides.
+        for message in [&asked, &third, &first, &held, &second] {
+            registry.post_message(message).unwrap();
+        }
+        let waiting = |registry: &Registry, at| {
+            registry
+                .deliverable_to(b, at)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        };
+        // A reply held for its asker stays out until released.
+        assert_eq!(waiting(&registry, 10), [first.id, second.id, third.id]);
+        assert_eq!(
+            waiting(&registry, 100),
+            [held.id, first.id, second.id, third.id]
+        );
+
+        // The recipient read one while the courier was handing them over.
+        let session = TerminalId::new();
+        assert!(registry.deliver_message(second.id, session, 11).unwrap());
+        let ids = [first.id, second.id, third.id];
+        assert_eq!(
+            registry.deliver_messages(&ids, session, 12).unwrap(),
+            [first.id, third.id]
+        );
+        assert!(waiting(&registry, 13).is_empty());
+        assert!(
+            registry
+                .deliver_messages(&ids, session, 14)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Refused, they wait again, all but the one settled before; another
+        // session's refusal returns none of them.
+        registry
+            .undeliver_messages(&ids, TerminalId::new())
+            .unwrap();
+        assert!(waiting(&registry, 15).is_empty());
+        registry
+            .undeliver_messages(&[first.id, third.id], session)
+            .unwrap();
+        assert_eq!(waiting(&registry, 16), [first.id, third.id]);
+        assert_eq!(
+            registry.message(first.id).unwrap().unwrap().to.session,
+            None
         );
     }
 
