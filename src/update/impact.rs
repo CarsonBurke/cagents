@@ -275,11 +275,16 @@ impl SessionImpact {
         if warns_about_agent_run
             && let SessionCause::AgentRunUnconfirmed { queued_prompts } = self.reason
         {
-            reason.push_str(" Updating now can leave this agent’s run without a confirmed result. The agent may then stop taking new work");
+            reason.push_str(if self.disposition == Disposition::WaitsForIdle {
+                " Updating now"
+            } else {
+                " Updating"
+            });
+            reason.push_str(" can leave this agent’s run without a confirmed result. The agent may then stop taking new work");
             if queued_prompts {
                 reason.push_str(", leaving its queued prompts unsent");
             }
-            reason.push_str(". Messages can still reach the conversation after it reopens.");
+            reason.push_str(". Messages can still reach the conversation.");
         }
         SessionReview {
             id: self.id,
