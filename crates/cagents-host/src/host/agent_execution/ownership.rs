@@ -1,5 +1,7 @@
 //! Serialize automatic cleanup with interactive ownership changes. Displaying
 //! a conversation is not takeover; issuing work or opening native controls is.
+//! Answering a request that can grant the agent something is not: an owner
+//! whose approvals are limited relies on a person to give that answer.
 use super::*;
 use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
 
@@ -52,6 +54,23 @@ pub(in crate::host) fn interactive(
     let Some(agent) = agent else {
         return apply(request);
     };
+    // Answering a request that can grant the agent something, such as a tool
+    // approval its limited owner was refused, answers for that owner, who
+    // keeps the agent's controls.
+    let claims = claims
+        && match &request {
+            ClientRequest::ChatCommand { command, .. }
+            | ClientRequest::ChatDeliver { command, .. } => {
+                let handle = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .chats
+                    .get(&id)
+                    .map(|record| record.handle.clone());
+                !handle.is_some_and(|handle| answers_grant(&handle, agent.spec.provider, command))
+            }
+            _ => true,
+        };
     let gate = agent_gate(host, agent.id);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     if claims {
