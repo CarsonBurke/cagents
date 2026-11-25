@@ -6,8 +6,10 @@
 //! is added to the conversations it lists. Antigravity 1.5.13 answers
 //! `{"sessions": [{"sessionId", "cwd", "title", "updatedAt"}]}` in one page,
 //! unordered; the protocol allows more pages through `nextCursor`.
+#[cfg(any(target_os = "linux", test))]
+use std::collections::HashMap;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     path::{Path, PathBuf},
     time::Duration,
@@ -252,7 +254,9 @@ pub fn held<'a>(
     root: &Path,
     ids: impl IntoIterator<Item = &'a str>,
 ) -> HashSet<String> {
+    #[cfg(target_os = "linux")]
     let locked = locked_inodes(&std::fs::read_to_string("/proc/locks").unwrap_or_default());
+    #[cfg(target_os = "linux")]
     if locked.is_empty() {
         return HashSet::new();
     }
@@ -278,27 +282,64 @@ pub fn held<'a>(
         Provider::Muse => muse_session_locks(&root.join("sessions"), &ids),
         Provider::Claude | Provider::Codex | Provider::Omp => Vec::new(),
     };
-    use std::os::unix::fs::MetadataExt;
     locks
         .into_iter()
         .filter(|(_, lock)| {
-            let Ok(metadata) = std::fs::symlink_metadata(lock) else {
-                return false;
-            };
-            // The lock table names a file by its inode alone, which another
-            // file system can share, so a holder must have this file open.
-            metadata.is_file()
-                && locked.get(&metadata.ino()).is_some_and(|holders| {
-                    holders
-                        .iter()
-                        .any(|&pid| holds_open(pid, (metadata.dev(), metadata.ino())))
-                })
+            #[cfg(target_os = "linux")]
+            return is_locked(lock, &locked);
+            #[cfg(target_os = "macos")]
+            return is_locked(lock);
         })
         .map(|(id, _)| id)
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn is_locked(lock: &Path, locked: &HashMap<u64, Vec<u32>>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(lock) else {
+        return false;
+    };
+    // The lock table names a file by its inode alone, which another
+    // file system can share, so a holder must have this file open.
+    metadata.is_file()
+        && locked.get(&metadata.ino()).is_some_and(|holders| {
+            holders
+                .iter()
+                .any(|&pid| holds_open(pid, (metadata.dev(), metadata.ino())))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn is_locked(lock: &Path) -> bool {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock)
+    else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    // XNU tests both flock and record locks against this range. A conflicting
+    // lock is sufficient here; we do not need to identify or signal its owner.
+    let mut query = libc::flock {
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+        l_type: libc::F_WRLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    };
+    // SAFETY: file retains the descriptor and query is initialized writable
+    // storage. F_GETLK queries a conflict without taking or changing a lock.
+    (unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut query) } == 0)
+        && query.l_type != libc::F_UNLCK as libc::c_short
+}
+
 /// Whether process `pid` has the file `(device, inode)` open.
+#[cfg(target_os = "linux")]
 fn holds_open(pid: u32, file: (u64, u64)) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
@@ -345,6 +386,7 @@ fn muse_session_locks(sessions: &Path, ids: &HashSet<&str>) -> Vec<(String, Path
 /// lock, by its `MAJOR:MINOR:INODE` field, with the processes holding it,
 /// by the field before. The device is not compared: a Btrfs subvolume's
 /// files report another device than the lock table does.
+#[cfg(any(target_os = "linux", test))]
 fn locked_inodes(table: &str) -> HashMap<u64, Vec<u32>> {
     let mut locked = HashMap::<u64, Vec<u32>>::new();
     for line in table.lines() {
