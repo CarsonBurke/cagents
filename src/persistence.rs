@@ -7009,6 +7009,7 @@ mod tests {
         BootId::new(value)
     }
 
+    #[cfg(target_os = "linux")]
     const VISITOR_TEST: &str = "persistence::tests::another_process_visits_the_store";
     const VISITOR_ENV: &str = "CAGENTS_STORE_VISITOR_DATABASE";
 

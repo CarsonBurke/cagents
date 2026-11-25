@@ -73,8 +73,10 @@ impl Process {
 }
 
 /// A process reaped between opening and reading its stat file fails the read
-/// with ESRCH. It is as absent as one whose entry is already gone.
-#[cfg(any(target_os = "linux", feature = "host"))]
+/// with ESRCH. It is as absent as one whose entry is already gone. Linux's
+/// [`Process::read`] needs it everywhere, and [`super::codex_temp`] in
+/// every lane that builds it.
+#[cfg(any(target_os = "linux", feature = "host", feature = "ui"))]
 pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::ESRCH) {
         io::Error::new(io::ErrorKind::NotFound, error)

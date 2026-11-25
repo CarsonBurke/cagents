@@ -208,6 +208,19 @@ impl Root {
         ))
     }
 
+    /// A second descriptor for this retained directory, for a child to enter
+    /// with `fchdir`: Darwin's `/dev/fd/N` names a directory descriptor but
+    /// cannot be traversed or entered, so it has no [`Self::process_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] when the descriptor cannot be
+    /// duplicated.
+    #[cfg(all(target_os = "macos", any(feature = "ui", feature = "host")))]
+    pub(crate) fn try_clone_descriptor(&self) -> io::Result<OwnedFd> {
+        self.directory.try_clone()
+    }
+
     pub(crate) fn descriptor(&self) -> RawFd {
         self.directory.as_raw_fd()
     }
@@ -662,6 +675,15 @@ pub(crate) fn directory_unlinked(directory: &Root) -> io::Result<bool> {
         return Ok(true);
     }
     Err(error)
+}
+
+/// A Darwin `fsid_t` as one number: it names a mounted filesystem.
+#[cfg(target_os = "macos")]
+pub(crate) fn fsid_identity(fsid: libc::fsid_t) -> u64 {
+    // SAFETY: libc's `fsid_t` is the `repr(C)` pair of `int32_t` that Darwin
+    // defines, whose field it keeps private.
+    let [high, low] = unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(fsid) };
+    (u64::from(high as u32) << 32) | u64::from(low as u32)
 }
 
 /// The mounted filesystem holding a retained descriptor.

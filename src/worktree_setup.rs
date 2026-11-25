@@ -255,7 +255,20 @@ impl SetupCheckout {
         self.check()?;
         index.check(&self.admin)?;
         check_cancel(cancel)?;
-        let spec = RepositoryService::system("git")
+        let spec = self.git(index)?.args(args);
+        let result = SystemProcessExecutor
+            .execute(&spec, cancel)
+            .map_err(error)?;
+        self.check()?;
+        index.check(&self.admin)?;
+        Ok(result)
+    }
+
+    /// Git addressing every checked directory and the index through this
+    /// process's retained descriptors, so renaming them cannot redirect it.
+    #[cfg(target_os = "linux")]
+    fn git(&self, index: &SetupIndex) -> Result<crate::process::CommandSpec, SetupError> {
+        Ok(RepositoryService::system("git")
             .git_base(&self.target.process_path(), true)
             .arg(format!("--git-dir={}", self.admin.process_path().display()))
             .arg(format!(
@@ -267,19 +280,39 @@ impl SetupCheckout {
             .env(
                 "GIT_INDEX_FILE",
                 format!("/proc/{}/fd/{}", std::process::id(), index.file.as_raw_fd()),
+            ))
+    }
+
+    /// Darwin's `/dev/fd` cannot be traversed into a directory, so this is
+    /// weaker than Linux. Git starts in the retained work tree and reads the
+    /// retained index, inherited as `/dev/fd/N`; the admin and common
+    /// directories are named by path. Git resolves its directories to paths
+    /// itself as it starts, so a rename while it runs could redirect it;
+    /// [`Self::check`] before and after the run refuses any such change.
+    #[cfg(target_os = "macos")]
+    fn git(&self, index: &SetupIndex) -> Result<crate::process::CommandSpec, SetupError> {
+        let mut git_dir = OsString::from("--git-dir=");
+        git_dir.push(self.admin.path());
+        RepositoryService::system("git")
+            .git_base(Path::new("."), true)
+            .cwd_held(std::sync::Arc::new(
+                self.target.try_clone_descriptor().map_err(error)?,
+            ))
+            .arg(git_dir)
+            .arg("--work-tree=.")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .env("GIT_COMMON_DIR", self.common.path())
+            .env(
+                "GIT_INDEX_FILE",
+                format!("/dev/fd/{}", index.file.as_raw_fd()),
             )
-            .args(args);
-        let result = SystemProcessExecutor
-            .execute(&spec, cancel)
-            .map_err(error)?;
-        self.check()?;
-        index.check(&self.admin)?;
-        Ok(result)
+            .inherit_file(std::sync::Arc::clone(&index.file))
+            .map_err(error)
     }
 }
 
 struct SetupIndex {
-    file: fs::File,
+    file: std::sync::Arc<fs::File>,
     fingerprint: SourceFingerprint,
 }
 
@@ -291,7 +324,7 @@ impl SetupIndex {
             return Err(error("setup index must be a regular file"));
         }
         let result = Self {
-            file,
+            file: std::sync::Arc::new(file),
             fingerprint: source_fingerprint(&metadata),
         };
         result.check(admin)?;
@@ -1299,6 +1332,9 @@ mod tests {
         assert!(!fixture.destination.join(".env").exists());
     }
 
+    // POSIX ACLs are Linux's `system.posix_acl_*` extended attributes; Darwin
+    // keeps ACLs outside xattrs, and its xattr calls take a position argument.
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_preserves_restrictive_access_acl_and_removes_inherited_acl() {
         use std::os::fd::AsRawFd;

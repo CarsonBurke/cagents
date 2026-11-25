@@ -179,6 +179,7 @@ fn verify_process(pid: u32, ticks: u64, executable: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(target_os = "linux")]
 fn socket_pid(socket: &Path) -> Result<u32> {
     let stream = UnixStream::connect(socket)?;
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
@@ -203,6 +204,14 @@ fn socket_pid(socket: &Path) -> Result<u32> {
         return Err(fail("daemon socket has invalid peer credentials"));
     }
     Ok(credentials.pid as u32)
+}
+/// This tool proves the old daemon's identity through `/proc`, which Darwin
+/// lacks, so it authorizes no replacement there.
+#[cfg(target_os = "macos")]
+fn socket_pid(_socket: &Path) -> Result<u32> {
+    Err(fail(
+        "replacing an installed daemon is supported only on Linux; no replacement authorized",
+    ))
 }
 fn verify_old(client: &mut ControlClient, socket: &Path, args: &Args) -> Result<()> {
     if socket_pid(socket)? != args.old_pid
@@ -601,6 +610,10 @@ mod tests {
         );
         assert!(check_start_report(b"unexpected output").is_err());
     }
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "process identity comes from Linux's /proc"
+    )]
     #[test]
     fn pid_reuse_or_wrong_executable_cannot_authorize_replacement() {
         let pid = std::process::id();

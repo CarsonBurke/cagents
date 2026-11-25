@@ -839,13 +839,29 @@ fn detached_browser_helper(process: &Path) -> bool {
 /// The user manager and PAM helper can deny environ reads even to their owner.
 /// A hosted PTY always starts a new POSIX session; its descendants cannot join
 /// this pre-existing service session. Authenticate it, never trust process names.
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(all(target_os = "linux", any(feature = "host", feature = "ui")))]
 struct UserManagerSession {
     id: i32,
     process: fs::File,
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
+/// Darwin has no systemd user manager, so no process is excused as its
+/// service session.
+#[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+enum UserManagerSession {}
+
+#[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+impl UserManagerSession {
+    fn connect() -> Option<Self> {
+        None
+    }
+
+    fn contains(&self, _pid: u32) -> bool {
+        match *self {}
+    }
+}
+
+#[cfg(all(target_os = "linux", any(feature = "host", feature = "ui")))]
 impl UserManagerSession {
     fn connect() -> Option<Self> {
         use std::os::{

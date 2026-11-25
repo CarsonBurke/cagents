@@ -2,8 +2,10 @@
 
 #[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) mod clock;
-pub(crate) mod identity;
+pub mod identity;
 mod poll;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) mod table;
 
 use crate::descriptor::set_nonblocking;
 use identity::{child_exit_status, child_identity};
@@ -98,6 +100,20 @@ impl PartialEq for InheritedFile {
 }
 impl Eq for InheritedFile {}
 
+/// A directory a child starts in, entered by descriptor rather than by path.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct HeldDirectory(Arc<OwnedFd>);
+
+#[cfg(target_os = "macos")]
+impl PartialEq for HeldDirectory {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+#[cfg(target_os = "macos")]
+impl Eq for HeldDirectory {}
+
 fn validate_inherited_fd(fd: i32) -> io::Result<()> {
     if fd < 3 {
         return Err(io::Error::new(
@@ -124,6 +140,8 @@ pub struct CommandSpec {
     // child opens its independent SH description after fork and retains it across exec.
     pub(crate) inherited_lease: Option<i32>,
     inherited_files: Vec<InheritedFile>,
+    #[cfg(target_os = "macos")]
+    held_directory: Option<HeldDirectory>,
 }
 
 impl CommandSpec {
@@ -140,6 +158,8 @@ impl CommandSpec {
             stderr_limit: DEFAULT_STDERR_LIMIT,
             inherited_lease: None,
             inherited_files: Vec::new(),
+            #[cfg(target_os = "macos")]
+            held_directory: None,
         }
     }
 
@@ -198,6 +218,17 @@ impl CommandSpec {
         Ok(self)
     }
 
+    /// Starts the child in the directory `directory` holds, entered with
+    /// `fchdir` after fork, so renaming paths before the spawn cannot move
+    /// it elsewhere. Linux children reach a held directory through
+    /// `/proc/<pid>/fd` instead; Darwin's `/dev/fd` cannot be traversed.
+    /// This replaces any [`Self::cwd`].
+    #[cfg(target_os = "macos")]
+    pub(crate) fn cwd_held(mut self, directory: Arc<OwnedFd>) -> Self {
+        self.held_directory = Some(HeldDirectory(directory));
+        self
+    }
+
     pub fn to_command(&self) -> Command {
         let mut command = Command::new(&self.program);
         #[cfg(unix)]
@@ -233,6 +264,23 @@ impl CommandSpec {
                         Ok(())
                     });
                 }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(directory) = &self.held_directory {
+            use std::os::unix::process::CommandExt;
+            // Clone before fork. The closure owns the descriptor through spawn
+            // and std runs it after any path chdir, so it decides the cwd.
+            let directory = directory.clone();
+            // SAFETY: only the async-signal-safe fchdir runs after fork, on a
+            // descriptor the captured Arc keeps open.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(directory.0.as_raw_fd()) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
             }
         }
         command.args(&self.arguments);

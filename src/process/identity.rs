@@ -15,11 +15,19 @@ use std::{
 };
 
 /// Pins `child` for its executor's lifetime. Call before anything can reap it.
-#[cfg(target_os = "linux")]
 pub(crate) fn child_identity(child: &std::process::Child) -> io::Result<OwnedFd> {
+    unreaped_child_identity(child.id())
+}
+
+/// Pins the caller's own child `pid`, which it alone reaps, for as long as it
+/// stays unreaped. Call before anything can reap it; a pid reaped already may
+/// name an unrelated process. The handle turns readable once that child
+/// exits, and [`child_exit_status`] reads its status.
+#[cfg(target_os = "linux")]
+pub fn unreaped_child_identity(pid: u32) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open returns a new close-on-exec descriptor for our newly
     // spawned, unreaped child. The guard never recreates it after reaping.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
     if descriptor < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -27,9 +35,12 @@ pub(crate) fn child_identity(child: &std::process::Child) -> io::Result<OwnedFd>
     }
 }
 
-/// Pins `child` for its executor's lifetime. Call before anything can reap it.
+/// Pins the caller's own child `pid`, which it alone reaps, for as long as it
+/// stays unreaped. Call before anything can reap it; a pid reaped already may
+/// name an unrelated process. The handle turns readable once that child
+/// exits, and [`child_exit_status`] reads its status.
 #[cfg(target_os = "macos")]
-pub(crate) fn child_identity(child: &std::process::Child) -> io::Result<OwnedFd> {
+pub fn unreaped_child_identity(pid: u32) -> io::Result<OwnedFd> {
     // SAFETY: kqueue returns a new descriptor that this function owns.
     let raw = unsafe { libc::kqueue() };
     if raw < 0 {
@@ -37,7 +48,6 @@ pub(crate) fn child_identity(child: &std::process::Child) -> io::Result<OwnedFd>
     }
     let queue = unsafe { OwnedFd::from_raw_fd(raw) };
     crate::descriptor::set_close_on_exec(std::os::fd::AsFd::as_fd(&queue))?;
-    let pid = child.id();
     match register(&queue, pid as usize, libc::EVFILT_PROC, libc::NOTE_EXIT) {
         Ok(()) => Ok(queue),
         // The kernel refuses to watch a child that is already a zombie. It is
@@ -92,7 +102,7 @@ fn register(queue: &OwnedFd, ident: usize, filter: i16, fflags: u32) -> io::Resu
 /// Reads the original child's status. `flags` always includes `WEXITED`; with
 /// `WNOWAIT` the child stays unreaped and its PID reserved.
 #[cfg(target_os = "linux")]
-pub(crate) fn child_exit_status(
+pub fn child_exit_status(
     identity: &OwnedFd,
     pid: u32,
     flags: i32,
@@ -125,7 +135,7 @@ pub(crate) fn child_exit_status(
 /// Reads the original child's status. `flags` always includes `WEXITED`; with
 /// `WNOWAIT` the child stays unreaped and its PID reserved.
 #[cfg(target_os = "macos")]
-pub(crate) fn child_exit_status(
+pub fn child_exit_status(
     identity: &OwnedFd,
     pid: u32,
     flags: i32,

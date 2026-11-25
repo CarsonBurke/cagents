@@ -1113,7 +1113,7 @@ fn a_mount_inside_the_worktree_blocks() {
     // mount, which kernels report since 5.8, tells it apart.
     if analysis::filesystem(&fixture.worktree)
         .unwrap()
-        .is_none_or(|(_, _, mount)| mount.is_none())
+        .is_none_or(|filesystem| filesystem.mount.is_none())
     {
         eprintln!("bind mounts skipped: the kernel reports no mount IDs");
         return;

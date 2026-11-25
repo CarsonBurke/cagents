@@ -90,11 +90,7 @@ fn parent_of(root: &Root) -> io::Result<Root> {
 /// bind mounts, so this is the closest analogue of the Linux mount ID.
 #[cfg(target_os = "macos")]
 fn mount_identity(root: &Root) -> io::Result<u64> {
-    // SAFETY: libc's `fsid_t` is the `repr(C)` pair of `int32_t` that Darwin
-    // defines, whose field it keeps private.
-    let [high, low] =
-        unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(filesystem_of(root)?.f_fsid) };
-    Ok((u64::from(high as u32) << 32) | u64::from(low as u32))
+    Ok(fsid_identity(filesystem_of(root)?.f_fsid))
 }
 /// Pre-effect qualification of a retained outside candidate. Unlike final
 /// placement this does not claim a private namespace, create anything, or

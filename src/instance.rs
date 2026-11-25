@@ -55,6 +55,8 @@ const ACTIVATION_SOCKET_FILE: &str = if IS_DEVELOPMENT {
 const ACTIVATION_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ACTIVATION_LINE_BYTES: usize = 4096;
 const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(feature = "ui")]
+const PRIVATE_SOCKET_MODE: libc::mode_t = 0o600;
 #[cfg(target_os = "linux")]
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 #[cfg(target_os = "linux")]
@@ -935,24 +937,26 @@ pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
 
+/// Whether an executable path names the shipped independent editor. Linux
+/// marks one whose image was replaced as ` (deleted)`.
+fn is_editor(executable: &Path) -> bool {
+    matches!(
+        executable.file_name().and_then(|name| name.to_str()),
+        Some(
+            "ceditor"
+                | "ceditor (deleted)"
+                | "ceditor-development"
+                | "ceditor-development (deleted)"
+        )
+    )
+}
+
 pub(crate) fn editor_executable(
     process: &Path,
     executable: io::Result<PathBuf>,
 ) -> io::Result<Option<PathBuf>> {
     match executable {
-        Ok(executable) => {
-            let name = executable.file_name().and_then(|name| name.to_str());
-            Ok(matches!(
-                name,
-                Some(
-                    "ceditor"
-                        | "ceditor (deleted)"
-                        | "ceditor-development"
-                        | "ceditor-development (deleted)"
-                )
-            )
-            .then_some(executable))
-        }
+        Ok(executable) => Ok(is_editor(&executable).then_some(executable)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             // Shipped ceditor keeps its executable-derived main-thread comm;
@@ -984,7 +988,7 @@ pub(crate) fn editor_executable(
     }
 }
 
-#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+#[cfg(all(target_os = "linux", any(feature = "host", test)))]
 fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
     let mut editors = Vec::new();
     for entry in fs::read_dir(proc_root)? {
@@ -1009,22 +1013,8 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
         else {
             continue;
         };
-        let lease_path = editor_ready_path(runtime, pid);
-        let lease = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&lease_path)
-            .map_err(|_| {
-                io::Error::other(
-                    "close older or unready independent editors before removing worktrees",
-                )
-            })?;
-        let expected = lease.metadata()?;
-        if !expected.is_file()
-            || expected.uid() != current_uid()
-            || expected.nlink() != 1
-            || !process_owns_slot(&process, pid, &expected)?
-        {
+        let (lease_path, lease, expected) = open_editor_lease(runtime, pid)?;
+        if !process_owns_slot(&process, pid, &expected)? {
             return Err(io::Error::other(
                 "independent editor protection cannot be authenticated",
             ));
@@ -1042,6 +1032,74 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
         editors.push(editor);
     }
     Ok(editors)
+}
+
+/// Darwin has no `/proc` to walk. Its census is every process the user runs,
+/// each pinned before its executable and descriptors are read, so a reused pid
+/// is never taken for an editor. Ownership is the pinned process holding its
+/// exact ready lease open, as [`owns_lease`] proves on Darwin.
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn verified_editors_in(runtime: &Path, _proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
+    let gone = |error: &io::Error| error.kind() == io::ErrorKind::NotFound;
+    let mut editors = Vec::new();
+    for pid in crate::process::table::list(current_uid())? {
+        let process = match PinnedProcess::open(pid) {
+            Ok(process) => process,
+            Err(error) if gone(&error) || error.kind() == io::ErrorKind::InvalidInput => continue,
+            Err(error) => return Err(error),
+        };
+        let executable = match process.uid().and_then(|uid| {
+            if uid == current_uid() {
+                process.executable().map(Some)
+            } else {
+                Ok(None)
+            }
+        }) {
+            Ok(Some(executable)) if is_editor(&executable) => executable,
+            Ok(_) => continue,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let (lease_path, lease, expected) = open_editor_lease(runtime, pid)?;
+        if !owns_lease(Path::new("/proc"), &process, &lease, &expected)? {
+            return Err(io::Error::other(
+                "independent editor protection cannot be authenticated",
+            ));
+        }
+        let editor = VerifiedWindow {
+            executable,
+            process,
+            pid,
+            lease,
+            lease_path,
+        };
+        if !editor.still_owns_lease()? {
+            return Err(io::Error::other("independent editor ownership changed"));
+        }
+        editors.push(editor);
+    }
+    Ok(editors)
+}
+
+/// Opens the ready lease an editor process must hold, refusing one that is
+/// missing or is not a private regular file with a single name.
+#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+fn open_editor_lease(runtime: &Path, pid: u32) -> io::Result<(PathBuf, File, fs::Metadata)> {
+    let lease_path = editor_ready_path(runtime, pid);
+    let lease = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lease_path)
+        .map_err(|_| {
+            io::Error::other("close older or unready independent editors before removing worktrees")
+        })?;
+    let expected = lease.metadata()?;
+    if !expected.is_file() || expected.uid() != current_uid() || expected.nlink() != 1 {
+        return Err(io::Error::other(
+            "independent editor protection cannot be authenticated",
+        ));
+    }
+    Ok((lease_path, lease, expected))
 }
 
 pub(crate) fn window_is_initialized() -> bool {
@@ -2475,7 +2533,7 @@ impl UiActivationListener {
         prepare_activation_socket_path(&socket_path)?;
         let listener = crate::descriptor::bind(&socket_path)?;
         // SAFETY: fchmod receives the bound listener's live descriptor.
-        if unsafe { libc::fchmod(listener.as_raw_fd(), PRIVATE_FILE_MODE) } != 0 {
+        if unsafe { libc::fchmod(listener.as_raw_fd(), PRIVATE_SOCKET_MODE) } != 0 {
             let error = io::Error::last_os_error();
             let _ = fs::remove_file(&socket_path);
             return Err(error);

@@ -359,11 +359,18 @@ impl OwnedPrivateSibling {
     pub(crate) fn retained_descriptor_count(&self) -> usize {
         1 + usize::from(self.directory.is_some())
     }
-    #[cfg(test)]
+    // For this module's tests and the Linux-only save tests.
+    #[cfg(all(
+        test,
+        any(target_os = "linux", not(any(feature = "host", feature = "ui")))
+    ))]
     pub(crate) fn is_resolved(&self) -> bool {
         self.removed && self.synced
     }
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(target_os = "linux", not(any(feature = "host", feature = "ui")))
+    ))]
     pub(crate) fn diagnostic_path(&self) -> PathBuf {
         self.parent
             .directory
