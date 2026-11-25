@@ -171,7 +171,7 @@ sha2 = "0.10"
 thiserror = "2.0"
 # Atomic settings writes are shared by CLI, daemon, and UI.
 tempfile = "3.21"
-tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"], optional = true }
+tokio = { version = "1.47", features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 toml = { version = "1.1.4", features = ["preserve_order"] }

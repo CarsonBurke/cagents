@@ -2,9 +2,11 @@
 
 #[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) mod clock;
-pub(crate) mod identity;
+pub mod identity;
 mod image;
 mod poll;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) mod table;
 
 pub use image::current_executable;
 #[cfg(feature = "host")]
