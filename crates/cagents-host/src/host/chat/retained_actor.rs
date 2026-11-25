@@ -1207,7 +1207,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn startup_descriptor_conflict_is_permanent_but_exact_transition_can_finish() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, context) = pending(root.path());
         let mut other = source.clone();
         other
@@ -1239,7 +1239,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn startup_cleanup_failure_and_uncertainty_can_be_retried_on_the_same_owner() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, context) = pending(root.path());
         let cleanup = Arc::new(Cleanup {
             mode: AtomicU8::new(0),
@@ -1269,7 +1269,7 @@ mod startup_retryability_tests {
     #[test]
     fn retained_restore_distinguishes_fixed_identity_conflicts_from_daemon_shutdown() {
         use crate::daemon::holder_registry::{Kind, Process, Record};
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, _) = pending(root.path());
         let proof = host.lock().unwrap().proof().clone();
         let process = Process::read(std::process::id() as i32).unwrap();
@@ -1313,7 +1313,7 @@ mod startup_retryability_tests {
     #[test]
     fn pending_enrollment_preserves_exact_owner_source_and_captured_scope() {
         use crate::daemon::holder_registry::{Kind, Process, Record};
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, _) = pending(root.path());
         let proof = host.lock().unwrap().proof().clone();
         let process = Process::read(std::process::id() as i32).unwrap();
@@ -1368,7 +1368,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn cleanup_recovery_without_a_resident_owner_can_be_retried() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, _) = pending(root.path());
         assert!(matches!(
             recover_cleanup_attachment_for_start(&host, &source),
@@ -1379,7 +1379,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn retained_publication_rejects_changed_source_before_private_operations() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, mut source, _) = pending(root.path());
         let handle = Handle::fixture_failed_remote();
         let identity = handle.actor_identity().unwrap();
@@ -1410,7 +1410,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn exited_attachment_keeps_source_conflicts_blocked_and_registry_failure_retryable() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, mut source, _) = pending(root.path());
         let handle = Handle::fixture_failed_remote();
         let identity = handle.actor_identity().unwrap();

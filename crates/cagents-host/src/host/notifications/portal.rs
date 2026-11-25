@@ -3,7 +3,8 @@
 //! Registration gives the portal this daemon's application ID, and clicks come
 //! back either as `org.freedesktop.Application` actions, which carry the
 //! compositor's activation token, or as portal signals.
-#[cfg(all(test, target_os = "linux"))] // Exercises real dbus-run-session and GTK portal registration.
+#[cfg(all(test, target_os = "linux"))]
+// Exercises real dbus-run-session and GTK portal registration.
 mod registration_tests;
 
 use std::{sync::Weak, time::Duration};
