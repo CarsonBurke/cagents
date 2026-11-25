@@ -790,7 +790,7 @@ impl ShutdownTarget {
     }
 }
 
-fn lease_owner_process(
+pub(crate) fn lease_owner_process(
     lock_path: &Path,
     proof: &HostSessionProof,
 ) -> Result<(u32, PinnedProcess), PlatformError> {
