@@ -2006,12 +2006,28 @@ pub mod handoff {
         /// Atomically and durably replaces `name` with `bytes`.
         #[cfg(any(feature = "host", test))]
         pub(super) fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+            self.publish_named(name, bytes, fs_safety::rename_within)
+        }
+
+        /// Atomically and durably creates `name`, preserving any prior evidence.
+        #[cfg(any(feature = "host", test))]
+        pub(super) fn create_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+            self.publish_named(name, bytes, fs_safety::rename_new_within)
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn publish_named(
+            &self,
+            name: &str,
+            bytes: &[u8],
+            rename: impl FnOnce(&fs_safety::Root, &OsStr, &OsStr) -> Result<(), fs_safety::ResolveError>,
+        ) -> Result<(), String> {
             let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
             let result = (|| {
                 file.write_all(bytes).map_err(|error| error.to_string())?;
                 file.sync_all().map_err(|error| error.to_string())?;
-                fs_safety::rename_within(&self.root, &temporary, OsStr::new(name))
+                rename(&self.root, &temporary, OsStr::new(name))
                     .map_err(|error| error.to_string())?;
                 fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
             })();
@@ -2476,6 +2492,27 @@ pub mod handoff {
     mod timeout_tests {
         use super::*;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        #[test]
+        fn a_claim_is_published_complete_and_preserves_an_existing_claim() {
+            let directory = crate::test_fixture::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let claim = "recovery.json";
+            let evidence = br#"{"settled":false}"#;
+            store
+                .publish_named(claim, evidence, |root, temporary, destination| {
+                    assert!(store.read_named(claim).unwrap().is_none());
+                    assert_eq!(
+                        std::fs::read(directory.path().join(temporary)).unwrap(),
+                        evidence
+                    );
+                    fs_safety::rename_new_within(root, temporary, destination)
+                })
+                .unwrap();
+            assert!(store.create_named(claim, br#"{"settled":true}"#).is_err());
+            assert_eq!(store.read_named(claim).unwrap().unwrap(), evidence);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
 
         #[test]
         fn evidence_encoding_stops_before_serializing_the_tail_of_an_oversized_report() {
