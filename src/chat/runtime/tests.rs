@@ -4066,7 +4066,7 @@ fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory
         transport: TransportSpec::OwnedUnixWebSocket {
             socket: socket.clone(),
         },
-        program: "/bin/false".into(),
+        program: "/usr/bin/false".into(),
         arguments: Vec::new(),
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
