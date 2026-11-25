@@ -1057,6 +1057,8 @@ impl std::fmt::Debug for ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
+/// Darwin answers that pressure with a refusal, which callers take to mean no
+/// daemon runs; see [`crate::descriptor::retry_refusal`].
 pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
@@ -1071,6 +1073,7 @@ pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<Unix
         *target = *byte as _;
     }
     let deadline = Instant::now() + timeout;
+    let refusing_since = Instant::now();
     let mut delay = Duration::from_millis(1);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1099,7 +1102,8 @@ pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<Unix
         if !matches!(
             error.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
+        ) && !crate::descriptor::retry_refusal(&error, refusing_since)
+        {
             return Err(error);
         }
         // EAGAIN has not queued a connection. Close this attempt before

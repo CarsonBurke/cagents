@@ -195,6 +195,7 @@ struct LockWait {
 /// Find a process of `group` that `locks`, in the format of `/proc/locks`,
 /// shows blocked behind another lock. Each blocked request follows the lock
 /// blocking it, marked `->`.
+#[cfg(target_os = "linux")]
 fn lock_wait_in(locks: &str, mut in_group: impl FnMut(i32) -> bool) -> Option<LockWait> {
     let mut holder = None;
     for line in locks.lines() {
@@ -212,6 +213,7 @@ fn lock_wait_in(locks: &str, mut in_group: impl FnMut(i32) -> bool) -> Option<Lo
 
 /// Whether a process of the launched server whose process group is `group`
 /// is blocked on a file lock another process holds.
+#[cfg(target_os = "linux")]
 fn launched_lock_wait(group: i32) -> Option<LockWait> {
     let locks = std::fs::read_to_string("/proc/locks").ok()?;
     lock_wait_in(&locks, |pid| {
@@ -220,6 +222,18 @@ fn launched_lock_wait(group: i32) -> Option<LockWait> {
             .and_then(|stat| crate::model::agent_recovery::process_identity(&stat))
             .is_some_and(|(actual, _)| actual == group)
     })
+}
+
+/// Darwin publishes no table of lock requests, so a process blocked on a
+/// file lock cannot be told from one doing its own work: neither the
+/// recorded lock owner nor `holds_open` on the lock file says who is waiting.
+/// No wait is ever proved, so the server's whole startup is charged to its
+/// own limit. That fails closed, never letting an unproved wait extend it,
+/// but a server queued behind many other Codex startups on one `CODEX_HOME`
+/// can run out of time where Linux would have waited for it.
+#[cfg(target_os = "macos")]
+fn launched_lock_wait(_group: i32) -> Option<LockWait> {
+    None
 }
 
 /// Join the endpoint of a server this conversation launched, once it accepts.
@@ -298,22 +312,6 @@ fn startup_halt_reason(child: Option<&ChildGuard>, cancelled: bool) -> Option<&'
     }
 }
 
-/// Whether the server a native holder launched is gone or a zombie its holder
-/// has not reaped yet.
-fn held_server_exited(server: &crate::daemon::holder_registry::Process) -> bool {
-    let Ok(stat) = std::fs::read(format!("/proc/{}/stat", server.pid)) else {
-        return true;
-    };
-    let zombie = std::str::from_utf8(&stat)
-        .ok()
-        .and_then(|stat| stat.rsplit_once(')'))
-        .and_then(|(_, fields)| fields.split_whitespace().next())
-        .is_some_and(|state| state == "Z");
-    zombie
-        || crate::model::agent_recovery::process_identity(&stat)
-            .is_none_or(|(_, start)| start != server.start)
-}
-
 impl Actor {
     /// Serve the listener this conversation's own server is bringing up.
     pub(super) fn run_launched_websocket(
@@ -337,7 +335,7 @@ impl Actor {
                 startup_halt_reason(self.child.as_ref(), self.stop.load(Ordering::Acquire)).or_else(
                     || {
                         held.as_ref()
-                            .is_some_and(held_server_exited)
+                            .is_some_and(crate::daemon::holder_registry::Process::exited)
                             .then_some("Codex server exited before opening its local socket")
                     },
                 )
@@ -359,22 +357,14 @@ impl Actor {
 
     fn serve_websocket(&mut self, initial: Step, socket: UnixStream) -> Result<(), String> {
         if self.native_holder.is_some() {
-            let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-            let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-            if unsafe {
-                libc::getsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_PEERCRED,
-                    (&mut credentials as *mut libc::ucred).cast(),
-                    &mut length,
-                )
-            } != 0
-                || length as usize != std::mem::size_of::<libc::ucred>()
-            {
-                return Err("Cannot verify owned app-server peer".into());
-            }
-            let peer = crate::daemon::holder_registry::Process::read(credentials.pid)
+            // The peer is only a candidate: an adopted server must match the
+            // identity its holder recorded, and the holder proves a new one
+            // descends from it before confirming it.
+            let pid = crate::pinned_process::peer_credentials(&socket)
+                .ok()
+                .and_then(|credentials| i32::try_from(credentials.pid).ok())
+                .ok_or("Cannot verify owned app-server peer")?;
+            let peer = crate::daemon::holder_registry::Process::read(pid)
                 .map_err(|error| error.to_string())?;
             if self
                 .expected_native_peer
@@ -781,7 +771,6 @@ mod tests {
     /// A socket bound at `path` that accepts nothing until it is told to
     /// listen, which is how a starting server first leaves its endpoint.
     fn bound(path: &Path) -> std::os::fd::OwnedFd {
-        use std::os::fd::{FromRawFd, OwnedFd};
         let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         address.sun_family = libc::AF_UNIX as _;
         let bytes = path.as_os_str().as_encoded_bytes();
@@ -789,10 +778,7 @@ mod tests {
         for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
             *target = *byte as _;
         }
-        let socket =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        assert!(socket >= 0, "{}", io::Error::last_os_error());
-        let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+        let socket = crate::descriptor::unix_socket(libc::SOCK_STREAM, false).unwrap();
         let result = unsafe {
             libc::bind(
                 socket.as_raw_fd(),
@@ -878,6 +864,8 @@ mod tests {
         );
     }
 
+    // Darwin publishes no lock-request table, so no wait is ever observed.
+    #[cfg(target_os = "linux")]
     #[test]
     fn lock_waits_are_found_only_for_the_launched_servers_group() {
         let locks = "\
@@ -903,6 +891,8 @@ mod tests {
         assert_eq!(lock_wait_in("", |_| true), None);
     }
 
+    // Darwin publishes no lock-request table, so no wait is ever observed.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_launched_server_blocked_on_a_held_lock_is_observed() {
         let directory = tempfile::tempdir().unwrap();
