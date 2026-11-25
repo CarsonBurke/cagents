@@ -229,7 +229,7 @@ impl Census {
                 let paths =
                     crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
                 if !crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
-                    && std::os::unix::net::UnixStream::connect(&paths.socket).is_err_and(|e| {
+                    && crate::descriptor::connect_settled(&paths.socket).is_err_and(|e| {
                         matches!(
                             e.kind(),
                             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -1794,7 +1794,7 @@ impl Census {
         // source handshake against a daemon the installer may have started.
         if !self.had_no_source()
             || crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
-            || !std::os::unix::net::UnixStream::connect(&paths.socket).is_err_and(|e| {
+            || !crate::descriptor::connect_settled(&paths.socket).is_err_and(|e| {
                 matches!(
                     e.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused

@@ -1269,9 +1269,7 @@ impl PendingRecovery {
         let daemon_path = descriptor_path(&daemon).map_err(|e| e.to_string())?;
         validate_lock(&daemon, &daemon_path).map_err(|e| e.to_string())?;
         let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
-        if daemon_path != paths.lock
-            || std::os::unix::net::UnixStream::connect(&paths.socket).is_ok()
-        {
+        if daemon_path != paths.lock || crate::descriptor::connect_settled(&paths.socket).is_ok() {
             return Err(
                 "Another daemon is serving or starting; explicit recovery did not replace it"
                     .into(),

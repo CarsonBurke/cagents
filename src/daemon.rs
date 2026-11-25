@@ -26,10 +26,7 @@ use std::{
     io::{self, Seek, SeekFrom},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{
-            fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
-            net::UnixStream,
-        },
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -40,7 +37,7 @@ use std::{
     io::{Read, Write},
     os::unix::{
         fs::{DirBuilderExt, PermissionsExt},
-        net::UnixListener,
+        net::{UnixListener, UnixStream},
     },
     sync::{
         Arc, LazyLock,
@@ -721,7 +718,7 @@ pub(crate) fn running_executable_at(
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
 pub fn replacement_owner(socket: &Path, proof: &HostSessionProof) -> Result<u32, PlatformError> {
     let pid = lease_owner(&socket.with_file_name("cagentsd.lock"), proof)?;
-    let stream = UnixStream::connect(socket)?;
+    let stream = crate::descriptor::connect_settled(socket)?;
     let credential = peer_credentials(&stream)?;
     if credential.uid != current_uid() || credential.pid != pid {
         return Err(io::Error::other("daemon socket does not belong to its lease owner").into());
@@ -1150,7 +1147,7 @@ fn recover_stale_socket(path: &Path) -> Result<(), PlatformError> {
             path: path.to_owned(),
         });
     }
-    if UnixStream::connect(path).is_ok() {
+    if crate::descriptor::connect_settled(path).is_ok() {
         return Err(PlatformError::AlreadyRunning {
             path: path.to_owned(),
         });
@@ -2461,7 +2458,7 @@ for line in sys.stdin:
                 (replacement_socket.dev(), replacement_socket.ino())
             );
             assert!(
-                UnixStream::connect(&paths.socket).is_ok(),
+                std::os::unix::net::UnixStream::connect(&paths.socket).is_ok(),
                 "replacement listener must remain usable"
             );
             replacement.send(b"release\n");

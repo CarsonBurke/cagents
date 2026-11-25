@@ -702,7 +702,8 @@ fn spawn_stream(
     if transport.cancelled.is_cancelled() {
         return Err(io::Error::other("device connection is closed"));
     }
-    let listening = || control.is_some_and(|control| UnixStream::connect(control).is_ok());
+    let listening =
+        || control.is_some_and(|control| crate::descriptor::connect_settled(control).is_ok());
     let cold = control.is_some() && !listening();
     let child = bridge_command(transport, control)
         .stdin(Stdio::piped())
@@ -1186,7 +1187,7 @@ pub(crate) fn bridge_socket() -> io::Result<PathBuf> {
 /// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
 pub fn serve_stdio() -> io::Result<()> {
     let path = bridge_socket()?;
-    let stream = match crate::descriptor::connect(&path) {
+    let stream = match crate::descriptor::connect_settled(&path) {
         Ok(stream) => stream,
         Err(error)
             if crate::control::daemon_autostart_disabled()
