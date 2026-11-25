@@ -1710,7 +1710,7 @@ fn finish_interrupted_exit_for_start(
         None,
         None,
         Ending::Stopped,
-        DetachedWork::Stop,
+        restart_close_scope(host, inspection.source.id),
     )
     .map_err(SetupError::Unavailable)?;
     Ok(true)
@@ -1787,10 +1787,22 @@ pub(in crate::host) fn finish_exited_attachment_for_start(
         Some(&target),
         None,
         Ending::Stopped,
-        DetachedWork::Stop,
+        restart_close_scope(host, source.id),
     )
     .map_err(chat::protocol::SetupError::Unavailable)?;
     Ok(true)
+}
+
+/// Resume may finish an interrupted daemon shutdown. Reuse its normal
+/// per-conversation disposition so a completed interactive Spare can settle.
+fn restart_close_scope(host: &SharedHost, id: TerminalId) -> DetachedWork {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (host, id);
+        DetachedWork::Stop
+    }
+    #[cfg(target_os = "macos")]
+    super::super::agent_execution::detached_work_on_close(host, id)
 }
 
 /// Whether `issued`'s paired CLI view has no worker here and its original
