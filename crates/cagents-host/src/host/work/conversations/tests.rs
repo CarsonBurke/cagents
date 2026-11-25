@@ -893,6 +893,140 @@ fn an_edit_stays_with_the_pull_request_it_was_made_for_and_not_with_a_reused_nam
     assert_eq!(list_now.worktrees[0].pull_request, Some(2));
 }
 
+/// A checkout of `old` in its own worktree, at `oid` committed at
+/// `committed_at`, `ahead` commits past the default branch.
+struct Checkout {
+    oid: &'static str,
+    committed_at: u64,
+    ahead: u32,
+}
+
+/// #2, merged at 2026-11-24T00:00:00Z, heads `old` at `pr_head`; the
+/// conversation pushed `old` from its worktree and edited there. `contained`
+/// is the scan's answer that `pr_head` contains the checkout's commit.
+fn merged_branch_list(
+    checkout: Checkout,
+    pr_head: &str,
+    contained: bool,
+) -> ConversationPullRequests {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut snapshot = (**project.snapshot.as_ref().unwrap()).clone();
+    let mut old = listed(2, "old", "MERGED");
+    old.head_ref_oid = pr_head.to_owned();
+    old.merged_at = Some("2026-11-24T00:00:00Z".to_owned());
+    old.closed_at = old.merged_at.clone();
+    snapshot.pull_requests = vec![listed(1, "feat", "OPEN"), old];
+    project.snapshot = Some(Arc::new(snapshot));
+    let mut local = (**project.local.as_ref().unwrap()).clone();
+    let mut worktree = worktree("/w/app/.worktrees/old", "old");
+    worktree.head = Some(crate::work::Head {
+        oid: checkout.oid.to_owned(),
+        committed_at_unix_ms: Some(checkout.committed_at),
+    });
+    worktree.comparison = Some(crate::work::Comparison {
+        base: "main".to_owned(),
+        ahead: checkout.ahead,
+        behind: 3,
+    });
+    local.worktrees.push(worktree);
+    if contained {
+        local
+            .ancestry
+            .insert((checkout.oid.to_owned(), pr_head.to_owned()), true);
+    }
+    project.local = Some(Arc::new(local));
+    let mut watched = Watched::new();
+    let found = |reference: Reference, relation: Relation| transcript::Found {
+        signal: Signal {
+            reference,
+            relation,
+        },
+        by_subagent: true,
+    };
+    watched.apply(
+        Scanned {
+            found: vec![
+                found(
+                    Reference::CurrentBranch {
+                        directory: Some(".worktrees/old/src".to_owned()),
+                    },
+                    Relation::Edited,
+                ),
+                found(branch(None, "old"), Relation::Pushed),
+            ],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts),
+    );
+    watched.pin_edits(Some(&facts), &BTreeMap::new(), &BTreeMap::new());
+    assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    )
+}
+
+#[test]
+fn a_worktree_shows_on_its_merged_pull_request_after_github_moved_its_head() {
+    // Its row and where its worktree is shown, which is on that row or not.
+    let shown = |list: ConversationPullRequests| {
+        (
+            list.pull_requests
+                .iter()
+                .filter(|row| row.number == 2)
+                .map(|row| row.relation)
+                .collect::<Vec<_>>(),
+            list.worktrees
+                .iter()
+                .map(|worktree| worktree.pull_request)
+                .collect::<Vec<_>>(),
+        )
+    };
+    const BEFORE: u64 = 1_763_942_400_000 + 365 * 86_400_000 - 3_600_000;
+    const AFTER: u64 = BEFORE + 2 * 3_600_000;
+    let one_row = (vec![Relation::Pushed], vec![Some(2)]);
+    let apart = (vec![Relation::Pushed], vec![None]);
+    let own = |oid, committed_at| Checkout {
+        oid,
+        committed_at,
+        ahead: 1,
+    };
+
+    // The default branch was merged into it on GitHub before it landed:
+    // its head contains the worktree's, which settles it whenever that was
+    // committed.
+    assert_eq!(
+        shown(merged_branch_list(own("local", AFTER), "merged-main", true)),
+        one_row
+    );
+    // Rebased and pushed from elsewhere, then merged: GitHub's head no
+    // longer contains the worktree's commits, all made before it merged.
+    assert_eq!(
+        shown(merged_branch_list(own("local", BEFORE), "rebased", false)),
+        one_row
+    );
+
+    // A commit made after it merged is new work on a reused name.
+    assert_eq!(
+        shown(merged_branch_list(own("new", AFTER), "rebased", false)),
+        apart
+    );
+    // So is the name made again from the default branch, which the merged
+    // head contains, with nothing committed on it yet.
+    let from_main = Checkout {
+        oid: "main",
+        committed_at: BEFORE,
+        ahead: 0,
+    };
+    assert_eq!(
+        shown(merged_branch_list(from_main, "merged-main", true)),
+        apart
+    );
+}
+
 #[test]
 fn edited_directories_are_bounded_by_recency() {
     let mut watched = Watched::new();

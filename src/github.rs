@@ -40,8 +40,8 @@ pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
 pub use sidebar::{SidebarProbe, SidebarValidator, append_recent_history};
 
-const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
-const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
+const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,mergedAt,closedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
+const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,mergedAt,closedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
 /// The fields every review comment carries, whichever query returns it.
 const REVIEW_COMMENT_FIELDS: &str = "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state";
 /// One review thread with its first page of comments.
@@ -340,6 +340,12 @@ pub struct PullRequest {
     #[serde(default)]
     pub created_at: Option<String>,
     pub updated_at: String,
+    /// When it merged, where a listing asked; `None` while it is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<String>,
+    /// When it merged or closed, where a listing asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
     pub url: Url,
     #[serde(default)]
     pub mergeable: Option<RemoteValue>,

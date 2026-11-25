@@ -791,16 +791,22 @@ fn coverage_note(coverage: &TranscriptCoverage) -> Option<String> {
 type Tone = fn(&cosmic::Theme) -> iced::widget::text::Style;
 
 /// One fact on a row's second line: a few words, each part in its own tone
-/// when it has one.
-struct Fact(Vec<(String, Option<Tone>)>);
+/// when it has one, and whether the row's accessible name repeats it among
+/// its facts.
+struct Fact(Vec<(String, Option<Tone>)>, bool);
 
 impl Fact {
     fn plain(text: impl Into<String>) -> Self {
-        Self(vec![(text.into(), None)])
+        Self(vec![(text.into(), None)], true)
     }
 
     fn toned(text: impl Into<String>, tone: Tone) -> Self {
-        Self(vec![(text.into(), Some(tone))])
+        Self(vec![(text.into(), Some(tone))], true)
+    }
+
+    /// Shown only: the accessible name says it already.
+    fn shown(text: impl Into<String>) -> Self {
+        Self(vec![(text.into(), None)], false)
     }
 
     /// Lines added and removed, each in its tone.
@@ -818,7 +824,7 @@ impl Fact {
                 (part.to_owned(), Some(tone))
             })
             .collect();
-        (!parts.is_empty()).then_some(Self(parts))
+        (!parts.is_empty()).then_some(Self(parts, true))
     }
 
     fn text(&self) -> String {
@@ -884,8 +890,9 @@ fn worktree_facts(worktree: &ConversationWorktree, facts: &mut Vec<Fact>) {
 
 /// What a pull request's row says about it, the facts most in need of
 /// attention first: whose it is when not this repository's, how current
-/// it is, what its worktree has not committed yet, its size, and why it is
-/// listed. Its checks and review are [`pull_request_marks`].
+/// it is, what its worktree has not committed yet, whether it has merged or
+/// closed, its size, and why it is listed. Its checks and review are
+/// [`pull_request_marks`].
 fn pull_request_facts(
     list: Option<&ConversationPullRequests>,
     row: &ConversationPullRequest,
@@ -922,11 +929,27 @@ fn pull_request_facts(
             design::warning_text,
         ));
     }
+    // Why it is listed, such as "Pushed", is no state: a finished pull
+    // request says it is finished in words, not only by its glyph. Its
+    // accessible name says so first.
+    if let Some(finished) = finished_state(row) {
+        facts.push(Fact::shown(finished.label()));
+    }
     if let Some(diff) = row.diff {
         facts.extend(Fact::change_counts(diff.additions, diff.deletions));
     }
     facts.push(Fact::plain(reason(row)));
     facts
+}
+
+/// A merged or closed pull request's state, which its facts name.
+fn finished_state(
+    row: &ConversationPullRequest,
+) -> Option<crate::sidebar::WorktreePullRequestState> {
+    row.pull_request
+        .as_ref()
+        .filter(|pull_request| pull_request.state != crate::work::PullRequestState::Open)
+        .map(crate::sidebar::WorktreePullRequestState::from_work)
 }
 
 /// An open pull request's checks and review as glyphs, as the board marks
@@ -990,7 +1013,7 @@ impl RowParts<'_> {
         };
         std::iter::once(shown)
             .chain(self.marks.iter().map(|(_, said)| said.clone()))
-            .chain(self.facts.iter().map(Fact::text))
+            .chain(self.facts.iter().filter(|fact| fact.1).map(Fact::text))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -2140,6 +2163,30 @@ mod tests {
         assert_eq!(
             row_parts(list, work, &|_| true).described(work, true, true),
             "Change 3, merged, #3, shown below, press to hide its details, Created"
+        );
+        // Why it is listed is no state: it says it merged in words too,
+        // which its name already read out.
+        merged.relation = Relation::Pushed;
+        let work = Work::PullRequest {
+            row: &merged,
+            worktree: None,
+        };
+        assert_eq!(
+            row_parts(list, work, &|_| true)
+                .facts
+                .iter()
+                .map(Fact::text)
+                .collect::<Vec<_>>(),
+            ["Merged", "Pushed"]
+        );
+        merged.pull_request.as_mut().unwrap().state = PullRequestState::Closed;
+        let work = Work::PullRequest {
+            row: &merged,
+            worktree: None,
+        };
+        assert_eq!(
+            row_parts(list, work, &|_| true).described(work, false, false),
+            "Show Change 3, closed, #3, Pushed"
         );
 
         // Another repository is named once, among the facts.
