@@ -1311,6 +1311,16 @@ impl TerminalHandle {
             .try_clone_to_owned()
             .map(File::from)
     }
+    /// PID from the exact root pin retained by the test's input worker.
+    #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+    pub fn original_root_pid_for_test(&self) -> Option<u32> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .map(PinnedProcess::pid)
+    }
+
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
     /// these atomic worker checks do not make a source mutation atomic.
@@ -1822,7 +1832,7 @@ impl TerminalHandle {
             worker.run();
         });
         join_owner.install(worker);
-        if let Err(error) = initialized.recv_timeout(Duration::from_secs(5)) {
+        if let Err(error) = initialized.recv_timeout(crate::terminal::SPAWN_START_TIMEOUT) {
             published.request_shutdown();
             joins::request(&join_owner, true, true);
             panic!("test terminal initialization did not finish: {error}");
