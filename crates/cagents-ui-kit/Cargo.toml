@@ -35,7 +35,6 @@ unicode-casefold = "0.2"
 unicode-linebreak = "0.1"
 unicode-segmentation = "1.13.3"
 async-channel = "2.5"
-ashpd = { version = "0.12.3", default-features = false, features = ["tokio"] }
 async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tracing"] }
 blake3 = "1.8"
 directories = "6.0"
@@ -87,7 +86,7 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["wayland", "x11"] }
 # Only Linux enables the portal's Wayland handle integration.
-ashpd = { version = "0.12.3", default-features = false, features = ["wayland"] }
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"] }
 
 [dev-dependencies]
 # The shared library's test fixtures, which these tests also use.
