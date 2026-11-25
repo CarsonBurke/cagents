@@ -1758,13 +1758,6 @@ impl ChangesTab {
             Self::History => "Commit history",
         }
     }
-
-    /// Whether the view is a list of changed files, which is what the
-    /// tree/flat switch arranges. History lists commits and has no such
-    /// choice to offer.
-    fn lists_files(self) -> bool {
-        matches!(self, Self::Changes | Self::Branch)
-    }
 }
 
 /// Which source-control mutation is currently running.
@@ -2247,8 +2240,7 @@ pub struct SourceControlModel {
     /// `None` for a detached or unborn `HEAD`, for a `HEAD` that could not be
     /// read, and for a branch whose ref name Git reported in bytes this cannot
     /// hand back to it - which is a branch that exists and still cannot be
-    /// pushed. The label the header shows is separate and may be lossy; see
-    /// [`Self::no_branch_reason`].
+    /// pushed. The label the header shows is separate and may be lossy.
     pub branch: Option<ValidatedBranchName>,
     pub detached: bool,
     /// The commit `HEAD` names, or `None` when `HEAD` is unborn or could not be
@@ -2752,6 +2744,13 @@ impl SourceControlModel {
             || matches!(&self.branch_changes, BranchChanges::Ready(branch) if !branch.rows.is_empty())
     }
 
+    /// Whether the working tree has anything uncommitted: what the Changes
+    /// view lists and a commit could take. Unlike [`Self::has_changes`], the
+    /// branch's committed changes do not count.
+    pub fn has_uncommitted_changes(&self) -> bool {
+        self.groups.iter().any(|group| !group.is_empty())
+    }
+
     /// Whether this panel is bound to a Git worktree, so Changes can load.
     pub fn offers_changes(&self) -> bool {
         self.branch.is_some() || self.unborn || self.detached || self.head_oid.is_some()
@@ -2799,6 +2798,29 @@ impl SourceControlModel {
             && !self.remotes.is_empty()
     }
 
+    /// Why a branch that has commits cannot be pushed from here, when the
+    /// reason is not already plain: a detached `HEAD` says so beside the
+    /// worktree, and an unborn branch has nothing to send. A branch whose
+    /// name Git reported in bytes this cannot represent has both and still
+    /// cannot be named back to Git; a `HEAD` that could not be read is
+    /// neither; an upstream `git status` reported but this could not name
+    /// cannot be pushed to without re-pointing the branch.
+    pub fn unpushable_reason(&self) -> Option<&'static str> {
+        if self.detached || self.unborn {
+            None
+        } else if self.branch.is_none() {
+            Some(if self.head_oid.is_some() {
+                "This branch's name can't be passed back to Git, so it can't be pushed from here."
+            } else {
+                "HEAD couldn't be read, so this branch can't be pushed from here."
+            })
+        } else if self.upstream.is_none() && self.upstream_reported() {
+            Some("This branch's upstream couldn't be read, so it can't be pushed from here.")
+        } else {
+            None
+        }
+    }
+
     /// Whether `git status` reported an upstream for the checked-out branch,
     /// whether or not it could be compared against or named.
     pub fn upstream_reported(&self) -> bool {
@@ -2806,26 +2828,6 @@ impl SourceControlModel {
             TrackingState::NoUpstream => false,
             TrackingState::Compared { .. } => true,
             TrackingState::Unknown { upstream } => upstream.is_some(),
-        }
-    }
-
-    /// Why this panel offers no branch mutation, for the caption that replaces
-    /// the button.
-    ///
-    /// The four states with no branch to push are four different facts: a
-    /// detached `HEAD` is on no branch, an unborn one has no commit to send, a
-    /// branch whose ref name Git reported in bytes this cannot represent has
-    /// both and still cannot be named back to Git, and a `HEAD` that could not
-    /// be read is not any of the three.
-    pub fn no_branch_reason(&self) -> &'static str {
-        if self.detached {
-            "Detached HEAD — nothing to push"
-        } else if self.unborn {
-            "Nothing committed yet — nothing to push"
-        } else if self.head_oid.is_some() {
-            "This branch's name is not representable — nothing to push"
-        } else {
-            "HEAD could not be read — nothing to push"
         }
     }
 }
@@ -3130,6 +3132,11 @@ pub struct SidebarView {
     change_list_mode: FileListMode,
     #[serde(default, deserialize_with = "known_or_default")]
     changes_tab: ChangesTab,
+    /// Whether `changes_tab` was settled for the worktree it was saved on,
+    /// by the user or by its first read; see
+    /// [`SidebarState::settle_changes_tab`].
+    #[serde(default)]
+    changes_tab_settled: bool,
 }
 
 impl SidebarView {
@@ -3143,6 +3150,7 @@ impl SidebarView {
             collapsed_change_directories: Vec::new(),
             toggled_sections: BTreeSet::new(),
             changes_tab: ChangesTab::default(),
+            changes_tab_settled: false,
             ..self
         }
     }
@@ -3290,6 +3298,10 @@ pub struct SidebarState {
     /// Which view of the Git panel is showing. Local to the surface, like
     /// every other draft here, so a worktree switch resets it.
     changes_tab: ChangesTab,
+    /// Whether `changes_tab` is settled for the bound worktree: chosen by
+    /// the user, or picked once from its first read. Until then the first
+    /// read picks it; see [`Self::settle_changes_tab`].
+    changes_tab_settled: bool,
     worktree_sort: crate::settings::WorktreeSort,
     hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -3557,6 +3569,7 @@ impl SidebarState {
             files_filter_open: self.files_filter_open,
             change_list_mode: self.change_list_mode,
             changes_tab: self.changes_tab,
+            changes_tab_settled: self.changes_tab_settled,
         }
     }
 
@@ -3575,6 +3588,10 @@ impl SidebarState {
         self.files_filter_open = view.files_filter_open;
         self.change_list_mode = view.change_list_mode;
         self.changes_tab = view.changes_tab;
+        // A view saved before this was recorded kept any tab but Changes
+        // only because someone chose it.
+        self.changes_tab_settled =
+            view.changes_tab_settled || view.changes_tab != ChangesTab::default();
         self.collapsed_projects = view.collapsed_projects;
         self.expanded_worktree_groups = view.expanded_worktree_groups;
         self.selection = view.selection;
@@ -4736,6 +4753,7 @@ impl SidebarState {
         // panel, so none of their disclosures carry to the next worktree.
         self.toggled_sections.clear();
         self.changes_tab = ChangesTab::default();
+        self.changes_tab_settled = false;
         self.publish = None;
         self.discard = None;
         self.panel_selection = None;
@@ -4749,6 +4767,26 @@ impl SidebarState {
     /// [`ChangesTab::History`], and nothing else in the panel asks for one.
     pub fn changes_tab(&self) -> ChangesTab {
         self.changes_tab
+    }
+
+    /// Picks the Git view for a worktree the panel has just bound, once its
+    /// first read is in: Changes when it has uncommitted changes, otherwise
+    /// Branch, since an empty Changes view has nothing to show. It picks
+    /// once per binding and never over the user's choice, so a view does
+    /// not switch under the reader as files change.
+    pub fn settle_changes_tab(&mut self, source: &SourceControlModel) {
+        if self.changes_tab_settled
+            || !matches!(source.data_state, SidebarDataState::Ready)
+            || self.active_worktree.as_ref() != Some(&source.key)
+        {
+            return;
+        }
+        self.changes_tab_settled = true;
+        self.changes_tab = if source.has_uncommitted_changes() {
+            ChangesTab::Changes
+        } else {
+            ChangesTab::Branch
+        };
     }
 
     /// Whether one change group is disclosed.
@@ -4836,7 +4874,10 @@ impl SidebarState {
                 }
             }
             SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
-            SidebarAction::SetChangesTab { tab, .. } => self.changes_tab = *tab,
+            SidebarAction::SetChangesTab { tab, .. } => {
+                self.changes_tab = *tab;
+                self.changes_tab_settled = true;
+            }
             SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.expanded_directories.remove(path) {
@@ -10301,6 +10342,16 @@ fn source_control_header<'a>(
         .width(Length::Fill)
         .into(),
     ]);
+    // Pushing belongs to the branch the header names, not to the commit box:
+    // committed work is pushed from whichever Git view is open, and the
+    // commit box is gone while there is nothing to commit. Files and Pull
+    // requests have no place for the publish form it may open.
+    if matches!(view, PanelView::Git(_))
+        && matches!(source.data_state, SidebarDataState::Ready)
+        && let Some(upload) = upload_control(source, modal_open)
+    {
+        header = header.push(upload);
+    }
     if let Some(branch) = worktree
         .and_then(|row| row.branch.as_deref())
         .filter(|_| !worktree.is_some_and(|row| row.detached))
@@ -10340,8 +10391,8 @@ fn source_control_header<'a>(
         }
         // File browsing is always a tree, so only a list of changed files
         // offers the tree/flat switch: the flat list exists for reading
-        // diffs, not for browsing.
-        PanelView::Git(tab) if tab.lists_files() => {
+        // diffs, not for browsing. An empty list has nothing to arrange.
+        PanelView::Git(tab) if lists_changed_files(source, tab) => {
             header = header.push(list_mode_toggle(
                 key,
                 chrome,
@@ -10359,6 +10410,19 @@ fn source_control_header<'a>(
         .into()
 }
 
+/// Whether `tab` shows a list of changed files right now, which the
+/// tree/flat switch arranges; an empty or unread list has nothing to
+/// arrange.
+fn lists_changed_files(source: &SourceControlModel, tab: ChangesTab) -> bool {
+    match tab {
+        ChangesTab::Changes => source.has_uncommitted_changes(),
+        ChangesTab::Branch => {
+            matches!(&source.branch_changes, BranchChanges::Ready(branch) if !branch.rows.is_empty())
+        }
+        ChangesTab::History => false,
+    }
+}
+
 /// Error notices beneath the header. Activity stays in the header's fixed
 /// icon slot so a background read or mutation cannot move the body.
 fn source_control_notices<'a>(
@@ -10371,6 +10435,16 @@ fn source_control_notices<'a>(
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into()
         })))
+        .push(slot(
+            matches!(source.data_state, SidebarDataState::Ready)
+                .then(|| source.unpushable_reason())
+                .flatten()
+                .map(|reason| {
+                    design::caption(reason)
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                        .into()
+                }),
+        ))
 }
 
 /// Shared worktree identity and loading slots around file or Git navigation.
@@ -10443,11 +10517,29 @@ fn source_control_panel<'a>(
         ChangesTab::Branch => branch_changes_section(state, source, modal_open),
         ChangesTab::History => history_section(state, source, modal_open),
     };
+    // The publish form is several rows tall and grows a wrapping refusal, so
+    // it stays in the scroll region: pinned beside the commit box it could
+    // push its own Cancel and Publish past the bottom of a short panel. The
+    // header opens it from any view, so every view shows it.
+    let body = match state
+        .publish_draft()
+        .filter(|draft| draft.key == source.key)
+    {
+        Some(publish) => widget::column::with_children(vec![
+            body,
+            crate::design::horizontal_rule(),
+            publish_picker(source, publish, modal_open),
+        ])
+        .spacing(space::XS)
+        .into(),
+        None => body,
+    };
     // Committing is the panel's terminal action, so it sits at the panel's
     // bottom edge rather than after however many change rows the scroll
     // region happens to hold. It belongs to the working tree, so only the
-    // working-tree view carries it.
-    let footer = matches!(tab, ChangesTab::Changes).then(|| {
+    // working-tree view carries it, and only while there is something to
+    // commit.
+    let footer = (matches!(tab, ChangesTab::Changes) && offers_commit(state, source)).then(|| {
         widget::container(changes_footer(state, source, modal_open))
             .padding(Padding::from([space::S, space::S]))
             .width(Length::Fill)
@@ -11192,6 +11284,21 @@ fn changes_section<'a>(
                 "No tracked changes."
             },
         ));
+        // With nothing to commit the commit box is gone, but the last commit
+        // can still be reworded: amending brings the box back for it.
+        if source.head_oid.is_some() && !offers_commit(state, source) {
+            column = column.push(
+                crate::ui_controls::button::secondary("Amend last commit")
+                    .icon(Icon::Commit.handle())
+                    .on_press_maybe(gated(
+                        SidebarAction::AmendChanged {
+                            key: source.key.clone(),
+                            amend: true,
+                        },
+                        modal_open || source.busy(),
+                    )),
+            );
+        }
     }
     for group in source.groups() {
         // A collapsed untracked group remains discoverable because its
@@ -11240,16 +11347,6 @@ fn changes_section<'a>(
                 }
             },
         ));
-    }
-    // The publish form is several rows tall and grows a wrapping refusal, so
-    // it stays in the scroll region: pinned beside the commit box it could
-    // push its own Cancel and Publish past the bottom of a short panel.
-    if let Some(publish) = state
-        .publish_draft()
-        .filter(|draft| draft.key == source.key)
-    {
-        column = column.push(crate::design::horizontal_rule());
-        column = column.push(publish_picker(source, publish, modal_open));
     }
     column.into()
 }
@@ -11882,6 +11979,90 @@ fn commit_description_style(
     }
 }
 
+/// Whether the working tree offers a commit: it has changes, or a commit
+/// draft is under way, which stays on screen rather than vanishing with the
+/// last change it was written for.
+fn offers_commit(state: &SidebarState, source: &SourceControlModel) -> bool {
+    source.has_uncommitted_changes()
+        || state.commit_draft.amend
+        || !state.commit_message().trim().is_empty()
+}
+
+/// The branch's push or publish control for the panel header, where it is
+/// reachable from every view, or `None` when there is nothing to send: an
+/// up-to-date branch, or no branch Git could be given.
+fn upload_control<'a>(
+    source: &'a SourceControlModel,
+    modal_open: bool,
+) -> Option<Element<'a, SidebarAction>> {
+    let key = &source.key;
+    let chrome = &source.chrome;
+    let branch = source.branch.as_ref()?;
+    match &source.upstream {
+        Some(_) if source.up_to_date => None,
+        Some(target) => {
+            let counts = match &source.tracking {
+                TrackingState::Compared { ahead, behind, .. } if *behind > 0 => {
+                    Some(format!("↑{ahead} ↓{behind}"))
+                }
+                TrackingState::Compared { ahead, .. } if *ahead > 0 => Some(format!("↑{ahead}")),
+                _ => None,
+            };
+            let detail = counts
+                .as_ref()
+                .map_or_else(String::new, |counts| format!(" · {counts}"));
+            let push = crate::ui_controls::icon_button(
+                Icon::Push,
+                format!(
+                    "Push {} to {}{detail}",
+                    branch.as_str(),
+                    target
+                        .remote_side_ref()
+                        .map(|reference| format!("{}:{}", target.remote(), reference.as_str()))
+                        .unwrap_or_else(|_| target.remote().to_owned())
+                ),
+            )
+            .on_press_maybe(
+                (source.can_push() && !modal_open).then(|| SidebarAction::Push {
+                    key: key.clone(),
+                    branch: branch.clone(),
+                    target: target.clone(),
+                }),
+            )
+            .id(chrome.push_id.clone());
+            let mut upload = widget::row::with_children(vec![push.into()])
+                .spacing(space::XXS)
+                .align_y(cosmic::iced::Alignment::Center);
+            if let Some(counts) = counts {
+                upload = upload.push(design::caption(counts));
+            }
+            Some(upload.into())
+        }
+        // A repository with no remote has nowhere to publish to.
+        None if source.remotes.is_empty() => None,
+        None if !source.upstream_reported() => Some(
+            crate::ui_controls::icon_button(
+                Icon::Push,
+                format!("Publish {}… Choose a remote and upstream", branch.as_str()),
+            )
+            .on_press_maybe((source.can_publish() && !modal_open).then(|| {
+                SidebarAction::OpenPublish {
+                    key: key.clone(),
+                    branch: branch.clone(),
+                    remotes: source.remotes.clone(),
+                }
+            }))
+            .id(chrome.push_id.clone())
+            .into(),
+        ),
+        // `git status` reported an upstream this panel could not name, so
+        // publishing would re-point the branch at whatever remote the picker
+        // offered rather than push to the upstream it has. The notices say
+        // why there is no push.
+        None => None,
+    }
+}
+
 fn changes_footer<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
@@ -12017,7 +12198,7 @@ fn changes_footer<'a>(
         commit_label
     };
     let commit = crate::interaction::tooltip(
-        // Ticking Amend relabels Commit; Push beside it stays put.
+        // Ticking Amend relabels Commit in place.
         crate::ui_controls::button::primary("Commit")
             .instead("Amend commit", state.commit_draft.amend)
             .icon(Icon::Commit)
@@ -12030,98 +12211,30 @@ fn changes_footer<'a>(
     if has_subject {
         column = column.push(commit_input);
     }
-    let amend = crate::ui_controls::field::checkbox(state.commit_draft.amend)
-        .label("Amend")
-        .size(14)
-        .text_size(design::TEXT_CAPTION)
-        .spacing(6)
-        .on_toggle_maybe(
-            (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
+    // Amending needs a commit; an unborn branch has none to offer.
+    let amend = source.head_oid.is_some().then(|| {
+        crate::ui_controls::field::checkbox(state.commit_draft.amend)
+            .label("Amend")
+            .size(14)
+            .text_size(design::TEXT_CAPTION)
+            .spacing(6)
+            .on_toggle_maybe((!modal_open && !source.busy()).then(|| {
                 let key = key.clone();
                 move |amend| SidebarAction::AmendChanged {
                     key: key.clone(),
                     amend,
                 }
-            }),
-        );
-    let mut buttons = widget::row::with_capacity(4)
+            }))
+    });
+    let buttons = widget::row::with_capacity(3)
         .spacing(space::S)
-        .align_y(cosmic::iced::Alignment::Center);
-    buttons = buttons.push(commit);
-    match (&source.branch, &source.upstream) {
-        (Some(branch), Some(target)) => {
-            let counts = match &source.tracking {
-                TrackingState::Compared { ahead, behind, .. } if *behind > 0 => {
-                    Some(format!("↑{ahead} ↓{behind}"))
-                }
-                TrackingState::Compared { ahead, .. } if *ahead > 0 => Some(format!("↑{ahead}")),
-                _ => None,
-            };
-            let detail = counts
-                .as_ref()
-                .map_or_else(String::new, |counts| format!(" · {counts}"));
-            let push = crate::ui_controls::icon_button(
-                Icon::Push,
-                format!(
-                    "Push {} to {}{detail}",
-                    branch.as_str(),
-                    target
-                        .remote_side_ref()
-                        .map(|reference| format!("{}:{}", target.remote(), reference.as_str()))
-                        .unwrap_or_else(|_| target.remote().to_owned())
-                ),
-            )
-            .on_press_maybe(
-                (source.can_push() && !modal_open).then(|| SidebarAction::Push {
-                    key: key.clone(),
-                    branch: branch.clone(),
-                    target: target.clone(),
-                }),
-            )
-            .id(chrome.push_id.clone());
-            let mut upload = widget::row::with_children(vec![push.into()])
-                .spacing(space::XS)
-                .align_y(cosmic::iced::Alignment::Center);
-            if let Some(counts) = counts {
-                upload = upload.push(design::caption(counts));
-            }
-            buttons = buttons.push(upload);
-        }
-        (Some(branch), None) if !source.upstream_reported() => {
-            buttons = buttons.push(
-                crate::ui_controls::icon_button(
-                    Icon::Push,
-                    format!("Publish {}… Choose a remote and upstream", branch.as_str()),
-                )
-                .on_press_maybe((source.can_publish() && !modal_open).then(|| {
-                    SidebarAction::OpenPublish {
-                        key: key.clone(),
-                        branch: branch.clone(),
-                        remotes: source.remotes.clone(),
-                    }
-                }))
-                .id(chrome.push_id.clone()),
-            );
-        }
-        (Some(_), None) => {
-            // `git status` reported an upstream this panel could not name, so
-            // publishing would re-point the branch at whatever remote the
-            // picker offered rather than push to the upstream it has.
-            column = column.push(design::caption(
-                "Upstream could not be read — nothing to push",
-            ));
-        }
-        (None, _) => {
-            // A branch this panel cannot name is not one it may invent a
-            // mutation for, and each reason is stated as itself.
-            column = column.push(design::caption(source.no_branch_reason()));
-        }
+        .align_y(cosmic::iced::Alignment::Center)
+        .push(commit);
+    let mut buttons = buttons.push(widget::Space::new().width(Length::Fill));
+    if let Some(amend) = amend {
+        buttons = buttons.push(amend);
     }
-    column = column.push(
-        buttons
-            .push(widget::Space::new().width(Length::Fill))
-            .push(amend),
-    );
+    column = column.push(buttons);
     column.into()
 }
 
