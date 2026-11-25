@@ -34,7 +34,7 @@ fn reviewed(proof: &HostSessionProof, terminal: TerminalId) -> DaemonImpact {
             title: String::new(),
             identity: "exact-owner".into(),
             disposition: crate::update::impact::Disposition::Resumes,
-            reason: String::new(),
+            reason: "".into(),
             interrupted_subagents: Vec::new(),
         }],
         blockers: Vec::new(),
@@ -1052,7 +1052,7 @@ fn scale_census(
             title: format!("chat {index}"),
             identity: "0".repeat(64),
             disposition: crate::update::impact::Disposition::Resumes,
-            reason: String::new(),
+            reason: "".into(),
             interrupted_subagents: Vec::new(),
         });
         captured.push(source.clone(), snapshot).unwrap();
@@ -2213,7 +2213,7 @@ fn reviewed_payload_budget_is_rejected_before_source_preparation() {
     let mut preparation = preparation(root.path());
     preflight_preparation_size(&preparation.authority).unwrap();
     preparation.authority.reviewed.as_mut().unwrap().sessions[0].reason =
-        "x".repeat(LIMIT as usize);
+        "x".repeat(LIMIT as usize).into();
     let error = preflight_preparation_size(&preparation.authority).unwrap_err();
     assert!(error.contains("byte limit"), "{error}");
     assert!(!preparation.authority.checkpoint_path.exists());

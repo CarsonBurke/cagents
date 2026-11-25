@@ -219,7 +219,7 @@ fn descriptor_impact<T: Serialize>(
         title: title.into(),
         identity: format!("{:x}", Sha256::digest(serde_json::to_vec(descriptor)?)),
         disposition: impact::Disposition::Blocked,
-        reason: String::new(),
+        reason: "".into(),
         interrupted_subagents: Vec::new(),
     })
 }

@@ -915,7 +915,7 @@ mod tests {
                 title: "Paused Codex".into(),
                 identity: hash(&serde_json::to_vec(&source).unwrap()),
                 disposition: crate::update::impact::Disposition::Resumes,
-                reason: String::new(),
+                reason: "".into(),
                 interrupted_subagents: Vec::new(),
             }],
             blockers: Vec::new(),
