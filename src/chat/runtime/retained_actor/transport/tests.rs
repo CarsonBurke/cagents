@@ -1,8 +1,8 @@
 use super::*;
 
-#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -28,6 +28,8 @@ fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
         );
         return;
     }
+    #[cfg(target_os = "macos")]
+    crate::daemon::adopted_orphans::become_sweeper();
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let cwd = root.path().join("cwd");
     let home = root.path().join("claude");
