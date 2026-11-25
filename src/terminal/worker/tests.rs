@@ -3467,18 +3467,42 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
         assert_eq!(&ready, b"ready");
         let root = RootIdentity::capture(held.child.pid(), None).unwrap();
         let started = std::time::Instant::now();
-        let status = shutdown_child_exit(
-            &held.child,
-            &held.master,
-            Some(&root),
-            &exits,
-            false,
-            budget,
-        )
-        .unwrap();
+        let shutdown = || {
+            shutdown_child_exit(
+                &held.child,
+                &held.master,
+                Some(&root),
+                &exits,
+                false,
+                budget,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let status = tracing::subscriber::with_default(
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .without_time()
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+            shutdown,
+        );
+        #[cfg(target_os = "linux")]
+        let status = shutdown();
+        let status = status.unwrap_or_else(|error| {
+            panic!(
+                "shutdown with expected exit {expected_code:?} failed after {:?}: {error}; root exited {:?}; session census {:?}",
+                started.elapsed(),
+                held.child.exited_within(Duration::ZERO),
+                close_processes::session_is_empty(held.child.pid(), Instant::now() + Duration::from_secs(2)),
+            );
+        });
         // Escalation follows the hangup grace, long before the deadline's
         // confirmation tail would force it.
-        assert!(started.elapsed() < budget.deadline - budget.confirmation_reserve);
+        assert!(
+            started.elapsed() < budget.deadline - budget.confirmation_reserve,
+            "shutdown with expected exit {expected_code:?} delayed {:?}",
+            started.elapsed()
+        );
         match expected_code {
             Some(code) => assert_eq!(status.exit_code(), code),
             None => assert!(status.signal().is_some()),
