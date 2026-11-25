@@ -110,6 +110,9 @@ pub(super) struct UpdateSummary {
     pub can_check: bool,
     /// A newer release: its version and release notes.
     pub available: Option<(String, String)>,
+    /// A newer release installed by running its installer in a terminal:
+    /// its release notes and the command to copy.
+    pub installer: Option<(String, String)>,
     /// Why this window would refuse to apply `available` right now.
     pub apply_blocker: Option<&'static str>,
     pub detail: String,
@@ -124,6 +127,8 @@ pub enum Action {
     CheckNow,
     Checked(Result<UpdateState, String>),
     OpenReleaseNotes(String),
+    /// Copies the command that installs the release the last check found.
+    CopyInstallerCommand,
     Apply,
     ChoosePolicy(crate::update::impact::Policy),
     Decided {
@@ -1392,7 +1397,15 @@ impl Cagents {
             }
             _ => None,
         };
-        let (status, failed) = if development {
+        let installer = match &state.result {
+            Some(UpdateState::InstallerAvailable { release, command }) => {
+                Some((release.url.clone(), command.clone()))
+            }
+            _ => None,
+        };
+        // A development build checks only for a native evidence fixture's
+        // release, and then reports what that check found.
+        let (status, failed) = if development && state.result.is_none() {
             (
                 "Update checks are off in development builds".to_owned(),
                 false,
@@ -1406,6 +1419,14 @@ impl Cagents {
                 Some(UpdateState::Available { release }) => {
                     (format!("cagents {} is available", release.version), false)
                 }
+                Some(UpdateState::InstallerAvailable { release, .. }) => (
+                    format!(
+                        "cagents {} is available. To update, run its installer in Terminal; \
+                         it says how to stop the running daemon first.",
+                        release.version
+                    ),
+                    false,
+                ),
                 Some(UpdateState::Current { .. }) => ("cagents is up to date".to_owned(), false),
                 Some(UpdateState::Unsupported { reason }) => (reason.clone(), false),
                 None => ("Not checked yet".to_owned(), false),
@@ -1435,6 +1456,7 @@ impl Cagents {
                 .as_ref()
                 .and_then(|_| self.window_update_blocker()),
             available,
+            installer,
             detail,
         }
     }
@@ -1481,6 +1503,15 @@ impl Cagents {
                 self.start_update_check(false)
             }
             Action::CheckNow => self.start_update_check(true),
+            Action::CopyInstallerCommand => match &self.update_ui.result {
+                Some(UpdateState::InstallerAvailable { command, .. }) => {
+                    chat_ui::invalidate_copy_intent();
+                    let command = command.clone();
+                    self.status = Some(TransientNotice::success("Copied the installer command"));
+                    iced::clipboard::write(command)
+                }
+                _ => Task::none(),
+            },
             Action::OpenReleaseNotes(url) => match Url::parse(&url) {
                 Ok(url) => self.open_external_url(url),
                 Err(error) => {
@@ -1498,7 +1529,12 @@ impl Cagents {
                         self.update_ui.last_checked = Some(std::time::SystemTime::now());
                         self.update_ui.check_failures = 0;
                         self.update_ui.check_error = None;
-                        let supported = !matches!(result, UpdateState::Unsupported { .. });
+                        // Only a release this window installs has a job to follow.
+                        let supported = !matches!(
+                            result,
+                            UpdateState::Unsupported { .. }
+                                | UpdateState::InstallerAvailable { .. }
+                        );
                         self.update_ui.result = Some(result);
                         if supported {
                             return self.apply_update_action(Action::Poll);
@@ -2268,6 +2304,46 @@ pub(in crate::app) mod tests {
         assert_eq!(app.update_ui.check_failures, 0);
         assert!(app.update_ui.check_error.is_none());
         assert!(app.update_ui.last_checked.is_some());
+    }
+
+    #[test]
+    fn a_release_installed_by_its_installer_offers_its_command() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let digest = [0u8; 32];
+        let asset = |name| serde_json::json!({"name": name, "size": 1, "sha256": digest});
+        let release = serde_json::from_value(serde_json::json!({
+            "version": "9.8.7",
+            "url": "https://example.invalid/release",
+            "metadata": digest,
+            "archive": asset("cagents.tar.gz"),
+            "checksums": asset("SHA256SUMS-macos"),
+            "installer": asset("install-macos.sh"),
+        }))
+        .unwrap();
+        let command =
+            "curl -fsSL https://example.invalid/install-macos.sh | sh -s -- --version 9.8.7";
+        app.update_ui.checking = true;
+        drop(
+            app.update_update_ui(Action::Checked(Ok(UpdateState::InstallerAvailable {
+                release,
+                command: command.into(),
+            }))),
+        );
+        let summary = app.summarize_updates(false);
+        assert_eq!(
+            summary.status,
+            "cagents 9.8.7 is available. To update, run its installer in Terminal; \
+             it says how to stop the running daemon first."
+        );
+        // Nothing in this window applies it, so nothing waits on a job.
+        assert!(summary.available.is_none());
+        assert!(summary.apply_blocker.is_none());
+        assert_eq!(
+            summary.installer,
+            Some(("https://example.invalid/release".into(), command.into()))
+        );
+        drop(app.update_update_ui(Action::CopyInstallerCommand));
+        assert!(app.status.is_some());
     }
 
     #[test]

@@ -205,9 +205,21 @@ struct Asset {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum UpdateState {
-    Unsupported { reason: String },
-    Current { version: String },
-    Available { release: Box<Release> },
+    Unsupported {
+        reason: String,
+    },
+    Current {
+        version: String,
+    },
+    Available {
+        release: Box<Release>,
+    },
+    /// A newer release that this platform installs only by running its
+    /// installer again: `command` runs that release's installer.
+    InstallerAvailable {
+        release: Box<Release>,
+        command: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -462,7 +474,16 @@ fn invalid(message: impl Into<String>) -> UpdateError {
 /// ends the text, so it can be copied whole: for a verified release it runs
 /// that release's own installer for that version.
 fn installer_updates(version: Option<&str>) -> String {
-    let command = match version {
+    format!(
+        "On macOS, update cagents by running its installer again from a system terminal. \
+         It says how to stop the running daemon first. Run:\n\n{}",
+        installer_command(version)
+    )
+}
+
+/// The terminal command that installs `version`, or the latest release.
+fn installer_command(version: Option<&str>) -> String {
+    match version {
         Some(version) => format!(
             "curl -fsSL {}/download/v{version}/install-macos.sh | sh -s -- --version {version}",
             feed::PUBLIC_FEED
@@ -471,11 +492,31 @@ fn installer_updates(version: Option<&str>) -> String {
             "curl -fsSL {}/latest/download/install-macos.sh | sh",
             feed::PUBLIC_FEED
         ),
-    };
-    format!(
-        "On macOS, update cagents by running its installer again from a system terminal. \
-         It says how to stop the running daemon first. Run:\n\n{command}"
-    )
+    }
+}
+
+/// Whether a check offers `version` to `installation`: a newer release,
+/// unless the updater would refuse it. Offering a version already unpacked
+/// would only end in the updater's refusal; that build is offered through
+/// `current`. The macOS installer reinstalls a retained version, such as the
+/// newer one a rollback left behind, so it is offered there.
+fn offers_release(installation: &Installation, version: &str) -> Result<bool, UpdateError> {
+    Ok(is_newer(version, &installation.version)?
+        && (cfg!(target_os = "macos") || !holds_installed_tree(&installation.prefix, version)))
+}
+
+/// What a check reports about `release`, newer than the installation.
+fn offered(release: Release, installer_only: bool) -> UpdateState {
+    if installer_only {
+        UpdateState::InstallerAvailable {
+            command: installer_command(Some(&release.version)),
+            release: Box::new(release),
+        }
+    } else {
+        UpdateState::Available {
+            release: Box::new(release),
+        }
+    }
 }
 
 fn installer_updates_only(version: Option<&str>) -> Result<(), UpdateError> {
@@ -520,9 +561,8 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
     if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
         && let Some(release) = review_fixture::release(Path::new(&root))?
     {
-        return Ok(UpdateState::Available {
-            release: Box::new(release),
-        });
+        let installer_only = review_fixture::offers_installer(Path::new(&root));
+        return Ok(offered(release, installer_only));
     }
     let installation = match Installation::detect() {
         Ok(installation) => installation,
@@ -537,25 +577,11 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
         Err(reason) => return Ok(UpdateState::Unsupported { reason }),
     };
     let release = feed.latest(
-        |version| {
-            // Offering a version already unpacked would only end in the
-            // installer's refusal. That build is offered through `current`.
-            Ok(is_newer(version, &installation.version)?
-                && !holds_installed_tree(&installation.prefix, version))
-        },
+        |version| offers_release(&installation, version),
         cancellation,
     )?;
     Ok(match release {
-        Some(release) if cfg!(target_os = "macos") => UpdateState::Unsupported {
-            reason: format!(
-                "cagents {} is available. {}",
-                release.version,
-                installer_updates(Some(&release.version))
-            ),
-        },
-        Some(release) => UpdateState::Available {
-            release: Box::new(release),
-        },
+        Some(release) => offered(release, cfg!(target_os = "macos")),
         None => UpdateState::Current {
             version: installation.version,
         },
@@ -5524,6 +5550,24 @@ finally:
         )
         .unwrap();
         fs::rename(root.join("current-next"), root.join("current")).unwrap();
+    }
+
+    #[test]
+    fn only_macos_offers_a_newer_version_it_retains() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // Installed 0.1.4, then rolled back to 0.1.3.
+        install_tree(root, &["0.1.3", "0.1.4"], "0.1.3");
+        let installation = Installation {
+            prefix: root.to_path_buf(),
+            version: "0.1.3".into(),
+        };
+        assert_eq!(
+            offers_release(&installation, "0.1.4").unwrap(),
+            cfg!(target_os = "macos")
+        );
+        assert!(offers_release(&installation, "0.1.5").unwrap());
+        assert!(!offers_release(&installation, "0.1.3").unwrap());
     }
 
     #[test]

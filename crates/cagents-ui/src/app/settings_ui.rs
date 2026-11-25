@@ -335,7 +335,15 @@ fn settings_category_controls<'a>(
             } else {
                 status.into()
             }];
-            if let Some((_, url)) = &updates.available {
+            if let Some((url, _)) = &updates.installer {
+                update_row.push(update_ui::release_notes_button(url));
+                update_row.push(
+                    crate::ui_controls::button::primary("Copy installer command")
+                        .id(widget::Id::new("settings.updates.copy-installer"))
+                        .on_press(Message::UpdateUi(update_ui::Action::CopyInstallerCommand))
+                        .into(),
+                );
+            } else if let Some((_, url)) = &updates.available {
                 update_row.push(update_ui::release_notes_button(url));
                 update_row.push(
                     // `Apply` is refused while this window is blocked, so the
@@ -2056,6 +2064,7 @@ mod keyboard_table_tests {
                 failed: false,
                 can_check: false,
                 available: None,
+                installer: None,
                 apply_blocker: None,
                 detail: String::new(),
             },
