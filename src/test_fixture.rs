@@ -38,13 +38,20 @@ fn create_in(
     protected: &[(PathBuf, &'static str)],
 ) -> io::Result<tempfile::TempDir> {
     validate_root(root, protected)?;
+    // Native cwd and repository queries spell Darwin's sealed system links
+    // through their targets. Use the same spelling, while still validating
+    // the original path and checking protections on the translated path.
+    let actual = crate::secure_file::sealed_system_path(root);
+    if actual != root {
+        validate_root(&actual, protected)?;
+    }
     if prefix.chars().any(|part| matches!(part, '/' | '\\' | '\0')) {
         return Err(refusal(root, "fixture prefix must be a filename prefix"));
     }
     let directory = tempfile::Builder::new()
         .prefix(prefix)
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(root)
+        .tempdir_in(&actual)
         .map_err(|error| refusal(root, format!("cannot create a private directory: {error}")))?;
     let metadata = fs::symlink_metadata(directory.path())
         .map_err(|error| refusal(root, format!("cannot verify private directory: {error}")))?;
@@ -244,6 +251,24 @@ mod tests {
         let metadata = fs::symlink_metadata(first.path()).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o700);
         assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uses_the_resolved_name_of_a_sealed_system_root() {
+        let fixture = fixture();
+        let Some(relative) = fixture.path().strip_prefix("/private").ok() else {
+            return; // TMPDIR is outside Darwin's sealed system links.
+        };
+        let root = Path::new("/").join(relative);
+        if crate::secure_file::sealed_system_path(&root) == root {
+            return;
+        }
+        let child = try_tempdir_in(&root, "sealed-").unwrap();
+        assert_eq!(child.path().parent(), Some(fixture.path()));
+        assert_eq!(child.path(), child.path().canonicalize().unwrap());
+        let protected = [(fixture.path().to_owned(), "the protected fixture")];
+        assert!(create_in(&root, "forbidden-", &protected).is_err());
     }
 
     #[test]

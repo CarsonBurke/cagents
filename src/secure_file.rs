@@ -60,6 +60,12 @@ pub fn reject_symlink_components(path: &Path) -> io::Result<()> {
 /// target. Any other link is left for SQLite to refuse. Linux has no sealed
 /// link, so there `path` is returned as it is.
 pub fn sqlite_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    sealed_system_path(path)
+}
+
+/// Spell a path through the target of Darwin's immutable system link, when
+/// present. Other components are carried over without resolving them.
+pub(crate) fn sealed_system_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     #[cfg(target_os = "macos")]
     {
         let mut components = path.components();
