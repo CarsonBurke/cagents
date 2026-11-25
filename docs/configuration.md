@@ -103,15 +103,15 @@ show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
 work_stale_after_days = 7
-shortcut_defaults_revision = 5
+shortcut_defaults_revision = 6
 preference_defaults_revision = 2
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
 new_native_thread = ["Ctrl+T", "Ctrl+Shift+N"]
 chat_account = ["Ctrl+Shift+A"]
-chat_model = ["Ctrl+Shift+M"]
-chat_permissions = ["Ctrl+Shift+O"]
+chat_model = ["Ctrl+M"]
+chat_permissions = ["Ctrl+O"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
 close_focused_column = ["Ctrl+W"]
@@ -192,7 +192,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
 | `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `5` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `shortcut_defaults_revision` | integer | `6` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `preference_defaults_revision` | integer | `2` | The revision of the built-in preference defaults the file has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
@@ -386,7 +386,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 5`, after which an old default you choose
+  `shortcut_defaults_revision = 6`, after which an old default you choose
   again is kept.
 - **New preference defaults:** a file without `preference_defaults_revision`
   wrote every preference out, so a value matching an old default does not say
