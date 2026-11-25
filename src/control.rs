@@ -4065,23 +4065,40 @@ where
     .then(ServiceRequestContext::capture);
     if !crate::device::is_remote()
         && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
-        && !service_context
-            .as_ref()
-            .is_some_and(|context| context.scoped())
     {
-        let recover = !no_start && staged_command_requires_daemon(&cli.command);
-        match staged_lookup(
-            &crate::process::current_executable().unwrap_or_default(),
-            recover,
+        let scoped = service_context
+            .as_ref()
+            .is_some_and(ServiceRequestContext::scoped);
+        let executable = crate::process::current_executable().unwrap_or_default();
+        let staged_cli = if !scoped {
+            let recover = !no_start && staged_command_requires_daemon(&cli.command);
+            staged_lookup(&executable, recover)
+                .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Cli.file_name())))
+        } else if matches!(
+            cli.command,
+            TopCommand::Agent {
+                command: AgentCommand::List { .. } | AgentCommand::Spawn { .. }
+            }
         ) {
-            Ok(Some(bin)) => {
+            // Use only a live owner whose shipped CLI handles this scoped
+            // request. Resolve it before Spawn can read the original stdin.
+            let owner = crate::install_guard::staged_agent_owner_cli(&executable)
+                .inspect_err(
+                    |error| tracing::debug!(%error, "could not verify staged agent routing"),
+                )
+                .ok()
+                .flatten();
+            Ok(owner)
+        } else {
+            Ok(None)
+        };
+        match staged_cli {
+            Ok(Some(executable)) => {
                 use std::os::unix::process::CommandExt;
-                let mut command =
-                    Command::new(bin.join(crate::companion::Product::Cli.file_name()));
-                // Carry implicit stop/environment policy into the matched CLI.
-                // An older owner that lacks this flag must refuse parsing
-                // rather than recover/start services before handling the read.
-                if inherited_no_start && !cli.global.no_start {
+                let mut command = Command::new(executable);
+                // Carry implicit stop policy into the matched CLI. Scoped
+                // delegation never starts or recovers a missing service.
+                if (inherited_no_start || scoped) && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
