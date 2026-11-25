@@ -3530,9 +3530,15 @@ impl Cagents {
         } else {
             0.0
         };
+        // The header starts where the traffic lights end, should they reach
+        // past the projects pane.
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
-            .padding(Padding::ZERO.right(inset))
+            .padding(
+                Padding::ZERO
+                    .left(self.window_controls_overhang())
+                    .right(inset),
+            )
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
             .into()
@@ -3567,6 +3573,7 @@ impl Cagents {
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
             - self.workspace_header_width()
+            - self.window_controls_overhang()
             - design::PRIMARY_CONTROL_SIZE
             - space::XXS)
             .max(0.0);

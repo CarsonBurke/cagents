@@ -545,8 +545,12 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
             let window_settings = iced::window::Settings {
                 size: iced::Size::new(1440.0, 900.0),
                 min_size: Some(iced::Size::new(900.0, 600.0)),
-                decorations: false,
-                transparent: true,
+                // AppKit keeps its titlebar, transparent over the
+                // client-drawn header, so the traffic lights, the window's
+                // shadow and its rounded corners are its own; the application
+                // leaves room for the lights and hides its own controls.
+                decorations: cfg!(target_os = "macos"),
+                transparent: !cfg!(target_os = "macos"),
                 resize_border: cagents::design::WINDOW_RESIZE_BORDER as u32,
                 exit_on_close_request: false,
                 // The startup task runs alongside window creation. Supply the
@@ -558,6 +562,12 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                 platform_specific: iced::window::PlatformSpecific {
                     application_id: cagents::instance::APPLICATION_ID.to_owned(),
                     ..Default::default()
+                },
+                #[cfg(target_os = "macos")]
+                platform_specific: iced::window::PlatformSpecific {
+                    title_hidden: true,
+                    titlebar_transparent: true,
+                    fullsize_content_view: true,
                 },
                 ..iced::window::Settings::default()
             };

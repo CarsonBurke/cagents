@@ -12286,6 +12286,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         window_filled: false,
         window_state_observed: false,
         right_edge_tiled: false,
+        window_controls_points: None,
         core,
         settings_path: None,
         uncertain_terminal_proofs: HashMap::new(),

@@ -36,6 +36,8 @@ mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+#[cfg(target_os = "macos")]
+mod macos_window;
 mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
@@ -5175,6 +5177,9 @@ pub enum Message {
         result: Result<SettingsSaved, String>,
     },
     StartupWindowOpened(window::Id),
+    /// The traffic lights' extent in points, or `None` if AppKit drew none.
+    #[cfg(target_os = "macos")]
+    WindowControlsMeasured(Option<sidebar::WindowControls>),
     StartupReported(Result<(), String>),
     VerifyStartupPanes,
     StartupStateInspected(startup_gate::Inspection),
@@ -6155,6 +6160,10 @@ pub struct Cagents {
     /// Whether the compositor reports the main window's right edge as tiled,
     /// so the shell offers no resize border there.
     right_edge_tiled: bool,
+    /// Where macOS draws the traffic lights over the window's top-left
+    /// corner, in points, once measured. Other systems draw no controls
+    /// there.
+    window_controls_points: Option<sidebar::WindowControls>,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -7304,12 +7313,37 @@ impl Cagents {
     /// reaches a widget. Panes put their scrollbars at their right edge, so the
     /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
     /// fullscreen and right-tiled windows have no border there and stay flush.
+    ///
+    /// macOS has no such border: AppKit resizes the window from its frame.
     fn window_edge_inset(&self) -> f32 {
-        if self.window_filled || self.right_edge_tiled {
+        if cfg!(target_os = "macos") || self.window_filled || self.right_edge_tiled {
             0.0
         } else {
             design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
         }
+    }
+
+    /// The traffic lights' extent in layout units, which interface scaling
+    /// makes larger than AppKit's points.
+    fn window_controls(&self) -> Option<sidebar::WindowControls> {
+        self.window_controls_points
+            .map(|controls| sidebar::WindowControls {
+                width: controls.width / self.settings.ui_scale,
+                height: controls.height / self.settings.ui_scale,
+            })
+    }
+
+    /// How far the traffic lights reach past the projects pane into the
+    /// workspace header, as they do beside the compact rail.
+    pub(super) fn window_controls_overhang(&self) -> f32 {
+        self.window_controls().map_or(0.0, |controls| {
+            (controls.width
+                - sidebar::effective_width(
+                    self.projects_sidebar_mode(),
+                    self.settings.sidebar_width,
+                ))
+            .max(0.0)
+        })
     }
 
     /// The trailing padding the rightmost surface gives its interactive edge
@@ -16622,6 +16656,13 @@ impl Application for Cagents {
         cosmic::theme::adjust_system_themes(crate::settings::attention_in_yellow);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
+        // AppKit draws these as the traffic lights.
+        #[cfg(target_os = "macos")]
+        {
+            core.window.show_close = false;
+            core.window.show_maximize = false;
+            core.window.show_minimize = false;
+        }
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
         let Bootstrap {
@@ -16811,6 +16852,7 @@ impl Application for Cagents {
             window_filled: false,
             window_state_observed: false,
             right_edge_tiled: false,
+            window_controls_points: None,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -17634,7 +17676,10 @@ impl Application for Cagents {
             self.modal_is_open(),
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
-            !self.core.window.sharp_corners,
+            sidebar::WindowCorner {
+                rounded: !self.core.window.sharp_corners,
+                controls: self.window_controls(),
+            },
         )
         .map(Message::Sidebar);
         drop(sidebar_part);
@@ -18839,7 +18884,19 @@ impl Cagents {
                 // opened yet. Initialize only after iced acknowledges this one.
                 #[cfg(feature = "integrated-browser")]
                 let report = Task::batch([report, self.browser_factory_task()]);
+                #[cfg(target_os = "macos")]
+                let report = Task::batch([
+                    report,
+                    macos_window::adopt(window).map(|controls| {
+                        cosmic::Action::App(Message::WindowControlsMeasured(controls))
+                    }),
+                ]);
                 report
+            }
+            #[cfg(target_os = "macos")]
+            Message::WindowControlsMeasured(controls) => {
+                self.window_controls_points = controls;
+                Task::none()
             }
             Message::VerifyStartupPanes => self.verify_startup_gate(),
             Message::StartupStateInspected(state) => self.startup_state_inspected(state),

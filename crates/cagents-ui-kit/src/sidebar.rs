@@ -5425,7 +5425,7 @@ pub fn view<'a>(
         modal_open,
         None,
         &crate::settings::KeyboardShortcuts::default(),
-        false,
+        WindowCorner::default(),
     )
 }
 
@@ -6003,9 +6003,8 @@ mod cached_projects {
     }
 }
 
-/// `window_rounded` says the window draws rounded corners, as a floating
-/// window does and a maximized or tiled one does not: the pane's top-left
-/// corner is the window's, and follows it.
+/// The pane's top-left corner is the window's, so the pane draws it as the
+/// window does and leaves room for anything the system draws over it.
 #[allow(clippy::too_many_arguments)]
 pub fn view_cached<'a>(
     model: &'a SidebarModel,
@@ -6015,7 +6014,7 @@ pub fn view_cached<'a>(
     modal_open: bool,
     cache: &'a NavigationCache,
     shortcuts: &crate::settings::KeyboardShortcuts,
-    window_rounded: bool,
+    corner: WindowCorner,
 ) -> Element<'a, SidebarAction> {
     view_inner(
         model,
@@ -6025,8 +6024,27 @@ pub fn view_cached<'a>(
         modal_open,
         Some(cache),
         shortcuts,
-        window_rounded,
+        corner,
     )
+}
+
+/// How the window draws the corner the pane shares with it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WindowCorner {
+    /// The window draws rounded corners, as a floating window does and a
+    /// maximized or tiled one does not.
+    pub rounded: bool,
+    /// The system's window controls over the corner, as macOS's traffic
+    /// lights are.
+    pub controls: Option<WindowControls>,
+}
+
+/// The region the system's window controls take, measured from the window's
+/// top-left corner and including their margin to whatever follows them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowControls {
+    pub width: f32,
+    pub height: f32,
 }
 
 fn view_inner<'a>(
@@ -6037,7 +6055,7 @@ fn view_inner<'a>(
     modal_open: bool,
     cache: Option<&'a NavigationCache>,
     shortcuts: &crate::settings::KeyboardShortcuts,
-    window_rounded: bool,
+    corner: WindowCorner,
 ) -> Element<'a, SidebarAction> {
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
@@ -6045,7 +6063,8 @@ fn view_inner<'a>(
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(utilities(compact, modal_open, shortcuts)).padding([0.0, space::XS]),
+            widget::container(utilities(compact, modal_open, shortcuts, corner.controls))
+                .padding([0.0, space::XS]),
         )
         .push(design::horizontal_rule())
         .push(
@@ -6109,7 +6128,7 @@ fn view_inner<'a>(
         .height(Length::Fill)
         .into(),
     ))
-    .class(design::docked_primary(window_rounded))
+    .class(design::docked_primary(corner.rounded))
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .into()
@@ -6324,11 +6343,17 @@ pub fn files_filter_focus_id(key: &ActiveWorktreeKey) -> Id {
     entity_id("panel.files.query", key.worktree_id)
 }
 
+/// The pane's first row, which on macOS shares the window's top-left corner
+/// with the traffic lights: the expanded row starts after them, and the
+/// rail, too narrow for them, starts below them.
 fn utilities<'a>(
     compact: bool,
     modal_open: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    controls: Option<WindowControls>,
 ) -> Element<'a, SidebarAction> {
+    // The container around this row and the row itself each pad by XS.
+    let inset = |extent: f32, padding: f32| (extent - padding).max(0.0);
     let toggle = crate::ui_controls::icon_button(
         Icon::Sidebar,
         crate::workspace_widget::shortcut_tooltip(
@@ -6342,23 +6367,45 @@ fn utilities<'a>(
     let [settings, automations, work] = utility_controls(modal_open, Some(shortcuts));
     if compact {
         let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations, work];
-        return widget::column::with_children(children)
+        let rail = widget::column::with_children(children)
             .align_x(Alignment::Center)
             .spacing(space::XS)
             .padding(space::XS)
-            .width(Length::Fill)
-            .into();
+            .width(Length::Fill);
+        return match controls {
+            Some(controls) => widget::column::with_children(vec![
+                window_gestures(
+                    cosmic::iced::widget::Space::new()
+                        .width(Length::Fill)
+                        .height(inset(controls.height, space::XS)),
+                ),
+                rail.into(),
+            ])
+            .into(),
+            None => rail.into(),
+        };
     }
+    // The row's spacing also follows the space kept for the controls.
+    let leading = controls.map(|controls| {
+        cosmic::iced::widget::Space::new()
+            .width(inset(controls.width, 2.0 * space::XS + space::XXS))
+            .into()
+    });
     window_gestures(
-        widget::row::with_children(vec![
-            settings,
-            automations,
-            work,
-            cosmic::iced::widget::Space::new()
-                .width(Length::Fill)
-                .into(),
-            toggle,
-        ])
+        widget::row::with_children(
+            leading
+                .into_iter()
+                .chain([
+                    settings,
+                    automations,
+                    work,
+                    cosmic::iced::widget::Space::new()
+                        .width(Length::Fill)
+                        .into(),
+                    toggle,
+                ])
+                .collect::<Vec<_>>(),
+        )
         .align_y(Alignment::Center)
         .spacing(space::XXS)
         .padding([0.0, space::XS])
