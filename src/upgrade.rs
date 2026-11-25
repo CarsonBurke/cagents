@@ -3449,7 +3449,7 @@ mod tests {
     #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
     fn detached_browser_helpers_do_not_own_inherited_terminal_markers() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{FileTypeExt, symlink};
 
         let directory = tempfile::tempdir().unwrap();
         let mut source = checkpoint(directory.path()).terminals.remove(0).source;
@@ -3489,23 +3489,22 @@ mod tests {
         symlink("/tools/chrome_crashpad_handler", process.join("exe")).unwrap();
 
         // A diagnostic pipe is normal for detached crash handlers.
-        let (reader, _writer) = std::io::pipe().unwrap();
-        use std::os::fd::AsRawFd;
-        fs::remove_file(process.join("fd/2")).unwrap();
-        symlink(
-            format!("/proc/self/fd/{}", reader.as_raw_fd()),
-            process.join("fd/2"),
-        )
-        .unwrap();
+        let stderr = process.join("fd/2");
+        fs::remove_file(&stderr).unwrap();
+        let path = std::ffi::CString::new(stderr.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path is a live, NUL-terminated name inside the fixture.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
 
         fs::write(process.join("stat"), "42 (helper) S 1 41 41 34816").unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
         fs::write(process.join("stat"), "42 (helper) S 1 41 41 0").unwrap();
-        // Retaining a terminal on any descriptor must prevent the exemption.
-        symlink("/dev/ptmx", process.join("fd/7")).unwrap();
+        // A non-null character device on any descriptor prevents the exemption.
+        let device = process.join("fd/7");
+        symlink("/dev/zero", &device).unwrap();
+        assert!(fs::metadata(&device).unwrap().file_type().is_char_device());
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
-        fs::remove_file(process.join("fd/7")).unwrap();
+        fs::remove_file(device).unwrap();
         fs::remove_file(process.join("fd/0")).unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
         symlink("/dev/null", process.join("fd/0")).unwrap();
