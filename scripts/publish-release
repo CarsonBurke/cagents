@@ -731,8 +731,8 @@ EOF
 
 Apple Silicon Macs with macOS 11 or newer. The build is signed ad hoc, not
 notarized; installing it from a terminal as below is what macOS allows
-without a warning. It puts Cagents in ~/Applications, the \`cagents\` command
-in ~/.local/bin, and starts the daemon at login. To update, install a newer
+without a warning. It links Cagents into ~/Applications and the \`cagents\`
+command into ~/.local/bin, and starts the daemon at login. To update, install a newer
 release the same way; the installer says what to stop first.
 
 \`\`\`sh

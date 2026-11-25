@@ -116,8 +116,9 @@ browser, and the dictation helper, linked against the pinned sherpa-onnx static
 libraries. The UI and the helper carry an embedded `Info.plist` section, so the
 microphone permission prompt names cagents and its purpose.
 
-The archive holds one version tree laid out as on Linux, so the install guard,
-companion lookup and, once it supports macOS, the updater read it the same way:
+The archive holds one version tree laid out as on Linux, so the install guard
+reads it the same way, as companion lookup and the updater will once they
+support macOS:
 
 ```
 cagents-VERSION/bin/{cagents,cagents-ui,cagentsd,cagents-dictate}
@@ -129,13 +130,15 @@ cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
 (`--prefix` overrides it):
 
 - `versions/VERSION/` is the tree, and `current` links to the version that
-  serves; the installer switches it atomically and keeps the previous version
-  until no process runs it.
+  serves. The installer switches it atomically, keeps the version it replaced
+  for rollback (named in `.previous`), and removes older trees that no running
+  process uses, or none when `lsof` cannot tell.
 - `Cagents.app` is a stable launcher bundle. Its executable, a small C program
   (`packaging/macos/launcher.c`), runs the real path of `current/bin/cagents-ui`.
   Launch Services and the Dock keep one application across updates, because
   the bundle they know never moves. `~/Applications/Cagents.app` links
-  to it.
+  to it; Spotlight and Launchpad may not list a link, so open it from
+  `~/Applications` or keep it in the Dock.
 - `~/.local/bin/cagents` links to `current/bin/cagents`.
 - `~/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist` runs
   `versions/VERSION/bin/cagents daemon start` once at login, as Linux's
@@ -144,11 +147,18 @@ cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
   for each version it installs.
 
 The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
-the release's members, refuses links in the tree, and checks every signature
-before it changes anything. It installs over a running daemon only of the same
-version: the daemon cannot yet hand its sessions to another version on macOS,
-so it says how to stop it instead. `--uninstall` removes the installation,
-links and login item, and `--purge` also removes saved app data.
+the release's members, refuses links in the tree, and checks every signature in
+a staging directory before it moves the release into place. It holds a lock
+on the prefix while it works. It installs over a running daemon only of the
+same version, asking the installed CLI, which speaks that daemon's protocol:
+the daemon cannot yet hand its sessions to another version on macOS, so it
+says how to stop it instead, and it refuses when it cannot tell. `--uninstall`
+removes the installation, its links, and the login item when that runs this
+installation; `--purge` also removes saved app data, and needs the installed
+CLI to check for a running daemon first. Only an installation in the account's
+own home registers `Cagents.app` with Launch Services or unloads its login
+item, so a test install under a private `HOME`, as the package's smoke test
+makes, leaves the account's own alone.
 
 Every executable and the bundle are signed ad hoc (`codesign --sign -`), which
 Apple Silicon requires to run anything. Files that `curl`, `tar` or

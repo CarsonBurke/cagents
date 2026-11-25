@@ -155,6 +155,9 @@ if [[ $COMMAND == cut && $ACTIONS == false ]] || [[ $COMMAND == build ]]; then
     # ssh hands the host's login shell the command line, which may not be POSIX.
     [[ -z $MACOS_HOST || $MACOS_HOST =~ ^[A-Za-z0-9][-A-Za-z0-9_.@]*$ ]] || fail "unsafe --macos-host: $MACOS_HOST"
 else
+    if [[ -n $MACOS_HOST && $COMMAND == cut ]]; then
+        printf 'release: GitHub Actions builds no macOS release yet; this release will be Linux only (CAGENTS_RELEASE_MACOS_HOST is not used).\n' >&2
+    fi
     MACOS_HOST=
 fi
 [[ -z $COMMIT || $WAIT == false ]] || fail "--wait releases main's tip; --commit releases another bundle"
