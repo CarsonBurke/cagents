@@ -3061,8 +3061,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        #[cfg(target_os = "linux")]
-        assert!(!private_tmp.exists(), "reaping the root must remove TMPDIR");
+        // Reaping proves the original child status. Linux reclamation also
+        // needs a stable global census and is covered in codex_temp tests.
         #[cfg(target_os = "macos")]
         assert!(
             private_tmp.is_dir(),
