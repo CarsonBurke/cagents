@@ -1608,7 +1608,7 @@ mod tests {
     }
 
     /// A peer that has closed keeps its uid, which a check after its reply
-    /// relies on; only Darwin stops reporting its pid.
+    /// relies on. Darwin may stop reporting its PID.
     #[cfg(feature = "host")]
     #[test]
     fn a_closed_peer_keeps_its_uid() {
@@ -1617,10 +1617,10 @@ mod tests {
         // SAFETY: geteuid has no preconditions.
         assert_eq!(peer_uid(&ours).unwrap(), unsafe { libc::geteuid() });
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            peer_credentials(&ours).unwrap_err().raw_os_error(),
-            Some(libc::ENOTCONN)
-        );
+        match peer_credentials(&ours) {
+            Ok(peer) => assert_eq!(peer.pid, std::process::id()),
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ENOTCONN)),
+        }
     }
 
     /// The pinned process's arguments read as Linux's `/proc/<pid>/cmdline`

@@ -2708,7 +2708,7 @@ mod tests {
     #[test]
     fn a_linked_session_root_still_identifies_the_open_conversation() {
         use std::os::unix::fs::symlink;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let root = directory.path().join("proc");
         fs::create_dir_all(root.join("fd")).unwrap();
         fs::create_dir_all(root.join("fdinfo")).unwrap();

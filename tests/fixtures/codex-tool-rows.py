@@ -60,7 +60,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import uuid
 
 sys.dont_write_bytecode = True
@@ -674,7 +673,11 @@ class Scenario:
     def config(self, codex_home):
         """The home's config.toml, as Codex reads it."""
         config = Path(codex_home) / "config.toml"
-        return tomllib.loads(config.read_text()) if config.is_file() else {}
+        if not config.is_file():
+            return {}
+        import tomllib
+
+        return tomllib.loads(config.read_text())
 
     def models(self, codex_home):
         """Optional recorded model/list result, private to this fixture's home."""

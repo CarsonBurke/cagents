@@ -382,19 +382,13 @@ mod tests {
     fn status_round_trips_non_utf8_paths() {
         let fixture = Fixture::new();
         let prefix = fixture.data.join(OsString::from_vec(b"npm-\xff".to_vec()));
-        let entry = fixture.bin.join("codex");
-        let binary = fixture.file(
-            prefix.join("lib/node_modules/@openai/codex/bin/codex.js"),
-            b"fake",
-        );
-        symlink(binary, entry).unwrap();
-        let status = fixture.status(Provider::Codex);
-        assert_eq!(
-            status.install_method,
-            ProviderInstallMethod::Npm {
-                prefix: prefix.canonicalize().unwrap()
-            }
-        );
+        let mut status = fixture.status(Provider::Codex);
+        // Keep raw paths in the serialization fixture even on filesystems
+        // that refuse to create entries whose names are not valid UTF-8.
+        status.executable = Some(prefix.join("bin/codex"));
+        status.resolved_executable =
+            Some(prefix.join("lib/node_modules/@openai/codex/bin/codex.js"));
+        status.install_method = ProviderInstallMethod::Npm { prefix };
         assert_eq!(
             postcard::from_bytes::<ProviderStatus>(&postcard::to_allocvec(&status).unwrap())
                 .unwrap(),
