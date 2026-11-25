@@ -2560,7 +2560,9 @@ mod tests {
         assert_eq!(resume_recipe(&claude).unwrap().arguments, ["--resume", id]);
     }
 
-    #[cfg(feature = "host")]
+    // The fixture stands in for /proc, which Darwin lacks; there started_at
+    // asks the live kernel about the fixture's pid instead.
+    #[cfg(all(feature = "host", target_os = "linux"))]
     #[test]
     fn runtime_identity_is_bound_to_this_terminal_not_a_recent_session() {
         use std::os::unix::fs::symlink;

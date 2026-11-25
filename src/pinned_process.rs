@@ -339,8 +339,9 @@ pub(crate) fn started_ticks_of(pid: u32) -> io::Result<u64> {
 #[cfg(all(target_os = "macos", any(feature = "host", test)))]
 pub(crate) fn wall_clock_start_of(pid: u32, ticks: u64) -> io::Result<std::time::SystemTime> {
     let info = imp::bsd_info(pid)?;
-    // The process the caller dated held `pid` before the record was read and
-    // still holds it after, so no successor can have answered in between.
+    // The caller read `ticks` from this pid before the record was read, and
+    // the same process still holds the pid after: a pid can't be reused while
+    // held, so no successor can have answered in between.
     if imp::start_of(pid)?.ticks() != ticks {
         return Err(io::Error::from(io::ErrorKind::NotFound));
     }

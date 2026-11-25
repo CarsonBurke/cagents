@@ -8,12 +8,12 @@
 //! reads that clock. [`since_boot`] is the clock for ordering events: it keeps
 //! counting through sleep and no change of the wall clock moves it.
 
-use std::{io, time::Duration};
+use std::io;
 
 /// The current time on the clock the kernel dates process starts by, in the
-/// units [`crate::agent::observe`] and the lineage records carry start times
-/// in. It is rounded down, so a process forked after this reading never reads
-/// as starting earlier.
+/// units process records and lineage launches carry start times in. It is
+/// rounded down, so a process forked after this reading never reads as
+/// starting earlier.
 ///
 /// # Errors
 ///
@@ -25,8 +25,8 @@ pub(crate) fn start_ticks_now() -> io::Result<u64> {
 }
 
 /// The current time on the clock the kernel dates process starts by, in the
-/// units [`crate::agent::observe`] and the lineage records carry start times
-/// in. A process forked after this reading never reads as starting earlier.
+/// units process records and lineage launches carry start times in. A
+/// process forked after this reading never reads as starting earlier.
 ///
 /// # Errors
 ///
@@ -49,7 +49,8 @@ pub(crate) fn start_ticks_now() -> io::Result<u64> {
 /// # Errors
 ///
 /// Returns the underlying error when the clock cannot be read.
-pub(crate) fn since_boot() -> io::Result<Duration> {
+#[cfg(any(target_os = "linux", feature = "ui", test))]
+pub(crate) fn since_boot() -> io::Result<std::time::Duration> {
     #[cfg(target_os = "linux")]
     const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
     #[cfg(target_os = "macos")]
@@ -69,22 +70,23 @@ pub(crate) fn since_boot() -> io::Result<Duration> {
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "clock nanoseconds out of range")
         })?;
-    Ok(Duration::new(seconds, nanos))
+    Ok(std::time::Duration::new(seconds, nanos))
 }
 
 /// When, by the wall clock, the process `pid` began, given the start time
-/// the kernel dated it by. Linux has no record of it, so the process's age on
-/// the boot clock is subtracted from the wall clock now. A change of the wall
-/// clock since the process started skews that estimate. Darwin reads the
-/// time the kernel recorded at fork, and answers only while that process
-/// still holds `pid`.
+/// the kernel dated it by. Linux keeps no per-process wall-clock start, so
+/// the process's age on the boot clock is subtracted from the wall clock now,
+/// and a change of the wall clock since the process started skews it. Darwin
+/// reads the time the kernel recorded at fork, and answers only while that
+/// process still runs as `pid`: a zombie has no record of it.
 #[cfg(any(feature = "host", test))]
 pub(crate) fn started_at(pid: u32, start: u64) -> Option<std::time::SystemTime> {
     #[cfg(target_os = "linux")]
     {
         let _ = pid;
-        let started =
-            Duration::from_secs_f64(start as f64 / f64::from(clock_ticks_per_second().ok()?));
+        let started = std::time::Duration::from_secs_f64(
+            start as f64 / f64::from(clock_ticks_per_second().ok()?),
+        );
         std::time::SystemTime::now().checked_sub(since_boot().ok()?.checked_sub(started)?)
     }
     #[cfg(target_os = "macos")]
@@ -106,6 +108,7 @@ fn clock_ticks_per_second() -> io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A child forked between two readings starts between them, by the clock
     /// the kernel dates it with, and its wall-clock start falls in the wall
