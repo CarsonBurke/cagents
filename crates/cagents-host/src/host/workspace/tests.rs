@@ -566,7 +566,7 @@ fn assert_sqlite_progress(removing: bool) {
     let (responsive, response) = mpsc::channel();
     let inspector = {
         let host = host.clone();
-        let received = &root.join("received");
+        let received = root.join("received");
         thread::spawn(move || {
             let input = process_request(
                 &host,
