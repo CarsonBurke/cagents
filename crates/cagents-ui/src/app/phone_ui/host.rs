@@ -535,8 +535,9 @@ fn mobile_bridge_environments_in(proc: &Path) -> Vec<Vec<u8>> {
 /// bridges of others are never read.
 #[cfg(target_os = "macos")]
 fn mobile_bridge_environments() -> Vec<Vec<u8>> {
-    use cagents::process::inspect;
-    inspect::own_user_processes()
+    use cagents::process::{inspect, table};
+    // SAFETY: geteuid has no preconditions.
+    table::list(unsafe { libc::geteuid() })
         .unwrap_or_default()
         .into_iter()
         .filter_map(|pid| inspect::arguments(pid).ok())

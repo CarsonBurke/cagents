@@ -13,11 +13,13 @@ const PROC_UID_ONLY: u32 = 4;
 /// kernel lists them now. A pid is only a candidate: it may exit or be reused
 /// at once, so a caller pins it before trusting anything it reads about it.
 ///
+/// # Errors
+///
 /// A census that comes back empty is refused, as is one of this process's
 /// own user that leaves this process out: libproc reports a failure as zero
 /// bytes, and a caller that takes an empty list for "no such process" would
 /// fail open.
-pub(crate) fn list(uid: u32) -> io::Result<Vec<u32>> {
+pub fn list(uid: u32) -> io::Result<Vec<u32>> {
     let entry = std::mem::size_of::<libc::pid_t>();
     // A null buffer answers the size the list needs now. It can grow before
     // the list is read, so leave room and retry whenever the list filled it.

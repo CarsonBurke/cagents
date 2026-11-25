@@ -7,8 +7,8 @@ mod image;
 #[cfg(target_os = "macos")]
 pub mod inspect;
 mod poll;
-#[cfg(all(target_os = "macos", feature = "host"))]
-pub(crate) mod table;
+#[cfg(target_os = "macos")]
+pub mod table;
 
 pub use image::current_executable;
 #[cfg(feature = "host")]
@@ -39,8 +39,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(all(target_os = "macos", feature = "host"))]
-pub use crate::pinned_process::OpenFile;
+#[cfg(target_os = "macos")]
+pub use inspect::OpenFile;
 
 /// The executable and command line of process `pid`, its arguments each
 /// followed by a NUL, the program first, as Linux's `/proc/<pid>/cmdline`

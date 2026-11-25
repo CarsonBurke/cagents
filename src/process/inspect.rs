@@ -4,13 +4,12 @@
 //! Every answer describes whichever process holds the pid at that instant.
 //! A caller that must know it describes a particular process pins it first
 //! (`crate::pinned_process::PinnedProcess`) and checks the pin afterwards.
+//! The process list itself is [`super::table`].
 
 use std::{ffi::OsString, io, os::unix::ffi::OsStringExt, path::PathBuf};
 
 /// `PROC_PIDFDVNODEPATHINFO` from `<sys/proc_info.h>`, which libc omits.
 const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
-/// `PROC_UID_ONLY` from `<sys/proc_info.h>`: processes of one effective uid.
-const PROC_UID_ONLY: u32 = 4;
 /// `FWRITE` from `<sys/fcntl.h>`: the open file allows writing. A file's
 /// recorded flags are the kernel's `F*` flags, not the `O_*` ones it was
 /// opened with.
@@ -67,7 +66,9 @@ fn nul_terminated(entries: &[Vec<u8>]) -> Vec<u8> {
 
 /// The arguments and environment of the process that holds `pid`. Darwin only
 /// shows them for a process of the same user (or to root), and not for a
-/// zombie.
+/// zombie. The executable path's padding cannot be told from an empty first
+/// argument, so, as `ps` does, an empty first argument is lost and the rest
+/// shift by one into the environment.
 ///
 /// # Errors
 ///
@@ -139,7 +140,12 @@ fn argument_limit() -> io::Result<usize> {
 fn parse_arguments(record: &[u8]) -> Option<Arguments> {
     let count = usize::try_from(i32::from_ne_bytes(record.get(..4)?.try_into().ok()?)).ok()?;
     let rest = record.get(4..)?;
-    let rest = &rest[rest.iter().position(|byte| *byte == 0)?..];
+    let rest = match rest.iter().position(|byte| *byte == 0) {
+        Some(end) => &rest[end..],
+        // A record of a process with no arguments may end at its count.
+        None if count == 0 => &[],
+        None => return None,
+    };
     let rest = &rest[rest
         .iter()
         .position(|byte| *byte != 0)
@@ -178,20 +184,31 @@ pub struct OpenFile {
     pub inode: u64,
 }
 
-/// The files `pid`'s descriptors name, at most `limit` descriptors read.
+/// The files behind `pid`'s descriptors, at most `limit` descriptors read.
+///
+/// A descriptor closed after the list was read has nothing to report and is
+/// left out, as Linux leaves out a `/proc/<pid>/fd` link that no longer
+/// reads. Any other failure to read one is an error, so a census never takes
+/// a file it could not see for one that is not open.
 ///
 /// # Errors
 ///
 /// Returns `NotFound` when no such process exists, and the underlying error
 /// when the kernel refuses, as it does for another user's process.
 pub fn open_files(pid: u32, limit: usize) -> io::Result<Vec<OpenFile>> {
-    Ok(descriptors(pid)?
+    let mut files = Vec::new();
+    for descriptor in descriptors(pid)?
         .into_iter()
         .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
         .take(limit)
-        // A descriptor closed since the list was read names nothing.
-        .filter_map(|descriptor| open_file(pid, descriptor.proc_fd).ok())
-        .collect())
+    {
+        match open_file(pid, descriptor.proc_fd) {
+            Ok(file) => files.push(file),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOENT)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(files)
 }
 
 fn open_file(pid: u32, descriptor: i32) -> io::Result<OpenFile> {
@@ -210,8 +227,14 @@ fn open_file(pid: u32, descriptor: i32) -> io::Result<OpenFile> {
             size,
         )
     };
-    if written != size {
+    if written == 0 {
         return Err(io::Error::last_os_error());
+    }
+    if written != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the kernel described an open file in an unexpected size",
+        ));
     }
     // SAFETY: `vip_path` is `MAXPATHLEN` bytes of plain data, laid out as
     // nested arrays only for libc's sake.
@@ -278,49 +301,6 @@ pub(crate) fn descriptors(pid: u32) -> io::Result<Vec<libc::proc_fdinfo>> {
     }
 }
 
-/// The processes running as this process's effective user, zombies included,
-/// as the kernel lists them now. Each pid is only a candidate: it may exit or
-/// be reused at once.
-///
-/// # Errors
-///
-/// Returns the underlying error when the list cannot be read. An empty list,
-/// or one without this process, is refused: libproc reports a failure as
-/// zero bytes, and taking that for "no processes" would fail open.
-pub fn own_user_processes() -> io::Result<Vec<u32>> {
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    let entry = std::mem::size_of::<libc::pid_t>();
-    // SAFETY: a null buffer of length zero asks for the size needed now.
-    let needed = unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, std::ptr::null_mut(), 0) };
-    let mut capacity = usize::try_from(needed).unwrap_or(0) / entry + 64;
-    loop {
-        let mut pids: Vec<libc::pid_t> = vec![0; capacity];
-        let bytes = libc::c_int::try_from(capacity * entry)
-            .map_err(|_| io::Error::other("process list too large"))?;
-        // SAFETY: the buffer is writable for `bytes` bytes, and the kernel
-        // writes at most that many.
-        let written =
-            unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), bytes) };
-        let count = usize::try_from(written).unwrap_or(0) / entry;
-        if count < capacity {
-            pids.truncate(count);
-            let pids: Vec<u32> = pids
-                .into_iter()
-                .filter_map(|pid| u32::try_from(pid).ok())
-                .filter(|pid| *pid != 0)
-                .collect();
-            if !pids.contains(&std::process::id()) {
-                return Err(io::Error::other(
-                    "the process table left out this process, so it cannot be trusted",
-                ));
-            }
-            return Ok(pids);
-        }
-        capacity *= 2;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,8 +320,14 @@ mod tests {
                 environment: vec![b"A=1".to_vec(), b"B=2".to_vec()],
             })
         );
-        record.truncate(4);
-        assert_eq!(parse_arguments(&record), None);
+        assert_eq!(parse_arguments(&record[..10]), None);
+        assert_eq!(
+            parse_arguments(&0_i32.to_ne_bytes()),
+            Some(Arguments {
+                arguments: Vec::new(),
+                environment: Vec::new(),
+            })
+        );
     }
 
     #[test]
@@ -386,10 +372,5 @@ mod tests {
             (written.device, written.inode),
             (metadata.dev(), metadata.ino())
         );
-    }
-
-    #[test]
-    fn this_user_s_processes_include_this_one() {
-        assert!(own_user_processes().unwrap().contains(&std::process::id()));
     }
 }
