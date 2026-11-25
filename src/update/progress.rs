@@ -33,19 +33,24 @@ pub struct Changes {
 
 #[cfg(feature = "ui")]
 impl Changes {
+    #[cfg(feature = "development")]
+    pub fn has_review_fixture() -> bool {
+        std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+            .is_some_and(|root| super::review_fixture::path(Path::new(&root)).is_file())
+    }
+
     /// Watch the directory, since the worker replaces status.json atomically.
     /// Register before reading the initial snapshot, so a publication during
-    /// that read is still delivered.
-    pub fn watch() -> Result<Self, UpdateError> {
+    /// that read is still delivered. Only follow the one-shot lease when the
+    /// window has already learned that a job started.
+    pub fn watch(active_job: bool) -> Result<Self, UpdateError> {
         #[cfg(feature = "development")]
         if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE") {
-            return Self::watch_file(
-                PathBuf::from(root).join("home/.config/fixture-update-review.json"),
-                None,
-            );
+            return Self::watch_file(super::review_fixture::path(Path::new(&root)), None);
         }
-        let directory = running_installation()?.prefix.join(".update");
-        Self::watch_file(directory.join("status.json"), Some(&directory.join("lock")))
+        let directory = running_installation()?.state_dir()?;
+        let lease = active_job.then(|| directory.join("lock"));
+        Self::watch_file(directory.join("status.json"), lease.as_deref())
     }
 
     fn watch_file(snapshot: PathBuf, lease: Option<&Path>) -> Result<Self, UpdateError> {
