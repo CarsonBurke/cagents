@@ -114,6 +114,9 @@ pub fn scan(
 ) -> Option<Scan> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
+    if len >= UNCACHE_BYTES {
+        read_uncached(&file);
+    }
     // A transcript found not to be a resumable conversation is trusted to
     // stay one only while it still holds the bytes that decided it: one
     // rewritten in place may now hold a conversation.
@@ -296,6 +299,23 @@ fn boundary(file: &mut std::fs::File, scan: &Scan) -> Option<u64> {
     (read == length).then_some(hash)
 }
 
+/// Linux drops a large transcript's pages once it has been read.
+#[cfg(target_os = "linux")]
+fn read_uncached(_file: &std::fs::File) {}
+
+/// Darwin cannot drop a file's cached pages after the fact, so a large
+/// transcript is read without caching it instead. Advisory only.
+#[cfg(target_os = "macos")]
+fn read_uncached(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_NOCACHE takes an integer flag, on a descriptor this function
+    // borrows.
+    unsafe {
+        libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn uncache(file: &std::fs::File) {
     use std::os::fd::AsRawFd;
     // SAFETY: advisory only, on a descriptor this function borrows.
@@ -303,6 +323,10 @@ fn uncache(file: &std::fs::File) {
         libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
     }
 }
+
+/// See [`read_uncached`]: Darwin read it without caching it.
+#[cfg(target_os = "macos")]
+fn uncache(_file: &std::fs::File) {}
 
 /// Reads records into a scan.
 struct Records<'a> {

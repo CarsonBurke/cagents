@@ -3094,6 +3094,7 @@ fn window_geometry_message(event: &window::Event, window: window::Id) -> Option<
 
 /// Whether a Wayland compositor fills the screen with a window or tiles its
 /// right edge, either of which removes the shell's resize border along it.
+#[cfg(target_os = "linux")]
 fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Message> {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
     use iced::event::{PlatformSpecific, wayland};
@@ -3108,6 +3109,13 @@ fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Messag
         }),
         _ => None,
     }
+}
+
+/// Only Wayland reports window states. Elsewhere, as on X11, each resize
+/// asks the backend whether the window fills the screen.
+#[cfg(target_os = "macos")]
+fn window_edge_message(_event: &iced::Event, _window: window::Id) -> Option<Message> {
+    None
 }
 
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {

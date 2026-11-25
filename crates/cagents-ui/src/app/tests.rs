@@ -4983,6 +4983,8 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
     }
 }
 
+// Window states are Wayland events.
+#[cfg(target_os = "linux")]
 #[test]
 fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
@@ -5040,6 +5042,8 @@ fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
     assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
 }
 
+// Window states are Wayland events.
+#[cfg(target_os = "linux")]
 #[test]
 fn resizes_query_the_window_state_only_until_wayland_reports_it() {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;

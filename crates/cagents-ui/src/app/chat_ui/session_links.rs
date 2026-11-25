@@ -225,6 +225,13 @@ impl Cagents {
         if !wayland {
             return handoff_session_window(slot, session, None);
         }
+        self.request_activation_token(slot, session)
+    }
+
+    /// Asks the compositor for a token that lets the session's window take
+    /// focus from this one's click, then hands the session over with it.
+    #[cfg(target_os = "linux")]
+    fn request_activation_token(&self, slot: String, session: TerminalId) -> Task<Message> {
         use iced::runtime::{Action as RuntimeAction, platform_specific};
         let window = self.core.main_window_id();
         iced::runtime::task::oneshot(move |channel| {
@@ -245,6 +252,15 @@ impl Cagents {
                 token,
             )))
         })
+    }
+}
+
+/// Activation tokens are a Wayland protocol, and no other window handle
+/// asks for one.
+#[cfg(target_os = "macos")]
+impl Cagents {
+    fn request_activation_token(&self, slot: String, session: TerminalId) -> Task<Message> {
+        handoff_session_window(slot, session, None)
     }
 }
 
@@ -300,6 +316,8 @@ mod tests {
         assert!(matches!(destination, Destination::Local(id) if id == session));
     }
 
+    // Activation tokens are a Wayland protocol.
+    #[cfg(target_os = "linux")]
     #[test]
     fn cross_window_link_requests_a_token_for_its_native_origin_window() {
         use cosmic::iced::futures::StreamExt as _;
