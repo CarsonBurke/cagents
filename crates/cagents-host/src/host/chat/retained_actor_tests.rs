@@ -5473,7 +5473,7 @@ fn a_full_daemon_stops_a_finished_hidden_chat_to_make_room() {
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_MAKE_ROOM_TEST";
     if std::env::var_os(MODE).is_none() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = crate::fixture_tempdir().unwrap();
         let root = directory.path();
         for path in [
             "home/.claude",
