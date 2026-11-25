@@ -1983,7 +1983,8 @@ impl Registry {
         // A pane written from the launch before its provider named the thread
         // learns the ID with the agent, in this transaction.
         if let HostedSession::Chat(bound) = &session {
-            learn_saved_pane_identity_in(&tx, bound)?;
+            // The sequence advances below.
+            super::views::learn_saved_chat_pane_identity(&tx, bound)?;
         }
         agent.session = Some(session);
         tx.execute(
@@ -2983,7 +2984,6 @@ fn run_is_unsent(db: &Connection, run: RunId) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 
-/// The open agent bound to session `id`.
 /// [`Registry::learn_saved_pane_identity`] inside the caller's transaction.
 fn learn_saved_pane_identity_in(
     tx: &rusqlite::Transaction<'_>,
@@ -3000,6 +3000,7 @@ fn learn_saved_pane_identity_in(
     Ok(changed)
 }
 
+/// The open agent bound to session `id`.
 pub(super) fn agent_for_session_in(
     db: &Connection,
     id: crate::model::TerminalId,
@@ -6476,6 +6477,27 @@ mod tests {
             "the rest of the write applies"
         );
 
+        // A write that only drops the ID changes nothing stored, but the new
+        // revision sends the window back the pane it lacks.
+        let before = current(&registry);
+        let view = registry.view_snapshot(&codex.scope).unwrap().0.unwrap();
+        let mut dropped = chat_pane(codex.pane, &codex.unnamed);
+        dropped.title = before.title.clone();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: codex.scope.clone(),
+                expected_revision: view.revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: before.clone(),
+                    pane: dropped,
+                },
+            })
+            .unwrap();
+        let after = registry.view_snapshot(&codex.scope).unwrap().0.unwrap();
+        assert!(after.revision > view.revision);
+        assert_eq!(current(&registry), before);
+
         // Resetting the pane to a draft changes its proof, which is not
         // giving up an ID and stands.
         let before = current(&registry);
@@ -6497,6 +6519,115 @@ mod tests {
             })
             .unwrap();
         assert_eq!(saved_chat_pane(&registry, codex.pane), (draft, None));
+    }
+
+    /// The holder confirms a thread the agent already saved: its pane, written
+    /// without the ID, takes it then. A confirmation naming another thread
+    /// saves nothing.
+    #[test]
+    fn a_confirmation_the_agent_already_holds_reaches_its_pane() {
+        let (mut registry, _directory, mut request) = fixture();
+        let codex = unnamed_codex_agent(&mut registry, &mut request, "first-request");
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(
+                    &[HostedSession::Chat(codex.unnamed.clone())],
+                    &HostedSession::Chat(codex.named.clone()),
+                )
+                .unwrap()
+        );
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: codex.scope.clone(),
+                panes: vec![chat_pane(codex.pane, &codex.unnamed)],
+                closed: vec![],
+            })
+            .unwrap();
+        forget_pane_thread(&registry, codex.pane);
+        let confirm = |registry: &mut Registry, thread: &str| {
+            crate::host::agent_execution::persist_confirmed_identity(
+                registry,
+                &codex.unnamed,
+                Some(thread.into()),
+                codex.named.native_continuity.clone(),
+            )
+            .unwrap()
+        };
+        assert!(!confirm(&mut registry, &uuid::Uuid::new_v4().to_string()));
+        assert_eq!(saved_chat_pane(&registry, codex.pane).1, None);
+        let thread = codex.named.launch.session_id.clone().unwrap();
+        assert!(confirm(&mut registry, &thread));
+        assert_eq!(
+            saved_chat_pane(&registry, codex.pane),
+            (codex.named.clone(), Some(thread.clone()))
+        );
+        assert!(
+            !confirm(&mut registry, &thread),
+            "repeating changes nothing"
+        );
+    }
+
+    /// A Claude conversation can be cleared or replaced under the same process,
+    /// so a write dropping a Claude pane's ID stands, and neither the pane nor
+    /// its agent's record gives the ID back.
+    #[test]
+    fn a_claude_pane_that_drops_its_conversation_is_not_given_it_back() {
+        use crate::workspace_model::views::{Change, Scope};
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let HostedSession::Chat(mut named) = source() else {
+            unreachable!()
+        };
+        named.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        registry
+            .bind_agent(accepted.agent.id, None, HostedSession::Chat(named.clone()))
+            .unwrap();
+        let mut cleared = named.clone();
+        cleared.launch.session_id = None;
+        assert!(crate::chat::is_confirmed_identity_update(&cleared, &named));
+        let scope = Scope::Channel(accepted.agent.channel().unwrap());
+        let pane = crate::model::CardId::from_uuid(accepted.agent.id.as_uuid());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![chat_pane(pane, &cleared)],
+                closed: vec![],
+            })
+            .unwrap();
+        assert_eq!(saved_chat_pane(&registry, pane), (cleared.clone(), None));
+        assert!(
+            !registry.learn_saved_pane_identity(&named).unwrap(),
+            "the agent's record does not name the pane's conversation"
+        );
+        assert_eq!(registry.save_agent_pane_identities().written, Vec::new());
+
+        let view = registry.view_snapshot(&scope).unwrap().0.unwrap();
+        let before = view.panes[0].clone();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: view.revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: before.clone(),
+                    pane: chat_pane(pane, &named),
+                },
+            })
+            .unwrap();
+        let view = registry.view_snapshot(&scope).unwrap().0.unwrap();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: view.revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: view.panes[0].clone(),
+                    pane: chat_pane(pane, &cleared),
+                },
+            })
+            .unwrap();
+        assert_eq!(saved_chat_pane(&registry, pane), (cleared, None));
     }
 
     /// The provider can name the thread while the launch is still pending,

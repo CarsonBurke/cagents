@@ -1229,6 +1229,17 @@ pub fn is_confirmed_identity_update(source: &Session, replacement: &Session) -> 
     projected == *replacement
 }
 
+/// [`is_confirmed_identity_update`] for a daemon-hosted Codex thread only: the
+/// first ID its provider confirmed for a thread that had none. A Codex thread
+/// never changes identity once begun, so a saved copy holding this ID is never
+/// outdated by the copy without it, and either may be restored from the other.
+/// A Claude conversation can be cleared or replaced under the same process, so
+/// copying a saved Claude ID onto a descriptor that lacks one could revive a
+/// conversation the person left; callers that restore an ID use this instead.
+pub fn is_first_codex_identity_update(source: &Session, replacement: &Session) -> bool {
+    source.launch.provider == Provider::Codex && is_confirmed_identity_update(source, replacement)
+}
+
 /// A formerly hosted pane may never have observed its first provider identity.
 /// This narrow transition is usable only after authenticated upgrade resolution,
 /// exact attachment and snapshot confirmation, followed by a writer receipt.

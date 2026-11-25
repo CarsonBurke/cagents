@@ -4427,6 +4427,58 @@ fn an_existing_agent_card_learns_the_thread_its_agent_names() {
     }
 }
 
+/// #3095: a new card made from a pane that lacks the thread its agent names
+/// takes the agent's ID. A Claude pane without its agent's ID may show a
+/// cleared conversation, so its card keeps the pane's descriptor.
+#[test]
+fn a_new_agent_card_takes_only_the_codex_thread_its_pane_lacks() {
+    use crate::agent_execution::HostedSession;
+    for codex in [true, false] {
+        let (mut app, mut agent, mut pane, destination) = unloaded_chat_label_fixture();
+        let Some(HostedSession::Chat(mut unnamed)) = agent.session.clone() else {
+            unreachable!()
+        };
+        if codex {
+            unnamed.launch.provider = crate::agent::Provider::Codex;
+            unnamed.launch.recipe.program = "codex".into();
+            unnamed.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+            let proof = unnamed.proof.clone().unwrap();
+            assert!(unnamed.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+            agent.spec.provider = crate::agent::Provider::Codex;
+        } else {
+            unnamed.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        }
+        unnamed.launch.session_id = None;
+        let mut named = unnamed.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if codex {
+            named.native_continuity = crate::chat::NativeContinuity::Durable {
+                provider_version: "0.157.1".into(),
+            };
+        }
+        assert!(crate::chat::is_confirmed_identity_update(&unnamed, &named));
+        agent.session = Some(HostedSession::Chat(named.clone()));
+        pane.kind = CardKind::Chat(unnamed.clone());
+        app.workspace_model.views = vec![crate::workspace_model::views::View {
+            scope: crate::agent_execution::Placement::Channel(destination),
+            revision: 9,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        }];
+        app.workspace_model.agents = vec![agent.clone()];
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Chat(if codex { named } else { unnamed }),
+            "codex: {codex}"
+        );
+    }
+}
+
 #[test]
 fn unloaded_spawn_label_reaches_the_sidebar_attention_row_without_a_model_change() {
     use crate::agent_execution::{Placement, agent_label};

@@ -821,8 +821,10 @@ pub(super) fn apply_recorded(
         }
         _ => unreachable!(),
     }
+    // A kept ID is a change to what the window wrote, even where the stored
+    // view is unchanged: the new revision sends the window the pane it lacks.
     if keep_confirmed_chat_identities(transaction, &stored, &mut view)? {
-        changed = view.panes != stored.panes || view.retired != stored.retired;
+        changed = true;
     }
     if changed || !existed {
         view.revision = store::next_revision(transaction)?;
@@ -1057,7 +1059,7 @@ pub(super) fn learn_saved_chat_pane_identity(
         return Ok(false);
     }
     match chat_pane_session(db, saved.id)? {
-        Some(current) if crate::chat::is_confirmed_identity_update(&current, saved) => {
+        Some(current) if crate::chat::is_first_codex_identity_update(&current, saved) => {
             learn_chat_pane_identity(db, &current, saved)
         }
         _ => Ok(false),
@@ -1075,7 +1077,7 @@ pub(super) fn learn_saved_chat_pane_identity(
 /// the rest of the write still applies, and a refused seed or insert would
 /// leave the agent with no pane at all. Only panes `view` changes from
 /// `stored` are checked, and only the exact identity-learning shape is
-/// restored ([`crate::chat::is_confirmed_identity_update`]); a write that
+/// restored ([`crate::chat::is_first_codex_identity_update`]); a write that
 /// changes the chat, its proof or its launch is not this and stands. Returns
 /// whether any pane kept its ID.
 fn keep_confirmed_chat_identities(
@@ -1112,7 +1114,7 @@ fn keep_confirmed_chat_identities(
             }),
         };
         if let Some(saved) = saved
-            && crate::chat::is_confirmed_identity_update(next, &saved)
+            && crate::chat::is_first_codex_identity_update(next, &saved)
         {
             pane.kind = CardKind::Chat(saved);
             kept = true;
