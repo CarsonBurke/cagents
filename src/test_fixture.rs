@@ -38,13 +38,20 @@ fn create_in(
     protected: &[(PathBuf, &'static str)],
 ) -> io::Result<tempfile::TempDir> {
     validate_root(root, protected)?;
+    // Native cwd and repository queries spell Darwin's sealed system links
+    // through their targets. Use the same spelling, while still validating
+    // the original path and checking protections on the translated path.
+    let actual = crate::secure_file::sealed_system_path(root);
+    if actual != root {
+        validate_root(&actual, protected)?;
+    }
     if prefix.chars().any(|part| matches!(part, '/' | '\\' | '\0')) {
         return Err(refusal(root, "fixture prefix must be a filename prefix"));
     }
     let directory = tempfile::Builder::new()
         .prefix(prefix)
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(root)
+        .tempdir_in(&actual)
         .map_err(|error| refusal(root, format!("cannot create a private directory: {error}")))?;
     let metadata = fs::symlink_metadata(directory.path())
         .map_err(|error| refusal(root, format!("cannot verify private directory: {error}")))?;
@@ -244,6 +251,31 @@ mod tests {
         let metadata = fs::symlink_metadata(first.path()).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o700);
         assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uses_the_resolved_name_of_a_sealed_system_root() {
+        let fixture = fixture();
+        let resolved = fixture.path().canonicalize().unwrap();
+        let Ok(relative) = resolved.strip_prefix("/private") else {
+            return; // TMPDIR is outside Darwin's sealed system links.
+        };
+        let Some(Component::Normal(name)) = relative.components().next() else {
+            return;
+        };
+        let link = Path::new("/").join(name);
+        if !fs::symlink_metadata(&link)
+            .is_ok_and(|metadata| crate::secure_file::is_sealed_system_link(&link, &metadata))
+        {
+            return;
+        }
+        let root = Path::new("/").join(relative);
+        let child = try_tempdir_in(&root, "sealed-").unwrap();
+        assert_eq!(child.path().parent(), Some(resolved.as_path()));
+        assert_eq!(child.path(), child.path().canonicalize().unwrap());
+        let protected = [(resolved, "the protected fixture")];
+        assert!(create_in(&root, "forbidden-", &protected).is_err());
     }
 
     #[test]
