@@ -966,6 +966,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn copy_only_preserves_modes_skips_missing_sources_and_never_overwrites_tracked_files() {
         let fixture = Fixture::new();
         let plan = fixture.config("copy = ['.env*', 'tracked', 'missing/local.toml']");
@@ -1117,6 +1121,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn literal_copy_works_without_enumerating_primary_directory() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
@@ -1132,6 +1140,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn anonymous_copy_publishes_the_owned_inode_and_never_cleans_foreign_names() {
         use std::os::unix::fs::FileExt;
         for collision in [false, true] {
@@ -1208,6 +1220,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn anonymous_copy_preserves_mode_under_restrictive_umask() {
         const CHILD: &str = "CAGENTS_SETUP_ANONYMOUS_UMASK_CHILD";
         if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
@@ -1334,6 +1350,9 @@ mod tests {
         assert!(!fixture.destination.join(".env").exists());
     }
 
+    // POSIX ACLs are Linux's `system.posix_acl_*` extended attributes; Darwin
+    // keeps ACLs outside xattrs, and its xattr calls take a position argument.
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_preserves_restrictive_access_acl_and_removes_inherited_acl() {
         use std::os::fd::AsRawFd;
@@ -1531,6 +1550,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn copy_preserves_bytes_mode_and_matching_source_group() {
         // This ordinary copy control does not exercise group restoration:
         // preserve_group returns before fchown when both groups already match.
@@ -1567,6 +1590,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn recursive_globs_are_bounded_to_real_directories_and_copy_nested_files() {
         let fixture = Fixture::new();
         fs::create_dir_all(fixture.primary.join("config/nested")).unwrap();
@@ -1609,6 +1636,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn broad_globs_do_not_copy_other_managed_worktrees_or_the_destination() {
         let fixture = Fixture::with_nested_destination(true);
         let other = fixture.primary.join(".worktrees/other");
@@ -1655,6 +1686,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn keeps_existing_untracked_and_dangling_symlink_destinations() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "source").unwrap();
@@ -1676,6 +1711,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn explicit_trust_is_project_local_and_exact_config_changes_revoke_it() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
@@ -1765,6 +1804,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
+    )]
     fn inherited_git_environment_cannot_redirect_setup() {
         const CHILD_PRIMARY: &str = "CAGENTS_SETUP_TEST_PRIMARY";
         const CHILD_DESTINATION: &str = "CAGENTS_SETUP_TEST_DESTINATION";
