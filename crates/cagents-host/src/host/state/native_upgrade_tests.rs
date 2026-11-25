@@ -91,6 +91,10 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
     else {
         panic!("expected the registered terminal view, got {view:?}");
     };
+    wait_until(
+        || root.join("console-ready").is_file(),
+        "the fixture did not start the paired CLI in its PTY",
+    );
     let (issued, terminal_owner) = {
         let state = host.lock().unwrap();
         (
@@ -138,7 +142,18 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
             path.display()
         );
     }
-    assert!(crate::chat::native_holder::inspect_closed_source(&issued, &proof.boot_id).unwrap());
+    let source_receipt = crate::chat::native_holder::closed_source(&issued, &proof).unwrap();
+    let (closed_owner, paired_closed) =
+        source_receipt.expect("missing receipt for the issued pair");
+    assert_eq!(closed_owner, native_owner);
+    assert!(
+        paired_closed,
+        "native receipt did not settle its registered terminal"
+    );
+    assert!(
+        crate::chat::native_holder::inspect_closed_source(&issued, &proof.boot_id).unwrap(),
+        "native holder published only scoped close evidence"
+    );
     assert_eq!(
         codex_execution(&issued, &proof.boot_id),
         CodexExecution::Ended
@@ -197,6 +212,38 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
         session.terminal.is_none()
             && session.owned_codex_listener.is_none()
             && session.proof.is_none()
+    );
+    let resumed_id = session.id;
+    let (resumed, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatStart {
+            session,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(resumed, ServerResponse::ChatAttached { .. }));
+    let resumed_handle = host.lock().unwrap().chats[&resumed_id].handle.clone();
+    wait_durable(&resumed_handle);
+    let resumed_control = registry::socket(&native_directory, resumed_id);
+    let resumed_owner = registry::evidence(&resumed_control, Kind::Native)
+        .unwrap()
+        .unwrap();
+    let (closed, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatClose {
+            chat_id: resumed_id,
+        },
+    )
+    .unwrap();
+    assert!(matches!(closed, ServerResponse::ChatClosed { .. }));
+    wait_until(
+        || !resumed_owner.holder.is_current() && !resumed_owner.root.is_current(),
+        "the resumed fixture provider survived close",
     );
 }
 
@@ -1900,7 +1947,8 @@ fn install_provider(root: &std::path::Path) -> std::path::PathBuf {
         format!(
             r#"#!/bin/sh
 set -eu
-if [ "${{{MODE}:-}}" = paired-floor ] && [ "${{1:-}}" = --remote ]; then
+if [ "${{1:-}}" = --remote ]; then
+  : > "${{0%/*}}/../console-ready"
   exec /bin/sleep 300
 fi
 for arg in "$@"; do
