@@ -120,6 +120,7 @@ UNINSTALL=0
 PURGE=0
 RESTART_DAEMON=0
 STAGE_ONLY=0
+STAGE_FOR_UPGRADE=0
 SELECT_VERSION=
 REQUIRE_EMPTY_DAEMON=0
 RELAUNCH_AGENTS=
@@ -140,6 +141,11 @@ while [ "$#" -gt 0 ]; do
             ;;
         --stage-only)
             STAGE_ONLY=1
+            shift
+            ;;
+        --stage-for-upgrade)
+            STAGE_ONLY=1
+            STAGE_FOR_UPGRADE=1
             shift
             ;;
         --prepare-candidate|--prepared-candidate)
@@ -226,6 +232,7 @@ if [ -n "$SELECT_VERSION" ]; then
     # Selection never closes windows or touches the daemon. Requiring the
     # option that promises this keeps the effect explicit at the call site.
     [ "$STAGE_ONLY" -eq 1 ] || fail '--select requires --stage-only'
+    [ "$STAGE_FOR_UPGRADE" -eq 0 ] || fail '--select cannot be combined with --stage-for-upgrade'
     case $SELECT_VERSION in
         v*) SELECT_VERSION=${SELECT_VERSION#v} ;;
     esac
@@ -1187,6 +1194,7 @@ awk '
     }
 ' "$ARCHIVE_VERBOSE" || fail 'archive contains links, special files, or invalid entry types'
 PREPARED_MARKER=.cagents-prepared-candidate-v1.json
+LOCAL_CANDIDATE_MARKER=.cagents-local-candidate-v1
 RETAINED_MARKER=.cagents-retained-candidate-v1.json
 validate_version_members() {
     awk -v top="$1" -v installed="$2" -v prepared="$PREPARED_MARKER" -v retained="$RETAINED_MARKER" '
@@ -1350,7 +1358,11 @@ else
         [ "$INSTALLER_ACTUAL" = "$INSTALLER_HASH" ] || fail 'installer SHA-256 verification failed'
     fi
     set -- --version "$VERSION" --prefix "$PREFIX"
-    [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --stage-only
+    if [ "$STAGE_FOR_UPGRADE" -eq 1 ]; then
+        set -- "$@" --stage-for-upgrade
+    elif [ "$STAGE_ONLY" -eq 1 ]; then
+        set -- "$@" --stage-only
+    fi
     [ -z "$SELECT_VERSION" ] || set -- "$@" --select "$SELECT_VERSION"
     [ "$RESTART_DAEMON" -eq 0 ] || set -- "$@" --restart-daemon
     [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || set -- "$@" --require-empty-daemon
@@ -1478,7 +1490,7 @@ prune_installed_versions() (
         # Keep private retry candidates for two weeks. A reviewed worker with
         # an inherited daemon lease still owns recovery even after its inner
         # installer commits, so leave marked trees to a later standalone pass.
-        for marker in "$old_tree/$PREPARED_MARKER" "$old_tree/$RETAINED_MARKER"; do
+        for marker in "$old_tree/$PREPARED_MARKER" "$old_tree/$RETAINED_MARKER" "$old_tree/$LOCAL_CANDIDATE_MARKER"; do
             [ -e "$marker" ] || [ -L "$marker" ] || continue
             if [ -n "${CAGENTS_DAEMON_LEASE_FD:-}" ] || \
                 [ "$(find "$marker" -maxdepth 0 -type f -mtime +13 -print)" != "$marker" ]; then
@@ -2100,11 +2112,23 @@ if [ "$HAD_CURRENT" -eq 1 ] && [ "$RESTART_DAEMON" -eq 1 ] && [ "$DAEMON_DEFERRE
         *[!0-9]*) fail 'the shared-model store schema is unreadable; installation was not changed' ;;
     esac
 fi
-CURRENT_TEMP=$PREFIX/.current.$$
-rm -f "$CURRENT_TEMP"
-ln -s "versions/$VERSION" "$CURRENT_TEMP"
-CURRENT_SWITCHED=1
-mv -Tf "$CURRENT_TEMP" "$PREFIX/current"
+if [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$HAD_CURRENT" -eq 1 ]; then
+    # Only the reviewed worker may publish this tree. Bind it to the installed
+    # source that owns the public launchers at the time of staging.
+    selected_root=$(readlink -f -- "$PREFIX/current") \
+        || fail 'cannot resolve the selected version'
+    [ "${selected_root%/*}" = "$(readlink -f -- "$PREFIX/versions")" ] \
+        || fail 'the selected version belongs to another installation'
+    (set -C; printf '%s\n' "${selected_root##*/}" > "$NEW_VERSION_DIR/$LOCAL_CANDIDATE_MARKER") \
+        || fail 'cannot mark the staged local build'
+    sync -f "$PREFIX/versions" || fail 'could not durably stage the local build'
+else
+    CURRENT_TEMP=$PREFIX/.current.$$
+    rm -f "$CURRENT_TEMP"
+    ln -s "versions/$VERSION" "$CURRENT_TEMP"
+    CURRENT_SWITCHED=1
+    mv -Tf "$CURRENT_TEMP" "$PREFIX/current"
+fi
 
 # Publish launchers only after their executable and icon targets exist. Menus
 # can cache a dangling desktop link as missing until their next full rescan.
@@ -2162,7 +2186,9 @@ prune_installed_versions
 refresh_launcher_caches
 
 
-if [ "$STAGE_ONLY" -eq 1 ]; then
+if [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$HAD_CURRENT" -eq 1 ]; then
+    printf 'Staged cagents %s. Your current installation is still serving.\n' "$VERSION"
+elif [ "$STAGE_ONLY" -eq 1 ]; then
     printf 'Staged cagents %s; existing windows and the previous service state were preserved. Run cagents daemon upgrade to apply it when ready.\n' "$VERSION"
 elif [ "$DAEMON_DEFERRED" -eq 1 ]; then
     printf 'Installed cagents %s; running sessions were preserved. Run cagents daemon upgrade to finish updating the daemon.\n' "$VERSION"

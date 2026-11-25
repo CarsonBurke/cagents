@@ -21,7 +21,7 @@ Usage: scripts/install-local [--build-host HOST] [--stage-only] [--this-commit]
                              [--yes] [--interrupt]
 
 Builds HEAD with the `local` Cargo profile as version <version>+local.<sha>,
-stages it with install.sh --stage-only, and runs `cagents daemon upgrade`.
+then stages it and runs the new build's `cagents daemon upgrade`.
 
 The build runs in the repository's .worktrees/.install-local, a detached
 checkout this script owns, so its target directory stays warm between runs
@@ -29,7 +29,7 @@ and edits in other checkouts never reach the binaries.
 
   --build-host HOST  Build on HOST over ssh, then install here. HEAD is pushed
                      to the repository at the same path relative to $HOME.
-  --stage-only       Stop after staging; finish later with: cagents daemon upgrade
+  --stage-only       Stop after staging and print the command to finish later.
   --this-commit      Build HEAD even when detached, without an upstream,
                      or behind its upstream.
   --yes, --interrupt
@@ -205,10 +205,15 @@ build_commit() {
     )
 }
 
-if [[ $PREFIX/current -ef $PREFIX/versions/$VERSION ]]; then
+CANDIDATE=$PREFIX/versions/$VERSION
+STAGED_MARKER=$CANDIDATE/.cagents-local-candidate-v1
+FRESH_INSTALL=0
+if [[ $PREFIX/current -ef $CANDIDATE ]]; then
     printf '%s is already current; skipping the build.\n' "$VERSION"
-elif [[ -e $PREFIX/versions/$VERSION ]]; then
-    fail "$PREFIX/versions/$VERSION exists but is not current; remove it to reinstall"
+elif [[ -f $STAGED_MARKER && ! -L $STAGED_MARKER && -O $STAGED_MARKER ]]; then
+    printf '%s is already staged; skipping the build.\n' "$VERSION"
+elif [[ -e $CANDIDATE ]]; then
+    fail "$CANDIDATE exists but is not a staged build"
 else
     if [[ -z $BUILD_HOST ]]; then
         build_commit "$REPOSITORY" "$COMMIT" "$VERSION" "$OUTPUT" "${CARGO_BUILD_JOBS:-}" </dev/null
@@ -248,13 +253,19 @@ EOF
     [[ -n $need ]] || fail 'could not determine the glibc the build requires'
     [[ $(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1) == "$have" ]] \
         || fail "the build requires glibc $need; this host has $have"
+    [[ -L $PREFIX/current ]] || FRESH_INSTALL=1
     CAGENTS_ARCHIVE=$OUTPUT/$ARCHIVE CAGENTS_CHECKSUMS=$OUTPUT/SHA256SUMS \
-        sh "$ROOT_DIR/install.sh" --version "$VERSION" --stage-only
+        sh "$ROOT_DIR/install.sh" --version "$VERSION" --stage-for-upgrade
     rm -rf -- "$OUTPUT"
 fi
 
 if ((STAGE_ONLY)); then
-    printf 'Staged %s. Finish the update with: cagents daemon upgrade\n' "$VERSION"
+    if [[ ! $PREFIX/current -ef $CANDIDATE ]]; then
+        printf 'Finish the update by running %q daemon upgrade\n' "$CANDIDATE/bin/cagents"
+    fi
     exit 0
 fi
-exec "$PREFIX/current/bin/cagents" daemon upgrade "${UPGRADE_ARGS[@]}"
+if ((FRESH_INSTALL)) && [[ $PREFIX/current -ef $CANDIDATE ]]; then
+    exit 0
+fi
+exec "$CANDIDATE/bin/cagents" daemon upgrade "${UPGRADE_ARGS[@]}"

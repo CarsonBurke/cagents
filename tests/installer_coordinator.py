@@ -414,6 +414,31 @@ class InstallerCoordinator(unittest.TestCase):
         self.assertTrue((self.prefix / 'versions/old').is_dir())
         self.assertFalse(obsolete.exists())
 
+    def test_staging_for_upgrade_keeps_the_public_cli_on_the_source(self):
+        previous = self.installed_cli(guarded=True, version='9.9.8')
+        public_cli = self.home / '.local/bin/cagents'
+        public_cli.parent.mkdir(parents=True)
+        public_cli.symlink_to(self.prefix / 'current/bin/cagents')
+        original = public_cli.stat()
+        staged = self.install('--stage-for-upgrade')
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assertEqual((self.prefix / 'current').readlink(), Path('versions/9.9.8'))
+        self.assertEqual(public_cli.resolve(), previous / 'cagents')
+        self.assertTrue(os.path.samestat(original, public_cli.stat()))
+        candidate = self.prefix / 'versions' / VERSION
+        marker = candidate / '.cagents-local-candidate-v1'
+        self.assertEqual(marker.read_text(), '9.9.8\n')
+        self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+        self.assertTrue(os.access(candidate / 'bin/cagents', os.X_OK))
+        self.assertFalse(any(e['event'] == 'daemon-start-fixture' for e in self.events()))
+
+    def test_staging_for_upgrade_without_a_source_publishes_the_first_installation(self):
+        staged = self.install('--stage-for-upgrade')
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assertEqual((self.prefix / 'current').readlink(), Path(f'versions/{VERSION}'))
+        self.assertFalse((self.prefix / 'current/.cagents-local-candidate-v1').exists())
+        self.assertTrue((self.home / '.local/bin/cagents').is_file())
+
     def test_install_defers_pruning_when_a_live_cagents_executable_cannot_be_read(self):
         self.installed_cli(guarded=True)
         self.add_editor_to_archive()

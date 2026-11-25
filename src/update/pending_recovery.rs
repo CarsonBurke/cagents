@@ -49,6 +49,12 @@ pub(crate) fn run(
     guard.set_recovery_restore_only();
     guard.set_fallback_executable(ui.clone());
     let before = candidate_stamp(&layout.version_root)?;
+    let local_stage = fs::symlink_metadata(layout.version_root.join(installed::LOCAL_STAGE_MARKER));
+    let switch = match local_stage {
+        Ok(_) => installed::Selection::capture(&layout)?.prepare(&layout)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
     let settled = match verify(&pending, &daemon) {
@@ -63,6 +69,7 @@ pub(crate) fn run(
         Err(_) => false,
     };
     if settled {
+        installed::complete_selection(switch, &layout)?;
         // A pre-existing UI may have ordinary restore policy. Close and reopen
         // it under the same guarded policy instead of merely activating it.
         let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
@@ -127,7 +134,9 @@ pub(crate) fn run(
                 "The selected candidate changed before recovery; nothing was started",
             ));
         }
-        select_target(&layout)?;
+        if switch.is_none() {
+            select_target(&layout)?;
+        }
         guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         let mut command = Command::new(&cli);
@@ -151,6 +160,7 @@ pub(crate) fn run(
             .map_err(invalid)?
             .ok_or_else(|| invalid("The Prepared evidence disappeared after recovery"))?;
         let outcome = verify(&pending, &daemon)?;
+        installed::complete_selection(switch, &layout)?;
         receipt.release_daemon_reservation();
         Ok::<_, UpdateError>(outcome)
     })();

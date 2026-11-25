@@ -598,18 +598,40 @@ fn selectable_root(prefix: &Path, version_root: &Path) -> io::Result<std::path::
 /// An unexpected link is restored before refusing. Supported writers hold the
 /// caller's launch fence; manual filesystem writes outside it are not serialized.
 fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let current = prefix.join("current");
-    let next = prefix.join(format!(".select.{}", std::process::id()));
-    match std::fs::remove_file(&next) {
-        Ok(()) => (),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-        Err(error) => return Err(error),
+    CurrentExchange::prepare(prefix, link, expected)?.commit()
+}
+
+/// Allocates the replacement pointer while the source is still available.
+/// The caller holds the launch fence through prepare and commit.
+pub(crate) struct CurrentExchange {
+    current: std::path::PathBuf,
+    next: std::path::PathBuf,
+    expected: std::path::PathBuf,
+    keep_next: bool,
+}
+
+impl CurrentExchange {
+    pub(crate) fn prepare(prefix: &Path, link: &Path, expected: &Path) -> io::Result<Self> {
+        let current = prefix.join("current");
+        if std::fs::read_link(&current)? != expected {
+            return Err(io::Error::other(
+                "current installation changed independently",
+            ));
+        }
+        let next = prefix.join(format!(".select.{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(link, &next)?;
+        Ok(Self {
+            current,
+            next,
+            expected: expected.to_owned(),
+            keep_next: false,
+        })
     }
-    std::os::unix::fs::symlink(link, &next)?;
-    let exchange = || -> io::Result<()> {
-        let from = std::ffi::CString::new(next.as_os_str().as_bytes())?;
-        let to = std::ffi::CString::new(current.as_os_str().as_bytes())?;
+
+    fn swap(&self) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let from = std::ffi::CString::new(self.next.as_os_str().as_bytes())?;
+        let to = std::ffi::CString::new(self.current.as_os_str().as_bytes())?;
         // SAFETY: both paths are NUL-terminated and outlive the call.
         #[cfg(target_os = "linux")]
         let exchanged = unsafe {
@@ -636,39 +658,50 @@ fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<(
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    };
-    if let Err(error) = exchange() {
-        let _ = std::fs::remove_file(&next);
-        return Err(io::Error::new(
-            error.kind(),
-            format!("cannot atomically switch {}: {error}", current.display()),
-        ));
     }
-    // `next` now holds whatever `current` held at the instant of exchange.
-    if std::fs::read_link(&next).ok().as_deref() != Some(expected) {
-        let restored = exchange();
-        if restored.is_ok() {
-            let _ = std::fs::remove_file(&next);
+
+    pub(crate) fn commit(mut self) -> io::Result<()> {
+        self.swap().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot atomically switch {}: {error}",
+                    self.current.display()
+                ),
+            )
+        })?;
+        // The temporary name now holds the previous public pointer.
+        if std::fs::read_link(&self.next).ok().as_deref() != Some(self.expected.as_path()) {
+            return Err(io::Error::other(match self.swap() {
+                Ok(()) => "current installation changed independently; the link observed during selection was restored".into(),
+                Err(error) => {
+                    self.keep_next = true;
+                    format!(
+                        "current installation changed independently, and restoring it failed ({error}); its replaced link is kept at {}",
+                        self.next.display()
+                    )
+                }
+            }));
         }
-        return Err(io::Error::other(match restored {
-            Ok(()) => "current installation changed independently; the link observed during selection was restored".into(),
-            Err(error) => format!(
-                "current installation changed independently, and restoring it failed ({error}); its replaced link is kept at {}",
-                next.display()
-            ),
-        }));
+        // The new pointer is serving. A cleanup error cannot undo it.
+        if let Err(error) = std::fs::remove_file(&self.next)
+            .and_then(|()| File::open(self.current.parent().unwrap()))
+            .and_then(|directory| directory.sync_all())
+        {
+            eprintln!(
+                "cagents: selected the installed version; finalizing its pointer failed ({error})"
+            );
+        }
+        Ok(())
     }
-    // `current` already serves the selection; failing now would misreport it.
-    if let Err(error) = std::fs::remove_file(&next)
-        .and_then(|()| File::open(prefix))
-        .and_then(|directory| directory.sync_all())
-    {
-        eprintln!(
-            "cagents: selected the installed version, but could not finish cleanup ({error}); remove {} if it remains",
-            next.display()
-        );
+}
+
+impl Drop for CurrentExchange {
+    fn drop(&mut self) {
+        if !self.keep_next {
+            let _ = std::fs::remove_file(&self.next);
+        }
     }
-    Ok(())
 }
 
 /// A marker only selects a complete same-prefix tree while the kernel still

@@ -2749,11 +2749,12 @@ It builds the three matched executables with the `local` Cargo profile,
 versioned `<version>+local.<short sha>`. That profile keeps release identity
 and optimization but skips link-time optimization and single-unit code
 generation. Each build is incremental, so after the first one only changed
-code is recompiled. The script stages the archive with
-`install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
-affected session and asks before replacing anything. `--stage-only` stops
-after staging; finish later with `cagents daemon upgrade`. The staged build
-always supplies the updater. A source daemon whose protocol live updates do
+code is recompiled. The new build's `cagents daemon upgrade` shows the
+affected sessions and asks before replacing anything. The public `cagents`
+command keeps serving the current installation until the replacement daemon
+is ready. `--stage-only` stops after staging and prints the command to
+finish later. Rerunning the script for the same staged build reuses it.
+A source daemon whose protocol live updates do
 not start from is refused before anything changes; follow the cold
 installation the refusal describes.
 
@@ -2821,8 +2822,8 @@ with `--stop stop`, as a person would type. Extra upgrade flags use
 `--upgrade-arg=--interrupt`; the harness adds no policy automatically. Refusals are measured outcomes: even
 a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
-That staged path is how `scripts/install-local` updates, and NEW's own worker
-runs it. A person updates from the app instead, and there OLD's installed worker
+NEW's own worker runs this staged path, as it does for `scripts/install-local`.
+Update from the app and OLD's installed worker
 runs the whole update, including the checks after NEW starts. Add `--feed DIR`
 to rehearse that path: DIR is a file feed holding NEW's signed bundle
 (`scripts/release feed`), and the feed's archive must match `--new-dir`. OLD's
