@@ -245,7 +245,9 @@ fn checked_close_waits_for_an_adopted_reaped_roots_exact_release() {
         admitted.recv().unwrap();
         worker.run();
     }));
-    initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+    initialized
+        .recv_timeout(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(5))
+        .unwrap();
     let expected = handle.holder_identity().unwrap().clone();
     let closer = handle.clone();
     let close_source = source.clone();
@@ -2264,7 +2266,9 @@ fn deferred_natural_close_keeps_registered_holder_receipt_authority() {
             worker: owner,
         }),
     };
-    initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+    initialized
+        .recv_timeout(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(5))
+        .unwrap();
     let record = handle.holder_identity().unwrap().clone();
     assert!(record.holder.is_current() && !record.root.is_current());
     assert!(!handle.is_completed());
