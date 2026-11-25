@@ -1,9 +1,8 @@
 use super::*;
 use crate::update::impact::{
-    DaemonImpact, Disposition, Policy, QUEUED_MESSAGES, SessionImpact, SessionKind,
+    DaemonImpact, Disposition, Policy, SessionCause, SessionImpact, SessionKind,
 };
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 
 /// The caller holds the control gate. SQL and actor barriers deliberately run
 /// without HostState: both may need host events to finish admitted work.
@@ -280,35 +279,20 @@ impl HostState {
                 source.launch.session_id = confirmed.clone();
             }
             let migration = crate::upgrade::handoff::validate_chat_source(&source, &launch);
-            let (disposition, reason): (_, Cow<str>) = if record.returning_terminal {
-                (
-                    Disposition::Blocked,
-                    "Finish the pending return to terminal or close this conversation.".into(),
-                )
+            let (disposition, reason) = if record.returning_terminal {
+                (Disposition::Blocked, SessionCause::ReturningToTerminal)
             } else if self.provider_ended(id, record) {
-                (
-                    Disposition::Resumes,
-                    crate::update::impact::PROVIDER_ENDED.into(),
-                )
+                (Disposition::Resumes, SessionCause::ProviderEnded)
             } else if record.handle.is_completed() {
-                (
-                    Disposition::Blocked,
-                    crate::update::impact::STOPPED_WITH_UNSETTLED_WORK.into(),
-                )
-            } else if let Err(reason) = &migration {
-                (Disposition::Blocked, reason.as_str().into())
-            } else if let Err(reason) = &environment {
-                (Disposition::Blocked, reason.as_str().into())
+                (Disposition::Blocked, SessionCause::UnsettledProvider)
+            } else if let Err(reason) = migration {
+                (Disposition::Blocked, SessionCause::Detail(reason))
+            } else if let Err(reason) = environment {
+                (Disposition::Blocked, SessionCause::Detail(reason))
             } else if !ready {
-                (
-                    Disposition::Blocked,
-                    "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.".into(),
-                )
+                (Disposition::Blocked, SessionCause::ProviderStarting)
             } else if (!aligned || launch.terminal_recipe().is_none()) && !retained_claude {
-                (
-                    Disposition::Blocked,
-                    "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.".into(),
-                )
+                (Disposition::Blocked, SessionCause::UnrecordedConversation)
             } else if durable
                 && self.terminals.get(&id).is_some_and(|terminal| {
                     !terminal.handle.is_completed()
@@ -317,11 +301,10 @@ impl HostState {
             {
                 (
                     Disposition::Blocked,
-                    "The paired console cannot preserve its live process through this update."
-                        .into(),
+                    SessionCause::PairedTerminalCannotCarry,
                 )
             } else if queued.contains(&id) {
-                (Disposition::WaitsForIdle, QUEUED_MESSAGES.into())
+                (Disposition::WaitsForIdle, SessionCause::PendingDelivery)
             } else if durable {
                 (
                     Disposition::Continues,
@@ -363,7 +346,7 @@ impl HostState {
                     record.handle.native_continuity(),
                 ))?,
                 disposition,
-                reason: reason.into_owned(),
+                reason,
                 interrupted_subagents: if disposition == Disposition::Interrupted {
                     interrupted_subagents
                 } else {

@@ -38,6 +38,84 @@ pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may stil
 pub const PROVIDER_ENDED: &str =
     "Its provider already stopped. The saved conversation will reopen with a new provider process.";
 
+const BACKGROUND_WORK: &str = "Its turn finished, but background agents are still running. Review stopping them to continue the update.";
+const RETURNING_TO_TERMINAL: &str =
+    "Finish the pending return to terminal or close this conversation.";
+const PROVIDER_STARTING: &str = "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.";
+const UNRECORDED_CONVERSATION: &str = "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.";
+const TERMINAL_CANNOT_CARRY: &str = "This terminal cannot preserve its live process through this update; finish it or close it before updating.";
+const PAIRED_TERMINAL_CANNOT_CARRY: &str =
+    "The paired console cannot preserve its live process through this update.";
+
+/// The reason for an update disposition. The existing wire and on-disk review
+/// records store text, so their fixed messages are decoded at this boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
+pub enum SessionCause {
+    PendingDelivery,
+    ProviderEnded,
+    UnsettledProvider,
+    BackgroundWork,
+    ReturningToTerminal,
+    ProviderStarting,
+    UnrecordedConversation,
+    TerminalCannotCarry,
+    PairedTerminalCannotCarry,
+    Detail(String),
+}
+
+impl SessionCause {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PendingDelivery => QUEUED_MESSAGES,
+            Self::ProviderEnded => PROVIDER_ENDED,
+            Self::UnsettledProvider => STOPPED_WITH_UNSETTLED_WORK,
+            Self::BackgroundWork => BACKGROUND_WORK,
+            Self::ReturningToTerminal => RETURNING_TO_TERMINAL,
+            Self::ProviderStarting => PROVIDER_STARTING,
+            Self::UnrecordedConversation => UNRECORDED_CONVERSATION,
+            Self::TerminalCannotCarry => TERMINAL_CANNOT_CARRY,
+            Self::PairedTerminalCannotCarry => PAIRED_TERMINAL_CANNOT_CARRY,
+            Self::Detail(text) => text,
+        }
+    }
+}
+
+impl From<String> for SessionCause {
+    fn from(text: String) -> Self {
+        match text.as_str() {
+            QUEUED_MESSAGES => Self::PendingDelivery,
+            PROVIDER_ENDED => Self::ProviderEnded,
+            STOPPED_WITH_UNSETTLED_WORK => Self::UnsettledProvider,
+            BACKGROUND_WORK => Self::BackgroundWork,
+            RETURNING_TO_TERMINAL => Self::ReturningToTerminal,
+            PROVIDER_STARTING => Self::ProviderStarting,
+            UNRECORDED_CONVERSATION => Self::UnrecordedConversation,
+            TERMINAL_CANNOT_CARRY => Self::TerminalCannotCarry,
+            PAIRED_TERMINAL_CANNOT_CARRY => Self::PairedTerminalCannotCarry,
+            _ => Self::Detail(text),
+        }
+    }
+}
+
+impl From<&str> for SessionCause {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl Serialize for SessionCause {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for SessionCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
@@ -58,7 +136,7 @@ pub struct SessionImpact {
     /// Recipes and credentials never belong in an impact preview.
     pub identity: String,
     pub disposition: Disposition,
-    pub reason: String,
+    pub reason: SessionCause,
     /// Exact background tasks this interruption would stop. An idle wait or
     /// live process carry never authorizes terminating these tasks.
     pub interrupted_subagents: Vec<String>,
@@ -81,7 +159,7 @@ impl SessionImpact {
     pub fn checkpointed(&self) -> bool {
         !(self.kind == SessionKind::NativeChat
             && self.disposition == Disposition::Resumes
-            && self.reason == PROVIDER_ENDED)
+            && self.reason == SessionCause::ProviderEnded)
     }
 
     pub fn review(&self) -> SessionReview {
@@ -93,7 +171,7 @@ impl SessionImpact {
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
             Disposition::WaitsForIdle => {
                 let tasks = self.interrupted_subagents.len();
-                if self.reason == QUEUED_MESSAGES {
+                if self.reason == SessionCause::PendingDelivery {
                     "Messages sent to it are still waiting to be delivered; the update waits for them.".into()
                 } else if tasks == 0 {
                     "Finishing its turn; the update waits.".into()
@@ -112,14 +190,14 @@ impl SessionImpact {
                 }
             }
             Disposition::ResumePicker => "Its conversation cannot reopen automatically.".into(),
-            Disposition::Blocked => match self.reason.as_str() {
-                "Its turn finished, but background agents are still running. Review stopping them to continue the update." => "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into(),
-                STOPPED_WITH_UNSETTLED_WORK => "Its provider stopped with unfinished work. Close this conversation before updating.".into(),
-                "Finish the pending return to terminal or close this conversation." => "Finish returning to the terminal or close this conversation before updating.".into(),
-                "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not." => "Its provider is still starting. Wait for it to finish, then try the update again.".into(),
-                "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it." => "Its conversation has not been recorded yet. Send it a message or close it before updating.".into(),
-                "This terminal cannot preserve its live process through this update; finish it or close it before updating." => "Its running processes cannot be preserved through this update. Finish their work or close this terminal before updating.".into(),
-                "The paired console cannot preserve its live process through this update." => "Its terminal cannot keep running through this update. Finish its work or close it before updating.".into(),
+            Disposition::Blocked => match &self.reason {
+                SessionCause::BackgroundWork => BACKGROUND_WORK.into(),
+                SessionCause::UnsettledProvider => "Its provider stopped with unfinished work. Close this conversation before updating.".into(),
+                SessionCause::ReturningToTerminal => "Finish returning to the terminal or close this conversation before updating.".into(),
+                SessionCause::ProviderStarting => "Its provider is still starting. Wait for it to finish, then try the update again.".into(),
+                SessionCause::UnrecordedConversation => "Its conversation has not been recorded yet. Send it a message or close it before updating.".into(),
+                SessionCause::TerminalCannotCarry => "Its running processes cannot be preserved through this update. Finish their work or close this terminal before updating.".into(),
+                SessionCause::PairedTerminalCannotCarry => "Its terminal cannot keep running through this update. Finish its work or close it before updating.".into(),
                 _ => match self.kind {
                     SessionKind::Terminal => "Its terminal could not be prepared for this update. Let its work finish, then try again; close the terminal if the problem continues.".into(),
                     SessionKind::NativeChat => "Its conversation could not be prepared for this update. Let its work finish, then try again; close the conversation if the problem continues.".into(),
@@ -348,6 +426,33 @@ impl Refusal {
 pub(super) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
+
+    #[test]
+    fn session_causes_read_and_write_the_legacy_string_in_reviews_and_on_the_wire() {
+        for (text, cause) in [
+            (QUEUED_MESSAGES, SessionCause::PendingDelivery),
+            (PROVIDER_ENDED, SessionCause::ProviderEnded),
+            (STOPPED_WITH_UNSETTLED_WORK, SessionCause::UnsettledProvider),
+            (
+                "an old diagnostic",
+                SessionCause::Detail("an old diagnostic".into()),
+            ),
+        ] {
+            let legacy_wire = postcard::to_allocvec(text).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<SessionCause>(&legacy_wire).unwrap(),
+                cause
+            );
+            assert_eq!(postcard::to_allocvec(&cause).unwrap(), legacy_wire);
+
+            let legacy_json = serde_json::to_string(text).unwrap();
+            assert_eq!(
+                serde_json::from_str::<SessionCause>(&legacy_json).unwrap(),
+                cause
+            );
+            assert_eq!(serde_json::to_string(&cause).unwrap(), legacy_json);
+        }
+    }
 
     pub(in crate::update) fn waiting() -> DaemonImpact {
         DaemonImpact {

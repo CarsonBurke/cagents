@@ -1994,7 +1994,7 @@ pub(in crate::app) mod tests {
             title: title.into(),
             identity: title.into(),
             disposition,
-            reason: format!("Why {title} is {}", disposition.label()),
+            reason: format!("Why {title} is {}", disposition.label()).into(),
             interrupted_subagents: Vec::new(),
         }
     }

@@ -94,14 +94,14 @@ impl TurnActivity {
             // individually to settle the conversation for a legacy prepare.
             item.interrupted_subagents = self.background.clone();
             if !self.background.is_empty() {
-                item.reason = format!(
+                item.reason = impact::SessionCause::Detail(format!(
                     "The active turn and {} running background subagent(s) will stop; background work will not resume automatically.",
                     self.background.len()
-                );
+                ));
             }
         } else if self.parent_finished && !self.background.is_empty() {
             item.disposition = impact::Disposition::Blocked;
-            item.reason = "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into();
+            item.reason = impact::SessionCause::BackgroundWork;
             item.interrupted_subagents = self.background.clone();
         } else if !self.parent_finished {
             // Disclose interruption's complete scope before offering `i`.
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(impact.disposition, impact::Disposition::Blocked);
         assert_eq!(impact.identity, "exact-source-owner");
         assert_eq!(impact.interrupted_subagents, ["background-child"]);
-        assert!(impact.reason.contains("turn finished"));
+        assert_eq!(impact.reason, impact::SessionCause::BackgroundWork);
     }
 
     #[test]
@@ -360,7 +360,12 @@ mod tests {
         .review(&mut impact);
         assert_eq!(impact.disposition, impact::Disposition::Interrupted);
         assert_eq!(impact.interrupted_subagents, ["background-child"]);
-        assert!(impact.reason.contains("background work will not resume"));
+        assert!(
+            impact
+                .reason
+                .as_str()
+                .contains("background work will not resume")
+        );
         assert_eq!(impact.identity, "exact-source-owner");
     }
 

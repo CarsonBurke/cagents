@@ -3564,7 +3564,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
     assert_eq!(interrupt.sessions[0].disposition, Disposition::Interrupted);
     assert_eq!(interrupt.sessions[0].interrupted_subagents, ["first"]);
     assert!(
-        interrupt.sessions[0].reason.starts_with(
+        interrupt.sessions[0].reason.as_str().starts_with(
             "The update will stop 1 running background subagent (\u{201c}first\u{201d})"
         ),
         "only a turn under way is called the active turn: {}",
@@ -3573,6 +3573,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
     assert!(
         waiting.sessions[0]
             .reason
+            .as_str()
             .contains("Background subagent \u{201c}first\u{201d} is still running"),
         "{}",
         waiting.sessions[0].reason

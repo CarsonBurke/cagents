@@ -450,7 +450,7 @@ pub(super) mod tests {
                     title: String::new(),
                     identity: "exact fixture actor".into(),
                     disposition: crate::update::impact::Disposition::Continues,
-                    reason: String::new(),
+                    reason: "".into(),
                     interrupted_subagents: vec![],
                 }],
                 blockers: vec![],
@@ -468,7 +468,7 @@ pub(super) mod tests {
                         title: String::new(),
                         identity: "exact additional fixture owner".into(),
                         disposition: crate::update::impact::Disposition::Continues,
-                        reason: String::new(),
+                        reason: "".into(),
                         interrupted_subagents: vec![],
                     });
             }

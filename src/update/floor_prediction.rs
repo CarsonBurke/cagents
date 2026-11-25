@@ -150,7 +150,7 @@ mod tests {
                 title: "chat".into(),
                 identity: "owner".into(),
                 disposition: impact::Disposition::Resumes,
-                reason: String::new(),
+                reason: "".into(),
                 interrupted_subagents: Vec::new(),
             }],
             blockers: Vec::new(),

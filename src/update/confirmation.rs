@@ -1816,7 +1816,7 @@ mod tests {
                 title: "reviewed pane".into(),
                 identity: "reviewed exact owner".into(),
                 disposition,
-                reason: String::new(),
+                reason: "".into(),
                 interrupted_subagents: Vec::new(),
             })
             .collect(),

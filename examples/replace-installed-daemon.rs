@@ -332,7 +332,7 @@ fn log_impact(impact: &DaemonImpact) {
             "  {}: {}: {}",
             session.id,
             session.disposition.label(),
-            session.reason.escape_debug()
+            session.reason.as_str().escape_debug()
         );
     }
     for blocker in &impact.blockers {

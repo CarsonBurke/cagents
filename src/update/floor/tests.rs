@@ -394,7 +394,7 @@ fn fixture() -> FakeSource {
             title: "build".into(),
             identity: "exact terminal owner".into(),
             disposition: impact::Disposition::Continues,
-            reason: String::new(),
+            reason: "".into(),
             interrupted_subagents: Vec::new(),
         }],
         blockers: Vec::new(),

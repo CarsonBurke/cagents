@@ -629,7 +629,7 @@ mod tests {
                 title: "Offline Codex".into(),
                 identity: "exact-owner".into(),
                 disposition: impact::Disposition::Interrupted,
-                reason: String::new(),
+                reason: "".into(),
                 interrupted_subagents: Vec::new(),
             }],
             blockers: Vec::new(),
