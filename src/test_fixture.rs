@@ -257,17 +257,24 @@ mod tests {
     #[test]
     fn uses_the_resolved_name_of_a_sealed_system_root() {
         let fixture = fixture();
-        let Some(relative) = fixture.path().strip_prefix("/private").ok() else {
+        let resolved = fixture.path().canonicalize().unwrap();
+        let Ok(relative) = resolved.strip_prefix("/private") else {
             return; // TMPDIR is outside Darwin's sealed system links.
         };
-        let root = Path::new("/").join(relative);
-        if crate::secure_file::sealed_system_path(&root) == root {
+        let Some(Component::Normal(name)) = relative.components().next() else {
+            return;
+        };
+        let link = Path::new("/").join(name);
+        if !fs::symlink_metadata(&link)
+            .is_ok_and(|metadata| crate::secure_file::is_sealed_system_link(&link, &metadata))
+        {
             return;
         }
+        let root = Path::new("/").join(relative);
         let child = try_tempdir_in(&root, "sealed-").unwrap();
-        assert_eq!(child.path().parent(), Some(fixture.path()));
+        assert_eq!(child.path().parent(), Some(resolved.as_path()));
         assert_eq!(child.path(), child.path().canonicalize().unwrap());
-        let protected = [(fixture.path().to_owned(), "the protected fixture")];
+        let protected = [(resolved, "the protected fixture")];
         assert!(create_in(&root, "forbidden-", &protected).is_err());
     }
 
