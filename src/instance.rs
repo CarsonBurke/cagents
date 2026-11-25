@@ -1617,6 +1617,10 @@ impl UiUpdateGuard {
     pub fn has_running_windows(&self) -> io::Result<bool> {
         running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
     }
+    /// The windows that hold a lease, without identifying their processes.
+    pub(crate) fn running_window_count(&self) -> io::Result<usize> {
+        running_window_slots(&self.runtime).map(|slots| slots.len())
+    }
     /// Pass the held launch fence to an installer that would otherwise try to
     /// acquire it again. The child validates both this exact lock description
     /// and the completed window shutdown; an environment flag is not authority.

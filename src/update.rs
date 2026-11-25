@@ -4,6 +4,7 @@
 //! run an installer.
 mod cancellation;
 mod candidate;
+mod cold;
 mod confirmation;
 mod feed;
 mod floor;
@@ -347,13 +348,16 @@ struct Installation {
 }
 impl Installation {
     fn detect() -> Result<Self, UpdateError> {
-        if !cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_env = "gnu"
+        if !cfg!(any(
+            all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_env = "gnu"
+            ),
+            all(target_os = "macos", target_arch = "aarch64")
         )) {
             return Err(invalid(
-                "self-update supports only Linux x86_64 GNU release installs",
+                "self-update supports only Linux x86_64 GNU and Apple Silicon macOS release installs",
             ));
         }
         if !cfg!(feature = "full") {
@@ -2292,11 +2296,19 @@ fn perform_update(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
     )?)?;
-    let terminal = matches!(request, UpdateRequest::ReleaseFromTerminal(_));
+    let terminal = matches!(
+        request,
+        UpdateRequest::ReleaseFromTerminal(_) | UpdateRequest::InstalledFromTerminal { .. }
+    );
     let selected = match request {
         UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
             Installation::detect()?;
             release
+        }
+        UpdateRequest::Installed { root } | UpdateRequest::InstalledFromTerminal { root }
+            if cfg!(target_os = "macos") =>
+        {
+            return cold::perform_installed(installation, state, job, &root, terminal);
         }
         UpdateRequest::Installed { root } => {
             return installed::perform(installation, state, job, &root, handoff, survivors, false);
@@ -2313,29 +2325,25 @@ fn perform_update(
             "selected release changed or is no longer an upgrade; check again",
         ));
     }
+    if cfg!(target_os = "macos") {
+        return cold::perform_release(
+            installation,
+            state,
+            job,
+            &feed,
+            &release,
+            terminal,
+            &cancellation,
+        );
+    }
     set_phase(
         state,
         job,
         UpdatePhase::Downloading,
         "Downloading the release",
     )?;
-    // The signed metadata names every digest. The checksum file the installer
-    // reads again must agree with it, or the two would vouch for different
-    // bytes.
-    let mut checksums = feed.download(&release, &release.checksums, &cancellation)?;
-    let mut manifest = String::new();
-    checksums.read_to_string(&mut manifest)?;
-    checksums.seek(SeekFrom::Start(0))?;
+    let (checksums, installer, archive) = download_release(&feed, &release, &cancellation)?;
     let archive_hash = release.archive.sha256;
-    if checksum_for(&manifest, &release.archive.name)? != archive_hash
-        || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
-    {
-        return Err(invalid(
-            "the release's checksum file disagrees with its signed metadata",
-        ));
-    }
-    let installer = feed.download(&release, &release.installer, &cancellation)?;
-    let archive = feed.download(&release, &release.archive, &cancellation)?;
     set_phase(
         state,
         job,
@@ -2560,6 +2568,32 @@ fn perform_update(
         None => (),
     }
     finish_reopening_windows(state, job, install_result, handoff_kind, reopen_result)
+}
+
+/// The release's checksum file, installer and archive, each matching the
+/// signed metadata.
+fn download_release(
+    feed: &feed::Feed,
+    release: &Release,
+    cancellation: &CancellationToken,
+) -> Result<(File, File, File), UpdateError> {
+    // The signed metadata names every digest. The checksum file the installer
+    // reads again must agree with it, or the two would vouch for different
+    // bytes.
+    let mut checksums = feed.download(release, &release.checksums, cancellation)?;
+    let mut manifest = String::new();
+    checksums.read_to_string(&mut manifest)?;
+    checksums.seek(SeekFrom::Start(0))?;
+    if checksum_for(&manifest, &release.archive.name)? != release.archive.sha256
+        || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
+    {
+        return Err(invalid(
+            "the release's checksum file disagrees with its signed metadata",
+        ));
+    }
+    let installer = feed.download(release, &release.installer, cancellation)?;
+    let archive = feed.download(release, &release.archive, cancellation)?;
+    Ok((checksums, installer, archive))
 }
 
 fn finish_reopening_windows(

@@ -5,7 +5,7 @@ const DAEMON_BINARY: &str = "cagentsd";
 const BINARIES: [&str; 3] = ["cagents", "cagents-ui", DAEMON_BINARY];
 
 #[derive(PartialEq, Eq)]
-struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
+pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
 
 #[cfg(target_os = "linux")]
 impl Stamp {
@@ -19,7 +19,7 @@ impl Stamp {
     }
 }
 
-fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
+pub(super) fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     let mut entries = Vec::new();
     for binary in BINARIES {
         let metadata = fs::symlink_metadata(root.join("bin").join(binary))?;
@@ -44,7 +44,7 @@ fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     Ok(Stamp(entries))
 }
 
-fn digest(root: &Path) -> Result<String, UpdateError> {
+pub(super) fn digest(root: &Path) -> Result<String, UpdateError> {
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     for binary in BINARIES {
