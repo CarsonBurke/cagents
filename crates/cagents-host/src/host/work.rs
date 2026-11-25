@@ -2294,7 +2294,7 @@ mod tests {
         Handle::idle(Weak::new())
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")] // Writes on-disk ref names that APFS rejects.
     fn non_utf8_branch_work_cards(previous_scan: bool) {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
@@ -2536,13 +2536,13 @@ mod tests {
         assert_eq!(tracked.local.as_ref().unwrap().branch_names.len(), 4);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_branch_preserves_first_work_cards() {
         non_utf8_branch_work_cards(false);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_branch_preserves_refreshed_work_cards() {
         non_utf8_branch_work_cards(true);

@@ -225,6 +225,7 @@ fn isolated(name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")] // Success requires the live checkout-process census.
 #[test]
 fn unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes() {
     let Some(root) = isolated("unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes") else {
@@ -319,6 +320,7 @@ fn unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes() {
     assert!(snapshots[0].created_at_unix_ms.is_some());
 }
 
+#[cfg(target_os = "linux")] // Success requires the live checkout-process census.
 #[test]
 fn a_landed_worktree_goes_with_its_branch() {
     let Some(root) = isolated("a_landed_worktree_goes_with_its_branch") else {
@@ -422,6 +424,7 @@ fn a_landed_worktree_goes_with_its_branch() {
     assert_eq!(error, "The primary worktree is never removed");
 }
 
+#[cfg(target_os = "linux")] // APFS refuses the invalid UTF-8 ref fixture.
 #[test]
 fn invalid_byte_branch_removal_is_disabled_without_affecting_literal_branch() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
