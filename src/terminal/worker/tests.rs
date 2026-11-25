@@ -4378,6 +4378,7 @@ fn codex_terminal_uses_private_temp_variables_and_cleans_up_on_exit() {
     }
 }
 
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn a_detached_codex_terminal_child_can_use_tmpdir_after_the_terminal_exits() {
     use std::path::Path;

@@ -227,7 +227,7 @@ pub(crate) fn unblock_sigchld_for_exec() -> io::Result<()> {
 
 /// For a test fixture process that creates [`ChildEvents`] beside libtest's
 /// own threads: every thread of the program `exec` starts inherits the block.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn block_sigchld_for_exec() -> io::Result<()> {
     let mask = sigchld();
     // SAFETY: sigprocmask is async-signal-safe and the mask is initialized.

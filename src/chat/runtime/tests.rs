@@ -6057,6 +6057,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
 /// memory kill of the provider itself is named as one when it exits.
 /// The kills are made the way systemd-oomd makes them: it marks the
 /// cgroup, then kills every process in it.
+#[cfg(target_os = "linux")] // cgroups and systemd-oomd are Linux's.
 #[test]
 fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
     use std::io::{BufRead, Read, Write};

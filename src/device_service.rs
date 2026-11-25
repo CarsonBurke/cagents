@@ -1494,6 +1494,8 @@ mod tests {
         }
     }
 
+    // The fixture writes Linux's POSIX ACL extended attribute.
+    #[cfg(target_os = "linux")]
     #[test]
     fn device_save_preserves_access_acl() {
         use std::os::fd::AsRawFd;

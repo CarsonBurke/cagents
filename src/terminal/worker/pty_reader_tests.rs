@@ -96,8 +96,9 @@ fn private_pty() -> (File, File) {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                // Linux takes these as const, Darwin as mut; either accepts mut.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0,
