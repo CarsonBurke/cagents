@@ -180,7 +180,8 @@ private fun UserMessage(text: String) {
 
 @Composable
 private fun AssistantText(text: String, quiet: Boolean) {
-    val blocks = remember(text) { markdownBlocks(text) }
+    val markdown = remember { IncrementalMarkdown() }
+    val blocks = remember(text) { markdown.blocks(text) }
     val color = if (quiet) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
     val style = if (quiet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge
     SelectionContainer {
@@ -387,40 +388,128 @@ sealed interface MarkdownBlock {
 }
 
 fun markdownBlocks(text: String): List<MarkdownBlock> {
-    val blocks = mutableListOf<MarkdownBlock>()
-    val paragraph = StringBuilder()
-    val code = StringBuilder()
-    var inCode = false
-    fun flushParagraph() {
-        if (paragraph.isNotBlank()) blocks += MarkdownBlock.Paragraph(paragraph.toString().trim('\n'))
-        paragraph.clear()
-    }
-    for (line in text.lines()) {
+    val lines = text.lines()
+    val reader = BlockReader()
+    for (i in 0 until lines.lastIndex) reader.line(lines[i])
+    return reader.ending(lines.last())
+}
+
+/**
+ * Markdown's blocks read a whole line at a time, so text that grows is read
+ * once: a paragraph or code block still open keeps growing until a line
+ * closes it.
+ */
+private class BlockReader {
+    /** The blocks closed so far. */
+    private val closed = mutableListOf<MarkdownBlock>()
+    private val paragraph = StringBuilder()
+    private val code = StringBuilder()
+    private var inCode = false
+
+    fun line(line: String) {
         val trimmed = line.trimStart()
         when {
-            trimmed.startsWith("```") -> {
+            isFence(trimmed) -> {
                 if (inCode) {
-                    blocks += MarkdownBlock.Code(code.toString().trimEnd('\n'))
+                    closed += codeBlock("")
                     code.clear()
                 } else {
-                    flushParagraph()
+                    paragraphBlock("")?.let(closed::add)
+                    paragraph.clear()
                 }
                 inCode = !inCode
             }
             inCode -> code.append(line).append('\n')
-            trimmed.startsWith("#") && trimmed.trimStart('#').startsWith(" ") -> {
-                flushParagraph()
-                val level = trimmed.takeWhile { it == '#' }.length
-                blocks += MarkdownBlock.Heading(level, trimmed.drop(level).trim())
+            isHeading(trimmed) -> {
+                paragraphBlock("")?.let(closed::add)
+                paragraph.clear()
+                closed += heading(trimmed)
             }
-            line.isBlank() -> flushParagraph()
+            line.isBlank() -> {
+                paragraphBlock("")?.let(closed::add)
+                paragraph.clear()
+            }
             else -> paragraph.append(line).append('\n')
         }
     }
-    // A fence still open is code still streaming.
-    if (inCode) blocks += MarkdownBlock.Code(code.toString().trimEnd('\n'))
-    flushParagraph()
-    return blocks
+
+    /**
+     * The blocks of the text read, ending with [last], a line with no line
+     * break after it. Leaves this reader as it was, for the text to go on.
+     */
+    fun ending(last: String): List<MarkdownBlock> {
+        val trimmed = last.trimStart()
+        val open = when {
+            // A fence still open is code still streaming.
+            isFence(trimmed) -> if (inCode) listOf(codeBlock("")) else listOfNotNull(paragraphBlock(""), MarkdownBlock.Code(""))
+            inCode -> listOf(codeBlock(last))
+            isHeading(trimmed) -> listOfNotNull(paragraphBlock(""), heading(trimmed))
+            last.isBlank() -> listOfNotNull(paragraphBlock(""))
+            else -> listOfNotNull(paragraphBlock(last))
+        }
+        return if (open.isEmpty()) closed.toList() else closed + open
+    }
+
+    private fun paragraphBlock(more: String): MarkdownBlock? {
+        val text = if (more.isEmpty()) paragraph.toString() else "$paragraph$more\n"
+        return if (text.isBlank()) null else MarkdownBlock.Paragraph(text.trim('\n'))
+    }
+
+    private fun codeBlock(more: String) = MarkdownBlock.Code("$code$more".trimEnd('\n'))
+
+    private fun isFence(trimmed: String) = trimmed.startsWith("```")
+
+    private fun isHeading(trimmed: String) = trimmed.startsWith("#") && trimmed.trimStart('#').startsWith(" ")
+
+    private fun heading(trimmed: String): MarkdownBlock {
+        val level = trimmed.takeWhile { it == '#' }.length
+        return MarkdownBlock.Heading(level, trimmed.drop(level).trim())
+    }
+}
+
+/**
+ * [markdownBlocks] for text that grows, as an answer streams. Each whole
+ * line is read once, so an append costs its own length and the block still
+ * open, not the whole answer. Text that doesn't extend the last is read
+ * again from the start.
+ */
+class IncrementalMarkdown {
+    private var reader = BlockReader()
+    private var text = ""
+
+    /** How much of [text] [reader] has read: whole lines, as [String.lines] has them. */
+    private var read = 0
+
+    /** Whether the last line read ended in a \r at the end of [text], which a \n may yet join. */
+    private var lastEndedInReturn = false
+
+    fun blocks(new: String): List<MarkdownBlock> {
+        if (new.length < read || !new.regionMatches(0, text, 0, read)) {
+            reader = BlockReader()
+            read = 0
+            lastEndedInReturn = false
+        }
+        text = new
+        if (lastEndedInReturn && read < new.length) {
+            if (new[read] == '\n') read++
+            lastEndedInReturn = false
+        }
+        var start = read
+        var i = read
+        while (i < new.length) {
+            val c = new[i]
+            if (c == '\n' || c == '\r') {
+                reader.line(new.substring(start, i))
+                lastEndedInReturn = c == '\r' && i + 1 == new.length
+                i += if (c == '\r' && i + 1 < new.length && new[i + 1] == '\n') 2 else 1
+                start = i
+            } else {
+                i++
+            }
+        }
+        read = start
+        return reader.ending(new.substring(read))
+    }
 }
 
 private val inlinePattern = Regex("""`([^`]+)`|\*\*([^*]+)\*\*|(?<![\w*])\*([^*\s][^*]*)\*(?![\w*])""")
