@@ -180,7 +180,8 @@ private fun UserMessage(text: String) {
 
 @Composable
 private fun AssistantText(text: String, quiet: Boolean) {
-    val blocks = remember(text) { markdownBlocks(text) }
+    val markdown = remember { IncrementalMarkdown() }
+    val blocks = remember(text) { markdown.blocks(text) }
     val color = if (quiet) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
     val style = if (quiet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge
     SelectionContainer {
@@ -421,6 +422,62 @@ fun markdownBlocks(text: String): List<MarkdownBlock> {
     if (inCode) blocks += MarkdownBlock.Code(code.toString().trimEnd('\n'))
     flushParagraph()
     return blocks
+}
+
+/**
+ * [markdownBlocks] for text that grows, as an answer streams: the blocks
+ * before the last place the text could be cut and parsed in two are kept,
+ * and only the rest is parsed again. So each append costs the block still
+ * open, not the whole answer.
+ */
+class IncrementalMarkdown {
+    private var text = ""
+
+    /** Where [stable] ends: after a whole line, with no paragraph or code block open. */
+    private var stableEnd = 0
+    private val stable = mutableListOf<MarkdownBlock>()
+
+    fun blocks(new: String): List<MarkdownBlock> {
+        if (new.length < stableEnd || !new.regionMatches(0, text, 0, stableEnd)) {
+            stableEnd = 0
+            stable.clear()
+        }
+        text = new
+        val cut = lastCut(new, stableEnd)
+        if (cut > stableEnd) {
+            stable += markdownBlocks(new.substring(stableEnd, cut))
+            stableEnd = cut
+        }
+        return stable + markdownBlocks(new.substring(stableEnd))
+    }
+
+    /** The last place after [from] where [markdownBlocks] starts afresh, as it does at [from]. */
+    private fun lastCut(text: String, from: Int): Int {
+        var cut = from
+        var inCode = false
+        var paragraph = false
+        var start = from
+        while (true) {
+            val end = text.indexOf('\n', start)
+            if (end < 0) return cut
+            // Lines as String.lines() has them, a lone \r ending one too.
+            for (line in text.substring(start, end).removeSuffix("\r").split('\r')) {
+                val trimmed = line.trimStart()
+                when {
+                    trimmed.startsWith("```") -> {
+                        inCode = !inCode
+                        paragraph = false
+                    }
+                    inCode -> Unit
+                    trimmed.startsWith("#") && trimmed.trimStart('#').startsWith(" ") -> paragraph = false
+                    trimmed.isBlank() -> paragraph = false
+                    else -> paragraph = true
+                }
+            }
+            start = end + 1
+            if (!inCode && !paragraph) cut = start
+        }
+    }
 }
 
 private val inlinePattern = Regex("""`([^`]+)`|\*\*([^*]+)\*\*|(?<![\w*])\*([^*\s][^*]*)\*(?![\w*])""")

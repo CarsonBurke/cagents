@@ -73,12 +73,15 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.cagents.mobile.client.Conversation
 import dev.cagents.mobile.client.ConnectionState
+import dev.cagents.mobile.client.RemoteState
 import dev.cagents.mobile.protocol.ConversationState
 import dev.cagents.mobile.protocol.PlanStatus
 import dev.cagents.mobile.protocol.SendMode
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -97,11 +100,14 @@ fun ConversationScreen(
     // Watched for as long as this screen is on the back stack: across
     // configuration changes, not just while composed.
     viewModel(key = "watch/$session") { ConversationWatch(vm, session) }
-    val remote by vm.remote.collectAsStateWithLifecycle()
-    val conversation = remote.conversations[session]
-    val listed = remote.sessions?.firstOrNull { it.id == session }
+    // Only what this screen shows, so the session list and other
+    // conversations changing don't recompose it.
+    val view by remember(session) {
+        vm.remote.map { ConversationView.of(it, session) }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(ConversationView.of(vm.remote.value, session))
+    val conversation = view.conversation
     val state = conversation?.state ?: ConversationState()
-    val title = state.title ?: listed?.let(::sessionTitle) ?: "Conversation"
+    val title = state.title ?: view.listedTitle ?: "Conversation"
     // Whether the transcript keeps to the newest item as items arrive. Only
     // the person scrolling changes it, and sending a message turns it back on.
     var follow by rememberSaveable(session) { mutableStateOf(true) }
@@ -124,7 +130,7 @@ fun ConversationScreen(
                                     Text(
                                         listOfNotNull(
                                             activityLabel(state.activity, state.exited),
-                                            listed?.providerLabel,
+                                            view.providerLabel,
                                             state.model,
                                         ).joinToString(" · "),
                                         style = MaterialTheme.typography.labelMedium,
@@ -138,7 +144,7 @@ fun ConversationScreen(
                     },
                 )
                 ConnectionBanner(
-                    connection = remote.connection,
+                    connection = view.connection,
                     hasData = conversation?.loaded == true,
                     onRetry = vm::retryNow,
                     onSettings = onBack,
@@ -150,7 +156,7 @@ fun ConversationScreen(
         bottomBar = {
             Column(Modifier.imePadding().navigationBarsPadding()) {
                 if (conversation != null) {
-                    BottomPanel(vm, session, conversation, remote.connection == ConnectionState.Connected) { follow = true }
+                    BottomPanel(vm, session, conversation, view.connection == ConnectionState.Connected) { follow = true }
                 }
             }
         },
@@ -161,6 +167,24 @@ fun ConversationScreen(
                     Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
                 else -> Transcript(vm, session, conversation, follow) { follow = it }
             }
+        }
+    }
+}
+
+/**
+ * What a conversation's screen shows of the remote state. Its conversation
+ * is the controller's own, which stays the same object until it changes.
+ */
+private data class ConversationView(
+    val conversation: Conversation?,
+    val listedTitle: String?,
+    val providerLabel: String?,
+    val connection: ConnectionState,
+) {
+    companion object {
+        fun of(remote: RemoteState, session: String): ConversationView {
+            val listed = remote.sessions?.firstOrNull { it.id == session }
+            return ConversationView(remote.conversations[session], listed?.let(::sessionTitle), listed?.providerLabel, remote.connection)
         }
     }
 }

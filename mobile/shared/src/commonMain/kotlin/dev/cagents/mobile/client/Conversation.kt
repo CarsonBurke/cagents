@@ -4,6 +4,7 @@ import dev.cagents.mobile.protocol.ConversationState
 import dev.cagents.mobile.protocol.ConversationUpdate
 import dev.cagents.mobile.protocol.Item
 import dev.cagents.mobile.protocol.ItemBody
+import dev.cagents.mobile.protocol.TextAppend
 
 /**
  * What the app holds of one watched conversation: its items in display order
@@ -29,6 +30,7 @@ data class Conversation(
      */
     fun apply(update: ConversationUpdate): Applied {
         if (!update.reset && !loaded) return Applied(this, desynced = true)
+        if (!update.reset && update.order == null) return applyInPlace(update)
 
         val byId: MutableMap<String, Item>
         val order: List<String>
@@ -40,19 +42,12 @@ data class Conversation(
         } else {
             byId = LinkedHashMap<String, Item>(items.size * 2).also { map -> items.forEach { map[it.id] = it } }
             update.items.forEach { byId[it.id] = it }
-            // The server sends `order` whenever it changes; without one, an
-            // item it hasn't placed goes last rather than being dropped.
-            order = update.order ?: run {
-                val known = items.mapTo(HashSet()) { it.id }
-                items.map { it.id } + update.items.map { it.id }.filter { known.add(it) }
-            }
+            order = checkNotNull(update.order) { "applied in place without one" }
         }
 
         for (append in update.appends) {
-            val held = byId[append.id] ?: return Applied(this, desynced = true)
-            val body = held.body as? ItemBody.Text ?: return Applied(this, desynced = true)
-            if (body.text.length.toLong() != append.offset) return Applied(this, desynced = true)
-            byId[append.id] = held.copy(body = body.copy(text = body.text + append.text), at = append.at ?: held.at)
+            byId[append.id] = appended(byId[append.id] ?: return Applied(this, desynced = true), append)
+                ?: return Applied(this, desynced = true)
         }
 
         return Applied(
@@ -65,6 +60,38 @@ data class Conversation(
             ),
             desynced = false,
         )
+    }
+
+    /**
+     * An update that keeps the order, as nearly every one while an answer
+     * streams does: its items replace the held ones in place, and one the
+     * server hasn't placed goes last rather than being dropped. Searched for
+     * from the end, where streaming happens, so an append doesn't cost a pass
+     * over the whole conversation.
+     */
+    private fun applyInPlace(update: ConversationUpdate): Applied {
+        val next = ArrayList<Item>(items.size + update.items.size)
+        next.addAll(items)
+        for (item in update.items) {
+            val at = next.indexOfLast { it.id == item.id }
+            if (at >= 0) next[at] = item else next += item
+        }
+        for (append in update.appends) {
+            val at = next.indexOfLast { it.id == append.id }
+            if (at < 0) return Applied(this, desynced = true)
+            next[at] = appended(next[at], append) ?: return Applied(this, desynced = true)
+        }
+        return Applied(
+            Conversation(session = session, state = update.state, items = next, loaded = true, ended = null),
+            desynced = false,
+        )
+    }
+
+    /** [held] with [append]'s text added, or null when it doesn't follow on from the held text. */
+    private fun appended(held: Item, append: TextAppend): Item? {
+        val body = held.body as? ItemBody.Text ?: return null
+        if (body.text.length.toLong() != append.offset) return null
+        return held.copy(body = body.copy(text = body.text + append.text), at = append.at ?: held.at)
     }
 }
 
