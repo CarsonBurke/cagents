@@ -3478,14 +3478,23 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
             )
         };
         #[cfg(target_os = "macos")]
-        let status = tracing::subscriber::with_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .without_time()
-                .with_max_level(tracing::Level::WARN)
-                .finish(),
-            shutdown,
-        );
+        let status = std::thread::scope(|scope| {
+            // The worker normally drains terminal output. XNU waits for this
+            // before it reports the shell's exit, including diagnostics from
+            // the sleep process interrupted by hangup.
+            let Reader {
+                output,
+                wake,
+                thread,
+                ..
+            } = Reader::start(TerminalId::new(), &held.master, 8, Vec::new()).unwrap();
+            let drain = scope.spawn(move || while output.recv().is_ok() {});
+            let result = shutdown();
+            drop(wake);
+            thread.join().unwrap();
+            drain.join().unwrap();
+            result
+        });
         #[cfg(target_os = "linux")]
         let status = shutdown();
         let status = status.unwrap_or_else(|error| {
