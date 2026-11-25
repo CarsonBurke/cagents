@@ -1486,7 +1486,7 @@ pub fn update_in_progress() -> bool {
 }
 
 fn update_window(runtime: &Path, slot: &str, action: &str, timeout: Duration) -> io::Result<()> {
-    let mut stream = crate::descriptor::connect_settled(runtime.join(slot_socket_name(slot)))?;
+    let mut stream = connect_activation_socket(&runtime.join(slot_socket_name(slot)))?;
     stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
     stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
     writeln!(stream, "{action}")?;
@@ -2562,11 +2562,7 @@ impl UiActivationListener {
         require_owned_runtime_directory(runtime_directory)?;
         let socket_path = runtime_directory.join(socket);
         prepare_activation_socket_path(&socket_path)?;
-        let listener = crate::descriptor::bind(&socket_path)?;
-        if let Err(error) = restrict_activation_socket(&listener, &socket_path) {
-            let _ = fs::remove_file(&socket_path);
-            return Err(error);
-        }
+        let listener = bind_activation_socket(&socket_path)?;
         let thread = match thread::Builder::new()
             .name("cagents-ui-activate".into())
             .spawn(move || serve_activation_socket(listener, events))
@@ -2587,12 +2583,15 @@ impl UiActivationListener {
 #[cfg(feature = "ui")]
 impl Drop for UiActivationListener {
     fn drop(&mut self) {
-        let woke = crate::descriptor::connect(&self.socket_path)
-            .and_then(|mut stream| {
-                stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-                writeln!(stream, "shutdown")
-            })
-            .is_ok();
+        // One attempt, as for any socket: the serve loop may already be gone.
+        let woke = crate::descriptor::with_socket_address(&self.socket_path, |address| {
+            crate::descriptor::connect(address)
+        })
+        .and_then(|mut stream| {
+            stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+            writeln!(stream, "shutdown")
+        })
+        .is_ok();
         if let Some(thread) = self.thread.take()
             && woke
         {
@@ -2652,8 +2651,7 @@ fn activate_window_session_in(
 ) -> io::Result<bool> {
     validate_window_slot(slot)?;
     require_owned_runtime_directory(runtime)?;
-    let mut stream = match crate::descriptor::connect_settled(runtime.join(slot_socket_name(slot)))
-    {
+    let mut stream = match connect_activation_socket(&runtime.join(slot_socket_name(slot))) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -2837,7 +2835,7 @@ fn activate_socket_with_token(
 ) -> io::Result<bool> {
     require_owned_runtime_directory(runtime_directory)?;
     let socket_path = runtime_directory.join(socket);
-    let mut stream = match crate::descriptor::connect_settled(&socket_path) {
+    let mut stream = match connect_activation_socket(&socket_path) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -2874,7 +2872,33 @@ fn require_owned_runtime_directory(runtime_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Leaves a bound activation socket readable and writable by its owner only.
+/// Connects to a window's activation socket. Its full path can exceed a Unix
+/// socket address: Darwin's holds 103 bytes, and its runtime directory alone
+/// takes about 56 of them, so a window or editor socket named for a UUID
+/// would not fit. It is reached as a holder endpoint is, through its directory.
+fn connect_activation_socket(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+    crate::descriptor::with_socket_address(path, |address| {
+        crate::descriptor::connect_settled(address)
+    })
+}
+
+/// Binds a window's activation socket for its owner alone, reaching a path
+/// longer than a Unix socket address as [`connect_activation_socket`] does.
+#[cfg(feature = "ui")]
+fn bind_activation_socket(path: &Path) -> io::Result<UnixListener> {
+    crate::descriptor::with_socket_address(path, |address| {
+        let listener = crate::descriptor::bind(address)?;
+        if let Err(error) = restrict_activation_socket(&listener, address) {
+            let _ = fs::remove_file(address);
+            return Err(error);
+        }
+        Ok(listener)
+    })
+}
+
+/// Restricts the bound socket's own inode to its owner. Linux leaves the node
+/// bind made at the mode the umask gave it, so the private runtime directory
+/// is what keeps other users from connecting.
 #[cfg(all(feature = "ui", target_os = "linux"))]
 fn restrict_activation_socket(listener: &UnixListener, _path: &Path) -> io::Result<()> {
     // SAFETY: fchmod receives the bound listener's live descriptor.
@@ -2887,12 +2911,12 @@ fn restrict_activation_socket(listener: &UnixListener, _path: &Path) -> io::Resu
 /// Leaves a bound activation socket readable and writable by its owner only.
 ///
 /// XNU's fchmod refuses a socket with `EINVAL`, so the mode is set through the
-/// path just bound, without following a symlink. That is weaker than Linux's
-/// descriptor-based change: a process of this user that replaces the socket
-/// in the window between bind and chmod could have the mode applied to its
-/// replacement instead. No one else can: the runtime directory `runtime_base`
-/// creates is verified private, and one named by `XDG_RUNTIME_DIR` is trusted
-/// as it is on Linux.
+/// path just bound, without following a symlink. A process of this user that
+/// replaces the socket between bind and chmod could have the mode applied to
+/// its replacement instead. No one else can: the runtime directory
+/// `runtime_base` creates is verified private, and one named by
+/// `XDG_RUNTIME_DIR` is trusted as it is on Linux, where that directory's
+/// privacy is what keeps the socket private.
 #[cfg(all(feature = "ui", target_os = "macos"))]
 fn restrict_activation_socket(_listener: &UnixListener, path: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -5091,6 +5115,45 @@ mod tests {
             !activate_socket_with_token(&runtime, destination_socket_name(&destination), None,)
                 .unwrap()
         );
+    }
+
+    /// Darwin's runtime directory leaves too little of a Unix socket address
+    /// for a window or editor named by a UUID, so a socket past that limit is
+    /// still bound at its full path, private, and reachable.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn activation_sockets_longer_than_a_unix_address_bind_and_answer() {
+        use crate::notifications::{Application, Destination};
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let root = tempdir().unwrap();
+        let runtime = root.path().join("r".repeat(120));
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let destination = Destination {
+            application: Application::Ceditor,
+            window: "w".repeat(40),
+        };
+        let socket = destination_socket_name(&destination);
+        assert!(!crate::descriptor::socket_fits(&runtime.join(&socket)));
+        let (sender, receiver) = async_channel::bounded(1);
+        let listener = UiActivationListener::bind_named(&runtime, socket.clone(), sender).unwrap();
+        let bound = fs::symlink_metadata(runtime.join(&socket)).unwrap();
+        assert!(bound.file_type().is_socket());
+        // Linux's fchmod reaches the socket's own inode, not the node bind
+        // made, so only Darwin's path-based restriction shows here.
+        #[cfg(target_os = "macos")]
+        assert_eq!(bound.permissions().mode() & 0o777, 0o600);
+        assert!(activate_socket_with_token(&runtime, socket.clone(), Some("token")).unwrap());
+        assert_eq!(
+            receiver.recv_blocking().unwrap().token.as_deref(),
+            Some("token")
+        );
+        drop(listener);
+        // The serve thread holds the only sender, so a closed channel shows
+        // that dropping the listener reached it at the long path and joined it.
+        assert!(receiver.is_closed());
+        assert!(!runtime.join(&socket).exists());
+        assert!(!activate_socket_with_token(&runtime, socket, None).unwrap());
     }
 
     #[cfg(feature = "ui")]
