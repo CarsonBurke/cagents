@@ -6,8 +6,9 @@ For how fixtures fit together and how to add a behaviour, see [Fixtures](fixture
 for native UI checks. It requires `jq`, makes no network requests, and uses a
 synthetic account. It advertises asynchronous message support, holds its first
 turn busy, acknowledges queued-message removal, and settles on interrupt.
-Later turns complete immediately. Busy messages deliberately stay queued;
-this fixture checks composer interactions, not provider delivery.
+Later turns complete immediately. Busy messages stay queued while the first
+turn holds; they start only once it ends by itself (see
+`fixture-first-turn-seconds`) or makes way for Send now.
 The permission picker can read `get_settings` both idle and during a turn:
 the fixture returns an empty effective settings object and no rule sources,
 matching its default permission setup. Reading settings keeps the turn active;
@@ -344,9 +345,10 @@ the provider answers.
 To have the first turn finish by itself, as real work does, write a whole
 number of seconds, such as `8`, to `home/.claude/fixture-first-turn-seconds`.
 The first turn then stays busy that long, unless it is interrupted first, and
-ends successfully. Anything else makes the provider exit with status 2 and say so.
-Use this to check what happens to prompts and messages that wait behind an
-agent's run once that run ends.
+ends successfully, and the next turn then starts every message queued during
+it, as Claude Code does. Anything else makes the provider exit with status 2
+and say so. Use this to check what happens to prompts and messages that wait
+behind an agent's run once that run ends.
 
 To run a real command, write it as the first line of
 `home/.claude/fixture-run-command`, such as `sleep 6001`. Every turn then runs
