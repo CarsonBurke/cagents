@@ -2689,7 +2689,11 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
     // A real foreground executable with an exact provider basename.
     // The copied shell reads our local `agents` script for the real probe;
     // no installed provider, credentials, network, or model is involved.
-    std::fs::copy("/bin/sh", &executable).unwrap();
+    #[cfg(target_os = "linux")]
+    let shell = "/bin/sh";
+    #[cfg(target_os = "macos")]
+    let shell = "/bin/bash";
+    std::fs::copy(shell, &executable).unwrap();
     #[cfg(target_os = "macos")]
     {
         // A copied system signature can hide the probe's source environment.
