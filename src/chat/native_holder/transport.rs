@@ -3249,6 +3249,85 @@ exec /bin/sleep 60
         assert!(record.root.reaped(), "the holder stopped its provider");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_explicit_spare_keeps_resume_evidence_separate_from_exact_cleanup() {
+        const STAGE: &str = "CAGENTS_NATIVE_SCOPED_SPARE_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::an_explicit_spare_keeps_resume_evidence_separate_from_exact_cleanup", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        let listener = source.owned_codex_listener.as_mut().unwrap();
+        listener.allocator.boot_id = boot;
+        let socket = listener.socket.clone();
+        let working = tempfile::tempdir().unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let working = working.path();
+        let spec = ProcessSpec {
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "/bin/sleep 10 & echo ready > ready; wait".into(),
+            ],
+            working_directory: working.to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+            execution: Some(context.clone()),
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            messages: None,
+            stdout_noise: None,
+            followed: false,
+        };
+        let mut holder = spawn(spec, source.clone()).unwrap();
+        context.installed();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !working.join("ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "provider did not start its child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let control = holder.control.as_ref().unwrap();
+        send(control, &Request::ReleaseSparing, TIMEOUT).unwrap();
+        assert!(matches!(
+            receive(control, TIMEOUT).unwrap(),
+            Some(Report::Failed(_))
+        ));
+        assert!(holder.identity.record.root.is_current());
+        holder.close_inner(true, DetachedWork::Spare).unwrap();
+        let receipt = super::super::closed_source(&source, &proof)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.0, holder.identity.record);
+        assert!(holder.identity.receipt(true, DetachedWork::Spare).unwrap());
+        assert!(!holder.identity.receipt(true, DetachedWork::Stop).unwrap());
+        let startup = super::super::cleanup::Startup {
+            terminal: source.id,
+            holder: holder.identity.record.holder.clone(),
+            proof,
+        };
+        assert!(!startup.consume().unwrap());
+    }
+
     #[cfg(target_os = "linux")] // The fixture asserts reparenting to the holder as a subreaper.
     #[test]
     fn an_ordinary_release_leaves_what_the_provider_leaves() {
