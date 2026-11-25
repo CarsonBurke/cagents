@@ -207,6 +207,25 @@ class RemoteControllerTest {
     }
 
     @Test
+    fun overlappingRestartsLeaveOneConnectionThatWorks() = runTest {
+        val controller = following()
+        val first = async { controller.restart(computerChanged = true) }
+        val second = async { controller.restart(computerChanged = true) }
+        first.await()
+        second.await()
+        runCurrent()
+        // The connection the second restart ended, if the first got to make it, then the one that stays.
+        repeat(bridge.opens - 2) { bridge.accept() }
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        controller.await { it.connection == ConnectionState.Connected }
+        // Requests go to this connection, not to one closed under it.
+        controller.open(S)
+        assertEquals(S, connection.expect("conversation.watch").params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun theSameComputerKeepsItsConversationsAcrossARestart() = runTest {
         val controller = following()
         controller.restart()
