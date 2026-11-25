@@ -540,9 +540,8 @@ fn ordinary_host_exit_keeps_fresh_clients_and_lease_until_late_original_is_reape
     // Publish the SAME original only after real ordinary shutdown admitted the
     // empty inventory. No producer takes/blocks on the host control writer.
     ticket.quarantine();
-    ticket
-        .retain(child, original.pidfd.try_clone().unwrap())
-        .unwrap();
+    let pin = child_reaper::PinnedChild::of(&child).unwrap();
+    ticket.retain(child, pin).unwrap();
     assert!(child_reaper::has_retained_ownership());
     assert!(completed.try_recv().is_err());
     assert!(original.process.is_current());

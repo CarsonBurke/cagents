@@ -1,8 +1,7 @@
 //! Descendant cleanup for dedicated process owners, never the daemon itself.
-use crate::daemon::holder_registry::Process;
+use crate::{daemon::holder_registry::Process, pinned_process::PinnedProcess};
 use std::{
     io,
-    os::fd::{FromRawFd, OwnedFd},
     process::Child,
     time::{Duration, Instant},
 };
@@ -20,11 +19,11 @@ pub enum DetachedWork {
     Spare,
 }
 
-/// Processes pinned by pidfd, so a process that later reuses one's pid is
-/// never signalled in its place.
+/// Processes pinned, so a process that later reuses one's pid is never
+/// signalled in its place.
 #[derive(Default)]
 struct Pinned {
-    fds: Vec<OwnedFd>,
+    processes: Vec<PinnedProcess>,
     pids: Vec<i32>,
 }
 
@@ -37,21 +36,14 @@ impl Pinned {
             if !process.is_current() {
                 continue;
             }
-            // SAFETY: pidfd_open takes scalar arguments and returns a new
-            // owned descriptor or -1 without writing through any pointer.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
-            if fd == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    continue;
-                }
-                return Err(error);
-            }
-            // SAFETY: a successful pidfd_open returned this fresh descriptor.
-            let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            let pin = match PinnedProcess::open_unreaped(process.pid as u32) {
+                Ok(pin) => pin,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             // The pid may have been reused between the check and the open.
             if process.is_current() {
-                pinned.fds.push(fd);
+                pinned.processes.push(pin);
                 pinned.pids.push(process.pid);
             }
         }
@@ -60,39 +52,25 @@ impl Pinned {
 
     /// Whether every pinned process has exited, reaped or not.
     fn exited(&self) -> bool {
-        use std::os::fd::AsRawFd;
-        self.fds.iter().all(|fd| {
-            let mut event = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one live pollfd; a pidfd is readable once its process
-            // has exited.
-            let ready = unsafe { libc::poll(&mut event, 1, 0) };
-            ready == 1
-        })
+        self.processes
+            .iter()
+            .all(|process| process.exited().unwrap_or(false))
     }
 
-    /// Sends `signal` to each pinned process; signal 0 only reports which
-    /// still exist, unreaped zombies included.
+    /// Sends `signal` to each pinned process, answering whether any took it.
     fn signal(&self, signal: libc::c_int) -> bool {
-        use std::os::fd::AsRawFd;
         let mut any = false;
-        for fd in &self.fds {
-            // SAFETY: the descriptor is live, and a null siginfo with zero
-            // flags is supported.
-            any |= unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd.as_raw_fd(),
-                    signal,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            } == 0;
+        for process in &self.processes {
+            any |= process.signal(signal).unwrap_or(false);
         }
         any
+    }
+
+    /// Whether any pinned process remains, an unreaped zombie included.
+    fn remain(&self) -> bool {
+        self.processes
+            .iter()
+            .any(|process| !process.reaped().unwrap_or(false))
     }
 }
 
@@ -288,7 +266,7 @@ impl OwnedChildren {
         loop {
             // A server its launcher left behind may be adopted here only now.
             self.provider.signal(libc::SIGKILL);
-            if self.reap()? || (self.child.is_none() && !self.provider.signal(0)) {
+            if self.reap()? || (self.child.is_none() && !self.provider.remain()) {
                 return Ok(true);
             }
             if Instant::now() >= deadline {
@@ -342,6 +320,7 @@ fn killed_unreaped(pid: i32) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
     let mut children = std::collections::BTreeSet::new();
     for task in std::fs::read_dir("/proc/self/task")? {
@@ -357,6 +336,14 @@ pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
         );
     }
     Ok(children)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
+    Ok(crate::pinned_process::children_of(std::process::id())?
+        .into_iter()
+        .filter_map(|pid| i32::try_from(pid).ok())
+        .collect())
 }
 
 #[cfg(test)]
@@ -465,7 +452,11 @@ record "$3" $left; record "$2" $running
         !exists(pid)
     }
 
+    // These stand in for the native holder as a Linux subreaper, which adopts
+    // what the provider detaches; Darwin has no subreaper to stand in for.
+
     /// A process orphaned to this subreaper once it has been adopted here.
+    #[cfg(target_os = "linux")]
     fn orphan(root: &Path, name: &str) -> i32 {
         let file = root.join(name);
         let status = Command::new("/bin/sh")
@@ -488,10 +479,12 @@ record "$3" $left; record "$2" $running
         pid
     }
 
+    #[cfg(target_os = "linux")]
     fn subreaper() {
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_ordinary_teardown_leaves_what_the_provider_leaves() {
         if crate::retained_fixture::run_isolated() {
@@ -519,6 +512,7 @@ record "$3" $left; record "$2" $running
         assert!(!exists(work.detached) && !exists(work.left));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_server_its_launcher_left_here_ends_with_the_provider() {
         if crate::retained_fixture::run_isolated() {
@@ -544,6 +538,7 @@ record "$3" $left; record "$2" $running
         assert!(children.terminate(Duration::from_secs(10)).unwrap());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_force_stopped_provider_spares_nothing() {
         if crate::retained_fixture::run_isolated() {
@@ -566,6 +561,7 @@ record "$3" $left; record "$2" $running
         assert!(!exists(work.detached) && !exists(work.running) && !exists(work.left));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_killed_server_its_launcher_left_here_spares_nothing() {
         if crate::retained_fixture::run_isolated() {
@@ -602,6 +598,7 @@ record "$3" $left; record "$2" $running
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_teardown_that_did_not_decide_stops_everything() {
         if crate::retained_fixture::run_isolated() {

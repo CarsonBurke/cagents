@@ -114,28 +114,18 @@ fn isolated_input_case(name: &str) -> bool {
     );
     true
 }
-fn input_root_exited(pidfd: &File) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let mut entry = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+fn input_root_exited(pin: &PinnedProcess) -> std::io::Result<bool> {
+    // An owned pin of the original root observes its exit without
+    // rediscovering a numeric process identity.
     loop {
-        // SAFETY: this is an owned capability for the original root; poll
-        // observes exit without rediscovering a numeric process identity.
-        let result = unsafe { libc::poll(&mut entry, 1, 0) };
-        if result >= 0 {
-            return Ok(entry.revents & libc::POLLIN != 0);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
+        match pin.exited() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            result => return result,
         }
     }
 }
 struct InputRootGuard {
-    pidfd: File,
+    pidfd: PinnedProcess,
     armed: bool,
 }
 impl InputRootGuard {
@@ -166,8 +156,8 @@ impl Drop for InputRootGuard {
     fn drop(&mut self) {
         if self.armed && !input_root_exited(&self.pidfd).unwrap_or(false) {
             // Failure-only original capability, never a guessed/reused PID.
-            let _ = close_processes::signal(&self.pidfd, libc::SIGCONT);
-            let _ = close_processes::signal(&self.pidfd, libc::SIGKILL);
+            let _ = self.pidfd.signal(libc::SIGCONT);
+            let _ = self.pidfd.signal(libc::SIGKILL);
         }
     }
 }
@@ -795,7 +785,7 @@ os.write(1, b'PAIR_DONE')
         expected.extend(ctrl_down);
         expected.extend(ctrl_up);
         fs::write(home.path().join("expected_len"), expected.len().to_string()).unwrap();
-        close_processes::signal(&root.pidfd, libc::SIGCONT).unwrap();
+        root.pidfd.signal(libc::SIGCONT).unwrap();
         let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
         let actual = loop {
             worker.flush_pty_input();
@@ -1653,9 +1643,8 @@ while True: time.sleep(1)
     .unwrap();
     let owner = original.holder_identity().unwrap().clone();
     let original_record = owner.clone();
-    let holder_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, owner.holder.pid, 0) };
-    assert!(holder_fd >= 0 && owner.holder.is_current());
-    let original_holder = unsafe { File::from_raw_fd(holder_fd as i32) };
+    let original_holder = PinnedProcess::open(owner.holder.pid as u32).unwrap();
+    assert!(owner.holder.is_current());
     let mut original_root = InputRootGuard::new(&original.inner.published);
     wait_for_text(&original, "ORIGINAL_READY");
     let socket = crate::daemon::holder_registry::socket(

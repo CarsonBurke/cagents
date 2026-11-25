@@ -393,7 +393,7 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
         fs::read(shell.home.path().join("stopped-hup")).unwrap(),
         b"hup"
     );
-    assert!(holder::exits_within(&child.0, Duration::ZERO).unwrap());
+    assert!(child.0.wait_for_exit(Duration::ZERO).unwrap());
 }
 
 #[test]
@@ -441,7 +441,7 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
     );
     // Watching for a product grace's worth of time: a busy host can only
     // shorten the watch relative to shutdown, never end the grace early.
-    let killed_during_grace = holder::exits_within(&root.0, CHILD_HANGUP_GRACE).unwrap();
+    let killed_during_grace = root.0.wait_for_exit(CHILD_HANGUP_GRACE).unwrap();
     fs::write(shell.home.path().join("release-hup"), b"").unwrap();
     let outcome = shutdown.join().unwrap();
     assert!(
@@ -454,7 +454,7 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
         started.elapsed(),
         shutdown_evidence(&shell)
     );
-    assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
+    assert!(root.0.wait_for_exit(Duration::ZERO).unwrap());
     assert_eq!(
         fs::read(shell.home.path().join("delayed-capture-hup")).unwrap(),
         b"hup",
@@ -491,7 +491,7 @@ fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
         b"hup",
         "ordinary shutdown must let the job run its HUP handler before escalation"
     );
-    assert!(holder::exits_within(&child.0, Duration::ZERO).unwrap());
+    assert!(child.0.wait_for_exit(Duration::ZERO).unwrap());
 }
 
 #[test]
@@ -511,7 +511,7 @@ fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits()
         "escalation must follow the hangup grace, not wait for the deadline"
     );
     assert!(
-        holder::exits_within(&child.0, Duration::ZERO).unwrap(),
+        child.0.wait_for_exit(Duration::ZERO).unwrap(),
         "ordinary shutdown reported success but left its HUP-ignoring background job running"
     );
 }
@@ -536,7 +536,7 @@ fn ordinary_shutdown_leaves_a_process_that_left_the_session_holding_the_pty() {
         "a PTY held outside the family must not delay shutdown: {elapsed:?}"
     );
     assert!(
-        !holder::exits_within(&outside.0, Duration::ZERO).unwrap(),
+        !outside.0.wait_for_exit(Duration::ZERO).unwrap(),
         "ordinary shutdown must not stop a process outside the terminal's family"
     );
 }
@@ -582,7 +582,7 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
             )
         })
     });
-    assert!(!holder::exits_within(&child.0, Duration::ZERO).unwrap());
+    assert!(!child.0.wait_for_exit(Duration::ZERO).unwrap());
     let unpublished = reaper.reserve().unwrap();
     let drain = reaper.begin_exit_drain();
     // The job ignores its hangup and outlives the shell, so confirmation
@@ -659,7 +659,7 @@ fn ordinary_shutdown_force_kills_its_pinned_root_when_the_census_fails() {
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_ok());
     assert!(started.elapsed() < ShutdownBudget::PATIENT.join);
-    assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
+    assert!(root.0.wait_for_exit(Duration::ZERO).unwrap());
     assert!(!shell.home.path().join("unexpected-root-exit").exists());
     assert!(shell.terminal.is_completed());
     let expected_signal = ExitStatus::from(std::process::ExitStatus::from_raw(libc::SIGKILL))
@@ -678,12 +678,12 @@ fn ordinary_shutdown_force_kills_its_pinned_root_when_the_census_fails() {
     );
 }
 
-struct ShutdownJob(File);
+struct ShutdownJob(crate::pinned_process::PinnedProcess);
 
 impl Drop for ShutdownJob {
     fn drop(&mut self) {
-        let _ = close_processes::signal(&self.0, libc::SIGKILL);
-        let _ = holder::exits_within(&self.0, Duration::from_secs(1));
+        let _ = self.0.signal(libc::SIGKILL);
+        let _ = self.0.wait_for_exit(Duration::from_secs(1));
     }
 }
 
@@ -715,9 +715,10 @@ fn shutdown_evidence(shell: &CloseSafetyShell) -> String {
 }
 
 fn pin_shutdown_process(pid: libc::pid_t) -> ShutdownJob {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    assert!(fd >= 0, "pin the fixture's exact terminal process");
-    ShutdownJob(unsafe { File::from_raw_fd(fd as libc::c_int) })
+    ShutdownJob(
+        crate::pinned_process::PinnedProcess::open_unreaped(pid as u32)
+            .expect("pin the fixture's exact terminal process"),
+    )
 }
 
 fn shutdown_job(shell: &CloseSafetyShell, command: &[u8], executable: &str) -> ShutdownJob {

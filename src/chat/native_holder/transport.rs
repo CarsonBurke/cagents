@@ -785,39 +785,27 @@ pub fn adopt(
 }
 
 /// Bind the exact already-validated provider incarnation, never its cwd path.
-/// An exited zombie can still pass Process::is_current; only the owned pidfd
+/// An exited zombie can still pass Process::is_current; only the pin
 /// establishes the kernel-live observation used by a directory-pin reply.
-fn pin_provider_process(process: &Process) -> Result<std::fs::File, String> {
+fn pin_provider_process(process: &Process) -> Result<crate::pinned_process::PinnedProcess, String> {
     if !process.is_current() {
         return Err("Original native provider identity changed".into());
     }
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
-    if descriptor < 0 {
-        return Err(format!(
-            "Pin original native provider: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let descriptor = unsafe { std::fs::File::from_raw_fd(descriptor as RawFd) };
+    let pin = crate::pinned_process::PinnedProcess::open_unreaped(process.pid as u32)
+        .map_err(|error| format!("Pin original native provider: {error}"))?;
     if !process.is_current() {
         return Err("Original native provider identity changed during pinning".into());
     }
-    Ok(descriptor)
+    Ok(pin)
 }
 
-fn ensure_provider_live(pidfd: &std::fs::File) -> Result<(), String> {
-    let mut event = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    match unsafe { libc::poll(&mut event, 1, 0) } {
-        0 if event.revents == 0 => Ok(()),
-        result if result < 0 => Err(format!(
-            "Observe original native provider: {}",
-            io::Error::last_os_error()
-        )),
-        _ => Err("Original native provider has exited or its observation is unavailable".into()),
+fn ensure_provider_live(pin: &crate::pinned_process::PinnedProcess) -> Result<(), String> {
+    match pin.exited() {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            Err("Original native provider has exited or its observation is unavailable".into())
+        }
+        Err(error) => Err(format!("Observe original native provider: {error}")),
     }
 }
 
@@ -830,7 +818,7 @@ struct Residence {
     child_events: ChildEvents,
     released: bool,
     _working_directory: Option<std::fs::File>,
-    provider_pidfd: std::fs::File,
+    provider_pidfd: crate::pinned_process::PinnedProcess,
     owner_application: String,
     /// This holder's divided cgroup scope, when the user manager gave one.
     /// The commands of the confirmed server are kept apart from it.

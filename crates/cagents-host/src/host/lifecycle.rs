@@ -4,7 +4,6 @@ use super::state::{Retirement, SharedHost};
 use crate::{daemon::child_reaper, model::TerminalId, terminal::TerminalRetirement};
 use std::{
     collections::BTreeSet,
-    fs::File,
     sync::{Arc, Mutex, TryLockError},
     time::{Duration, Instant},
 };
@@ -19,7 +18,7 @@ pub(super) struct Lifecycle {
     retention: Duration,
     retention_error_reported: bool,
     idle: IdleTimer,
-    waiting: Vec<Arc<File>>,
+    waiting: Vec<Arc<crate::daemon::PinnedProcess>>,
     settlement_retry: Option<Instant>,
     custody_retry: Option<Instant>,
 }
@@ -58,7 +57,7 @@ impl Lifecycle {
         }
     }
 
-    pub(super) fn waiting_holders(&self) -> &[Arc<File>] {
+    pub(super) fn waiting_holders(&self) -> &[Arc<crate::daemon::PinnedProcess>] {
         &self.waiting
     }
 
@@ -522,7 +521,7 @@ mod tests {
     };
     use std::{
         collections::BTreeMap,
-        fs,
+        fs::{self, File},
         io::Write,
         os::{
             fd::FromRawFd,
@@ -673,17 +672,17 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("pin suspended custody child: {error}");
-        }
-        let pidfd = unsafe { File::from_raw_fd(fd as i32) };
+        let pin = match child_reaper::PinnedChild::of(&child) {
+            Ok(pin) => pin,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pin suspended custody child: {error}");
+            }
+        };
         let mut stdin = child.stdin.take().unwrap();
         reservation.quarantine();
-        reservation.preserve_suspended(child, Some(pidfd), "fixture");
+        reservation.preserve_suspended(child, Some(pin), "fixture");
         assert!(child_reaper::reserve().is_err());
 
         Lifecycle::testing(Duration::from_secs(600)).maintain(&host, false);

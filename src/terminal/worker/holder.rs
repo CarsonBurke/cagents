@@ -5,7 +5,7 @@
 //! the PTY master open, which is what lets a terminal's life stop depending on
 //! the daemon's. The daemon starts a holder by executing its own image with
 //! [`ARGUMENT`]. The holder opens the PTY, spawns the root on it, and hands back
-//! the master and a pidfd for the root over its control socket. From then on
+//! the master and a pin of the root over its control socket. From then on
 //! the daemon reads, writes, resizes and signals through those descriptors
 //! directly, so no terminal byte is ever relayed. The holder only reaps the
 //! root, reports its wait status, and waits to be released.
@@ -49,7 +49,8 @@ use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::{ChildExit, close_processes::signal};
+use super::ChildExit;
+use crate::pinned_process::{PinnedChild, PinnedProcess, peer_credentials};
 use crate::terminal::{
     SPAWN_START_TIMEOUT as START_TIMEOUT,
     holder::{self as registry, Record, Recovery},
@@ -132,12 +133,15 @@ enum Request {
 enum Report {
     ScreenCached,
     AdoptionCommitted,
-    /// Protocol 5 carries PTY master, root pidfd, and original launch directory.
+    /// Protocol 5 carries PTY master, root pin, and original launch directory.
     Started {
         protocol: u32,
         pid: libc::pid_t,
         #[serde(default)]
         launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
+        /// See [`RootPin`]; Linux leaves it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_started: Option<u64>,
     },
     Failed(String),
     /// The root's raw wait status, reported once, after the holder reaps it.
@@ -151,7 +155,7 @@ enum Report {
         recovery: Box<Recovery>,
         screen_lost: bool,
     },
-    /// Carries the PTY master, then a pidfd for the root, to a successor.
+    /// Carries the PTY master, then a pin of the root, to a successor.
     Attached {
         protocol: u32,
         pid: libc::pid_t,
@@ -166,7 +170,67 @@ enum Report {
         screen_lost: bool,
         #[serde(default)]
         launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
+        /// See [`RootPin`]; Linux leaves it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_started: Option<u64>,
     },
+}
+
+/// How a holder hands the daemon a pin of its root, which it alone can reap.
+///
+/// * Linux sends a pidfd for the root alongside the PTY master.
+/// * Darwin cannot send a kqueue over a socket, so the holder reports when its
+///   root started instead. The holder reads that while the root is its
+///   unreaped child, so with the pid it names the root exactly, and the
+///   daemon pins whatever process holds the pid only if it started then.
+///   A root that has gone meanwhile pins as gone, and is never signalled.
+struct RootPin;
+
+impl RootPin {
+    /// The descriptors that carry the pin, after the PTY master.
+    #[cfg(target_os = "linux")]
+    fn rights(root: &PinnedProcess) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        vec![root.exit_readiness()]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rights(_root: &PinnedProcess) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        Vec::new()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn started(_root: &PinnedProcess) -> Option<u64> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn started(root: &PinnedProcess) -> Option<u64> {
+        Some(root.started_ticks())
+    }
+
+    /// The pin a holder sent: the descriptor right after the master on Linux.
+    #[cfg(target_os = "linux")]
+    fn receive(
+        pid: libc::pid_t,
+        _started: Option<u64>,
+        descriptors: &mut std::vec::IntoIter<OwnedFd>,
+    ) -> Result<PinnedProcess, String> {
+        let pidfd = descriptors
+            .next()
+            .ok_or("terminal holder did not send its root's pidfd")?;
+        Ok(PinnedProcess::from_pidfd(pid as u32, pidfd))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn receive(
+        pid: libc::pid_t,
+        started: Option<u64>,
+        _descriptors: &mut std::vec::IntoIter<OwnedFd>,
+    ) -> Result<PinnedProcess, String> {
+        let started = started.ok_or("terminal holder did not report when its root started")?;
+        PinnedProcess::open_started(pid as u32, started)
+            .map_err(|error| format!("pin terminal root: {error}"))
+    }
 }
 
 /// A terminal whose PTY and root a holder owns.
@@ -225,7 +289,7 @@ fn pin_launch_directory(command: &CommandBuilder) -> Result<LaunchDirectoryPin, 
     };
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .custom_flags(crate::fs_safety::DIRECTORY_HANDLE | libc::O_CLOEXEC)
         .open(&directory)
         .map_err(|error| {
             format!(
@@ -338,11 +402,14 @@ pub(super) fn spawn_reserved(
         .map_err(|error| format!("start terminal holder: {error}"))?;
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
-    let pidfd = open_pidfd(process.child.id() as libc::pid_t);
+    let pin = PinnedChild::of(&process.child);
     let mut holder = Holder::new(control, Some(process));
-    // Preserve the captured descriptor in the cleanup owner before any other
+    // Preserve the captured pin in the cleanup owner before any other
     // fallible setup step can return through Holder::drop.
-    holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
+    holder.pin =
+        Some(HolderPin::Child(pin.map_err(|error| {
+            format!("watch terminal holder: {error}")
+        })?));
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
     let owner = registry::Process::read(holder.process.as_ref().unwrap().child.id() as i32)
         .map_err(|error| error.to_string())?;
@@ -377,12 +444,13 @@ pub(super) fn spawn_reserved(
     })
     .map_err(|error| format!("start terminal holder: {error}"))?;
     let (report, descriptors) = started;
-    let (pid, launch_directory) = match report {
+    let (pid, launch_directory, root_started) = match report {
         Report::Started {
             protocol,
             pid,
             launch_directory,
-        } if protocol == PROTOCOL => (pid, launch_directory),
+            root_started,
+        } if protocol == PROTOCOL => (pid, launch_directory, root_started),
         Report::Started { protocol, .. } => {
             return Err(format!(
                 "terminal holder speaks protocol {protocol}, expected {PROTOCOL}"
@@ -410,7 +478,15 @@ pub(super) fn spawn_reserved(
         }
         holder.record = Some(record);
     }
-    watched(holder, pid, descriptors, None, exits, launch_directory)
+    watched(
+        holder,
+        pid,
+        root_started,
+        descriptors,
+        None,
+        exits,
+        launch_directory,
+    )
 }
 
 /// A terminal taken over from a detached holder.
@@ -478,7 +554,9 @@ pub(super) fn adopt_recoverable(
     let control = crate::daemon::holder_registry::connect(socket).map_err(failed)?;
     let peer = peer_credentials(&control).map_err(failed)?;
     if evidence.as_ref().is_some_and(|record| {
-        peer.pid != record.holder.pid || !record.holder.is_current() || recovery.is_none()
+        i64::from(peer.pid) != i64::from(record.holder.pid)
+            || !record.holder.is_current()
+            || recovery.is_none()
     }) {
         return Err("holder adoption requires matching live process evidence and lineage".into());
     }
@@ -489,11 +567,18 @@ pub(super) fn adopt_recoverable(
             socket.display()
         ));
     }
-    let pidfd = peer_pidfd(&control, peer.pid).map_err(failed)?;
+    let pin = match &evidence {
+        // Darwin names only a candidate pid, so pin the process the evidence
+        // recorded: a later one holding that pid pins as gone.
+        #[cfg(target_os = "macos")]
+        Some(record) => PinnedProcess::open_started(peer.pid, record.holder.start),
+        _ => pin_peer(&control, peer.pid),
+    }
+    .map_err(failed)?;
     let mut holder = Holder::new(control, None);
     // A refused or malformed handshake grants no authority to release it.
     holder.detached = true;
-    holder.pidfd = Some(pidfd);
+    holder.pin = Some(HolderPin::Adopted(pin));
     let deadline = Instant::now() + HANDOVER_TIMEOUT;
     crate::descriptor_frame::send_json_with_fds_until(
         &holder.control,
@@ -525,6 +610,7 @@ pub(super) fn adopt_recoverable(
         output,
         screen_lost,
         launch_directory,
+        root_started,
     } = report
     else {
         return Err(format!(
@@ -558,7 +644,15 @@ pub(super) fn adopt_recoverable(
     // No release/kill authority is acquired until descriptor provenance and
     // every fallible watch resource have been installed. Anonymous holders do
     // not have adoption_pending to protect a refused handoff in Drop.
-    let mut held = watched(holder, pid, descriptors, exited, exits, launch_directory)?;
+    let mut held = watched(
+        holder,
+        pid,
+        root_started,
+        descriptors,
+        exited,
+        exits,
+        launch_directory,
+    )?;
     held.holder.detached = false;
     Ok(Adopted {
         held,
@@ -572,14 +666,19 @@ pub(super) fn adopt_recoverable(
 fn watched(
     mut holder: Holder,
     pid: libc::pid_t,
+    root_started: Option<u64>,
     descriptors: Vec<OwnedFd>,
     exited: Option<libc::c_int>,
     exits: Sender<ChildExit>,
     launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
 ) -> Result<Held, String> {
-    let (master, pidfd, launch_directory) =
-        decode_held_descriptors(holder.protocol, launch_directory, descriptors)?;
-    let root = File::from(pidfd);
+    let (master, root, launch_directory) = decode_held_descriptors(
+        holder.protocol,
+        pid,
+        root_started,
+        launch_directory,
+        descriptors,
+    )?;
     if let Some(wait_status) = exited {
         let _ = exits.try_send(Ok(exit_status(wait_status)));
     }
@@ -589,14 +688,11 @@ fn watched(
         .control
         .try_clone()
         .map_err(|error| format!("watch terminal holder: {error}"))?;
-    let watched_root = root
-        .try_clone()
-        .map_err(|error| format!("watch terminal root: {error}"))?;
     let (released, release) =
         std::io::pipe().map_err(|error| format!("watch terminal release: {error}"))?;
     let watch = Watch::start(
         reader,
-        watched_root,
+        &root,
         released,
         exits,
         acknowledge,
@@ -606,7 +702,7 @@ fn watched(
     holder.watch = Some(watch);
     Ok(Held {
         master: PtyMaster(master),
-        child: HeldChild { pid, pidfd: root },
+        child: HeldChild { pid, pin: root },
         holder,
         launch_directory,
     })
@@ -614,27 +710,36 @@ fn watched(
 
 fn decode_held_descriptors(
     protocol: u32,
+    pid: libc::pid_t,
+    root_started: Option<u64>,
     identity: Option<crate::agent_execution::DirectoryIdentity>,
     descriptors: Vec<OwnedFd>,
-) -> Result<(OwnedFd, OwnedFd, Option<LaunchDirectoryPin>), String> {
+) -> Result<(OwnedFd, PinnedProcess, Option<LaunchDirectoryPin>), String> {
     if !ADOPTABLE.contains(&protocol) {
         return Err("unsupported terminal launch-directory protocol".into());
     }
+    // The master, the root's pin, and from protocol 5 the launch directory.
+    let expected = 1 + usize::from(cfg!(target_os = "linux")) + usize::from(protocol >= 5);
+    if descriptors.len() != expected {
+        return Err(if protocol >= 5 {
+            "terminal holder sent the wrong launch-directory descriptors".into()
+        } else {
+            "legacy terminal holder sent the wrong descriptors".into()
+        });
+    }
+    let mut descriptors = descriptors.into_iter();
+    let master = descriptors.next().expect("counted above");
+    let root = RootPin::receive(pid, root_started, &mut descriptors)?;
     if protocol >= 5 {
-        let [master, pidfd, directory]: [OwnedFd; 3] = descriptors
-            .try_into()
-            .map_err(|_| "terminal holder sent the wrong launch-directory descriptors")?;
+        let directory = descriptors.next().expect("counted above");
         let identity = identity.ok_or("terminal holder did not attest its launch directory")?;
         let pin = checked_launch_directory(identity, Arc::new(File::from(directory)))?;
-        Ok((master, pidfd, Some(pin)))
+        Ok((master, root, Some(pin)))
     } else {
         if identity.is_some() {
             return Err("legacy holder cannot attest a launch directory".into());
         }
-        let [master, pidfd]: [OwnedFd; 2] = descriptors
-            .try_into()
-            .map_err(|_| "legacy terminal holder sent the wrong descriptors")?;
-        Ok((master, pidfd, None))
+        Ok((master, root, None))
     }
 }
 
@@ -661,26 +766,42 @@ fn spawn_original(
 }
 
 impl OriginalChild {
-    fn retain(self, pidfd: Option<File>, reason: &str) {
-        self.retain_with_recovery(pidfd, reason, false);
+    fn retain(self, pin: Option<PinnedChild>, reason: &str) {
+        self.retain_with_recovery(pin, reason, false);
     }
 
-    fn retain_with_recovery(self, pidfd: Option<File>, reason: &str, recoverable: bool) {
+    fn retain_with_recovery(self, pin: Option<PinnedChild>, reason: &str, recoverable: bool) {
         let Self { child, reservation } = self;
         reservation.quarantine();
-        let Some(pidfd) = pidfd else {
+        let Some(pin) = pin else {
             reservation.preserve_suspended(child, None, reason);
             return;
         };
         let retained = if recoverable {
-            reservation.retain_recoverable(child, pidfd)
+            reservation.retain_recoverable(child, pin)
         } else {
-            reservation.retain(child, pidfd)
+            reservation.retain(child, pin)
         };
-        if let Err((error, child, pidfd, reservation)) = retained {
+        if let Err((error, child, pin, reservation)) = retained {
             // retain returns every original operand intact on validation,
             // wakeup or service failure. No second reaper or PID lookup.
-            reservation.preserve_suspended(child, Some(pidfd), &format!("{reason}: {error}"));
+            reservation.preserve_suspended(child, Some(pin), &format!("{reason}: {error}"));
+        }
+    }
+}
+
+/// The holder's own pin: a child's for a holder this daemon started, which
+/// its reaper can take over, or a process's for one it adopted.
+enum HolderPin {
+    Child(PinnedChild),
+    Adopted(PinnedProcess),
+}
+
+impl HolderPin {
+    fn process(&self) -> &PinnedProcess {
+        match self {
+            Self::Child(pin) => pin.process(),
+            Self::Adopted(pin) => pin,
         }
     }
 }
@@ -726,7 +847,7 @@ pub(super) struct Holder {
     /// A holder this daemon started is its child, which it reaps. An adopted
     /// holder's parent is whoever inherited it from the daemon that started it.
     process: Option<OriginalChild>,
-    pidfd: Option<File>,
+    pin: Option<HolderPin>,
     protocol: u32,
     watch: Option<Watch>,
     /// Dropping this ends a watch still waiting on a root its holder left.
@@ -745,8 +866,23 @@ pub(super) struct Holder {
 
 impl Holder {
     /// The already-authenticated original holder, never a new PID lookup.
-    pub(super) fn original_process_descriptor(&self) -> io::Result<Option<File>> {
-        self.pidfd.as_ref().map(File::try_clone).transpose()
+    pub(super) fn original_process_descriptor(&self) -> io::Result<Option<PinnedProcess>> {
+        self.pin
+            .as_ref()
+            .map(|pin| pin.process().try_clone())
+            .transpose()
+    }
+
+    /// The child pin for the reaper, which only a holder this daemon started
+    /// has.
+    fn take_child_pin(&mut self) -> Option<PinnedChild> {
+        match self.pin.take()? {
+            HolderPin::Child(pin) => Some(pin),
+            adopted @ HolderPin::Adopted(_) => {
+                self.pin = Some(adopted);
+                None
+            }
+        }
     }
 
     pub(super) fn original_role(&self) -> Option<&crate::daemon::holder_registry::OriginalRole> {
@@ -844,7 +980,7 @@ impl Holder {
         Self {
             control,
             process,
-            pidfd: None,
+            pin: None,
             protocol: 0,
             watch: None,
             release: None,
@@ -926,27 +1062,27 @@ impl Drop for Holder {
             };
             let _ = send(&self.control, &request, &[]);
             let exited = self
-                .pidfd
+                .pin
                 .as_ref()
-                .is_some_and(|pidfd| exits_within(pidfd, RELEASE_GRACE).unwrap_or(false));
+                .is_some_and(|pin| pin.process().wait_for_exit(RELEASE_GRACE).unwrap_or(false));
             if !exited && self.cleanup_proved && self.protocol >= 4 {
                 // A proved release may still be fsyncing its receipt. Keep
                 // that exact owner alive; killing it would erase the only
                 // authority for a retry after the daemon exits.
                 if let Some(process) = self.process.take() {
                     process.retain(
-                        self.pidfd.take(),
+                        self.take_child_pin(),
                         "Terminal receipt release remains pending",
                     );
                 }
             } else if !exited {
                 tracing::warn!("killing a terminal holder that did not exit when released");
-                match (&mut self.process, &self.pidfd) {
+                match (&mut self.process, &self.pin) {
                     (Some(process), _) => {
                         let _ = process.child.kill();
                     }
-                    (None, Some(pidfd)) => {
-                        let _ = signal(pidfd, libc::SIGKILL);
+                    (None, Some(pin)) => {
+                        let _ = pin.process().signal(libc::SIGKILL);
                     }
                     (None, None) => {}
                 }
@@ -955,14 +1091,14 @@ impl Drop for Holder {
                 && let Err(error) = process.child.wait()
             {
                 process.retain(
-                    self.pidfd.take(),
+                    self.take_child_pin(),
                     &format!("Terminal child wait failed: {error}"),
                 );
             }
             // Successful exact wait drops its reservation normally.
         } else if let Some(process) = self.process.take() {
             process.retain_with_recovery(
-                self.pidfd.take(),
+                self.take_child_pin(),
                 "Detached terminal child custody transfer",
                 self.recoverable_shutdown,
             );
@@ -1028,11 +1164,11 @@ impl AsRawFd for PtyMaster {
 }
 
 /// The root process of a held terminal. Its holder is the parent that reaps
-/// it; the daemon signals it through a pidfd, which can never reach a
-/// process that reused the pid.
+/// it; the daemon signals it through a pin, which can never reach a process
+/// that reused the pid.
 pub(super) struct HeldChild {
     pid: libc::pid_t,
-    pidfd: File,
+    pin: PinnedProcess,
 }
 
 impl HeldChild {
@@ -1040,67 +1176,39 @@ impl HeldChild {
         self.pid
     }
 
-    /// Clone this exact root pidfd; File::try_clone uses close-on-exec custody.
-    pub(super) fn duplicate_pidfd(&self) -> io::Result<File> {
-        self.pidfd.try_clone()
+    /// Another pin of this exact root.
+    pub(super) fn duplicate_pin(&self) -> io::Result<PinnedProcess> {
+        self.pin.try_clone()
     }
 
     /// Whether the root has not been reaped yet. Anything read about its pid
     /// before this answers true was read about the root itself.
     pub(super) fn unreaped(&self) -> bool {
-        signal(&self.pidfd, 0).is_ok()
+        matches!(self.pin.reaped(), Ok(false))
     }
 
     /// Hangs the root up, as closing its terminal would. A root that already
     /// exited counts as hung up; one that ignores the hangup keeps running.
     pub(super) fn kill(&self) -> io::Result<()> {
-        match signal(&self.pidfd, libc::SIGHUP) {
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-            result => result,
-        }
+        self.pin.signal(libc::SIGHUP).map(drop)
     }
 
     pub(super) fn exited_within(&self, grace: Duration) -> io::Result<bool> {
-        exits_within(&self.pidfd, grace)
+        self.pin.wait_for_exit(grace)
     }
 
     /// Escalates only this pinned root after a graceful hangup was ignored.
-    /// The pidfd cannot acquire authority over a reused numeric process ID.
+    /// The pin cannot acquire authority over a reused numeric process ID.
     pub(super) fn force_kill(&self) -> io::Result<()> {
-        match signal(&self.pidfd, libc::SIGKILL) {
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-            result => result,
-        }
+        self.pin.signal(libc::SIGKILL).map(drop)
     }
 }
 
-fn peer_credentials(socket: &UnixStream) -> io::Result<libc::ucred> {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `credentials` and `length` describe a live ucred buffer.
-    let result = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut credentials).cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(credentials)
-}
-
-/// A pidfd for the process at the other end of `socket`, whose pid is `pid`.
+/// A pin of the process at the other end of `socket`, whose pid is `pid`.
 /// The kernel names that very process where it can; otherwise the pid names
 /// it only while the holder lives, which it does until it has handed over.
-fn peer_pidfd(socket: &UnixStream, pid: libc::pid_t) -> io::Result<File> {
+#[cfg(target_os = "linux")]
+fn pin_peer(socket: &UnixStream, pid: u32) -> io::Result<PinnedProcess> {
     let mut fd: libc::c_int = -1;
     let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: `fd` and `length` describe a live c_int buffer.
@@ -1115,50 +1223,28 @@ fn peer_pidfd(socket: &UnixStream, pid: libc::pid_t) -> io::Result<File> {
     };
     if result == 0 {
         // SAFETY: a successful SO_PEERPIDFD returns a fresh owned descriptor.
-        return Ok(unsafe { File::from_raw_fd(fd) });
+        return Ok(PinnedProcess::from_pidfd(pid, unsafe {
+            OwnedFd::from_raw_fd(fd)
+        }));
     }
     match io::Error::last_os_error() {
         // Before Linux 6.5.
-        error if error.raw_os_error() == Some(libc::ENOPROTOOPT) => open_pidfd(pid),
+        error if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+            PinnedProcess::open_unreaped(pid)
+        }
         error => Err(error),
     }
 }
 
-fn open_pidfd(pid: libc::pid_t) -> io::Result<File> {
-    // SAFETY: pidfd_open takes scalars; a success is a fresh owned descriptor.
-    match unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } {
-        -1 => Err(io::Error::last_os_error()),
-        fd => Ok(unsafe { File::from_raw_fd(fd as RawFd) }),
-    }
-}
-
-/// Whether a pidfd's process exits within `grace`: a pidfd becomes readable
-/// when it does.
-pub(super) fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
-    let deadline = Instant::now() + grace;
-    let mut target = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        // SAFETY: one live pollfd for the duration of the call.
-        match unsafe {
-            libc::poll(
-                &mut target,
-                1,
-                remaining
-                    .as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(i32::MAX as u128) as libc::c_int,
-            )
-        } {
-            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-            -1 => return Err(io::Error::last_os_error()),
-            ready => return Ok(ready > 0),
-        }
-    }
+/// Darwin names only a candidate pid for the peer. Pinned without recorded
+/// evidence, it names the holder only once the holder answers through this
+/// socket, which no other process holds: a holder alive after the pin was
+/// alive when it was taken, so its pid had no successor yet. Until then the
+/// pin grants nothing, since a holder adopted without a handshake stays
+/// detached and is never signalled.
+#[cfg(target_os = "macos")]
+fn pin_peer(_socket: &UnixStream, pid: u32) -> io::Result<PinnedProcess> {
+    PinnedProcess::open_unreaped(pid)
 }
 
 /// Serves as a holder when this image was executed as one.
@@ -1264,7 +1350,7 @@ impl Drop for Residence {
 
 struct PtyRoot {
     pid: libc::pid_t,
-    pidfd: File,
+    pin: PinnedChild,
     exit: Option<libc::c_int>,
     private_tmp: Option<crate::daemon::codex_temp::PrivateDir>,
 }
@@ -1275,7 +1361,7 @@ impl PtyRoot {
         if self.exit.is_some() {
             -1
         } else {
-            self.pidfd.as_raw_fd()
+            self.pin.exit_readiness().as_raw_fd()
         }
     }
 
@@ -1328,7 +1414,7 @@ fn serve(control: UnixStream) -> i32 {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             authorize_successor(
-                peer.pid,
+                peer.pid as libc::pid_t,
                 &recovery
                     .source
                     .continuity
@@ -1396,8 +1482,8 @@ fn serve(control: UnixStream) -> i32 {
         return fail(format!("spawn {program}: no process id"));
     };
     // The root is this holder's unreaped child, so its pid is its own.
-    let pidfd = match open_pidfd(pid) {
-        Ok(pidfd) => pidfd,
+    let pin = match PinnedChild::of_pid(pid as u32) {
+        Ok(pin) => pin,
         Err(error) => {
             // SAFETY: as above; the root cannot be handed over, so it must
             // not outlive this failure.
@@ -1405,7 +1491,7 @@ fn serve(control: UnixStream) -> i32 {
                 libc::kill(pid, libc::SIGKILL);
                 libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
-            return fail(format!("open pidfd for {program}: {error}"));
+            return fail(format!("pin {program}: {error}"));
         }
     };
     let Some(master) = pair.master.as_raw_fd() else {
@@ -1424,7 +1510,7 @@ fn serve(control: UnixStream) -> i32 {
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
-            let _ = signal(&pidfd, libc::SIGKILL);
+            let _ = pin.signal(libc::SIGKILL);
             let _ = reap(pid);
             return fail(format!("register terminal holder: {error}"));
         }
@@ -1433,13 +1519,17 @@ fn serve(control: UnixStream) -> i32 {
         protocol: PROTOCOL,
         pid,
         launch_directory: Some(launch_directory.0),
+        root_started: RootPin::started(pin.process()),
     };
     // SAFETY: pair.master owns this exact live descriptor through the send.
     let master_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(master) };
+    let mut rights = vec![master_fd];
+    rights.extend(RootPin::rights(pin.process()));
+    rights.push(launch_directory.1.as_fd());
     let mut lost = crate::descriptor_frame::send_json_with_fds_until(
         &control,
         &started,
-        &[master_fd, pidfd.as_fd(), launch_directory.1.as_fd()],
+        &rights,
         Instant::now() + START_TIMEOUT,
         MAX_FRAME as usize,
         3,
@@ -1447,9 +1537,10 @@ fn serve(control: UnixStream) -> i32 {
     )
     .is_err();
 
+    drop(rights);
     let mut root = PtyRoot {
         pid,
-        pidfd,
+        pin,
         exit: None,
         private_tmp,
     };
@@ -1550,7 +1641,7 @@ fn serve(control: UnixStream) -> i32 {
     if cleanup_proved && let (Some(residence), Some(recovery)) = (&residence, &recovery) {
         // The checked worker has already stopped its exact process family;
         // independently require that this holder reaped the root too.
-        if root.exit.is_none() && exits_within(&root.pidfd, Duration::ZERO).unwrap_or(false) {
+        if root.exit.is_none() && root.pin.exited().unwrap_or(false) {
             root.reap();
         }
         if root.exit.is_some() {
@@ -1607,7 +1698,7 @@ fn attend(
         if targets[1].revents != 0 {
             // A root this holder cannot reap leaves nothing to report: ending
             // the holder lets the daemon report that exit as unknown instead
-            // of polling a pidfd that stays ready forever.
+            // of polling a pin that stays ready forever.
             let Some(wait_status) = root.reap() else {
                 return Attendance::Release;
             };
@@ -1733,7 +1824,7 @@ fn await_successor(
                 &successor,
                 master,
                 root.pid,
-                &root.pidfd,
+                root.pin.process(),
                 root.exit,
                 screen,
                 &output,
@@ -1759,7 +1850,7 @@ fn hand_over(
     successor: &UnixStream,
     master: RawFd,
     pid: libc::pid_t,
-    pidfd: &File,
+    root: &PinnedProcess,
     exit: Option<libc::c_int>,
     screen: &str,
     output: &[u8],
@@ -1787,7 +1878,7 @@ fn hand_over(
             let (Some(record), Some(recovery)) = (record, recovery.as_ref()) else {
                 return Err(io::ErrorKind::InvalidData.into());
             };
-            authorize_successor(peer.pid, &proof)?;
+            authorize_successor(peer.pid as libc::pid_t, &proof)?;
             let mut recovery = recovery.clone();
             // Size belongs to the live PTY, not the original spawn recipe.
             let mut size: libc::winsize = unsafe { std::mem::zeroed() };
@@ -1835,7 +1926,7 @@ fn hand_over(
         next.validate(&record.boot, record.terminal)
             .map_err(io::Error::other)?;
         authorize_successor(
-            peer.pid,
+            peer.pid as libc::pid_t,
             &next
                 .source
                 .continuity
@@ -1870,13 +1961,17 @@ fn hand_over(
         output: STANDARD.encode(output),
         screen_lost,
         launch_directory: Some(launch_directory.0),
+        root_started: RootPin::started(root),
     };
     // SAFETY: the caller owns this live master for the whole bounded send.
     let master = unsafe { std::os::fd::BorrowedFd::borrow_raw(master) };
+    let mut rights = vec![master];
+    rights.extend(RootPin::rights(root));
+    rights.push(launch_directory.1.as_fd());
     crate::descriptor_frame::send_json_with_fds_until(
         successor,
         &attached,
-        &[master, pidfd.as_fd(), launch_directory.1.as_fd()],
+        &rights,
         deadline,
         MAX_FRAME as usize,
         3,
@@ -1899,7 +1994,7 @@ pub fn inspect(
         crate::daemon::holder_registry::connect(socket).map_err(|error| error.to_string())?;
     let peer = peer_credentials(&control).map_err(|error| error.to_string())?;
     if peer.uid != crate::daemon::current_uid()
-        || peer.pid != expected.holder.pid
+        || i64::from(peer.pid) != i64::from(expected.holder.pid)
         || !expected.holder.is_current()
     {
         return Err("holder socket does not belong to the recorded process".into());
@@ -1948,12 +2043,12 @@ fn authorize_successor(pid: i32, proof: &crate::model::HostSessionProof) -> io::
     Ok(())
 }
 
-/// Reaps the root once its pidfd says it exited, returning its wait status.
+/// Reaps the root once its pin says it exited, returning its wait status.
 fn reap(pid: libc::pid_t) -> Option<libc::c_int> {
     let mut wait_status = 0;
     loop {
-        // SAFETY: the root is this holder's child, and its pidfd reported
-        // its exit.
+        // SAFETY: the root is this holder's child, and its pin reported its
+        // exit.
         match unsafe { libc::waitpid(pid, &mut wait_status, 0) } {
             reaped if reaped == pid => return Some(wait_status),
             -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
@@ -2072,10 +2167,11 @@ fn receive_with_descriptors(
         message.msg_iovlen = 1;
         message.msg_control = space.as_mut_ptr().cast();
         message.msg_controllen = std::mem::size_of_val(&space) as _;
-        let received = libc::recvmsg(control.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC);
+        let received = libc::recvmsg(control.as_raw_fd(), &mut message, RECEIVE_CLOSE_ON_EXEC);
         if received == -1 {
             return Err(io::Error::last_os_error());
         }
+        let first = descriptors.len();
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
@@ -2088,6 +2184,13 @@ fn receive_with_descriptors(
             }
             header = libc::CMSG_NXTHDR(&message, header);
         }
+        // Darwin has no flag to receive descriptors close-on-exec.
+        #[cfg(target_os = "macos")]
+        for descriptor in &descriptors[first..] {
+            crate::descriptor::set_close_on_exec(descriptor.as_fd())?;
+        }
+        #[cfg(target_os = "linux")]
+        let _ = first;
         if message.msg_flags & libc::MSG_CTRUNC != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2098,9 +2201,26 @@ fn receive_with_descriptors(
     }
 }
 
+#[cfg(target_os = "linux")]
+const RECEIVE_CLOSE_ON_EXEC: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+/// Darwin has no flag to receive descriptors close-on-exec, so each is marked
+/// right after `recvmsg` returns. A program another thread of the daemon
+/// executes in between could inherit one and keep it open. No pin crosses
+/// this socket on Darwin; see [`RootPin`].
+#[cfg(target_os = "macos")]
+const RECEIVE_CLOSE_ON_EXEC: libc::c_int = 0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pin of a child that has already been reaped.
+    fn reaped_child_pin() -> PinnedChild {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pin = PinnedChild::of(&child).unwrap();
+        child.wait().unwrap();
+        pin
+    }
 
     #[test]
     fn failed_adoption_commit_acknowledgement_keeps_unconsumed_replay() {
@@ -2109,10 +2229,10 @@ mod tests {
         send(&successor, &Request::CommitAdoption, &[]).unwrap();
         let mut replay = Some(("screen".to_owned(), b"orphan-output".to_vec(), false));
         let expected = replay.clone();
-        // An already reaped child has no pollable pidfd; the descriptor is ignored.
+        // An already reaped root is never polled; its pin is ignored.
         let mut root = PtyRoot {
             pid: 0,
-            pidfd: File::open("/dev/null").unwrap(),
+            pin: reaped_child_pin(),
             exit: Some(0),
             private_tmp: None,
         };
@@ -2167,6 +2287,7 @@ mod tests {
         )
         .unwrap();
         let descriptor = tempfile::tempfile().unwrap();
+        let root = PinnedProcess::open(std::process::id()).unwrap();
         let directory = pin_launch_directory(&command("true")).unwrap();
         let started = Instant::now();
         // The successor stays open and never reads, so only the deadline can
@@ -2176,7 +2297,7 @@ mod tests {
                 &holder,
                 descriptor.as_raw_fd(),
                 1,
-                &descriptor,
+                &root,
                 None,
                 "",
                 &vec![b'x'; DETACHED_OUTPUT],
@@ -2291,6 +2412,7 @@ mod tests {
                 protocol: PROTOCOL,
                 pid: 7,
                 launch_directory: None,
+                root_started: None,
             },
             &[write.as_raw_fd()],
         )
@@ -2541,7 +2663,7 @@ mod tests {
         assert!(read_until(&held.master, "ready").contains("ready"));
         let original_pid = held.child.pid();
         let master = held.master.duplicate().unwrap();
-        let pidfd = held.child.pidfd.try_clone().unwrap();
+        let root = held.child.duplicate_pin().unwrap();
         let invalid_directory = tempfile::tempfile().unwrap();
         let expected = pin_launch_directory(&command("true")).unwrap().0;
         let socket = directory.path().join("anonymous.sock");
@@ -2570,8 +2692,13 @@ mod tests {
                     output: String::new(),
                     screen_lost: false,
                     launch_directory: Some(expected),
+                    root_started: RootPin::started(&root),
                 },
-                &[master.as_fd(), pidfd.as_fd(), invalid_directory.as_fd()],
+                &[master.as_fd()]
+                    .into_iter()
+                    .chain(RootPin::rights(&root))
+                    .chain([invalid_directory.as_fd()])
+                    .collect::<Vec<_>>(),
                 Instant::now() + Duration::from_secs(5),
                 MAX_FRAME as usize,
                 3,
@@ -2590,7 +2717,7 @@ mod tests {
         assert!(error.contains("launch directory"), "{error}");
         server.join().unwrap();
         assert!(alive(original_pid));
-        assert!(!exits_within(&held.child.pidfd, Duration::ZERO).unwrap());
+        assert!(!held.child.exited_within(Duration::ZERO).unwrap());
         let mut input = File::from(held.master.duplicate().unwrap());
         std::io::Write::write_all(&mut input, b"continue\n").unwrap();
         assert!(read_until(&held.master, "ORIGINAL_SURVIVED").contains("ORIGINAL_SURVIVED"));
@@ -2611,44 +2738,48 @@ mod tests {
         let file = File::open(directory.path()).unwrap();
         let identity =
             crate::agent_execution::DirectoryIdentity::from_metadata(&file.metadata().unwrap());
+        // The root is this test process, whose pin Linux sends as a pidfd.
+        let root = PinnedProcess::open(std::process::id()).unwrap();
+        let decode = |protocol, identity, descriptors| {
+            decode_held_descriptors(
+                protocol,
+                std::process::id() as libc::pid_t,
+                RootPin::started(&root),
+                identity,
+                descriptors,
+            )
+        };
         let fds = |with_directory: bool| {
-            let mut descriptors = vec![
-                OwnedFd::from(tempfile::tempfile().unwrap()),
-                OwnedFd::from(tempfile::tempfile().unwrap()),
-            ];
+            let mut descriptors = vec![OwnedFd::from(tempfile::tempfile().unwrap())];
+            descriptors.extend(
+                RootPin::rights(&root)
+                    .into_iter()
+                    .map(|right| right.try_clone_to_owned().unwrap()),
+            );
             if with_directory {
                 descriptors.push(OwnedFd::from(file.try_clone().unwrap()));
             }
             descriptors
         };
         for protocol in 2..=4 {
-            assert!(
-                decode_held_descriptors(protocol, None, fds(false))
-                    .unwrap()
-                    .2
-                    .is_none()
-            );
-            assert!(decode_held_descriptors(protocol, Some(identity), fds(true)).is_err());
+            assert!(decode(protocol, None, fds(false)).unwrap().2.is_none());
+            assert!(decode(protocol, Some(identity), fds(true)).is_err());
         }
         for unsupported in [0, 1, 6] {
-            assert!(decode_held_descriptors(unsupported, Some(identity), fds(true)).is_err());
+            assert!(decode(unsupported, Some(identity), fds(true)).is_err());
         }
-        assert!(decode_held_descriptors(5, None, fds(true)).is_err());
-        assert!(decode_held_descriptors(5, Some(identity), fds(false)).is_err());
+        assert!(decode(5, None, fds(true)).is_err());
+        assert!(decode(5, Some(identity), fds(false)).is_err());
         let wrong = crate::agent_execution::DirectoryIdentity {
             inode: identity.inode.wrapping_add(1),
             ..identity
         };
-        assert!(decode_held_descriptors(5, Some(wrong), fds(true)).is_err());
+        assert!(decode(5, Some(wrong), fds(true)).is_err());
         let mut regular = fds(false);
         regular.push(OwnedFd::from(tempfile::tempfile().unwrap()));
-        assert!(decode_held_descriptors(5, Some(identity), regular).is_err());
+        assert!(decode(5, Some(identity), regular).is_err());
         assert_eq!(
-            decode_held_descriptors(5, Some(identity), fds(true))
-                .unwrap()
-                .2
-                .unwrap()
-                .0,
+            decode(5, Some(identity), fds(true)).unwrap().2.unwrap().0,
             identity
         );
         let not_cloexec = File::open(directory.path()).unwrap();
@@ -2921,14 +3052,18 @@ mod tests {
         let (exits, exited) = crossbeam_channel::bounded(1);
         let adopted = adopt(&socket, exits).unwrap().held;
         assert!(adopted.holder.process.is_none());
-        let exact_exit = adopted.holder.pidfd.as_ref().unwrap().try_clone().unwrap();
+        let exact_exit = adopted
+            .holder
+            .original_process_descriptor()
+            .unwrap()
+            .unwrap();
         adopted.child.kill().unwrap();
         exited
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
         drop(adopted);
-        assert!(exits_within(&exact_exit, Duration::from_secs(5)).unwrap());
+        assert!(exact_exit.wait_for_exit(Duration::from_secs(5)).unwrap());
         assert!(
             owner.is_current(),
             "suspended service must not silently reap before recovery"
@@ -3136,14 +3271,14 @@ mod tests {
 
         struct Cleanup {
             daemon: Child,
-            holder: Option<File>,
+            holder: Option<PinnedProcess>,
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 let _ = self.daemon.kill();
                 let _ = self.daemon.wait();
                 if let Some(holder) = &self.holder {
-                    let _ = signal(holder, libc::SIGKILL);
+                    let _ = holder.signal(libc::SIGKILL);
                 }
             }
         }
@@ -3182,7 +3317,7 @@ mod tests {
             "discovery must exist before startup is acknowledged"
         );
         let record = records[0].clone();
-        cleanup.holder = Some(open_pidfd(record.holder.pid).unwrap());
+        cleanup.holder = Some(PinnedProcess::open(record.holder.pid as u32).unwrap());
         cleanup.daemon.kill().unwrap();
         cleanup.daemon.wait().unwrap();
         assert!(record.holder.is_current());
@@ -3529,8 +3664,7 @@ mod tests {
         let (socket, root) = detached("echo ready; while :; do sleep 1; done", directory.path());
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let held = adopt(&socket, exits).unwrap().held;
-        let holder = held.holder.pidfd.as_ref().map(|pidfd| pidfd.as_raw_fd());
-        assert!(holder.is_some());
+        assert!(held.holder.pin.is_some());
         drop(held);
         wait_gone(root);
     }

@@ -154,7 +154,8 @@ fn late_completed_retirement_reuses_naturally_settled_original_worker() {
         .original_holder_process
         .get()
         .unwrap();
-    let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+    // SAFETY: F_GETFD takes no pointer and reads a descriptor the pin owns.
+    let flags = unsafe { libc::fcntl(original.exit_readiness().as_raw_fd(), libc::F_GETFD) };
     assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
     let proof = retirement_test_proof();
     assert!(
@@ -312,7 +313,8 @@ fn completed_retirement_waits_for_exact_holder_exit_and_authenticated_receipt() 
             .get()
             .unwrap(),
     );
-    let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+    // SAFETY: F_GETFD takes no pointer and reads a descriptor the pin owns.
+    let flags = unsafe { libc::fcntl(original.exit_readiness().as_raw_fd(), libc::F_GETFD) };
     assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
     let receipt = paths.directory.join("holders").join(format!(
         "{}-{}-{}.closed",
@@ -349,9 +351,12 @@ fn completed_retirement_waits_for_exact_holder_exit_and_authenticated_receipt() 
                 Arc::ptr_eq(&waiting, &original),
                 "wait must use the held original descriptor"
             );
-            assert_eq!(waiting.as_raw_fd(), original.as_raw_fd());
+            assert_eq!(
+                waiting.exit_readiness().as_raw_fd(),
+                original.exit_readiness().as_raw_fd()
+            );
             let mut event = libc::pollfd {
-                fd: waiting.as_raw_fd(),
+                fd: waiting.exit_readiness().as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
@@ -367,7 +372,7 @@ fn completed_retirement_waits_for_exact_holder_exit_and_authenticated_receipt() 
     fs::remove_file(fault_marker).unwrap();
     wait_for_retirement_fact(|| {
         let mut event = libc::pollfd {
-            fd: original.as_raw_fd(),
+            fd: original.exit_readiness().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -1614,7 +1619,9 @@ fn launch_pin_refuses_kernel_exit_before_worker_completion_publication() {
     assert!(handle.pinned_launch_directory().is_ok());
     let (_, original) = handle.inner.published.launch_directory.get().unwrap();
     assert_ne!(
-        unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+        // SAFETY: F_GETFD takes no pointer and reads a descriptor the pin owns.
+        unsafe { libc::fcntl(original.exit_readiness().as_raw_fd(), libc::F_GETFD) }
+            & libc::FD_CLOEXEC,
         0
     );
     // The actual event loop is deliberately not running. The shell exits

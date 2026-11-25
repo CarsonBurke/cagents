@@ -1411,6 +1411,7 @@ fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
 use super::super::Role;
 use super::*;
 use serde_json::{Value, json};
+use std::os::fd::FromRawFd;
 
 #[test]
 fn a_settled_actor_releases_large_json_frame_slack() {
@@ -2991,6 +2992,8 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         std::fs::write(original.join("marker"), "replacement").unwrap();
         let (identity, pin) = handle.pinned_launch_directory().unwrap();
         assert_eq!(identity, expected);
+        // Only Linux reports a path-only handle among a descriptor's flags.
+        #[cfg(target_os = "linux")]
         if !admitted {
             assert_ne!(
                 unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
