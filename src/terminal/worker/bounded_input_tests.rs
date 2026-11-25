@@ -172,7 +172,12 @@ fn finish_captured_input_worker(
     worker.run();
     published.release_completed_holder();
     assert!(published.retained_holder.lock().unwrap().is_none());
-    handle.shutdown().unwrap();
+    let shutdown = handle.shutdown();
+    assert!(
+        shutdown.is_ok(),
+        "captured input worker failed to complete: {shutdown:?}; events: {:?}",
+        handle.events().try_iter().collect::<Vec<_>>()
+    );
     root.settled();
 }
 
