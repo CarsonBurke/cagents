@@ -1110,16 +1110,16 @@ impl Residence {
     }
 
     fn verify_server(&self, server: &Process) -> Result<(), String> {
-        if let Some(confirmed) = &self.recovery.server_process {
-            if confirmed != server {
-                return Err("The retained app-server process changed".into());
+        match &self.recovery.server_process {
+            Some(confirmed) if confirmed != server => {
+                Err("The retained app-server process changed".into())
             }
             #[cfg(target_os = "macos")]
             // The exact, already-authenticated app-server can be reparented
             // to launchd when its launcher exits. Its pin still identifies it.
-            return ensure_provider_live(&self.provider_pidfd);
+            Some(_) => ensure_provider_live(&self.provider_pidfd),
+            _ => verify_server_ancestry(server, &self.record.holder),
         }
-        verify_server_ancestry(server, &self.record.holder)
     }
 
     fn orphan(&mut self) -> bool {
