@@ -21,9 +21,7 @@ class EditorArchive(unittest.TestCase):
         self.work = Path(self.temp.name)
         source = (ROOT / "scripts/publish-release").read_text()
         # Run the production function unchanged, with only its caller inputs.
-        function = source.split("check_archive() {", 1)[1].split(
-            '\n}\n\ncheck_asset_set "$DIST_DIR"', 1
-        )[0]
+        function = source.split("check_archive() {", 1)[1].split("\n}\n", 1)[0]
         self.validator = self.work / "validate"
         self.validator.write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\nexport LC_ALL=C\n'
@@ -133,9 +131,7 @@ class CagentsArchive(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
         source = (ROOT / "scripts/publish-release").read_text()
-        function = source.split("check_archive() {", 1)[1].split(
-            '\n}\n\ncheck_asset_set "$DIST_DIR"', 1
-        )[0]
+        function = source.split("check_archive() {", 1)[1].split("\n}\n", 1)[0]
         self.validator = self.work / "validate"
         self.validator.write_text(
             '#!/usr/bin/env bash\nset -euo pipefail\nexport LC_ALL=C\n'
