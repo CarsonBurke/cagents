@@ -72,7 +72,7 @@ by hand instead**:
    fingerprint. Compare it with
    `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the computer before
    trusting it. A later change of key is refused until you forget the old one
-   in Settings.
+   in Settings. For a paired computer, pair again from the computer instead.
 
 The phone and the computer must reach each other: on the same network, or
 over a VPN such as Tailscale when away.
@@ -121,3 +121,23 @@ either replaces the other, keeping the phone's key and trusted hosts.
 ```sh
 adb shell run-as dev.cagents.mobile.debug cat files/cagents-phone.pub
 ```
+
+### Test pairing end to end
+
+`scripts/mobile-pair-fixture` stands in for a computer to pair with, without
+touching your own SSH server or `authorized_keys`. It runs a throwaway sshd on
+loopback with its own host key, writes pairing codes the way the desktop does,
+and answers the phone's request as the desktop's popover would. The bridges it
+runs are a matched `cagents` and `cagentsd` you name, with a HOME of their
+own. Run it on the machine the emulator runs on, from your own shell:
+
+```sh
+scripts/mobile-pair-fixture start ~/.local/state/cagents-main-sentinel/builds/COMMIT
+scripts/mobile-pair-fixture code     # then open it on the emulator:
+adb shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "'CODE'"
+scripts/mobile-pair-fixture allow    # once the phone shows its fingerprint
+scripts/mobile-pair-fixture stop
+```
+
+The emulator reaches the fixture at 10.0.2.2. The code also comes as
+`code.png`, a QR code.

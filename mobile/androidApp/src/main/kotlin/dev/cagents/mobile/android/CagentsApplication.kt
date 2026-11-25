@@ -72,7 +72,9 @@ class AppGraph(private val app: Application) {
 
     /** What the computer will call this phone: the name it was given in system settings, or its model. */
     private fun deviceName(): String =
-        AndroidSettings.Global.getString(app.contentResolver, AndroidSettings.Global.DEVICE_NAME)
+        // Some builds may restrict the setting; the model is still a fine name.
+        runCatching { AndroidSettings.Global.getString(app.contentResolver, AndroidSettings.Global.DEVICE_NAME) }
+            .getOrNull()
             ?.takeIf { it.isNotBlank() }
             ?: Build.MODEL
 

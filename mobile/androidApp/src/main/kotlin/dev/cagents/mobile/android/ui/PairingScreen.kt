@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -60,6 +61,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.cagents.mobile.android.scan.QrScanner
@@ -68,13 +70,13 @@ import kotlinx.coroutines.launch
 
 /**
  * Pairs the phone with a computer by its pairing code: scanned with the
- * camera, or offered as [link] by another app. [onManual] leads to setting
+ * camera, or offered by another app, which [link] takes. [onManual] leads to setting
  * the computer up by hand instead.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PairingScreen(
-    link: String?,
+    link: () -> String?,
     onBack: () -> Unit,
     onPaired: () -> Unit,
     onManual: () -> Unit,
@@ -85,8 +87,9 @@ fun PairingScreen(
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(link) {
-        if (link != null) vm.linked(link)
+    // Taken once: a recreated screen's model already has it.
+    LaunchedEffect(Unit) {
+        link()?.let(vm::linked)
     }
     LaunchedEffect(state) {
         if (state is PairingState.Paired) onPaired()
@@ -118,7 +121,7 @@ fun PairingScreen(
         ) {
             when (val s = state) {
                 PairingState.Scanning -> Scanning(hint, onScanned = vm::scanned, onPaste = paste, onManual = onManual)
-                is PairingState.Confirm -> Confirm(s.code, s.replaces, s.conflicts, onPair = vm::confirm, onCancel = vm::scanAgain)
+                is PairingState.Confirm -> Confirm(s.code, s.warnings.replaces, s.warnings.conflicts, s.fromCamera, onPair = vm::confirm, onCancel = vm::scanAgain)
                 is PairingState.Connecting -> Progress("Connecting to ${s.code.name}…") {
                     OutlinedButton(onClick = vm::scanAgain) { Text("Cancel") }
                 }
@@ -143,24 +146,45 @@ fun PairingScreen(
 @Composable
 private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> Unit, onManual: () -> Unit) {
     val context = LocalContext.current
-    val activity = LocalActivity.current
     fun granted() = context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     var camera by remember { mutableStateOf(granted()) }
     val hasCamera = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) }
     var cameraFailed by remember { mutableStateOf(false) }
     // Asked once on arriving: the person just chose to scan, which is when the camera is needed.
     var asked by rememberSaveable { mutableStateOf(false) }
-    var refused by rememberSaveable { mutableStateOf(false) }
+    // Only Settings can allow the camera now: the person refused for good,
+    // so the system answers requests without asking.
+    var onlyInSettings by rememberSaveable { mutableStateOf(false) }
+    // The activity's own lifecycle: the system's dialog pauses the activity,
+    // which a screen's lifecycle in the back stack doesn't follow.
+    val activity = LocalActivity.current as? ComponentActivity
+    val lifecycleOwner = activity ?: LocalLifecycleOwner.current
+    // Whether the system's dialog came up for the request in flight.
+    var dialogShown by remember { mutableStateOf(false) }
+    var rationaleBefore by remember { mutableStateOf(false) }
+    fun rationale() = activity?.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) == true
     val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         camera = allowed
-        refused = !allowed
+        // Refused for good: answered without a dialog, or refused again after
+        // being told why. A refusal Android will still ask about again, or a
+        // dismissed dialog, leaves "Allow camera".
+        onlyInSettings = !allowed && !rationale() && (!dialogShown || rationaleBefore)
     }
+    fun ask() {
+        dialogShown = false
+        rationaleBefore = rationale()
+        request.launch(Manifest.permission.CAMERA)
+    }
+    LifecycleEventEffect(Lifecycle.Event.ON_PAUSE, lifecycleOwner) { dialogShown = true }
     // Coming back from system settings, where camera access may have been turned on.
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { camera = granted() }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME, lifecycleOwner) {
+        camera = granted()
+        if (camera) onlyInSettings = false
+    }
     LaunchedEffect(Unit) {
         if (hasCamera && !camera && !asked) {
             asked = true
-            request.launch(Manifest.permission.CAMERA)
+            ask()
         }
     }
 
@@ -202,7 +226,6 @@ private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> 
             ) {}
         } else {
             // Shown while the system asks, and after a refusal, so the reason is never missing.
-            val permanently = refused && activity?.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) == false
             Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxSize()) {
                 Column(
                     Modifier.padding(24.dp),
@@ -215,14 +238,14 @@ private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> 
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center,
                     )
-                    if (permanently) {
+                    if (onlyInSettings) {
                         Button(onClick = {
                             context.startActivity(
                                 Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)),
                             )
                         }) { Text("Allow in Settings") }
                     } else {
-                        Button(onClick = { request.launch(Manifest.permission.CAMERA) }) { Text("Allow camera") }
+                        Button(onClick = ::ask) { Text("Allow camera") }
                     }
                 }
             }
@@ -244,7 +267,14 @@ private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> 
 }
 
 @Composable
-private fun Confirm(code: PairingCode, replaces: String?, conflicts: List<String>, onPair: () -> Unit, onCancel: () -> Unit) {
+private fun Confirm(
+    code: PairingCode,
+    replaces: String?,
+    conflicts: List<String>,
+    fromCamera: Boolean,
+    onPair: () -> Unit,
+    onCancel: () -> Unit,
+) {
     Icon(Icons.Outlined.PhonelinkLock, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
     Text("Pair with ${code.name}?", style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
     Text(
@@ -255,7 +285,11 @@ private fun Confirm(code: PairingCode, replaces: String?, conflicts: List<String
     )
     if (replaces != null) {
         Text(
-            "It replaces $replaces as the computer this phone connects to.",
+            if (replaces.equals(code.name, ignoreCase = true)) {
+                "It isn't the $replaces this phone connects to now, and replaces it."
+            } else {
+                "It replaces $replaces as the computer this phone connects to."
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
@@ -271,7 +305,7 @@ private fun Confirm(code: PairingCode, replaces: String?, conflicts: List<String
         )
     }
     Button(onClick = onPair, modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("Pair") }
-    TextButton(onClick = onCancel) { Text("Scan a code instead") }
+    TextButton(onClick = onCancel) { Text(if (fromCamera) "Cancel" else "Scan a code instead") }
 }
 
 @Composable

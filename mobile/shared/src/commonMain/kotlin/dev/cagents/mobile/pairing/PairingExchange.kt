@@ -28,15 +28,25 @@ sealed interface PairOutcome {
  * request, which is what cancelling this does.
  */
 object PairingExchange {
-    /** The longest device name the computer keeps. */
+    /** The longest device name the computer keeps, in characters (code points). */
     const val MAX_DEVICE_NAME_CHARS = 48
 
     /** The line the phone sends: its own OpenSSH public key, without a comment, and its name. */
     fun requestLine(publicKey: String, deviceName: String): String = buildJsonObject {
         put("type", "pair")
         put("key", publicKey.trim())
-        put("name", deviceName.trim().take(MAX_DEVICE_NAME_CHARS))
+        put("name", takeCodePoints(deviceName.trim(), MAX_DEVICE_NAME_CHARS))
     }.toString()
+
+    /** The first [count] code points of [text], never half of a surrogate pair. */
+    private fun takeCodePoints(text: String, count: Int): String {
+        var end = 0
+        repeat(count) {
+            if (end >= text.length) return text
+            end += if (text[end].isHighSurrogate() && end + 1 < text.length && text[end + 1].isLowSurrogate()) 2 else 1
+        }
+        return text.substring(0, end)
+    }
 
     /**
      * Sends the request and waits for the person's decision, calling

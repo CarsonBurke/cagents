@@ -24,9 +24,13 @@ data class ConversationRoute(val session: String) : NavKey
 @Serializable
 data object SettingsRoute : NavKey
 
-/** Pairing with a computer: scanning its code, or confirming [link], one another app opened. */
+/**
+ * Pairing with a computer: scanning its code, or confirming one another app
+ * opened, [offer] in [MainViewModel.takePairingLink]. The code itself isn't
+ * part of the route, which is saved.
+ */
 @Serializable
-data class PairingRoute(val link: String? = null) : NavKey
+data class PairingRoute(val offer: Int = 0) : NavKey
 
 @Composable
 fun CagentsApp(vm: MainViewModel = viewModel()) {
@@ -39,14 +43,14 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
         vm.messages.collect { snackbar.showSnackbar(it) }
     }
 
-    val pairingLink by vm.pairingLink.collectAsStateWithLifecycle()
-    LaunchedEffect(pairingLink) {
-        val link = pairingLink ?: return@LaunchedEffect
-        vm.openPairingLink(null)
+    val pairingOffer by vm.pairingOffer.collectAsStateWithLifecycle()
+    LaunchedEffect(pairingOffer) {
+        val offer = pairingOffer ?: return@LaunchedEffect
+        if (backStack.lastOrNull() == PairingRoute(offer)) return@LaunchedEffect
         // One pairing at a time: a newer link replaces a pairing screen already open.
         backStack.removeAll { it is PairingRoute }
         if (backStack.isEmpty()) backStack.add(SettingsRoute)
-        backStack.add(PairingRoute(link))
+        backStack.add(PairingRoute(offer))
     }
 
     HostKeyDialogs(vm, onPairAgain = { backStack.add(PairingRoute()) })
@@ -96,7 +100,7 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
             }
             entry<PairingRoute> { route ->
                 PairingScreen(
-                    link = route.link,
+                    link = { if (route.offer == 0) null else vm.takePairingLink(route.offer) },
                     onBack = { backStack.removeAt(backStack.lastIndex) },
                     onPaired = {
                         // Paired: on to the new computer's sessions, with nothing to go back to.

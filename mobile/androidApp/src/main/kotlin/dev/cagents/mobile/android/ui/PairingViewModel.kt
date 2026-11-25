@@ -24,11 +24,11 @@ sealed interface PairingState {
 
     /**
      * A code waiting for the person to confirm: one from a link or the
-     * clipboard, or one that would replace the computer this phone uses
-     * ([replaces]) or trusts a different key at some of its addresses
-     * ([conflicts]).
+     * clipboard, or one the camera read ([fromCamera]) that would replace
+     * the computer this phone uses or trusts a different key at some of
+     * its addresses; see [warnings].
      */
-    data class Confirm(val code: PairingCode, val replaces: String?, val conflicts: List<String>) : PairingState
+    data class Confirm(val code: PairingCode, val warnings: PairingWarnings, val fromCamera: Boolean = false) : PairingState
 
     data class Connecting(val code: PairingCode) : PairingState
 
@@ -69,8 +69,8 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         lastScanned = text
         when (val parsed = PairingCode.parse(text, now())) {
             is PairingCode.Parsed.Code -> {
-                val confirm = confirmation(parsed.code)
-                if (confirm.replaces != null || confirm.conflicts.isNotEmpty()) _state.value = confirm else start(parsed.code)
+                val confirm = confirmation(parsed.code, fromCamera = true)
+                if (confirm.warnings.any) _state.value = confirm else start(parsed.code)
             }
             is PairingCode.Parsed.Invalid -> showHint(parsed.message)
             PairingCode.Parsed.NotACode -> showHint("That isn't a cagents pairing code.")
@@ -91,15 +91,11 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun confirmation(code: PairingCode): PairingState.Confirm {
-        val current = graph.settings.settings.value
-        val ids = current.copy(port = code.port)
-        val conflicts = code.hosts.filter { host ->
-            graph.hostKeys.pinned(ids.hostKeyId(host)).let { it != null && it != code.hostKey }
-        }
-        val replaces = current.label.takeIf { current.isComplete && current.hosts.none { it in code.hosts } }
-        return PairingState.Confirm(code, replaces, conflicts)
-    }
+    private fun confirmation(code: PairingCode, fromCamera: Boolean = false) = PairingState.Confirm(
+        code,
+        PairingWarnings.of(code, graph.settings.settings.value, graph.hostKeys::pinned),
+        fromCamera,
+    )
 
     /** A link another app opened this one with; offered once, however often the screen is recreated. */
     fun linked(link: String) {
@@ -152,11 +148,16 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Stops a pairing in progress, withdrawing the request, and scans again. */
+    /**
+     * Stops a pairing in progress, withdrawing the request, and scans again.
+     * Cancelling a code the camera read leaves it ignored, though the
+     * camera is likely still pointed at it, until it reads another.
+     */
     fun scanAgain() {
+        val declinedScan = (_state.value as? PairingState.Confirm)?.fromCamera == true
         job?.cancel()
         job = null
-        lastScanned = null
+        if (!declinedScan) lastScanned = null
         _hint.value = null
         _state.value = PairingState.Scanning
     }

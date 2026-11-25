@@ -26,11 +26,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             <!-- A pairing code read by another app, such as the system camera's
-                 QR reader. The app asks before using it. Not BROWSABLE: a web
-                 page has no business offering a computer to pair with. -->
+                 QR reader, which opens links as BROWSABLE. Since a web page can
+                 open one too, the app always asks before using it, and says
+                 when it would replace the computer this phone trusts. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="cagents-mobile" android:host="pair" />
             </intent-filter>
         </activity>

@@ -4,6 +4,8 @@ import dev.cagents.mobile.pairing.PairOutcome
 import dev.cagents.mobile.pairing.PairingExchange
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -92,5 +94,13 @@ class PairingExchangeTest {
         val line = PairingExchange.requestLine(key, "x".repeat(100))
         assertTrue(""""name":"${"x".repeat(PairingExchange.MAX_DEVICE_NAME_CHARS)}"""" in line)
         assertTrue(line.startsWith("""{"type":"pair","""))
+    }
+
+    @Test
+    fun theNameIsCutByCharacterNeverInsideOne() {
+        // 47 letters, then an emoji that takes two UTF-16 units: all 48 characters fit.
+        val name = "x".repeat(47) + "📱" + "more"
+        val sent = Json.parseToJsonElement(PairingExchange.requestLine(key, name)).jsonObject["name"]!!.jsonPrimitive.content
+        assertEquals("x".repeat(47) + "📱", sent)
     }
 }

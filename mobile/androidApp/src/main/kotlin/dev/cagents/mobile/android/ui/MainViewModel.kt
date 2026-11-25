@@ -37,10 +37,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _phoneKey = MutableStateFlow<Result<PhoneKeyInfo>?>(null)
     val phoneKey: StateFlow<Result<PhoneKeyInfo>?> = _phoneKey.asStateFlow()
 
-    /** The fingerprint trusted for the configured computer, if any. */
-    val pinnedFingerprint: StateFlow<String?> = combine(settings, graph.hostKeys.revision) { settings, _ ->
-        settings.hostKeyIds.firstNotNullOfOrNull(graph.hostKeys::pinned)
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    /** The fingerprint trusted at each of the configured computer's addresses that has one, in their order. */
+    val pinnedFingerprints: StateFlow<Map<String, String>> = combine(settings, graph.hostKeys.revision) { settings, _ ->
+        settings.hosts.mapNotNull { host -> graph.hostKeys.pinned(settings.hostKeyId(host))?.let { host to it } }.toMap()
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
     private val _manualSetup = MutableStateFlow(false)
     /** Whether Settings shows the fields for setting up a computer by hand, rather than leading with pairing. */
@@ -50,12 +50,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _manualSetup.value = show
     }
 
-    private val _pairingLink = MutableStateFlow<String?>(null)
-    /** A pairing code that another app opened this one with, waiting to be shown. */
-    val pairingLink: StateFlow<String?> = _pairingLink.asStateFlow()
+    /**
+     * Pairing codes other apps opened this one with, by offer, until a
+     * pairing screen takes them. Kept here rather than in the screen's
+     * route, which is saved with the activity, so a code's one-time key is
+     * never written out.
+     */
+    private val offeredLinks = mutableMapOf<Int, String>()
+    private var lastOffer = 0
 
-    fun openPairingLink(link: String?) {
-        _pairingLink.value = link
+    private val _pairingOffer = MutableStateFlow<Int?>(null)
+    /** The newest pairing code offered, to open a pairing screen for. */
+    val pairingOffer: StateFlow<Int?> = _pairingOffer.asStateFlow()
+
+    fun openPairingLink(link: String) {
+        val offer = ++lastOffer
+        offeredLinks[offer] = link
+        _pairingOffer.value = offer
+    }
+
+    /** The pairing code for [offer], once; null after that, or after the process was restarted. */
+    fun takePairingLink(offer: Int): String? {
+        if (_pairingOffer.value == offer) _pairingOffer.value = null
+        return offeredLinks.remove(offer)
     }
 
     private val _messages = Channel<String>(Channel.BUFFERED)

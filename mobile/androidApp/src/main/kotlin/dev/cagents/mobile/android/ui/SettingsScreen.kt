@@ -71,7 +71,7 @@ fun SettingsScreen(
 ) {
     val saved by vm.settings.collectAsStateWithLifecycle()
     val phoneKey by vm.phoneKey.collectAsStateWithLifecycle()
-    val pinned by vm.pinnedFingerprint.collectAsStateWithLifecycle()
+    val pinned by vm.pinnedFingerprints.collectAsStateWithLifecycle()
     var host by rememberSaveable { mutableStateOf(saved.hosts.joinToString(", ")) }
     var port by rememberSaveable { mutableStateOf(saved.port.toString()) }
     var user by rememberSaveable { mutableStateOf(saved.user) }
@@ -221,14 +221,27 @@ fun SettingsScreen(
                 PhoneKeySection(phoneKey, user.trim(), snackbar)
             }
 
-            if (pinned != null && saved.isComplete) {
+            if (pinned.isNotEmpty() && saved.isComplete) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 SectionTitle("Trusted computer")
-                Text(
-                    "${saved.label} (${saved.hosts.joinToString(", ")}, port ${saved.port}) is trusted with this host key fingerprint:",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Fingerprint(pinned!!)
+                val keys = pinned.values.distinct()
+                if (keys.size == 1) {
+                    Text(
+                        "${saved.label} (${pinned.keys.joinToString(", ")}, port ${saved.port}) is trusted with this host key fingerprint:",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Fingerprint(keys.single())
+                } else {
+                    // Trusted on first use one address at a time, so they may not all be the same computer.
+                    Text(
+                        "${saved.label}'s addresses are trusted with different host keys. Each should be the computer's own:",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    for ((host, key) in pinned) {
+                        Text("$host, port ${saved.port}", style = MaterialTheme.typography.labelMedium)
+                        Fingerprint(key)
+                    }
+                }
                 OutlinedButton(onClick = { vm.forgetHostKey() }) { Text("Forget this computer's key") }
             }
 

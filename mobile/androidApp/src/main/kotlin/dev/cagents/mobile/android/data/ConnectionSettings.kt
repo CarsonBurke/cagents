@@ -38,6 +38,13 @@ data class ConnectionSettings(
     companion object {
         const val DEFAULT_COMMAND = "cagents daemon bridge --mobile"
 
+        /**
+         * The addresses as saved: [hosts], one per line, or, from before
+         * there could be several, the single [host].
+         */
+        fun storedHosts(hosts: String?, host: String?): List<String> =
+            (hosts ?: host).orEmpty().lines().map(String::trim).filter(String::isNotEmpty)
+
         /** Addresses as typed: separated by commas or spaces. */
         fun parseHosts(text: String): List<String> =
             text.split(',', ' ', '\n').map(String::trim).filter(String::isNotEmpty).distinct()
@@ -51,8 +58,7 @@ class SettingsStore(context: Context) {
 
     private fun read() = ConnectionSettings(
         // "host" alone is how settings were kept before there could be several.
-        hosts = (prefs.getString("hosts", null) ?: prefs.getString("host", "")).orEmpty()
-            .lines().map(String::trim).filter(String::isNotEmpty),
+        hosts = ConnectionSettings.storedHosts(prefs.getString("hosts", null), prefs.getString("host", null)),
         port = prefs.getInt("port", 22),
         user = prefs.getString("user", "").orEmpty(),
         command = prefs.getString("command", null) ?: ConnectionSettings.DEFAULT_COMMAND,

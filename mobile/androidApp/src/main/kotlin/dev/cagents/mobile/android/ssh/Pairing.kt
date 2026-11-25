@@ -49,7 +49,7 @@ class Pairing(
             return PairOutcome.Failed(e.message ?: "Couldn't reach ${code.name}.")
         }
         val outcome = try {
-            PairingExchange.pair(channel, key.openSshKey, deviceName(), onWaiting)
+            PairingExchange.pair(channel, key.openSshKey, withContext(Dispatchers.IO) { deviceName() }, onWaiting)
         } catch (e: ConnectFailure) {
             PairOutcome.Failed(e.message ?: "The connection to ${code.name} was lost.")
         } catch (e: IOException) {
@@ -74,7 +74,7 @@ class Pairing(
  * Trusts exactly the host key the code names, never one seen for the first
  * time, and offers only Ed25519 host keys so that its fingerprint applies.
  */
-private class CodeHostKey(private val code: PairingCode) : HostKeyCheck {
+internal class CodeHostKey(private val code: PairingCode) : HostKeyCheck {
     override val ed25519Only get() = true
 
     override fun check(host: String, fingerprint: String, keyType: String): ConnectFailure? =
