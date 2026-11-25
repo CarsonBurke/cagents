@@ -14,13 +14,16 @@
 //! window and asks it to close. AppKit's own terminate would skip all of it.
 //!
 //! AppKit's `TerminateLater` would let the close answer the request, but
-//! AppKit then waits in its modal-panel run loop mode, where winit delivers
-//! no events, so the window could never answer. Each Quit is cancelled
-//! instead and the window's close ends the process itself. Logging out is
-//! cancelled the same way, so macOS reports that cagents interrupted it;
-//! logging out again after the window has closed proceeds. A Quit while the
-//! process is already ending, stopping its language servers, is cancelled
-//! too, so it cannot cut that short.
+//! AppKit then waits in its modal-panel run loop mode. winit's wake-ups
+//! still run there, while no keyboard or mouse event reaches the window, so
+//! nobody could answer the close's question about unsaved work. Each Quit is
+//! cancelled instead and the window's close ends the process itself. Logging
+//! out, restarting and shutting down are cancelled the same way, so macOS
+//! reports that cagents interrupted them; trying again after the window has
+//! closed proceeds. A Quit while the process is already ending, stopping its
+//! language servers, is cancelled too, so it cannot cut that short. A Quit
+//! in the moment before the window first opens finds no delegate yet and
+//! ends the process at once.
 //!
 //! The traffic lights keep AppKit's position at the top of the titlebar
 //! rather than centering in the taller header: AppKit offers no supported
@@ -33,7 +36,7 @@
 use std::{
     cell::Cell,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use cosmic::iced::{self, runtime::window::raw_window_handle::RawWindowHandle, window};
@@ -72,9 +75,33 @@ pub(super) fn adopt(window: window::Id) -> iced::Task<Option<WindowControls>> {
     })
 }
 
-/// Measures the traffic lights again, after the window changed size or
-/// entered or left full screen.
-pub(super) fn measure(window: window::Id) -> iced::Task<Option<WindowControls>> {
+/// How long AppKit's full screen transition takes, with margin. Leaving full
+/// screen reports its last size while the window still counts as full
+/// screen, and nothing follows the transition's end.
+const FULL_SCREEN_TRANSITION: std::time::Duration = std::time::Duration::from_millis(900);
+
+/// Resizes seen, so only the last of a burst measures again once settled.
+static RESIZES: AtomicU64 = AtomicU64::new(0);
+
+/// Measures the traffic lights again after the window changed size, at once
+/// and once more when a full screen transition would have ended.
+pub(super) fn measure_after_resize(window: window::Id) -> iced::Task<Option<WindowControls>> {
+    let resize = RESIZES.fetch_add(1, Ordering::Relaxed) + 1;
+    let settled = iced::Task::future(async move {
+        tokio::time::sleep(FULL_SCREEN_TRANSITION).await;
+        RESIZES.load(Ordering::Relaxed) == resize
+    })
+    .then(move |latest| {
+        if latest {
+            measure(window)
+        } else {
+            iced::Task::none()
+        }
+    });
+    iced::Task::batch([measure(window), settled])
+}
+
+fn measure(window: window::Id) -> iced::Task<Option<WindowControls>> {
     with_window(window, |window, view, _| controls(window, view))
 }
 
@@ -217,31 +244,26 @@ fn secondary_click_with_control() {
         // the length of this call.
         let event = unsafe { event.as_ref() };
         let flags = event.modifierFlags();
+        let unchanged = std::ptr::from_ref(event).cast_mut();
         let secondary = match event.r#type() {
-            NSEventType::LeftMouseDown
-                if flags.contains(NSEventModifierFlags::Control)
-                    && !flags.contains(NSEventModifierFlags::Command) =>
-            {
-                converting.set(true);
+            // Every press decides afresh, so a release that never reached
+            // this monitor, taken by a menu's tracking loop, cannot turn the
+            // next plain click into a secondary drag.
+            NSEventType::LeftMouseDown => {
+                let convert = flags.contains(NSEventModifierFlags::Control)
+                    && !flags.contains(NSEventModifierFlags::Command);
+                converting.set(convert);
+                if !convert {
+                    return unchanged;
+                }
                 NSEventType::RightMouseDown
             }
             NSEventType::LeftMouseDragged if converting.get() => NSEventType::RightMouseDragged,
             NSEventType::LeftMouseUp if converting.replace(false) => NSEventType::RightMouseUp,
-            _ => return std::ptr::from_ref(event).cast_mut(),
+            _ => return unchanged,
         };
-        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-            secondary,
-            event.locationInWindow(),
-            flags.difference(NSEventModifierFlags::Control),
-            event.timestamp(),
-            event.windowNumber(),
-            None,
-            event.eventNumber(),
-            event.clickCount(),
-            event.pressure(),
-        )
         // AppKit takes the returned event without a reference of its own.
-        .map_or(std::ptr::from_ref(event).cast_mut(), Retained::autorelease_return)
+        as_secondary(event, secondary).map_or(unchanged, Retained::autorelease_return)
     });
     // SAFETY: the handler returns the event it was given or a new event kept
     // alive by the enclosing autorelease pool, never a dangling pointer.
@@ -253,6 +275,23 @@ fn secondary_click_with_control() {
     };
     // The monitor lasts as long as the process; removing it is never needed.
     std::mem::forget(monitor);
+}
+
+/// `event`, a primary button event, as the secondary button's `kind`, with
+/// Control lifted. winit reads the button from the event's button number,
+/// which AppKit derives from the type.
+fn as_secondary(event: &NSEvent, kind: NSEventType) -> Option<Retained<NSEvent>> {
+    NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+        kind,
+        event.locationInWindow(),
+        event.modifierFlags().difference(NSEventModifierFlags::Control),
+        event.timestamp(),
+        event.windowNumber(),
+        None,
+        event.eventNumber(),
+        event.clickCount(),
+        event.pressure(),
+    )
 }
 
 /// The traffic lights' extent from the window's top corner on their side, in
@@ -300,4 +339,41 @@ fn controls(window: &NSWindow, view: &NSView) -> Option<WindowControls> {
         height: extent(top + first.size.height, top),
         edge,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_foundation::NSPoint;
+
+    /// winit names the button from `buttonNumber`, so a Control-click is a
+    /// secondary click only if AppKit numbers the converted event so.
+    #[test]
+    fn a_control_click_becomes_a_secondary_press_without_control() {
+        let press = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            NSEventType::LeftMouseDown,
+            NSPoint::new(10.0, 20.0),
+            NSEventModifierFlags::Control | NSEventModifierFlags::Shift,
+            1.0,
+            0,
+            None,
+            7,
+            1,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(press.buttonNumber(), 0);
+        for kind in [
+            NSEventType::RightMouseDown,
+            NSEventType::RightMouseDragged,
+            NSEventType::RightMouseUp,
+        ] {
+            let secondary = as_secondary(&press, kind).unwrap();
+            assert_eq!(secondary.r#type(), kind);
+            assert_eq!(secondary.buttonNumber(), 1, "{kind:?}");
+            assert_eq!(secondary.modifierFlags(), NSEventModifierFlags::Shift);
+            assert_eq!(secondary.locationInWindow(), NSPoint::new(10.0, 20.0));
+            assert_eq!(secondary.clickCount(), 1);
+        }
+    }
 }

@@ -5294,7 +5294,10 @@ mod tests {
                 .all(|face| face_has_advances(guard.db(), face.id))
         );
         drop(guard);
-        eprintln!("checked {} faces, dropped {dropped}, in {elapsed:?}", faces + dropped);
+        eprintln!(
+            "checked {} faces, dropped {dropped}, in {elapsed:?}",
+            faces + dropped
+        );
         assert_eq!(drop_faces_without_advances(), 0);
     }
 

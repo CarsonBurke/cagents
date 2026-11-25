@@ -7305,6 +7305,12 @@ impl Cagents {
         }
     }
 
+    /// Whether the window's outer corners are drawn square: always on macOS,
+    /// where AppKit rounds and clips a titled window itself.
+    pub(super) fn window_corners_sharp(&self) -> bool {
+        cfg!(target_os = "macos") || self.core.window.sharp_corners
+    }
+
     /// The trailing inset that keeps the interface out of the window's resize
     /// border.
     ///
@@ -7315,12 +7321,6 @@ impl Cagents {
     /// fullscreen and right-tiled windows have no border there and stay flush.
     ///
     /// macOS has no such border: AppKit resizes the window from its frame.
-    /// Whether the window's outer corners are drawn square: always on macOS,
-    /// where AppKit rounds and clips a titled window itself.
-    pub(super) fn window_corners_sharp(&self) -> bool {
-        cfg!(target_os = "macos") || self.core.window.sharp_corners
-    }
-
     fn window_edge_inset(&self) -> f32 {
         if cfg!(target_os = "macos") || self.window_filled || self.right_edge_tiled {
             0.0
@@ -8171,6 +8171,10 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(_)) => workspace_widget::FocusedPane::Browser {
+                inspector: self.pane_has_inspector(card),
+            },
             _ if !self.pane_has_inspector(card) => workspace_widget::FocusedPane::NoInspector,
             _ => workspace_widget::FocusedPane::Other,
         }
@@ -18921,7 +18925,10 @@ impl Cagents {
             }
             #[cfg(target_os = "macos")]
             Message::WindowControlsMeasured(controls) => {
-                self.window_controls_points = controls;
+                // A live resize measures on every step; most change nothing.
+                if self.window_controls_points != controls {
+                    self.window_controls_points = controls;
+                }
                 Task::none()
             }
             Message::VerifyStartupPanes => self.verify_startup_gate(),
@@ -19612,7 +19619,7 @@ impl Cagents {
                 #[cfg(target_os = "macos")]
                 let filled = Task::batch([
                     filled,
-                    macos_window::measure(window).map(|controls| {
+                    macos_window::measure_after_resize(window).map(|controls| {
                         cosmic::Action::App(Message::WindowControlsMeasured(controls))
                     }),
                 ]);

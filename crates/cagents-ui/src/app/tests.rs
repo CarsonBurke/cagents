@@ -16411,7 +16411,10 @@ fn the_header_leaves_the_window_controls_only_what_the_projects_pane_does_not() 
         edge: WindowControlsEdge::Trailing,
     });
     assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
-    assert_eq!(app.window_controls_reach(WindowControlsEdge::Trailing), 70.0);
+    assert_eq!(
+        app.window_controls_reach(WindowControlsEdge::Trailing),
+        70.0
+    );
     // The sidebar keeps its leading-edge layout; the trailing lights are
     // the header's to avoid.
     assert!(
