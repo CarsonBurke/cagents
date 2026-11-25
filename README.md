@@ -7,7 +7,7 @@
 <p align="center">A native Linux workspace for coding agents.</p>
 
 <p align="center">
-  <a href="https://carsonburke.github.io/cagents/">Website</a> ·
+  <a href="https://cagents.carsonburke.com/">Website</a> ·
   <a href="https://github.com/CarsonBurke/cagents/releases/latest">Download</a> ·
   <a href="docs/user-guide.md">User guide</a>
 </p>
