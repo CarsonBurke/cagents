@@ -359,11 +359,37 @@ fn a_provider_inherits_nothing_from_its_holder() {
     let fixture = Fixture::new(&root);
     let _spawned = Spawned::new(&fixture.source);
     let record = Spawned::record(&fixture.source);
+    #[cfg(target_os = "linux")]
     let descriptors = std::fs::read_dir(format!("/proc/{}/fd", record.root.pid))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .filter(|fd| !["0", "1", "2"].contains(&fd.as_str()))
         .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    let descriptors = {
+        assert!(record.root.is_current());
+        // SAFETY: the kernel record contains only integers.
+        let mut entries: [libc::proc_fdinfo; 64] = unsafe { std::mem::zeroed() };
+        let bytes = std::mem::size_of_val(&entries) as libc::c_int;
+        // SAFETY: entries describes a writable buffer of exactly bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                record.root.pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        assert!(written > 0 && written < bytes && (written as usize).is_multiple_of(entry));
+        assert!(record.root.is_current());
+        entries[..written as usize / entry]
+            .iter()
+            .filter(|fd| fd.proc_fd > 2)
+            .map(|fd| fd.proc_fd)
+            .collect::<Vec<_>>()
+    };
     assert!(descriptors.is_empty(), "inherited {descriptors:?}");
 }
 
@@ -1216,6 +1242,19 @@ impl CodexProcess {
         let program = root.join("writer/codex");
         std::fs::create_dir_all(program.parent().unwrap()).unwrap();
         std::fs::copy("/bin/bash", &program).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let signed = std::process::Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&program)
+                .output()
+                .unwrap();
+            assert!(
+                signed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&signed.stderr)
+            );
+        }
         let mut child = std::process::Command::new(&program)
             .args(["-c", "printf ready; IFS= read -r release", "codex"])
             .args(arguments)
