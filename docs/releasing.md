@@ -2,6 +2,7 @@
 
 - [Building a release](#building-a-release)
 - [Artifacts](#artifacts)
+- [macOS](#macos)
 - [Native platform roadmap](#native-platform-roadmap)
 - [Publishing](#publishing)
 - [Signing](#signing)
@@ -84,6 +85,8 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
+- with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
+  `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
 - `release-metadata-2.json`: the version, source commit, daemon protocol,
   release notes, and every other asset's size and SHA-256 (schema 2)
 - `release-metadata-2.json.sig`: its signature (see [Signing](#signing))
@@ -93,10 +96,93 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 A bundle holds its metadata as `release-metadata.json` and its signature as
 `release-metadata.json.sig`; the publisher gives them their published names.
 
-Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
-supported build and package lane today. Windows and macOS need their own native
-ports, validation, packaging, and signing before their targets can be enabled;
-the release tooling does not publish placeholder binaries for them.
+Artifact selection is explicitly platform-aware. The metadata's `targets` lists
+Linux x86_64 GNU, and `aarch64-apple-darwin` when the release carries the
+macOS build; a release without it is exactly what one was before macOS builds
+existed, and builds that predate them ignore the macOS entry and its assets.
+Windows needs its own native port, validation, packaging, and signing before
+its target can be enabled; the release tooling does not publish placeholder
+binaries.
+
+## macOS
+
+`scripts/package-macos` builds the Apple Silicon release on a Mac:
+`cagents-${VERSION}-aarch64-apple-darwin.tar.gz`, `install-macos.sh` and
+`SHA256SUMS-macos`. It needs Xcode's command line tools and rustup; the
+toolchain comes from `rust-toolchain.toml`. It builds the four executables with
+the release profile for macOS 11 or newer: the CLI, the daemon, the UI with
+the production identity `dev.cagents.Cagents` and without the integrated
+browser, and the dictation helper, linked against the pinned sherpa-onnx static
+libraries. The UI and the helper carry an embedded `Info.plist` section, so the
+microphone permission prompt names cagents and its purpose.
+
+The archive holds one version tree laid out as on Linux, so the install guard,
+companion lookup and, once it supports macOS, the updater read it the same way:
+
+```
+cagents-VERSION/bin/{cagents,cagents-ui,cagentsd,cagents-dictate}
+cagents-VERSION/Cagents.app
+cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
+```
+
+`install-macos.sh` installs it under `~/Library/Application Support/cagents-install`
+(`--prefix` overrides it):
+
+- `versions/VERSION/` is the tree, and `current` links to the version that
+  serves; the installer switches it atomically and keeps the previous version
+  until no process runs it.
+- `Cagents.app` is a stable launcher bundle. Its executable, a small C program
+  (`packaging/macos/launcher.c`), runs the real path of `current/bin/cagents-ui`.
+  Launch Services and the Dock keep one application across updates, because
+  the bundle they know never moves. `~/Applications/Cagents.app` links
+  to it.
+- `~/.local/bin/cagents` links to `current/bin/cagents`.
+- `~/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist` runs
+  `versions/VERSION/bin/cagents daemon start` once at login, as Linux's
+  autostart entry does. It is not kept alive: the daemon outlives the job, and
+  `cagents daemon stop` stays the way to stop it. The installer rewrites it
+  for each version it installs.
+
+The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
+the release's members, refuses links in the tree, and checks every signature
+before it changes anything. It installs over a running daemon only of the same
+version: the daemon cannot yet hand its sessions to another version on macOS,
+so it says how to stop it instead. `--uninstall` removes the installation,
+links and login item, and `--purge` also removes saved app data.
+
+Every executable and the bundle are signed ad hoc (`codesign --sign -`), which
+Apple Silicon requires to run anything. Files that `curl`, `tar` or
+`install-macos.sh` download carry no quarantine attribute, so Gatekeeper does
+not assess them. A browser download is quarantined, and the installer clears
+the attribute on the tree it installs. Gatekeeper blocks an ad hoc signed app
+opened from a quarantined download, as from a disk image, which is why the
+release installs from a terminal.
+
+Notarization, which would let people open a downloaded app without a warning,
+needs an Apple Developer ID Application certificate and an App Store Connect
+API key for `notarytool`. Signing would use `codesign --options runtime
+--timestamp --sign "Developer ID Application: ..."` on each executable and
+then the bundle, with the `com.apple.security.device.audio-input` entitlement
+on the dictation helper, whose microphone the hardened runtime otherwise
+denies. The notary service takes a zip, disk image or package, not a tarball:
+the signed tree would be zipped with `ditto -c -k --keepParent`, submitted
+with `xcrun notarytool submit --wait`, and the ticket stapled to `Cagents.app`
+with `xcrun stapler staple` before the release archive is made. A bare
+executable cannot hold a stapled ticket, so Gatekeeper would look the CLI's up
+online. None of this is set up, and the credentials would stay outside source and build
+artifacts like the release signing key.
+
+To cut a release with the macOS build, give `cut` or `build` the Mac with
+`--macos-host MAC` (or `CAGENTS_RELEASE_MACOS_HOST`). The release exports the
+commit, copies it to `~/Library/Caches/cagents-release/VERSION` on the Mac and
+runs its `scripts/package-macos` there, which builds, signs and installs it in
+a private home and prefix to check the commands, bundle and login item. It
+brings the three files back into the bundle before the metadata is written and
+signed, then removes the export; the Cargo target stays in
+`~/Library/Caches/cagents-release/target` for the next release. The publisher
+then requires all three files, checks `SHA256SUMS-macos` and the archive's
+members, and adds a macOS section to the release notes. GitHub Actions builds
+no macOS release yet.
 
 ## Native platform roadmap
 
@@ -112,7 +198,7 @@ need to be established for each target.
 | Linux x86_64 GNU | Supported local build/package lane | Keep matched full, browserless and editor artifacts and native smoke coverage |
 | Windows x64 | No supported native application or package | Qualify runtime and companion discovery before choosing installer layout |
 | Windows ARM64 | Unqualified; inclusion undecided | Choose support policy and qualify dependencies/toolchains before enabling artifacts |
-| macOS Apple Silicon | No supported native application or bundle | Qualify runtime before implementing `.app` layout and installation |
+| macOS Apple Silicon | Packaging, installer and release lane ([macOS](#macos)); the daemon and UI ports are in progress | Qualify the native runtime, then publish the first release with the macOS build |
 | macOS Intel | Unqualified; inclusion undecided | Explicitly choose support policy; an Apple Silicon build does not validate Intel |
 
 Each new target progresses through the following gates. Passing an isolated

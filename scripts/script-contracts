@@ -240,7 +240,10 @@ UNSCHEDULED = (
 SHELL_SYNTAX = (("sh", "scripts/run-development"), ("sh", "scripts/refuse-compile"), ("sh", "scripts/check-format"),
                 ("bash", "packaging/release-build"), ("bash", "scripts/package-release-linux"),
                 ("sh", "scripts/package-linux.sh"), ("sh", "scripts/package-ceditor-linux.sh"),
-                ("sh", "scripts/check-macos"), ("sh", "scripts/darwin-cc"), ("sh", "scripts/darwin-ar"))
+                ("sh", "scripts/check-macos"), ("sh", "scripts/darwin-cc"), ("sh", "scripts/darwin-ar"),
+                # The macOS packaging runs only on a Mac.
+                ("sh", "scripts/package-macos"), ("sh", "install-macos.sh"), ("sh", "packaging/macos/smoke"),
+                ("bash", "packaging/macos/make-icns"))
 
 # Run as `python3 -I -B -c SHARD FIXTURE INDEX COUNT VERBOSITY`: execute the fixture as
 # __main__, but let its unittest.main() run only every COUNT-th test, in id

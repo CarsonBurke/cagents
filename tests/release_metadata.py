@@ -71,6 +71,34 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertEqual(products["cagents"]["deb"], f"cagents_{VERSION}_amd64.deb")
         self.assertNotIn("deb", products["cagents-browserless"])
 
+    def test_a_linux_release_names_no_macos_target(self):
+        self.write()
+        targets = json.loads((self.release / "release-metadata.json").read_bytes())["targets"]
+        self.assertEqual([target["target"] for target in targets], ["x86_64-unknown-linux-gnu"])
+
+    def test_a_release_with_the_macos_archive_names_its_target(self):
+        darwin = f"cagents-{VERSION}-aarch64-apple-darwin.tar.gz"
+        for name in (darwin, "install-macos.sh", "SHA256SUMS-macos"):
+            (self.release / name).write_bytes(b"payload")
+        self.write()
+        written = json.loads((self.release / "release-metadata.json").read_bytes())
+        linux, macos = written["targets"]
+        self.assertEqual(linux["products"]["cagents"]["archive"], ARCHIVE)
+        self.assertEqual(macos, {
+            "target": "aarch64-apple-darwin", "os": "macos", "architecture": "aarch64",
+            "products": {"cagents": {"archive": darwin, "installer": "install-macos.sh",
+                                     "checksums": "SHA256SUMS-macos"}},
+        })
+        self.assertIn(darwin, written["assets"])
+        self.assertEqual(run("check", "--dir", str(self.release)).returncode, 0)
+
+    def test_a_partial_macos_release_is_refused(self):
+        (self.release / f"cagents-{VERSION}-aarch64-apple-darwin.tar.gz").write_bytes(b"payload")
+        refused = self.write(check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("install-macos.sh", refused.stderr)
+        self.assertFalse((self.release / "release-metadata.json").exists())
+
     def test_check_refuses_a_changed_added_or_removed_file(self):
         self.write()
         for change, message in (

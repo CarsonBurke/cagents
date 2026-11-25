@@ -132,6 +132,13 @@ PAYLOADS=(
     "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
     "$EDITOR_ARCHIVE" SHA256SUMS-browserless SHA256SUMS-ceditor install.sh
 )
+# A release may also carry the Apple Silicon macOS build (scripts/package-macos):
+# its archive, installer and their own checksums, all three or none.
+# SHA256SUMS covers only the Linux payloads, so a release without macOS is
+# what it was before macOS builds existed.
+MACOS_ARCHIVE=cagents-$VERSION-aarch64-apple-darwin.tar.gz
+MACOS_PAYLOADS=("$MACOS_ARCHIVE" install-macos.sh SHA256SUMS-macos)
+MACOS=false
 # The signed metadata names every other asset with its size and digest. A
 # bundle holds it as release-metadata.json. Published, each trust generation
 # has its own name (src/update/feed.rs): a release carries its own metadata
@@ -152,15 +159,36 @@ generation_at() {
 }
 
 GENERATION=$(generation_at "$SOURCE_COMMIT")
-BUNDLE_ASSETS=("${PAYLOADS[@]}" SHA256SUMS release-metadata.json release-metadata.json.sig)
-ASSETS=("${PAYLOADS[@]}" SHA256SUMS)
-for ((generation = 1; generation <= GENERATION; generation++)); do
-    name=$(metadata_name "$generation")
-    ASSETS+=("$name" "$name.sig")
-done
 OWN_METADATA=$(metadata_name "$GENERATION")
-EXPECTED_BUNDLE=$(printf '%s\n' "${BUNDLE_ASSETS[@]}" | sort)
-EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
+# The files a bundle holds and a release publishes, with or without macOS.
+define_assets() {
+    local generation name
+    SHIPPED=("${PAYLOADS[@]}" SHA256SUMS)
+    if "$MACOS"; then SHIPPED+=("${MACOS_PAYLOADS[@]}"); fi
+    BUNDLE_ASSETS=("${SHIPPED[@]}" release-metadata.json release-metadata.json.sig)
+    ASSETS=("${SHIPPED[@]}")
+    for ((generation = 1; generation <= GENERATION; generation++)); do
+        name=$(metadata_name "$generation")
+        ASSETS+=("$name" "$name.sig")
+    done
+    EXPECTED_BUNDLE=$(printf '%s\n' "${BUNDLE_ASSETS[@]}" | sort)
+    EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
+}
+define_assets
+
+# Whether DIRECTORY, or with --names the listed names, includes any macOS file.
+# The asset set then requires all three, and the signed metadata its target.
+carries_macos() {
+    local name
+    for name in "${MACOS_PAYLOADS[@]}"; do
+        if [[ $1 == --names ]]; then
+            grep -qxF -- "$name" <<< "$2" && return 0
+        elif [[ -e $1/$name || -L $1/$name ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 version_after() {
     [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
@@ -247,6 +275,7 @@ check_checksums() {
     check_manifest "$1" SHA256SUMS "${PAYLOADS[@]}"
     check_manifest "$1" SHA256SUMS-browserless "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
     check_manifest "$1" SHA256SUMS-ceditor "$EDITOR_ARCHIVE"
+    if "$MACOS"; then check_manifest "$1" SHA256SUMS-macos "$MACOS_ARCHIVE" install-macos.sh; fi
 }
 
 # An allowed-signers file for the trusted key lines of a release-keys.pub.
@@ -334,6 +363,10 @@ check_metadata() {
     done
     [[ $(sed -n '/^DEFAULT_REPOSITORY=/p' "$1/install.sh") == "DEFAULT_REPOSITORY='$REPOSITORY'" ]] \
         || fail 'installer is not stamped for the canonical repository'
+    if "$MACOS"; then
+        [[ $(sed -n '/^DEFAULT_REPOSITORY=/p' "$1/install-macos.sh") == "DEFAULT_REPOSITORY='$REPOSITORY'" ]] \
+            || fail 'macOS installer is not stamped for the canonical repository'
+    fi
 }
 
 # Validate the complete member set and types without extracting or running code.
@@ -447,9 +480,52 @@ check_bridge() {
     done
 }
 
+# The macOS check_archive cannot express: one version tree of regular files
+# and directories, laid out as install-macos.sh accepts, with executable
+# binaries. Nothing in it runs here; the Mac that built it smoke-tested it.
+check_macos_archive() {
+    local directory=$1 root=cagents-$VERSION file parent expected actual mode owner size date time name rest
+    local -a files=(bin/cagents bin/cagents-dictate bin/cagents-ui bin/cagentsd
+        Cagents.app/Contents/Info.plist Cagents.app/Contents/MacOS/Cagents Cagents.app/Contents/PkgInfo
+        Cagents.app/Contents/Resources/Cagents.icns Cagents.app/Contents/_CodeSignature/CodeResources
+        share/doc/cagents/LICENSE share/doc/cagents/THIRD-PARTY-NOTICES)
+    local -a executables=(bin/cagents bin/cagents-dictate bin/cagents-ui bin/cagentsd Cagents.app/Contents/MacOS/Cagents)
+    local -a directories=("$root/")
+    for file in "${files[@]}"; do
+        parent=${file%/*}
+        while [[ $parent != . ]]; do
+            directories+=("$root/$parent/")
+            if [[ $parent == */* ]]; then parent=${parent%/*}; else parent=.; fi
+        done
+    done
+    expected=$({ printf '%s\n' "${directories[@]}" | sort -u; printf "$root/%s\n" "${files[@]}"; } | sort)
+    tar -tzf "$directory/$MACOS_ARCHIVE" > "$WORK_DIR/macos-members" || fail "cannot read archive: $MACOS_ARCHIVE"
+    actual=$(sort "$WORK_DIR/macos-members")
+    [[ $actual == "$expected" ]] || fail "unexpected, missing, or duplicate archive members: $MACOS_ARCHIVE"
+    tar --numeric-owner --full-time -tvzf "$directory/$MACOS_ARCHIVE" > "$WORK_DIR/macos-types" \
+        || fail "cannot inspect archive: $MACOS_ARCHIVE"
+    while read -r mode owner size date time name rest; do
+        case $name in
+            */) [[ $mode == d* && -z $rest ]] || fail "invalid directory member in $MACOS_ARCHIVE" ;;
+            *) [[ $mode == -* && -z $rest ]] || fail "non-regular file member in $MACOS_ARCHIVE: $name" ;;
+        esac
+        [[ $mode != *s* && $mode != *S* && $mode != *t* && $mode != *T* ]] \
+            || fail "special permissions in $MACOS_ARCHIVE: $name"
+        for file in "${executables[@]}"; do
+            if [[ $name == "$root/$file" ]]; then
+                [[ ${mode:3:1} == x && ${mode:6:1} == x && ${mode:9:1} == x && $size =~ ^[1-9][0-9]*$ ]] \
+                    || fail "missing executable permissions or empty binary in $MACOS_ARCHIVE: $name"
+            fi
+        done
+    done < "$WORK_DIR/macos-types"
+}
+
 # A bundle is checked before anything is made for it; promotion makes it
 # from the draft.
-[[ -n $PROMOTE ]] || check_asset_set "$DIST_DIR"
+if [[ -z $PROMOTE ]]; then
+    if carries_macos "$DIST_DIR"; then MACOS=true; define_assets; fi
+    check_asset_set "$DIST_DIR"
+fi
 WORK_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/cagents-publish.XXXXXX")
 cleanup() { rm -rf -- "$WORK_DIR"; }
 trap cleanup EXIT
@@ -472,6 +548,7 @@ if [[ -n $PROMOTE ]]; then
         || fail "there is no one release of $TAG to publish; the release workflow leaves it as a draft"
     jq -e '.draft == true' <<< "$draft" >/dev/null || fail "$TAG is published already"
     DRAFT_ASSETS=$(draft_assets "$draft")
+    if carries_macos --names "$(jq -r '.assets[].name' <<< "$draft")"; then MACOS=true; define_assets; fi
     mkdir "$WORK_DIR/draft"
     gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/draft" \
         || fail "cannot download the draft of $TAG"
@@ -481,7 +558,7 @@ if [[ -n $PROMOTE ]]; then
     [[ $rehearsed == "$PROMOTE" ]] \
         || fail "the draft of $TAG is not what was rehearsed: its $OWN_METADATA has SHA-256 $rehearsed, the rehearsal's $PROMOTE; rehearse the draft: scripts/release rehearse $VERSION --from-draft"
     mkdir "$WORK_DIR/from-draft"
-    for asset in "${PAYLOADS[@]}" SHA256SUMS; do
+    for asset in "${SHIPPED[@]}"; do
         cp -- "$WORK_DIR/draft/$asset" "$WORK_DIR/from-draft/$asset"
     done
     cp -- "$WORK_DIR/draft/$OWN_METADATA" "$WORK_DIR/from-draft/release-metadata.json"
@@ -501,6 +578,7 @@ check_metadata "$DIST_DIR"
 check_archive "$DIST_DIR" "$FULL_ARCHIVE" cagents dev.cagents.Cagents
 check_archive "$DIST_DIR" "$BROWSERLESS_ARCHIVE" cagents-browserless dev.cagents.Cagents.Browserless
 check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
+if "$MACOS"; then check_macos_archive "$DIST_DIR"; fi
 if [[ -z $PROMOTE ]]; then
     smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
     if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
@@ -551,7 +629,7 @@ fi
 # The release as published: its own metadata under the new names, and what
 # older builds read under the old ones.
 mkdir "$WORK_DIR/upload"
-for asset in "${PAYLOADS[@]}" SHA256SUMS; do
+for asset in "${SHIPPED[@]}"; do
     cp --reflink=auto --preserve=mode -- "$DIST_DIR/$asset" "$WORK_DIR/upload/$asset"
 done
 cp -- "$WORK_DIR/bridges/"* "$WORK_DIR/upload/" 2>/dev/null || :
@@ -618,6 +696,8 @@ BUNDLE_HASH=$(sha256sum "$DIST_DIR/release-metadata.json")
 BUNDLE_HASH=${BUNDLE_HASH%% *}
 BUNDLE_MARKER="<!-- source_commit=$SOURCE_COMMIT release-metadata.json=$BUNDLE_HASH -->"
 NOTES=$WORK_DIR/release-notes.txt
+PLATFORMS='Windows and macOS builds are not provided.'
+if "$MACOS"; then PLATFORMS='Windows builds are not provided; macOS is below.'; fi
 {
     printf '%s\n%s\n\n' "$RELEASE_MARKER" "$BUNDLE_MARKER"
     # Commit subjects can name people; quoted, a name notifies no one.
@@ -627,7 +707,7 @@ NOTES=$WORK_DIR/release-notes.txt
 ## Install
 
 Linux x86_64 with glibc 2.35 or newer and Wayland. Repository features need
-Git 2.36 or newer. Windows and macOS builds are not provided.
+Git 2.36 or newer. $PLATFORMS
 
 An installed cagents offers this release under Update and installs it itself
 after checking its signature. To install by hand:
@@ -644,6 +724,28 @@ Debian packages are upgraded with the system package manager. The standalone
 ceditor archive unpacks into \`~/.local\`:
 \`tar -xzf $EDITOR_ARCHIVE --strip-components=1 -C ~/.local\`.
 
+EOF
+    if "$MACOS"; then
+        cat <<EOF
+## macOS
+
+Apple Silicon Macs with macOS 11 or newer. The build is signed ad hoc, not
+notarized; installing it from a terminal as below is what macOS allows
+without a warning. It puts Cagents in ~/Applications, the \`cagents\` command
+in ~/.local/bin, and starts the daemon at login. To update, install a newer
+release the same way; the installer says what to stop first.
+
+\`\`\`sh
+base=https://github.com/$REPOSITORY/releases/download/$TAG
+mkdir "cagents-$VERSION" && cd "cagents-$VERSION"
+curl --fail --location --remote-name-all "\$base/$MACOS_ARCHIVE" "\$base/SHA256SUMS-macos" "\$base/install-macos.sh"
+shasum -a 256 --check SHA256SUMS-macos
+CAGENTS_ARCHIVE="\$PWD/$MACOS_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS-macos" sh ./install-macos.sh --version $VERSION
+\`\`\`
+
+EOF
+    fi
+    cat <<EOF
 $BUILT_BY \`$SOURCE_COMMIT\`.
 \`$OWN_METADATA\` lists every asset with its SHA-256 and is signed in
 \`$OWN_METADATA.sig\` (\`ssh-keygen -Y verify -n cagents-release\`).
@@ -721,7 +823,7 @@ for asset in "${ASSETS[@]}"; do
 done
 # The served release, read back as the bundle it was published from.
 mkdir "$WORK_DIR/served"
-for asset in "${PAYLOADS[@]}" SHA256SUMS; do
+for asset in "${SHIPPED[@]}"; do
     cp -- "$WORK_DIR/downloaded/$asset" "$WORK_DIR/served/$asset"
 done
 cp -- "$WORK_DIR/downloaded/$OWN_METADATA" "$WORK_DIR/served/release-metadata.json"

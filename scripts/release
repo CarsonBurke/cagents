@@ -6,6 +6,9 @@ set -euo pipefail
 PROGRAM=release
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_HOST=${CAGENTS_RELEASE_BUILD_HOST:-fw16}
+# The Apple Silicon Mac that builds the macOS release beside the Linux one;
+# without one, a release is Linux only.
+MACOS_HOST=${CAGENTS_RELEASE_MACOS_HOST:-}
 BUNDLES=${CAGENTS_RELEASE_BUNDLES:-"${XDG_STATE_HOME:-$HOME/.local/state}/cagents-release"}
 GITHUB_REPOSITORY=${CAGENTS_RELEASE_GITHUB_REPOSITORY:-CarsonBurke/cagents}
 # The rehearsal's private user on the build host; by default
@@ -30,7 +33,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/release COMMAND [VERSION] [OPTIONS]
 
-  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY] [--build-host HOST]
+  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY] [--build-host HOST] [--macos-host MAC]
                    Release a bundle HOST already built: the newest bundle of
                    main whose tests passed, or SHA's. Says how far it is
                    behind main and offers to wait for a prebuild of the tip
@@ -42,11 +45,15 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    with KEY (default CAGENTS_RELEASE_SIGNING_KEY), or says how.
                    VERSION is the one the commit declares; an unpublished
                    earlier cut of it is replaced. Without a terminal, a
-                   bundle behind main needs --wait or --commit.
+                   bundle behind main needs --wait or --commit. With
+                   --macos-host (default CAGENTS_RELEASE_MACOS_HOST), MAC
+                   builds, signs ad hoc and smoke-tests the commit's Apple
+                   Silicon release with scripts/package-macos, and the cut
+                   carries it too.
   bump VERSION     Set every product manifest and Cargo.lock to VERSION.
                    Commit it through a pull request, then tag the merged
                    commit: git tag -a vVERSION -m vVERSION COMMIT
-  build VERSION [--notes FILE] [--build-host HOST]
+  build VERSION [--notes FILE] [--build-host HOST] [--macos-host MAC]
                    Build tag vVERSION on HOST (default: CAGENTS_RELEASE_BUILD_HOST
                    or fw16) in the glibc-baseline environment, require its
                    passing test verdict from main's sentinel there (testing
@@ -56,6 +63,7 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
                    fixes and speedups since the previous tag here.
+                   --macos-host adds the macOS release, as for cut.
   rehearse VERSION [--staged | --from-draft] [--build-host HOST]
                    Rehearse installed cagents updating from the newest
                    published release to the signed cut VERSION, on HOST,
@@ -116,12 +124,14 @@ STAGED=false
 FROM_DRAFT=false
 ACTIONS=false
 YES=false
+MACOS_FLAG=false
 while (($#)); do
     case $1 in
-        --notes|--build-host|--feed|--commit|--key)
+        --notes|--build-host|--macos-host|--feed|--commit|--key)
             (($# >= 2)) && [[ -n $2 ]] || fail "$1 requires a value"
             case $1 in
-                --notes) NOTES=$2 ;; --build-host) BUILD_HOST=$2 ;; --feed) FEED=$2 ;;
+                --notes) NOTES=$2 ;; --build-host) BUILD_HOST=$2 ;; --macos-host) MACOS_HOST=$2; MACOS_FLAG=true ;;
+                --feed) FEED=$2 ;;
                 --commit) COMMIT=$2 ;; --key) KEY=$2 ;;
             esac
             shift 2
@@ -139,6 +149,14 @@ done
 [[ $ACTIONS == false || $COMMAND == cut || $COMMAND == publish ]] || fail '--actions is for cut and publish'
 [[ $YES == false || $COMMAND == publish ]] || fail '--yes is for publish'
 [[ $ACTIONS == false || -z $KEY ]] || fail '--actions signs in GitHub Actions; drop --key'
+[[ $MACOS_FLAG == false || $ACTIONS == false ]] || fail 'GitHub Actions builds no macOS release yet; cut it here with --macos-host'
+[[ $MACOS_FLAG == false || $COMMAND == cut || $COMMAND == build ]] || fail '--macos-host is for cut and build'
+if [[ $COMMAND == cut && $ACTIONS == false ]] || [[ $COMMAND == build ]]; then
+    # ssh hands the host's login shell the command line, which may not be POSIX.
+    [[ -z $MACOS_HOST || $MACOS_HOST =~ ^[A-Za-z0-9][-A-Za-z0-9_.@]*$ ]] || fail "unsafe --macos-host: $MACOS_HOST"
+else
+    MACOS_HOST=
+fi
 [[ -z $COMMIT || $WAIT == false ]] || fail "--wait releases main's tip; --commit releases another bundle"
 [[ $COMMAND == rehearse || ( $STAGED == false && $FROM_DRAFT == false ) ]] || fail '--staged and --from-draft are for rehearse'
 [[ $STAGED == false || $FROM_DRAFT == false ]] || fail "--from-draft rehearses the in-app update, which publication requires; drop --staged"
@@ -267,12 +285,65 @@ EOF
     scp -q -r -- "$BUILD_HOST:$remote_output" "$bundle.partial"
     "$ROOT_DIR/scripts/release-metadata" check --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$commit" >/dev/null || fail 'the copied bundle does not match its metadata'
+    if [[ -n $MACOS_HOST ]]; then
+        local protocol
+        protocol=$(jq -r .protocol "$bundle.partial/release-metadata.json")
+        add_macos "$bundle.partial" "$commit"
+        rm -- "$bundle.partial/release-metadata.json"
+        "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
+            --source-commit "$commit" --protocol "$protocol" --notes "$NOTES" >/dev/null
+    fi
     mv -- "$bundle.partial" "$bundle"
     # shellcheck disable=SC2029
     ssh "$BUILD_HOST" rm -rf -- "$remote_output" "/var/tmp/cagents-release/$VERSION-notes.md"
     printf 'Built %s into %s.\nRead its notes, then sign:\n' "$TAG" "$bundle"
     printf '  jq -r .notes %q\n' "$bundle/release-metadata.json"
     printf '  ssh-keygen -Y sign -n cagents-release -f KEY %q\n' "$bundle/release-metadata.json"
+}
+
+# Adds to the bundle in DIRECTORY the Apple Silicon release of COMMIT, which
+# MACOS_HOST builds, signs ad hoc and smoke-tests with the commit's own
+# scripts/package-macos. It builds an export of the commit, which like the
+# Linux build's has no .git, and keeps its Cargo target under the Mac's
+# ~/Library/Caches/cagents-release/target for the next release.
+add_macos() {
+    local directory=$1 commit=$2 remote=Library/Caches/cagents-release/$VERSION source epoch name
+    [[ -n $MACOS_HOST ]] || return 0
+    repository_git cat-file -e "$commit:scripts/package-macos" 2>/dev/null \
+        || fail "$commit has no scripts/package-macos to build its macOS release"
+    epoch=$(repository_git show -s --format=%ct "$commit")
+    source=$(mktemp "${TMPDIR:-/var/tmp}/cagents-macos-source.XXXXXX")
+    repository_git archive --format=tar.gz -o "$source" "$commit" \
+        || { rm -f -- "$source"; fail "cannot export $commit for the Mac"; }
+    printf 'Building the macOS release of %s on %s.\n' "$commit" "$MACOS_HOST"
+    # The Mac's login shell may not be POSIX; bash reads each script.
+    ssh "$MACOS_HOST" bash -s -- "$remote" <<'MAC' || { rm -f -- "$source"; fail "cannot prepare $MACOS_HOST"; }
+set -euo pipefail
+rm -rf -- ~/"$1"
+mkdir -p -- ~/"$1"
+MAC
+    scp -q -- "$source" "$MACOS_HOST:$remote/source.tar.gz" \
+        || { rm -f -- "$source"; fail "cannot copy the source to $MACOS_HOST"; }
+    rm -f -- "$source"
+    ssh "$MACOS_HOST" bash -s -- "$remote" "$epoch" <<'MAC' || fail "$MACOS_HOST could not build the macOS release (above)"
+set -euo pipefail
+cd ~/"$1"
+mkdir source
+tar -xzf source.tar.gz -C source
+rm source.tar.gz
+export PATH=$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+export CARGO_TARGET_DIR=$HOME/Library/Caches/cagents-release/target SOURCE_DATE_EPOCH=$2
+source/scripts/package-macos --output "$PWD/dist" </dev/null
+MAC
+    for name in "cagents-$VERSION-aarch64-apple-darwin.tar.gz" install-macos.sh SHA256SUMS-macos; do
+        scp -q -- "$MACOS_HOST:$remote/dist/$name" "$directory/$name" \
+            || fail "cannot copy $name from $MACOS_HOST"
+    done
+    (cd -- "$directory" && sha256sum --check --strict --quiet SHA256SUMS-macos) \
+        || fail "the macOS release copied from $MACOS_HOST does not match its checksums"
+    ssh "$MACOS_HOST" bash -s -- "$remote" <<'MAC' || :
+rm -rf -- ~/"$1"
+MAC
 }
 
 # The build host's checkout of this repository, relative to its home. The
@@ -517,6 +588,7 @@ cut_release() {
     fi
     [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
     [[ $(wc -c < "$NOTES") -le 65536 ]] || fail 'release notes exceed 64 KiB; pass a shorter --notes FILE'
+    add_macos "$bundle.partial" "$sha"
     rm -- "$bundle.partial/release-metadata.json"
     "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$sha" --protocol "$protocol" --notes "$NOTES" >/dev/null

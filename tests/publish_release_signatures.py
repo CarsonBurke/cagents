@@ -74,6 +74,19 @@ def editor_archive(path: Path, version: str):
     archive(path, f"ceditor-{version}", files, executables, links)
 
 
+MACOS_FILES = ("bin/cagents", "bin/cagents-dictate", "bin/cagents-ui", "bin/cagentsd",
+               "Cagents.app/Contents/Info.plist", "Cagents.app/Contents/MacOS/Cagents",
+               "Cagents.app/Contents/PkgInfo", "Cagents.app/Contents/Resources/Cagents.icns",
+               "Cagents.app/Contents/_CodeSignature/CodeResources",
+               "share/doc/cagents/LICENSE", "share/doc/cagents/THIRD-PARTY-NOTICES")
+
+
+def macos_archive(path: Path, version: str, links: dict[str, str] | None = None):
+    """The Apple Silicon archive scripts/package-macos makes, with LINKS added."""
+    executables = {name for name in MACOS_FILES if name.startswith("bin/") or "/MacOS/" in name}
+    archive(path, f"cagents-{version}", {name: b"x" for name in MACOS_FILES}, executables, links or {})
+
+
 # GitHub for publication: releases are directories under $FAKE_GITHUB, tags
 # are the checkout's own, and every request is logged.
 GH = r"""#!/usr/bin/python3 -I
@@ -243,9 +256,10 @@ class PublisherSignatures(unittest.TestCase):
         self.git("commit", "-q", "-m", f"release {version}")
         self.git("tag", "-a", f"v{version}", "-m", f"v{version}")
 
-    def bundle(self, version: str, signers: list[str], variant: str = "") -> Path:
+    def bundle(self, version: str, signers: list[str], variant: str = "", macos: bool = False) -> Path:
         """A complete bundle of VERSION, its metadata signed by SIGNERS in
-        order; another VARIANT is another build of it."""
+        order; another VARIANT is another build of it. With MACOS it also
+        carries the Apple Silicon build."""
         dist = Path(tempfile.mkdtemp(prefix=f"dist-{version}-", dir=self.directory))
         cagents_archive(dist / f"cagents-{version}-{TARGET}.tar.gz", "cagents", version, "dev.cagents.Cagents")
         cagents_archive(dist / f"cagents-browserless-{version}-{TARGET}.tar.gz", "cagents-browserless", version,
@@ -266,6 +280,10 @@ class PublisherSignatures(unittest.TestCase):
         sums("SHA256SUMS-browserless", browserless)
         sums("SHA256SUMS-ceditor", [f"ceditor-{version}-{TARGET}.tar.gz"])
         sums("SHA256SUMS", sorted(path.name for path in dist.iterdir()))
+        if macos:
+            macos_archive(dist / f"cagents-{version}-aarch64-apple-darwin.tar.gz", version)
+            (dist / "install-macos.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n")
+            sums("SHA256SUMS-macos", [f"cagents-{version}-aarch64-apple-darwin.tar.gz", "install-macos.sh"])
         commit = self.git("rev-parse", f"v{version}^{{commit}}").strip()
         subprocess.run([sys.executable, "-I", str(self.checkout / "scripts/release-metadata"), "write",
                         "--dir", str(dist), "--version", version, "--source-commit", commit, "--protocol", "9"],
@@ -331,14 +349,14 @@ class PublisherSignatures(unittest.TestCase):
                                "--promote", digest], cwd=self.checkout, text=True, capture_output=True,
                               env=environment, timeout=HANG_GUARD)
 
-    def drafted(self) -> Path:
+    def drafted(self, macos: bool = False) -> Path:
         """0.2.5 left as a verified draft after 0.2.3 and 0.2.4, as the
         release workflow leaves it; its bundle."""
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         self.bridge = self.bundle("0.2.4", ["old"])
         self.published("0.2.4", self.bridge, {"release-metadata.json": "release-metadata.json",
                                               "release-metadata.json.sig": "release-metadata.json.sig"})
-        release = self.bundle("0.2.5", ["new"])
+        release = self.bundle("0.2.5", ["new"], macos=macos)
         result = self.publish("0.2.5", release, "--draft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Verified v0.2.5 as a draft", result.stdout)
@@ -519,6 +537,56 @@ class PublisherSignatures(unittest.TestCase):
         # signature, so it is refused rather than taken to begin generation 2.
         self.git("tag", "-d", "v0.2.3")
         self.assertRefused(self.verify("0.2.5", self.bundle("0.2.5", ["new"])), "fetch the release tags")
+
+    def test_a_release_may_carry_the_macos_build_whole_and_checked(self):
+        result = self.verify("0.2.4", self.bundle("0.2.4", ["old"], macos=True))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Validated v0.2.4: 19 assets", result.stdout)
+        # Its checksums cover what they name, and a Linux release's are as before.
+        dist = self.bundle("0.2.4", ["old"], macos=True)
+        (dist / "install-macos.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\nexit\n")
+        self.assertRefused(self.verify("0.2.4", dist), "checksum verification failed: SHA256SUMS-macos")
+        # The signed metadata names the macOS files; one missing is refused.
+        dist = self.bundle("0.2.4", ["old"], macos=True)
+        (dist / "SHA256SUMS-macos").unlink()
+        self.assertRefused(self.verify("0.2.4", dist), "exactly the 17 expected assets")
+        dist = self.bundle("0.2.4", ["old"])
+        shutil.copyfile(self.bundle("0.2.4", ["old"], macos=True) / "install-macos.sh", dist / "install-macos.sh")
+        self.assertRefused(self.verify("0.2.4", dist), "exactly the 17 expected assets")
+
+    def test_the_macos_archive_holds_only_its_version_tree(self):
+        dist = self.bundle("0.2.4", ["old"], macos=True)
+        archive = dist / "cagents-0.2.4-aarch64-apple-darwin.tar.gz"
+        macos_archive(archive, "0.2.4", links={"bin/cagents-ui-link": "cagents-ui"})
+        self.restamp(dist, ["old"])
+        self.assertRefused(self.verify("0.2.4", dist), "unexpected, missing, or duplicate archive members")
+        dist = self.bundle("0.2.4", ["old"], macos=True)
+        (dist / "install-macos.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='<OWNER>/<REPO>'\n")
+        self.restamp(dist, ["old"])
+        self.assertRefused(self.verify("0.2.4", dist), "macOS installer is not stamped")
+
+    def test_a_draft_with_the_macos_build_is_promoted_whole(self):
+        release = self.drafted(macos=True)
+        served = self.directory / "github/releases/v0.2.5/assets"
+        self.assertTrue((served / "cagents-0.2.5-aarch64-apple-darwin.tar.gz").is_file())
+        digest = hashlib.sha256((release / "release-metadata.json").read_bytes()).hexdigest()
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((served / "SHA256SUMS-macos").read_bytes(), (release / "SHA256SUMS-macos").read_bytes())
+
+    def restamp(self, dist: Path, signers: list[str]):
+        """Rewrites DIST's macOS checksums and metadata after a change, and signs it again."""
+        version = dist.name.split("-")[1]
+        lines = subprocess.run(["sha256sum", "--", f"cagents-{version}-aarch64-apple-darwin.tar.gz", "install-macos.sh"],
+                               cwd=dist, check=True, text=True, capture_output=True, timeout=HANG_GUARD).stdout
+        (dist / "SHA256SUMS-macos").write_text(lines)
+        commit = self.git("rev-parse", f"v{version}^{{commit}}").strip()
+        (dist / "release-metadata.json").unlink()
+        (dist / "release-metadata.json.sig").unlink()
+        subprocess.run([sys.executable, "-I", str(self.checkout / "scripts/release-metadata"), "write",
+                        "--dir", str(dist), "--version", version, "--source-commit", commit, "--protocol", "9"],
+                       check=True, capture_output=True, timeout=HANG_GUARD)
+        self.sign(dist, signers)
 
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])
