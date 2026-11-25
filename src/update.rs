@@ -2811,7 +2811,7 @@ pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> 
 
 const CEDITOR_COMPANION: &str = "Ceditor's companion";
 
-fn owned_cli_protocol(
+pub(crate) fn owned_cli_protocol(
     executable: &Path,
     subject: &str,
     operation: &'static str,
@@ -2885,6 +2885,7 @@ fn companion_read(
     }
     let mut command = Command::new(executable);
     crate::install_guard::sanitize_child_environment(&mut command);
+    command.env_remove(crate::agent_execution::AUTHORITY_ENV);
     command.args(arguments);
     if let Some(runtime) = runtime {
         command.env("XDG_RUNTIME_DIR", runtime);

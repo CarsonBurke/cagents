@@ -685,21 +685,7 @@ pub(crate) fn staged_owner_bin(
     if crate::daemon::lease_handoff::has_inherited_lease()? {
         return Ok(None);
     }
-    // Sealed update probes execute from anonymous FDs. Their kernel exe path
-    // has no filesystem entry to canonicalize and carries no install routing.
-    // Only an installed version shape can have our private ownership marker;
-    // locate() authenticates that tree after a marker has actually been found.
-    let Some(bin) = executable
-        .parent()
-        .filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))
-    else {
-        return Ok(None);
-    };
-    let Some(version_root) = bin.parent().filter(|root| {
-        root.parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "versions")
-    }) else {
+    let Some(version_root) = installed_version_root(executable) else {
         return Ok(None);
     };
     let Some(owner) = read_staged_owner(version_root)? else {
@@ -800,6 +786,67 @@ pub(crate) fn staged_owner_bin(
         ));
     }
     Ok(Some(expected))
+}
+
+fn installed_version_root(executable: &Path) -> Option<&Path> {
+    // Anonymous update probes and ordinary development executables have no
+    // installation marker. Inspect the layout before opening one.
+    let bin = executable
+        .parent()
+        .filter(|bin| bin.file_name().is_some_and(|name| name == "bin"))?;
+    bin.parent().filter(|root| {
+        root.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "versions")
+    })
+}
+
+/// Resolve the live, matched CLI for a scoped Agent command on an installation
+/// that selected its legacy staged build early. This route only connects to
+/// an existing daemon. A staged marker alone authorizes no delegation.
+pub(crate) fn staged_agent_owner_cli(executable: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    let Some(root) = installed_version_root(executable) else {
+        return Ok(None);
+    };
+    let Some(owner) = read_staged_owner(root)? else {
+        return Ok(None);
+    };
+    let Some(version) = owner.owner_version.filter(|_| !owner.daemon_compatible) else {
+        return Ok(None);
+    };
+    let layout = crate::update::locate(executable).map_err(io::Error::other)?;
+    if layout.prefix.join("current").canonicalize()? != layout.version_root {
+        return Ok(None);
+    }
+    let expected = layout.prefix.join("versions").join(version).join("bin");
+    let socket = crate::terminal_ipc::local_daemon_socket_path()?;
+    let source = crate::update::source::Client::connect(&socket).map_err(io::Error::other)?;
+    let protocol = source.protocol();
+    // These released CLIs preserve Agent List and Spawn caller authority,
+    // including a present but invalid token. General upgrade admission also
+    // includes releases that predate those scoped requests.
+    if protocol >= crate::terminal_ipc::PROTOCOL_VERSION || !matches!(protocol, 198 | 203) {
+        return Ok(None);
+    }
+    let daemon = source.serving_executable().map_err(io::Error::other)?;
+    if running_owner_bin(&layout.prefix, &daemon)? != expected {
+        return Ok(None);
+    }
+    let cli = expected.join("cagents");
+    if cli.canonicalize()? != cli {
+        return Ok(None);
+    }
+    let cli_protocol = crate::update::owned_cli_protocol(
+        &cli,
+        "the serving build's CLI",
+        "serving CLI protocol check",
+    )
+    .map_err(io::Error::other)?;
+    if cli_protocol != protocol || source.serving_executable().map_err(io::Error::other)? != daemon
+    {
+        return Ok(None);
+    }
+    Ok(Some(cli))
 }
 
 /// The ownership marker a staging transaction recorded in `version_root`, if
