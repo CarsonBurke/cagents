@@ -1,11 +1,10 @@
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::HashSet,
     ffi::OsStr,
     fs, io,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, PermissionsExt},
-    },
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -130,8 +129,17 @@ pub(crate) fn managed_base(path: &Path) -> Option<&Path> {
         .parent()
 }
 
+#[cfg(target_os = "linux")]
 fn pid_namespace() -> io::Result<u64> {
     Ok(fs::metadata("/proc/self/ns/pid")?.ino())
+}
+
+/// Darwin has no PID namespaces: every process shares one PID space, so every
+/// directory name carries the same namespace.
+#[cfg(target_os = "macos")]
+#[allow(clippy::unnecessary_wraps)]
+fn pid_namespace() -> io::Result<u64> {
+    Ok(0)
 }
 
 fn owner(path: &Path) -> Option<Owner> {
@@ -215,6 +223,7 @@ fn remove(path: PathBuf) -> io::Result<()> {
     proc_entry(fs::remove_dir_all(path)).map(|_| ())
 }
 
+#[cfg(target_os = "linux")]
 fn process_ids(proc: &Path) -> io::Result<HashSet<i32>> {
     fs::read_dir(proc)?
         .map(|entry| {
@@ -230,6 +239,7 @@ fn process_ids(proc: &Path) -> io::Result<HashSet<i32>> {
 /// Only collect directories absent from a stable process census. A process
 /// may fork, leave its provider's group, and exit during the scan. If the
 /// process set changes, scan again or leave the candidates for a later sweep.
+#[cfg(target_os = "linux")]
 fn unused(proc: &Path, candidates: &HashSet<PathBuf>) -> io::Result<HashSet<PathBuf>> {
     if candidates.is_empty() {
         return Ok(HashSet::new());
@@ -261,6 +271,17 @@ fn unused(proc: &Path, candidates: &HashSet<PathBuf>) -> io::Result<HashSet<Path
     Ok(HashSet::new())
 }
 
+/// Darwin has no procfs, and no other census here can prove that nothing
+/// still uses a directory: a tool that left its provider's group may hold it
+/// as its cwd, an open file or its TMPDIR. A directory that might be in use
+/// must survive, so nothing is reclaimed: each launch leaves its private
+/// (0700) directory behind until a Darwin process census can vouch for it.
+#[cfg(target_os = "macos")]
+#[allow(clippy::unnecessary_wraps)]
+fn unused(_proc: &Path, _candidates: &HashSet<PathBuf>) -> io::Result<HashSet<PathBuf>> {
+    Ok(HashSet::new())
+}
+
 fn proc_entry<T>(result: io::Result<T>) -> io::Result<Option<T>> {
     match result.map_err(exited_as_absent) {
         Ok(value) => Ok(Some(value)),
@@ -269,16 +290,19 @@ fn proc_entry<T>(result: io::Result<T>) -> io::Result<Option<T>> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn protect_path(unused: &mut HashSet<PathBuf>, path: &[u8]) {
     for part in Path::new(OsStr::from_bytes(path)).ancestors() {
         unused.remove(part);
     }
 }
 
+#[cfg(target_os = "linux")]
 fn without_deleted_suffix(path: &[u8]) -> &[u8] {
     path.strip_suffix(b" (deleted)").unwrap_or(path)
 }
 
+#[cfg(target_os = "linux")]
 fn mapped_path(mut line: &[u8]) -> Option<&[u8]> {
     for _ in 0..5 {
         line = line.trim_ascii_start();
@@ -288,6 +312,7 @@ fn mapped_path(mut line: &[u8]) -> Option<&[u8]> {
     path.starts_with(b"/").then_some(path)
 }
 
+#[cfg(target_os = "linux")]
 fn inspect_link(link: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<()> {
     if let Some(path) = proc_entry(fs::read_link(link))? {
         let bytes = path.as_os_str().as_bytes();
@@ -296,6 +321,7 @@ fn inspect_link(link: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn inspect_fds(path: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<()> {
     if let Some(fds) = proc_entry(fs::read_dir(path))? {
         for fd in fds {
@@ -305,6 +331,7 @@ fn inspect_fds(path: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn inspect_maps(path: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<bool> {
     let Some(maps) = proc_entry(fs::read(path))?.filter(|maps| !maps.is_empty()) else {
         return Ok(false);
@@ -337,6 +364,7 @@ fn inspect_maps(path: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<bool> 
     Ok(true)
 }
 
+#[cfg(target_os = "linux")]
 fn inspect_process(process: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<()> {
     if let Some(environment) = proc_entry(fs::read(process.join("environ")))? {
         for entry in environment.split(|byte| *byte == 0) {
@@ -370,6 +398,7 @@ fn inspect_process(process: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn process_may_share_uid(process: &Path) -> io::Result<bool> {
     // A non-dumpable process can have a root-owned proc directory even
     // when it runs as us, so inspect its credentials instead.
@@ -392,10 +421,9 @@ fn process_may_share_uid(process: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        os::unix::fs::symlink,
-        process::{Command, Stdio},
-    };
+    use std::process::Command;
+    #[cfg(target_os = "linux")]
+    use std::{os::unix::fs::symlink, process::Stdio};
 
     #[test]
     fn relative_tmpdir_uses_launch_cwd_and_managed_paths_do_not_nest() {
@@ -447,6 +475,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // A procfs census.
     fn open_fds_and_mappings_keep_directories_without_environment_or_cwd_references() {
         let fixture = tempfile::tempdir().unwrap();
         let proc = fixture.path();
@@ -465,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // A procfs census.
     fn a_non_leader_threads_working_directory_is_a_live_reference() {
         let fixture = tempfile::tempdir().unwrap();
         let proc = fixture.path();
@@ -479,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // A procfs census.
     fn an_unreadable_same_user_process_keeps_the_directory() {
         let fixture = tempfile::tempdir().unwrap();
         let proc = fixture.path();
@@ -538,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // A procfs census.
     fn sweep_reclaims_dead_owners_after_their_last_user_exits() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap();

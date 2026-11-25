@@ -248,8 +248,16 @@ pub(crate) fn run(
     let mut result = ResultPipe::new()?;
     let result_fd = result.writer.as_raw_fd();
     let mut command = Command::new("sh");
+    // Darwin's /dev/fd/N duplicates the descriptor instead of reopening it, so
+    // the shell shares its offset; this freshly opened script is at offset 0
+    // and nothing else reads it. The installer must therefore never reopen
+    // `$0` while guarded: there it would resume wherever sh had read to.
+    #[cfg(target_os = "linux")]
+    let script_path = format!("/proc/self/fd/{fd}");
+    #[cfg(target_os = "macos")]
+    let script_path = format!("/dev/fd/{fd}");
     command
-        .arg(format!("/proc/self/fd/{fd}"))
+        .arg(script_path)
         .args(arguments)
         .env(RESULT_FD_ENV, result_fd.to_string())
         .stdin(Stdio::null())
