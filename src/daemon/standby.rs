@@ -56,6 +56,10 @@ enum Status {
     Started,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct AdmissionRejected(String);
+
 #[cfg(any(feature = "host", test))]
 fn send_status(mut stream: &UnixStream, status: Status) -> io::Result<()> {
     match status {
@@ -97,7 +101,7 @@ fn expect(mut stream: &UnixStream, status: Status) -> io::Result<()> {
                 FrameByteOrder::LittleEndian,
             )
             .map_err(io::Error::other)?;
-            return Err(io::Error::other(reason));
+            return Err(io::Error::other(AdmissionRejected(reason)));
         }
         _ => return Err(io::Error::other("invalid replacement daemon startup reply")),
     };
@@ -227,7 +231,19 @@ impl Parked {
         self.transferred = true;
         self.channel.write_all(&[0])?;
         send(&self.channel, &request, &descriptors)?;
-        wait_for_start(&self.channel, timeout, overdue)
+        let result = wait_for_start(&self.channel, timeout, overdue);
+        if let Err(error) = &result
+            && error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<AdmissionRejected>())
+        {
+            // The reject is sent before the daemon can open the store or
+            // publish ownership. Settle that exact child before rolling back.
+            let child = self.child.as_mut().unwrap();
+            let _ = child.kill();
+            child.wait()?;
+        }
+        result
     }
 }
 
@@ -406,5 +422,14 @@ mod tests {
             send_status(&daemon, Status::Started).unwrap();
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_daemon_admission_refusal_has_a_typed_acknowledgement() {
+        let (worker, mut daemon) = UnixStream::pair().unwrap();
+        daemon.write_all(&[3]).unwrap();
+        send(&daemon, &"cannot acquire the launch fence", &[]).unwrap();
+        let error = wait_for_start(&worker, TRANSFER_TIMEOUT, || {}).unwrap_err();
+        assert!(error.get_ref().unwrap().is::<AdmissionRejected>());
     }
 }

@@ -327,6 +327,7 @@ pub(super) fn perform(
             result = Ok(());
         } else if candidate.may_own_runtime() {
             guard.set_fallback_executable(root.join("bin/cagents-ui"));
+            guard.set_recovery_restore_only();
             return Err(result.unwrap_err());
         }
     }
