@@ -55,12 +55,15 @@ if [ ! -d "$DESTINATION/$STEM/lib" ]; then
         || fail "could not unpack $STEM"
     chmod -R u+rwX,go+rX "$WORK/tree"
     # Another build may have finished first; its copy holds the same bytes.
-    # BSD mv has no -T, and would move the tree into an existing directory.
+    # BSD mv has no -T, and would move the tree into an existing directory;
+    # there, whoever makes the directory first places the tree in it.
     place_tree() {
         if [ "$(uname -s)" = Linux ]; then
             mv -T -- "$WORK/tree" "$DESTINATION"
         else
-            [ ! -e "$DESTINATION" ] && mv -- "$WORK/tree" "$DESTINATION"
+            # An empty directory is what an interrupted placement left.
+            { mkdir -- "$DESTINATION" || { rmdir -- "$DESTINATION" && mkdir -- "$DESTINATION"; }; } \
+                && mv -- "$WORK/tree/$STEM" "$DESTINATION/$STEM"
         fi
     }
     place_tree 2>/dev/null || [ -d "$DESTINATION/$STEM/lib" ] \

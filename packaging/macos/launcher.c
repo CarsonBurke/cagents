@@ -3,8 +3,8 @@
  *
  * An installation keeps each release in its own tree,
  * PREFIX/versions/VERSION/bin, and PREFIX/current names the one it serves.
- * The bundle at PREFIX/Cagents.app never moves, so the Dock, Spotlight and
- * Login Items keep pointing at it across updates. This launcher replaces
+ * The bundle at PREFIX/Cagents.app never moves, so the Dock and Login Items
+ * keep pointing at it across updates. This launcher replaces
  * itself with the served release's cagents-ui. LaunchServices keeps the
  * launcher's bundle as the identity of the process after the exec, while
  * cagents-ui runs from its own version tree and finds its matched CLI and
@@ -66,8 +66,15 @@ int main(int argc, char **argv)
     if (snprintf(marker, sizeof marker, "%s/.cagents-install-root", launcher) >= (int)sizeof marker
         || snprintf(wanted, sizeof wanted, "%s/current/bin/cagents-ui", launcher) >= (int)sizeof wanted)
         report("The installation path is too long.");
-    if (access(marker, F_OK) != 0)
-        report("This Cagents.app is not part of a cagents installation. Reinstall cagents.");
+    if (access(marker, F_OK) != 0) {
+        /* The copy inside a version tree, PREFIX/versions/VERSION/Cagents.app,
+         * which LaunchServices may also know: it runs its own version. */
+        if (snprintf(marker, sizeof marker, "%s/../../.cagents-install-root", launcher) >= (int)sizeof marker
+            || snprintf(wanted, sizeof wanted, "%s/bin/cagents-ui", launcher) >= (int)sizeof wanted)
+            report("The installation path is too long.");
+        if (access(marker, F_OK) != 0)
+            report("This Cagents.app is not part of a cagents installation. Reinstall cagents.");
+    }
     if (realpath(wanted, ui) == NULL)
         report("The installed version of cagents is missing. Reinstall cagents.");
 

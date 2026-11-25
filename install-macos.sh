@@ -81,7 +81,7 @@ case $HOME in
     /*) ;;
     *) fail 'HOME must be an absolute path' ;;
 esac
-for command in awk cmp codesign curl ditto find launchctl ln mkdir mktemp mv plutil rm shasum tar; do
+for command in awk cmp codesign curl diff ditto find launchctl ln mkdir mktemp mv osascript plutil rm shasum tar; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
 
@@ -96,7 +96,19 @@ APP_LINK=$HOME/Applications/Cagents.app
 BIN_LINK=$HOME/.local/bin/cagents
 AGENT_PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
 DOMAIN=gui/$(id -u)
+PLIST_BUDDY=/usr/libexec/PlistBuddy
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 umask 022
+
+# Launch Services is per account, not per HOME: only an installation in the
+# account's own home registers Cagents.app, so a private test install (as
+# scripts/package-macos makes) leaves the account's registrations alone.
+ACCOUNT_HOME=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p') \
+    || ACCOUNT_HOME=
+register_app() {
+    [ "$HOME" = "$ACCOUNT_HOME" ] && [ -x "$LSREGISTER" ] || return 0
+    "$LSREGISTER" "$@" >/dev/null 2>&1 || :
+}
 
 # The installation this script made, or nothing at PREFIX at all.
 owned_prefix() {
@@ -112,13 +124,59 @@ remove_owned_link() {
 }
 
 # The daemon of this user's production instance, as the CLI at $1 sees it:
-# prints its version, or nothing when none runs. Fails when it cannot tell.
+# prints its version (or "unknown"), or nothing when none runs. Fails when it
+# cannot tell, including when the status is not what this script expects.
+# JavaScript for Automation reads the JSON on every macOS; plutil cannot hold
+# its nulls.
 running_daemon() {
     status=$("$1" --no-start daemon status --json 2>/dev/null) || return 1
-    printf '%s\n' "$status" | /usr/bin/plutil -extract data.running raw -o - - 2>/dev/null \
-        | grep -qx true || { printf '%s\n' "$status" | /usr/bin/plutil -extract data.daemon_present raw -o - - 2>/dev/null \
-        | grep -qx true; } || return 0
-    printf '%s\n' "$status" | /usr/bin/plutil -extract data.daemon_version raw -o - - 2>/dev/null || printf 'unknown\n'
+    /usr/bin/osascript -l JavaScript -e '
+function run(argv) {
+    const data = JSON.parse(argv[0]).data;
+    if (typeof data.running !== "boolean" || typeof data.daemon_present !== "boolean")
+        throw new Error("unexpected daemon status");
+    if (!data.running && !data.daemon_present) return "";
+    return typeof data.daemon_version === "string" && data.daemon_version !== "" ? data.daemon_version : "unknown";
+}' "$status" 2>/dev/null
+}
+
+# The daemon status as the installed CLI reads it, which speaks the running
+# daemon's protocol; the CLI at $1 when nothing is installed.
+installed_daemon() {
+    if [ -x "$PREFIX/current/bin/cagents" ]; then
+        running_daemon "$PREFIX/current/bin/cagents"
+    else
+        running_daemon "$1"
+    fi
+}
+
+# Whether the login item at AGENT_PLIST runs a version of this installation.
+owned_agent() {
+    [ -f "$AGENT_PLIST" ] || return 1
+    program=$("$PLIST_BUDDY" -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null) || return 1
+    case $program in
+        "$PREFIX/versions/"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A second installer working on PREFIX at once would interleave its steps.
+LOCK=
+acquire_lock() {
+    LOCK=$PREFIX/.lock
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        holder=$(cat "$LOCK/pid" 2>/dev/null || :)
+        if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+            LOCK=
+            fail "another cagents installer (process $holder) is changing $PREFIX; wait for it to finish"
+        fi
+        rm -rf "$LOCK"
+        mkdir "$LOCK" 2>/dev/null || { LOCK=; fail "cannot lock $PREFIX"; }
+    fi
+    printf '%s\n' "$$" > "$LOCK/pid"
+}
+release_lock() {
+    [ -z "$LOCK" ] || rm -rf "$LOCK"
 }
 
 stop_instructions() {
@@ -128,13 +186,21 @@ stop_instructions() {
         "\`cagents --no-start daemon status\` reports stopped, and run this installer again."
 }
 
+# Unloads the login item, only when the job launchd has loaded is this
+# HOME's: a private test install must not unload the account's own.
 unload_agent() {
+    loaded=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '$1 == "path" && $2 == "=" { sub(/^[^=]*= /, ""); print; exit }') \
+        || return 0
+    [ "$loaded" = "$AGENT_PLIST" ] || return 0
     launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || :
 }
 
 if [ "$UNINSTALL" -eq 1 ]; then
     if [ -e "$PREFIX" ]; then
         owned_prefix || fail "$PREFIX was not made by this installer; nothing was removed"
+        acquire_lock
+        trap release_lock EXIT
+        trap 'exit 1' HUP INT TERM
         if [ -x "$PREFIX/current/bin/cagents" ]; then
             daemon=$(running_daemon "$PREFIX/current/bin/cagents") \
                 || fail 'cannot tell whether the cagents daemon is running; nothing was removed'
@@ -143,15 +209,25 @@ if [ "$UNINSTALL" -eq 1 ]; then
                 stop_instructions >&2
                 exit 1
             fi
+        elif [ "$PURGE" -eq 1 ]; then
+            fail "$PREFIX has no installed cagents to check for a running daemon; nothing was removed"
         fi
+    elif [ "$PURGE" -eq 1 ]; then
+        fail "no cagents is installed at $PREFIX to check for a running daemon; stop it with \`cagents daemon stop\`, then remove ~/Library/Application Support/dev.cagents.cagents yourself"
     fi
-    unload_agent
-    rm -f "$AGENT_PLIST"
+    if owned_agent; then
+        unload_agent
+        rm -f "$AGENT_PLIST"
+    fi
     remove_owned_link "$BIN_LINK" "$PREFIX/current/bin/cagents"
     remove_owned_link "$APP_LINK" "$APP"
     if [ -e "$PREFIX" ]; then
-        rm -rf "$PREFIX/versions" "$PREFIX/current" "$APP" "$PREFIX/.update" "$PREFIX"/.stage.* "$PREFIX"/.current.*
+        [ ! -d "$APP" ] || register_app -u "$APP"
+        rm -rf "$PREFIX/versions" "$PREFIX/current" "$APP" "$PREFIX/.update" "$PREFIX"/.stage.* "$PREFIX"/.current.* \
+            "$PREFIX/.previous"
         rm -f "$PREFIX/.cagents-install-root"
+        release_lock
+        LOCK=
         rmdir "$PREFIX" 2>/dev/null || note "kept $PREFIX, which holds files this installer did not make"
     fi
     if [ "$PURGE" -eq 1 ]; then
@@ -207,10 +283,12 @@ mkdir -p "$PREFIX/versions"
 chmod 0755 "$PREFIX"
 [ "$(stat -f %u "$PREFIX")" = "$(id -u)" ] || fail "$PREFIX is not owned by you"
 owned_prefix || printf '%s\n' "$MARKER_TEXT" > "$PREFIX/.cagents-install-root"
+acquire_lock
 
 STAGE=$(mktemp -d "$PREFIX/.stage.XXXXXX")
 cleanup() {
     rm -rf "$STAGE"
+    release_lock
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -266,7 +344,7 @@ if [ -L "$PREFIX/current" ]; then
     CURRENT_VERSION=$(readlink "$PREFIX/current")
     CURRENT_VERSION=${CURRENT_VERSION#versions/}
 fi
-daemon=$(running_daemon "$NEW/bin/cagents") \
+daemon=$(installed_daemon "$NEW/bin/cagents") \
     || fail 'cannot tell whether the cagents daemon is running; the installation was not changed'
 if [ -n "$daemon" ] && [ "$daemon" != "$VERSION" ]; then
     printf '%s: the cagents daemon (%s) is running; the installation was not changed.\n' "$PROGRAM" "$daemon" >&2
@@ -275,27 +353,37 @@ if [ -n "$daemon" ] && [ "$daemon" != "$VERSION" ]; then
 fi
 
 TARGET_DIR=$PREFIX/versions/$VERSION
-if [ -e "$TARGET_DIR" ]; then
-    [ "$CURRENT_VERSION" = "$VERSION" ] \
-        || fail "$TARGET_DIR exists but is not the installed version; remove it, then install again"
-    # The same release again: repair the launchers and the login item below.
+if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
+    # This release again, as a repair or a return to the version kept for
+    # rollback: keep the tree when it is the release's, or replace it whole.
+    # A process running from the old tree keeps the files it has open.
+    if [ -L "$TARGET_DIR" ] || ! diff -rq "$NEW" "$TARGET_DIR" >/dev/null 2>&1; then
+        mv "$TARGET_DIR" "$STAGE/replaced"
+        mv "$NEW" "$TARGET_DIR"
+    fi
 else
     mv "$NEW" "$TARGET_DIR"
 fi
-PREVIOUS_VERSION=$CURRENT_VERSION
+# The version kept for rollback: the one this install replaces, or after a
+# reinstall the one recorded before.
+PREVIOUS_VERSION=$(cat "$PREFIX/.previous" 2>/dev/null || :)
+if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
+    PREVIOUS_VERSION=$CURRENT_VERSION
+fi
+[ "$PREVIOUS_VERSION" != "$VERSION" ] || PREVIOUS_VERSION=
+rm -f "$PREFIX/.current.$$"
 ln -s "versions/$VERSION" "$PREFIX/.current.$$"
 mv -fh "$PREFIX/.current.$$" "$PREFIX/current"
+printf '%s\n' "$PREVIOUS_VERSION" > "$PREFIX/.previous"
 
-# Cagents.app stays at one path, which the Dock, Spotlight and Login Items
-# remember. Replace it only when the release changed it.
+# Cagents.app stays at one path, which the Dock and Login Items remember. Replace it only when the release changed it.
 if [ ! -d "$APP" ] || ! diff -rq "$TARGET_DIR/Cagents.app" "$APP" >/dev/null 2>&1; then
     rm -rf "$PREFIX/.Cagents.app.new" "$PREFIX/.Cagents.app.old"
     ditto "$TARGET_DIR/Cagents.app" "$PREFIX/.Cagents.app.new"
     [ ! -e "$APP" ] || mv "$APP" "$PREFIX/.Cagents.app.old"
     mv "$PREFIX/.Cagents.app.new" "$APP"
     rm -rf "$PREFIX/.Cagents.app.old"
-    lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-    [ ! -x "$lsregister" ] || "$lsregister" -f "$APP" >/dev/null 2>&1 || :
+    register_app -f "$APP"
 fi
 
 mkdir -p "$HOME/Applications" "$HOME/.local/bin"
@@ -345,9 +433,10 @@ EOF
 plutil -lint -s "$STAGE/agent.plist" || fail 'could not write the login item'
 mv -f "$STAGE/agent.plist" "$AGENT_PLIST"
 chmod 0644 "$AGENT_PLIST"
-unload_agent
 DAEMON_STARTED=0
 if [ "$START" -eq 1 ]; then
+    # A job loaded from an earlier install would keep its old definition.
+    unload_agent
     if launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" 2>/dev/null; then
         # RunAtLoad starts the daemon now; wait briefly to report it.
         attempt=0
@@ -365,9 +454,21 @@ if [ "$START" -eq 1 ]; then
 fi
 
 # Keep the served version and the one it replaced, for rollback; remove
-# older trees no running process uses.
-in_use=$(lsof -a -u "$(id -u)" -d txt -Fn 2>/dev/null | sed -n "s|^n$PREFIX/versions/\([^/]*\)/.*|\1|p" | sort -u) \
-    || in_use=unknown
+# older trees no running process uses. Without a reliable answer from lsof,
+# remove none.
+in_use=unknown
+if command -v lsof >/dev/null 2>&1; then
+    status=0
+    lsof -a -u "$(id -u)" -d txt -Fn > "$STAGE/lsof" 2>/dev/null || status=$?
+    # lsof exits 1 when a selection matches nothing, which here (this shell
+    # itself runs from an executable) means it could not see the processes.
+    if [ "$status" -eq 0 ] && [ -s "$STAGE/lsof" ]; then
+        in_use=$(awk -v root="$PREFIX/versions/" '
+            substr($0, 1, 1) == "n" && index(substr($0, 2), root) == 1 {
+                rest = substr($0, 2 + length(root)); sub(/\/.*/, "", rest); print rest
+            }' "$STAGE/lsof" | sort -u)
+    fi
+fi
 if [ "$in_use" != unknown ]; then
     for tree in "$PREFIX/versions"/*; do
         name=${tree##*/}

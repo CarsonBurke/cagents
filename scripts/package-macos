@@ -27,6 +27,8 @@ SMOKE=1
 # Archive times are SOURCE_DATE_EPOCH in UTC, whatever this Mac's zone.
 TZ=UTC
 export TZ
+# Modes in the archive do not follow this Mac's umask.
+umask 022
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -165,6 +167,11 @@ else
             || fail 'could not provide the verified sherpa-onnx libraries'
     fi
     export SHERPA_ONNX_LIB_DIR
+    # Panic messages and debug paths name source files; without remapping they
+    # would publish this Mac's account name and differ from Mac to Mac.
+    CARGO_HOME_DIR=${CARGO_HOME:-"$HOME/.cargo"}
+    RUSTFLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix=$CARGO_HOME_DIR=/cargo --remap-path-prefix=$ROOT_DIR=/source${RUSTFLAGS:+ $RUSTFLAGS}"
+    export RUSTFLAGS
 
     # macOS has one product, built with the `full` identity: it claims
     # dev.cagents.Cagents and is the build self-update serves. Its UI has no
@@ -205,11 +212,6 @@ for binary in cagents-ui cagents-dictate; do
     otool -l "$BIN_DIR/$binary" | grep -q 'sectname __info_plist' \
         || fail "$binary has no embedded Info.plist"
 done
-PROTOCOL_VERSION=$("$BIN_DIR/cagents" daemon protocol-version) \
-    || fail 'cannot inspect the packaged daemon protocol'
-case $PROTOCOL_VERSION in
-    ''|*[!0-9]*) fail 'the packaged CLI returned an invalid daemon protocol version' ;;
-esac
 
 # The launcher is part of the release, so it carries the same deployment
 # target and is signed with the bundle that names it.
@@ -224,8 +226,8 @@ install -m 0644 "$ROOT_DIR/packaging/macos/Cagents.icns" "$APP_DIR/Contents/Reso
 install -m 0644 "$ROOT_DIR/LICENSE" "$PACKAGE_ROOT/share/doc/cagents/LICENSE"
 install -m 0644 "$ROOT_DIR/packaging/THIRD-PARTY-NOTICES" "$PACKAGE_ROOT/share/doc/cagents/THIRD-PARTY-NOTICES"
 
-# Ad hoc signatures name each executable's identifier; the linker's own
-# signature does not survive strip. Sign inside out, then check strictly.
+# Ad hoc signatures name each executable's identifier, which the linker's own
+# signature does not. Sign inside out, then check strictly.
 # sign PATH [IDENTIFIER]
 sign() {
     path=$1
@@ -241,6 +243,12 @@ sign "$APP_DIR"
 for path in "$BIN_DIR/cagents" "$BIN_DIR/cagentsd" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagents-dictate" "$APP_DIR"; do
     codesign --verify --strict "$path" || fail "signature check failed: $path"
 done
+# Read from the executable as signed, which is what ships.
+PROTOCOL_VERSION=$("$BIN_DIR/cagents" daemon protocol-version) \
+    || fail 'cannot inspect the packaged daemon protocol'
+case $PROTOCOL_VERSION in
+    ''|*[!0-9]*) fail 'the packaged CLI returned an invalid daemon protocol version' ;;
+esac
 
 # A reproducible archive: sorted members, fixed times and owners, and no
 # extended attributes or AppleDouble files.

@@ -19,7 +19,7 @@ DIST=$1 VERSION=$2 PROTOCOL=$3
 ARCHIVE=$DIST/cagents-$VERSION-aarch64-apple-darwin.tar.gz
 
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cagents-macos-smoke.XXXXXX")
-trap 'rm -rf "$ROOT"' EXIT
+trap 'unregister 2>/dev/null; rm -rf "$ROOT"' EXIT
 trap 'exit 1' HUP INT TERM
 mkdir -p "$ROOT/home" "$ROOT/runtime"
 chmod 0700 "$ROOT/runtime"
@@ -47,11 +47,44 @@ codesign --verify --strict "$PREFIX/Cagents.app" || fail 'the installed Cagents.
     || fail 'the Cagents.app launcher does not reach the installed cagents-ui'
 AGENT="$ROOT/home/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist"
 plutil -lint -s "$AGENT" || fail 'the login item is not a valid property list'
-[ "$(plutil -extract ProgramArguments.0 raw -o - "$AGENT")" = "$PREFIX/versions/$VERSION/bin/cagents" ] \
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT")" = "$PREFIX/versions/$VERSION/bin/cagents" ] \
     || fail 'the login item does not run the version by its real path'
-[ "$(plutil -extract RunAtLoad raw -o - "$AGENT")" = true ] || fail 'the login item does not run at load'
+[ "$(/usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$AGENT")" = true ] || fail 'the login item does not run at load'
 [ -z "$(find "$PREFIX" -xattrname com.apple.quarantine -print 2>/dev/null)" ] || fail 'installed files carry quarantine'
 
+# The daemon, started and stopped through the command link as a person
+# would, in the private runtime directory. On macOS an executable sees the
+# path it was started by, so this needs the CLI to find its companions by
+# its real path (process::current_executable). Until that lands, a failure
+# here is expected and reported, and a pass says to make it required.
+DAEMON_THROUGH_LINK_REQUIRED=0
+cli() {
+    env -u CAGENTS_AGENT_AUTHORITY HOME="$ROOT/home" XDG_RUNTIME_DIR="$ROOT/runtime" "$ROOT/home/.local/bin/cagents" "$@"
+}
+if cli daemon start > "$ROOT/daemon.log" 2>&1 \
+        && cli --no-start daemon status --json > "$ROOT/status.json" 2>> "$ROOT/daemon.log" \
+        && grep -q '"running": *true' "$ROOT/status.json"; then
+    cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started through the link'
+    [ "$DAEMON_THROUGH_LINK_REQUIRED" = 1 ] \
+        || printf '%s: the daemon now starts through the command link; set DAEMON_THROUGH_LINK_REQUIRED=1\n' "$PROGRAM" >&2
+else
+    cli --no-start daemon stop > /dev/null 2>&1 || :
+    if [ "$DAEMON_THROUGH_LINK_REQUIRED" = 1 ]; then
+        cat "$ROOT/daemon.log" >&2
+        fail 'the daemon does not start and stop through the command link'
+    fi
+    printf '%s: expected failure: the daemon does not yet start through the command link (process::current_executable)\n' \
+        "$PROGRAM" >&2
+fi
+
+# Running the launcher registered the private bundle with Launch Services,
+# which is per account; take it back so the account's own stays the one.
+unregister() {
+    "$LSREGISTER" -u "$PREFIX/Cagents.app" >/dev/null 2>&1 || :
+    for copy in "$PREFIX"/versions/*/Cagents.app; do "$LSREGISTER" -u "$copy" >/dev/null 2>&1 || :; done
+}
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+unregister
 install_release --no-start > "$ROOT/reinstall.log" 2>&1 || { cat "$ROOT/reinstall.log" >&2; fail 'reinstalling the same release failed'; }
 install_release --uninstall > "$ROOT/uninstall.log" 2>&1 || { cat "$ROOT/uninstall.log" >&2; fail 'uninstall failed'; }
 [ ! -e "$PREFIX" ] || fail 'uninstall left the prefix behind'
