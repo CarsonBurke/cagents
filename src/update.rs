@@ -13,8 +13,10 @@ mod handoff;
 pub mod in_flight;
 mod installed;
 #[cfg(all(target_os = "linux", feature = "host"))]
+mod publication;
+#[cfg(all(target_os = "linux", feature = "host"))]
 #[doc(hidden)]
-pub use installed::LocalPublication;
+pub use publication::LocalPublication;
 mod pending_recovery;
 pub mod progress;
 pub mod recovery;

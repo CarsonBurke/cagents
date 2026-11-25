@@ -80,34 +80,6 @@ pub(super) fn complete_selection(
     Ok(())
 }
 
-/// Owned by the exact standby before it accepts the source's terminal lease.
-#[cfg(all(target_os = "linux", feature = "host"))]
-pub struct LocalPublication {
-    switch: crate::install_guard::CurrentExchange,
-    candidate: InstallLayout,
-}
-
-#[cfg(all(target_os = "linux", feature = "host"))]
-impl LocalPublication {
-    pub(crate) fn prepare(expected: &Path) -> Result<Self, UpdateError> {
-        let candidate = locate(&crate::process::current_executable()?)?;
-        let selection = Selection::capture(&candidate)?;
-        if selection.previous_link.as_deref() != Some(expected)
-            || candidate.version != crate::version()
-        {
-            return Err(invalid("The standby's staged source no longer matches"));
-        }
-        let switch = selection
-            .prepare(&candidate)?
-            .ok_or_else(|| invalid("The standby's local build is already selected"))?;
-        Ok(Self { switch, candidate })
-    }
-
-    pub fn publish(self) -> Result<(), UpdateError> {
-        complete_selection(Some(self.switch), &self.candidate)
-    }
-}
-
 #[derive(PartialEq, Eq)]
 struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
 
