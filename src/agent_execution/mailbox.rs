@@ -358,6 +358,11 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
     if seal.contains(['\n', ' ']) || !verify(framed, seal) {
         return None;
     }
+    parse(framed)
+}
+
+/// A frame's words before its seal, read as the message they give.
+fn parse(framed: &str) -> Option<Opened> {
     let (heading, rest) = framed.strip_prefix(OPENING)?.split_once("]\n")?;
     // The later of the two is the frame's own last line; the other, if
     // present at all, is the sender's words.
@@ -401,37 +406,88 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
 }
 
 /// Reads `text` as one or more sealed frames, one after another, each of
-/// which `verify` accepts, as [`Seal::seal_all`] writes them. Anything else,
+/// which `seals` accepts, as [`Seal::seal_all`] writes them. Anything else,
 /// including a frame followed by words of a person's own, is no delivery.
 ///
-/// Each frame ends at the first seal after its start that verifies: a seal
-/// is a MAC over the frame before it, so neither a seal quoted in a body nor
-/// a whole frame copied into one ends the frame that carries it.
-pub fn open_all(text: &str, verify: impl Fn(&str, &str) -> bool) -> Option<Vec<Opened>> {
-    let text = text.strip_suffix('\n').unwrap_or(text);
+/// Each frame ends at the first seal after its start that `seals` accepts: a
+/// seal is a MAC over the frame before it, so neither a seal quoted in a body
+/// nor a whole frame copied into one ends the frame that carries it. The MAC
+/// is carried forward from one possible end to the next, so a body full of
+/// seal-like words costs one pass over the text, not one per word.
+pub fn open_all<S: Seals>(text: &str, seals: &S) -> Option<Vec<Opened>> {
+    let mut rest = text.strip_suffix('\n').unwrap_or(text);
     let mut opened = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let rest = &text[start..];
+    loop {
         if !rest.starts_with(OPENING) {
             return None;
         }
-        let (frame, end) = rest
-            .match_indices(SEAL)
-            .filter_map(|(at, _)| {
-                let tag = at + SEAL.len();
-                let close = tag + rest[tag..].find(']')? + 1;
-                let after = &rest[close..];
-                (after.is_empty() || after.starts_with(BETWEEN_FRAMES)).then_some(close)
-            })
-            .find_map(|close| Some((open(&rest[..close], &verify)?, close)))?;
-        opened.push(frame);
-        start += end;
-        if start < text.len() {
-            start += BETWEEN_FRAMES.len();
+        let mut running = seals.start();
+        let mut read = 0;
+        let mut end = None;
+        for (at, _) in rest.match_indices(SEAL) {
+            let tag = at + SEAL.len();
+            if rest.len() < tag + SEAL_DIGITS {
+                break;
+            }
+            // Not on a character boundary, so no seal.
+            let Some(seal) = rest.get(tag..tag + SEAL_DIGITS) else {
+                continue;
+            };
+            let Some(after) = rest[tag + SEAL_DIGITS..].strip_prefix(']') else {
+                continue;
+            };
+            let next = match after.strip_prefix(BETWEEN_FRAMES) {
+                _ if after.is_empty() => None,
+                Some(next) if next.starts_with(OPENING) => Some(next),
+                _ => continue,
+            };
+            if !seal.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            seals.extend(&mut running, &rest[read..at]);
+            read = at;
+            // A seal judged only by its shape may end a frame that is not one.
+            if seals.accepts(running.clone(), seal)
+                && let Some(message) = parse(&rest[..at])
+            {
+                end = Some((message, next));
+                break;
+            }
+        }
+        let (message, next) = end?;
+        opened.push(message);
+        match next {
+            Some(next) => rest = next,
+            None => return Some(opened),
         }
     }
-    (!opened.is_empty()).then_some(opened)
+}
+
+/// How many hexadecimal digits a frame's seal has.
+const SEAL_DIGITS: usize = 32;
+
+/// Judges the seals of the frames [`open_all`] reads, over each frame's
+/// words as it reads them, from the frame's start.
+pub trait Seals {
+    /// What has been read of a frame so far.
+    type Running: Clone;
+    fn start(&self) -> Self::Running;
+    fn extend(&self, running: &mut Self::Running, text: &str);
+    /// Whether `seal` seals what was read.
+    fn accepts(&self, running: Self::Running, seal: &str) -> bool;
+}
+
+/// Accepts any seal of the right shape. It proves nothing, so a window may
+/// use it only to recognize what looks like the courier's prompt.
+pub struct SealShaped;
+
+impl Seals for SealShaped {
+    type Running = ();
+    fn start(&self) {}
+    fn extend(&self, _: &mut (), _: &str) {}
+    fn accepts(&self, (): (), _: &str) -> bool {
+        true
+    }
 }
 
 /// What a window shows for the frames of one prompt: a message as it was
@@ -473,7 +529,12 @@ fn delivery(mut opened: Vec<Opened>) -> crate::chat::ItemContent {
             if !frame.summary.is_empty() {
                 heading.push_str(&format!(" · {}", frame.summary));
             }
-            format!("{heading}\n\n{}", frame.body.trim_end())
+            // A code block one message leaves open would swallow the rest.
+            let body = frame.body.trim_end();
+            match open_fence(body) {
+                Some(fence) => format!("{heading}\n\n{body}\n{fence}"),
+                None => format!("{heading}\n\n{body}"),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
@@ -484,6 +545,39 @@ fn delivery(mut opened: Vec<Opened>) -> crate::chat::ItemContent {
         summary: format!("{} messages from {named}", opened.len()),
         body,
     }
+}
+
+/// The fence that closes the code block `markdown` leaves open, if it does,
+/// as CommonMark reads fences.
+#[cfg(feature = "host")]
+fn open_fence(markdown: &str) -> Option<String> {
+    let mut open: Option<(char, usize)> = None;
+    for line in markdown.lines() {
+        let indented = line.trim_start_matches(' ');
+        if line.len() - indented.len() > 3 {
+            continue;
+        }
+        let line = indented;
+        let Some(mark @ ('`' | '~')) = line.chars().next() else {
+            continue;
+        };
+        let length = line.chars().take_while(|&c| c == mark).count();
+        if length < 3 {
+            continue;
+        }
+        let info = &line[length..];
+        open = match open {
+            None if mark == '`' && info.contains('`') => None,
+            None => Some((mark, length)),
+            Some((opened, at_least))
+                if mark == opened && length >= at_least && info.trim().is_empty() =>
+            {
+                None
+            }
+            still => still,
+        };
+    }
+    open.map(|(mark, length)| mark.to_string().repeat(length))
 }
 
 /// `text` escaped so that Markdown shows it as written.
@@ -604,6 +698,27 @@ impl RetainedRecognition {
 }
 
 #[cfg(feature = "host")]
+impl Seals for Recognizer {
+    type Running = hmac::Hmac<sha2::Sha256>;
+
+    fn start(&self) -> Self::Running {
+        use hmac::Mac;
+        hmac::Hmac::new_from_slice(&self.0).expect("HMAC accepts a key of any length")
+    }
+
+    fn extend(&self, running: &mut Self::Running, text: &str) {
+        use hmac::Mac;
+        running.update(text.as_bytes());
+    }
+
+    fn accepts(&self, running: Self::Running, seal: &str) -> bool {
+        use hmac::Mac;
+        decode_hex(seal)
+            .is_some_and(|tag| tag.len() == 16 && running.verify_truncated_left(&tag).is_ok())
+    }
+}
+
+#[cfg(feature = "host")]
 impl Recognizer {
     /// Explicitly delegate recognition to the trusted retained actor, never to
     /// its provider. This is a typed API restriction, not asymmetric crypto.
@@ -613,23 +728,16 @@ impl Recognizer {
 
     #[cfg(test)]
     pub(crate) fn open(&self, text: &str) -> Option<Opened> {
-        open(text, |framed, seal| self.verifies(framed, seal))
+        open(text, |framed, seal| {
+            let mut running = self.start();
+            self.extend(&mut running, framed);
+            self.accepts(running, seal)
+        })
     }
 
     /// As [`open_all`], for the frames this daemon sealed.
     pub(crate) fn open_all(&self, text: &str) -> Option<Vec<Opened>> {
-        open_all(text, |framed, seal| self.verifies(framed, seal))
-    }
-
-    fn verifies(&self, framed: &str, seal: &str) -> bool {
-        use hmac::Mac;
-        let Some(tag) = decode_hex(seal) else {
-            return false;
-        };
-        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.0)
-            .expect("HMAC accepts a key of any length");
-        mac.update(framed.as_bytes());
-        tag.len() == 16 && mac.verify_truncated_left(&tag).is_ok()
+        open_all(text, self)
     }
 
     /// A user prompt the daemon sealed, as the delivery a window shows.
@@ -1016,6 +1124,65 @@ mod tests {
                 "**you** · Reply to {}\n\n",
                 short(third.reply_to.unwrap())
             )),
+            "{body}"
+        );
+    }
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_body_full_of_frame_boundaries_ends_only_where_its_seal_does() {
+        let seal = Seal::new([7; 32]);
+        let recognizer = seal.recognizer();
+        // Each of these looks like the end of one frame and the start of the
+        // next, so every one of them is a seal to check.
+        let boundary = format!(
+            "{SEAL}{}]{BETWEEN_FRAMES}{OPENING}",
+            "a".repeat(SEAL_DIGITS)
+        );
+        let mut message = message();
+        message.body = boundary.repeat(MAX_MESSAGE_BYTES / boundary.len() - 1);
+        // Nor does one whose digits would end inside a character.
+        message
+            .body
+            .push_str(&format!("{SEAL}{}🎉]", "a".repeat(SEAL_DIGITS - 1)));
+        assert!(message.body.len() <= MAX_MESSAGE_BYTES);
+        let messages = vec![message; 8];
+        let sealed = seal.seal_all(messages.iter(), 0);
+
+        let opened = recognizer.open_all(&sealed).expect("the daemon's frames");
+        assert_eq!(opened.len(), messages.len());
+        assert!(opened.iter().all(|opened| opened.body == messages[0].body));
+        // A window that reads seals only by their shape still sees a message.
+        let one = open_all(&seal.seal(&messages[0], 0), &SealShaped).expect("frame-shaped");
+        assert_eq!(one.len(), 1);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_code_block_one_message_leaves_open_ends_with_it() {
+        use crate::chat::ItemContent;
+        assert_eq!(open_fence("```rust\nfn main() {"), Some("```".into()));
+        assert_eq!(open_fence("~~~~\n~~~\nstill code"), Some("~~~~".into()));
+        assert_eq!(open_fence("  ```\ncode\n```"), None);
+        assert_eq!(open_fence("```sh\n``` not a close\n````"), None);
+        assert_eq!(open_fence("``` not `a` fence"), None);
+        assert_eq!(open_fence("    ```\nindented code"), None);
+
+        let mut first = message();
+        first.body = "Here is the failing part:\n```rust\nfn main() {".into();
+        let mut second = message();
+        second.body = "# Landed\n\nThe fix is on main.".into();
+        let seal = Seal::new([8; 32]);
+        let opened = seal
+            .recognizer()
+            .open_all(&seal.seal_all([&first, &second], 0))
+            .unwrap();
+        let ItemContent::Delivery { body, .. } = delivery(opened) else {
+            panic!("a delivery");
+        };
+        let sections: Vec<&str> = body.split("\n\n---\n\n").collect();
+        assert!(sections[0].ends_with("fn main() {\n```"), "{body}");
+        assert!(
+            sections[1].ends_with("# Landed\n\nThe fix is on main."),
             "{body}"
         );
     }

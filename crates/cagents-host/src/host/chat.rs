@@ -4505,11 +4505,21 @@ fn process_inner(
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
-            if let Some(holders) = state.held_followups.get_mut(&chat_id) {
-                holders.remove(&client);
-                if holders.is_empty() {
-                    state.held_followups.remove(&chat_id);
-                }
+            let released = state
+                .held_followups
+                .get_mut(&chat_id)
+                .is_some_and(|holders| holders.remove(&client));
+            if state
+                .held_followups
+                .get(&chat_id)
+                .is_some_and(std::collections::BTreeSet::is_empty)
+            {
+                state.held_followups.remove(&chat_id);
+            }
+            drop(state);
+            // A message waiting behind what this window held may go now.
+            if released {
+                super::agent_execution::mailbox::wake(host);
             }
             Ok(ServerResponse::Detached)
         }

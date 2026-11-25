@@ -1981,11 +1981,14 @@ mod tests {
                 .prompt_texts()
                 .iter()
                 .map(|text| {
-                    crate::agent_execution::mailbox::open_all(text, |_, _| true)
-                        .expect("each prompt is the courier's frames")
-                        .into_iter()
-                        .map(|opened| opened.body)
-                        .collect()
+                    crate::agent_execution::mailbox::open_all(
+                        text,
+                        &crate::agent_execution::mailbox::SealShaped,
+                    )
+                    .expect("each prompt is the courier's frames")
+                    .into_iter()
+                    .map(|opened| opened.body)
+                    .collect()
                 })
                 .collect()
         }
