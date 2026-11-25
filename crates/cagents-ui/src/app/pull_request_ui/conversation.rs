@@ -83,6 +83,15 @@ impl<'a> Work<'a> {
         }
     }
 
+    /// The branch checked out in its worktree, when it has one here.
+    fn branch(self) -> Option<&'a str> {
+        match self {
+            Self::PullRequest { worktree, .. } => worktree?.branch.as_deref(),
+            Self::Worktree(worktree) => worktree.branch.as_deref(),
+            Self::Here(_) => None,
+        }
+    }
+
     /// The pull request it is, when it is one.
     pub(crate) fn pull_request(self) -> Option<&'a ConversationPullRequest> {
         match self {
@@ -673,12 +682,16 @@ pub(super) fn view<'a>(
     shown_open: bool,
     with_note: bool,
     openable: &dyn Fn(&Path) -> bool,
+    reviewable: &dyn Fn(&GitHubRepoKey, u64) -> bool,
 ) -> Element<'a, Action> {
     let mut children: Vec<Element<'a, Action>> = Vec::with_capacity(work.len() + 2);
     let list = state.list.as_deref();
     for item in work {
         let chosen = shown.is_some_and(|key| item.is(key));
         let details = chosen && state.details_open(choices, *item);
+        let review = item
+            .pull_request()
+            .is_some_and(|row| reviewable(&row.repository, row.number));
         children.push(work_row(
             card,
             list,
@@ -686,9 +699,10 @@ pub(super) fn view<'a>(
             chosen && shown_open,
             details,
             openable,
+            review,
         ));
-        if details && let Some(row) = item.pull_request() {
-            children.push(chosen_details(row));
+        if details && let Some(details) = item.pull_request().and_then(chosen_details) {
+            children.push(details);
         }
     }
     if with_note && let Some(note) = list.and_then(note) {
@@ -721,8 +735,10 @@ pub(super) fn height(
         .filter(|shown| work.iter().any(|work| work.is(&shown.key())))
         .filter(|shown| state.details_open(choices, *shown))
         .and_then(|shown| shown.pull_request())
-        .map_or(0.0, |row| {
-            ROW_SPACING + detail_rows(row) as f32 * design::DENSE_ROW_HEIGHT
+        .map(detail_rows)
+        .filter(|rows| *rows > 0)
+        .map_or(0.0, |rows| {
+            ROW_SPACING + rows as f32 * design::DENSE_ROW_HEIGHT
         });
     let mut heights: Vec<f32> = work.iter().map(row_height).collect();
     let notes = if with_note {
@@ -907,16 +923,11 @@ impl RowParts<'_> {
     fn described(&self, work: Work<'_>, marked: bool, details: bool) -> String {
         let spoken = &self.spoken;
         let shown = match work.pull_request() {
-            Some(row) if marked => {
-                let what = if lists_checks(row) {
-                    "its checks"
-                } else {
-                    "its details"
-                };
+            Some(row) if marked && lists_checks(row) => {
                 let verb = if details { "hide" } else { "list" };
-                format!("{spoken}, shown below, press to {verb} {what}")
+                format!("{spoken}, shown below, press to {verb} its checks")
             }
-            None if marked => format!("{spoken}, shown below"),
+            _ if marked => format!("{spoken}, shown below"),
             _ => format!("Show {spoken}"),
         };
         std::iter::once(shown)
@@ -1055,6 +1066,7 @@ fn work_row<'a>(
     marked: bool,
     details: bool,
     openable: &dyn Fn(&Path) -> bool,
+    review: bool,
 ) -> Element<'a, Action> {
     let parts = row_parts(list, work, openable);
     let described = parts.described(work, marked, details);
@@ -1100,18 +1112,25 @@ fn work_row<'a>(
             .align_y(Alignment::Center)
             .into()
     });
-    // A pull request's marks give way to opening it in the browser while
-    // the pointer is on its row or the button has focus; pressing the rest
-    // of the row still shows its details here.
-    let browser = work
+    // A pull request's marks give way to opening it while the pointer is on
+    // its row or the button has focus, where Projects would open it: in the
+    // review pane, or else on GitHub. Pressing the rest of the row still
+    // shows its changes here.
+    let opens = work
         .pull_request()
-        .and_then(|row| Some((row.number, Url::parse(&row.url()).ok()?)));
+        .and_then(|row| Some((row.number, open(row)?)));
     let region = crate::ui_controls::hover_reveal::Region::new();
-    match (browser, idle) {
-        (Some((number, url)), idle) => {
-            let open =
-                crate::ui_controls::icon_button(Icon::PopOut, format!("Open #{number} in browser"))
-                    .on_press(Action::OpenInBrowser(url));
+    match (opens, idle) {
+        (Some((number, opening)), idle) => {
+            let open = crate::ui_controls::icon_button(
+                if review {
+                    Icon::PullRequest
+                } else {
+                    Icon::PopOut
+                },
+                open_label(number, review),
+            )
+            .on_press(opening);
             row = row.trailing(crate::ui_controls::hover_reveal::reveal(
                 idle.unwrap_or_else(|| iced::widget::Space::new().into()),
                 open,
@@ -1131,22 +1150,135 @@ fn work_row<'a>(
         ));
     }
     let row: Element<'a, Action> = row.into();
-    if work.pull_request().is_some() {
+    let row = if work.pull_request().is_some() {
         crate::ui_controls::hover_reveal::region(row, &region)
     } else {
         row
+    };
+    let menu = menu_entries(card, work, review);
+    crate::interaction::context_menu_lazy(row, move || {
+        let mut entries = Vec::with_capacity(menu.len() + 1);
+        for entry in &menu {
+            if entry.divided {
+                entries.push(widget::menu::Item::Divider);
+            }
+            entries.push(widget::menu::Item::Button(
+                entry.label.to_owned(),
+                Some(entry.icon.handle()),
+                MenuAction(&entry.action),
+            ));
+        }
+        widget::menu::items(&HashMap::new(), entries)
+    })
+}
+
+/// What opening a pull request from its row does, said on its button.
+fn open_label(number: u64, review: bool) -> String {
+    if review {
+        format!("Review #{number}")
+    } else {
+        format!("Open #{number} in browser")
     }
 }
 
+/// One entry of a Work row's context menu.
+struct MenuEntry {
+    label: &'static str,
+    icon: Icon,
+    action: Action,
+    /// Whether a rule sets it apart from the entries above it.
+    divided: bool,
+}
+
+/// A menu entry's action, which the menu turns into its message as it is
+/// built. Entries are told apart by where they are, not by what they do.
+#[derive(Clone, Copy)]
+struct MenuAction<'a>(&'a Action);
+
+impl PartialEq for MenuAction<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for MenuAction<'_> {}
+
+impl widget::menu::Action for MenuAction<'_> {
+    type Message = Action;
+
+    fn message(&self) -> Action {
+        self.0.clone()
+    }
+}
+
+/// What right-clicking a Work row offers: opening and linking its pull
+/// request, then showing, copying and opening its worktree. Only what the
+/// row has is offered: no worktree entries for a pull request checked out
+/// nowhere here, and no branch to copy from a detached head.
+fn menu_entries(card: CardId, work: Work<'_>, review: bool) -> Vec<MenuEntry> {
+    let item = |label, icon, action| MenuEntry {
+        label,
+        icon,
+        action,
+        divided: false,
+    };
+    let mut entries = Vec::with_capacity(7);
+    if let Some(row) = work.pull_request() {
+        if review && let Some(opening) = open(row) {
+            entries.push(item("Review pull request", Icon::PullRequest, opening));
+        }
+        if let Ok(url) = Url::parse(&row.url()) {
+            entries.push(item(
+                "Open in browser",
+                Icon::PopOut,
+                Action::OpenInBrowser(url.clone()),
+            ));
+            entries.push(item("Copy link", Icon::Copy, Action::Copy(url.into())));
+        }
+    }
+    if let Some(path) = work.worktree() {
+        let divided = !entries.is_empty();
+        entries.push(MenuEntry {
+            divided,
+            ..item(
+                "Show changes",
+                Icon::Changes,
+                Action::ShowChanges {
+                    card,
+                    key: work.key(),
+                },
+            )
+        });
+        if let Some(branch) = work.branch() {
+            entries.push(item(
+                "Copy branch",
+                Icon::Branch,
+                Action::Copy(branch.to_owned()),
+            ));
+        }
+        entries.push(item(
+            "Copy path",
+            Icon::CopyPath,
+            Action::Copy(path.display().to_string()),
+        ));
+        entries.push(item(
+            "Open folder",
+            Icon::OpenFolder,
+            Action::OpenFolder(path.to_path_buf()),
+        ));
+    }
+    entries
+}
+
 /// How many dense rows a chosen pull request adds beneath its row: its
-/// checks, a row for the rest when there are more, and its Open row.
+/// checks, and a row for the rest when there are more. Opening it is the
+/// row's own button, so a pull request with no checks to list adds none.
 fn detail_rows(row: &ConversationPullRequest) -> usize {
-    let checks = if lists_checks(row) {
+    if lists_checks(row) {
         row.checks.len().min(CHECKS_SHOWN) + usize::from(row.checks.len() > CHECKS_SHOWN)
     } else {
         0
-    };
-    checks + 1
+    }
 }
 
 /// Whether a chosen pull request lists its checks: only an open one's
@@ -1160,11 +1292,15 @@ fn lists_checks(row: &ConversationPullRequest) -> bool {
 }
 
 /// What a chosen pull request adds beneath its row: its checks, the ones
-/// most in need of attention first, and a way to open it. Its rows hang
-/// from the row's label column, so they read as belonging to it.
-fn chosen_details<'a>(row: &ConversationPullRequest) -> Element<'a, Action> {
+/// most in need of attention first, or nothing when it has none to list.
+/// Its rows hang from the row's label column, so they read as belonging to
+/// it.
+fn chosen_details<'a>(row: &ConversationPullRequest) -> Option<Element<'a, Action>> {
+    if !lists_checks(row) {
+        return None;
+    }
     let mut rows: Vec<Element<'a, Action>> = Vec::with_capacity(detail_rows(row));
-    if lists_checks(row) {
+    {
         let mut checks: Vec<&Check> = row.checks.iter().collect();
         checks.sort_by_key(|check| check.state);
         for check in checks.iter().take(CHECKS_SHOWN) {
@@ -1198,20 +1334,15 @@ fn chosen_details<'a>(row: &ConversationPullRequest) -> Element<'a, Action> {
             );
         }
     }
-    rows.push(
-        crate::ui_controls::list_row(Some(Icon::PopOut), "Open pull request")
-            .name(format!("Open #{}", row.number))
-            .dense()
-            .on_press_maybe(open(row))
+    Some(
+        widget::container(widget::column::with_children(rows).width(Length::Fill))
+            .padding(Padding {
+                left: list::ICON + list::GAP,
+                ..Padding::ZERO
+            })
+            .width(Length::Fill)
             .into(),
-    );
-    widget::container(widget::column::with_children(rows).width(Length::Fill))
-        .padding(Padding {
-            left: list::ICON + list::GAP,
-            ..Padding::ZERO
-        })
-        .width(Length::Fill)
-        .into()
+    )
 }
 
 /// Whether the row's pull request is in the conversation's own repository.
@@ -1769,6 +1900,8 @@ mod tests {
             (Some(0), false, false),
             (Some(0), true, false),
             (Some(0), true, true),
+            // A pull request with no checks unfolds nothing.
+            (Some(1), true, false),
             (Some(1), true, true),
         ] {
             let key = shown.map(|index: usize| keys[index].clone());
@@ -1791,6 +1924,7 @@ mod tests {
                 true,
                 true,
                 &|_| true,
+                &|_, _| false,
             );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
@@ -2123,7 +2257,7 @@ mod tests {
              Checks: 1 running, Review required, 2 uncommitted changes, +8 −17, +120 −30 in the pull request"
         );
 
-        // A merged one lists no checks, so pressing it shows only its link.
+        // A merged one lists no checks, so pressing it unfolds nothing.
         let mut merged = row(3, Relation::Created);
         merged.pull_request.as_mut().unwrap().state = PullRequestState::Merged;
         merged.checks = vec![check("test", CheckState::Passed)];
@@ -2133,7 +2267,7 @@ mod tests {
         };
         assert_eq!(
             row_parts(list, work, &|_| true).described(work, true, true),
-            "Change 3, merged, #3, shown below, press to hide its details"
+            "Change 3, merged, #3, shown below"
         );
         // A finished one says so in words after its number too, which its
         // name already read out; why it is listed is not said.
@@ -2236,6 +2370,100 @@ mod tests {
         assert_eq!(
             number_label(Some(&list), &delegated),
             "ghe.example/me/repo#2"
+        );
+    }
+
+    /// The button on a pull request's row says where it opens: the review
+    /// pane when Projects would open it there, else the browser.
+    #[test]
+    fn a_rows_button_says_where_it_opens_the_pull_request() {
+        assert_eq!(open_label(7, true), "Review #7");
+        assert_eq!(open_label(7, false), "Open #7 in browser");
+    }
+
+    /// A row's menu opens and links its pull request, then shows, copies and
+    /// opens its worktree; it offers only what the row has.
+    #[test]
+    fn a_rows_menu_offers_what_the_row_has() {
+        let labels = |entries: &[MenuEntry]| -> Vec<&str> {
+            entries
+                .iter()
+                .flat_map(|entry| {
+                    entry
+                        .divided
+                        .then_some("—")
+                        .into_iter()
+                        .chain([entry.label])
+                })
+                .collect()
+        };
+        let card = CardId::new();
+        let pull_request = row(9, Relation::Created);
+        let mut checked_out = worktree("/repo/fix-cache", Some(9));
+        checked_out.branch = Some("fix/cache".into());
+        let work = Work::PullRequest {
+            row: &pull_request,
+            worktree: Some(&checked_out),
+        };
+        let entries = menu_entries(card, work, true);
+        assert_eq!(
+            labels(&entries),
+            [
+                "Review pull request",
+                "Open in browser",
+                "Copy link",
+                "—",
+                "Show changes",
+                "Copy branch",
+                "Copy path",
+                "Open folder",
+            ]
+        );
+        let action = |label: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.label == label)
+                .map(|entry| entry.action.clone())
+        };
+        assert!(matches!(
+            action("Review pull request"),
+            Some(Action::Open { number: 9, .. })
+        ));
+        assert!(matches!(
+            action("Copy link"),
+            Some(Action::Copy(link)) if link == "https://github.com/me/repo/pull/9"
+        ));
+        assert!(
+            matches!(action("Copy branch"), Some(Action::Copy(branch)) if branch == "fix/cache")
+        );
+        assert!(matches!(
+            action("Copy path"),
+            Some(Action::Copy(path)) if path == "/repo/fix-cache"
+        ));
+        assert!(matches!(
+            action("Open folder"),
+            Some(Action::OpenFolder(path)) if path == Path::new("/repo/fix-cache")
+        ));
+        assert!(matches!(
+            action("Show changes"),
+            Some(Action::ShowChanges { card: shown, key }) if shown == card && key == work.key()
+        ));
+
+        // Not reviewable here, with no worktree: only its link.
+        let elsewhere = Work::PullRequest {
+            row: &pull_request,
+            worktree: None,
+        };
+        assert_eq!(
+            labels(&menu_entries(card, elsewhere, false)),
+            ["Open in browser", "Copy link"]
+        );
+        // A worktree on a detached head has no branch to copy.
+        let mut detached = worktree("/repo/notes", None);
+        detached.branch = None;
+        assert_eq!(
+            labels(&menu_entries(card, Work::Worktree(&detached), false)),
+            ["Show changes", "Copy path", "Open folder"]
         );
     }
 }
