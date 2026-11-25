@@ -1408,10 +1408,6 @@ fn losing_the_continuous_worker_lease_prevents_receipt_even_with_matching_bytes(
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
-)]
 fn a_changed_prepared_checkpoint_is_neither_reinterpreted_nor_modified() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
@@ -1433,10 +1429,6 @@ fn a_changed_prepared_checkpoint_is_neither_reinterpreted_nor_modified() {
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
-)]
 fn source_finishing_ready_keeps_normal_restore_and_preserves_checkpoint_bytes() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
@@ -1460,10 +1452,6 @@ fn source_finishing_ready_keeps_normal_restore_and_preserves_checkpoint_bytes() 
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
-)]
 fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
     const ISOLATED: &str = "CAGENTS_TEST_RECOVERY_RESERVATION_ISOLATED";
     if std::env::var_os(ISOLATED).is_none() {
@@ -1518,6 +1506,39 @@ fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
     assert!(receipt.inherit(&mut Command::new("true")).is_err());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn prepared_standby_proof_is_bound_to_the_target_and_locked_descriptions() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    save(
+        &preparation.authority.checkpoint_path,
+        &checkpoint(&preparation, "Prepared"),
+    );
+    let target = fs::canonicalize("/bin/sh").unwrap();
+    let lease = handoff(root.path());
+    let receipt = preparation
+        .acknowledged()
+        .unwrap()
+        .receipt(&target, &lease)
+        .unwrap()
+        .unwrap();
+    assert!(receipt.standby_proof(&target).is_ok());
+    let different = root.path().join("sh");
+    fs::copy(&target, &different).unwrap();
+    assert!(receipt.standby_proof(&different).is_err());
+
+    let unheld = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&receipt.authority.daemon_path)
+        .unwrap();
+    assert!(validate_lock(&unheld, &receipt.authority.daemon_path).is_err());
+    let mut modified = receipt.authority.clone();
+    modified.target_hash = "0".repeat(64);
+    assert!(validate_authority_target(&target, &modified).is_err());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn recovery_receipt_is_immutable_after_its_causal_identity_is_sealed() {
@@ -1537,6 +1558,7 @@ fn recovery_receipt_is_immutable_after_its_causal_identity_is_sealed() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn mutable_files_and_invalid_descriptors_cannot_pass_the_receipt_seal_check() {
     let file = tempfile::tempfile().unwrap();

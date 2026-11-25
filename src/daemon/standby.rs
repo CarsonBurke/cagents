@@ -1,13 +1,21 @@
 //! Start the exact replacement process before handing off any live ownership.
 //! The private channel stays open until that process is ready to serve.
 
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
+use super::lease_handoff::DAEMON_LEASE_ENV;
+#[cfg(any(feature = "host", all(target_os = "linux", test)))]
 use super::lease_handoff::DAEMON_LEASE_FD;
 use super::lease_handoff::LeaseHandoff;
+#[cfg(target_os = "linux")]
+use crate::upgrade::recovery::RECEIPT_DESCRIPTORS;
+#[cfg(all(feature = "host", target_os = "linux"))]
+use crate::upgrade::recovery::RECOVERY_FD_ENV;
+#[cfg(target_os = "macos")]
+use crate::upgrade::recovery::{STANDBY_RECEIPT_DESCRIPTORS, STANDBY_RECEIPT_LIMIT};
 use crate::{
     descriptor_frame::{FrameByteOrder, receive_json_with_fds_until, send_json_with_fds_until},
     instance::UiUpdateGuard,
-    upgrade::recovery::{RECEIPT_DESCRIPTORS, Receipt},
+    upgrade::recovery::Receipt,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -26,13 +34,15 @@ use std::{
     fs::File,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd},
 };
-#[cfg(feature = "host")]
-use {super::lease_handoff::DAEMON_LEASE_ENV, crate::upgrade::recovery::RECOVERY_FD_ENV};
 
 pub const ARGUMENT: &str = "--await-update-handoff";
 const LOCAL_PREVIOUS_CURRENT: &str = "CAGENTS_UPDATE_PREVIOUS_CURRENT";
 const FRAME_LIMIT: usize = 4096;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
+const DESCRIPTOR_LIMIT: usize = 1 + RECEIPT_DESCRIPTORS.len();
+#[cfg(target_os = "macos")]
+const DESCRIPTOR_LIMIT: usize = 1 + STANDBY_RECEIPT_DESCRIPTORS;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Activation {
@@ -43,6 +53,7 @@ enum Activation {
 
 #[cfg(any(feature = "host", test))]
 impl Activation {
+    #[cfg(target_os = "linux")]
     fn slots(&self) -> Vec<i32> {
         if matches!(self, Self::Fresh) {
             return Vec::new();
@@ -52,6 +63,17 @@ impl Activation {
             slots.extend(RECEIPT_DESCRIPTORS);
         }
         slots
+    }
+
+    fn descriptor_count(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        return self.slots().len();
+        #[cfg(target_os = "macos")]
+        match self {
+            Self::Fresh => 0,
+            Self::Lease => 1,
+            Self::Checkpoint => DESCRIPTOR_LIMIT,
+        }
     }
 }
 
@@ -84,7 +106,7 @@ fn send(
         descriptors,
         Instant::now() + TRANSFER_TIMEOUT,
         FRAME_LIMIT,
-        1 + RECEIPT_DESCRIPTORS.len(),
+        DESCRIPTOR_LIMIT,
         FrameByteOrder::LittleEndian,
     )
     .map_err(io::Error::other)
@@ -318,7 +340,7 @@ impl Parked {
     ) -> io::Result<()> {
         self.check_running()?;
         #[cfg(target_os = "macos")]
-        if lease.is_none() || receipt.is_some() {
+        if lease.is_none() {
             return Err(io::Error::other(
                 "Darwin standby requires a runtime lease transfer",
             ));
@@ -327,15 +349,28 @@ impl Parked {
             .into_iter()
             .map(LeaseHandoff::descriptor)
             .collect::<Vec<_>>();
+        #[cfg(target_os = "macos")]
+        let prepared = receipt
+            .map(|receipt| receipt.standby_proof(executable))
+            .transpose()?;
         let request = if let Some(receipt) = receipt {
             if lease.is_none() {
                 return Err(io::Error::other(
                     "a checkpoint activation requires the source lease",
                 ));
             }
-            let files = receipt.files()?;
-            crate::upgrade::recovery::validate_forward_target(executable, files[0])?;
-            descriptors.extend(files.map(AsFd::as_fd));
+            #[cfg(target_os = "linux")]
+            {
+                let files = receipt.files()?;
+                crate::upgrade::recovery::validate_forward_target(executable, files[0])?;
+                descriptors.extend(files.map(AsFd::as_fd));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = receipt;
+                let (_, files) = prepared.as_ref().expect("validated Prepared authority");
+                descriptors.extend(files.iter().map(|file| file.as_fd()));
+            }
             Activation::Checkpoint
         } else if lease.is_some() {
             Activation::Lease
@@ -347,6 +382,19 @@ impl Parked {
         self.transferred = true;
         self.channel.write_all(&[0])?;
         send(&self.channel, &request, &descriptors)?;
+        #[cfg(target_os = "macos")]
+        if let Some((authority, _)) = prepared {
+            send_json_with_fds_until(
+                &self.channel,
+                authority,
+                &[],
+                Instant::now() + TRANSFER_TIMEOUT,
+                STANDBY_RECEIPT_LIMIT,
+                0,
+                FrameByteOrder::LittleEndian,
+            )
+            .map_err(io::Error::other)?;
+        }
         let result = wait_for_start(&self.channel, timeout, overdue);
         if let Err(error) = &result
             && error
@@ -490,19 +538,17 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
             "fresh standby activation requires a local update",
         ));
     }
-    #[cfg(target_os = "macos")]
-    if !matches!(request, Activation::Lease) {
-        return Err(io::Error::other(
-            "Darwin standby requires a runtime lease transfer",
-        ));
-    }
+    #[cfg(target_os = "linux")]
     install_descriptors(descriptors, &request.slots())?;
+    #[cfg(target_os = "macos")]
+    install_darwin_activation(&control, &request, descriptors)?;
     // SAFETY: the inherited authority readers run immediately afterward in
     // this same thread, consuming their normal authenticated descriptors.
     unsafe {
         if !matches!(request, Activation::Fresh) {
             std::env::set_var(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
         }
+        #[cfg(target_os = "linux")]
         if matches!(request, Activation::Checkpoint) {
             std::env::set_var(RECOVERY_FD_ENV, RECEIPT_DESCRIPTORS[0].to_string());
         }
@@ -516,17 +562,48 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     })
 }
 
+#[cfg(all(feature = "host", target_os = "macos"))]
+fn install_darwin_activation(
+    control: &UnixStream,
+    request: &Activation,
+    descriptors: Vec<OwnedFd>,
+) -> io::Result<()> {
+    use crate::upgrade::recovery::{Authority, accept_standby_authority};
+
+    let mut descriptors = descriptors.into_iter();
+    let lease = descriptors
+        .next()
+        .ok_or_else(|| io::Error::other("Darwin standby requires a runtime lease transfer"))?;
+    if *request == Activation::Checkpoint {
+        let (authority, _): (Authority, _) = receive_json_with_fds_until(
+            control,
+            Instant::now() + TRANSFER_TIMEOUT,
+            STANDBY_RECEIPT_LIMIT,
+            0,
+            FrameByteOrder::LittleEndian,
+        )
+        .map_err(io::Error::other)?;
+        let files = descriptors
+            .map(File::from)
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| io::Error::other("Prepared transfer has incomplete custody"))?;
+        accept_standby_authority(authority, files, File::from(lease.try_clone()?))?;
+    }
+    install_descriptors(vec![lease], &[DAEMON_LEASE_FD])
+}
+
 #[cfg(any(feature = "host", test))]
 fn receive_activation(control: &UnixStream) -> io::Result<(Activation, Vec<OwnedFd>)> {
     let (request, descriptors): (Activation, _) = receive_json_with_fds_until(
         control,
         Instant::now() + TRANSFER_TIMEOUT,
         FRAME_LIMIT,
-        1 + RECEIPT_DESCRIPTORS.len(),
+        DESCRIPTOR_LIMIT,
         FrameByteOrder::LittleEndian,
     )
     .map_err(io::Error::other)?;
-    if descriptors.len() != request.slots().len() {
+    if descriptors.len() != request.descriptor_count() {
         return Err(io::Error::other(
             "replacement daemon activation has incomplete custody",
         ));
