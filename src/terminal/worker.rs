@@ -1312,7 +1312,7 @@ impl TerminalHandle {
             .map(File::from)
     }
     /// PID from the exact root pin retained by the test's input worker.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
     pub fn original_root_pid_for_test(&self) -> Option<u32> {
         self.inner
             .published

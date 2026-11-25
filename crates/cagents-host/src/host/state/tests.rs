@@ -2069,6 +2069,61 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         thread::sleep(Duration::from_millis(10));
     };
     let original_root = crate::terminal::holder::Process::read(pid).unwrap();
+    let root_pin = |handle: &crate::terminal::TerminalHandle| {
+        let descriptor = handle.original_root_pidfd_for_test().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let fdinfo =
+                fs::read_to_string(format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd()))
+                    .unwrap();
+            let pinned_pid = fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(pinned_pid, original_root.pid);
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            handle.original_root_pid_for_test(),
+            Some(original_root.pid as u32)
+        );
+        descriptor
+    };
+    let assert_pin_readiness = |descriptor: &fs::File, ready: bool| {
+        let mut readiness = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the same owned exit descriptor stays live across both polls.
+        assert_eq!(
+            unsafe { libc::poll(&mut readiness, 1, 0) },
+            i32::from(ready)
+        );
+        if ready {
+            assert_ne!(readiness.revents & libc::POLLIN, 0);
+        }
+    };
+    let assert_sleep = || {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim(),
+            "sleep"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            crate::process::program_of(pid as u32)
+                .unwrap()
+                .0
+                .file_name(),
+            Some(std::ffi::OsStr::new("sleep"))
+        );
+    };
     let old = host.lock().unwrap().terminals[&source.id].handle.clone();
     let carried_source = host
         .lock()
@@ -2168,18 +2223,8 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
             state.terminals[&source.id].handle.clone()
         };
         assert!(!handle.is_completed());
-        let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
-        assert_eq!(
-            handle.original_root_pid_for_test(),
-            Some(original_root.pid as u32)
-        );
-        let mut readiness = libc::pollfd {
-            fd: root_pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: the cloned original pidfd stays owned across poll.
-        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+        let descriptor = root_pin(&handle);
+        assert_pin_readiness(&descriptor, false);
         assert!(original_root.is_current());
         // Anonymous adoption intentionally unlinks its old listener;
         // the retained current worker is the reachable Close surface.
@@ -2193,18 +2238,13 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         let actual_retained: serde_json::Value =
             serde_json::from_slice(&fs::read(&retained_store.path).unwrap()).unwrap();
         assert_eq!(actual_retained, expected_retained);
-        assert_eq!(
-            crate::process::program_of(pid as u32)
-                .unwrap()
-                .0
-                .file_name(),
-            Some(std::ffi::OsStr::new("sleep"))
-        );
+        assert_sleep();
         assert_eq!(
             handle.close_checked(true),
             crate::terminal_ipc::TerminalCloseResult::Closed
         );
         assert!(!original_root.is_current());
+        assert_pin_readiness(&descriptor, true);
         return;
     }
 
@@ -2236,36 +2276,20 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         .unwrap();
     assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
     assert_eq!(descriptor.session.launch, source.launch);
-    assert_eq!(
-        crate::process::program_of(pid as u32)
-            .unwrap()
-            .0
-            .file_name(),
-        Some(std::ffi::OsStr::new("sleep")),
-        "the successor adopted the same process rather than starting another"
-    );
+    assert_sleep();
     let handle = replacement.lock().unwrap().terminals[&source.id]
         .handle
         .clone();
     assert!(!handle.is_completed());
-    let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
-    assert_eq!(
-        handle.original_root_pid_for_test(),
-        Some(original_root.pid as u32)
-    );
-    let mut readiness = libc::pollfd {
-        fd: root_pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: the cloned original pidfd stays owned across poll.
-    assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+    let original_exit = root_pin(&handle);
+    assert_pin_readiness(&original_exit, false);
     assert!(original_root.is_current());
     assert_eq!(
         handle.close_checked(true),
         crate::terminal_ipc::TerminalCloseResult::Closed
     );
     assert!(!original_root.is_current());
+    assert_pin_readiness(&original_exit, true);
 }
 
 #[test]
