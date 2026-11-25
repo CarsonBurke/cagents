@@ -1253,17 +1253,26 @@ fn a_codex_agent_whose_provider_survives_keeps_the_refusal() {
 fn codex_start_fixture(root: &std::path::Path) -> Fixture {
     let mut fixture = Fixture::new(root);
     let program = root.join("codex");
-    std::fs::write(
-        &program,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${0%/*}/started-argv\"\nexec /bin/sleep 60\n",
-    )
-    .unwrap();
+    #[cfg(target_os = "linux")]
+    let script = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${0%/*}/started-argv\"\nexec /bin/sleep 60\n";
+    #[cfg(target_os = "macos")]
+    let script = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$FIXTURE_STARTED_ARGV\"\nwhile IFS= read -r line; do :; done\n";
+    std::fs::write(&program, script).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let home = root.join("codex-home");
     std::fs::create_dir(&home).unwrap();
     fixture.source.launch.recipe.program = program.to_str().unwrap().into();
-    fixture.source.launch.recipe.environment =
-        BTreeMap::from([("CODEX_HOME".into(), home.to_str().unwrap().into())]);
+    let environment = BTreeMap::from([("CODEX_HOME".into(), home.to_str().unwrap().into())]);
+    #[cfg(target_os = "macos")]
+    let environment = {
+        let mut environment = environment;
+        environment.insert(
+            "FIXTURE_STARTED_ARGV".into(),
+            root.join("started-argv").to_str().unwrap().into(),
+        );
+        environment
+    };
+    fixture.source.launch.recipe.environment = environment;
     fixture.host.lock().unwrap().codex_listeners = CodexListenerRoots::at(root.into());
     fixture
 }
@@ -1328,9 +1337,10 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
                 .ok()
                 .and_then(Option::as_ref)
                 .map(|record| record.root.executable());
+            let failure = handle.failure();
+            let cleanup = handle.close();
             panic!(
-                "the fake app-server never recorded {expected:?}: {observed:?}; failure {:?}; holder {holder:?}; image {image:?}",
-                handle.failure(),
+                "the fake app-server never recorded {expected:?}: {observed:?}; failure {failure:?}; holder {holder:?}; image {image:?}; cleanup {cleanup:?}"
             );
         }
         thread::sleep(Duration::from_millis(5));
@@ -1990,7 +2000,9 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
     );
     let failure = codex_start(&fixture).unwrap_err();
     assert!(
-        failure.message.contains("could not be checked"),
+        failure
+            .message
+            .contains("The paired Codex console is still live"),
         "{}",
         failure.message
     );
@@ -2005,7 +2017,9 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
     }
     let stale_failure = codex_start(&fixture).unwrap_err();
     assert!(
-        stale_failure.message.contains("could not be checked"),
+        stale_failure
+            .message
+            .contains("The paired Codex console is still live"),
         "{}",
         stale_failure.message
     );
@@ -2021,8 +2035,30 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
     assert_codex_started(&fixture, &root);
     #[cfg(target_os = "macos")]
     {
-        assert_retirement_unproved(codex_start(&fixture).unwrap_err());
+        let failure = codex_start(&fixture).unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(failure.retryable, "{failure:?}");
+        assert!(
+            failure
+                .message
+                .contains("This conversation was not restarted"),
+            "{failure:?}"
+        );
+        assert!(
+            failure
+                .message
+                .contains("No exact retirement proves the prior Darwin Codex writer is gone")
+                || failure
+                    .message
+                    .contains("Cannot inspect possible Codex writer"),
+            "{}",
+            failure.message
+        );
         assert!(!root.join("started-argv").exists());
+        assert!(fixture.socket().parent().unwrap().is_dir());
+        let state = fixture.host.lock().unwrap();
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats.is_empty());
     }
 }
 
