@@ -6550,9 +6550,10 @@ mod tests {
     #[test]
     fn a_worktree_placement_starts_in_a_channel_and_follow_ups_need_the_open_strip() {
         let (mut registry, directory, mut request) = fixture();
+        let checkout = directory.path().canonicalize().unwrap();
         let scope = Placement::Worktree {
-            repository: directory.path().into(),
-            path: directory.path().into(),
+            repository: checkout.clone(),
+            path: checkout.clone(),
         };
         let Destination::New(spec) = &mut request.destination else {
             unreachable!()
@@ -6574,7 +6575,7 @@ mod tests {
         let foreign = tempfile::tempdir().unwrap();
         assert!(require_placement(&registry.db, &scope, foreign.path()).is_err());
         let missing = Placement::Worktree {
-            repository: directory.path().into(),
+            repository: checkout.clone(),
             path: directory.path().join("missing-view"),
         };
         assert!(require_placement(&registry.db, &missing, directory.path()).is_err());

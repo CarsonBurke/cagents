@@ -99,17 +99,17 @@ mod tests {
     #[test]
     fn same_path_replacement_and_symlink_do_not_inherit_directory_consent() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("worktree");
+        let path = root.path().canonicalize().unwrap().join("worktree");
         std::fs::create_dir(&path).unwrap();
         let identity = capture(&path).unwrap();
         let held = verify(&path, &identity).unwrap();
-        std::fs::rename(&path, root.path().join("old")).unwrap();
+        std::fs::rename(&path, root.path().canonicalize().unwrap().join("old")).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(verify(&path, &identity).is_err());
         // The already checked handle still names the original target.
         assert_eq!(held.metadata().unwrap().ino(), identity.inode);
         std::fs::remove_dir(&path).unwrap();
-        std::os::unix::fs::symlink(root.path().join("old"), &path).unwrap();
+        std::os::unix::fs::symlink(root.path().canonicalize().unwrap().join("old"), &path).unwrap();
         assert!(verify(&path, &identity).is_err());
     }
 
@@ -120,7 +120,7 @@ mod tests {
             process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
         };
         let root = tempfile::tempdir().unwrap();
-        let repository = root.path().join("project");
+        let repository = root.path().canonicalize().unwrap().join("project");
         std::fs::create_dir(&repository).unwrap();
         let executor = SystemProcessExecutor;
         let git = |arguments: &[&str]| {

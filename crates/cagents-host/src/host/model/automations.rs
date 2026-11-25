@@ -3226,9 +3226,10 @@ mod tests {
     fn an_automation_placed_in_a_worktree_starts_in_its_checkouts_channel() {
         use crate::agent_execution::Placement;
         let (mut registry, directory, mut definition) = fixture();
+        let checkout = directory.path().canonicalize().unwrap();
         definition.agent.target.placement = Some(Placement::Worktree {
-            repository: directory.path().into(),
-            path: directory.path().into(),
+            repository: checkout.clone(),
+            path: checkout.clone(),
         });
         definition.session_mode = SessionMode::Fresh;
         let (automation, _, agent) = completed_reusable_run(&mut registry, definition.clone());
