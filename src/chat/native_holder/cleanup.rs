@@ -21,8 +21,6 @@ pub struct Detached {
     pub(crate) original_role: Option<registry::OriginalRole>,
     /// The receipt keeps its publishing lease; current cleanup authority is separate.
     pub(super) receipt_proof: HostSessionProof,
-    #[cfg(target_os = "macos")]
-    pub(super) known_spared: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -150,17 +148,10 @@ impl Detached {
         record: Record,
         source: crate::chat::Session,
         proof: HostSessionProof,
+        require_exact: bool,
     ) -> Result<Self, String> {
-        let (receipt, kind) = find_source(&source, &proof, false)?
+        let (receipt, _) = find_source(&source, &proof, require_exact, Some(&record))?
             .ok_or("The native cleanup receipt is unavailable")?;
-        #[cfg(target_os = "linux")]
-        let _ = kind;
-        #[cfg(target_os = "macos")]
-        let known_spared =
-            matches!(kind, ReceiptKind::Spared) || !supports_scoped_spare(&receipt.record);
-        if receipt.record != record {
-            return Err("Native cleanup receipt changed".into());
-        }
         let original_role = registry::OriginalRole::authenticated(&record, &receipt.proof, &proof)?;
         Ok(Self {
             record,
@@ -168,8 +159,6 @@ impl Detached {
             proof,
             original_role,
             receipt_proof: receipt.proof,
-            #[cfg(target_os = "macos")]
-            known_spared,
         })
     }
 
@@ -179,11 +168,11 @@ impl Detached {
     }
 
     pub fn close_retaining_receipt(&self) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        if self.known_spared {
-            return self.close_with(true, DetachedWork::Spare);
-        }
-        self.close_with(true, DetachedWork::Stop)
+        self.close_retaining_receipt_with(DetachedWork::Stop)
+    }
+
+    pub fn close_retaining_receipt_with(&self, detached: DetachedWork) -> Result<(), String> {
+        self.close_with(true, detached)
     }
 
     pub(crate) fn close_with(&self, retain: bool, detached: DetachedWork) -> Result<(), String> {
@@ -342,7 +331,7 @@ pub fn closed_source(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
-    Ok(find_source(source, proof, false)?
+    Ok(find_source(source, proof, false, None)?
         .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
 }
 
@@ -351,7 +340,7 @@ pub fn closed_source_for_stop(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
-    Ok(find_source(source, proof, true)?
+    Ok(find_source(source, proof, true, None)?
         .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
 }
 
@@ -372,16 +361,21 @@ pub fn retire_abandoned(record: &Record) -> Result<bool, String> {
 pub fn closed_pair_holder(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
+    owner: &Record,
+    require_exact: bool,
 ) -> Result<Option<Record>, String> {
-    Ok(find_source(source, proof, false)?.and_then(|(receipt, _)| receipt.paired_holder))
+    Ok(find_source(source, proof, require_exact, Some(owner))?
+        .and_then(|(receipt, _)| receipt.paired_holder))
 }
 
 pub fn confirm_pair_closed(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
+    owner: &Record,
+    require_exact: bool,
 ) -> Result<(), String> {
-    let (mut receipt, kind) =
-        find_source(source, proof, false)?.ok_or("The native cleanup receipt is unavailable")?;
+    let (mut receipt, kind) = find_source(source, proof, require_exact, Some(owner))?
+        .ok_or("The native cleanup receipt is unavailable")?;
     receipt.paired_closed = true;
     save(
         &path(receipt.record.terminal, &receipt.record.holder, kind)?,
@@ -393,6 +387,7 @@ fn find_source(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
     require_exact: bool,
+    owner: Option<&Record>,
 ) -> Result<Option<(Receipt, ReceiptKind)>, String> {
     #[cfg(target_os = "linux")]
     let _ = require_exact;
@@ -408,6 +403,8 @@ fn find_source(
     let digest = source_digest(source)?;
     let prefix = format!("{}-", source.id);
     let mut candidates = 0;
+    #[cfg(target_os = "macos")]
+    let mut spared = None;
     for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
@@ -438,6 +435,7 @@ fn find_source(
                 return false;
             }
             if matches!(receipt.record.version, 3 | 4)
+                && owner.is_none_or(|owner| *owner == receipt.record)
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native
@@ -461,19 +459,24 @@ fn find_source(
             true
         })?;
         if complete && let Some(receipt) = matched {
-            #[cfg(target_os = "macos")]
-            if require_exact
-                && (matches!(kind, ReceiptKind::Spared) || !supports_scoped_spare(&receipt.record))
-            {
-                return Err(
-                    "The native close receipt does not prove detached provider cleanup".into(),
-                );
-            }
             if current.is_some() {
                 return Err("A replacement native holder exists after this exact close receipt; it was not stopped".into());
             }
+            #[cfg(target_os = "macos")]
+            if matches!(kind, ReceiptKind::Spared) || !supports_scoped_spare(&receipt.record) {
+                spared.get_or_insert((receipt, kind));
+                continue;
+            }
             return Ok(Some((receipt, kind)));
         }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(receipt) = spared {
+        return if require_exact {
+            Err("The native close receipt does not prove detached provider cleanup".into())
+        } else {
+            Ok(Some(receipt))
+        };
     }
     Ok(None)
 }
@@ -513,8 +516,6 @@ mod tests {
             proof: successor.clone(),
             original_role: None,
             receipt_proof: original,
-            #[cfg(target_os = "macos")]
-            known_spared: false,
         };
         assert_ne!(detached.proof, detached.receipt_proof);
         assert!(detached.matches_receipt(&receipt));

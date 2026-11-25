@@ -683,8 +683,6 @@ pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
                 source: retained_source,
                 original_role: None,
                 receipt_proof: source_proof.clone(),
-                #[cfg(target_os = "macos")]
-                known_spared: false,
             },
         }),
         Err(error) => {
@@ -819,8 +817,6 @@ pub fn adopt(
                         proof: proof.clone(),
                         original_role,
                         receipt_proof: proof.clone(),
-                        #[cfg(target_os = "macos")]
-                        known_spared: false,
                     },
                 },
                 recovery,
