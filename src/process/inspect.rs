@@ -95,9 +95,15 @@ pub fn arguments(pid: u32) -> io::Result<Arguments> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the kernel initialized the first `length` bytes, no more than
-    // the capacity it was given.
-    unsafe { buffer.set_len(length.min(buffer.capacity())) };
+    if length >= buffer.capacity() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process argument record filled its buffer",
+        ));
+    }
+    // SAFETY: the kernel initialized the first `length` bytes and the
+    // preceding check confirms they are within the allocation.
+    unsafe { buffer.set_len(length) };
     parse_arguments(&buffer)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed process arguments"))
 }
