@@ -20,7 +20,7 @@ pub(crate) fn run(
             "Recovery requires --checkpoint SHA256 --yes; nothing was started",
         ));
     }
-    let cli = fs::canonicalize(std::env::current_exe()?)?;
+    let cli = fs::canonicalize(crate::process::current_executable()?)?;
     let layout = locate(&cli)?;
     let daemon = layout.version_root.join("bin/cagentsd");
     let ui = layout.version_root.join("bin/cagents-ui");

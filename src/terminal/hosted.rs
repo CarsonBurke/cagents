@@ -1552,8 +1552,8 @@ fn ensure_daemon_ready_at(
 
     let timeout = crate::upgrade::handoff::startup_timeout()
         .map_err(HostedTerminalStartError::HostStartup)?;
-    let current_exe =
-        std::env::current_exe().map_err(HostedTerminalStartError::CurrentExecutable)?;
+    let current_exe = crate::process::current_executable()
+        .map_err(HostedTerminalStartError::CurrentExecutable)?;
     let daemon_binary = crate::companion::Product::Daemon
         .beside(&current_exe)
         .map_err(|_| HostedTerminalStartError::HostBinaryMissing(current_exe))?;

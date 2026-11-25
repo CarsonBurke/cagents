@@ -233,7 +233,7 @@ fn truncated(message: &str) -> &str {
 /// show the dialog itself: it must answer the launcher's handshake, and the
 /// launcher kills it the moment that answer is an error.
 fn spawn_startup_error_dialog(message: &str, still_starting: bool) -> std::io::Result<()> {
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(cagents::process::current_executable()?);
     command.arg(STARTUP_ERROR).arg(message);
     if still_starting {
         command.arg(STILL_STARTING);
@@ -253,7 +253,7 @@ fn spawn_startup_error_dialog(message: &str, still_starting: bool) -> std::io::R
 /// starting. The waiting process closes it once its own window opens.
 fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
     let parent = std::process::id();
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(cagents::process::current_executable()?);
     command
         .arg(STARTUP_WAIT)
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
@@ -283,7 +283,7 @@ fn spawn_startup_update_dialog(
     request: &cagents_ui::startup_window::Request,
 ) -> std::io::Result<()> {
     let payload = serde_json::to_string(request).map_err(std::io::Error::other)?;
-    std::process::Command::new(std::env::current_exe()?)
+    std::process::Command::new(cagents::process::current_executable()?)
         .args([STARTUP_UPDATE, &payload])
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
         .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)

@@ -254,7 +254,7 @@ impl Worker {
         File::open(directory)?.sync_all()?;
         let fd = lease.as_raw_fd();
         #[cfg(not(test))]
-        let mut command = Command::new(std::env::current_exe()?);
+        let mut command = Command::new(crate::process::current_executable()?);
         #[cfg(test)]
         let mut command = Command::new(test_helper_executable()?);
         command
@@ -649,7 +649,7 @@ fn supervisor(directory: &Path, request: &Request, _lease: File) -> io::Result<(
             start,
         },
     )?;
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(crate::process::current_executable()?);
     command
         .arg(EXECUTOR)
         .arg(directory)
