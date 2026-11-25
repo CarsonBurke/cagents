@@ -14,7 +14,6 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -171,15 +170,32 @@ class RemoteController(
 
     private suspend fun disconnect() {
         val job = locked { loop.also { loop = null } }
+        // Cancelled before the close, so the loop doesn't take the closed
+        // connection for a dropped one and connect again meanwhile, by then
+        // perhaps to another computer.
+        job?.cancel()
         // Closing an SSH channel can block on the network; keep it off the caller's thread.
         withContext(NonCancellable + Dispatchers.Default) { current?.close() }
-        job?.cancelAndJoin()
+        job?.join()
         _state.update { it.copy(connection = ConnectionState.Offline) }
     }
 
-    /** Drops the connection and connects afresh, such as after the settings changed. */
-    suspend fun restart() {
+    /**
+     * Drops the connection and connects afresh, such as after the settings
+     * changed. When [computerChanged], it first forgets what the last
+     * computer sent, its sessions, notices and name, and the conversations
+     * followed there, so none of it shows as the new computer's or is
+     * watched there.
+     */
+    suspend fun restart(computerChanged: Boolean = false) {
         stop()
+        if (computerChanged) {
+            locked {
+                resyncing.clear()
+                recoveries.clear()
+            }
+            _state.value = RemoteState()
+        }
         start()
     }
 

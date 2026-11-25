@@ -90,9 +90,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun saveSettings(new: ConnectionSettings) {
+        val old = graph.settings.settings.value
         graph.settings.save(new)
+        val changed = !old.sameComputer(graph.settings.settings.value)
         // Closing the old connection may wait on the network.
-        viewModelScope.launch(Dispatchers.Default) { controller.restart() }
+        viewModelScope.launch(Dispatchers.Default) { controller.restart(computerChanged = changed) }
     }
 
     fun trustHostKey(failure: ConnectFailure.UnknownHostKey) {
