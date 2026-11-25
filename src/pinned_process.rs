@@ -850,7 +850,9 @@ mod imp {
 
     /// The files behind `pid`'s descriptors. A descriptor closed after the
     /// list was read has nothing to report and is left out, as Linux leaves
-    /// out a `/proc/<pid>/fd` link that no longer reads.
+    /// out a `/proc/<pid>/fd` link that no longer reads. Any other failure to
+    /// read one is an error, so a census never takes a file it could not see
+    /// for one that is not open.
     #[cfg(feature = "host")]
     pub(super) fn open_files(pid: u32) -> io::Result<Vec<OpenFile>> {
         use std::os::unix::ffi::OsStrExt;
@@ -873,8 +875,18 @@ mod imp {
                     size,
                 )
             };
+            if written == 0 {
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOENT)) {
+                    continue;
+                }
+                return Err(vanished(error));
+            }
             if written != size {
-                continue;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the kernel described an open file in an unexpected size",
+                ));
             }
             let path: Vec<u8> = info
                 .pvip
@@ -948,6 +960,9 @@ mod imp {
     }
 
     /// The arguments in a `KERN_PROCARGS2` record, each followed by a NUL.
+    /// The executable path's padding cannot be told from an empty first
+    /// argument, so, as `ps` does, an empty first argument is lost and the
+    /// rest shift by one into the environment.
     #[cfg(feature = "host")]
     pub(super) fn arguments_from_record(record: &[u8]) -> Option<Vec<u8>> {
         let count = usize::try_from(i32::from_ne_bytes(record.get(..4)?.try_into().ok()?)).ok()?;

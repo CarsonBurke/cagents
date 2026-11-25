@@ -69,7 +69,7 @@ pub fn program_of(pid: u32) -> io::Result<(PathBuf, Vec<u8>)> {
 /// a file `wanted` accepts.
 ///
 /// A process that exits during the census, or whose descriptors the kernel
-/// hides from this account, as it hides a hardened runtime's, is passed
+/// refuses this account, as it refuses a protected process's, is passed
 /// over: it names nothing, as on Linux a process whose `/proc/<pid>/fd` does
 /// not read names nothing.
 ///
@@ -83,7 +83,8 @@ pub fn account_process_holding(
 ) -> io::Result<Option<u32>> {
     let own = std::process::id();
     for pid in table::list(crate::daemon::current_uid())? {
-        if pid == own {
+        // launchd is not this account's, and cannot be pinned.
+        if pid == own || pid <= 1 {
             continue;
         }
         let files = match crate::pinned_process::PinnedProcess::open(pid)
@@ -93,9 +94,7 @@ pub fn account_process_holding(
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::PermissionDenied
-                        | io::ErrorKind::InvalidInput
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
                 ) =>
             {
                 continue;

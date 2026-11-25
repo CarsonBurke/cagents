@@ -714,6 +714,7 @@ mod tests {
             );
             // The original's description is not the probe's, so it takes
             // the lock only once the probe has released it.
+            // SAFETY: flock takes a descriptor `original` owns and scalar flags.
             assert_eq!(
                 unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
@@ -790,20 +791,21 @@ mod tests {
 
         // This process holds the lock; the census passes over this process,
         // so until another has it open, nothing it can see is the holder.
+        // Another test's child can briefly share the description between
+        // fork and exec, so each answer is awaited rather than read once.
         let held = std::fs::File::open(&lock).unwrap();
+        // SAFETY: flock takes a descriptor `held` owns and scalar flags.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
-        assert_eq!(
-            held_lock_holder(&lock).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
+        eventually(|| {
+            held_lock_holder(&lock).is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+        });
         let mut opener = holder(&lock, "<");
         let pid = opener.id() as libc::pid_t;
         eventually(|| has_opened(pid));
-        assert_eq!(held_lock_holder(&lock).unwrap(), Some(pid));
-        assert_eq!(
-            writer(Some(&lock), "unrelated").unwrap(),
-            Some(Writer { pid })
-        );
+        eventually(|| held_lock_holder(&lock).is_ok_and(|holder| holder == Some(pid)));
+        eventually(|| {
+            writer(Some(&lock), "unrelated").is_ok_and(|writer| writer == Some(Writer { pid }))
+        });
         let hidden = LockTableScope::new(String::new());
         assert_eq!(
             held_lock_holder(&lock).unwrap_err().kind(),
@@ -813,6 +815,7 @@ mod tests {
         drop(hidden);
 
         // Released, the lock has no holder even while a process has it open.
+        // SAFETY: as above; this releases the lock `held` took.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         assert_eq!(held_lock_holder(&lock).unwrap(), None);
         independent_flock(&lock).unwrap();
