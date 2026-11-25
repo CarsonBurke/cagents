@@ -13,6 +13,7 @@ mod handoff;
 pub mod in_flight;
 mod installed;
 mod pending_recovery;
+pub mod progress;
 pub mod recovery;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
@@ -742,7 +743,10 @@ fn drive_terminal_review(
     yes: bool,
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
-    drive_terminal_review_with(initial, yes, interrupt, &mut NativeTerminalReview)
+    let mut terminal = NativeTerminalReview {
+        progress: progress::TerminalChanges::watch().ok(),
+    };
+    drive_terminal_review_with(initial, yes, interrupt, &mut terminal)
 }
 
 trait TerminalReview: Write {
@@ -755,12 +759,14 @@ trait TerminalReview: Write {
     fn worker_running(&mut self) -> Result<bool, UpdateError> {
         Ok(false)
     }
-    fn pause(&mut self) {
+    fn pause(&mut self, _deadline: Instant) {
         thread::sleep(Duration::from_millis(250));
     }
 }
 
-struct NativeTerminalReview;
+struct NativeTerminalReview {
+    progress: Option<progress::TerminalChanges>,
+}
 impl Write for NativeTerminalReview {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         io::stderr().lock().write(bytes)
@@ -795,6 +801,15 @@ impl TerminalReview for NativeTerminalReview {
             Ok(_lease) => Ok(false),
             Err(UpdateError::Busy) => Ok(true),
             Err(error) => Err(error),
+        }
+    }
+    fn pause(&mut self, deadline: Instant) {
+        if let Some(progress) = &self.progress {
+            if progress.wait(deadline) == progress::TerminalWake::Unavailable {
+                self.progress = None;
+            }
+        } else {
+            thread::sleep(Duration::from_millis(250));
         }
     }
 }
@@ -833,7 +848,7 @@ fn drive_terminal_review_with(
             })?;
         if job.phase.is_terminal() {
             if terminal.worker_running()? {
-                terminal.pause();
+                terminal.pause(deadline);
                 continue;
             }
             // Refresh after proving the worker has settled: the snapshot read
@@ -1047,7 +1062,7 @@ fn drive_terminal_review_with(
                 }
             }
         }
-        terminal.pause();
+        terminal.pause(deadline);
     }
 }
 
@@ -6443,7 +6458,7 @@ sys.stdin.buffer.read(1)
             fn worker_running(&mut self) -> Result<bool, UpdateError> {
                 Ok(true)
             }
-            fn pause(&mut self) {}
+            fn pause(&mut self, _deadline: Instant) {}
         }
         let preview = impact::tests::blocked_preview();
         let job = UpdateJob {
@@ -6535,7 +6550,7 @@ sys.stdin.buffer.read(1)
                 self.worker_checks += 1;
                 Ok(!self.recovery_finished)
             }
-            fn pause(&mut self) {
+            fn pause(&mut self, _deadline: Instant) {
                 self.pauses += 1;
                 assert_eq!(self.pauses, 1, "the settled failure must return promptly");
                 self.recovery_finished = true;

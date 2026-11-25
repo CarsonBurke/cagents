@@ -1,10 +1,36 @@
 //! Interrupting or terminating the CLI must also cancel its detached update.
 use super::*;
+use std::{
+    os::unix::net::UnixStream,
+    sync::{OnceLock, atomic::AtomicI32},
+};
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
+static WAKE: OnceLock<(UnixStream, UnixStream)> = OnceLock::new();
+static WAKE_WRITER: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn interrupt(_: libc::c_int) {
-    REQUESTED.store(true, Ordering::Relaxed);
+    REQUESTED.store(true, Ordering::Release);
+    let writer = WAKE_WRITER.load(Ordering::Relaxed);
+    if writer >= 0 {
+        // The process-lifetime socket stays open and nonblocking. A full
+        // buffer already contains a wake; write is async-signal-safe.
+        let saved = errno::errno();
+        unsafe { libc::write(writer, b"i".as_ptr().cast(), 1) };
+        errno::set_errno(saved);
+    }
+}
+
+pub(super) fn wake_fd() -> i32 {
+    WAKE.get().map_or(-1, |(reader, _)| reader.as_raw_fd())
+}
+
+pub(super) fn drain_wake() {
+    if let Some((reader, _)) = WAKE.get() {
+        let mut reader = reader;
+        let mut bytes = [0; 64];
+        while reader.read(&mut bytes).is_ok_and(|count| count > 0) {}
+    }
 }
 
 pub(super) struct Interrupt {
@@ -14,9 +40,17 @@ pub(super) struct Interrupt {
 
 impl Interrupt {
     pub(super) fn install() -> io::Result<Self> {
+        if WAKE.get().is_none() {
+            let (reader, writer) = UnixStream::pair()?;
+            reader.set_nonblocking(true)?;
+            writer.set_nonblocking(true)?;
+            let _ = WAKE.set((reader, writer));
+        }
+        WAKE_WRITER.store(WAKE.get().unwrap().1.as_raw_fd(), Ordering::Relaxed);
         REQUESTED.store(false, Ordering::Relaxed);
-        // SAFETY: valid initialized sigactions; the handler only touches a
-        // lock-free atomic. Omitting SA_RESTART also wakes a blocked poll.
+        drain_wake();
+        // SAFETY: initialized sigactions. The handler touches lock-free
+        // atomics and writes to the process's nonblocking wake.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             let mut previous_int = std::mem::zeroed();
@@ -50,7 +84,7 @@ impl Drop for Interrupt {
 }
 
 pub(super) fn requested() -> bool {
-    REQUESTED.load(Ordering::Relaxed)
+    REQUESTED.load(Ordering::Acquire)
 }
 
 /// Read only available bytes instead of stdio, which can retry an interrupted
@@ -72,19 +106,22 @@ pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
                 "Update cancellation requested",
             ));
         }
-        let mut poll = libc::pollfd {
-            fd: input.as_raw_fd(),
+        let mut poll = [input.as_raw_fd(), wake_fd()].map(|fd| libc::pollfd {
+            fd,
             events: libc::POLLIN,
             revents: 0,
-        };
-        // SAFETY: one initialized pollfd retained through the call.
-        let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+        });
+        // SAFETY: two initialized descriptors retained through the call.
+        let ready = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
             }
         } else if ready > 0 {
+            if poll[1].revents != 0 {
+                drain_wake();
+            }
             if requested() {
                 continue;
             }

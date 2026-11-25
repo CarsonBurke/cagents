@@ -27,6 +27,45 @@ pub struct Confirmation {
     pub expires_at_unix_ms: u64,
 }
 
+impl Confirmation {
+    /// The source reissues its internal shutdown capability on every
+    /// observation. The worker uses the fresh capability for preparation;
+    /// a rotated token alone does not change what the person can review.
+    fn same_review(&self, published: &Self) -> bool {
+        let mut published = published.clone();
+        if let (Some(current), Some(previous)) =
+            (&self.preview.daemon, &mut published.preview.daemon)
+        {
+            previous
+                .capability
+                .token
+                .clone_from(&current.capability.token);
+            previous.capability.expires_at_unix_ms = current.capability.expires_at_unix_ms;
+        }
+        self == &published
+    }
+}
+
+fn publish_review(
+    state: &Path,
+    job: &mut UpdateJob,
+    confirmation: Confirmation,
+    phase: UpdatePhase,
+    message: impl FnOnce(&UpdateJob) -> Result<String, UpdateError>,
+) -> Result<(), UpdateError> {
+    if job.phase != phase
+        || job
+            .confirmation
+            .as_ref()
+            .is_none_or(|published| !confirmation.same_review(published))
+    {
+        let message = message(job)?;
+        job.confirmation = Some(confirmation);
+        set_phase(state, job, phase, &message)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Choice {
     Confirm,
@@ -387,25 +426,28 @@ fn wait_for(
             } else {
                 None
             };
-            job.confirmation = Some(Confirmation {
+            let confirmation = Confirmation {
                 stop: None,
                 terminal_command,
                 nonce: nonce.clone(),
                 preview: preview.clone(),
                 expires_at_unix_ms: expires,
-            });
-            set_phase(
+            };
+            publish_review(
                 state,
                 job,
+                confirmation,
                 if approved {
                     UpdatePhase::WaitingForIdle
                 } else {
                     UpdatePhase::AwaitingConfirmation
                 },
-                if approved {
-                    "Waiting for the confirmed conversations to become idle"
-                } else {
-                    "Verified update is ready for review"
+                |_| {
+                    Ok(if approved {
+                        "Waiting for the confirmed conversations to become idle".into()
+                    } else {
+                        "Verified update is ready for review".into()
+                    })
                 },
             )?;
         }
@@ -600,22 +642,25 @@ pub(super) fn wait_stop(
             // changed inventory can publish its replacement.
             let _decisions = DecisionLease::acquire(state, &job.id)?;
             check_review_closed(state, job)?;
-            job.confirmation = Some(Confirmation {
+            let confirmation = Confirmation {
                 nonce: nonce.clone(),
                 preview: preview.clone(),
                 stop: Some(list.clone()),
                 terminal_command: None,
                 expires_at_unix_ms: expires,
-            });
-            set_phase(
+            };
+            publish_review(
                 state,
                 job,
+                confirmation,
                 UpdatePhase::AwaitingConfirmation,
-                &format!(
-                    "{}\n{}",
-                    list.render_preview(),
-                    floor::terminal_confirmation(state, job)?
-                ),
+                |job| {
+                    Ok(format!(
+                        "{}\n{}",
+                        list.render_preview(),
+                        floor::terminal_confirmation(state, job)?
+                    ))
+                },
             )?;
         }
         check_review_closed(state, job)?;
@@ -699,6 +744,39 @@ mod tests {
             replaces_daemon: false,
             daemon: None,
         }
+    }
+
+    #[test]
+    fn a_quiet_wait_does_not_publish_until_the_review_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path();
+        let mut job = job(state);
+        let mut review = Confirmation {
+            nonce: "confirmed".into(),
+            preview: working_preview(),
+            stop: None,
+            terminal_command: None,
+            expires_at_unix_ms: 50,
+        };
+        let phase = UpdatePhase::WaitingForIdle;
+        publish_review(state, &mut job, review.clone(), phase.clone(), |_| {
+            Ok("Waiting".into())
+        })
+        .unwrap();
+        let capability = &mut review.preview.daemon.as_mut().unwrap().capability;
+        capability.token = "renewed".into();
+        capability.expires_at_unix_ms -= 1;
+        publish_review(state, &mut job, review.clone(), phase.clone(), |_| {
+            panic!("a renewed capability must not republish a quiet review")
+        })
+        .unwrap();
+        review.preview.daemon.as_mut().unwrap().sessions.clear();
+        publish_review(state, &mut job, review.clone(), phase, |_| {
+            Ok("Waiting".into())
+        })
+        .unwrap();
+        let current = published(state, None);
+        assert_eq!(current.confirmation, Some(review));
     }
 
     fn published(directory: &Path, previous: Option<&str>) -> UpdateJob {
@@ -798,7 +876,7 @@ mod tests {
             fn interrupted(&self) -> bool {
                 false
             }
-            fn pause(&mut self) {
+            fn pause(&mut self, _deadline: Instant) {
                 assert!(Instant::now() < self.deadline, "terminal update stalled");
                 thread::sleep(Duration::from_millis(10));
             }
@@ -898,7 +976,7 @@ mod tests {
             fn interrupted(&self) -> bool {
                 false
             }
-            fn pause(&mut self) {}
+            fn pause(&mut self, _deadline: Instant) {}
         }
         for changed_owner in [false, true] {
             let mut preview = working_preview();
@@ -999,7 +1077,7 @@ mod tests {
             fn interrupted(&self) -> bool {
                 false
             }
-            fn pause(&mut self) {}
+            fn pause(&mut self, _deadline: Instant) {}
         }
         let mut preview = working_preview();
         let daemon = preview.daemon.as_mut().unwrap();

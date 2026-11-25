@@ -1264,6 +1264,7 @@ dependencies = [
  "crossbeam-channel",
  "directories",
  "ed25519-dalek",
+ "errno",
  "getrandom 0.4.3",
  "glob",
  "hmac 0.12.1",
