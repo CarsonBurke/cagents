@@ -30,10 +30,21 @@ const GENERATIONS: [(&str, &str); GENERATION] = [
     ("release-metadata-2.json", "release-metadata-2.json.sig"),
 ];
 const SCHEMA: u32 = 2;
-const TARGET: &str = "x86_64-unknown-linux-gnu";
 const PRODUCT: &str = "cagents";
+/// The release target this build installs, and the installer and checksum
+/// file its metadata entry names. A release carries each platform's whole.
+#[cfg(not(target_os = "macos"))]
+const TARGET: &str = "x86_64-unknown-linux-gnu";
+#[cfg(not(target_os = "macos"))]
 const INSTALLER: &str = "install.sh";
+#[cfg(not(target_os = "macos"))]
 const CHECKSUMS: &str = "SHA256SUMS";
+#[cfg(target_os = "macos")]
+const TARGET: &str = "aarch64-apple-darwin";
+#[cfg(target_os = "macos")]
+const INSTALLER: &str = "install-macos.sh";
+#[cfg(target_os = "macos")]
+const CHECKSUMS: &str = "SHA256SUMS-macos";
 /// A private feed for rehearsing updates: an `https://` URL or `file://`
 /// directory with the public layout. Only development and rehearsal builds
 /// read it, so the environment cannot redirect a published build's updates.
@@ -401,8 +412,31 @@ mod tests {
         }
     }
 
+    /// Metadata as a release carrying both platforms publishes it.
     fn metadata(version: &str) -> serde_json::Value {
         let digest = |size: u64| serde_json::json!({ "size": size, "sha256": "ab".repeat(32) });
+        let platforms = [
+            ("x86_64-unknown-linux-gnu", "install.sh", "SHA256SUMS"),
+            (
+                "aarch64-apple-darwin",
+                "install-macos.sh",
+                "SHA256SUMS-macos",
+            ),
+        ];
+        let mut assets = serde_json::Map::new();
+        let mut targets = Vec::new();
+        for (target, installer, checksums) in platforms {
+            let archive = format!("cagents-{version}-{target}.tar.gz");
+            assets.insert(archive.clone(), digest(100));
+            assets.insert(checksums.into(), digest(200));
+            assets.insert(installer.into(), digest(300));
+            targets.push(serde_json::json!({
+                "target": target,
+                "products": {
+                    "cagents": { "archive": archive, "installer": installer, "checksums": checksums }
+                }
+            }));
+        }
         serde_json::json!({
             "schema_version": 2,
             "repository": "CarsonBurke/cagents",
@@ -410,22 +444,19 @@ mod tests {
             "source_commit": "0".repeat(40),
             "protocol": 195,
             "notes": "- Updates install with one click",
-            "assets": {
-                format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"): digest(100),
-                "SHA256SUMS": digest(200),
-                "install.sh": digest(300),
-            },
-            "targets": [{
-                "target": "x86_64-unknown-linux-gnu",
-                "products": {
-                    "cagents": {
-                        "archive": format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"),
-                        "installer": "install.sh",
-                        "checksums": "SHA256SUMS",
-                    }
-                }
-            }]
+            "assets": assets,
+            "targets": targets,
         })
+    }
+
+    /// The metadata entry of the platform this build updates.
+    fn this_target(value: &mut serde_json::Value) -> &mut serde_json::Value {
+        value["targets"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|target| target["target"] == TARGET)
+            .unwrap()
     }
 
     fn parse(value: &serde_json::Value) -> Result<Release, UpdateError> {
@@ -440,8 +471,10 @@ mod tests {
         assert_eq!(release.notes, "- Updates install with one click");
         assert_eq!(
             release.archive.name,
-            "cagents-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+            format!("cagents-0.2.0-{TARGET}.tar.gz")
         );
+        assert_eq!(release.installer.name, INSTALLER);
+        assert_eq!(release.checksums.name, CHECKSUMS);
         assert_eq!(release.archive.size, 100);
         assert_eq!(release.installer.size, 300);
         assert_eq!(release.checksums.sha256, [0xab; 32]);
@@ -456,19 +489,16 @@ mod tests {
             }),
             ("prerelease", |value| value["version"] = "0.2.0-rc.1".into()),
             ("target", |value| {
-                value["targets"][0]["target"] = "aarch64-apple-darwin".into()
+                this_target(value)["target"] = "riscv64gc-unknown-linux-gnu".into()
             }),
             ("installer", |value| {
-                value["targets"][0]["products"]["cagents"]["installer"] = "other.sh".into()
+                this_target(value)["products"]["cagents"]["installer"] = "other.sh".into()
             }),
             ("missing digest", |value| {
-                value["assets"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("install.sh");
+                value["assets"].as_object_mut().unwrap().remove(INSTALLER);
             }),
             ("oversized", |value| {
-                value["assets"]["SHA256SUMS"]["size"] = (SMALL_ASSET_LIMIT + 1).into()
+                value["assets"][CHECKSUMS]["size"] = (SMALL_ASSET_LIMIT + 1).into()
             }),
         ];
         for (case, change) in cases {
@@ -476,6 +506,17 @@ mod tests {
             change(&mut value);
             assert!(parse(&value).is_err(), "{case} was accepted");
         }
+    }
+
+    #[test]
+    fn a_release_without_this_platforms_build_is_refused_by_name() {
+        let mut value = metadata("0.2.0");
+        value["targets"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|target| target["target"] != TARGET);
+        let error = parse(&value).unwrap_err().to_string();
+        assert!(error.contains(TARGET), "{error}");
     }
 
     /// A `file://` feed holding one signed release, read through real curl.
