@@ -206,6 +206,8 @@ pub struct CommandSpec {
     // child opens its independent SH description after fork and retains it across exec.
     pub(crate) inherited_lease: Option<i32>,
     inherited_files: Vec<InheritedFile>,
+    #[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+    held_directory: Option<InheritedFile>,
 }
 
 impl CommandSpec {
@@ -222,6 +224,8 @@ impl CommandSpec {
             stderr_limit: DEFAULT_STDERR_LIMIT,
             inherited_lease: None,
             inherited_files: Vec::new(),
+            #[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+            held_directory: None,
         }
     }
 
@@ -241,6 +245,10 @@ impl CommandSpec {
 
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
         self.current_dir = Some(path.into());
+        #[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+        {
+            self.held_directory = None;
+        }
         self
     }
 
@@ -280,6 +288,16 @@ impl CommandSpec {
         Ok(self)
     }
 
+    /// Starts the child in a retained directory even if its pathname moves.
+    /// Darwin's /dev/fd duplicates the descriptor but cannot traverse it.
+    #[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+    pub(crate) fn cwd_held(mut self, directory: Arc<std::fs::File>) -> io::Result<Self> {
+        validate_inherited_fd(directory.as_raw_fd())?;
+        self.current_dir = None;
+        self.held_directory = Some(InheritedFile(directory));
+        Ok(self)
+    }
+
     pub fn to_command(&self) -> Command {
         let mut command = Command::new(&self.program);
         #[cfg(unix)]
@@ -311,6 +329,20 @@ impl CommandSpec {
                             {
                                 return Err(io::Error::last_os_error());
                             }
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+            if let Some(directory) = &self.held_directory {
+                let directory = directory.clone();
+                // SAFETY: fchdir is async-signal-safe and the captured File
+                // keeps the descriptor open until the child execs.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::fchdir(directory.0.as_raw_fd()) == -1 {
+                            return Err(io::Error::last_os_error());
                         }
                         Ok(())
                     });

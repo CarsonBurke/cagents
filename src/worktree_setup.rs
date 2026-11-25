@@ -21,6 +21,7 @@ use std::{
         fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 const CONFIG_PATH: &str = ".cagents/worktree.toml";
@@ -254,19 +255,10 @@ impl SetupCheckout {
         self.check()?;
         index.check(&self.admin)?;
         check_cancel(cancel)?;
-        let target = child_path(&self.target);
-        let spec = RepositoryService::system("git")
-            .git_base(&target, true)
-            .arg(format!("--git-dir={}", child_path(&self.admin).display()))
-            .arg(format!("--work-tree={}", target.display()))
+        let spec = self
+            .git(index)?
             .args(["-c", "core.hooksPath=/dev/null"])
-            .env("GIT_COMMON_DIR", child_path(&self.common))
-            .env("GIT_INDEX_FILE", index.child_path(&self.admin))
             .args(args);
-        // Reading a sparse index can fetch missing trees, which runs a
-        // transport the configuration chooses; see `child_path`.
-        #[cfg(target_os = "macos")]
-        let spec = spec.env("GIT_NO_LAZY_FETCH", "1");
         let result = SystemProcessExecutor
             .execute(&spec, cancel)
             .map_err(error)?;
@@ -274,10 +266,49 @@ impl SetupCheckout {
         index.check(&self.admin)?;
         Ok(result)
     }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unnecessary_wraps)] // The Darwin backend prepares retained descriptors.
+    fn git(&self, index: &SetupIndex) -> Result<crate::process::CommandSpec, SetupError> {
+        let target = self.target.process_path();
+        Ok(RepositoryService::system("git")
+            .git_base(&target, true)
+            .arg(format!("--git-dir={}", self.admin.process_path().display()))
+            .arg(format!("--work-tree={}", target.display()))
+            .env("GIT_COMMON_DIR", self.common.process_path())
+            .env("GIT_INDEX_FILE", index.child_path()))
+    }
+
+    /// Start Git in the retained worktree and give it the open index. Darwin
+    /// cannot traverse a directory through /dev/fd, so Git still reaches the
+    /// admin and common directories, including shared index files, by path.
+    /// Check these paths before and after Git runs and disable subprocesses
+    /// that repository configuration could otherwise choose.
+    #[cfg(target_os = "macos")]
+    fn git(&self, index: &SetupIndex) -> Result<crate::process::CommandSpec, SetupError> {
+        use std::os::fd::AsRawFd;
+        let mut git_dir = OsString::from("--git-dir=");
+        git_dir.push(self.admin.path());
+        let directory = Arc::new(self.target.retained_directory().map_err(error)?);
+        RepositoryService::system("git")
+            .git_base(Path::new("."), true)
+            .cwd_held(directory)
+            .map_err(error)?
+            .arg(git_dir)
+            .arg("--work-tree=.")
+            .env("GIT_COMMON_DIR", self.common.path())
+            .env(
+                "GIT_INDEX_FILE",
+                format!("/dev/fd/{}", index.file.as_raw_fd()),
+            )
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .inherit_file(Arc::clone(&index.file))
+            .map_err(error)
+    }
 }
 
 struct SetupIndex {
-    file: fs::File,
+    file: Arc<fs::File>,
     fingerprint: SourceFingerprint,
 }
 
@@ -289,7 +320,7 @@ impl SetupIndex {
             return Err(error("setup index must be a regular file"));
         }
         let result = Self {
-            file,
+            file: Arc::new(file),
             fingerprint: source_fingerprint(&metadata),
         };
         result.check(admin)?;
@@ -298,21 +329,13 @@ impl SetupIndex {
 
     /// How Git, run while this index is held, names it.
     #[cfg(target_os = "linux")]
-    fn child_path(&self, _admin: &fs_safety::Root) -> PathBuf {
+    fn child_path(&self) -> PathBuf {
         use std::os::fd::AsRawFd;
         PathBuf::from(format!(
             "/proc/{}/fd/{}",
             std::process::id(),
             self.file.as_raw_fd()
         ))
-    }
-
-    /// Darwin can name the index only by its path; [`Self::check`], before
-    /// and after Git runs, confirms the path names this index then. See the
-    /// free `child_path` for what that leaves open.
-    #[cfg(target_os = "macos")]
-    fn child_path(&self, admin: &fs_safety::Root) -> PathBuf {
-        admin.path().join("index")
     }
 
     fn check(&self, admin: &fs_safety::Root) -> Result<(), SetupError> {
@@ -326,24 +349,6 @@ impl SetupIndex {
         }
         Ok(())
     }
-}
-
-/// How a child Git process, run while `root` is held, names that directory:
-/// through this process's descriptor on Linux.
-#[cfg(target_os = "linux")]
-fn child_path(root: &fs_safety::Root) -> PathBuf {
-    root.process_path()
-}
-
-/// Darwin offers no path to another process's descriptor, so Git gets the
-/// directory's path. [`SetupCheckout::check`], before and after Git runs,
-/// confirms each path names the held directory at those two moments, not in
-/// between: whoever can rename a parent could show Git another repository
-/// meanwhile, though they could as well edit this one's configuration. Git
-/// runs with hooks, the file-system monitor and lazy fetches disabled.
-#[cfg(target_os = "macos")]
-fn child_path(root: &fs_safety::Root) -> PathBuf {
-    root.path().to_path_buf()
 }
 
 fn same_directory(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -1115,6 +1120,42 @@ mod tests {
                 .contains("Git identity changed")
         );
         assert!(!fixture.destination.join(".env").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn setup_git_starts_in_the_retained_worktree_and_reads_the_retained_index() {
+        let fixture = Fixture::new();
+        let cancel = CancellationToken::new();
+        let service = RepositoryService::system("git");
+        let common = service.common_dir(&fixture.primary, &cancel).unwrap();
+        let checkout = SetupCheckout::capture(&fixture.destination, &common).unwrap();
+        let index = SetupIndex::capture(&checkout.admin).unwrap();
+        let git = checkout.git(&index).unwrap();
+
+        let moved = fixture.destination.with_file_name("moved");
+        fs::rename(&fixture.destination, &moved).unwrap();
+        fs::create_dir(&fixture.destination).unwrap();
+        let index_path = checkout.admin.path().join("index");
+        fs::rename(&index_path, index_path.with_file_name("old-index")).unwrap();
+        fs::write(&index_path, "replacement").unwrap();
+
+        let show_root = SystemProcessExecutor
+            .execute(&git.clone().args(["rev-parse", "--show-toplevel"]), &cancel)
+            .unwrap();
+        assert!(show_root.success, "{show_root:?}");
+        assert_eq!(
+            show_root.stdout.strip_suffix(b"\n").unwrap(),
+            moved.canonicalize().unwrap().as_os_str().as_encoded_bytes()
+        );
+        let listed = SystemProcessExecutor
+            .execute(
+                &git.args(["ls-files", "--cached", "-z", "--", "tracked"]),
+                &cancel,
+            )
+            .unwrap();
+        assert!(listed.success, "{listed:?}");
+        assert_eq!(listed.stdout, b"tracked\0");
     }
 
     #[test]
