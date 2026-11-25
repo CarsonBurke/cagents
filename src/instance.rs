@@ -1330,8 +1330,10 @@ fn verified_window_lease_owners_in(
         // locked descriptor's stat device and inode, not a mere open descriptor.
         // The index can miss a held lock under churn, so the owner the window
         // recorded in its lease is a candidate too.
-        let recorded: Vec<u32> = daemon_admission::recorded_owner(&lock)
-            .into_iter()
+        let owner = daemon_admission::recorded_owner(&lock);
+        let recorded: Vec<u32> = owner
+            .iter()
+            .map(daemon_admission::RecordedOwner::pid)
             .collect();
         let mut matches = crate::flock::proven_owners(proc_root, &expected, &recorded, |pid| {
             // A candidate that exits or hides its descriptors mid-proof, as a
@@ -1344,6 +1346,15 @@ fn verified_window_lease_owners_in(
             #[cfg(target_os = "linux")]
             if !fs::metadata(proc_root.join(pid.to_string()))
                 .is_ok_and(|metadata| metadata.uid() == current_uid())
+            {
+                return Ok(None);
+            }
+            // Darwin has no lock index, so the recorded owner is the only
+            // candidate, and only the very process it names can prove it.
+            #[cfg(target_os = "macos")]
+            if !owner
+                .as_ref()
+                .is_some_and(|owner| owner.names(&process).unwrap_or(false))
             {
                 return Ok(None);
             }
@@ -3584,7 +3595,8 @@ mod tests {
             // Darwin, with no kernel lock index, proves the owner from that.
             let published = || {
                 File::open(runtime.join(slot_lock_name(slot))).is_ok_and(|lease| {
-                    daemon_admission::recorded_owner(&lease) == Some(child.0.id())
+                    daemon_admission::recorded_owner(&lease).map(|owner| owner.pid())
+                        == Some(child.0.id())
                 })
             };
             while !running_window_slots(runtime)

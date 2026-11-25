@@ -42,13 +42,12 @@ impl Process {
         Ok(Self { pid, start })
     }
 
-    /// Darwin keeps no record for a zombie, so one reads as absent before
-    /// its parent reaps it, where Linux still names it.
+    /// As on Linux, a zombie still names its identity until its parent reaps it.
     #[cfg(target_os = "macos")]
     pub fn read(pid: i32) -> io::Result<Self> {
         let number = u32::try_from(pid)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
-        let start = crate::pinned_process::started_microseconds_of(number)?;
+        let start = crate::pinned_process::started_ticks_of(number)?;
         Ok(Self { pid, start })
     }
     pub fn is_current(&self) -> bool {

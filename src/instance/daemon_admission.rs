@@ -43,8 +43,8 @@ impl ProcessIdentity {
         })
     }
 
-    /// `started_ticks` is the start time in microseconds since the epoch on
-    /// Darwin, which reports no tick count; identities are only compared.
+    /// `started_ticks` counts `mach_absolute_time` ticks since boot on Darwin,
+    /// where Linux counts clock ticks; identities are only compared.
     /// Darwin names the executable by path, so replacing it on disk changes
     /// the identity, unlike Linux's `exe` link; self-update, the one flow that
     /// replaces a running window's executable, is refused there.
@@ -52,7 +52,7 @@ impl ProcessIdentity {
     fn read(pid: u32) -> io::Result<Self> {
         let process = crate::pinned_process::PinnedProcess::open(pid)?;
         let executable = fs::metadata(process.executable()?)?;
-        let started_ticks = process.started_microseconds();
+        let started_ticks = process.started_ticks();
         // The executable was read while the pin's process still ran.
         if process.exited()? {
             return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -94,10 +94,10 @@ pub(super) fn publish_capability(lease: &mut File) -> io::Result<()> {
     lease.sync_all()
 }
 
-/// The pid a window recorded in its lease when it took the lease. It is only
-/// a candidate: the bytes can be stale, mid-publication or another user's
+/// The process a window recorded in its lease when it took the lease. It is
+/// only a candidate: the bytes can be stale, mid-publication or another user's
 /// claim, so the caller must still prove the lock is that process's.
-pub(super) fn recorded_owner(lease: &File) -> Option<u32> {
+pub(super) fn recorded_owner(lease: &File) -> Option<RecordedOwner> {
     let length = lease.metadata().ok()?.len();
     if length == 0 || length > MAX_CAPABILITY_BYTES as u64 {
         return None;
@@ -105,7 +105,26 @@ pub(super) fn recorded_owner(lease: &File) -> Option<u32> {
     let mut bytes = vec![0; length as usize];
     lease.read_exact_at(&mut bytes, 0).ok()?;
     let capability: WindowCapability = serde_json::from_slice(&bytes).ok()?;
-    Some(capability.owner.pid)
+    Some(RecordedOwner(capability.owner))
+}
+
+/// The identity a window recorded for itself in its lease.
+pub(super) struct RecordedOwner(ProcessIdentity);
+
+impl RecordedOwner {
+    pub(super) fn pid(&self) -> u32 {
+        self.0.pid
+    }
+
+    /// Whether `process` is the one recorded: the same pid, started at the
+    /// same instant of this boot. A process that inherited the lease from the
+    /// window, or took its number after it, is not.
+    #[cfg(target_os = "macos")]
+    pub(super) fn names(&self, process: &crate::pinned_process::PinnedProcess) -> io::Result<bool> {
+        Ok(process.pid() == self.0.pid
+            && process.started_ticks() == self.0.started_ticks
+            && crate::daemon::read_boot_id()? == self.0.boot_id)
+    }
 }
 
 fn validate_private_file(metadata: &fs::Metadata) -> io::Result<()> {

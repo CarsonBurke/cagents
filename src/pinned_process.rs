@@ -95,6 +95,38 @@ pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredential
 /// `InvalidData` when the kernel's answer is not the expected record.
 #[cfg(target_os = "macos")]
 pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
+    let uid = peer_uid(stream)?;
+    let mut pid: libc::pid_t = 0;
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::pid_t>())
+        .expect("pid_t fits socklen_t");
+    // SAFETY: both buffers are writable, sized as declared, and the stream owns
+    // a live socket.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let pid = u32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid peer pid"))?;
+    Ok(PeerCredentials { uid, pid })
+}
+
+/// The peer's effective uid, as the kernel recorded it at `connect` time. It
+/// reads only `LOCAL_PEERCRED`, so it still answers after the peer closes.
+///
+/// # Errors
+///
+/// Returns the underlying error when the socket cannot be queried, and
+/// `InvalidData` when the kernel's answer is not the expected record.
+#[cfg(target_os = "macos")]
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     /// `XUCRED_VERSION` from `<sys/ucred.h>`.
     const XUCRED_VERSION: libc::c_uint = 0;
     // SAFETY: all-zero bytes are a valid `xucred`, which getsockopt overwrites.
@@ -122,28 +154,17 @@ pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredential
             "the kernel returned an unexpected peer credential",
         ));
     }
-    let mut pid: libc::pid_t = 0;
-    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::pid_t>())
-        .expect("pid_t fits socklen_t");
-    // SAFETY: as above, for a `pid_t`.
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&raw mut pid).cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let pid = u32::try_from(pid)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid peer pid"))?;
-    Ok(PeerCredentials {
-        uid: credentials.cr_uid,
-        pid,
-    })
+    Ok(credentials.cr_uid)
+}
+
+/// The peer's effective uid, as the kernel recorded it at `connect` time.
+///
+/// # Errors
+///
+/// As [`peer_credentials`].
+#[cfg(all(target_os = "linux", feature = "host"))]
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    peer_credentials(stream).map(|credentials| credentials.uid)
 }
 
 /// One process, pinned when it was opened.
@@ -229,9 +250,7 @@ impl PinnedProcess {
     /// Returns `NotFound` when the process has exited, so the answer can never
     /// describe a successor.
     pub(crate) fn uid(&self) -> io::Result<u32> {
-        let uid = self.pin.uid(self.pid)?;
-        self.still_running()?;
-        Ok(uid)
+        self.while_running(self.pin.uid(self.pid))
     }
 
     /// The executable the pinned process is running.
@@ -241,9 +260,7 @@ impl PinnedProcess {
     /// Returns `NotFound` when the process has exited, so the answer can never
     /// describe a successor.
     pub(crate) fn executable(&self) -> io::Result<PathBuf> {
-        let executable = self.pin.executable(self.pid)?;
-        self.still_running()?;
-        Ok(executable)
+        self.while_running(self.pin.executable(self.pid))
     }
 
     /// Whether the pinned process holds a descriptor open on the inode
@@ -254,9 +271,7 @@ impl PinnedProcess {
     /// Returns `NotFound` when the process has exited, so the answer can never
     /// describe a successor.
     pub(crate) fn holds_open(&self, expected: &Metadata) -> io::Result<bool> {
-        let holds = self.pin.holds_open(self.pid, expected)?;
-        self.still_running()?;
-        Ok(holds)
+        self.while_running(self.pin.holds_open(self.pid, expected))
     }
 
     /// Whether `other` pins the same process as this pin. Both must still be
@@ -270,11 +285,25 @@ impl PinnedProcess {
         Ok(self.pid == other.pid && !self.exited()? && !other.exited()?)
     }
 
-    /// When the pinned process started, in microseconds since the epoch: with
-    /// the pid, an identity no later process can share.
+    /// When the pinned process started, in `mach_absolute_time` ticks since
+    /// boot: with the pid, an identity no later process can share.
     #[cfg(target_os = "macos")]
-    pub(crate) fn started_microseconds(&self) -> u64 {
-        self.pin.started_microseconds()
+    pub(crate) fn started_ticks(&self) -> u64 {
+        self.pin.started_ticks()
+    }
+
+    /// What `read` found, while the pinned process is still running. A read
+    /// that fails because the process exited under it reports `NotFound`,
+    /// whatever error the platform gave for the vanished process.
+    fn while_running<T>(&self, read: io::Result<T>) -> io::Result<T> {
+        match read {
+            Ok(value) => {
+                self.still_running()?;
+                Ok(value)
+            }
+            Err(_) if self.exited()? => Err(io::Error::from(io::ErrorKind::NotFound)),
+            Err(error) => Err(error),
+        }
     }
 
     fn still_running(&self) -> io::Result<()> {
@@ -285,17 +314,18 @@ impl PinnedProcess {
     }
 }
 
-/// When `pid` started, in microseconds since the epoch, read without pinning
-/// it: with the pid, an identity no later process can share. XNU keeps no
-/// record for a zombie, so one reads as `NotFound`, as an exited process does.
+/// When `pid` started, in `mach_absolute_time` ticks since boot, read without
+/// pinning it: with the pid, an identity no later process can share. As with
+/// Linux's start ticks, a zombie still reads until its parent reaps it, and a
+/// change of the wall clock moves nothing.
 ///
 /// # Errors
 ///
-/// Returns `NotFound` when no such process is running, and the underlying
-/// error for every other failure.
+/// Returns `NotFound` when no process holds `pid`, and the underlying error
+/// for every other failure.
 #[cfg(target_os = "macos")]
-pub(crate) fn started_microseconds_of(pid: u32) -> io::Result<u64> {
-    Ok(imp::start_of(&imp::bsd_info(pid)?).microseconds())
+pub(crate) fn started_ticks_of(pid: u32) -> io::Result<u64> {
+    imp::start_of(pid).map(imp::Start::ticks)
 }
 
 /// How many of `pid`'s children have exited but not been reaped. XNU lists a
@@ -445,12 +475,12 @@ mod imp {
         pvi: libc::vnode_info,
     }
 
-    /// When a process started, which together with its pid names it uniquely.
+    /// When a process started, in `mach_absolute_time` ticks since boot, which
+    /// together with its pid names it uniquely. Unlike the wall-clock start
+    /// in `proc_bsdinfo`, it is readable for a zombie, cannot be moved by a
+    /// clock change, and orders processes as Linux's start ticks do.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) struct Start {
-        seconds: u64,
-        microseconds: u64,
-    }
+    pub(super) struct Start(u64);
 
     #[derive(Debug)]
     pub(super) struct Pin {
@@ -493,16 +523,29 @@ mod imp {
         Ok(info)
     }
 
-    pub(super) fn start_of(info: &libc::proc_bsdinfo) -> Start {
-        Start {
-            seconds: info.pbi_start_tvsec,
-            microseconds: info.pbi_start_tvusec,
+    pub(super) fn start_of(pid: u32) -> io::Result<Start> {
+        let pid =
+            libc::c_int::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::NotFound))?;
+        // SAFETY: all-zero bytes are a valid `rusage_info_v0`.
+        let mut usage: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+        // SAFETY: the flavor names exactly the record the pointer addresses,
+        // which lives for the call; the kernel only writes it.
+        let status = unsafe {
+            libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V0,
+                (&raw mut usage).cast::<libc::rusage_info_t>(),
+            )
+        };
+        if status != 0 {
+            return Err(vanished(io::Error::last_os_error()));
         }
+        Ok(Start(usage.ri_proc_start_abstime))
     }
 
     impl Start {
-        pub(super) fn microseconds(self) -> u64 {
-            self.seconds * 1_000_000 + self.microseconds
+        pub(super) fn ticks(self) -> u64 {
+            self.0
         }
     }
 
@@ -532,8 +575,8 @@ mod imp {
     }
 
     impl Pin {
-        pub(super) fn started_microseconds(&self) -> u64 {
-            self.start.microseconds()
+        pub(super) fn started_ticks(&self) -> u64 {
+            self.start.ticks()
         }
 
         pub(super) fn open(pid: u32) -> io::Result<Self> {
@@ -581,7 +624,7 @@ mod imp {
             if count == 1 && receipt.flags & libc::EV_ERROR != 0 && receipt.data != 0 {
                 return Err(vanished(io::Error::from_raw_os_error(receipt.data as i32)));
             }
-            let start = start_of(&bsd_info(pid)?);
+            let start = start_of(pid)?;
             Ok(Self {
                 watch,
                 start,
@@ -589,8 +632,23 @@ mod imp {
             })
         }
 
-        pub(super) fn exited(&self, _pid: u32) -> io::Result<bool> {
-            self.collect(std::time::Duration::ZERO)
+        /// Whether the pinned process has exited. The kernel reports the exit
+        /// event once, so a pin also reads the process table: a number held by
+        /// nothing, or by a process that started at another time, has exited
+        /// too.
+        pub(super) fn exited(&self, pid: u32) -> io::Result<bool> {
+            if self.collect(std::time::Duration::ZERO)? {
+                return Ok(true);
+            }
+            let exited = match start_of(pid) {
+                Ok(start) => start != self.start,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error),
+            };
+            if exited {
+                self.exited.store(true, Ordering::Release);
+            }
+            Ok(exited)
         }
 
         pub(super) fn wait(&self, timeout: std::time::Duration) -> io::Result<()> {
@@ -634,14 +692,7 @@ mod imp {
         /// Whether `pid` still names the pinned process: it has not exited and
         /// the process holding the number started when the pinned one did.
         fn current(&self, pid: u32) -> io::Result<bool> {
-            if self.exited(pid)? {
-                return Ok(false);
-            }
-            match bsd_info(pid) {
-                Ok(info) => Ok(start_of(&info) == self.start),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(error),
-            }
+            self.exited(pid).map(|exited| !exited)
         }
 
         pub(super) fn signal(&self, pid: u32, signal: libc::c_int) -> io::Result<bool> {
@@ -660,11 +711,8 @@ mod imp {
         }
 
         pub(super) fn uid(&self, pid: u32) -> io::Result<u32> {
-            let info = bsd_info(pid)?;
-            if start_of(&info) != self.start {
-                return Err(io::Error::from(io::ErrorKind::NotFound));
-            }
-            Ok(info.pbi_uid)
+            // The caller proves the record still describes the pinned process.
+            bsd_info(pid).map(|info| info.pbi_uid)
         }
 
         pub(super) fn executable(&self, pid: u32) -> io::Result<PathBuf> {
@@ -682,9 +730,6 @@ mod imp {
                 return Err(vanished(io::Error::last_os_error()));
             }
             buffer.truncate(written as usize);
-            if !self.current(pid)? {
-                return Err(io::Error::from(io::ErrorKind::NotFound));
-            }
             Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
         }
 
@@ -698,9 +743,6 @@ mod imp {
                         device == expected.dev() && inode == expected.ino()
                     })
                 });
-            if !self.current(pid)? {
-                return Err(io::Error::from(io::ErrorKind::NotFound));
-            }
             Ok(found)
         }
     }
@@ -869,6 +911,39 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    /// A zombie keeps the start it had while it ran, as Linux's `/proc` entry
+    /// does, so a recorded identity still names it until its parent reaps it,
+    /// and a process started later reads a later start.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn start_ticks_name_a_process_until_it_is_reaped() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let running = started_ticks_of(pid).unwrap();
+        assert_eq!(PinnedProcess::open(pid).unwrap().started_ticks(), running);
+        drop(child.stdin.take());
+        let process = PinnedProcess::open(pid).unwrap();
+        assert!(process.wait_for_exit(Duration::from_secs(10)).unwrap());
+        assert_eq!(started_ticks_of(pid).unwrap(), running, "the zombie");
+        child.wait().unwrap();
+        assert_eq!(
+            started_ticks_of(pid).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let mut later = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        assert!(started_ticks_of(later.id()).unwrap() > running);
+        later.wait().unwrap();
     }
 
     #[test]

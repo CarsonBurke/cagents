@@ -198,8 +198,13 @@ pub(crate) fn keep_options_after_shutdown(_socket: BorrowedFd<'_>) -> io::Result
 }
 
 /// Duplicates `source` onto exactly `target`, close-on-exec. Whatever `target`
-/// named before is closed; the caller must own that slot.
+/// named before is closed; the caller must own that slot. `source` cannot be
+/// `target`: Linux's `dup3` refuses that with `EINVAL`, and Darwin's `dup2`
+/// would return the borrowed descriptor itself as a second owner.
 pub(crate) fn duplicate_to(source: BorrowedFd<'_>, target: RawFd) -> io::Result<OwnedFd> {
+    if source.as_raw_fd() == target {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
     #[cfg(target_os = "linux")]
     // SAFETY: dup3 takes scalar arguments; the caller owns the target slot.
     let raw = unsafe { libc::dup3(source.as_raw_fd(), target, libc::O_CLOEXEC) };

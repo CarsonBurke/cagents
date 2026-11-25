@@ -45,7 +45,7 @@ pub(crate) fn child_identity(child: &std::process::Child) -> io::Result<OwnedFd>
         // still unreaped and ours, so confirm the exit, then make the queue
         // permanently ready the way NOTE_EXIT would have.
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
-            match child_exit_status(&queue, pid, libc::WEXITED | libc::WNOWAIT | libc::WNOHANG)? {
+            match exiting_child_status(pid, libc::WEXITED | libc::WNOWAIT)? {
                 Some(_) => {
                     register(&queue, 0, libc::EVFILT_USER, libc::NOTE_TRIGGER)?;
                     Ok(queue)
@@ -136,7 +136,30 @@ pub(crate) fn child_exit_status(
     // exit readiness instead, then read the status without blocking.
     if flags & libc::WNOHANG == 0 {
         wait_readable(identity)?;
+        return exiting_child_status(pid, flags);
     }
+    waited_status(pid, flags)
+}
+
+/// The status of a child whose exit the kernel has already announced, by
+/// NOTE_EXIT or by refusing to watch it. XNU announces the exit while tearing
+/// the process down, and only reports it to waitid once the child is a zombie,
+/// so allow that transition a moment before concluding there is no status.
+#[cfg(target_os = "macos")]
+fn exiting_child_status(pid: u32, flags: i32) -> io::Result<Option<ExitStatus>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let status = waited_status(pid, flags)?;
+        if status.is_some() || std::time::Instant::now() >= deadline {
+            return Ok(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// One waitid that never blocks; see [`child_exit_status`] for `flags`.
+#[cfg(target_os = "macos")]
+fn waited_status(pid: u32, flags: i32) -> io::Result<Option<ExitStatus>> {
     let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: this executor is the child's sole reaper, so the PID still

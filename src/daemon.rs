@@ -1176,21 +1176,58 @@ pub fn seal_inherited_descriptors() -> io::Result<()> {
 /// not retain installer assets, update leases, or other inherited descriptors.
 ///
 /// Darwin has no `close_range`. Between fork and exec only async-signal-safe
-/// calls are allowed, so this marks every possible descriptor with `fcntl`
-/// rather than listing the open ones, which would allocate. No descriptor can
-/// be numbered at or above the soft `RLIMIT_NOFILE` the process ran with, which
-/// `getdtablesize` reports.
+/// calls are allowed and nothing may allocate, so the kernel lists this
+/// process's open descriptors into a buffer on the stack, and each is marked
+/// close-on-exec. A list that may have been cut short falls back to marking
+/// every number below the highest descriptor limit the process has run with:
+/// an earlier hook may already have lowered the limit for the child, which
+/// leaves descriptors numbered above it open.
 #[cfg(target_os = "macos")]
 pub fn seal_inherited_descriptors() -> io::Result<()> {
-    // SAFETY: getdtablesize has no preconditions.
-    let limit = unsafe { libc::getdtablesize() };
-    for descriptor in 3..limit {
-        // SAFETY: fcntl takes scalar arguments; an unused number answers EBADF.
-        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EBADF) {
-                return Err(error);
-            }
+    const LISTED: usize = 4096;
+    let mut listed = [libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; LISTED];
+    let room = std::mem::size_of_val(&listed);
+    // SAFETY: the buffer is writable and exactly `room` bytes long; the call
+    // only fills it and answers how many bytes it wrote.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            listed.as_mut_ptr().cast(),
+            room as libc::c_int,
+        )
+    };
+    match usize::try_from(written) {
+        Ok(written) if written > 0 && written < room => {
+            let count = written / std::mem::size_of::<libc::proc_fdinfo>();
+            listed[..count]
+                .iter()
+                .filter(|entry| entry.proc_fd > 2)
+                .try_for_each(|entry| close_on_exec(entry.proc_fd))
+        }
+        _ => {
+            // SAFETY: getdtablesize has no preconditions.
+            let limit = unsafe { libc::getdtablesize() };
+            // Only the daemon raises its own limit.
+            #[cfg(feature = "host")]
+            let limit = limit.max(crate::descriptor_limit::highest());
+            (3..limit).try_for_each(close_on_exec)
+        }
+    }
+}
+
+/// Marks `descriptor` close-on-exec; a number not in use is left alone.
+#[cfg(target_os = "macos")]
+fn close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
+    // SAFETY: fcntl takes scalar arguments; an unused number answers EBADF.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBADF) {
+            return Err(error);
         }
     }
     Ok(())
@@ -1198,7 +1235,7 @@ pub fn seal_inherited_descriptors() -> io::Result<()> {
 
 #[cfg(feature = "host")]
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    peer_credentials(stream).map(|credentials| credentials.uid)
+    crate::pinned_process::peer_uid(stream)
 }
 
 pub fn read_boot_id() -> io::Result<BootId> {
