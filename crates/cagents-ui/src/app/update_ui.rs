@@ -18,6 +18,8 @@ pub(super) struct State {
     /// Whether this window runs from an installation tree, the only place an
     /// install can leave it behind.
     watch_installation: bool,
+    #[cfg(feature = "development")]
+    watch_review_fixture: bool,
     inspecting: bool,
     /// The installed UI executable this window has been left behind by.
     superseded: Option<PathBuf>,
@@ -141,19 +143,27 @@ pub enum Action {
 }
 
 #[derive(Hash)]
-struct ProgressJob(String);
+enum ProgressScope {
+    Installation,
+    Job(String),
+}
 
-fn watch_progress(job: &ProgressJob) -> impl iced::futures::Stream<Item = Action> + use<> {
-    let job = job.0.clone();
+fn watch_progress(scope: &ProgressScope) -> impl iced::futures::Stream<Item = Action> + use<> {
+    let job = match scope {
+        ProgressScope::Installation => None,
+        ProgressScope::Job(job) => Some(job.clone()),
+    };
     iced::stream::channel(1, async move |mut output| {
+        let active_job = job.is_some();
         if let Ok(Ok(changes)) =
-            tokio::task::spawn_blocking(crate::update::progress::Changes::watch).await
-        {
-            if output
-                .send(Action::ProgressWatch(job.clone(), true))
+            tokio::task::spawn_blocking(move || crate::update::progress::Changes::watch(active_job))
                 .await
-                .is_err()
-            {
+        {
+            let registered = match &job {
+                Some(job) => Action::ProgressWatch(job.clone(), true),
+                None => Action::Poll,
+            };
+            if output.send(registered).await.is_err() {
                 return;
             }
             while changes.changed().await {
@@ -162,7 +172,9 @@ fn watch_progress(job: &ProgressJob) -> impl iced::futures::Stream<Item = Action
                 }
             }
         }
-        let _ = output.send(Action::ProgressWatch(job, false)).await;
+        if let Some(job) = job {
+            let _ = output.send(Action::ProgressWatch(job, false)).await;
+        }
         // Keep the fallback active for the rest of this job if its file
         // watcher could not be registered or disconnected.
         std::future::pending::<()>().await;
@@ -344,6 +356,8 @@ impl State {
     pub(super) fn new() -> Self {
         Self {
             watch_installation: crate::update::runs_from_installation(),
+            #[cfg(feature = "development")]
+            watch_review_fixture: crate::update::progress::Changes::has_review_fixture(),
             ..Self::default()
         }
     }
@@ -715,14 +729,6 @@ impl Cagents {
         } else {
             Subscription::none()
         };
-        // Release discovery talks to GitHub and drives the installer, neither
-        // of which a development instance may do.
-        if crate::instance::NAME == "development"
-            && !self.update_ui.updating()
-            && !self.update_ui.poll_retry
-        {
-            return installation;
-        }
         let active_job = self.update_ui.active_job();
         // Older workers publish a failure before their last recovery verdict.
         // This window may still present Installing until their deadline,
@@ -738,7 +744,7 @@ impl Cagents {
         let progress = if let Some(job) = active_job {
             // The lease observer is one-shot. Register it only once we have
             // seen a job whose worker has taken custody of the lease.
-            let watch = Subscription::run_with(ProgressJob(job.to_owned()), watch_progress)
+            let watch = Subscription::run_with(ProgressScope::Job(job.to_owned()), watch_progress)
                 .map(Message::UpdateUi);
             let fallback = if poll {
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
@@ -750,11 +756,26 @@ impl Cagents {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
         } else if self.update_ui.applying {
             Subscription::none()
-        } else if self.settings.check_for_updates {
-            iced::time::every(background_check_interval(self.update_ui.check_failures))
-                .map(|_| Message::UpdateUi(Action::Check))
         } else {
-            Subscription::none()
+            // Development instances can observe their read-only fixture but
+            // have no installed release to check for.
+            let installed = crate::instance::NAME != "development";
+            let release = if installed && self.settings.check_for_updates {
+                iced::time::every(background_check_interval(self.update_ui.check_failures))
+                    .map(|_| Message::UpdateUi(Action::Check))
+            } else {
+                Subscription::none()
+            };
+            let watch_worker = installed && self.update_ui.watch_installation;
+            #[cfg(feature = "development")]
+            let watch_worker = watch_worker || self.update_ui.watch_review_fixture;
+            let worker = if watch_worker {
+                Subscription::run_with(ProgressScope::Installation, watch_progress)
+                    .map(Message::UpdateUi)
+            } else {
+                Subscription::none()
+            };
+            Subscription::batch([release, worker])
         };
         Subscription::batch([progress, installation])
     }
@@ -1374,7 +1395,8 @@ pub(in crate::app) mod tests {
         let main = window::Id::RESERVED;
         app.core.set_main_window_id(Some(main));
         app.refresh_ui.focused = true;
-        assert_eq!(app.update_subscription().units(), 1);
+        let worker = usize::from(crate::instance::NAME != "development");
+        assert_eq!(app.update_subscription().units(), worker + 1);
         let inspected = |app: &mut Cagents| {
             let started = app.update_ui.inspecting;
             drop(app.update_update_ui(Action::InstallationInspected(None)));
@@ -1388,8 +1410,8 @@ pub(in crate::app) mod tests {
         }
         assert_eq!(
             app.update_subscription().units(),
-            0,
-            "an unfocused window does not poll its installation"
+            worker,
+            "an unfocused window keeps noticing newly started jobs without polling its installation"
         );
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
         assert!(inspected(&mut app), "regaining focus inspects at once");

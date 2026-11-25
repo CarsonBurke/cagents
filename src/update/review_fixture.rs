@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
-    let Some(bytes) = read_fixture(&root.join("home/.config/fixture-update-review.json"))? else {
+    let Some(bytes) = read_fixture(&path(root))? else {
         return Ok(None);
     };
     let job: UpdateJob = serde_json::from_slice(&bytes)?;
@@ -23,6 +23,10 @@ pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
         ));
     }
     Ok(Some(job))
+}
+
+pub(super) fn path(root: &Path) -> PathBuf {
+    root.join("home/.config/fixture-update-review.json")
 }
 
 /// The release a development build's update check offers while
