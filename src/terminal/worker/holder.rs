@@ -2534,7 +2534,7 @@ mod tests {
             let stat = "/usr/bin/stat -f 'PIN_ID:%d:%i' .";
             std::fs::write(
                 &program,
-                format!("#!/bin/sh\n{stat}\n/bin/cat payload\nprintf 'PIN_OK\n'\n"),
+                format!("#!/bin/sh\n{stat}\n/bin/cat payload\nprintf 'PIN_OK\n'\nIFS= read -r release\nprintf 'PIN_DONE\n'\n"),
             )
             .unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2568,6 +2568,7 @@ mod tests {
             let duplicate = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0) };
             assert!(duplicate >= 0);
             let master = PtyMaster(unsafe { OwnedFd::from_raw_fd(duplicate) });
+            eprintln!("held cwd fixture using relative PATH: {relative_path}");
             let output = read_until(&master, "PIN_OK");
             assert!(
                 output.contains(&format!("PIN_ID:{}:{}", pin.0.device, pin.0.inode)),
@@ -2575,6 +2576,9 @@ mod tests {
             );
             assert!(output.contains("ORIGINAL_PAYLOAD"), "{output}");
             assert!(!output.contains("REPLACEMENT"), "{output}");
+            let mut writer = File::from(master.duplicate().unwrap());
+            std::io::Write::write_all(&mut writer, b"\n").unwrap();
+            assert!(read_until(&master, "PIN_DONE").contains("PIN_DONE"));
             assert_eq!(child.wait().unwrap().exit_code(), 0);
             assert_eq!(
                 crate::agent_execution::DirectoryIdentity::from_metadata(
@@ -3319,7 +3323,7 @@ mod tests {
             let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
             let (exits, _exited) = crossbeam_channel::bounded(1);
             let held = spawn_recoverable(
-                command("stty -echo; echo ready; while read line; do if [ \"$line\" = finish ]; then echo completed-result; exit 7; fi; echo still-running:$line; done"),
+                command("echo ready; while read line; do if [ \"$line\" = finish ]; then echo completed-result; exit 7; fi; echo still-running:$line; done"),
                 size(),
                 exits,
                 Some(recovery),
