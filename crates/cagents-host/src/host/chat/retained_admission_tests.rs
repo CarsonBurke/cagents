@@ -184,6 +184,10 @@ pub(super) fn pause_failed_confirmation(id: TerminalId) {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_failure_preserves_replacement_attachment() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -196,6 +200,10 @@ fn named_claude_resume_failure_preserves_replacement_attachment() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_failure_retires_before_exact_retry() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -208,6 +216,10 @@ fn named_claude_resume_failure_retires_before_exact_retry() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_retry_finishes_failed_retirement_write() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -220,6 +232,10 @@ fn named_claude_resume_retry_finishes_failed_retirement_write() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_normal_close_finishes_failed_retirement_write() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -792,6 +808,10 @@ impl Drop for HostClientWire {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -862,6 +882,10 @@ fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
     if crate::retained_fixture::run_isolated() {
         return;

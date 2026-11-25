@@ -3,6 +3,10 @@ use super::*;
 use std::{fs, path::Path};
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
     if crate::retained_fixture::run_isolated() {
         return;

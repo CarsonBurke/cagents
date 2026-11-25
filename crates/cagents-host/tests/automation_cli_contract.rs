@@ -185,6 +185,10 @@ impl Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn daemon_stop_then_start_waits_for_the_original_process_to_exit() {
     if retained_fixture::run_isolated() {
         return;
@@ -216,6 +220,10 @@ fn a_live_process_without_a_control_reply_is_not_ready() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it() {
     if retained_fixture::run_isolated() {
         return;
@@ -732,6 +740,10 @@ fn run_attention_rejected_by_the_journal_survives_a_killed_daemon() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_and_removal() {
     if retained_fixture::run_isolated() {
         return;

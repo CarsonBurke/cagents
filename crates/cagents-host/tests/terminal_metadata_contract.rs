@@ -1,3 +1,5 @@
+// Only the Linux-only inventory test drives the command line.
+#[cfg(target_os = "linux")]
 #[path = "support/cli.rs"]
 mod cli;
 use std::{

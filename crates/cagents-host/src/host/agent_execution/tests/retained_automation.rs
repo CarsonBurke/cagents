@@ -101,6 +101,10 @@ pub(super) fn isolated_retained() -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn completed_retained_automation_retires_only_after_exact_idle_close() {
     if isolated_retained() {
         return;

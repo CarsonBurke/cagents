@@ -424,6 +424,10 @@ impl Drop for Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -477,6 +481,10 @@ fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launchin
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -591,6 +599,10 @@ fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -699,6 +711,10 @@ const SPLIT_THIRD_FRAME: (&str, &str) = (
 /// actor has read but not applied keeps readiness Unready, so the provider's
 /// record and `busy` alone do not mean the held turn has settled.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_retained_update_readiness_settles_once_the_actor_applies_recorded_output() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -730,6 +746,10 @@ fn real_retained_update_readiness_settles_once_the_actor_applies_recorded_output
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -845,6 +865,10 @@ fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -894,6 +918,10 @@ fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -974,6 +1002,10 @@ fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -1033,6 +1065,10 @@ fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -1120,6 +1156,10 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -1168,6 +1208,10 @@ fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
 // Append inside the existing retained_resolution_tests module, where Fixture
 // and isolated() retain their original bounded real-helper ownership mechanics.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
     if crate::retained_fixture::run_isolated() {
         return;

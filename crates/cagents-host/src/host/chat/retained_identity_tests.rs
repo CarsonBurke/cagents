@@ -3,6 +3,10 @@ use super::*;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames() {
     if crate::retained_fixture::run_isolated() {
         return;
