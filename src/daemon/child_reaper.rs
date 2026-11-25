@@ -288,6 +288,7 @@ impl Reservation {
             ticket: self.ticket,
             suspended: false,
             recoverable,
+            exit_announced: None,
         });
         if let Err(error) = service.wake() {
             let entry = state.entries[slot]
@@ -335,6 +336,7 @@ impl Reservation {
             ticket: self.ticket,
             suspended: true,
             recoverable: false,
+            exit_announced: None,
         });
         if state.failure.is_none() {
             state.failure = Some(format!("Exact child {pid} remains suspended: {reason}"));
@@ -372,7 +374,16 @@ struct Entry {
     ticket: u64,
     suspended: bool,
     recoverable: bool,
+    /// When its pin first reported an exit that the child could not yet be
+    /// reaped for; see [`EXIT_SETTLE`].
+    exit_announced: Option<std::time::Instant>,
 }
+
+/// How long a child may stay unreapable after its pin reports its exit.
+/// Darwin announces an exit while it tears the process down, a moment before
+/// the child becomes a zombie that can be reaped; Linux makes the two one.
+const EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
 struct State {
     entries: Vec<Option<Entry>>,
     quarantined: Vec<Option<u64>>,
@@ -761,6 +772,10 @@ impl Service {
                 events: libc::POLLIN,
                 revents: 0,
             }));
+            // SAFETY: `poll` is an initialized, exclusively borrowed array of
+            // `poll.len()` pollfds, and poll touches nothing else. A
+            // descriptor whose entry left meanwhile can only report
+            // readiness, which the ticket check below discards.
             let result = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as _, -1) };
             if result < 0 {
                 let error = io::Error::last_os_error();
@@ -776,6 +791,7 @@ impl Service {
                 self.fail(error);
                 return;
             }
+            let mut settling = false;
             for ((slot, ticket, _), ready) in snapshot.iter().zip(&poll[1..]) {
                 if ready.revents == 0 {
                     continue;
@@ -799,6 +815,17 @@ impl Service {
                         true
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Ok(None)
+                        if cfg!(target_os = "macos")
+                            && entry
+                                .exit_announced
+                                .get_or_insert_with(std::time::Instant::now)
+                                .elapsed()
+                                < EXIT_SETTLE =>
+                    {
+                        settling = true;
+                        continue;
+                    }
                     result => {
                         entry.suspended = true;
                         let error = match result {
@@ -820,6 +847,10 @@ impl Service {
                 if should_wake_daemon {
                     crate::daemon::wake();
                 }
+            }
+            if settling {
+                // Its pin stays ready, so wait a moment rather than spin.
+                thread::sleep(std::time::Duration::from_millis(1));
             }
         }
     }

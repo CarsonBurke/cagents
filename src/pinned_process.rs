@@ -436,8 +436,8 @@ impl PinnedChild {
     ///
     /// # Errors
     ///
-    /// Returns `ECHILD` when `child` has already been reaped, and the
-    /// underlying error for every other failure.
+    /// Returns `ECHILD` or [`io::ErrorKind::NotFound`] when `child` has
+    /// already been reaped, and the underlying error for every other failure.
     pub fn of(child: &Child) -> io::Result<Self> {
         Self::of_pid(child.id())
     }
@@ -985,23 +985,31 @@ mod imp {
 
         pub(super) fn open(pid: u32) -> io::Result<Self> {
             let watch = queue()?;
-            // Register first, then read the start time: the registration binds
-            // to whichever process held the pid at that instant, and if that
-            // process exits before the start time is read, its exit event is
-            // already queued, so the pin reads as exited and never signals.
+            // The registration binds to whichever process held the pid at that
+            // instant. The start time read on both sides of it names that
+            // process only if it is the same: a process alive at both reads
+            // held the pid throughout. A different start means the pid changed
+            // hands meanwhile, so the process meant is gone.
+            let before = start_of(pid);
             match register(
                 &watch,
                 pid as libc::uintptr_t,
                 libc::EVFILT_PROC,
                 libc::NOTE_EXIT,
             ) {
-                Ok(()) => Ok(Self {
-                    start: start_of(pid)?,
-                    watch,
-                }),
+                Ok(()) => {
+                    let start = before?;
+                    if start_of(pid)? != start {
+                        return Err(io::Error::from(io::ErrorKind::NotFound));
+                    }
+                    Ok(Self { watch, start })
+                }
                 // XNU refuses to watch a process that is exiting or a zombie.
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                     let start = zombie_start(pid)?;
+                    if before.is_ok_and(|before| before != start) {
+                        return Err(io::Error::from(io::ErrorKind::NotFound));
+                    }
                     latch(&watch)?;
                     Ok(Self { watch, start })
                 }

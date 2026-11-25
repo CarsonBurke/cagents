@@ -154,6 +154,7 @@ fn late_completed_retirement_reuses_naturally_settled_original_worker() {
         .original_holder_process
         .get()
         .unwrap();
+    // SAFETY: F_GETFD takes no pointer and reads a descriptor the pin owns.
     let flags = unsafe { libc::fcntl(original.exit_readiness().as_raw_fd(), libc::F_GETFD) };
     assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
     let proof = retirement_test_proof();
@@ -312,6 +313,7 @@ fn completed_retirement_waits_for_exact_holder_exit_and_authenticated_receipt() 
             .get()
             .unwrap(),
     );
+    // SAFETY: F_GETFD takes no pointer and reads a descriptor the pin owns.
     let flags = unsafe { libc::fcntl(original.exit_readiness().as_raw_fd(), libc::F_GETFD) };
     assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
     let receipt = paths.directory.join("holders").join(format!(
@@ -1617,6 +1619,7 @@ fn launch_pin_refuses_kernel_exit_before_worker_completion_publication() {
     assert!(handle.pinned_launch_directory().is_ok());
     let (_, original) = handle.inner.published.launch_directory.get().unwrap();
     assert_ne!(
+        // SAFETY: F_GETFD takes no pointer and reads a descriptor the pin owns.
         unsafe { libc::fcntl(original.exit_readiness().as_raw_fd(), libc::F_GETFD) }
             & libc::FD_CLOEXEC,
         0

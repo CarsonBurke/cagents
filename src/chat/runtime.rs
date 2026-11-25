@@ -2306,6 +2306,7 @@ impl ChildGuard {
         grace: Duration,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
         let deadline = Instant::now() + grace;
+        let mut announced = false;
         loop {
             if let Some(status) = self.observed_exit_status()? {
                 return Ok(Some(status));
@@ -2314,8 +2315,15 @@ impl ChildGuard {
             if remaining.is_zero() {
                 return Ok(None);
             }
+            if announced {
+                // Darwin announces an exit a moment before the child can be
+                // waited for, and the pin stays ready, so pause, not spin.
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                continue;
+            }
             // The pin stays open throughout this non-reaping observation.
-            self.identity
+            announced = self
+                .identity
                 .process()
                 .wait_for_exit(remaining)
                 .map_err(|error| {
@@ -2338,6 +2346,8 @@ impl ChildGuard {
             Err(error) => {
                 // Startup has not handed the child to another owner. Keep the
                 // leader unreaped while cleaning its original process group.
+                // SAFETY: kill takes scalar arguments. The unreaped leader
+                // keeps its pid, and so its group's, from being reused.
                 let group_cleanup =
                     if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
                         Ok(())

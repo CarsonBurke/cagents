@@ -567,7 +567,14 @@ pub(super) fn adopt_recoverable(
             socket.display()
         ));
     }
-    let pin = pin_peer(&control, peer.pid).map_err(failed)?;
+    let pin = match &evidence {
+        // Darwin names only a candidate pid, so pin the process the evidence
+        // recorded: a later one holding that pid pins as gone.
+        #[cfg(target_os = "macos")]
+        Some(record) => PinnedProcess::open_started(peer.pid, record.holder.start),
+        _ => pin_peer(&control, peer.pid),
+    }
+    .map_err(failed)?;
     let mut holder = Holder::new(control, None);
     // A refused or malformed handshake grants no authority to release it.
     holder.detached = true;
@@ -1229,8 +1236,12 @@ fn pin_peer(socket: &UnixStream, pid: u32) -> io::Result<PinnedProcess> {
     }
 }
 
-/// Darwin names only a candidate pid for the peer, which lives until it has
-/// handed over; every caller checks the pin against recorded evidence.
+/// Darwin names only a candidate pid for the peer. Pinned without recorded
+/// evidence, it names the holder only once the holder answers through this
+/// socket, which no other process holds: a holder alive after the pin was
+/// alive when it was taken, so its pid had no successor yet. Until then the
+/// pin grants nothing, since a holder adopted without a handshake stays
+/// detached and is never signalled.
 #[cfg(target_os = "macos")]
 fn pin_peer(_socket: &UnixStream, pid: u32) -> io::Result<PinnedProcess> {
     PinnedProcess::open_unreaped(pid)
@@ -2192,6 +2203,10 @@ fn receive_with_descriptors(
 
 #[cfg(target_os = "linux")]
 const RECEIVE_CLOSE_ON_EXEC: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+/// Darwin has no flag to receive descriptors close-on-exec, so each is marked
+/// right after `recvmsg` returns. A program another thread of the daemon
+/// executes in between could inherit one and keep it open. No pin crosses
+/// this socket on Darwin; see [`RootPin`].
 #[cfg(target_os = "macos")]
 const RECEIVE_CLOSE_ON_EXEC: libc::c_int = 0;
 

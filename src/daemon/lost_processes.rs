@@ -376,12 +376,20 @@ fn wait_for_exit(mut pinned: Vec<Pinned>, limit: Duration) -> Result<Vec<Pinned>
             }
             return Err(format!("Cannot wait for ended processes: {error}"));
         }
-        let mut index = 0;
-        pinned.retain(|_| {
-            let exited = polled[index].revents != 0;
-            index += 1;
-            !exited
-        });
+        let mut remaining = Vec::with_capacity(pinned.len());
+        for (process, polled) in pinned.into_iter().zip(&polled) {
+            // Only a readiness that reports an exit removes a process; an
+            // invalid or failed descriptor proves nothing.
+            if polled.revents == 0
+                || !process
+                    .process
+                    .exited()
+                    .map_err(|error| format!("Cannot wait for ended processes: {error}"))?
+            {
+                remaining.push(process);
+            }
+        }
+        pinned = remaining;
     }
     Ok(pinned)
 }
