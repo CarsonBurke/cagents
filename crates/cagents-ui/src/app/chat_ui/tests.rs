@@ -24503,7 +24503,14 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
                 )));
             }
             drop(f.app.update(receipt));
-            assert_inert_live_recovery_copy(&f);
+            // Either way the pane still holds the same conversation, so its
+            // draft stays on it and no copy is left beside it.
+            let canonical = if case == "writer refusal" {
+                f.canonical.clone()
+            } else {
+                next.clone()
+            };
+            assert_draft_kept_without_copy(&mut f, &canonical);
         }
         assert!(!f.app.chat_start_pending(f.card));
         assert!(

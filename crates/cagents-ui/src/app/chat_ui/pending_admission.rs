@@ -315,8 +315,21 @@ impl Cagents {
             return (Task::none(), None);
         };
         runtime.connection = Connection::AwaitingAdmission;
-        // The card's own pane may already be retired or replaced, so its
-        // Content can't be assumed to belong there: it is kept as a copy.
+        // A view that still lists the card with the same conversation, as
+        // when only the daemon's proof changed again, keeps the draft there.
+        let source = runtime.session.clone();
+        if let Some(listed) = self.workspace_model.views.iter().find_map(|view| {
+            view.panes.iter().find(|listed| {
+                listed.id == card
+                    && matches!(&listed.kind, CardKind::Chat(session) if same_conversation(session, &source))
+            })
+        }) {
+            let listed = listed.clone();
+            return self.admit_shared_chat_inner(&listed, false, true);
+        }
+        // Otherwise the card's own pane may already be retired or replaced,
+        // so its Content can't be assumed to belong there: it is kept as a
+        // copy.
         self.admit_shared_chat_inner(&pane, false, false)
     }
 
