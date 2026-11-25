@@ -1,5 +1,5 @@
 use super::{PinnedProcess, Process, Survivor, command_for_display};
-use std::path::Path;
+use std::{io, path::Path};
 
 /// What `/proc/<pid>/stat` says of one process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
