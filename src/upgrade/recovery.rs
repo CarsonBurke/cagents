@@ -2247,6 +2247,7 @@ fn validate_lock_description(file: &File, access: &str) -> io::Result<()> {
         // can hold a SH lock on this inode throughout recovery. An
         // independently held SH lock here prevents an EX owner from racing
         // the offered descriptor's acquisition or downgrade.
+        crate::flock::require_lock_history(file)?;
         let independent = crate::descriptor::reopen(file, 0)?;
         for descriptor in [&independent, file] {
             // SAFETY: the descriptors remain live; neither flock blocks.

@@ -1534,6 +1534,11 @@ fn prepared_standby_proof_is_bound_to_the_target_and_locked_descriptions() {
         .open(&receipt.authority.daemon_path)
         .unwrap();
     assert!(validate_lock(&unheld, &receipt.authority.daemon_path).is_err());
+    let unheld_legacy = OpenOptions::new()
+        .read(true)
+        .open(&receipt.authority.legacy_path)
+        .unwrap();
+    assert!(validate_lock_mode(&unheld_legacy, &receipt.authority.legacy_path, "READ").is_err());
     let mut modified = receipt.authority.clone();
     modified.target_hash = "0".repeat(64);
     assert!(validate_authority_target(&target, &modified).is_err());
