@@ -2894,24 +2894,39 @@ fn connect_activation_socket(path: &Path) -> io::Result<std::os::unix::net::Unix
 fn bind_activation_socket(path: &Path) -> io::Result<UnixListener> {
     crate::descriptor::with_socket_address(path, |address| {
         let listener = crate::descriptor::bind(address)?;
-        if let Err(error) = restrict_activation_socket(&listener, address) {
-            let _ = fs::remove_file(address);
-            return Err(error);
-        }
+        // On failure drop the listener. A retry may remove a stale socket
+        // through prepare_activation_socket_path. Unlinking here could
+        // delete a replacement file.
+        restrict_activation_socket(address)?;
         Ok(listener)
     })
 }
 
-/// Restricts the bound socket's own inode to its owner. Linux leaves the node
-/// bind made at the mode the umask gave it, so the private runtime directory
-/// is what keeps other users from connecting.
+/// Leaves a bound activation socket readable and writable by its owner only.
+///
+/// `fchmod` on the listener would change only the socket's own inode, not the
+/// node bind made, whose mode `connect` checks. So the node is opened by
+/// `path` without following a symlink, required to be a socket, and changed
+/// through its `/proc/self/fd` link, which needs no glibc support for
+/// `AT_SYMLINK_NOFOLLOW`. Binding trusts the runtime directory to protect
+/// the name between bind and open, as it does for other runtime entries.
 #[cfg(all(feature = "ui", target_os = "linux"))]
-fn restrict_activation_socket(listener: &UnixListener, _path: &Path) -> io::Result<()> {
-    // SAFETY: fchmod receives the bound listener's live descriptor.
-    if unsafe { libc::fchmod(listener.as_raw_fd(), PRIVATE_SOCKET_MODE) } != 0 {
-        return Err(io::Error::last_os_error());
+fn restrict_activation_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let node = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !node.metadata()?.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the activation socket was replaced before it was made private",
+        ));
     }
-    Ok(())
+    fs::set_permissions(
+        format!("/proc/self/fd/{}", node.as_raw_fd()),
+        fs::Permissions::from_mode(PRIVATE_SOCKET_MODE),
+    )
 }
 
 /// Leaves a bound activation socket readable and writable by its owner only.
@@ -2921,10 +2936,9 @@ fn restrict_activation_socket(listener: &UnixListener, _path: &Path) -> io::Resu
 /// replaces the socket between bind and chmod could have the mode applied to
 /// its replacement instead. No one else can: the runtime directory
 /// `runtime_base` creates is verified private, and one named by
-/// `XDG_RUNTIME_DIR` is trusted as it is on Linux, where that directory's
-/// privacy is what keeps the socket private.
+/// `XDG_RUNTIME_DIR` is trusted as it is on Linux.
 #[cfg(all(feature = "ui", target_os = "macos"))]
-fn restrict_activation_socket(_listener: &UnixListener, path: &Path) -> io::Result<()> {
+fn restrict_activation_socket(path: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -5233,9 +5247,6 @@ mod tests {
         let listener = UiActivationListener::bind_named(&runtime, socket.clone(), sender).unwrap();
         let bound = fs::symlink_metadata(runtime.join(&socket)).unwrap();
         assert!(bound.file_type().is_socket());
-        // Linux's fchmod reaches the socket's own inode, not the node bind
-        // made, so only Darwin's path-based restriction shows here.
-        #[cfg(target_os = "macos")]
         assert_eq!(bound.permissions().mode() & 0o777, 0o600);
         assert!(activate_socket_with_token(&runtime, socket.clone(), Some("token")).unwrap());
         assert_eq!(
@@ -5277,6 +5288,12 @@ mod tests {
             editor_sender,
         )
         .unwrap();
+        for destination in [&agents, &editor] {
+            let bound =
+                fs::symlink_metadata(runtime.path().join(destination_socket_name(destination)))
+                    .unwrap();
+            assert_eq!(bound.mode() & 0o777, 0o600);
+        }
         assert!(
             activate_socket_with_token(
                 runtime.path(),
