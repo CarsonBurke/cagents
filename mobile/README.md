@@ -82,6 +82,9 @@ mise run mobile:install-debug  # the debuggable build instead
 
 Both builds install beside a release build as `dev.cagents.mobile.debug`, and
 either replaces the other, keeping the phone's key and trusted hosts.
+They are signed with this machine's debug key (`~/.android/debug.keystore`,
+or `ANDROID_DEBUG_KEYSTORE`), which the build host borrows for the build, so
+they also replace what was installed from here before.
 
 - The preview is release code: minified by R8, not debuggable, and signed with
   the debug key until release signing exists. Use it on a phone. On a Pixel 8,
