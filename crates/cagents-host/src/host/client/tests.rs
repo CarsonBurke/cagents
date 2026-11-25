@@ -2683,12 +2683,31 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
         }
     }
 
-    let directory = tempfile::tempdir().unwrap();
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = tempfile::tempdir_in(parent).unwrap();
     let executable = directory.path().join("claude");
-    // A real ELF foreground executable with an exact provider basename.
+    // A real foreground executable with an exact provider basename.
     // The copied shell reads our local `agents` script for the real probe;
     // no installed provider, credentials, network, or model is involved.
-    std::fs::copy("/bin/sh", &executable).unwrap();
+    #[cfg(target_os = "linux")]
+    let shell = "/bin/sh";
+    #[cfg(target_os = "macos")]
+    let shell = "/bin/bash";
+    std::fs::copy(shell, &executable).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // A copied system signature can hide the probe's source environment.
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     std::fs::write(
         directory.path().join("agents"),
         "printf '%s' \"$$\" > probe-started\nexec /bin/sleep 30\n",
@@ -2758,6 +2777,11 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
             response: ServerResponse::Connected { .. }
         }
     ));
+    // Startup execs the full holder image. Only subsequent IPC requests
+    // must answer within a second while the provider probe is running.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     send(
         &mut stream,
         &proof,
@@ -2773,6 +2797,9 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
             response: ServerResponse::Spawned { .. }
         }
     ));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
     cleanup.handle = Some(host.lock().unwrap().handle(1, terminal_id).unwrap());
     wait_file(&directory.path().join("terminal-ready"));
     // The daemon samples without any refresh request. Process discovery is

@@ -1179,6 +1179,34 @@ impl HeldChild {
         self.pid
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn foreground_group(&self, master: &PtyMaster) -> Option<libc::pid_t> {
+        use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+
+        // Darwin restricts TIOCGPGRP to the process's own controlling tty.
+        // Read the held root's controlling tty instead and match it to the
+        // slave device of this live master, without opening that slave.
+        let mut name = [0u8; 128];
+        // SAFETY: TIOCPTYGNAME on a master writes at most 128 bytes.
+        if unsafe {
+            libc::ioctl(
+                master.as_raw_fd(),
+                libc::TIOCPTYGNAME.into(),
+                name.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return None;
+        }
+        let name = std::ffi::CStr::from_bytes_until_nul(&name).ok()?;
+        let path = Path::new(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let slave = path.symlink_metadata().ok()?;
+        if !slave.file_type().is_char_device() {
+            return None;
+        }
+        self.pin.terminal_foreground_group(slave.rdev())
+    }
+
     /// Another pin of this exact root.
     pub(super) fn duplicate_pin(&self) -> io::Result<PinnedProcess> {
         self.pin.try_clone()
@@ -2862,6 +2890,39 @@ mod tests {
         read_until(&held.master, "HOME_PIN_READY");
         let mut writer = File::from(held.master.duplicate().unwrap());
         std::io::Write::write_all(&mut writer, b"\n").unwrap();
+        assert_eq!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .exit_code(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_exact_pty_foreground_group_can_differ_from_its_root() {
+        let mut fixture = CommandBuilder::new("/bin/bash");
+        fixture.args([
+            "-c",
+            r#"set -m; /bin/bash -c 'printf "job:%d ready\n" "$$"; IFS= read -r line'; printf "job-finished\n""#,
+        ]);
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = spawn(fixture, size(), exits).unwrap();
+        let output = read_until(&held.master, " ready");
+        let job = output
+            .lines()
+            .find_map(|line| line.strip_prefix("job:")?.strip_suffix(" ready"))
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert_ne!(job, held.child.pid());
+        assert_eq!(held.child.foreground_group(&held.master), Some(job));
+
+        let mut writer = File::from(held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"\n").unwrap();
+        assert!(read_until(&held.master, "job-finished").contains("job-finished"));
         assert_eq!(
             exited
                 .recv_timeout(Duration::from_secs(5))
