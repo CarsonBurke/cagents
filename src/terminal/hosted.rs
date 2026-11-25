@@ -1530,7 +1530,7 @@ fn ensure_daemon_ready_at(
     application: crate::notifications::Application,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     let started = Instant::now();
-    match crate::descriptor::connect(socket) {
+    match crate::descriptor::connect_settled(socket) {
         Ok(stream) => {
             return verify_existing_startup_stream(socket, stream, started);
         }
@@ -1552,8 +1552,8 @@ fn ensure_daemon_ready_at(
 
     let timeout = crate::upgrade::handoff::startup_timeout()
         .map_err(HostedTerminalStartError::HostStartup)?;
-    let current_exe =
-        std::env::current_exe().map_err(HostedTerminalStartError::CurrentExecutable)?;
+    let current_exe = crate::process::current_executable()
+        .map_err(HostedTerminalStartError::CurrentExecutable)?;
     let daemon_binary = crate::companion::Product::Daemon
         .beside(&current_exe)
         .map_err(|_| HostedTerminalStartError::HostBinaryMissing(current_exe))?;
@@ -1609,7 +1609,7 @@ fn start_and_verify_daemon_at(
     start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     // Another launcher can win the daemon lease while we wait for readiness;
     // it must satisfy the same protocol contract as an existing daemon.
-    let stream = crate::descriptor::connect(socket).map_err(|source| {
+    let stream = crate::descriptor::connect_settled(socket).map_err(|source| {
         HostedTerminalStartError::HostSocket {
             path: socket.to_owned(),
             source,
@@ -1812,7 +1812,7 @@ fn daemon_startup_ready(
     elapsed: Duration,
     child_status: Option<ExitStatus>,
 ) -> Result<bool, HostedTerminalStartError> {
-    match UnixStream::connect(socket) {
+    match crate::descriptor::connect_settled(socket) {
         Ok(_) => return Ok(true),
         Err(error)
             if matches!(

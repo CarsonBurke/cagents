@@ -290,7 +290,7 @@ fn with_verified_manager(
 
 /// Failure keeps the existing launch path. No actor has started yet and no
 /// provider command, identity, environment or inherited descriptor is changed.
-pub(crate) fn enroll_holder() -> io::Result<()> {
+pub(crate) fn enroll_current_process() -> io::Result<()> {
     if !manager_available() {
         return Ok(());
     }

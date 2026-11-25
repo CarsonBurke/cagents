@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command as Process, Stdio},
@@ -2180,7 +2180,7 @@ fn spawn_provider(
             Arc::new(
                 std::fs::OpenOptions::new()
                     .read(true)
-                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .custom_flags(crate::fs_safety::DIRECTORY_HANDLE | libc::O_CLOEXEC)
                     .open(&spec.working_directory)
                     .map_err(|error| error.to_string())?,
             )
@@ -2283,7 +2283,7 @@ impl DetachedDecision {
 }
 struct ChildGuard {
     child: Child,
-    identity: OwnedFd,
+    identity: crate::pinned_process::PinnedChild,
     terminated: bool,
     directory: Option<Arc<std::fs::File>>,
     /// The provider's cgroup scope, when the OS user manager provided one.
@@ -2306,6 +2306,7 @@ impl ChildGuard {
         grace: Duration,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
         let deadline = Instant::now() + grace;
+        let mut announced = false;
         loop {
             if let Some(status) = self.observed_exit_status()? {
                 return Ok(Some(status));
@@ -2314,27 +2315,22 @@ impl ChildGuard {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            let mut descriptor = libc::pollfd {
-                fd: self.identity.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout = remaining
-                .as_nanos()
-                .div_ceil(1_000_000)
-                .min(i32::MAX as u128) as i32;
-            // SAFETY: descriptor points to one initialized pollfd and the
-            // owned pidfd stays open throughout this non-reaping observation.
-            if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            } else if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
-                return Err(std::io::Error::other(
-                    "Provider exit capability became unavailable",
-                ));
+            if announced {
+                // Darwin announces an exit a moment before the child can be
+                // waited for, and the pin stays ready, so pause, not spin.
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                continue;
             }
+            // The pin stays open throughout this non-reaping observation.
+            announced = self
+                .identity
+                .process()
+                .wait_for_exit(remaining)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Provider exit capability became unavailable: {error}"
+                    ))
+                })?;
         }
     }
 
@@ -2343,40 +2339,42 @@ impl ChildGuard {
         mut child: Child,
         registration: crate::daemon::adopted_orphans::Registration,
     ) -> std::io::Result<Self> {
-        // SAFETY: pidfd_open obtains a capability for our freshly spawned,
-        // unreaped child. Its PID remains reserved even if it has exited.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-        if descriptor < 0 {
-            let error = std::io::Error::last_os_error();
-            // Startup has not handed the child to another owner. Keep the
-            // leader unreaped while cleaning its original process group.
-            let group_cleanup = if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
-                Ok(())
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
+        // Our freshly spawned, unreaped child: its PID remains reserved even
+        // if it has exited.
+        let identity = match crate::pinned_process::PinnedChild::of(&child) {
+            Ok(identity) => identity,
+            Err(error) => {
+                // Startup has not handed the child to another owner. Keep the
+                // leader unreaped while cleaning its original process group.
+                // SAFETY: kill takes scalar arguments. The unreaped leader
+                // keeps its pid, and so its group's, from being reused.
+                let group_cleanup =
+                    if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+                        Ok(())
+                    } else {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ESRCH) {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(
+                                error.kind(),
+                                format!("process group: {error}"),
+                            ))
+                        }
+                    };
+                let cleanup = child
+                    .kill()
+                    .and_then(|()| child.wait().map(|_| ()))
+                    .and(group_cleanup);
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => std::io::Error::new(
                         error.kind(),
-                        format!("process group: {error}"),
-                    ))
-                }
-            };
-            let cleanup = child
-                .kill()
-                .and_then(|()| child.wait().map(|_| ()))
-                .and(group_cleanup);
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => std::io::Error::new(
-                    error.kind(),
-                    format!("{error}; provider startup cleanup is unconfirmed: {cleanup}"),
-                ),
-            });
-        }
-        // SAFETY: successful pidfd_open returned a new descriptor owned here.
-        let identity = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+                        format!("{error}; provider startup cleanup is unconfirmed: {cleanup}"),
+                    ),
+                });
+            }
+        };
         Ok(Self {
             child,
             identity,
@@ -2398,49 +2396,10 @@ impl ChildGuard {
     }
 
     fn observed_exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        use std::os::unix::process::ExitStatusExt;
-        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: the pidfd identifies the original child despite numeric PID
-            // reuse and initializes the siginfo buffer. WNOWAIT leaves all
-            // reaping to terminate below.
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.identity.as_raw_fd() as libc::id_t,
-                    &mut information,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        // SAFETY: successful waitid initialized the child status fields.
-        let (pid, status) = unsafe { (information.si_pid(), information.si_status()) };
-        if pid == 0 {
-            return Ok(None);
-        }
-        if pid as u32 != self.child.id() {
-            return Err(std::io::Error::other(
-                "Provider exit observation returned another child",
-            ));
-        }
-        let raw = match information.si_code {
-            libc::CLD_EXITED => status << 8,
-            libc::CLD_KILLED => status,
-            libc::CLD_DUMPED => status | 0x80,
-            _ => {
-                return Err(std::io::Error::other(
-                    "Provider exit observation returned an unexpected status",
-                ));
-            }
-        };
-        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+        // The pin identifies the original child despite numeric PID reuse.
+        // WNOWAIT leaves all reaping to terminate below.
+        self.identity
+            .exit_status(libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {

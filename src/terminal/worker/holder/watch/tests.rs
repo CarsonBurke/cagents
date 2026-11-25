@@ -1,7 +1,7 @@
 use super::*;
-use std::{io::Write, os::fd::FromRawFd};
+use std::io::Write;
 
-/// Real original sockets and a real pidfd for this still-live test process;
+/// Real original sockets and a real pin of this still-live test process;
 /// no child, provider, daemon or synthetic exit-authority is created here.
 struct Stream {
     watch: Option<Watch>,
@@ -16,16 +16,14 @@ impl Stream {
         let (owner, peer) = UnixStream::pair().unwrap();
         peer.set_write_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        // SAFETY: pidfd_open captures this current process, never signals it.
-        let root = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
-        assert!(root >= 0, "{}", io::Error::last_os_error());
-        let root = unsafe { File::from_raw_fd(root as i32) };
+        // Pins this current process, and never signals it.
+        let root = PinnedProcess::open(std::process::id()).unwrap();
         let (released, release) = std::io::pipe().unwrap();
         let (exits, received) = crossbeam_channel::bounded(2);
         let (acknowledge, acknowledgements) = crossbeam_channel::bounded(1);
         let watch = Watch::start(
             owner.try_clone().unwrap(),
-            root,
+            &root,
             released,
             exits,
             acknowledge,

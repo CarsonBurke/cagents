@@ -82,7 +82,16 @@ const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` but without `integrated-browser` would claim them while running the
 // browserless code paths, so refuse the combination instead of shipping an
 // identity the binary cannot honour.
-#[cfg(all(feature = "ui", feature = "full", not(feature = "integrated-browser")))]
+//
+// macOS ships one product, `full`, whose UI has no integrated browser yet and
+// opens saved browser cards in the system browser: there is no browserless
+// peer package for it to be confused with.
+#[cfg(all(
+    target_os = "linux",
+    feature = "ui",
+    feature = "full",
+    not(feature = "integrated-browser")
+))]
 compile_error!(
     "a `full` UI must select `integrated-browser`; build the browserless UI with \
      --no-default-features --features ui"
@@ -1477,7 +1486,7 @@ pub fn update_in_progress() -> bool {
 }
 
 fn update_window(runtime: &Path, slot: &str, action: &str, timeout: Duration) -> io::Result<()> {
-    let mut stream = crate::descriptor::connect(&runtime.join(slot_socket_name(slot)))?;
+    let mut stream = crate::descriptor::connect_settled(runtime.join(slot_socket_name(slot)))?;
     stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
     stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
     writeln!(stream, "{action}")?;
@@ -1785,6 +1794,19 @@ impl UiUpdateGuard {
             ),
         }
         Ok(slots)
+    }
+
+    /// Finish draining the windows this update prepared, if any.
+    pub(crate) fn close_remaining_prepared_windows(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<bool> {
+        if self.prepared.is_empty() {
+            return Ok(false);
+        }
+        let slots = self.prepared.clone();
+        self.close_prepared_windows(&slots, timeout)?;
+        Ok(true)
     }
 
     /// Human review has no window-RPC deadline. Closing gets its own budget.
@@ -2621,7 +2643,8 @@ fn activate_window_session_in(
 ) -> io::Result<bool> {
     validate_window_slot(slot)?;
     require_owned_runtime_directory(runtime)?;
-    let mut stream = match crate::descriptor::connect(&runtime.join(slot_socket_name(slot))) {
+    let mut stream = match crate::descriptor::connect_settled(runtime.join(slot_socket_name(slot)))
+    {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -2708,7 +2731,7 @@ pub fn notification_desktop_id(application: crate::notifications::Application) -
 // installed separately, so resolve only these fixed application names, never a
 // path carried by an alert. Relative PATH entries cannot redirect activation.
 fn notification_executable(product: crate::companion::Product) -> io::Result<PathBuf> {
-    let current = env::current_exe()?;
+    let current = crate::process::current_executable()?;
     let sibling = product.beside(&current)?;
     let search = env::var_os("PATH").unwrap_or_default();
     resolve_notification_executable(
@@ -2805,7 +2828,7 @@ fn activate_socket_with_token(
 ) -> io::Result<bool> {
     require_owned_runtime_directory(runtime_directory)?;
     let socket_path = runtime_directory.join(socket);
-    let mut stream = match crate::descriptor::connect(&socket_path) {
+    let mut stream = match crate::descriptor::connect_settled(&socket_path) {
         Ok(stream) => stream,
         Err(error)
             if matches!(

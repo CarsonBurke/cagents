@@ -347,7 +347,9 @@ pub(super) fn interruption_review(preview: &Preview) -> Preview {
     if let Some(daemon) = &mut selected.daemon {
         daemon.policy = super::impact::Policy::Interrupt;
         for session in &mut daemon.sessions {
-            if session.disposition == Disposition::WaitsForIdle {
+            if session.disposition == Disposition::WaitsForIdle
+                && session.reason != super::impact::SessionCause::PendingDelivery
+            {
                 session.disposition = Disposition::Interrupted;
             }
         }

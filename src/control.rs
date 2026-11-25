@@ -1057,6 +1057,8 @@ impl std::fmt::Debug for ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
+/// Darwin answers that pressure with a refusal, which callers take to mean no
+/// daemon runs; see [`crate::descriptor::retry_refusal`].
 pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
@@ -1071,6 +1073,7 @@ pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<Unix
         *target = *byte as _;
     }
     let deadline = Instant::now() + timeout;
+    let refusing_since = Instant::now();
     let mut delay = Duration::from_millis(1);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1099,7 +1102,8 @@ pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<Unix
         if !matches!(
             error.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
+        ) && !crate::descriptor::retry_refusal(&error, refusing_since)
+        {
             return Err(error);
         }
         // EAGAIN has not queued a connection. Close this attempt before
@@ -4061,20 +4065,40 @@ where
     .then(ServiceRequestContext::capture);
     if !crate::device::is_remote()
         && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
-        && !service_context
-            .as_ref()
-            .is_some_and(|context| context.scoped())
     {
-        let recover = !no_start && staged_command_requires_daemon(&cli.command);
-        match staged_lookup(&std::env::current_exe().unwrap_or_default(), recover) {
-            Ok(Some(bin)) => {
+        let scoped = service_context
+            .as_ref()
+            .is_some_and(ServiceRequestContext::scoped);
+        let executable = crate::process::current_executable().unwrap_or_default();
+        let staged_cli = if !scoped {
+            let recover = !no_start && staged_command_requires_daemon(&cli.command);
+            staged_lookup(&executable, recover)
+                .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Cli.file_name())))
+        } else if matches!(
+            cli.command,
+            TopCommand::Agent {
+                command: AgentCommand::List { .. } | AgentCommand::Spawn { .. }
+            }
+        ) {
+            // Use only a live owner whose shipped CLI handles this scoped
+            // request. Resolve it before Spawn can read the original stdin.
+            let owner = crate::install_guard::staged_agent_owner_cli(&executable)
+                .inspect_err(
+                    |error| tracing::debug!(%error, "could not verify staged agent routing"),
+                )
+                .ok()
+                .flatten();
+            Ok(owner)
+        } else {
+            Ok(None)
+        };
+        match staged_cli {
+            Ok(Some(executable)) => {
                 use std::os::unix::process::CommandExt;
-                let mut command =
-                    Command::new(bin.join(crate::companion::Product::Cli.file_name()));
-                // Carry implicit stop/environment policy into the matched CLI.
-                // An older owner that lacks this flag must refuse parsing
-                // rather than recover/start services before handling the read.
-                if inherited_no_start && !cli.global.no_start {
+                let mut command = Command::new(executable);
+                // Carry implicit stop policy into the matched CLI. Scoped
+                // delegation never starts or recovers a missing service.
+                if (inherited_no_start || scoped) && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
@@ -4226,7 +4250,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
 /// Desktop launches need the same matched owner as CLI launches while a staged
 /// update is pending. Internal helpers and remote devices do not use this route.
 pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
-    crate::install_guard::staged_owner_bin(&std::env::current_exe()?, true)
+    crate::install_guard::staged_owner_bin(&crate::process::current_executable()?, true)
         .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
 }
 
@@ -8149,18 +8173,15 @@ mod tests {
         path: &Path,
     ) -> (std::os::unix::net::UnixListener, Vec<UnixStream>) {
         let listener = crate::descriptor::bind(path).unwrap();
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
-        let pending = (0..2)
-            .map(|_| connect_control_socket(path, Duration::from_millis(100)).unwrap())
-            .collect();
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let pending = vec![connect_control_socket(path, Duration::from_millis(100)).unwrap()];
         (listener, pending)
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
-    )]
     fn control_socket_backlog_pressure_times_out_without_replacing_the_endpoint() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
@@ -8177,10 +8198,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
-    )]
     fn control_socket_retry_connects_and_handshakes_when_the_backlog_drains() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");

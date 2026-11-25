@@ -541,21 +541,12 @@ fn walk(root: &Path, cancellation: &CancellationToken) -> Result<Walk, ContentEr
     Ok(walk)
 }
 
-/// The file system a directory is on: equal for two directories exactly when
-/// no mount edge separates them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Filesystem {
-    device: u64,
-    /// The mount, when the kernel names it. It tells apart a Linux bind mount
-    /// of the same file system; Linux kernels before 5.8 report none.
-    pub(super) mount: Option<u64>,
-}
-
-/// The file system a directory is on, or `None` once it is gone or is no
-/// longer a directory. The device tells apart a Btrfs subvolume, which is no
-/// mount; the mount, a bind mount of the same file system.
+/// The device and mount a directory is on, or `None` once it is gone or is
+/// no longer a directory. The
+/// mount tells apart a bind mount of the same file system; the device, a
+/// Btrfs subvolume, which is no mount. Kernels before 5.8 report no mount.
 #[cfg(target_os = "linux")]
-pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<Filesystem>> {
+pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Option<u64>)>> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let mut metadata = std::mem::MaybeUninit::<libc::statx>::zeroed();
@@ -576,79 +567,74 @@ pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<Filesystem>> {
             Some(libc::ENOSYS | libc::EPERM) => {
                 let metadata =
                     std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path.as_bytes()))?;
-                Ok(Some(Filesystem {
-                    device: metadata.dev(),
-                    mount: None,
-                }))
+                Ok(Some((
+                    libc::major(metadata.dev()).into(),
+                    libc::minor(metadata.dev()).into(),
+                    None,
+                )))
             }
             _ => Err(error),
         };
     }
     let metadata = unsafe { metadata.assume_init() };
     let mount = (metadata.stx_mask & libc::STATX_MNT_ID != 0).then_some(metadata.stx_mnt_id);
-    Ok(Some(Filesystem {
-        device: libc::makedev(metadata.stx_dev_major, metadata.stx_dev_minor),
+    Ok(Some((
+        u64::from(metadata.stx_dev_major),
+        u64::from(metadata.stx_dev_minor),
         mount,
-    }))
+    )))
 }
 
-/// Darwin names the mounted file system by its `f_fsid`, as
-/// [`crate::fs_safety`] does for a retained directory. It has no bind mounts,
-/// and firmlinks and the sealed system snapshot show up as different fsids.
-/// `getattrlist` reads both, like `statx`, without following a final symlink
-/// or needing permission on the directory itself.
+/// The device and mount a directory is on, or `None` once it is gone or is
+/// no longer a directory. Darwin gives every volume its own device but has no
+/// mount ID, so the mount is named by where it is mounted: that also tells
+/// apart a mount that shares its parent's device.
 #[cfg(target_os = "macos")]
-pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<Filesystem>> {
-    /// The buffer `getattrlist` packs the requested common attributes into, in
-    /// bit order after the total length. Each is 4-byte aligned.
-    #[repr(C)]
-    struct Attributes {
-        length: u32,
-        device: libc::dev_t,
-        fsid: libc::fsid_t,
-    }
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut request = libc::attrlist {
-        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-        reserved: 0,
-        commonattr: libc::ATTR_CMN_DEVID | libc::ATTR_CMN_FSID,
-        volattr: 0,
-        dirattr: 0,
-        fileattr: 0,
-        forkattr: 0,
+pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Option<u64>)>> {
+    let vanished = |error: &std::io::Error| {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
     };
-    let mut attributes = std::mem::MaybeUninit::<Attributes>::zeroed();
-    // SAFETY: the path, request and output buffer outlive the call, which
-    // writes at most the buffer's declared size.
-    let result = unsafe {
-        libc::getattrlist(
-            path.as_ptr(),
-            (&raw mut request).cast(),
-            attributes.as_mut_ptr().cast(),
-            std::mem::size_of::<Attributes>(),
-            libc::FSOPT_NOFOLLOW,
-        )
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if vanished(&error) => return Ok(None),
+        Err(error) => return Err(error),
     };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ENOENT | libc::ENOTDIR) => Ok(None),
-            _ => Err(error),
-        };
-    }
-    // SAFETY: getattrlist succeeded and the buffer started zeroed, so every
-    // field is initialized.
-    let attributes = unsafe { attributes.assume_init() };
-    if attributes.length as usize != std::mem::size_of::<Attributes>() {
-        return Err(std::io::Error::other(
-            "the file system did not report its device and identity",
-        ));
-    }
-    Ok(Some(Filesystem {
-        device: u64::from(attributes.device as u32),
-        mount: Some(crate::fs_safety::fsid_identity(attributes.fsid)),
-    }))
+    // A symbolic link is reported as itself, as on Linux; statfs would
+    // describe its target.
+    let mount = if metadata.is_dir() {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let mut status = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: the path is NUL-terminated and the kernel fills the
+        // exclusively borrowed record, which outlives the call.
+        if unsafe { libc::statfs(path.as_ptr(), status.as_mut_ptr()) } < 0 {
+            let error = std::io::Error::last_os_error();
+            return if vanished(&error) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: a successful statfs initialized the record.
+        let status = unsafe { status.assume_init() };
+        // SAFETY: the kernel NUL-terminates the mount point it reports.
+        let mounted_on = unsafe { std::ffi::CStr::from_ptr(status.f_mntonname.as_ptr()) };
+        let digest = Sha256::digest(mounted_on.to_bytes());
+        Some(u64::from_le_bytes(
+            digest[..8]
+                .try_into()
+                .expect("a SHA-256 digest has eight bytes"),
+        ))
+    } else {
+        None
+    };
+    // `st_dev` is Darwin's 32-bit `dev_t`, widened by the standard library.
+    let device = metadata.dev() as libc::dev_t;
+    Ok(Some((
+        libc::major(device).unsigned_abs().into(),
+        libc::minor(device).unsigned_abs().into(),
+        mount,
+    )))
 }
 
 /// Whether two files hold the same bytes, read in chunks.

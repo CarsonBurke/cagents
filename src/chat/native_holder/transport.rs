@@ -227,10 +227,7 @@ impl Holder {
         }
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
         let credentials = peer(control)?;
-        if credentials.uid != crate::daemon::current_uid()
-            || credentials.pid != self.control_peer.pid
-            || !self.control_peer.is_current()
-        {
+        if !is_peer(credentials, &self.control_peer) || !self.control_peer.is_current() {
             return Err("Native holder directory endpoint belongs to another process".into());
         }
         let deadline = Instant::now() + TIMEOUT;
@@ -482,7 +479,7 @@ pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
             std::sync::Arc::new(
                 std::fs::OpenOptions::new()
                     .read(true)
-                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .custom_flags(crate::fs_safety::DIRECTORY_HANDLE | libc::O_CLOEXEC)
                     .open(&spec.working_directory)
                     .map_err(|error| error.to_string())?,
             )
@@ -503,11 +500,12 @@ pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
     let _account =
         crate::account::registry::authorize_command(&command).map_err(|error| error.to_string())?;
     let (control, remote) = UnixStream::pair().map_err(|error| error.to_string())?;
-    // SO_PEERCRED on a socketpair remains its creator, including after exec.
-    let control_peer =
-        Process::read(std::process::id() as i32).map_err(|error| error.to_string())?;
+    // The peer of the holder's end of the pair: see `handed_end_peer`.
+    let creator = Process::read(std::process::id() as i32).map_err(|error| error.to_string())?;
     let fd = remote.as_raw_fd();
-    let mut holder = Command::new("/proc/self/exe");
+    // Held until the spawn below has executed it.
+    let image = crate::process::own_image().map_err(|error| error.to_string())?;
+    let mut holder = Command::new(image.path());
     holder
         .arg0("cagents-native")
         .arg(ARGUMENT)
@@ -635,7 +633,8 @@ pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
             durable: false,
             directory_pin: capabilities.directory_pin,
             sparing_release: capabilities.sparing_release,
-            control_peer,
+            // The holder has already answered on its end.
+            control_peer: crate::pinned_process::handed_end_peer(creator, record.holder.clone()),
             control_poisoned: false,
             identity: super::Detached {
                 record,
@@ -666,10 +665,7 @@ fn connect(record: &Record) -> Result<UnixStream, String> {
     let control =
         crate::daemon::holder_registry::connect(&socket).map_err(|error| error.to_string())?;
     let credentials = peer(&control)?;
-    if credentials.uid != crate::daemon::current_uid()
-        || credentials.pid != record.holder.pid
-        || !record.holder.is_current()
-    {
+    if !is_peer(credentials, &record.holder) || !record.holder.is_current() {
         return Err("Native holder endpoint belongs to another process".into());
     }
     Ok(control)
@@ -791,39 +787,27 @@ pub fn adopt(
 }
 
 /// Bind the exact already-validated provider incarnation, never its cwd path.
-/// An exited zombie can still pass Process::is_current; only the owned pidfd
+/// An exited zombie can still pass Process::is_current; only the pin
 /// establishes the kernel-live observation used by a directory-pin reply.
-fn pin_provider_process(process: &Process) -> Result<std::fs::File, String> {
+fn pin_provider_process(process: &Process) -> Result<crate::pinned_process::PinnedProcess, String> {
     if !process.is_current() {
         return Err("Original native provider identity changed".into());
     }
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
-    if descriptor < 0 {
-        return Err(format!(
-            "Pin original native provider: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let descriptor = unsafe { std::fs::File::from_raw_fd(descriptor as RawFd) };
+    let pin = crate::pinned_process::PinnedProcess::open_unreaped(process.pid as u32)
+        .map_err(|error| format!("Pin original native provider: {error}"))?;
     if !process.is_current() {
         return Err("Original native provider identity changed during pinning".into());
     }
-    Ok(descriptor)
+    Ok(pin)
 }
 
-fn ensure_provider_live(pidfd: &std::fs::File) -> Result<(), String> {
-    let mut event = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    match unsafe { libc::poll(&mut event, 1, 0) } {
-        0 if event.revents == 0 => Ok(()),
-        result if result < 0 => Err(format!(
-            "Observe original native provider: {}",
-            io::Error::last_os_error()
-        )),
-        _ => Err("Original native provider has exited or its observation is unavailable".into()),
+fn ensure_provider_live(pin: &crate::pinned_process::PinnedProcess) -> Result<(), String> {
+    match pin.exited() {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            Err("Original native provider has exited or its observation is unavailable".into())
+        }
+        Err(error) => Err(format!("Observe original native provider: {error}")),
     }
 }
 
@@ -836,7 +820,7 @@ struct Residence {
     child_events: ChildEvents,
     released: bool,
     _working_directory: Option<std::fs::File>,
-    provider_pidfd: std::fs::File,
+    provider_pidfd: crate::pinned_process::PinnedProcess,
     owner_application: String,
     /// This holder's divided cgroup scope, when the user manager gave one.
     /// The commands of the confirmed server are kept apart from it.
@@ -1397,30 +1381,22 @@ fn authorize(control: &UnixStream, proof: &HostSessionProof) -> Result<(), Strin
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
     let owner =
         crate::daemon::lease_owner(&paths.lock, proof).map_err(|error| error.to_string())?;
-    if credentials.uid != crate::daemon::current_uid()
-        || u32::try_from(credentials.pid).ok() != Some(owner)
-    {
+    if credentials.uid != crate::daemon::current_uid() || credentials.pid != owner {
         return Err("Native holder caller does not own the daemon lease".into());
     }
     Ok(())
 }
 
-fn peer(control: &UnixStream) -> Result<libc::ucred, String> {
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            control.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut credentials).cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    Ok(credentials)
+/// The peer's credentials. On Darwin the pid is only a candidate, which every
+/// caller compares to a process it has already proven.
+fn peer(control: &UnixStream) -> Result<crate::pinned_process::PeerCredentials, String> {
+    crate::pinned_process::peer_credentials(control).map_err(|error| error.to_string())
+}
+
+/// Whether `credentials` name this user and exactly `process`.
+fn is_peer(credentials: crate::pinned_process::PeerCredentials, process: &Process) -> bool {
+    credentials.uid == crate::daemon::current_uid()
+        && u32::try_from(process.pid).is_ok_and(|pid| pid == credentials.pid)
 }
 
 fn send(control: &UnixStream, value: &impl Serialize, timeout: Duration) -> Result<(), String> {
@@ -1498,14 +1474,18 @@ fn read_exact(
 }
 
 #[used]
-#[unsafe(link_section = ".init_array")]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+)]
 static SERVE: extern "C" fn() = serve_if_requested;
 
 extern "C" fn serve_if_requested() {
-    let Ok(arguments) = std::fs::read("/proc/self/cmdline") else {
+    let Some(arguments) = crate::process::command_line() else {
         return;
     };
-    let mut arguments = arguments.split(|&byte| byte == 0).skip(1);
+    let mut arguments = arguments.iter().map(Vec::as_slice).skip(1);
     if arguments.next() != Some(ARGUMENT.as_bytes()) {
         return;
     }
@@ -2522,6 +2502,7 @@ exec /bin/sleep 60
         let (mut adopted, _) = adopt(&record, &source, &proof).unwrap();
         let (identity, pin) = adopted.pinned_launch_directory().unwrap();
         assert_eq!(identity, expected);
+        #[cfg(target_os = "linux")]
         assert_ne!(
             unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
             0

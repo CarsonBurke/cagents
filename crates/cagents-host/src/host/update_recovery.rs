@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 /// been handled. It supplies no launch recipes or renewed execution authority.
 pub(super) fn restore_settled(host: &SharedHost) -> Result<bool, String> {
     let store = Store::discover()?;
-    let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+    let daemon = crate::process::current_executable().map_err(|error| error.to_string())?;
     restore_settled_from(host, &store.path, &daemon)
 }
 
@@ -70,7 +70,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     chat::retained_actor::reconcile_startup_losses(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore current presentations", None);
-    model::floor::restore_presentations()?;
+    model::floor::restore_presentations(None)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: reconcile retained runs", None);
     let retained_runs = chat::retained_actor::retained_runs(host);
@@ -89,7 +89,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
             .collect::<Vec<_>>();
         (state.proof().clone(), state.list(0), chats)
     };
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = crate::process::current_executable().map_err(|error| error.to_string())?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
     crate::upgrade::recovery::verified::ready::publish(
@@ -150,7 +150,7 @@ fn settle_agents(
 fn publish_archived_proof(host: &SharedHost) {
     let result = (|| -> Result<(), String> {
         let store = Store::discover()?;
-        let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+        let daemon = crate::process::current_executable().map_err(|error| error.to_string())?;
         let Some(settled) = recovery::archived_discovery(&store.path, &daemon)? else {
             return Ok(());
         };
@@ -220,7 +220,7 @@ fn restore_recovered(
     super::chat::retained_actor::reconcile_retired_actors(host)?;
     super::chat::retained_actor::reconcile_startup_losses(host)?;
 
-    super::model::floor::restore_presentations()?;
+    super::model::floor::restore_presentations(None)?;
     let retained_runs = super::chat::retained_actor::retained_runs(host);
     settle_agents(host, &retained_runs)?;
     ensure_no_ambiguous_adoption(host)?;
@@ -362,7 +362,7 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     paused.save()?;
     // A close performed by the already-approved floor can retire its managed
     // pane in the old registry. Restore that saved presentation, never its run.
-    super::model::floor::restore_presentations()?;
+    super::model::floor::restore_presentations(Some(&record.source))?;
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.pause_update_terminals(&record.paused_terminals);
@@ -851,7 +851,7 @@ mod tests {
                 .unwrap()
                 .save()
                 .unwrap();
-            model::floor::restore_presentations().unwrap();
+            model::floor::restore_presentations(None).unwrap();
         }
         let original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
         let Some(crate::agent_execution::HostedSession::Chat(latest_saved)) =
@@ -1179,7 +1179,7 @@ mod tests {
         if case == SettledCase::CanonicalClose {
             // Production pruning removes the genuinely closed paused page.
             // The still-canonical settled Prepared file must never recreate it.
-            model::floor::restore_presentations().unwrap();
+            model::floor::restore_presentations(None).unwrap();
             assert!(crate::upgrade::floor::load().unwrap().records.is_empty());
             assert!(crate::upgrade::floor::snapshot(&history_source).is_err());
             let mut initial = state::HostState::new(proof("closed-canonical-restart"));

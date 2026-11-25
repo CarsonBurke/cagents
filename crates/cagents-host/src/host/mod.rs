@@ -235,6 +235,17 @@ pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
     lease: Option<std::fs::File>,
     retirement_owned_by_updater: bool,
+    #[cfg(target_os = "linux")]
+    standby: Option<daemon::standby::Activated>,
+}
+
+#[cfg(target_os = "linux")]
+impl DaemonAdmission {
+    #[doc(hidden)]
+    pub fn with_update_standby(mut self, standby: Option<daemon::standby::Activated>) -> Self {
+        self.standby = standby;
+        self
+    }
 }
 
 /// Authenticate startup authority before diagnostics or runtime threads exist.
@@ -261,6 +272,8 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
         _guard: admission,
         lease,
         retirement_owned_by_updater,
+        #[cfg(target_os = "linux")]
+        standby: None,
     })
 }
 
@@ -563,6 +576,11 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     observe_fixture_startup("host run entered", None);
     daemon::install_signal_handlers()?;
     crate::descriptor_limit::raise();
+    // Holders start from this image; pin it before an update replaces the
+    // installed daemon.
+    if let Err(error) = crate::process::pin_own_image() {
+        tracing::warn!(%error, "terminal and chat holders cannot be started");
+    }
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,
@@ -570,6 +588,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
+    #[cfg(target_os = "linux")]
+    let standby = admission.standby.take();
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -635,7 +655,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(
-        &std::env::current_exe()?,
+        &crate::process::current_executable()?,
         std::env::args_os()
             .any(|argument| argument == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT),
     )?;
@@ -859,6 +879,14 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         {
             tracing::warn!(%error, "recovery completion proof could not be scheduled; serving owners were kept");
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(standby) = standby
+        && let Err(error) = standby.started()
+    {
+        // The host already owns the restored state. A missing acknowledgement
+        // is never a reason to tear down its sessions.
+        tracing::warn!(%error, "replacement daemon startup acknowledgement was not delivered");
     }
     loop {
         reap_finished(&mut clients);

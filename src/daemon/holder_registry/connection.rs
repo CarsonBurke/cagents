@@ -3,7 +3,7 @@
 use std::{
     io,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::AsRawFd,
         unix::{ffi::OsStrExt, net::UnixStream},
     },
     path::Path,
@@ -40,21 +40,10 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
         }
         let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
             as libc::socklen_t;
+        let refusing_since = Instant::now();
         loop {
             remaining(deadline)?;
-            // SAFETY: a successful socket owns one new descriptor immediately
-            // transferred to OwnedFd. CLOEXEC is set atomically.
-            let descriptor = unsafe {
-                libc::socket(
-                    libc::AF_UNIX,
-                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                    0,
-                )
-            };
-            if descriptor < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            let descriptor = crate::descriptor::unix_socket(libc::SOCK_STREAM, true)?;
             let connected = unsafe {
                 libc::connect(descriptor.as_raw_fd(), (&raw const address).cast(), length)
             };
@@ -65,6 +54,15 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
                     // backlog is full without beginning a connection. Retry a
                     // fresh descriptor after a bounded pause, never blocking.
                     Some(libc::EAGAIN) => {
+                        drop(descriptor);
+                        std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(5)));
+                        continue;
+                    }
+                    // Darwin answers a full backlog with the refusal it
+                    // gives a socket nobody listens on; see `retry_refusal`.
+                    Some(libc::ECONNREFUSED)
+                        if crate::descriptor::retry_refusal(&error, refusing_since) =>
+                    {
                         drop(descriptor);
                         std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(5)));
                         continue;
@@ -129,7 +127,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("holder");
         let listener = crate::descriptor::bind(&path).unwrap();
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
         let original = UnixStream::connect(&path).unwrap();
         let start = Instant::now();
         let error = connect_until(&path, start + Duration::from_millis(80)).unwrap_err();

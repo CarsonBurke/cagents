@@ -33,19 +33,24 @@ pub struct Changes {
 
 #[cfg(feature = "ui")]
 impl Changes {
+    #[cfg(feature = "development")]
+    pub fn has_review_fixture() -> bool {
+        std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+            .is_some_and(|root| super::review_fixture::path(Path::new(&root)).is_file())
+    }
+
     /// Watch the directory, since the worker replaces status.json atomically.
     /// Register before reading the initial snapshot, so a publication during
-    /// that read is still delivered.
-    pub fn watch() -> Result<Self, UpdateError> {
+    /// that read is still delivered. Only follow the one-shot lease when the
+    /// window has already learned that a job started.
+    pub fn watch(active_job: bool) -> Result<Self, UpdateError> {
         #[cfg(feature = "development")]
         if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE") {
-            return Self::watch_file(
-                PathBuf::from(root).join("home/.config/fixture-update-review.json"),
-                None,
-            );
+            return Self::watch_file(super::review_fixture::path(Path::new(&root)), None);
         }
-        let directory = running_installation()?.prefix.join(".update");
-        Self::watch_file(directory.join("status.json"), Some(&directory.join("lock")))
+        let directory = running_installation()?.state_dir()?;
+        let lease = active_job.then(|| directory.join("lock"));
+        Self::watch_file(directory.join("status.json"), lease.as_deref())
     }
 
     fn watch_file(snapshot: PathBuf, lease: Option<&Path>) -> Result<Self, UpdateError> {
@@ -79,6 +84,7 @@ pub(super) struct TerminalChanges {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TerminalWake {
     Changed,
+    Input,
     Deadline,
     Unavailable,
 }
@@ -114,17 +120,31 @@ impl TerminalChanges {
     }
 
     pub(super) fn wait(&self, deadline: Instant) -> TerminalWake {
-        let mut descriptors =
-            [self.receiver.as_raw_fd(), cancellation::wake_fd()].map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
+        Self::wait_with_input(Some(self), None, Some(deadline))
+    }
+
+    pub(super) fn wait_with_input(
+        observer: Option<&Self>,
+        input: Option<i32>,
+        deadline: Option<Instant>,
+    ) -> TerminalWake {
+        let mut descriptors = [
+            observer.map_or(-1, |observer| observer.receiver.as_raw_fd()),
+            cancellation::wake_fd(),
+            input.unwrap_or(-1),
+        ]
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        let timeout = deadline.map_or(-1, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32
+        });
         // SAFETY: both descriptors remain open through the call.
         let ready = unsafe {
             libc::poll(
@@ -140,19 +160,23 @@ impl TerminalChanges {
                 TerminalWake::Unavailable
             };
         }
-        if descriptors[0].revents != 0 {
+        if descriptors[0].revents != 0
+            && let Some(observer) = observer
+        {
             let mut value = [0];
-            while self.receiver.recv(&mut value).is_ok() {}
+            while observer.receiver.recv(&mut value).is_ok() {}
         }
         if descriptors[1].revents != 0 {
             cancellation::drain_wake();
         }
-        if !self.available.load(Ordering::Acquire) {
+        if observer.is_some_and(|observer| !observer.available.load(Ordering::Acquire)) {
             TerminalWake::Unavailable
         } else if ready == 0 {
             TerminalWake::Deadline
-        } else {
+        } else if descriptors[0].revents != 0 || descriptors[1].revents != 0 {
             TerminalWake::Changed
+        } else {
+            TerminalWake::Input
         }
     }
 }
@@ -163,12 +187,27 @@ fn terminal_status_follows_a_published_phase_without_waiting_for_the_deadline() 
     let directory = tempfile::tempdir().unwrap();
     let active = super::acquire_lock(directory.path()).unwrap();
     let changes = TerminalChanges::watch_directory(directory.path()).unwrap();
+    let (input, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
     let staged = directory.path().join("status.tmp");
     std::fs::write(&staged, "new phase").unwrap();
     std::fs::rename(staged, directory.path().join("status.json")).unwrap();
     assert_eq!(
-        changes.wait(Instant::now() + std::time::Duration::from_secs(5)),
+        TerminalChanges::wait_with_input(
+            Some(&changes),
+            Some(input.as_raw_fd()),
+            Some(Instant::now() + std::time::Duration::from_secs(5)),
+        ),
         TerminalWake::Changed,
+    );
+    use std::io::Write;
+    writer.write_all(b"i\n").unwrap();
+    assert_eq!(
+        TerminalChanges::wait_with_input(
+            Some(&changes),
+            Some(input.as_raw_fd()),
+            Some(Instant::now() + std::time::Duration::from_secs(5)),
+        ),
+        TerminalWake::Input,
     );
     drop(active);
 }

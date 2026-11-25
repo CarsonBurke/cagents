@@ -41,7 +41,7 @@ pub mod daemon;
 pub mod daemon_health;
 #[doc(hidden)]
 pub mod descriptor;
-#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+#[cfg(any(feature = "host", target_os = "linux"))]
 pub(crate) mod descriptor_frame;
 /// The daemon's open-descriptor limit, which the processes it starts never inherit.
 #[cfg(feature = "host")]
@@ -71,6 +71,9 @@ pub mod fixture_workspace;
 #[doc(hidden)]
 pub mod flock;
 pub mod fs_safety;
+/// Watches on open files that wake only the subscribers of the changed inode.
+#[cfg(feature = "host")]
+pub(crate) mod fs_watch;
 pub mod git_marker;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod git_watch;

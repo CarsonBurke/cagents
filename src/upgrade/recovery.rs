@@ -42,6 +42,8 @@ const RECEIPT_FD: i32 = 193;
 const WORKER_FD: i32 = 194;
 const FENCE_FD: i32 = 195;
 const DAEMON_FD: i32 = 196;
+pub(crate) const RECEIPT_DESCRIPTORS: [i32; 5] =
+    [RECEIPT_FD, WORKER_FD, FENCE_FD, DAEMON_FD, LEGACY_FD];
 const ORIGINAL_WORKER_FD: i32 = 198;
 const LIMIT: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 8 * 1024 * 1024;
@@ -1243,8 +1245,9 @@ impl PendingRecovery {
         )?;
         let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
         let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
-        let cli = fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let cli =
+            fs::canonicalize(crate::process::current_executable().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
         if crate::update::locate(&cli)
             .map_err(|e| e.to_string())?
             .version_root
@@ -1269,9 +1272,7 @@ impl PendingRecovery {
         let daemon_path = descriptor_path(&daemon).map_err(|e| e.to_string())?;
         validate_lock(&daemon, &daemon_path).map_err(|e| e.to_string())?;
         let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
-        if daemon_path != paths.lock
-            || std::os::unix::net::UnixStream::connect(&paths.socket).is_ok()
-        {
+        if daemon_path != paths.lock || crate::descriptor::connect_settled(&paths.socket).is_ok() {
             return Err(
                 "Another daemon is serving or starting; explicit recovery did not replace it"
                     .into(),
@@ -1571,18 +1572,19 @@ impl Receipt {
     }
 
     pub(crate) fn inherit(&self, command: &mut Command) -> io::Result<()> {
-        forward(
-            command,
-            [
-                &self.receipt,
-                &self.worker,
-                &self.fence,
-                self.daemon.as_ref().ok_or_else(|| {
-                    io::Error::other("Recovery daemon reservation was already released")
-                })?,
-                &self.legacy,
-            ],
-        )
+        forward(command, self.files()?)
+    }
+
+    pub(crate) fn files(&self) -> io::Result<[&File; 5]> {
+        Ok([
+            &self.receipt,
+            &self.worker,
+            &self.fence,
+            self.daemon.as_ref().ok_or_else(|| {
+                io::Error::other("Recovery daemon reservation was already released")
+            })?,
+            &self.legacy,
+        ])
     }
 
     /// Bind the target's verified serving proof to this exact Prepared job.
@@ -2253,10 +2255,7 @@ fn forward(command: &mut Command, files: [&File; 5]) -> io::Result<()> {
     command.env(ENV, RECEIPT_FD.to_string());
     unsafe {
         command.pre_exec(move || {
-            for (file, target) in copies
-                .iter()
-                .zip([RECEIPT_FD, WORKER_FD, FENCE_FD, DAEMON_FD, LEGACY_FD])
-            {
+            for (file, target) in copies.iter().zip(RECEIPT_DESCRIPTORS) {
                 if libc::dup2(file.as_raw_fd(), target) == -1
                     || libc::fcntl(target, libc::F_SETFD, 0) == -1
                 {
@@ -2281,7 +2280,7 @@ fn inherited() -> io::Result<&'static Mutex<Option<Inherited>>> {
                 ));
             }
             let mut files = Vec::new();
-            for fd in [RECEIPT_FD, WORKER_FD, FENCE_FD, DAEMON_FD, LEGACY_FD] {
+            for fd in RECEIPT_DESCRIPTORS {
                 if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -2324,7 +2323,7 @@ pub(crate) fn forward_target_daemon(command: &mut Command) -> io::Result<()> {
         .map_err(|_| io::Error::other("Update recovery descriptors are unavailable"))?
         .as_ref()
     {
-        validate_forward_target(command, &receipt.receipt)?;
+        validate_forward_target(Path::new(command.get_program()), &receipt.receipt)?;
         forward(
             command,
             [
@@ -2339,14 +2338,13 @@ pub(crate) fn forward_target_daemon(command: &mut Command) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_forward_target(command: &Command, receipt: &File) -> io::Result<()> {
+pub(crate) fn validate_forward_target(selected: &Path, receipt: &File) -> io::Result<()> {
     validate_sealed_descriptor(receipt.as_raw_fd())?;
     let mut bytes = vec![0; receipt.metadata()?.len() as usize];
     // F_DUPFD shares an open-file description with the selected CLI and daemon.
     // Read by offset so forwarding never consumes another receiver's receipt.
     std::os::unix::fs::FileExt::read_exact_at(receipt, &mut bytes, 0)?;
     let authority: Authority = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    let selected = Path::new(command.get_program());
     if authority.version != 1
         || !selected.is_absolute()
         || !authority.target.is_absolute()
@@ -3925,7 +3923,7 @@ pub fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
     validate_host_context(&authority)?;
     if authority.version != 1
         || fs::canonicalize(&authority.target).map_err(|e| e.to_string())?
-            != fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
+            != fs::canonicalize(crate::process::current_executable().map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?
         || executable_hash(&authority.target)? != authority.target_hash
     {
@@ -3995,8 +3993,9 @@ pub fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
 
 #[cfg(feature = "host")]
 fn validate_host_context(authority: &Authority) -> Result<(), String> {
-    let layout = crate::update::locate(&std::env::current_exe().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let layout =
+        crate::update::locate(&crate::process::current_executable().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     let state = layout.prefix.join(".update");
     let metadata = fs::symlink_metadata(&state).map_err(|e| e.to_string())?;
     if !metadata.is_dir()

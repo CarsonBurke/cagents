@@ -45,6 +45,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `dev:browser` | Run the development UI with the embedded browser |
 | `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check and lint one [lane](#feature-boundaries), all targets by default |
 | `check:editor` | Type-check and lint ceditor |
+| `check:macos:cli`, `check:macos:host`, `check:macos:ui` | Type-check and lint one lane for Apple Silicon macOS on the build host, without a Mac; see [macOS](#macos) |
 | `check:dictate`, `test:dictate` | Type-check and lint, or test, the [dictation helper](#feature-boundaries) |
 | `check` | `check:isolation`, then `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:isolation` | Check, without compiling, that each lane resolves only its own dependency graph ([feature boundaries](#feature-boundaries)) |
@@ -3128,3 +3129,16 @@ Cagents installation untouched. Existing private builds remain available to
 running windows and daemons; update Ceditor with its original installer, not the
 Cagents self-updater. Opening an alert for the other application requires that
 application to be installed alongside the daemon or in an absolute PATH directory.
+
+## macOS
+
+The daemon and UI are being ported to Apple Silicon macOS. The plan is in
+issue #4045. `mise run check:macos:LANE` type-checks a lane for
+`aarch64-apple-darwin` on the build host. Rust cross-checks natively, and
+`scripts/darwin-cc` compiles the C that build scripts need using the zig that
+`mise.toml` pins. The build host needs that target once:
+`rustup target add aarch64-apple-darwin --toolchain 1.93.0` (the
+`rust-toolchain.toml` channel). A check cannot link or run
+anything, so behavior, and anything that needs Apple's frameworks, still has
+to be verified on a real Mac.
+

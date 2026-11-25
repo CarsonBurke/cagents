@@ -229,7 +229,7 @@ impl Census {
                 let paths =
                     crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
                 if !crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
-                    && std::os::unix::net::UnixStream::connect(&paths.socket).is_err_and(|e| {
+                    && crate::descriptor::connect_settled(&paths.socket).is_err_and(|e| {
                         matches!(
                             e.kind(),
                             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -1011,12 +1011,14 @@ fn inspect_capture_source(
 ) -> Result<Option<HostSessionProof>, UpdateError> {
     match candidate_cli {
         Some(candidate) => inspect_pending_source_inner(candidate, None, false, busy),
-        None => inspect_pending_source_inner(&std::env::current_exe()?, None, true, busy),
+        None => {
+            inspect_pending_source_inner(&crate::process::current_executable()?, None, true, busy)
+        }
     }
 }
 
 pub(super) fn inspect_pending_current() -> Result<(), UpdateError> {
-    inspect_pending_caller(&std::env::current_exe()?)
+    inspect_pending_caller(&crate::process::current_executable()?)
 }
 
 pub(super) fn inspect_pending_caller(caller: &Path) -> Result<(), UpdateError> {
@@ -1302,7 +1304,7 @@ fn retire_service(
             // This is local mechanical evidence only. No socket self-query,
             // old census reconstruction, pause inspection or live-owner claim
             // is needed once the exact archive transaction has completed.
-            let target = std::env::current_exe()?;
+            let target = crate::process::current_executable()?;
             if let Some(status) = completed_cold_retirement(&store.path, &target)? {
                 return Ok(status);
             }
@@ -1794,7 +1796,7 @@ impl Census {
         // source handshake against a daemon the installer may have started.
         if !self.had_no_source()
             || crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
-            || !std::os::unix::net::UnixStream::connect(&paths.socket).is_err_and(|e| {
+            || !crate::descriptor::connect_settled(&paths.socket).is_err_and(|e| {
                 matches!(
                     e.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused

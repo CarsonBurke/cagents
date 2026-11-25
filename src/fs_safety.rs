@@ -94,9 +94,9 @@ struct OpenHow {
 /// and an ancestor walk stops below one; neither can be resolved beneath
 /// there in any case.
 #[cfg(target_os = "linux")]
-const DIRECTORY_HANDLE: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
+pub(crate) const DIRECTORY_HANDLE: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
 #[cfg(target_os = "macos")]
-const DIRECTORY_HANDLE: libc::c_int = libc::O_SEARCH;
+pub(crate) const DIRECTORY_HANDLE: libc::c_int = libc::O_SEARCH;
 
 /// Flags for an intermediate component of the component-at-a-time walk. The
 /// walk checks each one is a directory, so Linux needs no `O_DIRECTORY`; on
@@ -770,18 +770,33 @@ pub fn directory_entries_beneath(
     relative: &Path,
     limit: usize,
 ) -> Result<Vec<OsString>, ResolveError> {
-    let directory = if relative.as_os_str().is_empty() {
-        root.try_clone()
-            .map_err(|error| ResolveError::io(root.path(), &error))?
-    } else {
-        resolve_directory(root, relative)?
-    };
+    let directory = directory_beneath(root, relative)?;
     match entry_names(&directory, limit)? {
         (names, false) => Ok(names),
         (_, true) => Err(ResolveError::message(
             directory.path(),
             "directory entry limit exceeded",
         )),
+    }
+}
+
+/// The first `limit` direct child names of a directory beneath `root`, and
+/// whether it holds more, for a caller that explains an oversized directory
+/// itself.
+pub fn first_entries_beneath(
+    root: &Root,
+    relative: &Path,
+    limit: usize,
+) -> Result<(Vec<OsString>, bool), ResolveError> {
+    entry_names(&directory_beneath(root, relative)?, limit)
+}
+
+fn directory_beneath(root: &Root, relative: &Path) -> Result<Root, ResolveError> {
+    if relative.as_os_str().is_empty() {
+        root.try_clone()
+            .map_err(|error| ResolveError::io(root.path(), &error))
+    } else {
+        resolve_directory(root, relative)
     }
 }
 
@@ -2159,6 +2174,26 @@ pub(crate) mod tests {
         #[cfg(target_os = "macos")]
         let unusable = refusing_pipe();
         assert!(copy_ownership(&source, &unusable).is_err());
+    }
+
+    #[test]
+    fn first_entries_beneath_lists_up_to_the_limit_and_says_whether_more_remain() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("child")).unwrap();
+        for name in ["a", "b", "c"] {
+            File::create(directory.path().join("child").join(name)).unwrap();
+        }
+        let root = Root::open(directory.path()).unwrap();
+        let (mut names, more) = first_entries_beneath(&root, Path::new("child"), 3).unwrap();
+        names.sort();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert!(!more);
+        let (names, more) = first_entries_beneath(&root, Path::new("child"), 2).unwrap();
+        assert_eq!(names.len(), 2);
+        assert!(more);
+        let (names, _) = first_entries_beneath(&root, Path::new(""), 8).unwrap();
+        assert_eq!(names, ["child"]);
+        assert!(first_entries_beneath(&root, Path::new("../child"), 8).is_err());
     }
 
     fn fifo(path: &Path) {

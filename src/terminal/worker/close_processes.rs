@@ -1,17 +1,16 @@
 use std::{
     fs::{self, File},
     io,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, OpenOptionsExt},
-        },
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+use crate::pinned_process::PinnedProcess;
 
 const MAX_CENSUS_PASSES: usize = 16;
 const MAX_PROCESSES: usize = 65_536;
@@ -44,7 +43,7 @@ pub(super) struct CloseProcess {
 
 pub(super) struct RootIdentity {
     pub process: CloseProcess,
-    pidfd: File,
+    pidfd: PinnedProcess,
     executable: Option<File>,
     kill_receipt: Arc<Mutex<bool>>,
 }
@@ -93,7 +92,7 @@ impl RootIdentity {
         let identity = |path: &Path| {
             let file = fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .custom_flags(EXECUTABLE_HANDLE | libc::O_CLOEXEC)
                 .open(path)
                 .ok()?;
             let metadata = file.metadata().ok()?;
@@ -115,6 +114,13 @@ impl RootIdentity {
     }
 }
 
+/// Opens an executable to hold its identity without reading it: a path
+/// handle on Linux, an execute-only one on Darwin.
+#[cfg(target_os = "linux")]
+const EXECUTABLE_HANDLE: libc::c_int = libc::O_PATH;
+#[cfg(target_os = "macos")]
+const EXECUTABLE_HANDLE: libc::c_int = libc::O_EXEC;
+
 fn executable_identity(pid: libc::pid_t) -> io::Result<(u64, u64)> {
     let metadata = fs::metadata(format!("/proc/{pid}/exe"))?;
     Ok((metadata.dev(), metadata.ino()))
@@ -122,7 +128,7 @@ fn executable_identity(pid: libc::pid_t) -> io::Result<(u64, u64)> {
 
 struct FrozenProcess {
     identity: CloseProcess,
-    pidfd: File,
+    pidfd: PinnedProcess,
     resume: bool,
 }
 
@@ -181,7 +187,8 @@ impl FrozenFamily {
                 let pidfd = match open_target(&process) {
                     Ok(pidfd) => pidfd,
                     Err(error)
-                        if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) =>
+                        if error.kind() == io::ErrorKind::NotFound
+                            || matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) =>
                     {
                         continue;
                     }
@@ -212,7 +219,7 @@ impl FrozenFamily {
     fn freeze(
         &mut self,
         process: CloseProcess,
-        pidfd: File,
+        pidfd: PinnedProcess,
         deadline: Instant,
     ) -> Result<(), String> {
         check_deadline(deadline)?;
@@ -336,11 +343,10 @@ impl FrozenFamily {
 
     pub(super) fn wait_until(&self, deadline: Instant) -> Result<bool, String> {
         for target in &self.targets {
-            if !super::holder::exits_within(
-                &target.pidfd,
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .map_err(|error| error.to_string())?
+            if !target
+                .pidfd
+                .wait_for_exit(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| error.to_string())?
             {
                 return Ok(false);
             }
@@ -354,7 +360,7 @@ impl FrozenFamily {
         // same handles across its graceful wait. Only survivors receive KILL.
         // Numeric PID reuse and reparenting cannot change that authority.
         for (index, target) in self.targets.iter_mut().enumerate() {
-            if super::holder::exits_within(&target.pidfd, Duration::ZERO).unwrap_or(false) {
+            if target.pidfd.exited().unwrap_or(false) {
                 target.resume = false;
                 continue;
             }
@@ -614,39 +620,37 @@ fn process_family(
     }
     family
 }
-fn open_target(process: &CloseProcess) -> io::Result<File> {
-    // SAFETY: successful pidfd_open yields a fresh owned descriptor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
-    if fd == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let file = unsafe { File::from_raw_fd(fd as libc::c_int) };
+fn open_target(process: &CloseProcess) -> io::Result<PinnedProcess> {
+    // A zombie member still needs its pin: the census already counts it, and
+    // the identity re-read below confirms the pin is of that very process.
+    let pin = PinnedProcess::open_unreaped(process.pid as u32)?;
     if !same_identity(process, &read_process(process.pid)?) {
         return Err(changed());
     }
-    Ok(file)
+    Ok(pin)
 }
-pub(super) fn signal(pidfd: &File, signal: libc::c_int) -> io::Result<()> {
-    // SAFETY: the owned pidfd pins one process and null siginfo uses ordinary delivery.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            signal,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
+
+/// Signals exactly the pinned process. A process that is gone answers
+/// `ESRCH`, as `kill(2)` would for its pid.
+fn signal(pin: &PinnedProcess, signal: libc::c_int) -> io::Result<()> {
+    if pin.signal(signal)? {
         Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(libc::ESRCH))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pin of a process that is gone, which no signal reaches.
+    fn reaped_pin() -> PinnedProcess {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pin = crate::pinned_process::PinnedChild::of(&child).unwrap();
+        child.wait().unwrap();
+        pin.into_process()
+    }
 
     #[test]
     fn census_skips_candidates_that_disappear_before_or_during_stat_read() {
@@ -700,7 +704,7 @@ mod tests {
                 state: b'T',
                 start: 1,
             },
-            pidfd: File::open("/dev/null").unwrap(),
+            pidfd: reaped_pin(),
             resume: false,
         };
         let mut family = FrozenFamily {
@@ -749,7 +753,7 @@ mod tests {
                 .into_iter()
                 .map(|identity| FrozenProcess {
                     identity,
-                    pidfd: File::open("/dev/null").unwrap(),
+                    pidfd: reaped_pin(),
                     resume: false,
                 })
                 .collect(),

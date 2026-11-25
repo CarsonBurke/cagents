@@ -470,6 +470,7 @@ struct Scan<'a> {
     session: &'a TerminalSession,
     proc_root: &'a Path,
     table: &'a ProcessTable,
+    #[cfg(target_os = "linux")]
     manager: Option<UserManagerSession>,
     exact_identity: Option<(crate::agent::Provider, uuid::Uuid)>,
     terminal_marker: String,
@@ -484,6 +485,7 @@ impl<'a> Scan<'a> {
             session,
             proc_root,
             table,
+            #[cfg(target_os = "linux")]
             manager: UserManagerSession::connect(),
             exact_identity: session
                 .agent_resume_recipe()
@@ -496,6 +498,20 @@ impl<'a> Scan<'a> {
             ),
             unit: systemd_unit(&session.launch),
         }
+    }
+
+    /// Whether `pid` belongs to the systemd user manager's own session.
+    #[cfg(target_os = "linux")]
+    fn in_user_manager(&self, pid: u32) -> bool {
+        self.manager
+            .as_ref()
+            .is_some_and(|manager| manager.contains(pid))
+    }
+
+    /// Darwin runs no systemd user manager; launchd's sessions are not one.
+    #[cfg(target_os = "macos")]
+    fn in_user_manager(&self, _pid: u32) -> bool {
+        false
     }
 
     fn carries_marker(&self, environment: &[u8]) -> bool {
@@ -605,12 +621,7 @@ impl<'a> Scan<'a> {
                 return Ok(Inspected::Unrelated);
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                if self
-                    .manager
-                    .as_ref()
-                    .is_some_and(|manager| manager.contains(pid))
-                    || self.in_unmarked_session(pid)
-                {
+                if self.in_user_manager(pid) || self.in_unmarked_session(pid) {
                     return Ok(Inspected::Unrelated);
                 }
                 return Ok(Inspected::Unreadable(UnreadableProcess {
@@ -839,29 +850,13 @@ fn detached_browser_helper(process: &Path) -> bool {
 /// The user manager and PAM helper can deny environ reads even to their owner.
 /// A hosted PTY always starts a new POSIX session; its descendants cannot join
 /// this pre-existing service session. Authenticate it, never trust process names.
-#[cfg(all(target_os = "linux", any(feature = "host", feature = "ui")))]
+#[cfg(all(any(feature = "host", feature = "ui"), target_os = "linux"))]
 struct UserManagerSession {
     id: i32,
     process: fs::File,
 }
 
-/// Darwin has no systemd user manager, so no process is excused as its
-/// service session.
-#[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
-enum UserManagerSession {}
-
-#[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
-impl UserManagerSession {
-    fn connect() -> Option<Self> {
-        None
-    }
-
-    fn contains(&self, _pid: u32) -> bool {
-        match *self {}
-    }
-}
-
-#[cfg(all(target_os = "linux", any(feature = "host", feature = "ui")))]
+#[cfg(all(any(feature = "host", feature = "ui"), target_os = "linux"))]
 impl UserManagerSession {
     fn connect() -> Option<Self> {
         use std::os::{

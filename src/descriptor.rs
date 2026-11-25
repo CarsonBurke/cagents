@@ -128,11 +128,67 @@ pub(crate) fn unix_socket(kind: libc::c_int, nonblocking: bool) -> io::Result<Ow
     Ok(socket)
 }
 
+/// Whether a refused Unix-domain `connect` should be tried again before it
+/// counts as proof that nothing listens there. `refusing_since` is when the
+/// first refusal of this endpoint was seen.
+///
+/// Linux refuses only a socket nobody listens on, and answers a full backlog
+/// with `EAGAIN`, so a refusal is final there. Darwin refuses a full backlog
+/// with the same `ECONNREFUSED`. A live listener drains its backlog as it
+/// accepts, so there a refusal counts only once it has persisted for
+/// [`REFUSAL_WINDOW`]. That is weaker than Linux: a listener whose backlog
+/// stays full for the whole window is taken for one that stopped. Retrying
+/// until a caller's own deadline instead, as Linux retries `EAGAIN`, would
+/// make every request to a crashed server, whose socket file stays behind,
+/// wait out that whole deadline. A deadline that ends inside the window
+/// leaves the refusal unproved, so the caller reports a timeout, not absence.
+pub(crate) fn retry_refusal(error: &io::Error, refusing_since: std::time::Instant) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (error, refusing_since);
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        error.kind() == io::ErrorKind::ConnectionRefused
+            && refusing_since.elapsed() < REFUSAL_WINDOW
+    }
+}
+
+/// How long Darwin must keep refusing; see [`retry_refusal`].
+#[cfg(target_os = "macos")]
+pub(crate) const REFUSAL_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A listen backlog that admits exactly one pending connection, so a test can
+/// fill it with one. Linux admits one more than the backlog; XNU admits the
+/// backlog itself, and replaces a backlog of 0 with its default.
+#[cfg(test)]
+pub(crate) const ONE_PENDING_BACKLOG: libc::c_int = if cfg!(target_os = "macos") { 1 } else { 0 };
+
 /// Connects a Unix-domain stream to `path`; see [`keep_options_after_shutdown`].
 pub(crate) fn connect(path: &std::path::Path) -> io::Result<UnixStream> {
     let stream = UnixStream::connect(path)?;
     keep_options_after_shutdown(std::os::fd::AsFd::as_fd(&stream))?;
     Ok(stream)
+}
+
+/// [`connect`] for a caller that takes a refusal to mean nothing listens at
+/// `path`. Linux makes one attempt, since its refusal is final. Darwin also
+/// refuses a full backlog, so a refusal is tried again until it has lasted
+/// [`REFUSAL_WINDOW`] and only then returned; see [`retry_refusal`].
+pub(crate) fn connect_settled(path: impl AsRef<std::path::Path>) -> io::Result<UnixStream> {
+    let path = path.as_ref();
+    let refusing_since = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(1);
+    loop {
+        match connect(path) {
+            Err(error) if retry_refusal(&error, refusing_since) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Binds a Unix-domain listener at `path` whose connections keep their
@@ -387,5 +443,34 @@ mod tests {
         }
         // SAFETY: as above.
         assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 1);
+    }
+
+    /// A full backlog is waited out, as Linux blocks on it, but a socket that
+    /// nobody listens on is still reported refused once the window has passed.
+    #[test]
+    fn a_settled_connect_waits_out_a_full_backlog_but_not_a_dead_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("listener.sock");
+        let listener = super::bind(&path).unwrap();
+        // SAFETY: listen takes the live listener descriptor and a scalar.
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), super::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let _pending = super::connect(&path).unwrap();
+        let accepter = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(20));
+            let accepted = listener.accept().unwrap();
+            (listener, accepted)
+        });
+        super::connect_settled(&path).unwrap();
+        drop(accepter.join().unwrap());
+
+        let started = std::time::Instant::now();
+        let error = super::connect_settled(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        #[cfg(target_os = "macos")]
+        assert!(started.elapsed() >= super::REFUSAL_WINDOW);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

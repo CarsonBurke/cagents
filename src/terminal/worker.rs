@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{BufWriter, Read, Write},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -46,6 +46,7 @@ use crate::{
         LaunchRecipe, TerminalId, TerminalOutputActivity, TerminalSession,
         agent_recovery::AgentProcess,
     },
+    pinned_process::PinnedProcess,
     secure_file::open_private_append_file,
 };
 
@@ -599,12 +600,12 @@ struct PublishedState {
     #[cfg(any(test, feature = "test-support"))]
     close_inspection_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     #[cfg(any(test, feature = "test-support"))]
-    test_input_root_pidfd: OnceLock<File>,
+    test_input_root_pidfd: OnceLock<PinnedProcess>,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
-    launch_directory: OnceLock<(holder::LaunchDirectoryPin, File)>,
-    original_holder_process: OnceLock<Arc<File>>,
+    launch_directory: OnceLock<(holder::LaunchDirectoryPin, PinnedProcess)>,
+    original_holder_process: OnceLock<Arc<PinnedProcess>>,
     original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
@@ -1151,7 +1152,7 @@ pub struct TerminalHandle {
 /// Completion or transfer to the child reaper alone is not a release receipt.
 pub enum TerminalRetirement {
     Pending,
-    WaitingForHolder(Arc<File>),
+    WaitingForHolder(Arc<PinnedProcess>),
     Released,
     Retained(String),
 }
@@ -1298,13 +1299,17 @@ impl TerminalHandle {
             .unwrap_or_else(|p| p.into_inner()) = budget;
     }
     #[cfg(any(test, feature = "test-support"))]
+    /// A descriptor that polls readable once the original root exits: its
+    /// pidfd on Linux.
     pub fn original_root_pidfd_for_test(&self) -> std::io::Result<File> {
         self.inner
             .published
             .test_input_root_pidfd
             .get()
-            .ok_or_else(|| std::io::Error::other("original root pidfd was not captured"))?
-            .try_clone()
+            .ok_or_else(|| std::io::Error::other("original root pin was not captured"))?
+            .exit_readiness()
+            .try_clone_to_owned()
+            .map(File::from)
     }
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
@@ -1328,15 +1333,9 @@ impl TerminalHandle {
             .launch_directory
             .get()
             .ok_or("this terminal holder cannot attest its original launch directory")?;
-        let mut original = libc::pollfd {
-            fd: root.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll observes the already-held original root, never a PID
-        // lookup. A kernel exit must refuse even before Completed is published.
-        let ready = unsafe { libc::poll(&mut original, 1, 0) };
-        if ready != 0 {
+        // The already-held original root, never a PID lookup. A kernel exit
+        // must refuse even before Completed is published.
+        if !matches!(root.exited(), Ok(false)) {
             return Err("terminal original root is no longer live or cannot be observed".into());
         }
         holder::checked_launch_directory(*identity, Arc::clone(file))
@@ -1882,24 +1881,14 @@ impl TerminalHandle {
                 "Original holder process evidence is unavailable".into(),
             );
         };
-        let mut event = libc::pollfd {
-            fd: original.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // The held pidfd cannot observe a reused numeric PID. Keep it alive
+        // The held pin cannot observe a reused numeric PID. Keep it alive
         // through the daemon's wait when an adopted or fsyncing holder remains.
-        match unsafe { libc::poll(&mut event, 1, 0) } {
-            0 => TerminalRetirement::WaitingForHolder(Arc::clone(original)),
-            n if n < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted =>
-            {
+        match original.exited() {
+            Ok(false) => TerminalRetirement::WaitingForHolder(Arc::clone(original)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                 TerminalRetirement::WaitingForHolder(Arc::clone(original))
             }
-            n if n > 0
-                && event.revents & libc::POLLIN != 0
-                && event.revents & (libc::POLLNVAL | libc::POLLERR) == 0 =>
-            {
+            Ok(true) => {
                 if let Some(record) = self.holder_identity() {
                     match super::holder::cleanup::confirmed_with_role(
                         source,
@@ -3337,7 +3326,7 @@ impl Worker {
             }
         };
         // The holder reaps the root, so its pid identifies it only while the
-        // pidfd still reaches an unreaped process: checked after the capture,
+        // pin still reaches an unreaped process: checked after the capture,
         // that proves the capture read the root and not a reused pid.
         let child_identity = RootIdentity::capture(held.child.pid(), executable)
             .ok()
@@ -3349,15 +3338,12 @@ impl Worker {
         };
         #[cfg(any(test, feature = "test-support"))]
         {
-            // The existing holder pidfd must still reach its original root
-            // after opening the fixture capability. A reaped/reused PID never
-            // reaches the failure guard. Quick natural exits need no fallback.
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, held.child.pid(), 0) };
-            if raw >= 0 {
-                let descriptor = unsafe { File::from_raw_fd(raw as i32) };
-                if held.child.unreaped() {
-                    let _ = published.test_input_root_pidfd.set(descriptor);
-                }
+            // A second pin of the exact root, never a reopened PID. Quick
+            // natural exits need no fallback.
+            if let Ok(pin) = held.child.duplicate_pin()
+                && held.child.unreaped()
+            {
+                let _ = published.test_input_root_pidfd.set(pin);
             }
         }
         let writer = File::from(duplicate("writing")?);
@@ -3419,7 +3405,7 @@ impl Worker {
             .as_ref()
             .map(|(identity, file)| {
                 held.child
-                    .duplicate_pidfd()
+                    .duplicate_pin()
                     .map(|root| ((*identity, Arc::clone(file)), root))
                     .map_err(|error| format!("pin original terminal root: {error}"))
             })
@@ -5887,7 +5873,7 @@ impl Worker {
             return;
         }
         // SAFETY: the successful ioctl returned a fresh owned descriptor.
-        let peer = unsafe { OwnedFd::from_raw_fd(peer) };
+        let peer = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(peer) };
         if unsafe { libc::tcflush(peer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
             self.error(
                 "cancel terminal input",

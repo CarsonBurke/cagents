@@ -49,7 +49,7 @@ impl ProviderScope {
     }
 }
 
-pub(crate) fn enroll_holder() -> io::Result<()> {
+pub(crate) fn enroll_current_process() -> io::Result<()> {
     Ok(())
 }
 
@@ -101,7 +101,7 @@ pub(crate) mod tests {
 
     #[test]
     fn every_enrollment_keeps_the_existing_launch() {
-        super::enroll_holder().unwrap();
+        super::enroll_current_process().unwrap();
         assert!(super::enroll_dividing_holder().unwrap().is_none());
         assert!(
             super::enroll_provider(std::process::id(), None)

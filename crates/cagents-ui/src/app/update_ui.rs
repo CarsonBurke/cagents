@@ -18,6 +18,10 @@ pub(super) struct State {
     /// Whether this window runs from an installation tree, the only place an
     /// install can leave it behind.
     watch_installation: bool,
+    discovery_watch: usize,
+    discovery_watch_failed: bool,
+    #[cfg(feature = "development")]
+    watch_review_fixture: bool,
     inspecting: bool,
     /// The installed UI executable this window has been left behind by.
     superseded: Option<PathBuf>,
@@ -128,6 +132,7 @@ pub enum Action {
         result: Result<(), String>,
     },
     ConfirmApply(String),
+    ConfirmInterrupt(String),
     ReviewJob,
     /// Leave the review to look at a session it names, keeping the update.
     ShowSession(crate::model::TerminalId),
@@ -141,6 +146,7 @@ pub enum Action {
     StartApply,
     Applied(Result<UpdateJob, String>),
     ProgressWatch(String, bool),
+    DiscoveryWatchFailed(usize),
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
     InspectInstallation,
@@ -148,20 +154,25 @@ pub enum Action {
     Restart,
 }
 
-#[derive(Hash)]
-struct ProgressJob(String);
+#[derive(Clone, Hash)]
+enum ProgressScope {
+    Installation(usize),
+    Job(String),
+}
 
-fn watch_progress(job: &ProgressJob) -> impl iced::futures::Stream<Item = Action> + use<> {
-    let job = job.0.clone();
+fn watch_progress(scope: &ProgressScope) -> impl iced::futures::Stream<Item = Action> + use<> {
+    let scope = scope.clone();
     iced::stream::channel(1, async move |mut output| {
+        let active_job = matches!(scope, ProgressScope::Job(_));
         if let Ok(Ok(changes)) =
-            tokio::task::spawn_blocking(crate::update::progress::Changes::watch).await
-        {
-            if output
-                .send(Action::ProgressWatch(job.clone(), true))
+            tokio::task::spawn_blocking(move || crate::update::progress::Changes::watch(active_job))
                 .await
-                .is_err()
-            {
+        {
+            let registered = match &scope {
+                ProgressScope::Job(job) => Action::ProgressWatch(job.clone(), true),
+                ProgressScope::Installation(_) => Action::Poll,
+            };
+            if output.send(registered).await.is_err() {
                 return;
             }
             while changes.changed().await {
@@ -170,9 +181,12 @@ fn watch_progress(job: &ProgressJob) -> impl iced::futures::Stream<Item = Action
                 }
             }
         }
-        let _ = output.send(Action::ProgressWatch(job, false)).await;
-        // Keep the fallback active for the rest of this job if its file
-        // watcher could not be registered or disconnected.
+        let failed = match scope {
+            ProgressScope::Job(job) => Action::ProgressWatch(job, false),
+            ProgressScope::Installation(attempt) => Action::DiscoveryWatchFailed(attempt),
+        };
+        let _ = output.send(failed).await;
+        // Use the job's fallback or rearm passive discovery on the next focus.
         std::future::pending::<()>().await;
     })
 }
@@ -314,6 +328,58 @@ fn waits_for_idle(preview: &crate::update::impact::Preview) -> bool {
     })
 }
 
+/// Conversations whose current turns can be interrupted by the choice now
+/// on screen. An already claimed delivery cannot be interrupted for update.
+fn interruptions_available(
+    confirmation: &crate::update::UpdateConfirmation,
+) -> Option<(usize, usize)> {
+    use crate::update::impact::{Disposition, Policy, SessionCause, SessionKind};
+
+    if confirmation.stop.is_some() {
+        return None;
+    }
+    let daemon = confirmation.preview.daemon.as_ref()?;
+    if daemon.policy != Policy::WhenIdle || daemon.blocked() {
+        return None;
+    }
+    let mut conversations = 0;
+    let mut subagents = 0;
+    for session in daemon.sessions.iter().filter(|session| {
+        session.kind == SessionKind::NativeChat && session.disposition == Disposition::WaitsForIdle
+    }) {
+        // A staged update can have started in an earlier worker. Its
+        // interruption approval must not be broader than these buttons say.
+        if session.reason == SessionCause::PendingDelivery
+            || confirmation
+                .preview
+                .stopped
+                .iter()
+                .any(|pane| pane.pane == session.id)
+        {
+            return None;
+        }
+        conversations += 1;
+        subagents += session.interrupted_subagents.len();
+    }
+    (conversations > 0).then_some((conversations, subagents))
+}
+
+fn interruption_choice_summary(conversations: usize, subagents: usize) -> String {
+    let mut summary = if conversations == 1 {
+        "Updating now interrupts one running conversation and then reopens it.".to_owned()
+    } else {
+        format!(
+            "Updating now interrupts {conversations} running conversations and then reopens them."
+        )
+    };
+    match subagents {
+        0 => {}
+        1 => summary.push_str(" One background agent will stop."),
+        count => summary.push_str(&format!(" {count} background agents will stop.")),
+    }
+    summary
+}
+
 /// The other way to treat conversations that are mid-turn, when any are.
 fn policy_choice(
     daemon: &crate::update::impact::DaemonImpact,
@@ -445,6 +511,8 @@ impl State {
     pub(super) fn new() -> Self {
         Self {
             watch_installation: crate::update::runs_from_installation(),
+            #[cfg(feature = "development")]
+            watch_review_fixture: crate::update::progress::Changes::has_review_fixture(),
             ..Self::default()
         }
     }
@@ -546,6 +614,24 @@ impl Cagents {
         })
     }
 
+    fn confirm_update(
+        &mut self,
+        nonce: String,
+        choice: crate::update::UpdateChoice,
+    ) -> Task<Message> {
+        let Some(confirmation) = &self.update_ui.confirmation else {
+            return Task::none();
+        };
+        if confirmation.nonce != nonce
+            || !confirmable(confirmation)
+            || matches!(choice, crate::update::UpdateChoice::InterruptNow)
+                && interruptions_available(confirmation).is_none()
+        {
+            return Task::none();
+        }
+        self.decide_update(choice)
+    }
+
     pub(super) fn update_dialog(&self) -> Option<Element<'_, Message>> {
         use crate::update::impact::Disposition;
         let confirmation = self.update_ui.confirmation.as_ref()?;
@@ -568,6 +654,7 @@ impl Cagents {
             None => title,
         };
         let terminal_confirmation = confirmation.stop.is_some();
+        let interruptions = interruptions_available(confirmation);
         let mut body = vec![
             heading,
             notice_body(if terminal_confirmation {
@@ -576,6 +663,12 @@ impl Cagents {
                 preview_summary(preview)
             }),
         ];
+        if let Some((conversations, subagents)) = interruptions {
+            body.push(notice_body(interruption_choice_summary(
+                conversations,
+                subagents,
+            )));
+        }
         let mut rows = Vec::new();
         if terminal_confirmation {
             // The worker's list and command replace the old refusal details in
@@ -599,13 +692,12 @@ impl Cagents {
             let (attention, settled): (Vec<_>, Vec<_>) = daemon
                 .sessions
                 .iter()
-                .map(|session| session.review())
                 .partition(|session| session.disposition == Disposition::Blocked);
             rows.extend(
                 attention
                     .into_iter()
                     .chain(settled)
-                    .map(|session| self.update_session_row(session)),
+                    .map(|session| self.update_session_row(session, interruptions.is_some())),
             );
             rows.extend(daemon.review_notices().into_iter().map(notice_body));
         }
@@ -619,7 +711,8 @@ impl Cagents {
         if let Some(handoff) = terminal_handoff(confirmation) {
             body.push(notice_body(handoff));
         }
-        if !terminal_confirmation
+        if interruptions.is_none()
+            && !terminal_confirmation
             && let Some(daemon) = &preview.daemon
             && let Some((label, policy)) = policy_choice(daemon)
         {
@@ -629,18 +722,9 @@ impl Cagents {
                     .into(),
             );
         }
-        let waits_for_idle = waits_for_idle(preview);
-        // While something holds the update back, the warning above the list
-        // says what, and the update waits until a poll finds it resolved.
-        let confirm = crate::ui_controls::button::primary("Update and reopen")
-            .instead("Continue in terminal", terminal_confirmation)
-            .instead("Update when idle", waits_for_idle)
-            .id(confirm_id())
-            .on_press_maybe(
-                confirmable(confirmation)
-                    .then(|| Message::UpdateUi(Action::ConfirmApply(confirmation.nonce.clone()))),
-            );
-        let actions = widget::row::with_children(vec![
+        let confirm =
+            |action: fn(String) -> Action| Message::UpdateUi(action(confirmation.nonce.clone()));
+        let mut actions = vec![
             crate::ui_controls::button::quiet("Copy details")
                 .id(widget::Id::new("update.copy"))
                 .on_press(Message::UpdateUi(Action::CopyDetails))
@@ -650,12 +734,35 @@ impl Cagents {
                 .id(cancel_id())
                 .on_press(Message::UpdateUi(Action::CancelApply))
                 .into(),
-            // Choosing to wait for idle sessions renames the update, and
-            // Cancel beside it stays put.
-            confirm.into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(space::S);
+        ];
+        if interruptions.is_some() {
+            actions.push(
+                crate::ui_controls::button::secondary("Update when idle")
+                    .id(widget::Id::new("update.when-idle"))
+                    .on_press(confirm(Action::ConfirmApply))
+                    .into(),
+            );
+            actions.push(
+                crate::ui_controls::button::primary("Update now")
+                    .id(confirm_id())
+                    .on_press(confirm(Action::ConfirmInterrupt))
+                    .into(),
+            );
+        } else {
+            actions.push(
+                crate::ui_controls::button::primary("Update and reopen")
+                    .instead("Continue in terminal", terminal_confirmation)
+                    .instead("Update when idle", waits_for_idle(preview))
+                    .id(confirm_id())
+                    .on_press_maybe(
+                        confirmable(confirmation).then(|| confirm(Action::ConfirmApply)),
+                    )
+                    .into(),
+            );
+        }
+        let actions = widget::row::with_children(actions)
+            .align_y(Alignment::Center)
+            .spacing(space::S);
         // A short window scrolls what the update affects; Cancel and the
         // update stay in reach.
         Some(dialog_ui::overlay(
@@ -676,18 +783,27 @@ impl Cagents {
     /// window is the one holding its tab.
     fn update_session_row<'a>(
         &self,
-        session: crate::update::impact::SessionReview,
+        session: &crate::update::impact::SessionImpact,
+        choosing_when: bool,
     ) -> Element<'a, Message> {
-        use crate::update::impact::Disposition;
+        use crate::update::impact::{Disposition, SessionKind};
+        let working = choosing_when
+            && session.kind == SessionKind::NativeChat
+            && session.disposition == Disposition::WaitsForIdle;
+        let review = session.review();
         let mut header = vec![
-            widget::selectable_text(session.title.clone())
+            widget::selectable_text(review.title)
                 .size(design::TEXT_HEADING)
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .width(Length::Fill)
                 .into(),
             crate::ui_controls::badge(
-                session.disposition.label(),
+                if working {
+                    "Working"
+                } else {
+                    session.disposition.label()
+                },
                 disposition_tone(session.disposition),
             ),
         ];
@@ -699,15 +815,16 @@ impl Cagents {
                     .into(),
             );
         }
-        widget::column::with_children(vec![
+        let mut row = widget::column::with_children(vec![
             widget::row::with_children(header)
                 .align_y(Alignment::Center)
                 .spacing(space::S)
                 .into(),
-            notice_detail(session.reason),
-        ])
-        .spacing(space::XXS)
-        .into()
+        ]);
+        if !working || !session.interrupted_subagents.is_empty() {
+            row = row.push(notice_detail(review.reason));
+        }
+        row.spacing(space::XXS).into()
     }
 
     /// The open tab in this window that shows a daemon session, and the
@@ -811,14 +928,6 @@ impl Cagents {
         } else {
             Subscription::none()
         };
-        // Release discovery talks to GitHub and drives the installer, neither
-        // of which a development instance may do.
-        if crate::instance::NAME == "development"
-            && !self.update_ui.updating()
-            && !self.update_ui.poll_retry
-        {
-            return installation;
-        }
         let active_job = self.update_ui.active_job();
         // Older workers publish a failure before their last recovery verdict.
         // This window may still present Installing until their deadline,
@@ -834,7 +943,7 @@ impl Cagents {
         let progress = if let Some(job) = active_job {
             // The lease observer is one-shot. Register it only once we have
             // seen a job whose worker has taken custody of the lease.
-            let watch = Subscription::run_with(ProgressJob(job.to_owned()), watch_progress)
+            let watch = Subscription::run_with(ProgressScope::Job(job.to_owned()), watch_progress)
                 .map(Message::UpdateUi);
             let fallback = if poll {
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
@@ -846,17 +955,38 @@ impl Cagents {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
         } else if self.update_ui.applying {
             Subscription::none()
-        } else if self.settings.check_for_updates {
-            iced::time::every(background_check_interval(self.update_ui.check_failures))
-                .map(|_| Message::UpdateUi(Action::Check))
         } else {
-            Subscription::none()
+            // Development instances can observe their read-only fixture but
+            // have no installed release to check for.
+            let installed = crate::instance::NAME != "development";
+            let release = if installed && self.settings.check_for_updates {
+                iced::time::every(background_check_interval(self.update_ui.check_failures))
+                    .map(|_| Message::UpdateUi(Action::Check))
+            } else {
+                Subscription::none()
+            };
+            let watch_worker = installed && self.update_ui.watch_installation;
+            #[cfg(feature = "development")]
+            let watch_worker = watch_worker || self.update_ui.watch_review_fixture;
+            let worker = if watch_worker {
+                Subscription::run_with(
+                    ProgressScope::Installation(self.update_ui.discovery_watch),
+                    watch_progress,
+                )
+                .map(Message::UpdateUi)
+            } else {
+                Subscription::none()
+            };
+            Subscription::batch([release, worker])
         };
         Subscription::batch([progress, installation])
     }
 
     /// Focus returning is when a stale window is about to be used again.
     pub(super) fn installation_focus_regained(&mut self) -> Task<Message> {
+        if std::mem::take(&mut self.update_ui.discovery_watch_failed) {
+            self.update_ui.discovery_watch = self.update_ui.discovery_watch.wrapping_add(1);
+        }
         // A first look that failed for a passing reason (a descriptor limit,
         // an unreadable marker) must not blind the window for good. A source
         // build stays off: it is never inside an installation tree.
@@ -1393,17 +1523,10 @@ impl Cagents {
                 Task::none()
             }
             Action::ConfirmApply(nonce) => {
-                if self
-                    .update_ui
-                    .confirmation
-                    .as_ref()
-                    .is_none_or(|confirmation| {
-                        confirmation.nonce != nonce || !confirmable(confirmation)
-                    })
-                {
-                    return Task::none();
-                }
-                self.decide_update(crate::update::UpdateChoice::Confirm)
+                self.confirm_update(nonce, crate::update::UpdateChoice::Confirm)
+            }
+            Action::ConfirmInterrupt(nonce) => {
+                self.confirm_update(nonce, crate::update::UpdateChoice::InterruptNow)
             }
             Action::CancelApply => self.decide_update(crate::update::UpdateChoice::Cancel),
             Action::InterruptWaiting => self.decide_waiting(crate::update::UpdateChoice::Policy(
@@ -1468,6 +1591,12 @@ impl Cagents {
                         self.status = Some(TransientNotice::error(error.clone()));
                         self.update_ui.error = Some(error);
                     }
+                }
+                Task::none()
+            }
+            Action::DiscoveryWatchFailed(attempt) => {
+                if self.update_ui.discovery_watch == attempt {
+                    self.update_ui.discovery_watch_failed = true;
                 }
                 Task::none()
             }
@@ -1719,7 +1848,8 @@ pub(in crate::app) mod tests {
         let main = window::Id::RESERVED;
         app.core.set_main_window_id(Some(main));
         app.refresh_ui.focused = true;
-        assert_eq!(app.update_subscription().units(), 1);
+        let worker = usize::from(crate::instance::NAME != "development");
+        assert_eq!(app.update_subscription().units(), worker + 1);
         let inspected = |app: &mut Cagents| {
             let started = app.update_ui.inspecting;
             drop(app.update_update_ui(Action::InstallationInspected(None)));
@@ -1733,8 +1863,8 @@ pub(in crate::app) mod tests {
         }
         assert_eq!(
             app.update_subscription().units(),
-            0,
-            "an unfocused window does not poll its installation"
+            worker,
+            "an unfocused window keeps noticing newly started jobs without polling its installation"
         );
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
         assert!(inspected(&mut app), "regaining focus inspects at once");
@@ -2468,6 +2598,52 @@ pub(in crate::app) mod tests {
             refusal: None,
             in_flight: Vec::new(),
             recorded_by: None,
+        }
+    }
+
+    #[test]
+    fn the_first_review_offers_either_update_decision() {
+        use crate::update::impact::{Disposition, SessionCause};
+
+        let mut awaiting_delivery = session("Delivery", Disposition::WaitsForIdle);
+        awaiting_delivery.reason = SessionCause::PendingDelivery;
+        let mut working = session("Lead", Disposition::WaitsForIdle);
+        working.interrupted_subagents.push("child".into());
+        let mixed = daemon_preview(vec![working.clone(), awaiting_delivery]);
+        assert_eq!(interruptions_available(&mixed), None);
+        let confirmation = daemon_preview(vec![working]);
+        assert_eq!(interruptions_available(&confirmation), Some((1, 1)));
+        assert_eq!(
+            interruption_choice_summary(1, 1),
+            "Updating now interrupts one running conversation and then reopens it. One background agent will stop."
+        );
+
+        for (id, now) in [
+            (confirm_id(), true),
+            (widget::Id::new("update.when-idle"), false),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let poll = review_ready(&mut app, awaiting(&confirmation));
+            drop(app.update(poll));
+            let (mut messages, _) = crate::app::dialog_ui::tests::key_control(
+                app.update_dialog().unwrap(),
+                id,
+                crate::app::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(match (&messages[0], now) {
+                (Message::UpdateUi(Action::ConfirmInterrupt(nonce)), true)
+                | (Message::UpdateUi(Action::ConfirmApply(nonce)), false) => {
+                    nonce == &confirmation.nonce
+                }
+                _ => false,
+            });
+            drop(app.update(messages.pop().unwrap()));
+            assert!(app.update_ui.confirmation.is_none());
+            assert_eq!(
+                app.update_ui.submitted_confirmation,
+                Some(confirmation.nonce.clone())
+            );
         }
     }
 

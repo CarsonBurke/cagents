@@ -1502,7 +1502,7 @@ impl RemoteActor {
                 1,
                 crate::descriptor_frame::FrameByteOrder::LittleEndian,
             )?;
-        verify_peer(&control, &self.0.identity.record)?;
+        verify_replied_peer(&control, &self.0.identity.record)?;
         match result {
             Err(error) if error == UNKNOWN_METHOD => Ok(None),
             Err(error) => Err(error),
@@ -1736,7 +1736,7 @@ impl RemoteActor {
                 1,
                 crate::descriptor_frame::FrameByteOrder::LittleEndian,
             )?;
-            verify_peer(&control, &self.0.identity.record)?;
+            verify_replied_peer(&control, &self.0.identity.record)?;
             Ok::<_, String>(received)
         })()
         .map_err(|error| interrupted_request("pinned_directory", error))?;
@@ -4207,7 +4207,21 @@ fn interrupted_request(method: &str, error: String) -> String {
 fn verify_peer(control: &UnixStream, record: &Record) -> Result<(), String> {
     let credentials = peer(control)?;
     if credentials.uid != crate::daemon::current_uid()
-        || credentials.pid != record.holder.pid
+        || u32::try_from(record.holder.pid).ok() != Some(credentials.pid)
+        || !record.holder.is_current()
+    {
+        return Err("Retained actor socket peer identity changed".into());
+    }
+    Ok(())
+}
+/// [`verify_peer`] again once the helper has replied. A connected stream's
+/// peer cannot change, so the pid proved before the request still names it;
+/// what can change is whether that holder is still current. The pid is not
+/// read again: Darwin stops reporting it once the peer closes, which the
+/// helper may already have done after replying. The uid still answers.
+fn verify_replied_peer(control: &UnixStream, record: &Record) -> Result<(), String> {
+    if crate::pinned_process::peer_uid(control).map_err(|error| error.to_string())?
+        != crate::daemon::current_uid()
         || !record.holder.is_current()
     {
         return Err("Retained actor socket peer identity changed".into());
@@ -4237,29 +4251,15 @@ fn authorize(control: &UnixStream, proof: &HostSessionProof) -> Result<(), Strin
     let credentials = peer(control)?;
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
     let owner = authority_result(crate::daemon::lease_owner(&paths.lock, proof))?;
-    if credentials.uid != crate::daemon::current_uid()
-        || u32::try_from(credentials.pid).ok() != Some(owner)
-    {
+    if credentials.uid != crate::daemon::current_uid() || credentials.pid != owner {
         return Err("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED: Retained actor caller does not own the current daemon lease".into());
     }
     Ok(())
 }
-fn peer(control: &UnixStream) -> Result<libc::ucred, String> {
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            control.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut credentials).cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    Ok(credentials)
+/// The peer's credentials. On Darwin the pid is only a candidate, which every
+/// caller compares to a process it has already proven.
+fn peer(control: &UnixStream) -> Result<crate::pinned_process::PeerCredentials, String> {
+    crate::pinned_process::peer_credentials(control).map_err(|error| error.to_string())
 }
 fn send(control: &UnixStream, value: &impl Serialize, timeout: Duration) -> Result<(), String> {
     deadline_io::send_until(control, value, Instant::now() + timeout)
@@ -4450,7 +4450,7 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
             let mut server = Server::start_after_scope_enrollment(
                 startup,
                 &control,
-                crate::daemon::process_scope::enroll_holder,
+                crate::daemon::process_scope::enroll_current_process,
             )?;
             let served = server.serve(
                 control.try_clone().map_err(|error| error.to_string())?,
@@ -4487,9 +4487,24 @@ fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {
         }
         Ok(value)
     }
-    if option(fd, libc::SO_DOMAIN)? != libc::AF_UNIX
-        || option(fd, libc::SO_TYPE)? != libc::SOCK_STREAM
-    {
+    #[cfg(target_os = "linux")]
+    fn domain(fd: RawFd) -> Result<libc::c_int, String> {
+        option(fd, libc::SO_DOMAIN)
+    }
+    /// Darwin has no `SO_DOMAIN`; a socket's own address carries its family.
+    #[cfg(target_os = "macos")]
+    fn domain(fd: RawFd) -> Result<libc::c_int, String> {
+        // SAFETY: all-zero bytes are a valid `sockaddr_storage`.
+        let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: the buffer is writable and `length` bytes long; an invalid
+        // `fd` only makes the call fail.
+        if unsafe { libc::getsockname(fd, (&raw mut address).cast(), &mut length) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(libc::c_int::from(address.ss_family))
+    }
+    if domain(fd)? != libc::AF_UNIX || option(fd, libc::SO_TYPE)? != libc::SOCK_STREAM {
         return Err("Retained helper control must be a connected Unix stream socket".into());
     }
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -4521,7 +4536,7 @@ fn helper_executable() -> Result<PathBuf, String> {
     if crate::test_binary::is_test_binary() {
         return Err("Actual retained-helper tests require CAGENTS_TEST_RETAINED_ACTOR_HELPER pointing to the same-head cagentsd binary".into());
     }
-    std::env::current_exe().map_err(|error| error.to_string())
+    crate::process::current_executable().map_err(|error| error.to_string())
 }
 
 fn confirm_installed_snapshot(state: &mut Snapshot) {

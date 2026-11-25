@@ -410,8 +410,8 @@ impl Default for KeyboardShortcuts {
             review_previous_change: vec!["Alt+K".to_owned()],
             command_palette: vec!["Ctrl+Shift+P".to_owned()],
             new_native_thread: vec!["Ctrl+T".to_owned(), "Ctrl+Shift+N".to_owned()],
-            chat_permissions: vec!["Ctrl+Shift+O".to_owned()],
-            chat_model: vec!["Ctrl+Shift+M".to_owned()],
+            chat_permissions: vec!["Ctrl+O".to_owned()],
+            chat_model: vec!["Ctrl+M".to_owned()],
             chat_account: vec!["Ctrl+Shift+A".to_owned()],
             toggle_inspector: vec!["Ctrl+Shift+I".to_owned()],
             open_settings: vec!["Ctrl+Comma".to_owned()],
@@ -1714,7 +1714,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 6;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1757,6 +1757,9 @@ struct RetiredShortcutDefault {
 /// Revision 3 adds the conventional new-tab chord to native threads.
 /// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
 /// Revision 5 separates project search from find in the focused pane.
+/// Revision 6 drops Shift from the chat model and permission pickers: their
+/// chords act only in a chat pane, so they never reach a shell, and neither
+/// `Ctrl+M` nor `Ctrl+O` edits the message.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1812,6 +1815,16 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "search_projects",
         retired_in: 5,
         chords: &["Ctrl+F"],
+    },
+    RetiredShortcutDefault {
+        action: "chat_permissions",
+        retired_in: 6,
+        chords: &["Ctrl+Shift+O"],
+    },
+    RetiredShortcutDefault {
+        action: "chat_model",
+        retired_in: 6,
+        chords: &["Ctrl+Shift+M"],
     },
 ];
 
@@ -4809,6 +4822,52 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
+    fn revision_6_moves_chat_pickers_still_on_their_default_off_shift() {
+        for (model, permissions, occupied, expected_model, expected_permissions) in [
+            (
+                vec!["Ctrl+Shift+M"],
+                vec!["Ctrl+Shift+O"],
+                "Alt+S",
+                vec!["Ctrl+M"],
+                vec!["Ctrl+O"],
+            ),
+            (
+                vec!["Alt+M"],
+                vec!["Ctrl+Shift+O", "Alt+O"],
+                "Alt+S",
+                vec!["Alt+M"],
+                vec!["Ctrl+Shift+O", "Alt+O"],
+            ),
+            (
+                vec!["Ctrl+Shift+M"],
+                vec!["Ctrl+Shift+O"],
+                "Ctrl+M",
+                vec!["Ctrl+Shift+M"],
+                vec!["Ctrl+O"],
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 5.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("chat_model".into(), model.into());
+            shortcuts.insert("chat_permissions".into(), permissions.into());
+            shortcuts.insert("new_terminal".into(), vec![occupied].into());
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.keyboard_shortcuts.chat_model, expected_model);
+            assert_eq!(
+                loaded.keyboard_shortcuts.chat_permissions,
+                expected_permissions
+            );
+            assert_eq!(loaded.keyboard_shortcuts.new_terminal, [occupied]);
+            save(&path, &loaded).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded);
+        }
+    }
+
+    #[test]
     fn pane_find_can_be_explicitly_unbound_and_stays_unbound_on_reload() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -4975,7 +5034,7 @@ next_column = ["Alt+W", "Alt+Right"]
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+A"]);
         assert!(loaded.keyboard_shortcuts.chat_account.is_empty());
-        assert_eq!(loaded.keyboard_shortcuts.chat_model, ["Ctrl+Shift+M"]);
+        assert_eq!(loaded.keyboard_shortcuts.chat_model, ["Ctrl+M"]);
         assert!(loaded.keyboard_shortcuts.chat_permissions.is_empty());
         save(&path, &loaded).unwrap();
         assert_eq!(load(&path).unwrap(), loaded);
