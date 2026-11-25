@@ -116,10 +116,16 @@ class RemoteController(
     private data class Sync(val session: String, val kind: SyncKind)
 
     private enum class SyncKind {
-        /** Watch it if held and not ended, unwatch it otherwise; unwatch every one in the background. */
+        /**
+         * Watch it if held and not ended, unwatch it otherwise. In the
+         * background every one is unwatched once its requests are answered.
+         */
         Settle,
 
-        /** Watch it if held, even when ended or already watched, for a fresh reset; not in the background. */
+        /**
+         * Watch it if held, even when ended or already watched, for a fresh
+         * reset. In the background, once the app returns.
+         */
         Watch,
 
         /** Like [Watch], unless the recovery that asked for it was settled meanwhile. */
