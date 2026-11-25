@@ -1533,8 +1533,12 @@ pub(super) fn lost_processes(
             )?);
         }
         if let Some(listener) = &listener {
+            #[cfg(target_os = "linux")]
             let providers =
                 super::upgrade_inspect::codex_listener_providers(session.id, &listener.socket)?;
+            #[cfg(target_os = "macos")]
+            let providers =
+                crate::daemon::lost_processes::listener_providers(session.id, &listener.socket)?;
             if !providers.is_empty() {
                 found.extend(crate::daemon::lost_processes::listener_census(&providers)?);
             }

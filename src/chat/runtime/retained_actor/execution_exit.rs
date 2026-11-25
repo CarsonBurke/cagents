@@ -36,9 +36,13 @@ pub(super) fn identity_absent(expected: &Process) -> Result<bool, String> {
 /// purpose are tool work, not writers of the provider's conversation, which
 /// only the provider process itself records.
 pub fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
-    abandoned_in(std::path::Path::new("/proc"), holder, root)
+    #[cfg(target_os = "linux")]
+    return abandoned_in(std::path::Path::new("/proc"), holder, root);
+    #[cfg(target_os = "macos")]
+    return observable_survivors(holder, root);
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Result<bool, String> {
     abandoned_with_policy(proc, holder, root, false)
 }
@@ -47,9 +51,29 @@ fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Res
 /// proves its original group/session also ended: Linux cannot reuse the PID
 /// while that numeric group/session still has members.
 pub fn codex_abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
-    abandoned_with_policy(std::path::Path::new("/proc"), holder, root, true)
+    #[cfg(target_os = "linux")]
+    return abandoned_with_policy(std::path::Path::new("/proc"), holder, root, true);
+    #[cfg(target_os = "macos")]
+    return observable_survivors(holder, root);
 }
 
+#[cfg(target_os = "macos")]
+fn observable_survivors(holder: &Process, root: &Process) -> Result<bool, String> {
+    if !identity_absent(holder)? || !identity_absent(root)? {
+        return Ok(false);
+    }
+    if crate::daemon::lost_processes::census(holder, root)?
+        .iter()
+        .any(|process| !process.zombie)
+    {
+        return Ok(false);
+    }
+    // A missing holder leaves no tracker that could exclude detached work.
+    // Preserve the unknown outcome when the visible session and group empty.
+    Err("Cannot confirm detached provider cleanup after the helper exited on macOS".into())
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn abandoned_with_policy(
     proc: &std::path::Path,
     holder: &Process,
