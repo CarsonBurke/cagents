@@ -215,7 +215,8 @@ pub fn socket_fits(path: &std::path::Path) -> bool {
 }
 
 /// Runs `operation` with an address that reaches the endpoint at `path`, for
-/// `bind`, `connect` or a `stat` of the socket. A path that fits `sun_path` is
+/// `bind`, `connect`, or a `stat`, `chmod` or unlink of the socket; it must
+/// resolve that address and nothing else. A path that fits `sun_path` is
 /// passed as is. A longer one is reached through its parent directory, opened
 /// once and checked to be private, so the operation acts in exactly the
 /// directory that was checked:
@@ -226,9 +227,8 @@ pub fn socket_fits(path: &std::path::Path) -> bool {
 ///   whose working directory is the held one, and is passed the bare name. No
 ///   other code runs on that thread, so nothing else resolves paths there.
 ///
-/// Either way the endpoint stays at its full path, so discovery,
-/// authentication and inode-based retirement keep their identity and survive
-/// daemon upgrades.
+/// Either way the endpoint stays at its full path, so whatever finds,
+/// authenticates or retires it by that path keeps working.
 pub fn with_socket_address<T: Send>(
     path: &std::path::Path,
     operation: impl FnOnce(&std::path::Path) -> io::Result<T> + Send,

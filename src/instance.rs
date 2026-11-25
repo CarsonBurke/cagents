@@ -2583,12 +2583,15 @@ impl UiActivationListener {
 #[cfg(feature = "ui")]
 impl Drop for UiActivationListener {
     fn drop(&mut self) {
-        let woke = connect_activation_socket(&self.socket_path)
-            .and_then(|mut stream| {
-                stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-                writeln!(stream, "shutdown")
-            })
-            .is_ok();
+        // One attempt, as for any socket: the serve loop may already be gone.
+        let woke = crate::descriptor::with_socket_address(&self.socket_path, |address| {
+            crate::descriptor::connect(address)
+        })
+        .and_then(|mut stream| {
+            stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+            writeln!(stream, "shutdown")
+        })
+        .is_ok();
         if let Some(thread) = self.thread.take()
             && woke
         {
@@ -2874,7 +2877,9 @@ fn require_owned_runtime_directory(runtime_directory: &Path) -> io::Result<()> {
 /// takes about 56 of them, so a window or editor socket named for a UUID
 /// would not fit. It is reached as a holder endpoint is, through its directory.
 fn connect_activation_socket(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
-    crate::descriptor::with_socket_address(path, crate::descriptor::connect_settled)
+    crate::descriptor::with_socket_address(path, |address| {
+        crate::descriptor::connect_settled(address)
+    })
 }
 
 /// Binds a window's activation socket for its owner alone, reaching a path
@@ -5144,6 +5149,9 @@ mod tests {
             Some("token")
         );
         drop(listener);
+        // The serve thread holds the only sender, so a closed channel shows
+        // that dropping the listener reached it at the long path and joined it.
+        assert!(receiver.is_closed());
         assert!(!runtime.join(&socket).exists());
         assert!(!activate_socket_with_token(&runtime, socket, None).unwrap());
     }
