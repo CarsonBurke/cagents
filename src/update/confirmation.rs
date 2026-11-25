@@ -633,7 +633,7 @@ pub(super) fn closed(preview: &impact::Preview) -> UpdateError {
     refused(preview, false).unwrap_or(UpdateError::Cancelled)
 }
 
-fn refused(preview: &impact::Preview, expired: bool) -> Option<UpdateError> {
+pub(super) fn refused(preview: &impact::Preview, expired: bool) -> Option<UpdateError> {
     let refusal = preview.refusal()?;
     Some(UpdateError::Refused(Box::new(impact::Refusal {
         expired,

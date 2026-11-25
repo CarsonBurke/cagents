@@ -49,6 +49,10 @@ const UNRECORDED_CONVERSATION: &str = "Its provider has not reported which conve
 const TERMINAL_CANNOT_CARRY: &str = "This terminal cannot preserve its live process through this update; finish it or close it before updating.";
 const PAIRED_TERMINAL_CANNOT_CARRY: &str =
     "The paired console cannot preserve its live process through this update.";
+/// macOS updates restart the daemon, which cannot yet hand a session to
+/// another version there. Only the updater assigns it, never a source.
+const DAEMON_RESTARTS: &str =
+    "Updates on macOS restart the daemon, which cannot keep sessions running yet.";
 
 /// The reason for an update disposition. The existing wire and on-disk review
 /// records store text, so their fixed messages are decoded at this boundary.
@@ -64,6 +68,7 @@ pub enum SessionCause {
     UnrecordedConversation,
     TerminalCannotCarry,
     PairedTerminalCannotCarry,
+    DaemonRestarts,
     Detail(String),
 }
 
@@ -79,6 +84,7 @@ impl SessionCause {
             Self::UnrecordedConversation => UNRECORDED_CONVERSATION,
             Self::TerminalCannotCarry => TERMINAL_CANNOT_CARRY,
             Self::PairedTerminalCannotCarry => PAIRED_TERMINAL_CANNOT_CARRY,
+            Self::DaemonRestarts => DAEMON_RESTARTS,
             Self::Detail(text) => text,
         }
     }
@@ -96,6 +102,7 @@ impl From<String> for SessionCause {
             UNRECORDED_CONVERSATION => Self::UnrecordedConversation,
             TERMINAL_CANNOT_CARRY => Self::TerminalCannotCarry,
             PAIRED_TERMINAL_CANNOT_CARRY => Self::PairedTerminalCannotCarry,
+            DAEMON_RESTARTS => Self::DaemonRestarts,
             _ => Self::Detail(text),
         }
     }
@@ -201,6 +208,10 @@ impl SessionImpact {
                 SessionCause::UnrecordedConversation => "Its conversation has not been recorded yet. Send it a message or close it before updating.".into(),
                 SessionCause::TerminalCannotCarry => "Its running processes cannot be preserved through this update. Finish their work or close this terminal before updating.".into(),
                 SessionCause::PairedTerminalCannotCarry => "Its terminal cannot keep running through this update. Finish its work or close it before updating.".into(),
+                SessionCause::DaemonRestarts => match self.kind {
+                    SessionKind::Terminal => "Updates on macOS restart the daemon, which cannot keep this terminal running yet. Finish its work and close it before updating.".into(),
+                    SessionKind::NativeChat => "Updates on macOS restart the daemon, which cannot keep this conversation running yet. Close it before updating.".into(),
+                },
                 _ => match self.kind {
                     SessionKind::Terminal => "Its terminal could not be prepared for this update. Let its work finish, then try again; close the terminal if the problem continues.".into(),
                     SessionKind::NativeChat => "Its conversation could not be prepared for this update. Let its work finish, then try again; close the conversation if the problem continues.".into(),

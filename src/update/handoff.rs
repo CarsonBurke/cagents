@@ -254,16 +254,21 @@ fn stop_empty_service(cli: &Path, timeout: Duration) -> Result<(), UpdateError> 
         eprintln!("Contender shutdown reply invalid: {error}");
         invalid(ANOTHER_SERVICE)
     })?;
-    if reply["ok"] != true
-        || reply["command"] != "daemon.stop"
-        || !(reply["data"]["state"] == "already_stopped"
-            || (reply["data"]["outcome"] == "accepted"
-                && reply["data"]["live_terminals_before"] == 0))
-    {
+    if !confirms_empty_stop(&reply) {
         eprintln!("Contender did not confirm an empty shutdown: {reply}");
         return Err(invalid(SERVICE_BUSY));
     }
     Ok(())
+}
+
+/// Whether a `daemon stop --require-empty` reply says the daemon had no
+/// sessions and is stopping, or had already stopped.
+pub(super) fn confirms_empty_stop(reply: &serde_json::Value) -> bool {
+    reply["ok"] == true
+        && reply["command"] == "daemon.stop"
+        && (reply["data"]["state"] == "already_stopped"
+            || (reply["data"]["outcome"] == "accepted"
+                && reply["data"]["live_terminals_before"] == 0))
 }
 
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
