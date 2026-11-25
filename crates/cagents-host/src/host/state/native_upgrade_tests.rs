@@ -1197,10 +1197,6 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     }
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
     let program = install_provider(&root);
-    let holders = root.join("holders");
-    let checkpoint_directory = root.join("checkpoint");
-    let empty_proc = root.join("proc");
-    fs::create_dir(&empty_proc).unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     let daemon = |incarnation: &str| HostSessionProof {
         host_session_id: HostSessionId::new("restart-upgrade"),
@@ -1273,19 +1269,26 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         track(id);
         ids.insert(thread, id);
     }
-    let capability = host
-        .lock()
-        .unwrap()
-        .shutdown_preflight(Instant::now())
-        .unwrap()
-        .capability;
-    prepare_upgrade_with_policy(&host, capability, false, Some(&holders), || {
-        Store::open(&checkpoint_directory)
-    })
+    let (agent, queued) = queue_messages_during_turn(&host, &root, ids[restarted]);
+    let idle =
+        super::update::inspect(&host, crate::update::impact::Policy::WhenIdle, true).unwrap();
+    let (prepared, _, shutdown) = super::super::client::process_request(
+        &host,
+        0,
+        crate::terminal_ipc::ClientRequest::PrepareConfirmedUpgrade {
+            impact: idle,
+            relaunch_agents: false,
+        },
+    )
     .unwrap();
+    assert!(shutdown);
+    assert!(matches!(
+        prepared,
+        crate::terminal_ipc::ServerResponse::UpgradePrepared { .. }
+    ));
     super::super::finish_chat_shutdown(&host).unwrap();
     drop(host);
-    let store = || Store::open(&checkpoint_directory).unwrap();
+    let store = || Store::discover().unwrap();
     let checkpoint = store().load().unwrap().unwrap();
     assert_eq!(checkpoint.phase, Phase::Ready);
     assert_eq!(checkpoint.chats.len(), 4);
@@ -1309,7 +1312,7 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     // The fixture allocated each listener under `root`, as this daemon would
     // under its runtime directory; reopening a stopped thread keeps its own.
     state.codex_listeners = super::super::chat::CodexListenerRoots::at(root.clone());
-    state.install_model(crate::host::model::Registry::at(&root.join("updated.sqlite3")).unwrap());
+    state.install_model(crate::host::model::Registry::at(&root.join("model.sqlite3")).unwrap());
     let updated = Arc::new(crate::host::state::HostLock::new(state));
     updated.lock().unwrap().register_client(0);
     let stalled_server = || {
@@ -1317,12 +1320,14 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
             .ok()
             .and_then(|pid| registry::Process::read(pid.trim().parse().ok()?).ok())
     };
-    let unattached = restore_upgrade_from(&updated, store(), &empty_proc, Some(&holders)).unwrap();
+    super::super::update_recovery::restore_ordinary(&updated).unwrap();
+    let unattached = store().unattached().unwrap();
     // Only the two stopped restarts are left unattached, so startup's orphan
     // recovery skips them; no retained conversation was refused.
     assert_eq!(
         unattached
-            .into_iter()
+            .iter()
+            .map(|entry| entry.id)
             .collect::<std::collections::BTreeSet<_>>(),
         [ids[stalled], ids[refused]].into_iter().collect(),
     );
@@ -1339,6 +1344,42 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
             track(ids[thread]);
         }
     }
+    let registry = super::super::agent_execution::registry(&updated).unwrap();
+    {
+        let registry = registry.lock().unwrap();
+        let rebound = registry.agent(agent).unwrap().session.unwrap();
+        let current = updated.lock().unwrap().chats[&ids[restarted]]
+            .session
+            .clone();
+        assert_eq!(
+            rebound,
+            crate::agent_execution::HostedSession::Chat(current)
+        );
+        for run in &queued {
+            assert!(registry.agent_run_is_queued(*run).unwrap());
+        }
+    }
+    let courier = super::super::agent_execution::mailbox::Courier::start(&updated).unwrap();
+    wait_until(
+        || {
+            let registry = registry.lock().unwrap();
+            queued.iter().all(|run| {
+                registry.agent_run(*run).unwrap().state == crate::agent_execution::State::Succeeded
+            })
+        },
+        "the successor did not deliver the accepted messages",
+    );
+    courier.wake_and_wait_for_scan();
+    let delivered = fs::read_to_string(root.join("queued-provider-inputs")).unwrap();
+    assert_eq!(
+        delivered.lines().collect::<Vec<_>>(),
+        [
+            format!("{restarted} first accepted message"),
+            format!("{restarted} second accepted message"),
+        ],
+        "the restored provider must get each message once, on the exact conversation and in order",
+    );
+    drop(courier);
     // The two that failed were stopped, down to the stalled server, and are
     // left for their panes to reopen with the reason each failed.
     for thread in [stalled, refused] {
@@ -1350,7 +1391,6 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         stalled_server().is_none(),
         "the stalled server was left running"
     );
-    let unattached = store().unattached().unwrap();
     assert_eq!(unattached.len(), 2, "{unattached:?}");
     for (thread, reason) in [
         (
@@ -1472,6 +1512,119 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         || cleanup.0.iter().all(|process| !process.is_current()),
         "closing the conversations left a holder or server running",
     );
+}
+
+const HELD_PROMPT: &str = "Work until this test interrupts the turn";
+const FIRST_MESSAGE: &str = "first accepted message";
+const SECOND_MESSAGE: &str = "second accepted message";
+
+fn queue_messages_during_turn(
+    host: &SharedHost,
+    root: &std::path::Path,
+    id: TerminalId,
+) -> (crate::model::AgentId, Vec<crate::model::RunId>) {
+    use super::super::agent_execution as execution;
+    use crate::agent_execution::{
+        Authority, Destination, HostedSession, Origin, Spec, Start, State, Submit, Surface, Target,
+        mailbox::{Handoff, Outgoing, To},
+    };
+
+    let project = root.join("project");
+    let mut registry = crate::host::model::Registry::at(&root.join("model.sqlite3")).unwrap();
+    registry
+        .apply(&crate::workspace_model::ModelEdit::OpenProject {
+            repository: project.clone(),
+            name: "Conversation receiving queued messages".into(),
+            kind: crate::model::ProjectKind::Folder,
+        })
+        .unwrap();
+    let mut accepted = registry
+        .submit_agent(
+            &Origin::User,
+            &Submit {
+                name: None,
+                destination: Destination::New(Spec {
+                    provider: Provider::Codex,
+                    account: None,
+                    target: Target {
+                        repository: project.clone(),
+                        directory: project,
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                }),
+                prompt: HELD_PROMPT.into(),
+                idempotency_key: "run-before-upgrade".into(),
+            },
+            crate::chat::now_ms().unwrap(),
+        )
+        .unwrap();
+    let agent = accepted.agent.id;
+    let run = accepted.run.id;
+    let handle = {
+        let mut state = host.lock().unwrap();
+        let record = &state.chats[&id];
+        let session = HostedSession::Chat(record.session.clone());
+        let handle = record.handle.clone();
+        registry.reserve_agent_launch(agent, &session).unwrap();
+        registry.bind_agent(agent, None, session).unwrap();
+        accepted.agent = registry.agent(agent).unwrap();
+        state.install_model(registry);
+        handle
+    };
+    let registry = execution::registry(host).unwrap();
+    let state = || registry.lock().unwrap().agent_run(run).unwrap().state;
+    execution::dispatch_accepted(host, accepted).unwrap();
+    wait_until(
+        || state() == State::Running,
+        "the original turn did not start",
+    );
+
+    let queued: Vec<_> = [FIRST_MESSAGE, SECOND_MESSAGE]
+        .into_iter()
+        .map(|body| {
+            let handed = execution::mailbox::hand(
+                host,
+                &Authority::default(),
+                Outgoing {
+                    to: To::Session(agent.to_string()),
+                    body: body.into(),
+                    wait_ms: None,
+                },
+            )
+            .unwrap();
+            let Some(Handoff::Run {
+                run,
+                start: Start::Queued { .. },
+                ..
+            }) = handed.agent
+            else {
+                panic!(
+                    "the message did not become a queued run: {:?}",
+                    handed.agent
+                );
+            };
+            assert!(registry.lock().unwrap().agent_run_is_queued(run).unwrap());
+            run
+        })
+        .collect();
+
+    let impact =
+        super::update::inspect(host, crate::update::impact::Policy::Interrupt, false).unwrap();
+    assert!(!impact.blocked(), "{impact:?}");
+    assert!(impact.sessions.iter().any(|item| {
+        item.id == id && item.disposition == crate::update::impact::Disposition::Interrupted
+    }));
+    // Interrupt the exact active run. The held message runs stay unclaimed.
+    handle.interrupt_run(run).unwrap();
+    wait_until(
+        || state() == State::Cancelled,
+        "the provider did not confirm interruption",
+    );
+    (agent, queued)
 }
 
 /// Runs `test` again in a private runtime, data and provider home, in `mode`.
@@ -1656,6 +1809,8 @@ fn provider() {
     let listener = crate::descriptor::bind(socket).unwrap();
     // The retained server remains alive after the actor disconnects. Only an
     // explicit holder release should terminate this process.
+    let mut turns = 0;
+    let mut active = None;
     for stream in listener.incoming() {
         let mut websocket = tungstenite::accept(stream.unwrap()).unwrap();
         while let Ok(message) = websocket.read() {
@@ -1691,12 +1846,53 @@ fn provider() {
                     .unwrap();
                 continue;
             }
+            let mut completion = None;
             let result = match frame["method"].as_str().unwrap() {
                 "initialize" => {
                     json!({"userAgent":format!("cagents/{version} (Linux)"), "codexHome":std::env::var("CODEX_HOME").unwrap()})
                 }
                 "thread/start" | "thread/resume" => {
                     json!({"thread":{"id":thread,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
+                }
+                "turn/start" => {
+                    assert_eq!(frame["params"]["threadId"], thread);
+                    turns += 1;
+                    let turn = format!("{}-{turns}", std::process::id());
+                    let text = frame["params"]["input"][0]["text"].as_str().unwrap();
+                    if text != HELD_PROMPT {
+                        use std::io::Write;
+                        let mut log = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(root.join("queued-provider-inputs"))
+                            .unwrap();
+                        let mut bodies = [FIRST_MESSAGE, SECOND_MESSAGE]
+                            .into_iter()
+                            .filter(|body| text.contains(body));
+                        let body = bodies.next().expect("one accepted message per prompt");
+                        assert!(
+                            bodies.next().is_none(),
+                            "two messages in one provider prompt"
+                        );
+                        writeln!(log, "{thread} {body}").unwrap();
+                        completion = Some(json!({"id":turn,"status":"completed","items":[]}));
+                    } else {
+                        assert!(active.replace(turn.clone()).is_none());
+                    }
+                    json!({"turn":{"id":turn,"status":"inProgress","items":[]}})
+                }
+                "turn/interrupt" => {
+                    assert_eq!(frame["params"]["threadId"], thread);
+                    let turn = active
+                        .take()
+                        .expect("the original turn must still be active");
+                    assert_eq!(frame["params"]["turnId"], turn);
+                    completion = Some(json!({
+                        "id":turn,
+                        "status":"interrupted",
+                        "items":[]
+                    }));
+                    json!({})
                 }
                 "thread/read" => json!({"thread":{"id":thread,"turns":[]}}),
                 "thread/turns/list" | "thread/queue/list" | "thread/list" => {
@@ -1714,6 +1910,15 @@ fn provider() {
                 .is_err()
             {
                 break;
+            }
+            if let Some(turn) = completion {
+                websocket
+                    .send(tungstenite::Message::Text(
+                        json!({"method":"turn/completed","params":{"threadId":thread,"turn":turn}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
             }
         }
     }
