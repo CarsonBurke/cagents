@@ -397,6 +397,8 @@ struct Inner {
     /// What closing does with the work the provider already detached, once
     /// its owner decides. See [`DetachedDecision`].
     detached_work: Arc<DetachedDecision>,
+    #[cfg(target_os = "macos")]
+    completed_descendants: Arc<Mutex<Option<crate::daemon::descendants::Tracker>>>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
@@ -688,6 +690,8 @@ impl LocalHandle {
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
         let detached_work = Arc::new(DetachedDecision::default());
+        #[cfg(target_os = "macos")]
+        let completed_descendants = Arc::new(Mutex::new(None));
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
@@ -715,6 +719,8 @@ impl LocalHandle {
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_work: detached_work.clone(),
+            #[cfg(target_os = "macos")]
+            completed_descendants: completed_descendants.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
@@ -892,6 +898,17 @@ impl LocalHandle {
                         .and_then(|s| s.code());
                     child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
                     let result = child.terminate();
+                    #[cfg(target_os = "macos")]
+                    if child.terminated
+                        && let Some(mut tracker) = child.descendants.take()
+                    {
+                        if result.is_err() {
+                            tracker.mark_incomplete();
+                        }
+                        *completed_descendants
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(tracker);
+                    }
                     if child.force_stopped == Some(true) {
                         detached_work.force_stopped();
                     }
@@ -1887,6 +1904,34 @@ impl LocalHandle {
         self.0.detached_work.was_force_stopped()
     }
 
+    fn detached_cleanup_proved(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return true;
+        #[cfg(target_os = "macos")]
+        return self
+            .0
+            .completed_descendants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .is_some_and(|tracker| tracker.prove_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stop_observed_detached(&self) -> Result<(), String> {
+        let mut completed = self
+            .0
+            .completed_descendants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match &mut *completed {
+            Some(tracker) => tracker
+                .stop_known(Duration::from_secs(2))
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
@@ -2101,6 +2146,10 @@ impl Drop for Inner {
 }
 impl super::protocol::LaunchCleanup for LocalHandle {
     fn cleanup(&self) -> Result<super::protocol::LaunchOutcome, String> {
+        #[cfg(target_os = "macos")]
+        if self.0.detached_work.get() == Some(DetachedWork::Spare) {
+            return Err("Launch cleanup requires an exact detached-work stop".into());
+        }
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         let deadline = Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE;
@@ -2120,6 +2169,10 @@ impl super::protocol::LaunchCleanup for LocalHandle {
             thread::sleep(Duration::from_millis(10));
         }
         self.close()?;
+        #[cfg(target_os = "macos")]
+        if crate::daemon::adopted_orphans::sweeping() && !self.detached_cleanup_proved() {
+            return Err("Retained launch did not prove detached provider cleanup".into());
+        }
         Ok(super::protocol::LaunchOutcome::TeardownProved)
     }
 }
@@ -2222,13 +2275,30 @@ fn spawn_provider(
     };
     // A retained actor sweeps its unregistered exited children; this
     // registration keeps the provider's status for its ChildGuard.
-    let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
-        .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+    let failure = |e| format!("Cannot start {}: {e}", spec.program);
+    #[cfg(target_os = "linux")]
+    let (child, registration) =
+        crate::daemon::adopted_orphans::spawn_owned(&mut process).map_err(failure)?;
+    #[cfg(target_os = "macos")]
+    let (child, registration, descendants) = if crate::daemon::adopted_orphans::sweeping() {
+        let (child, registration, tracker) =
+            crate::daemon::adopted_orphans::spawn_tracked(process).map_err(failure)?;
+        (child, registration, Some(tracker))
+    } else {
+        let (child, registration) =
+            crate::daemon::adopted_orphans::spawn_owned(&mut process).map_err(failure)?;
+        (child, registration, None)
+    };
     if let Some(temporary) = &mut temp {
         temporary.launched();
     }
     let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
+    #[cfg(target_os = "macos")]
+    {
+        child.stop_detached = descendants.is_some();
+        child.descendants = descendants;
+    }
     child.directory = Some(directory);
     child._temp = temp;
     // Scope enrollment happens before this child is handed to the actor and
@@ -2297,6 +2367,8 @@ struct ChildGuard {
     /// Whether teardown also ends the commands the provider detached, as
     /// when its owner decided to stop them.
     stop_detached: bool,
+    #[cfg(target_os = "macos")]
+    descendants: Option<crate::daemon::descendants::Tracker>,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
     _temp: Option<crate::daemon::codex_temp::PrivateDir>,
@@ -2384,6 +2456,8 @@ impl ChildGuard {
             terminated: false,
             force_stopped: None,
             stop_detached: false,
+            #[cfg(target_os = "macos")]
+            descendants: None,
             directory: None,
             scope: None,
             _registration: registration,
@@ -2449,13 +2523,22 @@ impl ChildGuard {
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
         #[cfg(target_os = "macos")]
-        {
+        let descendants = {
             let timeout = Duration::from_secs(2);
-            // Keep the original child un-reaped until the group census has
-            // completed even if it left the group before its shutdown.
+            // While the leader still reserves its ID, attempt cleanup of
+            // both the original group and exact known descendants. Failure in
+            // either path must not stop the other from ending known work.
             self.identity.signal(libc::SIGKILL)?;
-            crate::process::identity::finish_unreaped_group(pid, timeout)?;
-        }
+            let group = crate::process::identity::finish_unreaped_group(pid, timeout);
+            let detached = if let Some(tracker) = &mut self.descendants
+                && (force_stopped || self.stop_detached)
+            {
+                tracker.stop_known(timeout)
+            } else {
+                Ok(())
+            };
+            group.and(detached)
+        };
         // Commands in process groups of their own outlive that signal. A
         // force-stopped provider's would hold memory the system needed, with
         // no agent left to use them, so they end with it, as do those of an
@@ -2469,6 +2552,8 @@ impl ChildGuard {
         }
         self.child.wait()?;
         self.terminated = true;
+        #[cfg(target_os = "macos")]
+        descendants?;
         Ok(())
     }
 }
@@ -3192,6 +3277,16 @@ impl Actor {
                     revents: 0,
                 },
                 watch,
+                #[cfg(target_os = "macos")]
+                libc::pollfd {
+                    fd: self
+                        .child
+                        .as_ref()
+                        .and_then(|child| child.descendants.as_ref())
+                        .map_or(-1, |tracker| tracker.fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             // The -1 branch proves the parser drained every complete frame
             // and no partial line remains. It also covers a conversation
@@ -3206,6 +3301,17 @@ impl Actor {
                 }
             }
             let mut buffer = [0u8; 8192];
+            #[cfg(target_os = "macos")]
+            if fds[5].revents != 0
+                && let Some(tracker) = self
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.descendants.as_mut())
+            {
+                // The tracker remembers incomplete observation. The provider
+                // transport can continue, with teardown proof unavailable.
+                let _ = tracker.observe();
+            }
             if fds[0].revents != 0 {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }

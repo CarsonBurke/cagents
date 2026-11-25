@@ -50,6 +50,9 @@ struct Receipt {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     confirmed_session: Option<String>,
     snapshot: Snapshot,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    detached_cleanup_proved: bool,
     /// The snapshot was reduced after retirement and is no transcript. Older
     /// readers ignore this field, which is safe because none of them reads a
     /// retired receipt's snapshot.
@@ -72,6 +75,7 @@ pub(super) fn save(
     scope: Result<&crate::account::scope::LaunchAccountScope, &str>,
     confirmed_session: Option<&str>,
     snapshot: &Snapshot,
+    #[cfg(target_os = "macos")] detached_cleanup_proved: bool,
 ) -> Result<(), String> {
     let bytes = serde_json::to_vec(&Receipt {
         installed,
@@ -83,6 +87,8 @@ pub(super) fn save(
         launch_account_scope: scope.cloned().map_err(str::to_owned),
         confirmed_session: confirmed_session.map(str::to_owned),
         snapshot: snapshot.clone(),
+        #[cfg(target_os = "macos")]
+        detached_cleanup_proved,
         compacted: false,
     })
     .map_err(|error| error.to_string())?;
@@ -199,6 +205,15 @@ pub(super) fn close_proved(
     proof: &HostSessionProof,
     source: &chat::Session,
 ) -> Result<bool, String> {
+    close_proved_with_scope(identity, proof, source, false)
+}
+
+pub(super) fn close_proved_with_scope(
+    identity: &ActorIdentity,
+    proof: &HostSessionProof,
+    source: &chat::Session,
+    require_exact: bool,
+) -> Result<bool, String> {
     if !execution_exit::identity_absent(&identity.record.root)? {
         return Ok(false);
     }
@@ -207,7 +222,14 @@ pub(super) fn close_proved(
     let Some(receipt) = read_receipt_if_published(&identity.record)? else {
         return Ok(false);
     };
-    validate_publication(&receipt, identity, proof, source).map(|()| true)
+    validate_publication(&receipt, identity, proof, source)?;
+    #[cfg(target_os = "linux")]
+    let _ = require_exact;
+    #[cfg(target_os = "macos")]
+    if require_exact && !receipt.detached_cleanup_proved {
+        return Ok(false);
+    }
+    Ok(true)
 }
 const MAX_RETIREMENT: usize = 256 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -606,6 +628,8 @@ pub mod fixture {
             scope,
             Some(&session),
             &snapshot,
+            #[cfg(target_os = "macos")]
+            false,
         )
         .unwrap();
         publish_retirement(RetirementReceipt {
@@ -696,6 +720,8 @@ mod tests {
                 exited: true,
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: false,
             compacted: false,
         };
         assert!(validate_publication(&live, &identity, &proof, &source).is_err());
@@ -784,6 +810,8 @@ mod tests {
                 exited: true,
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: false,
             compacted: false,
         };
         let make = || RetirementReceipt {
@@ -874,6 +902,8 @@ mod tests {
                 items: vec![item; 64],
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: false,
             compacted: false,
         };
         let retired = RetirementReceipt {
@@ -1100,6 +1130,8 @@ os.waitpid(pid,0)
             Err("fixture unknown account"),
             source.launch.session_id.as_deref(),
             &snapshot,
+            #[cfg(target_os = "macos")]
+            false,
         )
         .unwrap();
         let receipt = RetirementReceipt {
@@ -1287,6 +1319,8 @@ os.waitpid(pid,0)
                 title: Some("final".into()),
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: false,
             compacted: false,
         };
         save_at(&path, &serde_json::to_vec(&receipt).unwrap()).unwrap();

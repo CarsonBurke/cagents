@@ -266,6 +266,9 @@ pub struct ActorInspection {
 struct ClosePublication {
     snapshot: Snapshot,
     resident: Resident,
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    detached_cleanup_proved: bool,
 }
 /// Additive private operation: older protocol-2 helpers refuse the method.
 /// A retryable generation mismatch must never be inferred from an error string.
@@ -2468,7 +2471,8 @@ impl RemoteActor {
         Ok(())
     }
     pub fn close_method(&self, method: &str, args: Value) -> Result<(), String> {
-        self.publish_close_result(self.call(method, args))
+        let require_exact = method != "close" || args.get(0).and_then(Value::as_bool) != Some(true);
+        self.publish_close_result(self.call(method, args), require_exact)
     }
     pub fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
         self.try_close_if_idle_with(json!([generation]))
@@ -2484,6 +2488,7 @@ impl RemoteActor {
         self.try_close_if_idle_with(json!([generation, detached == DetachedWork::Spare]))
     }
     fn try_close_if_idle_with(&self, args: Value) -> Result<bool, String> {
+        let require_exact = args.get(1).and_then(Value::as_bool) != Some(true);
         let publication = match self.call("try_close_if_idle", args) {
             Ok(ConditionalClosePublication::Changed) => return Ok(false),
             Ok(ConditionalClosePublication::Closed(publication)) => Ok(*publication),
@@ -2491,13 +2496,27 @@ impl RemoteActor {
         };
         // A lost reply remains uncertain unless the existing exact durable
         // final publication independently proves this provider's cleanup.
-        self.publish_close_result(publication).map(|()| true)
+        self.publish_close_result(publication, require_exact)
+            .map(|()| true)
     }
-    fn publish_close_result(&self, result: Result<ClosePublication, String>) -> Result<(), String> {
+    fn publish_close_result(
+        &self,
+        result: Result<ClosePublication, String>,
+        require_exact: bool,
+    ) -> Result<(), String> {
         let (snapshot, resident) = match result {
+            #[cfg(target_os = "macos")]
+            Ok(publication) if require_exact && !publication.detached_cleanup_proved => {
+                return Err("Retained actor did not prove detached provider cleanup".into());
+            }
             Ok(publication) => (publication.snapshot, Some(publication.resident)),
             Err(error) => {
-                if !final_snapshot::close_proved(&self.0.identity, &self.0.proof, &self.0.source)? {
+                if !final_snapshot::close_proved_with_scope(
+                    &self.0.identity,
+                    &self.0.proof,
+                    &self.0.source,
+                    require_exact,
+                )? {
                     return Err(error);
                 }
                 (final_snapshot::read(&self.0.identity, &self.0.proof, &self.0.source)
@@ -2541,7 +2560,16 @@ impl RemoteActor {
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
     fn cleanup(&self) -> Result<chat::protocol::LaunchOutcome, String> {
+        #[cfg(target_os = "linux")]
         self.close()?;
+        #[cfg(target_os = "macos")]
+        {
+            let publication: ClosePublication = self.call("close", json!([false]))?;
+            if !publication.detached_cleanup_proved {
+                return Err("Retained actor did not prove detached provider cleanup".into());
+            }
+            self.publish_close_result(Ok(publication), true)?;
+        }
         self.finish_close()?;
         Ok(chat::protocol::LaunchOutcome::TeardownProved)
     }
@@ -2856,74 +2884,87 @@ impl Server {
                 metadata_watcher.notify();
             },
         )?;
-        let provider = actor
-            .provider_process()
-            .ok_or("Retained actor did not retain its exact provider process")?;
-        let directory_path = registry::directory(Kind::Native)?;
-        crate::secure_file::prepare_private_directory(&directory_path)
-            .map_err(|error| error.to_string())?;
-        let socket = registry::socket(&directory_path, startup.source.id);
-        let listener = registry::bind(&socket).map_err(|error| error.to_string())?;
-        let metadata = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
-        let socket_identity = (metadata.dev(), metadata.ino());
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| error.to_string())?;
-        let mut build = registry::BuildIdentity::current(Kind::Native);
-        build.capabilities.push(CAPABILITY.into());
-        build
-            .capabilities
-            .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
-        let identity = ActorIdentity {
-            instance: uuid::Uuid::new_v4(),
-            record: Record {
-                version: 4,
-                build: Some(build),
-                kind: Kind::Native,
-                application: crate::instance::APPLICATION_ID.into(),
-                boot,
-                terminal: startup.source.id,
-                holder: Process::read(std::process::id() as i32)
-                    .map_err(|error| error.to_string())?,
-                root: provider,
-            },
-        };
-        identity
-            .record
-            .create(&directory_path)
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
-            actor,
-            identity,
-            source: startup.source,
-            lineage: Vec::new(),
-            execution_console: None,
-            paired_holder: None,
-            proof,
-            epoch: uuid::Uuid::new_v4(),
-            installed: false,
-            journal,
-            changed,
-            watcher,
-            #[cfg(any(test, feature = "test-support"))]
-            state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(any(test, feature = "test-support"))]
-            fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            prompt_revision,
-            pending: Vec::new(),
-            account_reports,
-            environment,
-            recovery_environment: startup.recovery_environment,
-            listener,
-            socket,
-            socket_identity,
-            _directory: directory,
-            closed_snapshot: None,
-            session_stopping: false,
-            attachment_preserved: false,
-            close_only: false,
-            detached: DetachedWork::Stop,
-        })
+        #[cfg(target_os = "macos")]
+        let cleanup = actor.clone();
+        let registered: Result<Self, String> = (|| {
+            let provider = actor
+                .provider_process()
+                .ok_or("Retained actor did not retain its exact provider process")?;
+            let directory_path = registry::directory(Kind::Native)?;
+            crate::secure_file::prepare_private_directory(&directory_path)
+                .map_err(|error| error.to_string())?;
+            let socket = registry::socket(&directory_path, startup.source.id);
+            let listener = registry::bind(&socket).map_err(|error| error.to_string())?;
+            let metadata = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+            let socket_identity = (metadata.dev(), metadata.ino());
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| error.to_string())?;
+            let mut build = registry::BuildIdentity::current(Kind::Native);
+            build.capabilities.push(CAPABILITY.into());
+            build
+                .capabilities
+                .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
+            let identity = ActorIdentity {
+                instance: uuid::Uuid::new_v4(),
+                record: Record {
+                    version: 4,
+                    build: Some(build),
+                    kind: Kind::Native,
+                    application: crate::instance::APPLICATION_ID.into(),
+                    boot,
+                    terminal: startup.source.id,
+                    holder: Process::read(std::process::id() as i32)
+                        .map_err(|error| error.to_string())?,
+                    root: provider,
+                },
+            };
+            identity
+                .record
+                .create(&directory_path)
+                .map_err(|error| error.to_string())?;
+            Ok(Self {
+                actor,
+                identity,
+                source: startup.source,
+                lineage: Vec::new(),
+                execution_console: None,
+                paired_holder: None,
+                proof,
+                epoch: uuid::Uuid::new_v4(),
+                installed: false,
+                journal,
+                changed,
+                watcher,
+                #[cfg(any(test, feature = "test-support"))]
+                state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(any(test, feature = "test-support"))]
+                fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                prompt_revision,
+                pending: Vec::new(),
+                account_reports,
+                environment,
+                recovery_environment: startup.recovery_environment,
+                listener,
+                socket,
+                socket_identity,
+                _directory: directory,
+                closed_snapshot: None,
+                session_stopping: false,
+                attachment_preserved: false,
+                close_only: false,
+                detached: DetachedWork::Stop,
+            })
+        })();
+        #[cfg(target_os = "macos")]
+        if registered.is_err() {
+            // The actor's execution context can keep it alive after this
+            // handle drops. Join its owning worker before any helper sweep.
+            cleanup.decide_detached_work(DetachedWork::Stop);
+            let _ = cleanup.close();
+            let _ = cleanup.stop_observed_detached();
+        }
+        registered
     }
     fn presentation_response(
         &mut self,
@@ -3862,13 +3903,14 @@ impl Server {
                 // `[true]` leaves what the provider leaves running when it
                 // quits. A daemon that sends no decision stops everything, as
                 // before.
+                let mut detached = if request.args.get(0).and_then(Value::as_bool) == Some(true) {
+                    DetachedWork::Spare
+                } else {
+                    DetachedWork::Stop
+                };
+                #[cfg(target_os = "macos")]
+                self.ensure_close_scope(detached)?;
                 if self.closed_snapshot.is_none() {
-                    let mut detached = if request.args.get(0).and_then(Value::as_bool) == Some(true)
-                    {
-                        DetachedWork::Spare
-                    } else {
-                        DetachedWork::Stop
-                    };
                     // The provider's scope holds what it detached, too.
                     self.actor.decide_detached_work(detached);
                     self.actor.close()?;
@@ -3881,7 +3923,7 @@ impl Server {
                     // Only once the provider is gone: until then, the helper's
                     // exit must prove it is by stopping everything.
                     self.detached = detached;
-                    reap_orphans(self.detached)?;
+                    self.reap_provider_orphans()?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -3968,6 +4010,8 @@ impl Server {
         generation: u64,
         detached: Option<DetachedWork>,
     ) -> Result<ConditionalClosePublication, String> {
+        #[cfg(target_os = "macos")]
+        self.ensure_close_scope(detached.unwrap_or(DetachedWork::Stop))?;
         if self.closed_snapshot.is_none() {
             let closed = match detached {
                 Some(detached) => self.actor.try_stop_if_idle(generation, detached)?,
@@ -3985,12 +4029,33 @@ impl Server {
                     detached
                 };
             }
-            reap_orphans(self.detached)?;
+            self.reap_provider_orphans()?;
             self.finish_inputs();
         }
         self.publish_close()
             .map(|publication| ConditionalClosePublication::Closed(Box::new(publication)))
     }
+    #[cfg(target_os = "macos")]
+    fn ensure_close_scope(&self, detached: DetachedWork) -> Result<(), String> {
+        if self.closed_snapshot.is_some()
+            && detached == DetachedWork::Stop
+            && !self.actor.detached_cleanup_proved()
+        {
+            return Err("The previous close did not prove detached provider cleanup".into());
+        }
+        Ok(())
+    }
+
+    fn reap_provider_orphans(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if self.detached == DetachedWork::Stop {
+            // An actor may have exited while its detached-work disposition
+            // was still undecided. Its joined worker handed the watch back.
+            self.actor.stop_observed_detached()?;
+        }
+        reap_orphans(self.detached, self.actor.detached_cleanup_proved())
+    }
+
     fn publish_close(&mut self) -> Result<ClosePublication, String> {
         let snapshot = if let Some(snapshot) = &self.closed_snapshot {
             snapshot.as_ref().clone()
@@ -4024,11 +4089,15 @@ impl Server {
             self.actor.launch_account_scope(),
             self.actor.confirmed_session_id().as_deref(),
             &snapshot,
+            #[cfg(target_os = "macos")]
+            self.actor.detached_cleanup_proved(),
         )?;
         self.closed_snapshot = Some(Arc::new(snapshot.clone()));
         Ok(ClosePublication {
             snapshot,
             resident: self.resident()?,
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: self.actor.detached_cleanup_proved(),
         })
     }
     /// `children` wakes the loop to reap exited orphans; see [`OrphanSweep`].
@@ -4049,7 +4118,7 @@ impl Server {
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
-                reap_orphans(self.detached)?;
+                self.reap_provider_orphans()?;
                 break;
             }
             let accepting = connections.has_capacity();
@@ -4363,7 +4432,9 @@ impl OrphanSweep {
 /// - `Spare` reaps the children that have exited and signals none, as a
 ///   terminal leaves what an exited CLI left running. The provider itself is
 ///   gone: the actor's ChildGuard has stopped and reaped it.
-fn reap_orphans(detached: DetachedWork) -> Result<(), String> {
+fn reap_orphans(detached: DetachedWork, cleanup_proved: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let _ = cleanup_proved;
     if detached == DetachedWork::Spare {
         return crate::daemon::adopted_orphans::reap_exited(usize::MAX)
             .map(drop)
@@ -4394,8 +4465,11 @@ fn reap_orphans(detached: DetachedWork) -> Result<(), String> {
                 pid if pid > 0 => continue,
                 0 => break,
                 _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) => {
-                    return crate::daemon::owned_children::require_detached_cleanup_proof(detached)
-                        .map_err(|error| error.to_string());
+                    #[cfg(target_os = "macos")]
+                    if !cleanup_proved {
+                        return Err("The provider stopped, but macOS could not confirm cleanup of detached processes".into());
+                    }
+                    return Ok(());
                 }
                 _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {
                     continue;
@@ -4464,6 +4538,7 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         let children = ChildEvents::new().ok();
         let mut detached = DetachedWork::Stop;
         let mut launch_attempted = false;
+        let mut cleanup_proved = false;
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
             let mut server = Server::start_after_scope_enrollment(
@@ -4472,11 +4547,18 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
                 crate::daemon::process_scope::enroll_current_process,
                 || launch_attempted = true,
             )?;
-            let served = server.serve(
-                control.try_clone().map_err(|error| error.to_string())?,
-                children,
-            );
+            let served = control
+                .try_clone()
+                .map_err(|error| error.to_string())
+                .and_then(|startup| server.serve(startup, children));
+            #[cfg(target_os = "macos")]
+            if served.is_err() && server.detached == DetachedWork::Stop {
+                server.actor.decide_detached_work(DetachedWork::Stop);
+                let _ = server.actor.close();
+                let _ = server.actor.stop_observed_detached();
+            }
             detached = server.detached;
+            cleanup_proved = server.actor.detached_cleanup_proved();
             served
         })();
         if let Err(error) = result {
@@ -4492,7 +4574,13 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         }
         #[cfg(target_os = "linux")]
         let _ = launch_attempted;
-        reap_orphans(detached)
+        #[cfg(target_os = "macos")]
+        if !cleanup_proved {
+            // An unfinished actor may still own the registered child.
+            // Never use a raw wait when that custody remains uncertain.
+            return Err("Retained actor has no complete descendant cleanup receipt".into());
+        }
+        reap_orphans(detached, cleanup_proved)
     })())
 }
 fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {

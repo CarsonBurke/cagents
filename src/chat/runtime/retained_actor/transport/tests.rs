@@ -403,10 +403,10 @@ fn an_ordinary_close_leaves_what_the_provider_leaves() {
     unsafe { libc::kill(-(provider.id() as i32), libc::SIGTERM) };
     provider.wait().unwrap();
     drop(registration);
-    reap_orphans(DetachedWork::Spare).unwrap();
+    reap_orphans(DetachedWork::Spare, false).unwrap();
     assert!(
         children::ends(work.running, || {
-            reap_orphans(DetachedWork::Spare).unwrap();
+            reap_orphans(DetachedWork::Spare, false).unwrap();
         }),
         "the provider stopped its own command as it quit, and it is reaped"
     );
@@ -418,7 +418,7 @@ fn an_ordinary_close_leaves_what_the_provider_leaves() {
     }
     // A close that stops everything, as for an unattended agent, reaps
     // them too.
-    reap_orphans(DetachedWork::Stop).unwrap();
+    reap_orphans(DetachedWork::Stop, false).unwrap();
     assert!(!children::exists(work.detached) && !children::exists(work.left));
 }
 
