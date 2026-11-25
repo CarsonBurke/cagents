@@ -56,21 +56,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * route, which is saved with the activity, so a code's one-time key is
      * never written out.
      */
-    private val offeredLinks = mutableMapOf<Int, String>()
-    private var lastOffer = 0
+    private val offeredLinks = mutableMapOf<Long, String>()
+    private var lastOffer = 0L
 
-    private val _pairingOffer = MutableStateFlow<Int?>(null)
+    private val _pairingOffer = MutableStateFlow<Long?>(null)
     /** The newest pairing code offered, to open a pairing screen for. */
-    val pairingOffer: StateFlow<Int?> = _pairingOffer.asStateFlow()
+    val pairingOffer: StateFlow<Long?> = _pairingOffer.asStateFlow()
 
     fun openPairingLink(link: String) {
-        val offer = ++lastOffer
+        // From the clock, so no offer matches a pairing screen restored
+        // from before the process was restarted.
+        val offer = maxOf(lastOffer + 1, System.currentTimeMillis())
+        lastOffer = offer
         offeredLinks[offer] = link
         _pairingOffer.value = offer
     }
 
     /** The pairing code for [offer], once; null after that, or after the process was restarted. */
-    fun takePairingLink(offer: Int): String? {
+    fun takePairingLink(offer: Long): String? {
         if (_pairingOffer.value == offer) _pairingOffer.value = null
         return offeredLinks.remove(offer)
     }

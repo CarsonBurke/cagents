@@ -30,7 +30,7 @@ data object SettingsRoute : NavKey
  * part of the route, which is saved.
  */
 @Serializable
-data class PairingRoute(val offer: Int = 0) : NavKey
+data class PairingRoute(val offer: Long = 0) : NavKey
 
 @Composable
 fun CagentsApp(vm: MainViewModel = viewModel()) {
@@ -100,7 +100,7 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
             }
             entry<PairingRoute> { route ->
                 PairingScreen(
-                    link = { if (route.offer == 0) null else vm.takePairingLink(route.offer) },
+                    link = { if (route.offer == 0L) null else vm.takePairingLink(route.offer) },
                     onBack = { backStack.removeAt(backStack.lastIndex) },
                     onPaired = {
                         // Paired: on to the new computer's sessions, with nothing to go back to.

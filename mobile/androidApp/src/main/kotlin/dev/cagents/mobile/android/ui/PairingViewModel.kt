@@ -1,6 +1,7 @@
 package dev.cagents.mobile.android.ui
 
 import android.app.Application
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.cagents.mobile.android.graph
@@ -58,16 +59,28 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
 
     private var job: Job? = null
     private var hintJob: Job? = null
-    private var lastScanned: String? = null
+    private val seen = SeenCodes()
     private var linked: String? = null
 
     private fun now() = System.currentTimeMillis() / 1000
 
-    /** A code the camera read. A usable one starts pairing at once: pointing the camera at it was the choice. */
-    fun scanned(text: String) {
-        if (_state.value != PairingState.Scanning || text == lastScanned) return
-        lastScanned = text
-        when (val parsed = PairingCode.parse(text, now())) {
+    /**
+     * A frame the camera analyzed, with the code it read, if any. A usable
+     * code coming into view starts pairing at once: pointing the camera at
+     * it was the choice.
+     */
+    fun scanned(text: String?) {
+        if (_state.value != PairingState.Scanning) return
+        when (seen.frame(text, SystemClock.elapsedRealtime())) {
+            SeenCodes.Sighting.Nothing -> return
+            SeenCodes.Sighting.StillThere -> {
+                showHint("That's the code from before. Point the camera away and back to use it again.")
+                return
+            }
+            SeenCodes.Sighting.New -> {}
+        }
+        val read = text ?: return
+        when (val parsed = PairingCode.parse(read, now())) {
             is PairingCode.Parsed.Code -> {
                 val confirm = confirmation(parsed.code, fromCamera = true)
                 if (confirm.warnings.any) _state.value = confirm else start(parsed.code)
@@ -93,7 +106,7 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun confirmation(code: PairingCode, fromCamera: Boolean = false) = PairingState.Confirm(
         code,
-        PairingWarnings.of(code, graph.settings.settings.value, graph.hostKeys::pinned),
+        PairingWarnings.of(code, graph.settings.settings.value, graph.hostKeys::pinnedKey),
         fromCamera,
     )
 
@@ -150,14 +163,13 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Stops a pairing in progress, withdrawing the request, and scans again.
-     * Cancelling a code the camera read leaves it ignored, though the
-     * camera is likely still pointed at it, until it reads another.
+     * The camera, likely still pointed at the code just used, ignores it
+     * until it has looked away.
      */
     fun scanAgain() {
-        val declinedScan = (_state.value as? PairingState.Confirm)?.fromCamera == true
         job?.cancel()
         job = null
-        if (!declinedScan) lastScanned = null
+        seen.resume()
         _hint.value = null
         _state.value = PairingState.Scanning
     }
@@ -168,8 +180,6 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         hintJob = viewModelScope.launch {
             delay(4_000)
             _hint.value = null
-            // Lets the same code be read again, such as one whose problem the person has fixed.
-            lastScanned = null
         }
     }
 }

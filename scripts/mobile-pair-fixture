@@ -53,9 +53,10 @@ start)
         esac
     done
     [ ${#hosts[@]} -gt 0 ] || hosts=(10.0.2.2)
-    [ ! -e "$base/sshd.pid" ] || die "already started; stop it first"
-    mkdir -p -m 700 "$base" "$base/home" "$base/run"
-    chmod 700 "$base/run"
+    # A directory of its own, made here: sshd trusts its authorized_keys
+    # without checking who could write them.
+    mkdir -m 700 "$base" 2>/dev/null || die "$base exists; stop it first, or set CAGENTS_PAIR_FIXTURE"
+    mkdir -m 700 "$base/home" "$base/run"
     ssh-keygen -q -t ed25519 -N '' -C fixture-host -f "$base/host_key" <<<y >/dev/null
     : >"$base/authorized_keys"
     chmod 600 "$base/authorized_keys"
@@ -72,9 +73,9 @@ StrictModes no
 AllowUsers $USER
 EOF
     {
-        echo "bin=$bin"
-        echo "port=$port"
-        echo "hosts=(${hosts[*]})"
+        printf 'bin=%q\n' "$bin"
+        printf 'port=%q\n' "$port"
+        printf 'hosts=(%s)\n' "$(printf '%q ' "${hosts[@]}")"
     } >"$state"
     sshd=$(command -v sshd || echo /usr/sbin/sshd)
     "$sshd" -f "$base/sshd_config" -E "$base/sshd.log"

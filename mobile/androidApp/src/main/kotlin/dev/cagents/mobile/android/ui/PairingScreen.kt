@@ -1,6 +1,7 @@
 package dev.cagents.mobile.android.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -82,15 +83,14 @@ fun PairingScreen(
     onManual: () -> Unit,
     vm: PairingViewModel = viewModel(),
 ) {
+    // Taken once, a recreated screen's model already having it, and before
+    // the first frame: a link opens on its code, without asking for the
+    // camera or starting it.
+    remember(vm) { link()?.let(vm::linked) }
     val state by vm.state.collectAsStateWithLifecycle()
     val hint by vm.hint.collectAsStateWithLifecycle()
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
-
-    // Taken once: a recreated screen's model already has it.
-    LaunchedEffect(Unit) {
-        link()?.let(vm::linked)
-    }
     LaunchedEffect(state) {
         if (state is PairingState.Paired) onPaired()
     }
@@ -144,46 +144,47 @@ fun PairingScreen(
 }
 
 @Composable
-private fun Scanning(hint: String?, onScanned: (String) -> Unit, onPaste: () -> Unit, onManual: () -> Unit) {
+private fun Scanning(hint: String?, onScanned: (String?) -> Unit, onPaste: () -> Unit, onManual: () -> Unit) {
     val context = LocalContext.current
     fun granted() = context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     var camera by remember { mutableStateOf(granted()) }
     val hasCamera = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) }
     var cameraFailed by remember { mutableStateOf(false) }
     // Asked once on arriving: the person just chose to scan, which is when the camera is needed.
-    var asked by rememberSaveable { mutableStateOf(false) }
+    var askedHere by rememberSaveable { mutableStateOf(false) }
     // Only Settings can allow the camera now: the person refused for good,
     // so the system answers requests without asking.
     var onlyInSettings by rememberSaveable { mutableStateOf(false) }
-    // The activity's own lifecycle: the system's dialog pauses the activity,
-    // which a screen's lifecycle in the back stack doesn't follow.
+    // The activity's own lifecycle, which a screen's lifecycle in the back
+    // stack doesn't follow, to see the person return from Settings.
     val activity = LocalActivity.current as? ComponentActivity
     val lifecycleOwner = activity ?: LocalLifecycleOwner.current
-    // Whether the system's dialog came up for the request in flight.
-    var dialogShown by remember { mutableStateOf(false) }
+    val asked = remember(context) { CameraAsked(context) }
     var rationaleBefore by remember { mutableStateOf(false) }
     fun rationale() = activity?.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) == true
     val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         camera = allowed
-        // Refused for good: answered without a dialog, or refused again after
-        // being told why. A refusal Android will still ask about again, or a
-        // dismissed dialog, leaves "Allow camera".
-        onlyInSettings = !allowed && !rationale() && (!dialogShown || rationaleBefore)
+        // Android asks no more once the camera was refused twice, or once
+        // after being told why: it answers at once, and only Settings can
+        // allow it. A refusal it will ask about again shows the reason
+        // instead. Android doesn't say which happened, so a dismissed
+        // dialog on a later visit may lead to Settings too, where the
+        // camera can be allowed all the same.
+        onlyInSettings = !allowed && !rationale() && (rationaleBefore || asked.before)
+        asked.before = true
     }
     fun ask() {
-        dialogShown = false
         rationaleBefore = rationale()
         request.launch(Manifest.permission.CAMERA)
     }
-    LifecycleEventEffect(Lifecycle.Event.ON_PAUSE, lifecycleOwner) { dialogShown = true }
     // Coming back from system settings, where camera access may have been turned on.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME, lifecycleOwner) {
         camera = granted()
         if (camera) onlyInSettings = false
     }
     LaunchedEffect(Unit) {
-        if (hasCamera && !camera && !asked) {
-            asked = true
+        if (hasCamera && !camera && !askedHere) {
+            askedHere = true
             ask()
         }
     }
@@ -347,4 +348,17 @@ private fun Outcome(
     Text(title, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
     if (message != null) Text(message, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
     actions()
+}
+
+/**
+ * Whether this app ever asked for the camera, which Android doesn't say:
+ * after that, a refusal it answers without asking means only Settings can
+ * allow the camera.
+ */
+private class CameraAsked(context: Context) {
+    private val prefs = context.getSharedPreferences("permissions", Context.MODE_PRIVATE)
+
+    var before: Boolean
+        get() = prefs.getBoolean("camera_asked", false)
+        set(value) = prefs.edit().putBoolean("camera_asked", value).apply()
 }

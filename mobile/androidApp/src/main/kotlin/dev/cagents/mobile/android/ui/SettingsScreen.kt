@@ -242,7 +242,16 @@ fun SettingsScreen(
                         Fingerprint(key)
                     }
                 }
-                OutlinedButton(onClick = { vm.forgetHostKey() }) { Text("Forget this computer's key") }
+                if (paired) {
+                    // Forgetting it would trust whichever key answers next, instead of the one its code named.
+                    Text(
+                        "The key came from its pairing code. If ${saved.label} was reinstalled, pair with it again.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    OutlinedButton(onClick = { vm.forgetHostKey() }) { Text("Forget this computer's key") }
+                }
             }
 
             Spacer(Modifier.height(8.dp))

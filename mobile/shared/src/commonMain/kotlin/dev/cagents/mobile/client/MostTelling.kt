@@ -21,9 +21,9 @@ fun mostTelling(failures: List<Throwable>, name: String, hosts: List<String>, pa
         if (!paired || changed.size == failures.size || changed.any { isTailscale(it.host) }) return changed.first()
         val strangers = changed.map { it.host }.filter { it.isNotEmpty() }.distinct()
         val where = if (strangers.isEmpty()) "one of its addresses" else strangers.joinToString(", ")
+        val tailscale = if (hosts.any(::isTailscale)) " Is this phone on Tailscale?" else ""
         return ConnectFailure.Network(
-            "Couldn't reach $name. A different computer answered at $where, so this phone may be on another network. " +
-                "Is this phone on Tailscale?",
+            "Couldn't reach $name. A different computer answered at $where, so this phone may be on another network.$tailscale",
             changed.first(),
         )
     }

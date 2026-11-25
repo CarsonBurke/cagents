@@ -9,6 +9,9 @@ import net.schmizz.sshj.common.Buffer
 import java.security.MessageDigest
 import java.security.PublicKey
 
+/** A trusted host key's fingerprint and its [type], such as `ssh-ed25519`; null in a pin saved before types were. */
+data class PinnedKey(val fingerprint: String, val type: String?)
+
 /**
  * The host keys the phone trusts, one per computer address, shown as
  * OpenSSH's SHA-256 fingerprint so it can be compared with
@@ -26,6 +29,8 @@ class HostKeyStore(context: Context) {
     fun pinned(hostKeyId: String): String? = prefs.getString("$hostKeyId/fingerprint", null)
 
     fun pinnedType(hostKeyId: String): String? = prefs.getString("$hostKeyId/type", null)
+
+    fun pinnedKey(hostKeyId: String): PinnedKey? = pinned(hostKeyId)?.let { PinnedKey(it, pinnedType(hostKeyId)) }
 
     fun pin(hostKeyIds: Collection<String>, fingerprint: String, keyType: String) {
         val edit = prefs.edit()

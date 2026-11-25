@@ -25,7 +25,12 @@ class MostTellingTest {
         val network = assertIs<ConnectFailure.Network>(reported)
         assertTrue(network.retry, "it keeps trying, and connects once the computer is in reach")
         assertTrue(lan in network.message!!)
+        assertTrue("Tailscale" in network.message!!)
         assertSame(stranger, network.cause)
+        // A computer with no Tailscale address isn't one to suggest it for.
+        val local = listOf("192.168.1.21", lan)
+        val elsewhere = mostTelling(listOf(unreachable, stranger), "workstation", local, paired = true)
+        assertFalse("Tailscale" in elsewhere.message!!)
     }
 
     @Test

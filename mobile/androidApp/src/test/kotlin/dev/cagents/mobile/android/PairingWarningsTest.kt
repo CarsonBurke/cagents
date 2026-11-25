@@ -1,6 +1,7 @@
 package dev.cagents.mobile.android
 
 import dev.cagents.mobile.android.data.ConnectionSettings
+import dev.cagents.mobile.android.ssh.PinnedKey
 import dev.cagents.mobile.android.ui.PairingWarnings
 import dev.cagents.mobile.pairing.PairingCode
 import kotlin.test.Test
@@ -21,7 +22,8 @@ class PairingWarningsTest {
     private fun code(hostKey: String = home, hosts: List<String> = paired.hosts, port: Int = 22, user: String = "person") =
         PairingCode("workstation", user, port, hostKey, hosts, ByteArray(32), 1_800_000_300)
 
-    private fun pins(vararg pins: Pair<String, String>): (String) -> String? = mapOf(*pins)::get
+    private fun pins(vararg pins: Pair<String, String>, type: String? = "ssh-ed25519"): (String) -> PinnedKey? =
+        pins.associate { (id, fingerprint) -> id to PinnedKey(fingerprint, type) }::get
 
     private val pinnedHome = pins("workstation.tail1234.ts.net:22" to home, "192.168.1.20:22" to home)
 
@@ -54,6 +56,23 @@ class PairingWarningsTest {
         assertEquals("192.168.1.20", PairingWarnings.of(code(user = "someone"), manual, pins()).replaces)
         assertEquals("192.168.1.20", PairingWarnings.of(code(port = 2222), manual, pins()).replaces)
         assertEquals("192.168.1.20", PairingWarnings.of(code(hosts = listOf("10.0.0.7")), manual, pins()).replaces)
+    }
+
+    @Test
+    fun aKeyOfAnotherTypeTrustedOnFirstUseIsNoConflict() {
+        // Set up by hand, the computer's ECDSA key was trusted; its code names its Ed25519 key.
+        val manual = paired.copy(name = "")
+        val ecdsa = pins("workstation.tail1234.ts.net:22" to other, "192.168.1.20:22" to other, type = "ecdsa-sha2-nistp256")
+        assertFalse(PairingWarnings.of(code(), manual, ecdsa).any)
+        // Nothing to compare by key, so a different login still replaces it.
+        assertEquals("workstation.tail1234.ts.net", PairingWarnings.of(code(user = "someone"), manual, ecdsa).replaces)
+    }
+
+    @Test
+    fun aPinSavedBeforeTypesWereIsCompared() {
+        val untyped = pins("workstation.tail1234.ts.net:22" to home, "192.168.1.20:22" to home, type = null)
+        assertFalse(PairingWarnings.of(code(), paired, untyped).any)
+        assertEquals(paired.hosts, PairingWarnings.of(code(hostKey = other), paired, untyped).conflicts)
     }
 
     @Test

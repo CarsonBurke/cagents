@@ -29,11 +29,13 @@ import java.util.concurrent.Executors
 
 /**
  * The camera's view, reading QR codes from it. Each text read is handed to
- * [onText] on the main thread, as often as the code stays in view.
+ * [onText] on the main thread, as often as the code stays in view, and
+ * frames with no code as null, a few times a second, so the caller can
+ * tell when a code left the view.
  * [onUnavailable] is called if the camera can't be opened.
  */
 @Composable
-fun QrScanner(onText: (String) -> Unit, onUnavailable: () -> Unit, modifier: Modifier = Modifier) {
+fun QrScanner(onText: (String?) -> Unit, onUnavailable: () -> Unit, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
     val currentOnText by rememberUpdatedState(onText)
@@ -80,10 +82,11 @@ fun QrScanner(onText: (String) -> Unit, onUnavailable: () -> Unit, modifier: Mod
 }
 
 /** Reads a QR code from each frame's luminance, the Y plane of its YUV image. */
-private class QrAnalyzer(private val onText: (String) -> Unit) : ImageAnalysis.Analyzer {
+private class QrAnalyzer(private val onText: (String?) -> Unit) : ImageAnalysis.Analyzer {
     private val reader = QRCodeReader()
     private val hints = mapOf(DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE))
     private var luminance = ByteArray(0)
+    private var lastEmpty = 0L
 
     override fun analyze(image: ImageProxy) {
         image.use {
@@ -103,7 +106,14 @@ private class QrAnalyzer(private val onText: (String) -> Unit) : ImageAnalysis.A
             } finally {
                 reader.reset()
             }
-            if (!text.isNullOrEmpty()) onText(text)
+            if (!text.isNullOrEmpty()) {
+                onText(text)
+            } else if (image.imageInfo.timestamp - lastEmpty >= EMPTY_INTERVAL_NANOS) {
+                lastEmpty = image.imageInfo.timestamp
+                onText(null)
+            }
         }
     }
 }
+
+private const val EMPTY_INTERVAL_NANOS = 250_000_000L
