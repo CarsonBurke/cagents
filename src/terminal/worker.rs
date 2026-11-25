@@ -3853,10 +3853,9 @@ impl Worker {
                 let cleanup = if self.checked_shutdown {
                     Ok(())
                 } else {
-                    let wait_for_pty = !cfg!(target_os = "macos") || !self.pty_eof;
                     confirm_exited_family(
                         &self.child,
-                        wait_for_pty.then_some(&self.master),
+                        &self.master,
                         Instant::now() + budget.deadline,
                         budget.census_reserve,
                     )
@@ -6267,7 +6266,7 @@ fn shutdown_child_exit(
                 }
             }
         }
-        confirm_exited_family(child, Some(master), deadline, budget.census_reserve)?;
+        confirm_exited_family(child, master, deadline, budget.census_reserve)?;
     }
     if let Some(report) = report {
         return report;
@@ -6285,7 +6284,7 @@ fn shutdown_child_exit(
 
 fn confirm_exited_family(
     child: &holder::HeldChild,
-    master: Option<&holder::PtyMaster>,
+    master: &holder::PtyMaster,
     deadline: Instant,
     census_reserve: Duration,
 ) -> Result<(), String> {
@@ -6295,9 +6294,10 @@ fn confirm_exited_family(
             .map_err(|error| format!("observe child exit: {error}"))?
             && close_processes::session_is_empty(child.pid(), deadline)?)
     };
-    let Some(master) = master else {
-        // After Darwin PTY EOF, the descriptor cannot tell us when the last
-        // jobs finish. Give process observations a bounded time to settle.
+    if cfg!(target_os = "macos") {
+        // Darwin's PTY EOF can precede the last job's exit, and the master
+        // does not wake a poll with no requested events. Wait for bounded
+        // session observations instead.
         let deadline = deadline.min(Instant::now() + CHILD_SHUTDOWN_DEADLINE);
         let mut delay = Duration::from_millis(20);
         loop {
@@ -6315,7 +6315,7 @@ fn confirm_exited_family(
             std::thread::sleep(delay.min(remaining));
             delay = (delay * 2).min(Duration::from_millis(250));
         }
-    };
+    }
     // Usually the family is already gone. A process outside it (one that left
     // the session, such as `setsid -f`) may keep the PTY open indefinitely;
     // cleanup never claims or depends on it, so its PTY is no reason to wait.
