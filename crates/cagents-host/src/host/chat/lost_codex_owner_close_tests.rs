@@ -1033,7 +1033,11 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_requires_signal_proof() 
             "the unproved tool was signaled"
         );
         assert!(tool_guard.0.signal(libc::SIGKILL).unwrap());
-        assert!(tool_guard.0.wait_for_exit(Duration::from_secs(5)).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tool_guard.0.exited().unwrap() {
+            assert!(Instant::now() < deadline, "the fixture tool never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     drop(tool_guard);
     fixture.close_after_unproved_loss();
