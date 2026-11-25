@@ -1556,6 +1556,11 @@ fn activation_session(
 
 fn test_notice(outcome: Result<TestOutcome, String>) -> TransientNotice {
     match outcome {
+        // macOS posts through Script Editor, which reports nothing back:
+        // a notice its notification permission refuses still looks sent.
+        Ok(TestOutcome::Sent) if cfg!(target_os = "macos") => TransientNotice::success(
+            "Test notification handed to macOS. It comes from Script Editor; if none appeared, allow Script Editor in System Settings > Notifications.",
+        ),
         Ok(TestOutcome::Sent) => TransientNotice::success(
             "Test notification sent. Your desktop decides how it looks and whether it plays a sound.",
         ),
