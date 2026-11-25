@@ -2374,7 +2374,7 @@ fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
         fn interrupted(&self) -> bool {
             false
         }
-        fn pause(&mut self) {
+        fn pause(&mut self, _deadline: Instant) {
             assert!(
                 Instant::now() < self.deadline,
                 "the full terminal update stalled"

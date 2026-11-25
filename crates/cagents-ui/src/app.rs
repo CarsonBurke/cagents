@@ -17951,6 +17951,7 @@ impl Application for Cagents {
         self.dispatching += 1;
         let task = self.dispatch(message);
         self.dispatching -= 1;
+        let task = self.resume_deferred_update_review(task);
         let task = self.finish_update(
             task,
             UpdateEntry {

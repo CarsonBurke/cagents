@@ -1,6 +1,7 @@
 use super::*;
 use crate::model::ChannelId;
 use crate::update::{UpdateJob, UpdatePhase, UpdateState};
+use cosmic::iced::futures::SinkExt;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -10,7 +11,10 @@ pub(super) struct State {
     checking: bool,
     applying: bool,
     polling: bool,
+    poll_again: bool,
     poll_retry: bool,
+    listening_for_progress: Option<String>,
+    review_deferred: bool,
     /// Whether this window runs from an installation tree, the only place an
     /// install can leave it behind.
     watch_installation: bool,
@@ -128,11 +132,41 @@ pub enum Action {
     CancelApply,
     StartApply,
     Applied(Result<UpdateJob, String>),
+    ProgressWatch(String, bool),
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
     InspectInstallation,
     InstallationInspected(Option<PathBuf>),
     Restart,
+}
+
+#[derive(Hash)]
+struct ProgressJob(String);
+
+fn watch_progress(job: &ProgressJob) -> impl iced::futures::Stream<Item = Action> + use<> {
+    let job = job.0.clone();
+    iced::stream::channel(1, async move |mut output| {
+        if let Ok(Ok(changes)) =
+            tokio::task::spawn_blocking(crate::update::progress::Changes::watch).await
+        {
+            if output
+                .send(Action::ProgressWatch(job.clone(), true))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while changes.changed().await {
+                if output.send(Action::Poll).await.is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = output.send(Action::ProgressWatch(job, false)).await;
+        // Keep the fallback active for the rest of this job if its file
+        // watcher could not be registered or disconnected.
+        std::future::pending::<()>().await;
+    })
 }
 
 /// The update review's dismissal.
@@ -372,11 +406,14 @@ impl State {
     }
 
     fn updating(&self) -> bool {
-        self.applying
-            || self
-                .job
-                .as_ref()
-                .is_some_and(|job| !job.phase.is_terminal())
+        self.applying || self.active_job().is_some()
+    }
+
+    fn active_job(&self) -> Option<&str> {
+        self.job
+            .as_ref()
+            .filter(|job| !job.phase.is_terminal())
+            .map(|job| job.id.as_str())
     }
 }
 
@@ -686,8 +723,33 @@ impl Cagents {
         {
             return installation;
         }
-        let progress = if self.update_ui.updating() || self.update_ui.poll_retry {
+        let active_job = self.update_ui.active_job();
+        // Older workers publish a failure before their last recovery verdict.
+        // This window may still present Installing until their deadline,
+        // even if that worker stops publishing while it holds the lease.
+        let legacy_finishing =
+            self.update_ui.job.as_ref().is_some_and(|job| {
+                job.phase == UpdatePhase::Installing && job.recorded_by.is_none()
+            });
+        let poll = self.update_ui.poll_retry
+            || legacy_finishing
+            || active_job
+                .is_some_and(|id| self.update_ui.listening_for_progress.as_deref() != Some(id));
+        let progress = if let Some(job) = active_job {
+            // The lease observer is one-shot. Register it only once we have
+            // seen a job whose worker has taken custody of the lease.
+            let watch = Subscription::run_with(ProgressJob(job.to_owned()), watch_progress)
+                .map(Message::UpdateUi);
+            let fallback = if poll {
+                iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
+            } else {
+                Subscription::none()
+            };
+            Subscription::batch([watch, fallback])
+        } else if poll {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
+        } else if self.update_ui.applying {
+            Subscription::none()
         } else if self.settings.check_for_updates {
             iced::time::every(background_check_interval(self.update_ui.check_failures))
                 .map(|_| Message::UpdateUi(Action::Check))
@@ -895,6 +957,14 @@ impl Cagents {
         ])
     }
 
+    pub(super) fn resume_deferred_update_review(&mut self, task: Task<Message>) -> Task<Message> {
+        if !self.update_ui.review_deferred || self.other_modal_is_open() {
+            return task;
+        }
+        self.update_ui.review_deferred = false;
+        Task::batch([task, self.update_update_ui(Action::Poll)])
+    }
+
     fn apply_update_action(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Check => {
@@ -1061,8 +1131,16 @@ impl Cagents {
                 }
                 Task::none()
             }
+            Action::ProgressWatch(job, listening) => {
+                if self.update_ui.active_job() != Some(&job) {
+                    return Task::none();
+                }
+                self.update_ui.listening_for_progress = listening.then_some(job);
+                self.apply_update_action(Action::Poll)
+            }
             Action::Poll => {
                 if self.update_ui.polling {
+                    self.update_ui.poll_again = true;
                     return Task::none();
                 }
                 self.update_ui.polling = true;
@@ -1079,9 +1157,19 @@ impl Cagents {
             }
             Action::Polled(expected_job, result) => {
                 self.update_ui.polling = false;
+                let poll_again = std::mem::take(&mut self.update_ui.poll_again);
                 if self.update_ui.job.as_ref().map(|job| &job.id) != expected_job.as_ref() {
-                    return Task::none();
+                    return if self.update_ui.updating() || poll_again {
+                        self.apply_update_action(Action::Poll)
+                    } else {
+                        Task::none()
+                    };
                 }
+                let followup = if poll_again {
+                    self.dispatch(Message::UpdateUi(Action::Poll))
+                } else {
+                    Task::none()
+                };
                 match result {
                     Ok(Some(job)) => {
                         self.update_ui.poll_retry = false;
@@ -1141,21 +1229,22 @@ impl Cagents {
                         {
                             self.update_ui.set_aside = None;
                         }
-                        self.update_ui.confirmation =
-                            job.confirmation.clone().filter(|confirmation| {
-                                matches!(
-                                    job.phase,
-                                    UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
-                                ) && self.update_ui.submitted_confirmation.as_ref()
-                                    != Some(&confirmation.nonce)
-                                    && self.update_ui.set_aside.is_none()
-                                    && !self.other_modal_is_open()
-                            });
+                        let confirmation = job.active_confirmation().filter(|confirmation| {
+                            self.update_ui.submitted_confirmation.as_ref()
+                                != Some(&confirmation.nonce)
+                                && self.update_ui.set_aside.is_none()
+                        });
+                        self.update_ui.review_deferred =
+                            confirmation.is_some() && self.other_modal_is_open();
+                        self.update_ui.confirmation = confirmation
+                            .filter(|_| !self.update_ui.review_deferred)
+                            .cloned();
                         let offer = self.offer_update_resume(&job);
                         self.update_ui.job = Some(job);
-                        return offer;
+                        return Task::batch([offer, followup]);
                     }
                     Ok(None) => {
+                        self.update_ui.review_deferred = false;
                         self.update_ui.poll_retry = self.update_ui.updating();
                         if !self.update_ui.poll_retry {
                             if self.update_ui.job.take().is_some() {
@@ -1170,6 +1259,7 @@ impl Cagents {
                         }
                     }
                     Err(error) => {
+                        self.update_ui.review_deferred = false;
                         self.update_ui.poll_retry = true;
                         if let Some(job) = &mut self.update_ui.job {
                             job.confirmation = None;
@@ -1178,7 +1268,7 @@ impl Cagents {
                         self.update_ui.error = Some(error);
                     }
                 }
-                Task::none()
+                followup
             }
             Action::InspectInstallation => {
                 if !self.update_ui.watch_installation
@@ -1742,6 +1832,29 @@ pub(in crate::app) mod tests {
             Some(cancel_id()),
             "reopening it from the header opens on Cancel again"
         );
+    }
+
+    #[test]
+    fn closing_the_dialog_that_deferred_an_update_review_reads_the_latest_job() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let job = awaiting_confirmation();
+        let poll = review_ready(&mut app, job.clone());
+        app.device_ui.open = true;
+        drop(app.update(poll));
+        assert!(app.update_ui.review_deferred);
+        assert!(app.update_ui.confirmation.is_none());
+        assert!(!app.update_ui.polling);
+
+        drop(app.update(Message::Device(device_ui::Action::Close)));
+        assert!(!app.update_ui.review_deferred);
+        assert!(app.update_ui.polling);
+        assert!(app.update_ui.confirmation.is_none());
+
+        drop(app.update(Message::UpdateUi(Action::Polled(
+            Some(job.id.clone()),
+            Ok(Some(job)),
+        ))));
+        assert!(app.update_ui.confirmation.is_some());
     }
 
     #[test]
