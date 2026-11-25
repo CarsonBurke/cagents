@@ -4337,22 +4337,11 @@ impl RecoveryRecord {
         if bytes.len() as u64 > LIMIT {
             return Err("Recovery evidence exceeds its byte limit".into());
         }
-        // Claim before adoption, atomically. A crash may leave an incomplete
-        // claim requiring attention; it must never leave a reusable receipt.
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(store.path.with_file_name(self.name()))
-            .map_err(|error| format!("This recovery receipt could not be claimed; existing recovery evidence was preserved: {error}"))?;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        File::open(
-            store
-                .path
-                .parent()
-                .ok_or("Recovery storage has no parent directory")?,
-        )
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| e.to_string())
+        // Publish the whole claim before adopting work. An interrupted write
+        // leaves the canonical claim absent, so it cannot consume the receipt.
+        store.create_named(&self.name(), &bytes).map_err(|error| {
+            format!("This recovery receipt could not be claimed. Existing recovery evidence was preserved: {error}")
+        })
     }
     pub fn finish(mut self, successor: &HostSessionProof) -> Result<(), String> {
         self.validate_continuity()?;
